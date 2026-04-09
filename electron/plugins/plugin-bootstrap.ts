@@ -1,4 +1,6 @@
-import { existsSync, cpSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, cpSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { app } from 'electron';
 
@@ -14,6 +16,39 @@ function getBundledPluginsDir(): string {
   }
   // Dev mode — bundled-plugins/ lives at the project root
   return join(__dirname, '../../bundled-plugins');
+}
+
+function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
+  const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) => a.name.localeCompare(b.name));
+  const files: string[] = [];
+
+  for (const entry of entries) {
+    const fullPath = join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectPluginFiles(rootDir, fullPath));
+      continue;
+    }
+    if (entry.isFile()) {
+      files.push(fullPath);
+    }
+  }
+
+  return files;
+}
+
+function hashPluginDirectory(dir: string): string {
+  const hash = createHash('sha256');
+  const files = collectPluginFiles(dir);
+
+  for (const filePath of files) {
+    const relativePath = filePath.slice(dir.length + 1).replace(/\\/g, '/');
+    hash.update(relativePath);
+    hash.update('\0');
+    hash.update(readFileSync(filePath));
+    hash.update('\0');
+  }
+
+  return hash.digest('hex');
 }
 
 /**
@@ -40,11 +75,18 @@ export function bootstrapBundledPlugins(pluginsDir: string): void {
     const srcDir = join(bundledDir, entry);
     const destDir = join(pluginsDir, entry);
 
-    if (existsSync(destDir)) continue;
-
     try {
+      let action = 'Installed';
+      const sourceHash = hashPluginDirectory(srcDir);
+      if (existsSync(destDir)) {
+        const installedHash = hashPluginDirectory(destDir);
+        if (installedHash === sourceHash) continue;
+        rmSync(destDir, { recursive: true, force: true });
+        action = 'Updated';
+      }
+
       cpSync(srcDir, destDir, { recursive: true });
-      console.info(`[PluginBootstrap] Installed bundled plugin "${entry}"`);
+      console.info(`[PluginBootstrap] ${action} bundled plugin "${entry}"`);
     } catch (err) {
       console.warn(`[PluginBootstrap] Failed to install bundled plugin "${entry}":`, err);
     }
