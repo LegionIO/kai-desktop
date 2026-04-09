@@ -49,7 +49,7 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 | `src/components/thread/` | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
 | `src/components/settings/` | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage) |
 | `src/components/conversations/` | Sidebar conversation list and sub-agent section |
-| `src/components/plugins/` | Plugin banners, modal host, and plugin-driven settings sections |
+| `src/components/plugins/` | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections |
 | `src/providers/` | React context providers (Config, Runtime, Attachments) |
 | `src/lib/` | IPC client wrapper, utilities |
 
@@ -104,6 +104,13 @@ Renderer code **never** accesses Node APIs directly. All communication goes thro
 - `window.app.skills.*` - list/get/delete/toggle skills
 - `window.app.dialog.*` - native file picker
 - `window.app.image.*` - fetch/save images (bypasses CORS)
+
+## Plugin Notes
+
+- Plugin `main` entries run directly from disk in the main process.
+- Plugin `renderer` entries are treated as **browser entrypoints** and may be authored as multi-file module graphs.
+- Kai compiles plugin renderer graphs into a cached browser ESM output served over a custom protocol, so relative imports, dynamic imports, plugin-local packages, CSS imports, and URL-based assets/workers can load without exposing raw source files to the renderer.
+- Plugin renderer packages must still be browser-runnable; Node builtins such as `fs`, `net`, or `child_process` are not supported in renderer code.
 
 ## Model Providers
 

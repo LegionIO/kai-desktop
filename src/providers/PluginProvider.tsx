@@ -89,13 +89,14 @@ type PluginRendererScript = {
   pluginName: string;
   scriptPath: string;
   scriptHash: string;
-  scriptContent?: string;
+  entryUrl: string;
 };
 
 type PluginRendererStyle = {
   pluginName: string;
   stylePath: string;
   styleHash: string;
+  styleUrl?: string;
   styleContent?: string;
 };
 
@@ -189,18 +190,14 @@ function loadPluginRendererScripts(
   loadedRef: Map<string, string>,
   onLoaded: () => void,
 ): void {
-  for (const { pluginName, scriptContent, scriptHash } of scripts) {
-    if (!scriptContent) continue;
-    if (loadedRef.get(pluginName) === scriptHash) continue;
-    loadedRef.set(pluginName, scriptHash);
+  for (const { pluginName, entryUrl, scriptHash } of scripts) {
+    const cacheKey = `${scriptHash}:${entryUrl}`;
+    if (loadedRef.get(pluginName) === cacheKey) continue;
+    loadedRef.set(pluginName, cacheKey);
 
     try {
-      const blob = new Blob([scriptContent], { type: 'text/javascript' });
-      const url = URL.createObjectURL(blob);
-
-      import(/* @vite-ignore */ url)
+      import(/* @vite-ignore */ entryUrl)
         .then((mod) => {
-          URL.revokeObjectURL(url);
           if (typeof mod.register === 'function') {
             mod.register({
               React,
@@ -214,7 +211,6 @@ function loadPluginRendererScripts(
           }
         })
         .catch((err) => {
-          URL.revokeObjectURL(url);
           console.error(`[PluginProvider] Failed to import renderer for "${pluginName}":`, err);
         });
     } catch (err) {
@@ -227,20 +223,37 @@ function applyPluginRendererStyles(
   styles: PluginRendererStyle[],
   loadedRef: Map<string, string>,
 ): void {
-  for (const { pluginName, stylePath, styleHash, styleContent } of styles) {
-    if (!styleContent) continue;
+  for (const { pluginName, stylePath, styleHash, styleContent, styleUrl } of styles) {
+    if (!styleContent && !styleUrl) continue;
     const key = `${pluginName}:${stylePath}`;
-    if (loadedRef.get(key) === styleHash) continue;
-    loadedRef.set(key, styleHash);
+    const cacheKey = `${styleHash}:${styleUrl ?? stylePath}`;
+    if (loadedRef.get(key) === cacheKey) continue;
+    loadedRef.set(key, cacheKey);
 
     const elementId = `plugin-style-${pluginName}-${btoa(stylePath).replace(/=/g, '')}`;
-    let styleElement = document.getElementById(elementId) as HTMLStyleElement | null;
-    if (!styleElement) {
+    const existingElement = document.getElementById(elementId);
+
+    if (styleUrl) {
+      let linkElement = existingElement as HTMLLinkElement | null;
+      if (!linkElement || linkElement.tagName !== 'LINK') {
+        existingElement?.remove();
+        linkElement = document.createElement('link');
+        linkElement.id = elementId;
+        linkElement.rel = 'stylesheet';
+        document.head.appendChild(linkElement);
+      }
+      linkElement.href = styleUrl;
+      continue;
+    }
+
+    let styleElement = existingElement as HTMLStyleElement | null;
+    if (!styleElement || styleElement.tagName !== 'STYLE') {
+      existingElement?.remove();
       styleElement = document.createElement('style');
       styleElement.id = elementId;
       document.head.appendChild(styleElement);
     }
-    styleElement.textContent = styleContent;
+    styleElement.textContent = styleContent ?? '';
   }
 }
 

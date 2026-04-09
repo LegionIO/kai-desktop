@@ -25,6 +25,7 @@ import { registerUsageHandlers } from './ipc/usage.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
+import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
@@ -41,6 +42,16 @@ protocol.registerSchemesAsPrivileged([
       secure: true,
       supportFetchAPI: true,
       stream: true,
+    },
+  },
+  {
+    scheme: PLUGIN_RENDERER_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      corsEnabled: true,
     },
   },
 ]);
@@ -697,6 +708,41 @@ if (gotSingleInstanceLock) {
 
       return new Response(data, {
         headers: { 'Content-Type': contentType, 'Cache-Control': 'no-cache' },
+      });
+    });
+
+    protocol.handle(PLUGIN_RENDERER_PROTOCOL, (request) => {
+      if (!pluginManagerRef) {
+        return new Response('Plugin manager not ready', { status: 503 });
+      }
+
+      let parsed: URL;
+      try {
+        parsed = new URL(request.url);
+      } catch {
+        return new Response('Bad Request', { status: 400 });
+      }
+
+      const pluginName = decodeURIComponent(parsed.hostname);
+      const pathSegments = parsed.pathname.split('/').filter(Boolean).map((segment) => decodeURIComponent(segment));
+      const [fileHash, ...assetParts] = pathSegments;
+      const assetPath = assetParts.join('/');
+
+      if (!pluginName || !fileHash || !assetPath) {
+        return new Response('Bad Request', { status: 400 });
+      }
+
+      const resolved = pluginManagerRef.resolveRendererAssetRequest(pluginName, fileHash, assetPath);
+      if (!resolved) {
+        return new Response('Not Found', { status: 404 });
+      }
+
+      const data = readFileSync(resolved.filePath);
+      return new Response(data, {
+        headers: {
+          'Content-Type': resolved.contentType,
+          'Cache-Control': 'no-cache',
+        },
       });
     });
 

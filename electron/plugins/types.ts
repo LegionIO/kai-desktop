@@ -69,6 +69,7 @@ export type PluginInstance = {
   publishedState: Record<string, unknown>;
   notifications: PluginNotificationDescriptor[];
   configChangeListeners: Array<(config: AppConfig) => void>;
+  rendererBuild: PluginRendererBuild | null;
 };
 
 /* ── Plugin Module (what main.js must export) ── */
@@ -208,14 +209,27 @@ export type PluginRendererScript = {
   pluginName: string;
   scriptPath: string;
   scriptHash: string;
-  scriptContent?: string;
+  entryUrl: string;
 };
 
 export type PluginRendererStyle = {
   pluginName: string;
   stylePath: string;
   styleHash: string;
+  styleUrl?: string;
   styleContent?: string;
+};
+
+export type PluginRendererBuild = {
+  pluginName: string;
+  pluginDir: string;
+  fileHash: string;
+  outDir: string;
+  entryPath: string;
+  entryUrl: string;
+  scripts: PluginRendererScript[];
+  styles: PluginRendererStyle[];
+  mimeTypes: Record<string, string>;
 };
 
 export type PluginNotificationDescriptor = {

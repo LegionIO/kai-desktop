@@ -35,6 +35,7 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { unregisterAgentBackend, unregisterAgentBackendsForPlugin } from '../agent/backend-registry.js';
+import { buildPluginRendererBundle, resolvePluginRendererRequest } from './renderer-build.js';
 
 const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
   'config:read': 'Read app configuration',
@@ -339,6 +340,7 @@ export class PluginManager {
       publishedState: {},
       notifications: [],
       configChangeListeners: [],
+      rendererBuild: null,
     };
 
     this.plugins.set(manifest.name, instance);
@@ -397,6 +399,17 @@ export class PluginManager {
 
       if (typeof mod.activate === 'function') {
         await mod.activate(api);
+      }
+
+      if (manifest.renderer) {
+        instance.rendererBuild = await buildPluginRendererBundle({
+          appHome: this.appHome,
+          pluginName: manifest.name,
+          pluginDir: dir,
+          fileHash: instance.fileHash,
+          rendererPath: manifest.renderer,
+          mainPath: manifest.main,
+        });
       }
 
       instance.state = 'active';
@@ -472,6 +485,19 @@ export class PluginManager {
     const instance = this.plugins.get(pluginName);
     if (!instance) return {};
     return this.validatePluginConfig(instance.manifest, this.getConfig().plugins?.[pluginName]);
+  }
+
+  resolveRendererAssetRequest(pluginName: string, fileHash: string, assetPath: string): { filePath: string; contentType: string } | null {
+    const instance = this.plugins.get(pluginName);
+    if (!instance || instance.state !== 'active') return null;
+
+    return resolvePluginRendererRequest({
+      appHome: this.appHome,
+      pluginName,
+      fileHash,
+      assetPath,
+      build: instance.rendererBuild,
+    });
   }
 
   setPluginConfig(pluginName: string, path: string, value: unknown): void {
@@ -603,21 +629,9 @@ export class PluginManager {
       threadDecorations.push(...instance.threadDecorations);
       notifications.push(...instance.notifications.filter((notification) => notification.visible));
 
-      if (instance.state !== 'disabled' && instance.state !== 'error' && instance.manifest.renderer) {
-        const scriptPath = join(instance.dir, instance.manifest.renderer);
-        if (existsSync(scriptPath)) {
-          try {
-            const scriptContent = readFileSync(scriptPath, 'utf-8');
-            rendererScripts.push({
-              pluginName: instance.manifest.name,
-              scriptPath,
-              scriptHash: hashContent(scriptContent),
-              scriptContent,
-            });
-          } catch (err) {
-            console.warn(`[PluginManager] Failed to read renderer for "${instance.manifest.name}":`, err);
-          }
-        }
+      if (instance.state !== 'disabled' && instance.state !== 'error' && instance.rendererBuild) {
+        rendererScripts.push(...instance.rendererBuild.scripts);
+        rendererStyles.push(...instance.rendererBuild.styles);
       }
 
       for (const styleRelPath of instance.manifest.rendererStyles ?? []) {
