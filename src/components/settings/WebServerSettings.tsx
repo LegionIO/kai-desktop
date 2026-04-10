@@ -4,6 +4,12 @@ import { Toggle, NumberField, TextField, settingsSelectClass, type SettingsProps
 type WebServerConfig = {
   enabled: boolean;
   port: number;
+  tls: {
+    enabled: boolean;
+    mode: 'self-signed' | 'custom';
+    certPath: string;
+    keyPath: string;
+  };
   auth: {
     mode: 'anonymous' | 'password';
     username: string;
@@ -15,14 +21,17 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
   const ws = (config.webServer as WebServerConfig | undefined) ?? {
     enabled: false,
     port: 5243,
+    tls: { enabled: true, mode: 'self-signed' as const, certPath: '', keyPath: '' },
     auth: { mode: 'anonymous' as const, username: '', password: '' },
   };
+
+  const protocol = ws.tls.enabled ? 'https' : 'http';
 
   return (
     <div className="space-y-6">
       <h3 className="text-sm font-semibold">Web UI</h3>
       <p className="text-xs text-muted-foreground">
-        Serve the same chat interface over HTTP so you can access it from any browser on your network.
+        Serve the same chat interface over HTTP/HTTPS so you can access it from any browser on your network.
       </p>
 
       <Toggle
@@ -45,8 +54,62 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               max={65535}
             />
             <p className="text-[10px] text-muted-foreground">
-              Access the Web UI at <span className="font-mono">http://localhost:{ws.port}</span>
+              Access the Web UI at <span className="font-mono">{protocol}://localhost:{ws.port}</span>
             </p>
+          </fieldset>
+
+          <fieldset className="rounded-lg border p-3 space-y-3">
+            <legend className="text-xs font-semibold px-1">TLS / HTTPS</legend>
+            <Toggle
+              label="Enable HTTPS"
+              checked={ws.tls.enabled}
+              onChange={(v) => updateConfig('webServer.tls.enabled', v)}
+            />
+            <p className="text-[10px] text-muted-foreground">
+              HTTPS is required for microphone access (dictation, realtime calls) when connecting from other devices.
+            </p>
+
+            {ws.tls.enabled && (
+              <div className="space-y-3 pl-1">
+                <div>
+                  <label className="text-[10px] text-muted-foreground block mb-0.5">Certificate Mode</label>
+                  <select
+                    className={settingsSelectClass}
+                    value={ws.tls.mode}
+                    onChange={(e) => updateConfig('webServer.tls.mode', e.target.value)}
+                  >
+                    <option value="self-signed">Self-Signed (auto-generated)</option>
+                    <option value="custom">Custom Certificate</option>
+                  </select>
+                </div>
+
+                {ws.tls.mode === 'self-signed' && (
+                  <p className="text-[10px] text-muted-foreground">
+                    A self-signed certificate will be generated automatically for localhost and all local network IPs.
+                    Your browser will show a security warning on first visit — accept it to proceed.
+                  </p>
+                )}
+
+                {ws.tls.mode === 'custom' && (
+                  <div className="space-y-3">
+                    <TextField
+                      label="Certificate file path"
+                      value={ws.tls.certPath}
+                      onChange={(v) => updateConfig('webServer.tls.certPath', v)}
+                      placeholder="/path/to/cert.pem"
+                      mono
+                    />
+                    <TextField
+                      label="Private key file path"
+                      value={ws.tls.keyPath}
+                      onChange={(v) => updateConfig('webServer.tls.keyPath', v)}
+                      placeholder="/path/to/key.pem"
+                      mono
+                    />
+                  </div>
+                )}
+              </div>
+            )}
           </fieldset>
 
           <fieldset className="rounded-lg border p-3 space-y-3">

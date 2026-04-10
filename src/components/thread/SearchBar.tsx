@@ -160,7 +160,7 @@ export const SearchBar: FC<SearchBarProps> = ({ visible, onClose, viewportRef })
   return (
     <div
       data-search-bar
-      className="mx-auto mt-4 flex w-full max-w-5xl items-center gap-2 rounded-2xl border border-border/70 bg-card/85 px-4 py-2 shadow-[0_10px_30px_rgba(5,4,15,0.12)]"
+      className="mx-auto mt-2 flex w-full max-w-5xl items-center gap-2 rounded-2xl border border-border/70 bg-card/85 px-3 py-2 shadow-[0_10px_30px_rgba(5,4,15,0.12)] md:mt-4 md:px-4"
     >
       <SearchIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
       <input

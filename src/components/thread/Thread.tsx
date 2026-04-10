@@ -103,7 +103,7 @@ export const Thread: FC<{
       <ComputerUseFallbackBanner />
       <ThreadModeTabs mode={mode} onChange={onChangeMode} />
       {threadDecorations.length > 0 && (
-        <div className="border-b border-border/60 bg-background/65 px-6 py-2 backdrop-blur-sm">
+        <div className="border-b border-border/60 bg-background/65 px-3 py-2 backdrop-blur-sm md:px-6">
           <div className="mx-auto flex w-full max-w-5xl flex-wrap gap-2">
             {threadDecorations.map((decoration) => (
               <span
@@ -129,7 +129,7 @@ export const Thread: FC<{
           <ThreadPrimitive.Empty>
             <EmptyThreadBackground />
           </ThreadPrimitive.Empty>
-          <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl flex-col px-6 pt-8">
+          <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl flex-col px-3 pt-4 md:px-6 md:pt-8">
             <ThreadWelcome />
             <ThreadPrimitive.Messages
               components={{
@@ -172,7 +172,7 @@ const ThreadModeTabs: FC<{ mode: ThreadMode; onChange: (mode: ThreadMode) => voi
   if (!computerUseEnabled) return null;
 
   return (
-    <div className="border-b border-border/70 bg-background/85 px-6 py-2 backdrop-blur-md">
+    <div className="border-b border-border/70 bg-background/85 px-3 py-2 backdrop-blur-md md:px-6">
       <div className="mx-auto flex w-full max-w-5xl items-center gap-1.5">
         <button
           type="button"
@@ -239,7 +239,7 @@ const ComputerTabSurface: FC = () => {
   if (!activeComputerSession) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="px-6 py-4">
+        <div className="px-3 py-4 md:px-6">
           <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
@@ -260,10 +260,120 @@ const ComputerTabSurface: FC = () => {
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="px-6 py-4">
+      <div className="px-3 py-4 md:px-6">
         <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
           <ComputerSessionPanel session={activeComputerSession} />
         </div>
+      </div>
+    </div>
+  );
+};
+
+/** Directory browser for web UI users to select a working directory on the host. */
+const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => void }> = ({ onSelect, onCancel }) => {
+  const [currentPath, setCurrentPath] = useState<string>('~');
+  const [resolvedPath, setResolvedPath] = useState<string>('');
+  const [entries, setEntries] = useState<Array<{ name: string; isDirectory: boolean }>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadDirectory = useCallback(async (dirPath: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await (window.app as Record<string, unknown> & { fs: { listDirectory: (p: string) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }> } }).fs.listDirectory(dirPath);
+      if (result.error) {
+        setError(result.error);
+        setEntries([]);
+      } else {
+        setEntries(result.entries);
+        if (result.path) {
+          setResolvedPath(result.path);
+          setCurrentPath(result.path);
+        }
+      }
+    } catch (err) {
+      setError(String(err));
+      setEntries([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void loadDirectory(currentPath); }, []);
+
+  const navigateTo = (dirName: string) => {
+    const next = currentPath === '/' ? `/${dirName}` : `${currentPath}/${dirName}`;
+    setCurrentPath(next);
+    void loadDirectory(next);
+  };
+
+  const navigateUp = () => {
+    const parent = currentPath.replace(/\/[^/]+\/?$/, '') || '/';
+    setCurrentPath(parent);
+    void loadDirectory(parent);
+  };
+
+  return (
+    <div className="absolute inset-x-0 bottom-full z-30 mx-3 mb-2 max-h-[60vh] overflow-hidden rounded-2xl border border-border/70 bg-card/95 shadow-xl backdrop-blur-md md:mx-6">
+      <div className="flex items-center justify-between border-b border-border/60 px-4 py-2.5">
+        <div className="flex items-center gap-2 min-w-0">
+          <FolderOpenIcon className="h-4 w-4 shrink-0 text-primary" />
+          <span className="text-xs font-medium">Select Working Directory</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => onSelect(resolvedPath || currentPath)}
+            className="rounded-lg bg-primary px-3 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Select
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-lg border border-border/70 px-3 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/50"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+      <div className="border-b border-border/40 bg-muted/20 px-4 py-1.5">
+        <span className="block truncate text-[11px] font-mono text-muted-foreground" title={resolvedPath || currentPath}>
+          {resolvedPath || currentPath}
+        </span>
+      </div>
+      <div className="max-h-[45vh] overflow-y-auto">
+        {currentPath !== '/' && (
+          <button
+            type="button"
+            onClick={navigateUp}
+            className="flex w-full items-center gap-2 px-4 py-2 text-xs transition-colors hover:bg-muted/50"
+          >
+            <ChevronLeftIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-muted-foreground">..</span>
+          </button>
+        )}
+        {loading && (
+          <div className="px-4 py-6 text-center text-xs text-muted-foreground">Loading...</div>
+        )}
+        {error && (
+          <div className="px-4 py-3 text-xs text-red-400">{error}</div>
+        )}
+        {!loading && !error && entries.filter((e) => e.isDirectory).map((entry) => (
+          <button
+            key={entry.name}
+            type="button"
+            onClick={() => navigateTo(entry.name)}
+            className="flex w-full items-center gap-2 px-4 py-2 text-xs transition-colors hover:bg-muted/50"
+          >
+            <FolderOpenIcon className="h-3.5 w-3.5 text-primary/70" />
+            <span className="truncate">{entry.name}</span>
+          </button>
+        ))}
+        {!loading && !error && entries.filter((e) => e.isDirectory).length === 0 && (
+          <div className="px-4 py-3 text-xs text-muted-foreground">No subdirectories</div>
+        )}
       </div>
     </div>
   );
@@ -320,14 +430,14 @@ const ThreadWelcome: FC = () => {
     <ThreadPrimitive.Empty>
       <div className="flex flex-1 items-center justify-center py-24">
         <div className="relative z-10 flex select-none flex-col items-center justify-center">
-          <div className="mb-3 inline-flex items-center gap-0.5 text-4xl font-semibold">
+          <div className="mb-3 inline-flex items-center gap-0.5 text-2xl font-semibold md:text-4xl">
             <span className={`app-wordmark ${gradientText ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
-            <CpuIcon className="h-9 w-9 text-primary/80" />
+            <CpuIcon className="h-6 w-6 text-primary/80 md:h-9 md:w-9" />
           </div>
           <p className="max-w-xl text-center text-sm text-muted-foreground">
             Your local neural workspace for coding, tooling, and system automation.
           </p>
-          <div className="mt-8 grid max-w-2xl grid-cols-2 gap-3">
+          <div className="mt-8 grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
             {['List files in my home directory', 'Search for TODO comments in my code', 'Help me write a shell script', 'Explain a file in my project'].map((s) => (
               <button
                 key={s}
@@ -919,7 +1029,7 @@ const UserMessage: FC = () => {
     : true;
   return (
     <MessagePrimitive.Root className="group mb-6 flex justify-end">
-      <div className="max-w-[72%]">
+      <div className="max-w-[88%] md:max-w-[72%]">
         <div
           className="rounded-[1.6rem] border px-5 py-3 text-foreground backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.22),var(--app-user-bubble-shadow)]"
           style={{
@@ -930,7 +1040,7 @@ const UserMessage: FC = () => {
           <MessagePrimitive.Content components={userContentComponents} />
         </div>
         <div className="flex items-center justify-end gap-1">
-          <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+          <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
             <CopyButton />
             {ttsEnabled && <SpeakButton />}
           </ActionBarPrimitive.Root>
@@ -1254,7 +1364,7 @@ const AssistantActionBar: FC = () => {
     ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
     : true;
   return (
-    <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+    <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
       <CopyButton />
       {ttsEnabled && <SpeakButton />}
       <ActionBarPrimitive.Reload asChild>
@@ -1424,7 +1534,10 @@ const DictationButton: FC = () => {
     azure?: { endpoint?: string; region?: string; subscriptionKey?: string; sttLanguage?: string };
     dictation?: { enabled?: boolean; language?: string; continuous?: boolean; inputDeviceId?: string };
   } | undefined;
-  const audioProvider: AudioProvider = audioConfig?.provider ?? 'native';
+  const isWebBridgeDictation = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  // Azure STT relies on main-process mic capture which isn't available over
+  // the web bridge — fall back to native Web Speech API for browser users.
+  const audioProvider: AudioProvider = isWebBridgeDictation ? 'native' : (audioConfig?.provider ?? 'native');
   const dictationConfig = audioConfig?.dictation;
   const azureConfig = audioConfig?.azure;
   const selectedDeviceId = dictationConfig?.inputDeviceId;
@@ -1442,9 +1555,26 @@ const DictationButton: FC = () => {
   // Load devices and start level monitoring when picker opens
   useEffect(() => {
     if (!pickerOpen) {
-      window.app?.mic?.stopMonitor();
+      if (!isWebBridgeDictation) window.app?.mic?.stopMonitor();
       if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
       setLevels({});
+      return;
+    }
+
+    if (isWebBridgeDictation) {
+      // Browser: use navigator.mediaDevices.enumerateDevices
+      if (navigator.mediaDevices?.enumerateDevices) {
+        navigator.mediaDevices.enumerateDevices()
+          .then((allDevices) => {
+            const inputs = allDevices
+              .filter((d) => d.kind === 'audioinput')
+              .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' }));
+            setDevices(inputs);
+          })
+          .catch(() => setDevices([]));
+      } else {
+        setDevices([]);
+      }
       return;
     }
 
@@ -1465,10 +1595,10 @@ const DictationButton: FC = () => {
     }).catch(() => setDevices([]));
 
     return () => {
-      mic.stopMonitor();
+      if (!isWebBridgeDictation) mic.stopMonitor();
       if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
     };
-  }, [pickerOpen]);
+  }, [pickerOpen, isWebBridgeDictation]);
 
   const selectDevice = useCallback((deviceId: string | undefined) => {
     updateConfig('audio.dictation.inputDeviceId', deviceId);
@@ -1592,17 +1722,19 @@ const DictationButton: FC = () => {
             : <MicOffIcon className={`h-3.5 w-3.5 ${error ? 'text-yellow-500' : 'text-muted-foreground'}`} />
           }
         </button>
-        {/* Caret dropdown trigger */}
-        <button
-          type="button"
-          onClick={() => setPickerOpen(!pickerOpen)}
-          className={`flex h-8 w-4 items-center justify-center border-l transition-colors ${
-            isActive ? 'border-border/30' : 'border-border/50 hover:bg-muted/50'
-          }`}
-          title="Select microphone"
-        >
-          <ChevronUpIcon className="h-2.5 w-2.5 text-muted-foreground" />
-        </button>
+        {/* Caret dropdown trigger — hidden on web where browser handles device selection */}
+        {!isWebBridgeDictation && (
+          <button
+            type="button"
+            onClick={() => setPickerOpen(!pickerOpen)}
+            className={`flex h-8 w-4 items-center justify-center border-l transition-colors ${
+              isActive ? 'border-border/30' : 'border-border/50 hover:bg-muted/50'
+            }`}
+            title="Select microphone"
+          >
+            <ChevronUpIcon className="h-2.5 w-2.5 text-muted-foreground" />
+          </button>
+        )}
       </div>
 
       {/* Status label */}
@@ -1705,6 +1837,11 @@ const Composer: FC<{
     ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
     : true;
 
+  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
+
   const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
 
@@ -1716,13 +1853,53 @@ const Composer: FC<{
   }, [composerRuntime]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
+    if (isWebBridge) {
+      // On web: use browser file picker
+      const accept = filters?.flatMap((f) => f.extensions.map((e) => `.${e}`)).join(',') || '*/*';
+      setPendingFileAccept(accept);
+      // Trigger after state update so the input has the right accept
+      setTimeout(() => fileInputRef.current?.click(), 0);
+      return;
+    }
     try {
       const result = await app.dialog.openFile({ filters }) as { canceled: boolean; files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }> };
       if (!result.canceled && result.files) addAttachments(result.files);
     } catch (err) { console.error('Attach failed:', err); }
   };
 
+  const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    const readers: Promise<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      readers.push(new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const isImage = file.type.startsWith('image/');
+          const isText = file.type.startsWith('text/') || file.type === 'application/json';
+          if (isText) {
+            const textReader = new FileReader();
+            textReader.onload = () => resolve({ name: file.name, mime: file.type || 'application/octet-stream', isImage, size: file.size, dataUrl, text: textReader.result as string });
+            textReader.readAsText(file);
+          } else {
+            resolve({ name: file.name, mime: file.type || 'application/octet-stream', isImage, size: file.size, dataUrl });
+          }
+        };
+        reader.readAsDataURL(file);
+      }));
+    }
+    void Promise.all(readers).then((results) => addAttachments(results));
+    // Reset so the same file can be re-selected
+    event.target.value = '';
+  };
+
   const handleAttachDirectory = async () => {
+    if (isWebBridge) {
+      setShowDirectoryBrowser(true);
+      return;
+    }
     try {
       const result = await app.dialog.openDirectory();
       if (!result.canceled && result.directoryPath) {
@@ -1744,7 +1921,28 @@ const Composer: FC<{
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   return (
-    <div className="relative z-20 border-t border-border/70 bg-background/88 px-6 pb-6 pt-4 backdrop-blur-md">
+    <div className="relative z-20 border-t border-border/70 bg-background/88 px-3 pb-3 pt-3 backdrop-blur-md md:px-6 md:pb-6 md:pt-4">
+      {/* Hidden file input for web bridge */}
+      {isWebBridge && (
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept={pendingFileAccept}
+          className="hidden"
+          onChange={handleWebFileInputChange}
+        />
+      )}
+      {/* Directory browser for web bridge */}
+      {showDirectoryBrowser && (
+        <DirectoryBrowser
+          onSelect={async (path) => {
+            setShowDirectoryBrowser(false);
+            await setCurrentWorkingDirectory(path);
+          }}
+          onCancel={() => setShowDirectoryBrowser(false)}
+        />
+      )}
       <div className="mx-auto w-full max-w-5xl">
         {mode === 'chat' && hasFileAttachments && (
           <div className="mb-3 flex flex-wrap gap-2">
@@ -1762,7 +1960,7 @@ const Composer: FC<{
                 <button
                   type="button"
                   onClick={() => removeAttachment(i)}
-                  className="ml-1 rounded p-0.5 opacity-0 transition-opacity hover:bg-destructive/10 group-hover/att:opacity-100"
+                  className="ml-1 rounded p-0.5 opacity-100 transition-opacity hover:bg-destructive/10 md:opacity-0 md:group-hover/att:opacity-100"
                 >
                   <XIcon className="h-3 w-3 text-muted-foreground" />
                 </button>
@@ -1824,8 +2022,8 @@ const Composer: FC<{
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-[15px]"
                   autoFocus
                 />
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex min-w-0 items-center gap-2">
+                <div className="flex items-center justify-between gap-2 md:gap-3">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 md:gap-2">
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
                         <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">

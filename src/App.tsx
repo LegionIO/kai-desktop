@@ -21,16 +21,18 @@ import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { CpuIcon, DownloadIcon, SettingsIcon } from 'lucide-react';
+import { CpuIcon, DownloadIcon, MenuIcon, SettingsIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarDock, type DockItem } from '@/components/SidebarDock';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import { app } from '@/lib/ipc-client';
+import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
+import { useIsMobile } from '@/hooks/useIsMobile';
 
 export default function App() {
   return (
@@ -396,7 +398,10 @@ function AppShell() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(280);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
+  const suppressStoreSync = useRef(false);
   const { config, updateConfig } = useConfig();
   const { title: themeTitle, Icon: ThemeIcon, toggle: toggleTheme } = useThemeToggleControl();
   const {
@@ -418,6 +423,7 @@ function AppShell() {
 
     const applyStore = (store: ConversationsStore | null) => {
       if (cancelled) return;
+      if (suppressStoreSync.current) return;
       const resolvedActiveId = store?.activeConversationId ?? null;
       const conversation = resolvedActiveId && store?.conversations
         ? store.conversations[resolvedActiveId] ?? null
@@ -525,6 +531,7 @@ function AppShell() {
   }, [activeConversationId, cuSessionsByConversation]);
 
   const handleSwitchConversation = useCallback(async (id: string) => {
+    if (isMobile) setSidebarOpen(false);
     await cleanupAbandonedConversation(id);
     await app.conversations.setActiveId(id);
     setActiveView(CHAT_VIEW);
@@ -537,44 +544,63 @@ function AppShell() {
     ));
     // Clean up any other empty conversations in the background
     void cleanupEmptyConversations(id, undefined, cuSessionsByConversation);
-  }, [cleanupAbandonedConversation, cuSessionsByConversation]);
+  }, [cleanupAbandonedConversation, cuSessionsByConversation, isMobile]);
 
   const handleNewConversation = useCallback(async () => {
-    await cleanupAbandonedConversation();
-    const newId = crypto.randomUUID();
-    const now = new Date().toISOString();
-    await app.conversations.put({
-      id: newId, title: null, fallbackTitle: null, messages: [],
-      conversationCompaction: null, lastContextUsage: null,
-      createdAt: now, updatedAt: now, lastMessageAt: null,
-      titleStatus: 'idle', titleUpdatedAt: null,
-      messageCount: 0, userMessageCount: 0,
-      runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
-      selectedModelKey: null,
-      selectedBackendKey: null,
-      currentWorkingDirectory: null,
-    });
-    await app.conversations.setActiveId(newId);
-    setActiveView(CHAT_VIEW);
-    setActiveConversationId(newId);
-    // Reset per-conversation settings for the new conversation
-    setSelectedModelKey(null);
-    setSelectedProfileKey(null);
-    setFallbackEnabled(false);
-    setProfilePrimaryModelKey(null);
-  }, [cleanupAbandonedConversation]);
+    if (isMobile) setSidebarOpen(false);
+    suppressStoreSync.current = true;
+    try {
+      if (activeConversationId) {
+        try {
+          const conversation = await app.conversations.get(activeConversationId) as ConversationRecord | null;
+          const hasComputerSessions = cuSessionsByConversation.has(activeConversationId);
+          if (isDisposableNewConversation(conversation, hasComputerSessions)) {
+            await app.conversations.delete(activeConversationId);
+          }
+        } catch { /* ignore */ }
+      }
+      const newId = generateId();
+      const now = new Date().toISOString();
+      await app.conversations.put({
+        id: newId, title: null, fallbackTitle: null, messages: [],
+        messageTree: [], headId: null,
+        conversationCompaction: null, lastContextUsage: null,
+        createdAt: now, updatedAt: now, lastMessageAt: null,
+        titleStatus: 'idle', titleUpdatedAt: null,
+        messageCount: 0, userMessageCount: 0,
+        runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
+        selectedModelKey: null,
+        selectedBackendKey: null,
+        currentWorkingDirectory: null,
+      });
+      await app.conversations.setActiveId(newId);
+      setActiveView(CHAT_VIEW);
+      setActiveConversationId(newId);
+      setActiveConversationTitle('New Conversation');
+      setSelectedModelKey(null);
+      setSelectedProfileKey(null);
+      setFallbackEnabled(false);
+      setProfilePrimaryModelKey(null);
+    } catch (err) {
+      console.error('[AppShell] handleNewConversation failed:', err);
+    } finally {
+      suppressStoreSync.current = false;
+    }
+  }, [activeConversationId, cuSessionsByConversation, isMobile]);
 
   const handleSettingsToggle = useCallback(async () => {
     if (activeView !== 'settings') {
       await cleanupAbandonedConversation();
     }
     setActiveView((v) => v === SETTINGS_VIEW ? CHAT_VIEW : SETTINGS_VIEW);
-  }, [cleanupAbandonedConversation, activeView]);
+    if (isMobile) setSidebarOpen(false);
+  }, [cleanupAbandonedConversation, activeView, isMobile]);
 
   const handleOpenSettings = useCallback(async () => {
     await cleanupAbandonedConversation();
     setActiveView(SETTINGS_VIEW);
-  }, [cleanupAbandonedConversation]);
+    if (isMobile) setSidebarOpen(false);
+  }, [cleanupAbandonedConversation, isMobile]);
 
   // Listen for Cmd+, / menu Settings
   useEffect(() => {
@@ -775,13 +801,24 @@ function AppShell() {
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
         <div className="flex h-screen overflow-hidden bg-transparent text-foreground">
+          {/* Mobile sidebar backdrop */}
+          {isMobile && sidebarOpen && (
+            <div
+              className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
+              onClick={() => setSidebarOpen(false)}
+            />
+          )}
           {/* Sidebar */}
           <aside
-            className="app-shell-panel flex h-full shrink-0 flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground"
-            style={{ width: `${sidebarWidth}px` }}
+            className={
+              isMobile
+                ? `app-shell-panel fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
+                : 'app-shell-panel flex h-full shrink-0 flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground'
+            }
+            style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
-              <div className="pointer-events-none absolute inset-y-0 left-0 w-20" />
+              <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
               <span className="titlebar-no-drag inline-flex items-center gap-0.5 text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
                 <CpuIcon className="h-4 w-4 text-primary/80" />
@@ -802,25 +839,36 @@ function AppShell() {
               <SidebarDock items={dockItems} />
             </div>
           </aside>
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize left navigation"
-            aria-valuenow={sidebarWidth}
-            aria-valuemin={SIDEBAR_MIN_WIDTH}
-            aria-valuemax={SIDEBAR_MAX_WIDTH}
-            onPointerDown={(event) => {
-              event.preventDefault();
-              setDragState({ startX: event.clientX, startWidth: sidebarWidth });
-            }}
-            className="group relative -ml-px h-full w-2 shrink-0 cursor-col-resize bg-transparent"
-          >
-            <div className="absolute inset-y-0 left-0 w-px bg-border/40 transition-colors group-hover:bg-primary/50" />
-          </div>
+          {!isMobile && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize left navigation"
+              aria-valuenow={sidebarWidth}
+              aria-valuemin={SIDEBAR_MIN_WIDTH}
+              aria-valuemax={SIDEBAR_MAX_WIDTH}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                setDragState({ startX: event.clientX, startWidth: sidebarWidth });
+              }}
+              className="group relative -ml-px h-full w-2 shrink-0 cursor-col-resize bg-transparent"
+            >
+              <div className="absolute inset-y-0 left-0 w-px bg-border/40 transition-colors group-hover:bg-primary/50" />
+            </div>
+          )}
 
           {/* Main content area */}
           <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            <div className="titlebar-drag flex h-14 items-center justify-between border-b border-border/70 bg-background/85 px-6 backdrop-blur-md">
+            <div className="titlebar-drag flex h-12 items-center justify-between border-b border-border/70 bg-background/85 px-3 backdrop-blur-md md:h-14 md:px-6">
+              {isMobile && (
+                <button
+                  type="button"
+                  onClick={() => setSidebarOpen(true)}
+                  className="mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
+                >
+                  <MenuIcon className="h-5 w-5" />
+                </button>
+              )}
               <div className="titlebar-no-drag min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Settings</span>

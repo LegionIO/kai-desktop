@@ -5,6 +5,7 @@ import {
   useExternalStoreRuntime,
 } from '@assistant-ui/react';
 import { app } from '@/lib/ipc-client';
+import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
 import { useConfig } from './ConfigProvider';
 import { createUnifiedSpeechAdapter, createUnifiedDictationAdapter, type AudioProvider } from '@/lib/audio/speech-adapters';
@@ -1145,7 +1146,7 @@ export function RuntimeProvider({
         if (id && await loadConversationState(id)) {
           return;
         }
-        const newId = crypto.randomUUID();
+        const newId = generateId();
         const now = nowIso();
         await app.conversations.put({
           id: newId, title: null, fallbackTitle: null, messages: [], messageTree: [], headId: null,

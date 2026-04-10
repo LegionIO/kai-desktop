@@ -147,6 +147,7 @@ function DevicePicker({
 export const CallOverlay: FC = () => {
   const { callState, endCall, inputLevel, outputLevel } = useRealtime();
   const { config, updateConfig } = useConfig();
+  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
   const [inputDevices, setInputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
   const [outputDevices, setOutputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
@@ -187,11 +188,11 @@ export const CallOverlay: FC = () => {
   const statusPulse = callState.isSpeaking || callState.isResponding;
 
   return (
-    <div className="relative z-20 border-t border-border/70 bg-background/88 px-6 pb-6 pt-4 backdrop-blur-md">
+    <div className="relative z-20 border-t border-border/70 bg-background/88 px-3 pb-3 pt-3 backdrop-blur-md md:px-6 md:pb-6 md:pt-4">
       <div className="mx-auto w-full max-w-5xl">
         <div className="flex flex-col gap-3 rounded-[1.7rem] border border-border/70 bg-card/78 px-4 py-4 app-composer-shadow">
           {/* Row 1: Status, audio levels, timer */}
-          <div className="flex items-center justify-between px-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
             <div className="flex items-center gap-2.5">
               <StatusDot status={callState.status} />
               <span className="text-xs font-medium capitalize text-muted-foreground">
@@ -213,28 +214,30 @@ export const CallOverlay: FC = () => {
             </div>
           </div>
 
-          {/* Row 2: Device selectors */}
-          <div className="flex items-center gap-2 px-1">
-            <DevicePicker
-              label="Input Device"
-              icon={<MicIcon className="h-3 w-3" />}
-              devices={inputDevices}
-              selectedDeviceId={selectedInputDeviceId}
-              levels={inputLevels}
-              onSelect={handleSelectInput}
-            />
-            <DevicePicker
-              label="Output Device"
-              icon={<Volume2Icon className="h-3 w-3" />}
-              devices={outputDevices}
-              selectedDeviceId={selectedOutputDeviceId}
-              levels={outputLevels}
-              onSelect={handleSelectOutput}
-            />
-          </div>
+          {/* Row 2: Device selectors — hidden on web where browser handles device selection */}
+          {!isWebBridge && (
+            <div className="flex items-center gap-2 px-1">
+              <DevicePicker
+                label="Input Device"
+                icon={<MicIcon className="h-3 w-3" />}
+                devices={inputDevices}
+                selectedDeviceId={selectedInputDeviceId}
+                levels={inputLevels}
+                onSelect={handleSelectInput}
+              />
+              <DevicePicker
+                label="Output Device"
+                icon={<Volume2Icon className="h-3 w-3" />}
+                devices={outputDevices}
+                selectedDeviceId={selectedOutputDeviceId}
+                levels={outputLevels}
+                onSelect={handleSelectOutput}
+              />
+            </div>
+          )}
 
           {/* Row 3: Speaking status + End Call */}
-          <div className="flex items-center justify-between px-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
             <div className="flex items-center gap-2">
               <span
                 className={`text-xs font-medium ${statusPulse ? 'animate-pulse' : ''} ${

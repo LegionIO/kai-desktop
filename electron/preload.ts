@@ -182,6 +182,10 @@ const appAPI = {
     homedir: () => ipcRenderer.invoke('platform:homedir'),
   },
 
+  fs: {
+    listDirectory: (dirPath: string) => ipcRenderer.invoke('fs:list-directory', dirPath) as Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }>,
+  },
+
   computerUse: {
     startSession: (goal: string, options: unknown) => ipcRenderer.invoke('computer-use:start-session', goal, options),
     pauseSession: (sessionId: string) => ipcRenderer.invoke('computer-use:pause-session', sessionId),

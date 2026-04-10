@@ -119,6 +119,8 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   const startTimeRef = useRef<number>(0);
   const lastUserSpeechRef = useRef<number>(0);
   const callActiveRef = useRef(false);
+  const browserMicRef = useRef<{ stream: MediaStream; ctx: AudioContext; processor: ScriptProcessorNode } | null>(null);
+  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
   const realtimeConfig = (config as Record<string, unknown> | null)?.realtime as {
     enabled?: boolean;
@@ -169,6 +171,12 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
     }
 
     // Stop mic
+    if (browserMicRef.current) {
+      browserMicRef.current.processor.disconnect();
+      browserMicRef.current.stream.getTracks().forEach((t) => t.stop());
+      void browserMicRef.current.ctx.close();
+      browserMicRef.current = null;
+    }
     void app.mic?.liveMicStop?.();
 
     // Stop player
@@ -229,37 +237,78 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
 
       // Start mic capture
       const inputDeviceId = realtimeConfig?.inputDeviceId;
-      await app.mic.liveMicStart(inputDeviceId);
-
-      // Poll mic for PCM chunks and send to realtime session
-      let totalChunksSent = 0;
-      let lastLogTime = Date.now();
-      micDrainTimerRef.current = setInterval(async () => {
-        if (!callActiveRef.current) return;
-        try {
-          const chunks = await app.mic.liveMicDrain();
-          if (chunks.length > 0) {
-            // Compute input level from the latest chunk's PCM16 data
-            const lastChunk = chunks[chunks.length - 1];
-            setInputLevel(computePcmLevel(lastChunk));
-
-            for (const chunk of chunks) {
-              app.realtime.sendAudio(chunk);
-              totalChunksSent++;
-            }
-            // Log every 2 seconds
-            const now = Date.now();
-            if (now - lastLogTime > 2000) {
-              console.log(`[RealtimeProvider] Audio: ${chunks.length} chunks drained, total sent: ${totalChunksSent}, latest chunk size: ${chunks[0]?.length ?? 0} chars`);
-              lastLogTime = now;
-            }
-          } else {
-            setInputLevel(0);
-          }
-        } catch (err) {
-          console.warn('[RealtimeProvider] Mic drain error:', err);
+      if (isWebBridge) {
+        // Browser audio capture: getUserMedia → ScriptProcessorNode → PCM16 base64
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Microphone access requires HTTPS. Enable TLS in Web UI settings.');
         }
-      }, 50); // ~20fps, low latency
+        const constraints: MediaStreamConstraints = {
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 16000,
+            ...(inputDeviceId ? { deviceId: { exact: inputDeviceId } } : {}),
+          },
+        };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        const ctx = new AudioContext({ sampleRate: 16000 });
+        const source = ctx.createMediaStreamSource(stream);
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+          if (!callActiveRef.current) return;
+          const float32 = e.inputBuffer.getChannelData(0);
+          const pcm = new Int16Array(float32.length);
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          // Compute level
+          let maxA = 0;
+          for (let i = 0; i < float32.length; i++) {
+            const a = Math.abs(float32[i]);
+            if (a > maxA) maxA = a;
+          }
+          setInputLevel(Math.min(1, maxA * 3));
+          // Base64 encode and send
+          const bytes = new Uint8Array(pcm.buffer);
+          let bin = '';
+          for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+          app.realtime.sendAudio(btoa(bin));
+        };
+        source.connect(processor);
+        processor.connect(ctx.destination);
+        browserMicRef.current = { stream, ctx, processor };
+      } else {
+        await app.mic.liveMicStart(inputDeviceId);
+
+        // Poll mic for PCM chunks and send to realtime session
+        let totalChunksSent = 0;
+        let lastLogTime = Date.now();
+        micDrainTimerRef.current = setInterval(async () => {
+          if (!callActiveRef.current) return;
+          try {
+            const chunks = await app.mic.liveMicDrain();
+            if (chunks.length > 0) {
+              const lastChunk = chunks[chunks.length - 1];
+              setInputLevel(computePcmLevel(lastChunk));
+              for (const chunk of chunks) {
+                app.realtime.sendAudio(chunk);
+                totalChunksSent++;
+              }
+              const now = Date.now();
+              if (now - lastLogTime > 2000) {
+                console.log(`[RealtimeProvider] Audio: ${chunks.length} chunks drained, total sent: ${totalChunksSent}, latest chunk size: ${chunks[0]?.length ?? 0} chars`);
+                lastLogTime = now;
+              }
+            } else {
+              setInputLevel(0);
+            }
+          } catch (err) {
+            console.warn('[RealtimeProvider] Mic drain error:', err);
+          }
+        }, 50);
+      }
 
       // Duration timer
       durationTimerRef.current = setInterval(() => {
@@ -355,16 +404,61 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
     if (!callActiveRef.current) return;
     const deviceId = realtimeConfig?.inputDeviceId;
     console.log('[RealtimeProvider] Input device changed mid-call:', deviceId ?? 'default');
-    // Restart mic capture with the new device
-    void (async () => {
-      try {
-        await app.mic.liveMicStop();
-        await app.mic.liveMicStart(deviceId);
-      } catch (err) {
-        console.warn('[RealtimeProvider] Failed to swap input device:', err);
-      }
-    })();
-  }, [realtimeConfig?.inputDeviceId]);
+    if (isWebBridge) {
+      // Restart browser mic capture with the new device
+      void (async () => {
+        try {
+          if (browserMicRef.current) {
+            browserMicRef.current.processor.disconnect();
+            browserMicRef.current.stream.getTracks().forEach((t) => t.stop());
+            void browserMicRef.current.ctx.close();
+            browserMicRef.current = null;
+          }
+          const constraints: MediaStreamConstraints = {
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              sampleRate: 16000,
+              ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+            },
+          };
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          const ctx = new AudioContext({ sampleRate: 16000 });
+          const source = ctx.createMediaStreamSource(stream);
+          const processor = ctx.createScriptProcessor(4096, 1, 1);
+          processor.onaudioprocess = (e) => {
+            if (!callActiveRef.current) return;
+            const float32 = e.inputBuffer.getChannelData(0);
+            const pcm = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+              const s = Math.max(-1, Math.min(1, float32[i]));
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            const bytes = new Uint8Array(pcm.buffer);
+            let bin = '';
+            for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+            app.realtime.sendAudio(btoa(bin));
+          };
+          source.connect(processor);
+          processor.connect(ctx.destination);
+          browserMicRef.current = { stream, ctx, processor };
+        } catch (err) {
+          console.warn('[RealtimeProvider] Failed to swap browser input device:', err);
+        }
+      })();
+    } else {
+      // Restart IPC mic capture with the new device
+      void (async () => {
+        try {
+          await app.mic.liveMicStop();
+          await app.mic.liveMicStart(deviceId);
+        } catch (err) {
+          console.warn('[RealtimeProvider] Failed to swap input device:', err);
+        }
+      })();
+    }
+  }, [realtimeConfig?.inputDeviceId, isWebBridge]);
 
   // Subscribe to realtime events
   useEffect(() => {

@@ -467,7 +467,7 @@ if (gotSingleInstanceLock) {
         const wsConfig = config.webServer;
         if (wsConfig?.enabled) {
           restartWebServer(wsConfig)
-            .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on port ${wsConfig.port}`))
+            .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://localhost:${wsConfig.port}`))
             .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server restart failed:`, err));
         } else {
           stopWebServer()
@@ -620,6 +620,26 @@ if (gotSingleInstanceLock) {
       };
       walk(dirPath);
       return { canceled: false, filePaths: files };
+    });
+
+    // List directory contents on the host (used by web UI directory browser)
+    ipcMain.handle('fs:list-directory', (_event, dirPath: string) => {
+      try {
+        const resolved = dirPath === '~' ? homedir() : dirPath.replace(/^~\//, homedir() + '/');
+        if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+          return { error: 'Not a directory', entries: [] };
+        }
+        const entries = readdirSync(resolved, { withFileTypes: true })
+          .filter((e) => !e.name.startsWith('.'))
+          .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
+          .sort((a, b) => {
+            if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          });
+        return { path: resolved, entries };
+      } catch (err) {
+        return { error: String(err), entries: [] };
+      }
     });
 
     // Fetch image bytes from main process (bypasses CORS)
@@ -791,7 +811,7 @@ if (gotSingleInstanceLock) {
       const webServerConfig = getConfig().webServer;
       if (webServerConfig?.enabled) {
         startWebServer(webServerConfig)
-          .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on port ${webServerConfig.port}`))
+          .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://localhost:${webServerConfig.port}`))
           .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
       }
     }).catch((err) => {

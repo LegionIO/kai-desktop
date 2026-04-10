@@ -1,13 +1,21 @@
 import http from 'http';
+import https from 'https';
 import { join, extname } from 'path';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
 import { invokeHandler } from './ipc-bridge.js';
+import { ensureSelfSignedCert } from './self-signed.js';
 
 interface WebServerConfig {
   enabled: boolean;
   port: number;
+  tls: {
+    enabled: boolean;
+    mode: 'self-signed' | 'custom';
+    certPath: string;
+    keyPath: string;
+  };
   auth: {
     mode: 'anonymous' | 'password';
     username: string;
@@ -15,7 +23,7 @@ interface WebServerConfig {
   };
 }
 
-let httpServer: http.Server | null = null;
+let httpServer: http.Server | https.Server | null = null;
 let wss: WebSocketServer | null = null;
 
 const MIME_TYPES: Record<string, string> = {
@@ -117,6 +125,7 @@ function getBridgeScript(): string {
   function noopObj(v) { return Promise.resolve(v || {}); }
 
   window.app = {
+    __isWebBridge: true,
     config: {
       get: function() { return invoke('config:get'); },
       set: function(path, value) { return invoke('config:set', path, value); },
@@ -194,6 +203,9 @@ function getBridgeScript(): string {
     },
     platform: {
       homedir: function() { return invoke('platform:homedir'); }
+    },
+    fs: {
+      listDirectory: function(dirPath) { return invoke('fs:list-directory', dirPath); }
     },
     computerUse: {
       startSession: function(goal, opts) { return invoke('computer-use:start-session', goal, opts); },
@@ -384,7 +396,20 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
   const rendererDir = getRendererDir();
   const viteDevUrl = process.env.ELECTRON_RENDERER_URL;
 
-  httpServer = http.createServer((req, res) => {
+  // Resolve TLS options
+  let tlsOptions: { cert: string; key: string } | null = null;
+  if (config.tls?.enabled) {
+    if (config.tls.mode === 'custom' && config.tls.certPath && config.tls.keyPath) {
+      tlsOptions = {
+        cert: readFileSync(config.tls.certPath, 'utf-8'),
+        key: readFileSync(config.tls.keyPath, 'utf-8'),
+      };
+    } else {
+      tlsOptions = ensureSelfSignedCert();
+    }
+  }
+
+  const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
     // Auth check
     if (!checkBasicAuth(req, config)) {
       sendUnauthorized(res);
@@ -419,7 +444,12 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       // SPA fallback
       serveStaticFile(join(rendererDir, 'index.html'), res, bridgeScript);
     }
-  });
+  };
+
+  // Create HTTP or HTTPS server
+  httpServer = tlsOptions
+    ? https.createServer({ cert: tlsOptions.cert, key: tlsOptions.key }, requestHandler)
+    : http.createServer(requestHandler);
 
   // WebSocket server
   wss = new WebSocketServer({ noServer: true });

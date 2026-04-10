@@ -119,7 +119,7 @@ const ConversationDeleteButton: FC<{ onDelete: () => Promise<void>; isDeleting: 
         e.stopPropagation();
         void onDelete();
       }}
-      className="shrink-0 rounded p-0.5 opacity-0 transition-all group-hover:opacity-100 hover:bg-destructive/10"
+      className="shrink-0 rounded p-0.5 opacity-100 transition-all md:opacity-0 md:group-hover:opacity-100 hover:bg-destructive/10"
       title="Delete conversation"
       aria-label="Delete conversation"
     >
@@ -483,7 +483,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); togglePin(conv.id); }}
-                        className={`shrink-0 rounded p-0.5 transition-all ${isPinned ? 'opacity-100 text-primary' : 'opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary'}`}
+                        className={`shrink-0 rounded p-0.5 transition-all ${isPinned ? 'opacity-100 text-primary' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100 text-muted-foreground hover:text-primary'}`}
                         title={isPinned ? 'Unpin' : 'Pin to top'}
                       >
                         <PinIcon className="h-3 w-3" />

@@ -12,6 +12,8 @@ import type {
   ComputerUsePermissionSection,
 } from '../../../shared/computer-use';
 
+const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+
 type PermissionRowStatus = 'granted' | 'missing' | 'requesting';
 
 type PermissionRowDef = {
@@ -40,12 +42,15 @@ const PERMISSION_ROWS: PermissionRowDef[] = [
     description: 'Launch and control applications',
     getStatus: (p) => p.automationGranted,
   },
-  {
-    section: 'input-monitoring',
+  // Input Monitoring is only relevant when running locally in Electron.
+  // When accessed via the web UI the user is remote and cannot provide
+  // local input events for the probe, so we skip this row entirely.
+  ...(!isWebBridge ? [{
+    section: 'input-monitoring' as ComputerUsePermissionSection,
     label: 'Input Monitoring',
     description: 'Detect takeover to pause sessions',
-    getStatus: (p) => p.inputMonitoringGranted,
-  },
+    getStatus: (p: ComputerUsePermissions) => p.inputMonitoringGranted,
+  }] : []),
 ];
 
 type PermissionChecklistProps = {

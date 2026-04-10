@@ -95,60 +95,62 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   }
 
   return (
-    <div className="flex h-full bg-background">
-      <div className="app-shell-panel w-[220px] space-y-1 overflow-y-auto border-r border-border/70 bg-sidebar/55 p-3">
-        <div className="mb-3 flex items-center justify-between px-2 py-1.5">
+    <div className="flex h-full flex-col bg-background md:flex-row">
+      <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
+        <div className="flex items-center justify-between px-4 py-2 md:mb-3 md:px-2 md:py-1.5">
           <span className="text-xs font-semibold uppercase tracking-[0.16em]">Settings</span>
           <button type="button" onClick={onClose} className="rounded-xl p-1.5 transition-colors hover:bg-muted">
             <XIcon className="h-4 w-4" />
           </button>
         </div>
 
-        {sections.map((section) => (
-          <button
-            key={section.key}
-            type="button"
-            onClick={() => setActiveSection(section.key)}
-            className={`flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-xs font-medium transition-all ${
-              activeSection === section.key
-                ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
-                : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-            }`}
-          >
-            {section.label}
-            <ChevronRightIcon className="ml-auto h-3 w-3 opacity-50" />
-          </button>
-        ))}
+        <div className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
+          {sections.map((section) => (
+            <button
+              key={section.key}
+              type="button"
+              onClick={() => setActiveSection(section.key)}
+              className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
+                activeSection === section.key
+                  ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
+                  : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+              }`}
+            >
+              {section.label}
+              <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
+            </button>
+          ))}
 
-        {hasPluginSections && (
-          <>
-            <div className="flex items-center gap-2 px-1 pb-1 pt-3">
-              <div className="h-px flex-1 bg-border" />
-              <span className="whitespace-nowrap text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                Plugin Settings
-              </span>
-              <div className="h-px flex-1 bg-border" />
-            </div>
-            {sortedPluginSections.map((section) => (
-              <button
-                key={section.key}
-                type="button"
-                onClick={() => setActiveSection(section.key)}
-                className={`flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-xs font-medium transition-all ${
-                  activeSection === section.key
-                    ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
-                    : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-                }`}
-              >
-                {section.label}
-                <ChevronRightIcon className="ml-auto h-3 w-3 opacity-50" />
-              </button>
-            ))}
-          </>
-        )}
+          {hasPluginSections && (
+            <>
+              <div className="hidden items-center gap-2 px-1 pb-1 pt-3 md:flex">
+                <div className="h-px flex-1 bg-border" />
+                <span className="whitespace-nowrap text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                  Plugin Settings
+                </span>
+                <div className="h-px flex-1 bg-border" />
+              </div>
+              {sortedPluginSections.map((section) => (
+                <button
+                  key={section.key}
+                  type="button"
+                  onClick={() => setActiveSection(section.key)}
+                  className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
+                    activeSection === section.key
+                      ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
+                      : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+                  }`}
+                >
+                  {section.label}
+                  <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
+                </button>
+              ))}
+            </>
+          )}
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-5">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'profiles' && <ProfileSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'memory' && <MemorySettings config={config} updateConfig={updateConfig} />}

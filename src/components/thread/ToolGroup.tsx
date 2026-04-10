@@ -215,7 +215,7 @@ const MediaPreview: FC<{ media: MediaResult }> = ({ media }) => {
               <button
                 type="button"
                 onClick={() => handleSave(url)}
-                className="absolute top-2 right-2 opacity-0 group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1.5"
+                className="absolute top-2 right-2 opacity-100 md:opacity-0 md:group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1.5"
                 title="Save image"
               >
                 <DownloadIcon className="h-3.5 w-3.5" />
@@ -240,7 +240,7 @@ const MediaPreview: FC<{ media: MediaResult }> = ({ media }) => {
           <button
             type="button"
             onClick={() => handleSave(media.urls[0])}
-            className="absolute top-2 right-2 opacity-0 group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1.5"
+            className="absolute top-2 right-2 opacity-100 md:opacity-0 md:group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1.5"
             title="Save video"
           >
             <DownloadIcon className="h-3.5 w-3.5" />

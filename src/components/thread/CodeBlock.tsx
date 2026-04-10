@@ -332,7 +332,7 @@ export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, is
             type="button"
             onClick={() => setViewMode(next)}
             title={modeTooltips[next]}
-            className={`h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-0 group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm ${
+            className={`h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm ${
               isActive ? 'text-blue-500 hover:text-blue-600 hover:bg-blue-500/10' : 'text-muted-foreground hover:text-foreground hover:bg-accent'
             }`}
           >
@@ -343,7 +343,7 @@ export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, is
           type="button"
           onClick={handleCopy}
           title="Copy code"
-          className="h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-0 group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm text-muted-foreground hover:text-foreground hover:bg-accent"
+          className="h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm text-muted-foreground hover:text-foreground hover:bg-accent"
         >
           {copied ? <CheckIcon className="h-3 w-3 text-green-500" /> : <CopyIcon className="h-3 w-3" />}
         </button>

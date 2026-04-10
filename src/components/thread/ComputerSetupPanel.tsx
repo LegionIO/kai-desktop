@@ -91,15 +91,19 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'step');
   }, [computerConfig?.approvalModeDefault, computerConfig?.defaultTarget]);
 
+  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const localPermissionState = activeComputerSession?.permissionState?.target === 'local-macos'
     ? activeComputerSession.permissionState
     : probedLocalPermissionState;
+  // When accessed via web UI, skip the input monitoring requirement since the
+  // user is remote and cannot provide local input events for the probe.
+  const inputMonitoringOk = isWebBridge || Boolean(localPermissionState?.inputMonitoringGranted);
   const localPermissionAuthorized = localPermissionState?.target === 'local-macos'
     && localPermissionState.helperReady
     && localPermissionState.accessibilityTrusted
     && localPermissionState.screenRecordingGranted
     && localPermissionState.automationGranted
-    && localPermissionState.inputMonitoringGranted;
+    && inputMonitoringOk;
   const showLocalMacPreflight = computerTarget === 'local-macos' && (showLocalPermissionSpinner || !localPermissionAuthorized);
   const canStart = Boolean(conversationId) && Boolean(computerGoal.trim()) && !isStartingComputerSession;
 

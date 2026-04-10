@@ -51,7 +51,7 @@ const ChatImage: FC<React.ImgHTMLAttributes<HTMLImageElement>> = ({ alt, src, ..
       <button
         type="button"
         onClick={handleReload}
-        className="absolute top-3 right-1 opacity-0 group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1"
+        className="absolute top-3 right-1 opacity-100 md:opacity-0 md:group-hover:opacity-80 transition-opacity bg-black/60 hover:bg-black/80 text-white rounded-md p-1"
         title="Reload image"
       >
         <RefreshCwIcon className="h-3.5 w-3.5" />
