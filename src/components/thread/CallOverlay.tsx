@@ -4,7 +4,7 @@ import { useConfig } from '@/providers/ConfigProvider';
 import { DeviceRow } from './DeviceRow';
 import { app } from '@/lib/ipc-client';
 import { listOutputDevices } from '@/lib/audio/realtime-playback';
-import { PhoneOffIcon, MicIcon, Volume2Icon, ChevronUpIcon } from 'lucide-react';
+import { PhoneOffIcon, MicIcon, MicOffIcon, Volume2Icon, ChevronUpIcon } from 'lucide-react';
 
 /* ── Helpers ── */
 
@@ -145,7 +145,7 @@ function DevicePicker({
 /* ── CallOverlay ── */
 
 export const CallOverlay: FC = () => {
-  const { callState, endCall, inputLevel, outputLevel } = useRealtime();
+  const { callState, endCall, toggleMute, isMuted, inputLevel, outputLevel } = useRealtime();
   const { config, updateConfig } = useConfig();
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
@@ -257,14 +257,29 @@ export const CallOverlay: FC = () => {
               )}
             </div>
 
-            <button
-              type="button"
-              onClick={() => void endCall()}
-              className="flex h-9 w-9 items-center justify-center rounded-full bg-red-600 text-white transition-colors hover:bg-red-700"
-              title="End call"
-            >
-              <PhoneOffIcon className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleMute}
+                className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
+                  isMuted
+                    ? 'bg-amber-600 text-white hover:bg-amber-700'
+                    : 'bg-muted/60 text-muted-foreground hover:bg-muted'
+                }`}
+                title={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+              >
+                {isMuted ? <MicOffIcon className="h-4 w-4" /> : <MicIcon className="h-4 w-4" />}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void endCall()}
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-red-600 text-white transition-colors hover:bg-red-700"
+                title="End call"
+              >
+                <PhoneOffIcon className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
           {/* Error display */}

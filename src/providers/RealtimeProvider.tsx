@@ -79,6 +79,8 @@ type RealtimeContextValue = {
   callState: RealtimeCallState;
   startCall: (conversationId: string) => Promise<void>;
   endCall: () => Promise<void>;
+  toggleMute: () => void;
+  isMuted: boolean;
   inputLevel: number;        // 0-1, current mic input level
   outputLevel: number;       // 0-1, current playback audio level
 };
@@ -95,6 +97,8 @@ const RealtimeContext = createContext<RealtimeContextValue>({
   callState: defaultState,
   startCall: async () => {},
   endCall: async () => {},
+  toggleMute: () => {},
+  isMuted: false,
   inputLevel: 0,
   outputLevel: 0,
 });
@@ -108,6 +112,8 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   const [callState, setCallState] = useState<RealtimeCallState>(defaultState);
   const [inputLevel, setInputLevel] = useState(0);
   const [outputLevel, setOutputLevel] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const mutedRef = useRef(false);
 
   const playerRef = useRef<RealtimeAudioPlayer | null>(null);
   const ringtoneRef = useRef<Ringtone | null>(null);
@@ -187,6 +193,20 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
 
     setInputLevel(0);
     setOutputLevel(0);
+    setIsMuted(false);
+    mutedRef.current = false;
+  }, []);
+
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      mutedRef.current = next;
+      // Mute/unmute browser mic tracks directly for immediate effect
+      if (browserMicRef.current) {
+        browserMicRef.current.stream.getAudioTracks().forEach((t) => { t.enabled = !next; });
+      }
+      return next;
+    });
   }, []);
 
   const startCall = useCallback(async (conversationId: string) => {
@@ -284,6 +304,10 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
         const processor = ctx.createScriptProcessor(4096, 1, 1);
         processor.onaudioprocess = (e) => {
           if (!callActiveRef.current) return;
+          if (mutedRef.current) {
+            setInputLevel(0);
+            return;
+          }
           const float32 = e.inputBuffer.getChannelData(0);
           const pcm = new Int16Array(float32.length);
           for (let i = 0; i < float32.length; i++) {
@@ -316,6 +340,11 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
           if (!callActiveRef.current) return;
           try {
             const chunks = await app.mic.liveMicDrain();
+            if (mutedRef.current) {
+              // Drain chunks but don't send them — keeps the mic buffer from growing
+              setInputLevel(0);
+              return;
+            }
             if (chunks.length > 0) {
               const lastChunk = chunks[chunks.length - 1];
               setInputLevel(computePcmLevel(lastChunk));
@@ -612,6 +641,8 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
     callState,
     startCall,
     endCall,
+    toggleMute,
+    isMuted,
     inputLevel,
     outputLevel,
   };
