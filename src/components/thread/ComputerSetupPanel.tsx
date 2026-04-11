@@ -91,7 +91,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'step');
   }, [computerConfig?.approvalModeDefault, computerConfig?.defaultTarget]);
 
-  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const localPermissionState = activeComputerSession?.permissionState?.target === 'local-macos'
     ? activeComputerSession.permissionState
     : probedLocalPermissionState;

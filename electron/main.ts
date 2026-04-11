@@ -386,6 +386,7 @@ if (gotSingleInstanceLock) {
     let lastCliToolsFingerprint = JSON.stringify(getConfig().cliTools ?? []);
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
+    let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
     };
@@ -460,20 +461,24 @@ if (gotSingleInstanceLock) {
         }
       }
 
-      // Web server hot-reload
+      // Web server hot-reload (debounced to coalesce rapid config changes)
       const newWebServerFp = JSON.stringify(config.webServer ?? {});
       if (newWebServerFp !== lastWebServerFingerprint) {
         lastWebServerFingerprint = newWebServerFp;
-        const wsConfig = config.webServer;
-        if (wsConfig?.enabled) {
-          restartWebServer(wsConfig)
-            .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://localhost:${wsConfig.port}`))
-            .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server restart failed:`, err));
-        } else {
-          stopWebServer()
-            .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server stopped`))
-            .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server stop failed:`, err));
-        }
+        if (webServerDebounce) clearTimeout(webServerDebounce);
+        webServerDebounce = setTimeout(() => {
+          webServerDebounce = null;
+          const wsConfig = config.webServer;
+          if (wsConfig?.enabled) {
+            restartWebServer(wsConfig)
+              .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://localhost:${wsConfig.port}`))
+              .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server restart failed:`, err));
+          } else {
+            stopWebServer()
+              .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server stopped`))
+              .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server stop failed:`, err));
+          }
+        }, 500);
       }
 
       // Plugin config change forwarding

@@ -12,7 +12,7 @@ import type {
   ComputerUsePermissionSection,
 } from '../../../shared/computer-use';
 
-const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
 type PermissionRowStatus = 'granted' | 'missing' | 'requesting';
 

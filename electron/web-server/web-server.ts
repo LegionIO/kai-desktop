@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
 import { join, extname } from 'path';
@@ -6,6 +7,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
 import { invokeHandler } from './ipc-bridge.js';
 import { ensureSelfSignedCert } from './self-signed.js';
+import { getLoginPageHtml } from './login-page.js';
 
 interface WebServerConfig {
   enabled: boolean;
@@ -25,6 +27,12 @@ interface WebServerConfig {
 
 let httpServer: http.Server | https.Server | null = null;
 let wss: WebSocketServer | null = null;
+
+/** Active session tokens for cookie-based auth. Cleared on server restart. */
+const sessionTokens = new Set<string>();
+
+/** Serialization guard — only one restart runs at a time; late callers get the latest config. */
+let pendingRestart: { promise: Promise<void>; config: WebServerConfig } | null = null;
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -275,28 +283,32 @@ function getBridgeScript(): string {
 </script>`;
 }
 
-function checkBasicAuth(
+function parseCookies(req: http.IncomingMessage): Record<string, string> {
+  const header = req.headers.cookie ?? '';
+  const cookies: Record<string, string> = {};
+  for (const pair of header.split(';')) {
+    const [name, ...rest] = pair.trim().split('=');
+    if (name) cookies[name] = rest.join('=');
+  }
+  return cookies;
+}
+
+function hasValidSession(req: http.IncomingMessage): boolean {
+  const cookies = parseCookies(req);
+  const token = cookies['kai_session'];
+  return Boolean(token && sessionTokens.has(token));
+}
+
+function isAuthenticated(
   req: http.IncomingMessage,
   config: WebServerConfig,
 ): boolean {
   if (config.auth.mode === 'anonymous') return true;
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Basic ')) return false;
-
-  const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
-  const [user, ...passParts] = decoded.split(':');
-  const pass = passParts.join(':');
-  return user === config.auth.username && pass === config.auth.password;
+  return hasValidSession(req);
 }
 
-function sendUnauthorized(res: http.ServerResponse): void {
-  res.writeHead(401, {
-    'WWW-Authenticate': 'Basic realm="Kai Web UI"',
-    'Content-Type': 'text/plain',
-  });
-  res.end('Unauthorized');
-}
+/** Routes that bypass auth so the login page and its API work. */
+const AUTH_EXEMPT_PATHS = new Set(['/login', '/api/login', '/api/auth-status']);
 
 function getRendererDir(): string {
   return join(__dirname, '../renderer');
@@ -410,13 +422,70 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
   }
 
   const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
-    // Auth check
-    if (!checkBasicAuth(req, config)) {
-      sendUnauthorized(res);
+    const urlPath = (req.url ?? '/').split('?')[0];
+
+    // --- Auth-exempt API endpoints ---
+
+    if (urlPath === '/api/login' && req.method === 'POST') {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+          if (body.username === config.auth.username && body.password === config.auth.password) {
+            const token = crypto.randomUUID();
+            sessionTokens.add(token);
+            const secure = config.tls?.enabled ? '; Secure' : '';
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Set-Cookie': `kai_session=${token}; HttpOnly; Path=/; SameSite=Strict${secure}`,
+            });
+            res.end(JSON.stringify({ ok: true }));
+          } else {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Invalid credentials' }));
+          }
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Bad request' }));
+        }
+      });
       return;
     }
 
-    const urlPath = (req.url ?? '/').split('?')[0];
+    if (urlPath === '/api/auth-status') {
+      const authed = isAuthenticated(req, config);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ authenticated: authed, mode: config.auth.mode }));
+      return;
+    }
+
+    // --- Auth check (skip for login page) ---
+
+    if (!AUTH_EXEMPT_PATHS.has(urlPath) && !isAuthenticated(req, config)) {
+      res.writeHead(302, { Location: '/login' });
+      res.end();
+      return;
+    }
+
+    // --- Login page ---
+
+    if (urlPath === '/login') {
+      if (config.auth.mode === 'anonymous' || isAuthenticated(req, config)) {
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        return;
+      }
+      const html = getLoginPageHtml();
+      const buf = Buffer.from(html, 'utf-8');
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': buf.byteLength,
+        'Cache-Control': 'no-cache',
+      });
+      res.end(buf);
+      return;
+    }
 
     // Dev mode: proxy to Vite
     if (viteDevUrl) {
@@ -460,9 +529,9 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       return;
     }
 
-    // Auth check for WebSocket
+    // Auth check for WebSocket (cookies are sent automatically, unlike Basic Auth)
     if (config.auth.mode === 'password') {
-      if (!checkBasicAuth(req, config)) {
+      if (!hasValidSession(req)) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
@@ -528,6 +597,9 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 }
 
 export async function stopWebServer(): Promise<void> {
+  // Clear all sessions
+  sessionTokens.clear();
+
   // Close all web client connections
   for (const ws of webClients) {
     try { ws.close(); } catch { /* ignore */ }
@@ -540,21 +612,40 @@ export async function stopWebServer(): Promise<void> {
   }
 
   if (httpServer) {
+    const server = httpServer;
+    httpServer = null;
     return new Promise<void>((resolve) => {
-      httpServer!.close(() => {
-        httpServer = null;
-        resolve();
-      });
-      // Force close after 2 seconds
-      setTimeout(() => {
-        httpServer = null;
-        resolve();
-      }, 2000);
+      server.close(() => resolve());
+      // Force-close all keep-alive connections so .close() fires promptly
+      server.closeAllConnections();
     });
   }
 }
 
 export async function restartWebServer(config: WebServerConfig): Promise<void> {
-  await stopWebServer();
-  await startWebServer(config);
+  // If a restart is already in-flight, update its target config and return
+  // the same promise — this coalesces rapid successive restarts.
+  if (pendingRestart) {
+    pendingRestart.config = config;
+    return pendingRestart.promise;
+  }
+
+  const doRestart = async (): Promise<void> => {
+    try {
+      // Loop until the queued config is stable (no new config arrived during restart)
+      while (true) {
+        const target = pendingRestart!.config;
+        await stopWebServer();
+        await startWebServer(target);
+        // If config hasn't changed while we were restarting, we're done
+        if (pendingRestart!.config === target) break;
+      }
+    } finally {
+      pendingRestart = null;
+    }
+  };
+
+  const promise = doRestart();
+  pendingRestart = { promise, config };
+  return promise;
 }

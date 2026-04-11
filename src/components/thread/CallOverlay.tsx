@@ -147,7 +147,7 @@ function DevicePicker({
 export const CallOverlay: FC = () => {
   const { callState, endCall, inputLevel, outputLevel } = useRealtime();
   const { config, updateConfig } = useConfig();
-  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
   const [inputDevices, setInputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
   const [outputDevices, setOutputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);

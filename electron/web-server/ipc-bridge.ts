@@ -31,7 +31,7 @@ export function installIpcCapture(ipcMain: IpcMain): void {
   };
 
   const originalOn = ipcMain.on.bind(ipcMain);
-  (ipcMain as { on: typeof ipcMain.on }).on = (channel: string, listener: (...args: unknown[]) => void) => {
+  (ipcMain as unknown as { on: (channel: string, listener: (...args: unknown[]) => void) => Electron.IpcMain }).on = (channel: string, listener: (...args: unknown[]) => void) => {
     listeners.set(channel, listener as ListenerFn);
     return originalOn(channel, listener as Parameters<typeof originalOn>[1]);
   };

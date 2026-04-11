@@ -281,7 +281,7 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
     setLoading(true);
     setError(null);
     try {
-      const result = await (window.app as Record<string, unknown> & { fs: { listDirectory: (p: string) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }> } }).fs.listDirectory(dirPath);
+      const result = await (window.app as unknown as Record<string, unknown> & { fs: { listDirectory: (p: string) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }> } }).fs.listDirectory(dirPath);
       if (result.error) {
         setError(result.error);
         setEntries([]);
@@ -1534,7 +1534,7 @@ const DictationButton: FC = () => {
     azure?: { endpoint?: string; region?: string; subscriptionKey?: string; sttLanguage?: string };
     dictation?: { enabled?: boolean; language?: string; continuous?: boolean; inputDeviceId?: string };
   } | undefined;
-  const isWebBridgeDictation = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridgeDictation = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   // Azure STT relies on main-process mic capture which isn't available over
   // the web bridge — fall back to native Web Speech API for browser users.
   const audioProvider: AudioProvider = isWebBridgeDictation ? 'native' : (audioConfig?.provider ?? 'native');
@@ -1837,7 +1837,7 @@ const Composer: FC<{
     ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
     : true;
 
-  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
   const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);

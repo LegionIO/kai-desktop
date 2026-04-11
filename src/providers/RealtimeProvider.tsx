@@ -120,7 +120,7 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   const lastUserSpeechRef = useRef<number>(0);
   const callActiveRef = useRef(false);
   const browserMicRef = useRef<{ stream: MediaStream; ctx: AudioContext; processor: ScriptProcessorNode } | null>(null);
-  const isWebBridge = Boolean((window as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
   const realtimeConfig = (config as Record<string, unknown> | null)?.realtime as {
     enabled?: boolean;
