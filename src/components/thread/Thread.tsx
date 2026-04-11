@@ -697,6 +697,9 @@ function useConstellationCanvas() {
       nudgeCountdown: 60 + Math.floor(Math.random() * 200),
     });
 
+    let prevWidth = 0;
+    let prevHeight = 0;
+
     const setup = () => {
       const container = canvas.parentElement;
       const width = container?.offsetWidth ?? window.innerWidth;
@@ -710,6 +713,20 @@ function useConstellationCanvas() {
 
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.scale(dpr, dpr);
+
+      // When the canvas grows, rescale existing particle positions so they
+      // spread across the full area instead of staying clumped in the old region.
+      if (prevWidth > 0 && prevHeight > 0 && (width > prevWidth || height > prevHeight)) {
+        const sx = width / prevWidth;
+        const sy = height / prevHeight;
+        for (const p of particles) {
+          p.x *= sx;
+          p.y *= sy;
+        }
+      }
+
+      prevWidth = width;
+      prevHeight = height;
 
       const kept = particles.filter(
         (p) => p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height,
@@ -1025,11 +1042,21 @@ function useConstellationCanvas() {
       draw();
     };
 
+    // Use ResizeObserver on the container so the canvas is correctly sized
+    // on first layout (Electron may render before the window is fully sized).
+    const container = canvas.parentElement;
+    let ro: ResizeObserver | undefined;
+    if (container) {
+      ro = new ResizeObserver(handleResize);
+      ro.observe(container);
+    }
+
     window.addEventListener('resize', handleResize);
     return () => {
       window.clearTimeout(frameId);
       window.cancelAnimationFrame(animationFrame);
       window.removeEventListener('resize', handleResize);
+      ro?.disconnect();
     };
   }, []);
 
