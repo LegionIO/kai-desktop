@@ -8,7 +8,7 @@ export function getLoginPageHtml(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kai — Login</title>
+<title>${__BRAND_PRODUCT_NAME} — Login</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -88,7 +88,7 @@ export function getLoginPageHtml(): string {
 </head>
 <body>
 <div class="card">
-  <h1>Kai Web UI</h1>
+  <h1>${__BRAND_PRODUCT_NAME} Web UI</h1>
   <p class="subtitle">Sign in to continue</p>
   <form id="loginForm" autocomplete="on">
     <div class="field">

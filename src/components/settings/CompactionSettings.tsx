@@ -33,7 +33,7 @@ export const CompactionSettings: FC<SettingsProps> = ({ config, updateConfig }) 
             Observational Memory
           </div>
           <p className="text-[10px] text-muted-foreground">
-            Kai compacts older conversation context into observational memory so durable context stays available without bloating the active thread.
+            {__BRAND_PRODUCT_NAME} compacts older conversation context into observational memory so durable context stays available without bloating the active thread.
           </p>
         </div>
         <SliderField label={`Trigger at ${Math.round(compaction.conversation.triggerPercent * 100)}% context`} value={compaction.conversation.triggerPercent} min={0.5} max={0.95} step={0.05} onChange={(v) => updateConfig('compaction.conversation.triggerPercent', v)} />

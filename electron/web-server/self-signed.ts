@@ -67,8 +67,8 @@ function generateSelfSignedCert(addresses: string[]): { cert: string; key: strin
   cert.validity.notAfter.setFullYear(cert.validity.notAfter.getFullYear() + 1);
 
   const attrs = [
-    { name: 'commonName', value: 'Kai Web UI' },
-    { name: 'organizationName', value: 'Kai Desktop' },
+    { name: 'commonName', value: __BRAND_PRODUCT_NAME + ' Web UI' },
+    { name: 'organizationName', value: __BRAND_PRODUCT_NAME },
   ];
   cert.setSubject(attrs);
   cert.setIssuer(attrs);

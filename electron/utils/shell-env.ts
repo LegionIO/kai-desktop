@@ -6,8 +6,8 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const PATH_RESOLVE_TIMEOUT_MS = 4000;
 const PATH_RESOLVE_CACHE_MS = 5 * 60 * 1000;
-const PATH_MARKER_START = '__KAI_PATH_START__';
-const PATH_MARKER_END = '__KAI_PATH_END__';
+const PATH_MARKER_START = `__${__BRAND_APP_SLUG.toUpperCase()}_PATH_START__`;
+const PATH_MARKER_END = `__${__BRAND_APP_SLUG.toUpperCase()}_PATH_END__`;
 
 let cachedResolvedPath: string | null = null;
 let cachedResolvedAt = 0;

@@ -318,7 +318,7 @@ function parseCookies(req: http.IncomingMessage): Record<string, string> {
 
 function hasValidSession(req: http.IncomingMessage): boolean {
   const cookies = parseCookies(req);
-  const token = cookies['kai_session'];
+  const token = cookies[__BRAND_APP_SLUG + '_session'];
   return Boolean(token && sessionTokens.has(token));
 }
 
@@ -455,13 +455,13 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       req.on('end', () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-          if (body.username === config.auth.username && body.password === config.auth.password) {
+          if (body.username?.toLowerCase() === config.auth.username.toLowerCase() && body.password === config.auth.password) {
             const token = crypto.randomUUID();
             sessionTokens.add(token);
             const secure = config.tls?.enabled ? '; Secure' : '';
             res.writeHead(200, {
               'Content-Type': 'application/json',
-              'Set-Cookie': `kai_session=${token}; HttpOnly; Path=/; SameSite=Strict${secure}`,
+              'Set-Cookie': `${__BRAND_APP_SLUG}_session=${token}; HttpOnly; Path=/; SameSite=Strict${secure}`,
             });
             res.end(JSON.stringify({ ok: true }));
           } else {
@@ -507,7 +507,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         const secure = config.tls?.enabled ? '; Secure' : '';
         res.writeHead(302, {
           Location: '/',
-          'Set-Cookie': `kai_session=${sessionToken}; HttpOnly; Path=/; SameSite=Lax${secure}`,
+          'Set-Cookie': `${__BRAND_APP_SLUG}_session=${sessionToken}; HttpOnly; Path=/; SameSite=Lax${secure}`,
         });
         res.end();
       } else {
