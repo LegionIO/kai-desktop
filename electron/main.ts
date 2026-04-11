@@ -380,12 +380,21 @@ if (gotSingleInstanceLock) {
     // Config reader (used by tools and OAuth)
     const getConfig = () => readEffectiveConfig(APP_HOME);
 
+    // Apply launch-at-login setting from config at startup
+    try {
+      const initialConfig = getConfig();
+      app.setLoginItemSettings({ openAtLogin: initialConfig.launchAtLogin ?? false });
+    } catch {
+      // Non-fatal — login item registration can fail in dev mode
+    }
+
     // Track last mcpServers fingerprint to detect changes
     let lastMcpFingerprint = JSON.stringify(getConfig().mcpServers ?? []);
     let lastSkillsFingerprint = JSON.stringify(getConfig().skills?.enabled ?? []);
     let lastCliToolsFingerprint = JSON.stringify(getConfig().cliTools ?? []);
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
+    let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
@@ -483,6 +492,13 @@ if (gotSingleInstanceLock) {
 
       // Plugin config change forwarding
       pluginManager.onConfigChanged(config);
+
+      // Launch at login
+      const newLaunchAtLoginFp = JSON.stringify(config.launchAtLogin ?? false);
+      if (newLaunchAtLoginFp !== lastLaunchAtLoginFp) {
+        lastLaunchAtLoginFp = newLaunchAtLoginFp;
+        app.setLoginItemSettings({ openAtLogin: config.launchAtLogin ?? false });
+      }
     };
 
     // Register IPC handlers (capture must be installed first for web UI bridge)

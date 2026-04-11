@@ -395,6 +395,7 @@ export const appConfigSchema = z.object({
   systemPrompt: z.string(),
   plugins: z.record(z.record(z.unknown())).optional(),
   pluginApprovals: z.record(pluginApprovalSchema),
+  launchAtLogin: z.boolean(),
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),

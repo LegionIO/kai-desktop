@@ -104,6 +104,7 @@ function getDefaultConfig() {
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; approvedAt: string }>,
+    launchAtLogin: false,
     ui: {
       theme: 'system' as const,
       sidebarWidth: 280,
@@ -631,6 +632,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     systemPrompt: config.systemPrompt,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
+    launchAtLogin: config.launchAtLogin,
     ui: config.ui,
     webServer: config.webServer,
     audio: config.audio,
