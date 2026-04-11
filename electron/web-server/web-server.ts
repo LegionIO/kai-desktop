@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
 import { join, extname } from 'path';
+import { homedir } from 'os';
 import { readFileSync, existsSync, statSync } from 'fs';
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -72,7 +73,14 @@ const MIME_TYPES: Record<string, string> = {
   '.wav': 'audio/wav',
   '.mp4': 'video/mp4',
   '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.flac': 'audio/flac',
+  '.opus': 'audio/opus',
+  '.ogg': 'audio/ogg',
 };
+
+/** Base directory where generated media files are stored. */
+const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
 
 /**
  * Client-side bridge script injected into the HTML served to web clients.
@@ -553,6 +561,36 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         'Cache-Control': 'no-cache',
       });
       res.end(buf);
+      return;
+    }
+
+    // --- Serve generated media files (images, videos, audio) ---
+    if (urlPath.startsWith('/media/')) {
+      const relativePath = decodeURIComponent(urlPath.slice('/media/'.length));
+      const filePath = join(MEDIA_DIR, relativePath);
+
+      // Security: ensure the resolved path is under the media directory
+      if (!filePath.startsWith(MEDIA_DIR)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return;
+      }
+
+      if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+
+      const ext = extname(filePath).toLowerCase();
+      const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+      const data = readFileSync(filePath);
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': data.byteLength,
+        'Cache-Control': 'no-cache',
+      });
+      res.end(data);
       return;
     }
 
