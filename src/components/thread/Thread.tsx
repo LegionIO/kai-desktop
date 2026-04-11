@@ -129,8 +129,8 @@ export const Thread: FC<{
           <ThreadPrimitive.Empty>
             <EmptyThreadBackground />
           </ThreadPrimitive.Empty>
+          <ThreadWelcome />
           <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pt-4 md:px-6 md:pt-8">
-            <ThreadWelcome />
             <ThreadPrimitive.Messages
               components={{
                 UserMessage,
@@ -428,8 +428,8 @@ const ThreadWelcome: FC = () => {
 
   return (
     <ThreadPrimitive.Empty>
-      <div className="absolute inset-0 z-20 flex items-center justify-center px-3 md:px-6">
-        <div className="flex select-none flex-col items-center justify-center">
+      <div className="absolute inset-0 z-20 flex flex-col overflow-y-auto px-3 py-4 md:px-6 md:py-8">
+        <div className="m-auto flex w-full max-w-2xl select-none flex-col items-center">
           <div className="mb-3 inline-flex items-center gap-0.5 text-2xl font-semibold md:text-4xl">
             <span className={`app-wordmark ${gradientText ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
             <CpuIcon className="h-6 w-6 text-primary/80 md:h-9 md:w-9" />
