@@ -2061,11 +2061,11 @@ const Composer: FC<{
                 )}
                 <ComposerInput
                   placeholder={__BRAND_COMPOSER_PLACEHOLDER}
-                  className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-[15px]"
+                  className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
                 <div className="flex items-center justify-between gap-2 md:gap-3">
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 md:gap-2">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 md:gap-2">
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
                         <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">
@@ -2108,19 +2108,21 @@ const Composer: FC<{
                       selectedProfileKey={selectedProfileKey}
                       onSelectProfile={onSelectProfile}
                     />
-                    <FallbackToggle
-                      enabled={fallbackEnabled}
-                      onToggle={onToggleFallback}
-                    />
-                    <ModelSelector
-                      selectedModelKey={selectedModelKey}
-                      onSelectModel={onSelectModel}
-                      disabled={fallbackEnabled}
-                    />
-                    <ReasoningEffortSelector
-                      value={reasoningEffort}
-                      onChange={onChangeReasoningEffort}
-                    />
+                    <div className="flex min-w-0 basis-full items-center gap-1.5 md:basis-auto md:gap-2">
+                      <FallbackToggle
+                        enabled={fallbackEnabled}
+                        onToggle={onToggleFallback}
+                      />
+                      <ModelSelector
+                        selectedModelKey={selectedModelKey}
+                        onSelectModel={onSelectModel}
+                        disabled={fallbackEnabled}
+                      />
+                      <ReasoningEffortSelector
+                        value={reasoningEffort}
+                        onChange={onChangeReasoningEffort}
+                      />
+                    </div>
                   </div>
                   <ThreadPrimitive.If running={false}>
                     <button

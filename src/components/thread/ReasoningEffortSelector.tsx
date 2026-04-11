@@ -37,10 +37,10 @@ export const ReasoningEffortSelector: FC<{
       <button
         type="button"
         onClick={() => setIsOpen((open) => !open)}
-        className="flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-3 py-1.5 text-xs transition-colors hover:bg-muted/50"
+        className="flex min-w-0 items-center gap-1 rounded-xl border border-border/70 bg-card/70 px-2 py-1.5 text-[11px] transition-colors hover:bg-muted/50 md:gap-1.5 md:px-3 md:text-xs"
       >
         <BrainCircuitIcon className="h-3 w-3 text-muted-foreground" />
-        <span className="font-medium">{current.label}</span>
+        <span className="font-medium truncate max-w-[72px] md:max-w-none">{current.label}</span>
         <ChevronDownIcon className="h-3 w-3 text-muted-foreground" />
       </button>
 

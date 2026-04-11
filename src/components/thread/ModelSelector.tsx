@@ -68,12 +68,12 @@ export const ModelSelector: FC<ModelSelectorProps> = ({ selectedModelKey, onSele
         type="button"
         onClick={() => !disabled && setIsOpen(!isOpen)}
         disabled={disabled}
-        className={`flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-3 py-1.5 text-xs transition-colors ${
+        className={`flex min-w-0 items-center gap-1 rounded-xl border border-border/70 bg-card/70 px-2 py-1.5 text-[11px] md:gap-1.5 md:px-3 md:text-xs transition-colors ${
           disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-muted/50'
         }`}
       >
         <CpuIcon className="h-3 w-3 text-muted-foreground" />
-        <span className="font-medium max-w-[140px] truncate">{currentLabel}</span>
+        <span className="font-medium max-w-[88px] truncate md:max-w-[140px]">{currentLabel}</span>
         <ChevronDownIcon className="h-3 w-3 text-muted-foreground" />
       </button>
 
