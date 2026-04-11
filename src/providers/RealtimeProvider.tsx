@@ -125,6 +125,7 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   const startTimeRef = useRef<number>(0);
   const lastUserSpeechRef = useRef<number>(0);
   const callActiveRef = useRef(false);
+  const muteSilenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const browserMicRef = useRef<{ stream: MediaStream; ctx: AudioContext; processor: ScriptProcessorNode } | null>(null);
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
 
@@ -176,6 +177,12 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
       levelTimerRef.current = null;
     }
 
+    // Stop mute silence sender
+    if (muteSilenceTimerRef.current) {
+      clearInterval(muteSilenceTimerRef.current);
+      muteSilenceTimerRef.current = null;
+    }
+
     // Stop mic
     if (browserMicRef.current) {
       browserMicRef.current.processor.disconnect();
@@ -202,15 +209,34 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
       const next = !prev;
       mutedRef.current = next;
       if (next && callActiveRef.current) {
-        // Send a short burst of silence so the server-side VAD detects
-        // end-of-speech immediately instead of waiting for its timeout.
-        const silenceFrames = 4800; // 300ms at 16kHz
+        // Continuously send silence while muted so the audio stream stays
+        // alive and the server-side VAD gets a clean speech→silence edge.
+        // 50ms interval matches the Electron mic drain cadence (~3200 frames
+        // at 16kHz = 200ms chunks, but smaller/more-frequent is fine).
+        const silenceFrames = 1600; // 100ms at 16kHz per tick
         const silence = new Int16Array(silenceFrames);
         const bytes = new Uint8Array(silence.buffer);
         let bin = '';
         for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
         const silenceB64 = btoa(bin);
+        // Send one immediately, then on interval
         app.realtime.sendAudio(silenceB64);
+        muteSilenceTimerRef.current = setInterval(() => {
+          if (!mutedRef.current || !callActiveRef.current) {
+            if (muteSilenceTimerRef.current) {
+              clearInterval(muteSilenceTimerRef.current);
+              muteSilenceTimerRef.current = null;
+            }
+            return;
+          }
+          app.realtime.sendAudio(silenceB64);
+        }, 100);
+      } else {
+        // Unmuting — stop the silence sender
+        if (muteSilenceTimerRef.current) {
+          clearInterval(muteSilenceTimerRef.current);
+          muteSilenceTimerRef.current = null;
+        }
       }
       // Mute/unmute browser mic tracks directly
       if (browserMicRef.current) {
