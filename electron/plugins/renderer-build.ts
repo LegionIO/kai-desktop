@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { mkdirSync, existsSync, readFileSync, rmSync, copyFileSync, writeFileSync, statSync, readdirSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, rmSync, copyFileSync, writeFileSync, statSync, readdirSync, realpathSync } from 'fs';
 import { dirname, extname, join, normalize, relative, resolve } from 'path';
 import type * as Esbuild from 'esbuild';
 import type { PluginRendererBuild, PluginRendererScript, PluginRendererStyle } from './types.js';
@@ -222,19 +222,22 @@ export async function buildPluginRendererBundle(options: {
   rendererPath: string;
   mainPath: string;
 }): Promise<PluginRendererBuild> {
-  const cached = loadCachedBuild(options.appHome, options.pluginName, options.pluginDir, options.fileHash);
+  // Resolve symlinks so esbuild metafile paths (relative to realpath) align with our path math
+  const resolvedPluginDir = realpathSync(options.pluginDir);
+
+  const cached = loadCachedBuild(options.appHome, options.pluginName, resolvedPluginDir, options.fileHash);
   if (cached) return cached;
 
   const outDir = rendererCacheRoot(options.appHome, options.pluginName, options.fileHash);
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
 
-  const rendererEntryAbs = join(options.pluginDir, options.rendererPath);
+  const rendererEntryAbs = join(resolvedPluginDir, options.rendererPath);
   if (!existsSync(rendererEntryAbs)) {
     throw new Error(`Plugin renderer entry point not found: ${rendererEntryAbs}`);
   }
 
-  const { scriptEntries, assetPaths } = scanImportMetaUrlReferences(options.pluginDir, join(options.pluginDir, options.mainPath));
+  const { scriptEntries, assetPaths } = scanImportMetaUrlReferences(resolvedPluginDir, join(resolvedPluginDir, options.mainPath));
   scriptEntries.add(normalizeRelativePath(options.rendererPath));
 
   const entryPointList = [...scriptEntries].sort();
@@ -243,7 +246,7 @@ export async function buildPluginRendererBundle(options: {
   try {
     const esbuild = await getEsbuild();
     result = await esbuild.build({
-      absWorkingDir: options.pluginDir,
+      absWorkingDir: resolvedPluginDir,
       assetNames: 'assets/[name]-[hash]',
       bundle: true,
       chunkNames: 'chunks/[name]-[hash]',
@@ -294,7 +297,7 @@ export async function buildPluginRendererBundle(options: {
   const stylePaths = new Set<string>();
 
   for (const [outputPath, outputMeta] of Object.entries(outputs)) {
-    const outputFullPath = resolveBuildOutputPath(options.pluginDir, outputPath);
+    const outputFullPath = resolveBuildOutputPath(resolvedPluginDir, outputPath);
     const entryPoint = outputMeta.entryPoint ? normalizeRelativePath(outputMeta.entryPoint) : null;
     const outputRelative = normalizeRelativePath(relative(outDir, outputFullPath));
     if (entryPoint) {
@@ -304,7 +307,7 @@ export async function buildPluginRendererBundle(options: {
       stylePaths.add(outputRelative);
     }
     if (outputMeta.cssBundle) {
-      const cssBundleFullPath = resolveBuildOutputPath(options.pluginDir, outputMeta.cssBundle);
+      const cssBundleFullPath = resolveBuildOutputPath(resolvedPluginDir, outputMeta.cssBundle);
       stylePaths.add(normalizeRelativePath(relative(outDir, cssBundleFullPath)));
     }
   }
@@ -328,7 +331,7 @@ export async function buildPluginRendererBundle(options: {
   }
 
   for (const assetRelative of assetPaths) {
-    const sourceFullPath = join(options.pluginDir, assetRelative);
+    const sourceFullPath = join(resolvedPluginDir, assetRelative);
     const destFullPath = join(outDir, assetRelative);
     if (!existsSync(sourceFullPath) || existsSync(destFullPath)) continue;
     mkdirSync(dirname(destFullPath), { recursive: true });
