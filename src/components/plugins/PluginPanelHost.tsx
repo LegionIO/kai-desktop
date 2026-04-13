@@ -58,8 +58,8 @@ export const PluginPanelHost: FC<{
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
-        <div className={`mx-auto w-full ${widthClass}`}>
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 h-full">
+        <div className={`mx-auto w-full h-full ${widthClass}`}>
           {Component ? (
             <Component
               pluginName={panel.pluginName}
