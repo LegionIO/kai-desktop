@@ -67,7 +67,7 @@ export type PluginNavigationItemDescriptor = {
   id: string;
   pluginName: string;
   label: string;
-  icon?: string;
+  icon?: string | { svg: string };
   visible: boolean;
   priority?: number;
   badge?: string | number;

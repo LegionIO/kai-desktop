@@ -590,7 +590,7 @@ export function createPluginAPI(
     },
 
     http: {
-      listen: (port, handler) => {
+      listen: (port, handler, options) => {
         requirePermission('http:listen');
         return new Promise<void>((resolve, reject) => {
           if (httpServer) {
@@ -642,8 +642,9 @@ export function createPluginAPI(
             }
           });
 
-          httpServer.listen(port, '127.0.0.1', () => {
-            console.info(`[Plugin:${manifest.name}] HTTP server listening on 127.0.0.1:${port}`);
+          const host = options?.host ?? '127.0.0.1';
+          httpServer.listen(port, host, () => {
+            console.info(`[Plugin:${manifest.name}] HTTP server listening on ${host}:${port}`);
             resolve();
           });
 

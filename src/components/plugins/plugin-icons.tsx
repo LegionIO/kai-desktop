@@ -66,7 +66,15 @@ const iconMap: Record<string, ReactNode> = {
   terminal: <TerminalSquareIcon className="h-[18px] w-[18px]" />,
 };
 
-export function getPluginNavigationIcon(iconName?: string): ReactNode {
-  if (!iconName) return iconMap.puzzle;
-  return iconMap[iconName] ?? iconMap.puzzle;
+export function getPluginNavigationIcon(icon?: string | { svg: string }): ReactNode {
+  if (!icon) return iconMap.puzzle;
+  if (typeof icon === 'object' && 'svg' in icon) {
+    return (
+      <span
+        className="inline-flex h-[18px] w-[18px] items-center justify-center [&>svg]:h-full [&>svg]:w-full"
+        dangerouslySetInnerHTML={{ __html: icon.svg }}
+      />
+    );
+  }
+  return iconMap[icon] ?? iconMap.puzzle;
 }

@@ -170,7 +170,7 @@ export type PluginNavigationItemDescriptor = {
   id: string;
   pluginName: string;
   label: string;
-  icon?: string;
+  icon?: string | { svg: string };
   visible: boolean;
   priority?: number;
   badge?: string | number;
@@ -388,7 +388,7 @@ export type PluginAPI = {
   };
 
   http: {
-    listen: (port: number, handler: (req: PluginHttpRequest) => PluginHttpResponse | Promise<PluginHttpResponse>) => Promise<void>;
+    listen: (port: number, handler: (req: PluginHttpRequest) => PluginHttpResponse | Promise<PluginHttpResponse>, options?: { host?: string }) => Promise<void>;
     close: () => Promise<void>;
   };
 
