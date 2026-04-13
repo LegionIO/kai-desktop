@@ -82,6 +82,7 @@ type AppAPI = {
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;
+    onNavigateDirect: (callback: (data: unknown) => void) => () => void;
     onModalCallback: (callback: (data: unknown) => void) => () => void;
   };
   modelCatalog: () => Promise<unknown>;

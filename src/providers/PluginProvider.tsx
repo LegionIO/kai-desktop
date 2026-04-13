@@ -190,6 +190,7 @@ type PluginContextValue = {
   setPluginConfig: (pluginName: string, path: string, value: unknown) => Promise<void>;
   consumeModalCallback: (pluginName: string, modalId: string) => ModalCallbackData | null;
   consumeNavigationRequest: () => PluginNavigationRequestRecord | null;
+  injectNavigationRequest: (pluginName: string, target: PluginNavigationTarget) => void;
   consumePluginEvent: (pluginName?: string, eventName?: string) => PluginEventRecord | null;
 };
 
@@ -213,6 +214,7 @@ const PluginContext = createContext<PluginContextValue>({
   setPluginConfig: async () => {},
   consumeModalCallback: () => null,
   consumeNavigationRequest: () => null,
+  injectNavigationRequest: () => {},
   consumePluginEvent: () => null,
 });
 
@@ -383,11 +385,21 @@ export function PluginProvider({ children }: { children: ReactNode }) {
       setModalCallbacks((prev) => [...prev, data as ModalCallbackData]);
     });
 
+    const unsubNavigateDirect = app.plugins.onNavigateDirect?.((data) => {
+      const typed = data as { pluginName?: string; target?: PluginNavigationTarget };
+      if (typed.pluginName && typed.target) {
+        window.dispatchEvent(new CustomEvent('plugin-navigate', {
+          detail: { pluginName: typed.pluginName, target: typed.target },
+        }));
+      }
+    });
+
     return () => {
       unsubUI();
       unsubEvent();
       unsubNavigation();
       unsubCallback();
+      unsubNavigateDirect?.();
     };
   }, [onRendererLoaded, updateRendererStatus]);
 
@@ -488,6 +500,14 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     return found;
   }, []);
 
+  const injectNavigationRequest = useCallback((pluginName: string, target: PluginNavigationTarget) => {
+    // Dispatch a DOM custom event that App.tsx listens for directly
+    // This bypasses React state batching issues with the navigation request queue
+    window.dispatchEvent(new CustomEvent('plugin-navigate', {
+      detail: { pluginName, target },
+    }));
+  }, []);
+
   const consumePluginEvent = useCallback((pluginName?: string, eventName?: string): PluginEventRecord | null => {
     let found: PluginEventRecord | null = null;
     setPluginEvents((prev) => {
@@ -525,6 +545,7 @@ export function PluginProvider({ children }: { children: ReactNode }) {
         setPluginConfig,
         consumeModalCallback,
         consumeNavigationRequest,
+        injectNavigationRequest,
         consumePluginEvent,
       }}
     >

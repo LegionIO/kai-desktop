@@ -685,6 +685,8 @@ function AppShell() {
     const request = consumeNavigationRequest();
     if (!request) return;
 
+    console.info('[App] Processing navigation request:', request.pluginName, request.target);
+
     if (request.target.type === 'conversation') {
       void handleSwitchConversation(request.target.conversationId);
       return;
@@ -699,6 +701,20 @@ function AppShell() {
       void sendPluginAction(request.pluginName, request.target.targetId, request.target.action, request.target.data);
     }
   }, [consumeNavigationRequest, handleSwitchConversation, navigationRequests.length, sendPluginAction]);
+
+  // Handle plugin navigation from in-app toast clicks (via DOM custom event to bypass React state batching)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { pluginName, target } = (e as CustomEvent).detail;
+      if (target?.type === 'panel' && target.panelId) {
+        setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
+      } else if (target?.type === 'conversation' && target.conversationId) {
+        void handleSwitchConversation(target.conversationId);
+      }
+    };
+    window.addEventListener('plugin-navigate', handler);
+    return () => window.removeEventListener('plugin-navigate', handler);
+  }, [handleSwitchConversation]);
 
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
   const pluginNavigationItems = pluginUIState?.navigationItems?.filter((item) => item.visible) ?? [];

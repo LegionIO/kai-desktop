@@ -395,6 +395,7 @@ export type PluginAPI = {
   agent: {
     registerBackend: (definition: Omit<AgentBackendDefinition, 'pluginName'>) => void;
     unregisterBackend: (key: string) => void;
+    generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
   };
 
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
@@ -414,6 +415,26 @@ export type PluginHttpResponse = {
   status?: number;
   headers?: Record<string, string>;
   body?: string;
+};
+
+/* ── Plugin Agent Generate Types ── */
+
+export type PluginAgentMessage = {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+};
+
+export type PluginAgentGenerateOptions = {
+  messages: PluginAgentMessage[];
+  modelKey?: string;
+  systemPrompt?: string;
+  maxTokens?: number;
+  tools?: boolean;
+};
+
+export type PluginAgentGenerateResult = {
+  text: string;
+  modelKey: string;
 };
 
 /* ── Modal/Banner Actions (renderer → main via IPC) ── */

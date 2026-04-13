@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { Notification, app, dialog } from 'electron';
+import { Notification, app, dialog, BrowserWindow } from 'electron';
 import { readdirSync, readFileSync, existsSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import { pathToFileURL } from 'url';
@@ -101,6 +101,7 @@ export class PluginManager {
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> = new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private nativeNotifications: Map<string, Notification> = new Map();
 
   constructor(
     private pluginsDir: string,
@@ -784,15 +785,35 @@ export class PluginManager {
     }
 
     if (descriptor.native && Notification.isSupported()) {
+      const notifKey = `${pluginName}:${descriptor.id}`;
       const nativeNotification = new Notification({
         title: descriptor.title,
         body: descriptor.body ?? '',
       });
+
+      // Store reference to prevent garbage collection before user clicks
+      this.nativeNotifications.set(notifKey, nativeNotification);
+
+      const cleanup = () => {
+        this.nativeNotifications.delete(notifKey);
+      };
+
       if (descriptor.target) {
         nativeNotification.on('click', () => {
-          this.broadcastNavigationRequest(pluginName, descriptor.target!);
+          for (const win of BrowserWindow.getAllWindows()) {
+            if (!win.isDestroyed()) {
+              win.show();
+              win.focus();
+              // Send directly to the renderer to trigger DOM custom event
+              win.webContents.send('plugin:navigate-direct', { pluginName, target: descriptor.target });
+            }
+          }
+          cleanup();
         });
       }
+
+      nativeNotification.on('close', cleanup);
+
       nativeNotification.show();
     }
 

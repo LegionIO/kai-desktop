@@ -1,6 +1,6 @@
-import type { FC } from 'react';
+import { useState, type FC } from 'react';
 import { AlertCircleIcon, CheckCircle2Icon, InfoIcon, TriangleAlertIcon } from 'lucide-react';
-import { usePlugins } from '@/providers/PluginProvider';
+import { usePlugins, type PluginNavigationTarget } from '@/providers/PluginProvider';
 
 const levelClasses = {
   info: 'border-blue-500/20 bg-blue-500/10 text-blue-800 dark:text-blue-300',
@@ -17,20 +17,34 @@ const levelIcons = {
 } as const;
 
 export const PluginToastHost: FC = () => {
-  const { uiState } = usePlugins();
+  const { uiState, injectNavigationRequest } = usePlugins();
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
-  const notifications = uiState?.notifications?.filter((notification) => notification.visible) ?? [];
+  const notifications = uiState?.notifications?.filter((n) => {
+    if (!n.visible) return false;
+    const key = `${n.pluginName}:${n.id}`;
+    return !dismissed.has(key);
+  }) ?? [];
   if (notifications.length === 0) return null;
+
+  const handleClick = (notification: typeof notifications[0]) => {
+    const key = `${notification.pluginName}:${notification.id}`;
+    setDismissed((prev) => new Set(prev).add(key));
+    if (!notification.target) return;
+    injectNavigationRequest(notification.pluginName, notification.target as PluginNavigationTarget);
+  };
 
   return (
     <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-full max-w-sm flex-col gap-3">
       {notifications.slice(-4).reverse().map((notification) => {
         const level = notification.level ?? 'info';
         const Icon = levelIcons[level];
+        const hasTarget = Boolean(notification.target);
         return (
           <div
             key={`${notification.pluginName}-${notification.id}`}
-            className={`pointer-events-auto rounded-2xl border px-4 py-3 shadow-2xl backdrop-blur ${levelClasses[level]}`}
+            className={`pointer-events-auto rounded-2xl border px-4 py-3 shadow-2xl backdrop-blur ${levelClasses[level]} ${hasTarget ? 'cursor-pointer hover:brightness-95 transition-all' : ''}`}
+            onClick={hasTarget ? () => handleClick(notification) : undefined}
           >
             <div className="flex items-start gap-3">
               <Icon className="mt-0.5 h-4 w-4 shrink-0" />

@@ -3,6 +3,8 @@ import { applyBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
 import { z } from 'zod';
+import { generateForPlugin } from '../agent/plugin-generate.js';
+import { getRegisteredTools } from '../ipc/agent.js';
 import type {
   PluginAPI,
   PluginInstance,
@@ -683,6 +685,19 @@ export function createPluginAPI(
         requirePermission('agent:backend');
         instance.registeredBackendKeys = instance.registeredBackendKeys.filter((backendKey) => backendKey !== key);
         unregisterAgentBackend(key);
+      },
+      generate: async (options) => {
+        requirePermission('agent:backend');
+        const config = callbacks.getConfig();
+        const allTools = options.tools ? getRegisteredTools() : [];
+        return generateForPlugin({
+          messages: options.messages,
+          config,
+          appHome: callbacks.appHome,
+          modelKey: options.modelKey,
+          systemPrompt: options.systemPrompt,
+          tools: allTools,
+        });
       },
     },
 

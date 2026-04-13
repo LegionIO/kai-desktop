@@ -134,6 +134,11 @@ const appAPI = {
       ipcRenderer.on('plugin:navigation-request', handler);
       return () => ipcRenderer.removeListener('plugin:navigation-request', handler);
     },
+    onNavigateDirect: (callback: (data: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('plugin:navigate-direct', handler);
+      return () => ipcRenderer.removeListener('plugin:navigate-direct', handler);
+    },
     onModalCallback: (callback: (data: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('plugin:modal-callback', handler);
