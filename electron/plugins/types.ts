@@ -427,6 +427,9 @@ export type PluginAgentMessage = {
 export type PluginAgentGenerateOptions = {
   messages: PluginAgentMessage[];
   modelKey?: string;
+  profileKey?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  fallbackEnabled?: boolean;
   systemPrompt?: string;
   maxTokens?: number;
   tools?: boolean;
@@ -435,6 +438,13 @@ export type PluginAgentGenerateOptions = {
 export type PluginAgentGenerateResult = {
   text: string;
   modelKey: string;
+  toolCalls: Array<{
+    toolName: string;
+    args: unknown;
+    result: unknown;
+    error?: string;
+    durationMs?: number;
+  }>;
 };
 
 /* ── Modal/Banner Actions (renderer → main via IPC) ── */

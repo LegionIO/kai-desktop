@@ -695,6 +695,9 @@ export function createPluginAPI(
           config,
           appHome: callbacks.appHome,
           modelKey: options.modelKey,
+          profileKey: options.profileKey,
+          reasoningEffort: options.reasoningEffort,
+          fallbackEnabled: options.fallbackEnabled,
           systemPrompt: options.systemPrompt,
           tools: allTools,
         });
