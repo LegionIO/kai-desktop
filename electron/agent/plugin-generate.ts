@@ -7,7 +7,7 @@ import type { ToolDefinition } from '../tools/types.js';
 import { join } from 'path';
 
 export type PluginGenerateOptions = {
-  messages: Array<{ role: string; content: string }>;
+  messages: Array<{ role: string; content: unknown }>;
   config: AppConfig;
   appHome: string;
   modelKey?: string;
@@ -16,6 +16,7 @@ export type PluginGenerateOptions = {
   fallbackEnabled?: boolean;
   systemPrompt?: string;
   tools?: ToolDefinition[];
+  abortSignal?: AbortSignal;
 };
 
 export type PluginGenerateToolCall = {
@@ -32,21 +33,41 @@ export type PluginGenerateResult = {
   toolCalls: PluginGenerateToolCall[];
 };
 
+type SanitizedContent = string | Array<{ type: 'text'; text: string } | { type: 'image'; image: unknown; mimeType?: string }>;
+
 function sanitizeMessages(
   messages: Array<{ role: string; content: unknown }>,
-): Array<{ role: 'user' | 'assistant' | 'system'; content: string }> {
-  const clean: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = [];
+): Array<{ role: 'user' | 'assistant' | 'system'; content: SanitizedContent }> {
+  const clean: Array<{ role: 'user' | 'assistant' | 'system'; content: SanitizedContent }> = [];
 
   for (const msg of messages) {
     const role = msg.role;
     if (role !== 'user' && role !== 'assistant' && role !== 'system') continue;
 
     if (Array.isArray(msg.content)) {
-      const textParts = (msg.content as Array<{ type?: string; text?: string }>)
-        .filter((part) => part.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text);
-      if (textParts.length > 0) {
-        clean.push({ role, content: textParts.join('\n') });
+      const parts = msg.content as Array<Record<string, unknown>>;
+      const textParts: Array<{ type: 'text'; text: string }> = [];
+      const imageParts: Array<{ type: 'image'; image: unknown; mimeType?: string }> = [];
+
+      for (const part of parts) {
+        if (part.type === 'text' && typeof part.text === 'string') {
+          textParts.push({ type: 'text', text: part.text });
+        } else if (part.type === 'image' && part.image != null) {
+          imageParts.push({
+            type: 'image',
+            image: part.image,
+            ...(typeof part.mimeType === 'string' ? { mimeType: part.mimeType } : {}),
+          });
+        }
+      }
+
+      if (imageParts.length > 0) {
+        const contentArray: SanitizedContent = [...textParts, ...imageParts];
+        if (contentArray.length > 0) {
+          clean.push({ role, content: contentArray });
+        }
+      } else if (textParts.length > 0) {
+        clean.push({ role, content: textParts.map((p) => p.text).join('\n') });
       }
       continue;
     }
@@ -79,12 +100,12 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
     // Fallback: use default model directly
     const dbPath = join(appHome, 'data', 'memory.db');
     const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
-    const allMessages: Array<{ role: string; content: string }> = [];
+    const allMessages: Array<{ role: string; content: SanitizedContent }> = [];
     if (systemPrompt) allMessages.push({ role: 'system', content: systemPrompt });
     allMessages.push(...sanitized);
     const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const stream = streamAgentResponse(conversationId, allMessages, fallbackEntry.modelConfig, config, pluginTools ?? [], dbPath);
+    const stream = streamAgentResponse(conversationId, allMessages, fallbackEntry.modelConfig, config, pluginTools ?? [], dbPath, { abortSignal: options.abortSignal });
     return collectStreamResult(stream, fallbackEntry.key);
   }
 
@@ -92,7 +113,7 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
   const dbPath = join(appHome, 'data', 'memory.db');
   const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
 
-  const allMessages: Array<{ role: string; content: string }> = [];
+  const allMessages: Array<{ role: string; content: SanitizedContent }> = [];
   if (systemPrompt) {
     allMessages.push({ role: 'system', content: systemPrompt });
   }
@@ -110,7 +131,7 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
       config,
       pluginTools ?? [],
       dbPath,
-      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined },
+      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },
     );
   } else {
     stream = streamAgentResponse(
@@ -120,7 +141,7 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
       config,
       pluginTools ?? [],
       dbPath,
-      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined },
+      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },
     );
   }
 

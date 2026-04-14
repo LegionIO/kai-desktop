@@ -700,6 +700,7 @@ export function createPluginAPI(
           fallbackEnabled: options.fallbackEnabled,
           systemPrompt: options.systemPrompt,
           tools: allTools,
+          abortSignal: options.abortSignal,
         });
       },
     },

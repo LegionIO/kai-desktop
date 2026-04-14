@@ -421,7 +421,7 @@ export type PluginHttpResponse = {
 
 export type PluginAgentMessage = {
   role: 'user' | 'assistant' | 'system';
-  content: string;
+  content: string | MessageContent[];
 };
 
 export type PluginAgentGenerateOptions = {
@@ -433,6 +433,7 @@ export type PluginAgentGenerateOptions = {
   systemPrompt?: string;
   maxTokens?: number;
   tools?: boolean;
+  abortSignal?: AbortSignal;
 };
 
 export type PluginAgentGenerateResult = {
