@@ -1,4 +1,4 @@
-import { shell, BrowserWindow } from 'electron';
+import { shell, BrowserWindow, safeStorage, session } from 'electron';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
@@ -10,6 +10,7 @@ import type {
   PluginInstance,
   PluginBannerDescriptor,
   PluginModalDescriptor,
+  PluginBrowserWindowOptions,
   PluginSettingsSectionDescriptor,
   PluginPanelDescriptor,
   PluginNavigationItemDescriptor,
@@ -475,12 +476,18 @@ export function createPluginAPI(
           showAfterMs,
           successMessage,
           extractParams,
+          interceptUrls,
+          interceptHeader,
+          partition,
+          onReady,
         } = options;
 
         return new Promise((resolve) => {
           let settled = false;
           let wasShown = showOnCreate;
           let revealTimer: NodeJS.Timeout | null = null;
+
+          const ses = partition ? session.fromPartition(partition) : undefined;
 
           const authWin = new BrowserWindow({
             width,
@@ -490,6 +497,7 @@ export function createPluginAPI(
             webPreferences: {
               nodeIntegration: false,
               contextIsolation: true,
+              ...(ses ? { session: ses } : {}),
             },
           });
           applyBrandUserAgent(authWin.webContents);
@@ -508,86 +516,410 @@ export function createPluginAPI(
             authWin.focus();
           };
 
+          const settle = (result: PluginAuthResult, closeWindow = true) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            clearRevealTimer();
+            if (closeWindow) {
+              setTimeout(() => {
+                try { if (!authWin.isDestroyed()) authWin.close(); } catch { /* ignore */ }
+              }, 500);
+            }
+            resolve(result);
+          };
+
           if (!showOnCreate && typeof showAfterMs === 'number' && showAfterMs >= 0) {
             revealTimer = setTimeout(revealWindow, showAfterMs);
           }
 
           const timeout = setTimeout(() => {
-            if (!settled) {
-              settled = true;
-              clearRevealTimer();
-              try { authWin.close(); } catch { /* ignore */ }
-              resolve({ success: false, error: 'Authentication timed out' });
-            }
+            settle({ success: false, error: 'Authentication timed out' });
           }, timeoutMs);
 
-          const handleRedirect = (_event: Electron.Event, redirectUrl: string) => {
-            if (settled || !redirectUrl.includes(callbackMatch)) return;
-            settled = true;
-            clearTimeout(timeout);
-
-            try {
-              const parsed = new URL(redirectUrl);
-              const params: Record<string, string> = {};
-              parsed.searchParams.forEach((value, key) => {
-                if (!extractParams || extractParams.includes(key)) {
-                  params[key] = value;
+          // Mode 1: Header interception (for APIs that don't use redirects)
+          if (interceptUrls && interceptUrls.length > 0 && interceptHeader) {
+            const targetSession = ses ?? authWin.webContents.session;
+            const urlPatterns = interceptUrls;
+            targetSession.webRequest.onBeforeSendHeaders(
+              { urls: urlPatterns },
+              (details, callback) => {
+                const headerValue =
+                  details.requestHeaders[interceptHeader] ??
+                  details.requestHeaders[interceptHeader.toLowerCase()] ??
+                  details.requestHeaders[interceptHeader.charAt(0).toUpperCase() + interceptHeader.slice(1)];
+                if (headerValue && !settled) {
+                  settle(
+                    { success: true, params: { [interceptHeader]: headerValue } },
+                    true,
+                  );
                 }
-              });
+                callback({ requestHeaders: details.requestHeaders });
+              },
+            );
+          }
 
-              clearRevealTimer();
+          // Mode 2: Redirect matching (original behavior)
+          if (callbackMatch) {
+            const handleRedirect = (_event: Electron.Event, redirectUrl: string) => {
+              if (settled || !redirectUrl.includes(callbackMatch)) return;
 
-              if (!wasShown) {
-                try { authWin.close(); } catch { /* ignore */ }
+              try {
+                const parsed = new URL(redirectUrl);
+                const params: Record<string, string> = {};
+                parsed.searchParams.forEach((value, key) => {
+                  if (!extractParams || extractParams.includes(key)) {
+                    params[key] = value;
+                  }
+                });
+
+                clearRevealTimer();
+                settled = true;
+                clearTimeout(timeout);
+
+                if (!wasShown) {
+                  try { authWin.close(); } catch { /* ignore */ }
+                  resolve({ success: true, params });
+                  return;
+                }
+
+                const successHtml = successMessage || `
+                  <html>
+                  <body style="font-family: system-ui; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: #e0e0e0;">
+                    <div style="text-align: center;">
+                      <h2 style="color: #4ade80;">&#10003; Authentication Successful</h2>
+                      <p>You can close this window and return to the application.</p>
+                    </div>
+                  </body>
+                  </html>
+                `;
+                authWin.loadURL(`data:text/html,${encodeURIComponent(successHtml)}`);
+                setTimeout(() => {
+                  try { authWin.close(); } catch { /* ignore */ }
+                }, 2000);
+
                 resolve({ success: true, params });
-                return;
+              } catch (err) {
+                settle({ success: false, error: err instanceof Error ? err.message : String(err) });
               }
+            };
 
-              const successHtml = successMessage || `
-                <html>
-                <body style="font-family: system-ui; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: #e0e0e0;">
-                  <div style="text-align: center;">
-                    <h2 style="color: #4ade80;">&#10003; Authentication Successful</h2>
-                    <p>You can close this window and return to the application.</p>
-                  </div>
-                </body>
-                </html>
-              `;
-              authWin.loadURL(`data:text/html,${encodeURIComponent(successHtml)}`);
-              setTimeout(() => {
-                try { authWin.close(); } catch { /* ignore */ }
-              }, 2000);
+            authWin.webContents.on('will-redirect', handleRedirect);
+            authWin.webContents.on('will-navigate', handleRedirect);
+          }
 
-              resolve({ success: true, params });
-            } catch (err) {
-              clearRevealTimer();
-              try { authWin.close(); } catch { /* ignore */ }
-              resolve({ success: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          };
-
-          authWin.webContents.on('will-redirect', handleRedirect);
-          authWin.webContents.on('will-navigate', handleRedirect);
+          // Provide helpers to the caller for auto-login / webContents interaction
+          if (onReady) {
+            const helpers = {
+              executeJavaScript: (code: string) => authWin.webContents.executeJavaScript(code),
+              getURL: () => authWin.webContents.getURL(),
+              onDidNavigate: (cb: (url: string) => void) => {
+                authWin.webContents.on('did-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
+                authWin.webContents.on('will-redirect', (_event: Electron.Event, navUrl: string) => cb(navUrl));
+                authWin.webContents.on('will-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
+              },
+              show: () => revealWindow(),
+              hide: () => { if (!authWin.isDestroyed()) authWin.hide(); },
+              close: () => settle({ success: false, error: 'Closed by plugin' }),
+            };
+            onReady(helpers);
+          }
 
           authWin.loadURL(url).catch((err) => {
-            if (!settled) {
-              settled = true;
-              clearTimeout(timeout);
-              clearRevealTimer();
-              try { authWin.close(); } catch { /* ignore */ }
-              resolve({ success: false, error: `Failed to load auth URL: ${err.message}` });
-            }
+            settle({ success: false, error: `Failed to load auth URL: ${err.message}` });
           });
 
           authWin.once('close', () => {
             if (!settled) {
-              settled = true;
-              clearTimeout(timeout);
-              clearRevealTimer();
-              resolve({ success: false, error: 'Auth window closed by user' });
+              settle({ success: false, error: 'Auth window closed by user' }, false);
             }
           });
         });
+      },
+    },
+
+    safeStorage: {
+      isEncryptionAvailable: () => {
+        requirePermission('safe-storage');
+        return safeStorage.isEncryptionAvailable();
+      },
+      encryptString: (plaintext: string) => {
+        requirePermission('safe-storage');
+        if (!safeStorage.isEncryptionAvailable()) {
+          throw new Error('OS encryption is not available');
+        }
+        return safeStorage.encryptString(plaintext).toString('base64');
+      },
+      decryptString: (base64Cipher: string) => {
+        requirePermission('safe-storage');
+        if (!safeStorage.isEncryptionAvailable()) {
+          throw new Error('OS encryption is not available');
+        }
+        return safeStorage.decryptString(Buffer.from(base64Cipher, 'base64'));
+      },
+    },
+
+    browser: {
+      open: (options: PluginBrowserWindowOptions) => {
+        requirePermission('browser:window');
+        const {
+          url,
+          title = 'Browser',
+          width = 1280,
+          height = 900,
+          partition,
+        } = options;
+
+        const ses = partition ? session.fromPartition(partition) : undefined;
+
+        const browserWin = new BrowserWindow({
+          width,
+          height,
+          title,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            webviewTag: true,
+            ...(ses ? { session: ses } : {}),
+          },
+        });
+        applyBrandUserAgent(browserWin.webContents);
+
+        const partitionAttr = partition ? ` partition="${partition}"` : '';
+        const jsUrl = JSON.stringify(url);
+        const escapedTitle = title.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
+        const chromeHtml = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapedTitle}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #1a1a2e; color: #e0e0e0; font-family: system-ui, -apple-system, sans-serif; }
+  #chrome { display: flex; flex-direction: column; height: 100%; }
+  #toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: #16162a; border-bottom: 1px solid #2a2a4a; flex-shrink: 0; -webkit-app-region: drag; }
+  #toolbar > * { -webkit-app-region: no-drag; }
+  .nav-btn { width: 28px; height: 28px; border: none; background: transparent; color: #888; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+  .nav-btn:hover { background: #2a2a4a; color: #ccc; }
+  .nav-btn:disabled { opacity: 0.3; cursor: default; }
+  .nav-btn:disabled:hover { background: transparent; color: #888; }
+  #url-bar { flex: 1; height: 28px; padding: 0 10px; border: 1px solid #2a2a4a; border-radius: 6px; background: #0f0f1e; color: #ccc; font-size: 12px; outline: none; }
+  #url-bar:focus { border-color: #5b5bd6; }
+  #tabs { display: flex; align-items: center; gap: 2px; padding: 4px 8px 0; background: #16162a; flex-shrink: 0; overflow-x: auto; }
+  .tab { display: flex; align-items: center; gap: 6px; padding: 5px 12px; background: #1a1a2e; border: 1px solid #2a2a4a; border-bottom: none; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 11px; color: #888; max-width: 200px; min-width: 60px; flex-shrink: 0; }
+  .tab.active { background: #1e1e38; color: #e0e0e0; border-color: #3a3a5a; }
+  .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab-close { width: 16px; height: 16px; border: none; background: transparent; color: #666; cursor: pointer; border-radius: 4px; font-size: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .tab-close:hover { background: #3a3a5a; color: #ccc; }
+  .new-tab-btn { width: 24px; height: 24px; border: none; background: transparent; color: #666; cursor: pointer; border-radius: 6px; font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .new-tab-btn:hover { background: #2a2a4a; color: #ccc; }
+  #webview-container { flex: 1; position: relative; }
+  webview { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+  webview.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="chrome">
+  <div id="tabs">
+    <button class="new-tab-btn" id="new-tab-btn" title="New Tab">+</button>
+  </div>
+  <div id="toolbar">
+    <button class="nav-btn" id="back-btn" title="Back" disabled>&#9664;</button>
+    <button class="nav-btn" id="fwd-btn" title="Forward" disabled>&#9654;</button>
+    <button class="nav-btn" id="reload-btn" title="Reload">&#8635;</button>
+    <input type="text" id="url-bar" spellcheck="false">
+  </div>
+  <div id="webview-container"></div>
+</div>
+<script>
+  const container = document.getElementById('webview-container');
+  const tabsBar = document.getElementById('tabs');
+  const newTabBtn = document.getElementById('new-tab-btn');
+  const urlBar = document.getElementById('url-bar');
+  const backBtn = document.getElementById('back-btn');
+  const fwdBtn = document.getElementById('fwd-btn');
+  const reloadBtn = document.getElementById('reload-btn');
+
+  let tabs = [];
+  let activeTabId = null;
+  let tabIdCounter = 0;
+
+  function createTab(url) {
+    const id = ++tabIdCounter;
+    const wv = document.createElement('webview');
+    wv.setAttribute('src', url);
+    wv.setAttribute('class', 'hidden');
+    wv.setAttribute('allowpopups', '');
+    ${partitionAttr ? `wv.setAttribute('partition', '${partition}');` : ''}
+    wv.id = 'wv-' + id;
+    container.appendChild(wv);
+
+    const tab = { id, wv, title: 'Loading...' };
+    tabs.push(tab);
+
+    wv.addEventListener('page-title-updated', (e) => {
+      tab.title = e.title || url;
+      renderTabs();
+    });
+    wv.addEventListener('did-navigate', () => updateNavState());
+    wv.addEventListener('did-navigate-in-page', () => updateNavState());
+
+    // Handle new windows (target=_blank, window.open, cmd+click)
+    // Open them as new tabs in our browser instead of new Electron windows
+    wv.addEventListener('did-attach', () => {
+      try {
+        const wc = wv.getWebContents();
+        if (wc) {
+          wc.setWindowOpenHandler(({ url: newUrl }) => {
+            if (newUrl && newUrl !== 'about:blank') {
+              createTab(newUrl);
+            }
+            return { action: 'deny' };
+          });
+        }
+      } catch (e) {
+        console.warn('Could not set window open handler:', e);
+      }
+    });
+
+    // Fallback for older Electron: listen for new-window on the webview element
+    wv.addEventListener('new-window', (e) => {
+      e.preventDefault();
+      if (e.url && e.url !== 'about:blank') {
+        createTab(e.url);
+      }
+    });
+
+    switchTab(id);
+    renderTabs();
+    return id;
+  }
+
+  function switchTab(id) {
+    activeTabId = id;
+    tabs.forEach(t => {
+      t.wv.classList.toggle('hidden', t.id !== id);
+    });
+    renderTabs();
+    updateNavState();
+  }
+
+  function closeTab(id) {
+    const idx = tabs.findIndex(t => t.id === id);
+    if (idx < 0) return;
+    const tab = tabs[idx];
+    tab.wv.remove();
+    tabs.splice(idx, 1);
+    if (tabs.length === 0) {
+      window.close();
+      return;
+    }
+    if (activeTabId === id) {
+      const next = tabs[Math.min(idx, tabs.length - 1)];
+      switchTab(next.id);
+    }
+    renderTabs();
+  }
+
+  function renderTabs() {
+    tabsBar.querySelectorAll('.tab').forEach(el => el.remove());
+    tabs.forEach(t => {
+      const el = document.createElement('div');
+      el.className = 'tab' + (t.id === activeTabId ? ' active' : '');
+      el.innerHTML = '<span class="tab-title"></span><button class="tab-close">&times;</button>';
+      el.querySelector('.tab-title').textContent = t.title;
+      el.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('tab-close')) switchTab(t.id);
+      });
+      el.querySelector('.tab-close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeTab(t.id);
+      });
+      tabsBar.insertBefore(el, newTabBtn);
+    });
+  }
+
+  function updateNavState() {
+    const tab = tabs.find(t => t.id === activeTabId);
+    if (!tab) return;
+    try {
+      urlBar.value = tab.wv.getURL();
+      backBtn.disabled = !tab.wv.canGoBack();
+      fwdBtn.disabled = !tab.wv.canGoForward();
+    } catch {}
+  }
+
+  backBtn.addEventListener('click', () => {
+    const tab = tabs.find(t => t.id === activeTabId);
+    if (tab && tab.wv.canGoBack()) tab.wv.goBack();
+  });
+  fwdBtn.addEventListener('click', () => {
+    const tab = tabs.find(t => t.id === activeTabId);
+    if (tab && tab.wv.canGoForward()) tab.wv.goForward();
+  });
+  reloadBtn.addEventListener('click', () => {
+    const tab = tabs.find(t => t.id === activeTabId);
+    if (tab) tab.wv.reload();
+  });
+  urlBar.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      let val = urlBar.value.trim();
+      if (val && !val.match(/^https?:\\/\\//)) val = 'https://' + val;
+      const tab = tabs.find(t => t.id === activeTabId);
+      if (tab && val) tab.wv.loadURL(val);
+    }
+  });
+  newTabBtn.addEventListener('click', () => {
+    createTab(${jsUrl});
+  });
+
+  createTab(${jsUrl});
+</script>
+</body>
+</html>`;
+
+        browserWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(chromeHtml)}`);
+
+        // Intercept new windows from webview guest contents and redirect
+        // them back to the chrome page to open as new tabs
+        browserWin.webContents.on('did-attach-webview', (_event, webContents) => {
+          webContents.setWindowOpenHandler(({ url: newUrl }) => {
+            if (newUrl && newUrl !== 'about:blank') {
+              // Send the URL to the chrome page to open as a new tab
+              browserWin.webContents.executeJavaScript(
+                `typeof createTab === 'function' && createTab(${JSON.stringify(newUrl)})`
+              ).catch(() => {});
+            }
+            return { action: 'deny' };
+          });
+        });
+      },
+    },
+
+    session: {
+      clearCookies: async (partition: string, filter?: { domain?: string }): Promise<number> => {
+        requirePermission('auth:window');
+        const ses = session.fromPartition(partition);
+        const allCookies = await ses.cookies.get({});
+
+        let targetCookies = allCookies;
+        if (filter?.domain) {
+          const domains = Array.isArray(filter.domain) ? filter.domain : [filter.domain];
+          targetCookies = allCookies.filter((cookie) => {
+            const d = cookie.domain?.toLowerCase() ?? '';
+            return domains.some((pattern) => d.includes(pattern.toLowerCase()));
+          });
+        }
+
+        for (const cookie of targetCookies) {
+          const protocol = cookie.secure ? 'https' : 'http';
+          const domain = cookie.domain?.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
+          const cookieUrl = `${protocol}://${domain}${cookie.path}`;
+          await ses.cookies.remove(cookieUrl, cookie.name);
+        }
+
+        return targetCookies.length;
       },
     },
 

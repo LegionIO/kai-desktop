@@ -22,7 +22,9 @@ export type PluginPermission =
   | 'conversations:write'
   | 'navigation:open'
   | 'state:publish'
-  | 'agent:backend';
+  | 'agent:backend'
+  | 'safe-storage'
+  | 'browser:window';
 
 export type PluginApprovalRecord = {
   hash: string;
@@ -387,6 +389,20 @@ export type PluginAPI = {
     openAuthWindow: (options: PluginAuthWindowOptions) => Promise<PluginAuthResult>;
   };
 
+  safeStorage: {
+    isEncryptionAvailable: () => boolean;
+    encryptString: (plaintext: string) => string;
+    decryptString: (base64Cipher: string) => string;
+  };
+
+  browser: {
+    open: (options: PluginBrowserWindowOptions) => void;
+  };
+
+  session: {
+    clearCookies: (partition: string, filter?: { domain?: string }) => Promise<number>;
+  };
+
   http: {
     listen: (port: number, handler: (req: PluginHttpRequest) => PluginHttpResponse | Promise<PluginHttpResponse>, options?: { host?: string }) => Promise<void>;
     close: () => Promise<void>;
@@ -461,7 +477,7 @@ export type PluginActionPayload = {
 
 export type PluginAuthWindowOptions = {
   url: string;
-  callbackMatch: string;
+  callbackMatch?: string;
   title?: string;
   width?: number;
   height?: number;
@@ -470,6 +486,27 @@ export type PluginAuthWindowOptions = {
   showAfterMs?: number;
   successMessage?: string;
   extractParams?: string[];
+  interceptUrls?: string[];
+  interceptHeader?: string;
+  partition?: string;
+  onReady?: (helpers: AuthWindowHelpers) => void;
+};
+
+export type AuthWindowHelpers = {
+  executeJavaScript: (code: string) => Promise<unknown>;
+  getURL: () => string;
+  onDidNavigate: (callback: (url: string) => void) => void;
+  show: () => void;
+  hide: () => void;
+  close: () => void;
+};
+
+export type PluginBrowserWindowOptions = {
+  url: string;
+  title?: string;
+  width?: number;
+  height?: number;
+  partition?: string;
 };
 
 export type PluginAuthResult = {

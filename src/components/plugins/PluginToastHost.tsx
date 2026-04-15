@@ -28,8 +28,12 @@ export const PluginToastHost: FC = () => {
   if (notifications.length === 0) return null;
 
   const handleClick = (notification: typeof notifications[0]) => {
-    const key = `${notification.pluginName}:${notification.id}`;
-    setDismissed((prev) => new Set(prev).add(key));
+    // Only dismiss on click if the notification has autoDismiss (i.e. it's a one-shot notification).
+    // Persistent progress notifications (no autoDismissMs) stay visible — clicking just navigates.
+    if (notification.autoDismissMs) {
+      const key = `${notification.pluginName}:${notification.id}`;
+      setDismissed((prev) => new Set(prev).add(key));
+    }
     if (!notification.target) return;
     injectNavigationRequest(notification.pluginName, notification.target as PluginNavigationTarget);
   };
