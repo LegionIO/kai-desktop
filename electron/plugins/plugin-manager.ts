@@ -56,6 +56,8 @@ const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
   'navigation:open': 'Request in-app navigation actions',
   'state:publish': 'Publish plugin state and live events to the renderer',
   'agent:backend': 'Register alternate agent backends',
+  'safe-storage': 'Access encrypted safe storage',
+  'browser:window': 'Open browser windows',
 };
 
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
