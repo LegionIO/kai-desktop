@@ -28,30 +28,19 @@ export default defineConfig({
   main: {
     define: brandDefines,
     build: {
-      // Bundle these into the main process JS instead of relying on
-      // node_modules resolution, because electron-builder + pnpm doesn't
-      // reliably include deep transitive dependencies in the asar.
-      externalizeDeps: {
-        exclude: [
-          '@ai-sdk/provider',
-          '@ai-sdk/provider-utils',
-          '@ai-sdk/anthropic',
-          '@ai-sdk/openai',
-          '@ai-sdk/azure',
-          '@ai-sdk/amazon-bedrock',
-          'ai',
-          'eventsource-parser',
-          '@standard-schema/spec',
-          '@modelcontextprotocol/sdk',
-          'cross-spawn',
-          'which',
-          'path-key',
-          'shebang-command',
-          'shebang-regex',
-          'isexe',
-        ],
-      },
+      // electron-builder + pnpm doesn't reliably include transitive
+      // dependencies in the asar. Disable automatic externalization so
+      // everything is bundled into the main JS, then only externalize
+      // packages that must remain external (native addons, electron).
+      externalizeDeps: false,
       rollupOptions: {
+        external: [
+          'electron',
+          'original-fs',
+          // Native addons that can't be bundled
+          'better-sqlite3',
+          'tiktoken',
+        ],
         input: {
           index: resolve(__dirname, 'electron/main.ts'),
         },
