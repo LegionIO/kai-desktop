@@ -204,7 +204,7 @@ function buildMenu(): void {
 }
 
 // Resolve the app icon — works in both dev and packaged builds
-const APP_ICON = join(__dirname, '../../build/icon.png');
+const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
 
 function createWindow(): BrowserWindow {
@@ -223,7 +223,7 @@ function createWindow(): BrowserWindow {
     visualEffectState: IS_MAC ? 'active' : undefined,
     backgroundColor: IS_MAC ? '#00000000' : (nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff'),
     webPreferences: {
-      preload: join(__dirname, '../preload/index.mjs'),
+      preload: join(import.meta.dirname, '../preload/index.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -343,7 +343,7 @@ function createWindow(): BrowserWindow {
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
+    mainWindow.loadFile(join(import.meta.dirname, '../renderer/index.html'));
   }
 
   mainWindow.once('ready-to-show', () => {

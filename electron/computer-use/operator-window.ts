@@ -11,7 +11,7 @@ function getSetupWindowKey(conversationId?: string | null): string {
 }
 
 function createOperatorBrowserWindow(title: string): BrowserWindow {
-  const preloadPath = join(__dirname, '../preload/index.mjs');
+  const preloadPath = join(import.meta.dirname, '../preload/index.mjs');
   const win = new BrowserWindow({
     width: 1280,
     height: 900,
@@ -36,7 +36,7 @@ function revealWindow(win: BrowserWindow): void {
 
 function loadOperatorRoute(win: BrowserWindow, query: Record<string, string>): void {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
-  const rendererHtmlPath = join(__dirname, '../renderer/index.html');
+  const rendererHtmlPath = join(import.meta.dirname, '../renderer/index.html');
 
   if (rendererUrl) {
     const targetUrl = new URL(rendererUrl);

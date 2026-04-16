@@ -31,7 +31,7 @@ let httpServer: http.Server | https.Server | null = null;
 let wss: WebSocketServer | null = null;
 
 /** Cached favicon PNG read from build/icon.png at module load. */
-const APP_ICON_PATH = join(__dirname, '../../build/icon.png');
+const APP_ICON_PATH = join(import.meta.dirname, '../../build/icon.png');
 let faviconBuffer: Buffer | null = null;
 try {
   if (existsSync(APP_ICON_PATH)) {
@@ -403,7 +403,7 @@ function isAuthenticated(
 const AUTH_EXEMPT_PATHS = new Set(['/login', '/api/login', '/api/auth-status', '/api/token-login', '/favicon.ico', '/favicon.png']);
 
 function getRendererDir(): string {
-  return join(__dirname, '../renderer');
+  return join(import.meta.dirname, '../renderer');
 }
 
 function serveStaticFile(

@@ -5,7 +5,7 @@ import type { ComputerDisplayLayout, ComputerOverlayState } from '../../shared/c
 import { applyBrandUserAgent } from '../utils/user-agent.js';
 
 // Resolve the app icon once — same path as electron/main.ts
-const APP_ICON = join(__dirname, '../../build/icon.png');
+const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 
 /** Ensure the app dock icon stays visible on macOS with the correct custom icon. */
 function ensureDockVisible(): void {
@@ -59,7 +59,7 @@ const overlayWindows = new Map<string, Map<string, BrowserWindow>>();
 
 function loadOverlayRoute(win: BrowserWindow, query: Record<string, string>): void {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
-  const rendererHtmlPath = join(__dirname, '../renderer/index.html');
+  const rendererHtmlPath = join(import.meta.dirname, '../renderer/index.html');
 
   if (rendererUrl) {
     const targetUrl = new URL(rendererUrl);
@@ -98,7 +98,7 @@ function createSingleOverlay(
   bounds: { x: number; y: number; width: number; height: number },
 ): BrowserWindow {
   ensureOverlayMouseIpc();
-  const preloadPath = join(__dirname, '../preload/index.mjs');
+  const preloadPath = join(import.meta.dirname, '../preload/index.mjs');
   const win = new BrowserWindow({
     x: bounds.x,
     y: bounds.y,

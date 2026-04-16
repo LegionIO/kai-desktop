@@ -15,7 +15,7 @@ function getBundledPluginsDir(): string {
     return join(process.resourcesPath, 'bundled-plugins');
   }
   // Dev mode — bundled-plugins/ lives at the project root
-  return join(__dirname, '../../bundled-plugins');
+  return join(import.meta.dirname, '../../bundled-plugins');
 }
 
 function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
