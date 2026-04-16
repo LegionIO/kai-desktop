@@ -26,7 +26,21 @@ brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [
+      externalizeDepsPlugin({
+        exclude: [
+          '@ai-sdk/provider',
+          '@ai-sdk/provider-utils',
+          '@ai-sdk/anthropic',
+          '@ai-sdk/openai',
+          '@ai-sdk/azure',
+          '@ai-sdk/amazon-bedrock',
+          'ai',
+          'eventsource-parser',
+          '@standard-schema/spec',
+        ],
+      }),
+    ],
     define: brandDefines,
     build: {
       rollupOptions: {
