@@ -61,35 +61,40 @@ export const ModelSettingsButton: FC<{
   const currentReasoning = REASONING_OPTIONS.find((o) => o.value === reasoningEffort) ?? REASONING_OPTIONS[1];
 
   return (
-    <div ref={rootRef} className="relative flex items-center gap-1">
-      {/* Chevron button */}
-      <button
-        type="button"
-        onClick={toggle}
-        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
-      >
-        <ChevronUpIcon className="h-3.5 w-3.5" />
-      </button>
+    <div ref={rootRef} className="relative flex items-center">
+      {/* Joined button group: chevron + model icon */}
+      <div className="flex items-center overflow-hidden rounded-xl border border-border/70 bg-card/70 transition-colors">
+        {/* Left segment: chevron — opens settings popover */}
+        <Tooltip content="Model settings" side="top" sideOffset={8}>
+          <button
+            type="button"
+            onClick={toggle}
+            className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+          >
+            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+          </button>
+        </Tooltip>
 
-      {/* Model icon button */}
-      <Tooltip
-        content={
-          <span className="flex items-center gap-1.5">
-            {currentLabel}
-            <span className="text-[10px] opacity-60">{currentReasoning.label}</span>
-          </span>
-        }
-        side="top"
-        sideOffset={8}
-      >
-        <button
-          type="button"
-          onClick={toggle}
-          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
+        {/* Right segment: model icon */}
+        <Tooltip
+          content={
+            <span className="flex items-center gap-1.5">
+              {currentLabel}
+              <span className="text-[10px] opacity-60">{currentReasoning.label}</span>
+            </span>
+          }
+          side="top"
+          sideOffset={8}
         >
-          <CpuIcon className="h-4 w-4" />
-        </button>
-      </Tooltip>
+          <button
+            type="button"
+            onClick={toggle}
+            className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+          >
+            <CpuIcon className="h-4 w-4" />
+          </button>
+        </Tooltip>
+      </div>
 
       {/* Settings popover */}
       {isOpen && (

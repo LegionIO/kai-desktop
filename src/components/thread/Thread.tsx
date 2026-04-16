@@ -1672,10 +1672,30 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   const composerRuntime = useComposerRuntime();
   const { config, updateConfig } = useConfig();
   const [isListening, _setIsListening] = useState(false);
+  const [isActivating, setIsActivating] = useState(false);
   const setIsListening = useCallback((v: boolean) => {
     _setIsListening(v);
+    if (v) setIsActivating(false); // transition from activating → listening
     onListeningChange?.(v);
   }, [onListeningChange]);
+
+  // Short audio feedback tones via Web Audio API
+  const playTone = useCallback((frequency: number, endFrequency: number, duration = 0.12) => {
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, ctx.currentTime);
+      osc.frequency.linearRampToValueAtTime(endFrequency, ctx.currentTime + duration);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + duration);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + duration);
+      setTimeout(() => ctx.close(), (duration + 0.1) * 1000);
+    } catch { /* audio not available */ }
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
@@ -1760,17 +1780,25 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   }, [updateConfig]);
 
   const handleStop = useCallback(() => {
-    if (!isListening) return;
+    if (!isListening && !isActivating) return;
     console.log('[DictationButton] Stopping...');
     sessionRef.current?.stop();
-  }, [isListening]);
+    setIsListening(false);
+    setIsActivating(false);
+    sessionRef.current = null;
+    playTone(480, 320); // falling tone — stop
+  }, [isListening, isActivating, setIsListening, playTone]);
 
   const handleStart = useCallback(() => {
     setError(null);
-    if (isListening) return;
+    if (isListening || isActivating) return;
+
+    // Enter activating state (light blue) before the SDK is ready
+    setIsActivating(true);
 
     console.log('[DictationButton] Starting, provider=%s, deviceId=%s', audioProvider, selectedDeviceId ?? 'default');
     if (!isDictationSupportedForProvider(audioProvider, Boolean(azureConfig?.subscriptionKey))) {
+      setIsActivating(false);
       setError('Speech recognition is not supported');
       return;
     }
@@ -1791,11 +1819,27 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
         } : undefined,
       });
 
-      if (!adapter) { setError('Failed to create dictation adapter'); return; }
+      if (!adapter) { setIsActivating(false); setError('Failed to create dictation adapter'); return; }
 
       const session = adapter.listen();
       sessionRef.current = session;
-      setIsListening(true);
+
+      // Transition to listening when the speech engine is actually ready
+      let transitioned = false;
+      const fallbackTimer = setTimeout(() => {
+        if (transitioned || !sessionRef.current) return;
+        transitioned = true;
+        setIsListening(true);
+        playTone(320, 480);
+      }, 500);
+
+      session.onSpeechStart(() => {
+        if (transitioned) return;
+        transitioned = true;
+        clearTimeout(fallbackTimer);
+        setIsListening(true); // clears isActivating
+        playTone(320, 480); // rising tone — listening
+      });
 
       // Track the committed text (finalized segments) vs partial preview
       let baseText = composerRuntime.getState().text ?? '';
@@ -1818,7 +1862,9 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       };
       extSession.onError?.((err) => {
         console.error('[DictationButton] onError:', err);
+        clearTimeout(fallbackTimer);
         setIsListening(false);
+        setIsActivating(false);
         sessionRef.current = null;
         setError(err === 'not-allowed' ? 'Microphone permission denied'
           : err === 'no-speech' ? 'No speech detected — try again'
@@ -1828,18 +1874,15 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
     } catch (err) {
       console.error('[DictationButton] Failed:', err);
       setIsListening(false);
+      setIsActivating(false);
       setError('Failed to start dictation');
     }
-  }, [isListening, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId]);
+  }, [isListening, isActivating, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId, setIsListening, playTone]);
 
   // Expose start/stop to parent via refs (for keyboard shortcut)
   useEffect(() => {
-    if (startRef) {
-      (startRef as { current: (() => void) | null }).current = handleStart;
-    }
-    if (stopRef) {
-      (stopRef as { current: (() => void) | null }).current = handleStop;
-    }
+    if (startRef) (startRef as { current: (() => void) | null }).current = handleStart;
+    if (stopRef) (stopRef as { current: (() => void) | null }).current = handleStop;
     return () => {
       if (startRef) (startRef as { current: (() => void) | null }).current = null;
       if (stopRef) (stopRef as { current: (() => void) | null }).current = null;
@@ -1871,52 +1914,64 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   const isActive = isListening;
 
   return (
-    <div ref={rootRef} className="relative flex items-center gap-1">
-      {/* Listening indicator: animated dots */}
-      {isActive && (
-        <div className="flex items-center gap-[3px] mr-0.5 px-1">
-          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
-          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
-          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
-        </div>
-      )}
+    <div ref={rootRef} className="relative flex items-center">
+      {/* Joined button group: chevron/dots + mic */}
+      <div className={`flex items-center overflow-hidden rounded-xl border transition-colors ${
+        isActive
+          ? 'border-primary/50 bg-primary/10'
+          : isActivating
+            ? 'border-primary/30 bg-primary/5'
+            : 'border-border/70 bg-card/70'
+      }`}>
+        {/* Left segment: chevron (idle) or animated dots (active) */}
+        {!isWebBridgeDictation && (
+          isActive || isActivating ? (
+            <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+            </div>
+          ) : (
+            <Tooltip content="Microphone settings" side="top" sideOffset={8}>
+              <button
+                type="button"
+                onClick={() => setPickerOpen(!pickerOpen)}
+                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+              >
+                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? 'rotate-180' : ''}`} />
+              </button>
+            </Tooltip>
+          )
+        )}
 
-      {/* Settings chevron button — opens device picker */}
-      {!isWebBridgeDictation && (
-        <button
-          type="button"
-          onClick={() => setPickerOpen(!pickerOpen)}
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
+        {/* Right segment: mic button */}
+        <Tooltip
+          content={
+            <span className="flex items-center gap-2">
+              Press and hold to record
+              <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
+            </span>
+          }
+          side="top"
+          sideOffset={8}
         >
-          <ChevronUpIcon className="h-3.5 w-3.5" />
-        </button>
-      )}
-
-      {/* Mic button */}
-      <Tooltip
-        content={
-          <span className="flex items-center gap-2">
-            Press and hold to record
-            <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
-          </span>
-        }
-        side="top"
-        sideOffset={8}
-      >
-        <button
-          type="button"
-          onMouseDown={handleStart}
-          onMouseUp={handleStop}
-          onMouseLeave={handleStop}
-          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors ${
-            isActive
-              ? 'bg-primary text-primary-foreground'
-              : 'bg-muted/60 text-muted-foreground hover:bg-muted'
-          }`}
-        >
-          <MicIcon className="h-4 w-4" />
-        </button>
-      </Tooltip>
+          <button
+            type="button"
+            onMouseDown={handleStart}
+            onMouseUp={handleStop}
+            onMouseLeave={handleStop}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+              isActive
+                ? 'bg-primary text-primary-foreground'
+                : isActivating
+                  ? 'bg-primary/40 text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted/50'
+            }`}
+          >
+            <MicIcon className="h-4 w-4" />
+          </button>
+        </Tooltip>
+      </div>
 
       {/* Error tooltip */}
       {error && (
@@ -2046,26 +2101,30 @@ const Composer: FC<{
   const dictationStopRef = useRef<(() => void) | null>(null);
 
   // ⌘D keyboard shortcut: hold to record, release to stop
+  const dictatingViaKeyboard = useRef(false);
   useEffect(() => {
     if (!dictationEnabled) return;
     const onDown = (e: KeyboardEvent) => {
       if (e.repeat) return;
       if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
         e.preventDefault();
+        dictatingViaKeyboard.current = true;
         dictationStartRef.current?.();
       }
     };
-    const onUp = (e: KeyboardEvent) => {
-      // Stop when either D or the modifier key (⌘/Ctrl) is released
-      if (e.key === 'd' || e.key === 'D' || e.key === 'Meta' || e.key === 'Control') {
+    const stop = () => {
+      if (dictatingViaKeyboard.current) {
+        dictatingViaKeyboard.current = false;
         dictationStopRef.current?.();
       }
     };
     window.addEventListener('keydown', onDown);
-    window.addEventListener('keyup', onUp);
+    window.addEventListener('keyup', stop);
+    window.addEventListener('blur', stop);
     return () => {
       window.removeEventListener('keydown', onDown);
-      window.removeEventListener('keyup', onUp);
+      window.removeEventListener('keyup', stop);
+      window.removeEventListener('blur', stop);
     };
   }, [dictationEnabled]);
 
