@@ -109,6 +109,9 @@ type AppAPI = {
     fetch: (url: string) => Promise<{ data?: string; mime?: string; error?: string }>;
     save: (url: string, suggestedName?: string) => Promise<{ canceled?: boolean; filePath?: string; error?: string }>;
   };
+  shell: {
+    openPath: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+  };
   platform: {
     homedir: () => Promise<string>;
   };
@@ -174,6 +177,11 @@ type AppAPI = {
     nonLlmEvents: (params?: Record<string, string>) => Promise<unknown>;
     recordEvent: (event: unknown) => Promise<unknown>;
     exportCsv: () => Promise<unknown>;
+  };
+  autoUpdate: {
+    check: () => Promise<{ ok?: boolean; error?: string }>;
+    install: () => Promise<void>;
+    onStatus: (callback: (status: { state: string; version?: string }) => void) => () => void;
   };
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;

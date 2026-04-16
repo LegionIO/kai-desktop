@@ -24,6 +24,7 @@ import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { CpuIcon, DownloadIcon, MenuIcon, SettingsIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarDock, type DockItem } from '@/components/SidebarDock';
+import { UpdateCard } from '@/components/UpdateCard';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import { app } from '@/lib/ipc-client';
@@ -852,6 +853,7 @@ function AppShell() {
               <div className="shrink-0">
                 <SubAgentSidebarSection />
               </div>
+              <UpdateCard />
               <SidebarDock items={dockItems} />
             </div>
           </aside>

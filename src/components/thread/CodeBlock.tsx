@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useLayoutEffect, useCallback, useRef, mem
 import ShikiHighlighter from 'react-shiki';
 import { CopyIcon, CheckIcon, BracketsIcon, MinimizeIcon, FileTextIcon } from 'lucide-react';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
+import { Tooltip } from '@/components/ui/Tooltip';
 
 /* ── Lazy-loaded heavy deps ── */
 const lazyHljs = () => import('highlight.js').then((m) => m.default);
@@ -283,9 +284,11 @@ type CodeBlockProps = {
   language?: string;
   isError?: boolean;
   maxHeight?: string;
+  /** Extra buttons rendered at the start of the toolbar (before compact/copy) */
+  extraActions?: React.ReactNode;
 };
 
-export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, isError, maxHeight = '400px' }) => {
+export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, isError, maxHeight = '400px', extraActions }) => {
   const code = rawCode ?? '';
   const [viewMode, setViewMode] = useState<ViewMode>('original');
   const [copied, setCopied] = useState(false);
@@ -327,26 +330,29 @@ export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, is
   return (
     <div className={`relative group/code ${isError ? 'ring-1 ring-destructive/30 rounded-md' : ''}`}>
       <div className="absolute right-2 bottom-2 flex items-center gap-1 z-10">
+        {extraActions}
         {canToggle && (
+          <Tooltip content={modeTooltips[next]} side="top">
+            <button
+              type="button"
+              onClick={() => setViewMode(next)}
+              className={`h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm ${
+                isActive ? 'text-blue-500 hover:text-blue-600 hover:bg-blue-500/10' : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+              }`}
+            >
+              <NextIcon className="h-3 w-3" />
+            </button>
+          </Tooltip>
+        )}
+        <Tooltip content={copied ? 'Copied!' : 'Copy code'} side="top">
           <button
             type="button"
-            onClick={() => setViewMode(next)}
-            title={modeTooltips[next]}
-            className={`h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm ${
-              isActive ? 'text-blue-500 hover:text-blue-600 hover:bg-blue-500/10' : 'text-muted-foreground hover:text-foreground hover:bg-accent'
-            }`}
+            onClick={handleCopy}
+            className="h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm text-muted-foreground hover:text-foreground hover:bg-accent"
           >
-            <NextIcon className="h-3 w-3" />
+            {copied ? <CheckIcon className="h-3 w-3 text-green-500" /> : <CopyIcon className="h-3 w-3" />}
           </button>
-        )}
-        <button
-          type="button"
-          onClick={handleCopy}
-          title="Copy code"
-          className="h-6 w-6 p-0 inline-flex items-center justify-center rounded opacity-100 md:opacity-0 md:group-hover/code:opacity-100 transition-opacity bg-background/80 backdrop-blur-sm text-muted-foreground hover:text-foreground hover:bg-accent"
-        >
-          {copied ? <CheckIcon className="h-3 w-3 text-green-500" /> : <CopyIcon className="h-3 w-3" />}
-        </button>
+        </Tooltip>
       </div>
       <div className="rounded-md overflow-hidden" style={{ maxHeight, overflow: 'auto' }}>
         <ShikiHighlighter
@@ -547,33 +553,36 @@ export const EditableCodeBlock: FC<EditableCodeBlockProps> = memo(({
         />
         <div className="ml-auto flex items-center gap-1">
           {formatInfo?.modes.includes('beautify') && (
-            <button
-              type="button"
-              onClick={() => applyTransform('beautify')}
-              title="Beautify code"
-              className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/80 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            >
-              <BracketsIcon className="h-3.5 w-3.5" />
-            </button>
+            <Tooltip content="Beautify code" side="top">
+              <button
+                type="button"
+                onClick={() => applyTransform('beautify')}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/80 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <BracketsIcon className="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
           )}
           {formatInfo?.modes.includes('minify') && (
+            <Tooltip content="Minify code" side="top">
+              <button
+                type="button"
+                onClick={() => applyTransform('minify')}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/80 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <MinimizeIcon className="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
+          )}
+          <Tooltip content={copied ? 'Copied!' : 'Copy code'} side="top">
             <button
               type="button"
-              onClick={() => applyTransform('minify')}
-              title="Minify code"
+              onClick={handleCopy}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/80 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             >
-              <MinimizeIcon className="h-3.5 w-3.5" />
+              {copied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5" />}
             </button>
-          )}
-          <button
-            type="button"
-            onClick={handleCopy}
-            title="Copy code"
-            className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-background/80 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            {copied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5" />}
-          </button>
+          </Tooltip>
         </div>
       </div>
       <div className="relative overflow-hidden rounded-b-xl" style={{ height: editorHeight }}>

@@ -27,7 +27,6 @@ import {
   Volume2Icon,
   SquareIcon,
   MicIcon,
-  MicOffIcon,
   ChevronUpIcon,
   PhoneIcon,
   MonitorIcon,
@@ -53,10 +52,10 @@ import { ComposerInput } from './ComposerInput';
 import { RichChatInput } from './RichChatInput';
 import { DeviceRow } from './DeviceRow';
 import { SearchBar } from './SearchBar';
-import { ModelSelector } from './ModelSelector';
-import { ReasoningEffortSelector, type ReasoningEffort } from './ReasoningEffortSelector';
+import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { ProfileSelector } from './ProfileSelector';
-import { FallbackToggle } from './FallbackToggle';
+import { ModelSettingsButton } from './ModelSettingsButton';
+import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
@@ -65,6 +64,7 @@ import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, type ComputerSession } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
+import { SPINNER_VERBS } from '@/config/spinner-verbs';
 const MATRIX_GLYPHS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*+-/~{[|`]}<>01';
 
 export type ThreadMode = 'chat' | 'computer';
@@ -1073,7 +1073,7 @@ const UserMessage: FC = () => {
     <MessagePrimitive.Root className="group mb-6 flex justify-end">
       <div className="max-w-[88%] md:max-w-[72%]">
         <div
-          className="rounded-[1.6rem] border px-5 py-3 text-foreground backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.22),var(--app-user-bubble-shadow)]"
+          className="rounded-xl border px-4 py-2.5 text-foreground"
           style={{
             backgroundColor: 'var(--app-user-bubble)',
             borderColor: 'var(--app-user-bubble-border)',
@@ -1081,12 +1081,12 @@ const UserMessage: FC = () => {
         >
           <MessagePrimitive.Content components={userContentComponents} />
         </div>
-        <div className="flex items-center justify-end gap-1">
-          <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
+        <div className={`flex items-center justify-end gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+          <MessageTimestamp date={message.createdAt} align="right" />
+          <ActionBarPrimitive.Root className="flex items-center gap-1">
             <CopyButton />
             {ttsEnabled && <SpeakButton />}
           </ActionBarPrimitive.Root>
-          <MessageTimestamp date={message.createdAt} align="right" />
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1224,10 +1224,22 @@ const ToolFallback: FC<{
     stopped?: boolean;
   };
 }> = (props) => {
+  const hasResult = props.result !== undefined;
+  const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
+    (props.result as Record<string, unknown>).error || (props.result as Record<string, unknown>).isError === true
+  ));
+  const isRunning = !hasResult;
+  const dotColor = isRunning
+    ? 'bg-blue-500 animate-pulse'
+    : isError
+      ? 'bg-red-500'
+      : 'bg-emerald-500';
+
   // Render sub-agent tool calls with the specialized component
   if (props.toolName === 'sub_agent') {
     return (
-      <div className="my-1">
+      <div className="timeline-item my-1">
+        <span className={`timeline-dot timeline-dot-tool ${dotColor}`} />
         <SubAgentInline
           toolCallId={props.toolCallId}
           args={props.args}
@@ -1240,7 +1252,8 @@ const ToolFallback: FC<{
   }
 
   return (
-    <div className="my-1">
+    <div className="timeline-item my-1">
+      <span className={`timeline-dot timeline-dot-tool ${dotColor}`} />
       <ToolCallDisplay
         part={{
           type: 'tool-call',
@@ -1262,9 +1275,9 @@ const ToolFallback: FC<{
   );
 };
 
-/** Wraps consecutive tool calls with a divider above */
+/** Wraps consecutive tool calls */
 const ToolGroupWrapper: FC<PropsWithChildren> = ({ children }) => (
-  <div className="my-2 border-t border-border/40 pt-2 space-y-1.5">
+  <div className="space-y-0">
     {children}
   </div>
 );
@@ -1284,7 +1297,75 @@ const userContentComponents = {
 
 const AssistantTextPart: FC<{ text: string }> = ({ text }) => {
   if (!text) return null;
-  return <div className="py-0.5"><MarkdownText text={text} /></div>;
+  return (
+    <div className="timeline-item py-0.5">
+      <span className="timeline-dot bg-[oklch(0.55_0.01_0)]" />
+      <div className="min-w-0 flex-1"><MarkdownText text={text} /></div>
+    </div>
+  );
+};
+
+const ThinkingSpinner: FC = () => {
+  const [currentVerb, setCurrentVerb] = useState<string>(
+    () => SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)],
+  );
+  const [displayText, setDisplayText] = useState(() => currentVerb + '...');
+  const [cursorPos, setCursorPos] = useState(-1); // -1 = no cursor visible
+  const nextVerbRef = useRef('');
+  const frameRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Pick a new verb every ~4s and animate the transition
+  useEffect(() => {
+    const interval = setInterval(() => {
+      let next: string;
+      do {
+        next = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
+      } while (next === currentVerb);
+      nextVerbRef.current = next + '...';
+      setCursorPos(0); // start sweep
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [currentVerb]);
+
+  // Animate the block cursor sweep: reveal new text char-by-char
+  useEffect(() => {
+    if (cursorPos < 0) return; // no animation in progress
+
+    const target = nextVerbRef.current;
+    const maxLen = Math.max(displayText.length, target.length);
+
+    if (cursorPos > maxLen) {
+      // Animation complete — settle on new text
+      setDisplayText(target);
+      setCursorPos(-1);
+      setCurrentVerb(target.replace(/\.\.\.$/, ''));
+      return;
+    }
+
+    // Build the display: new chars up to cursor, then cursor block, then old chars after
+    const revealed = target.slice(0, cursorPos);
+    const remaining = displayText.slice(cursorPos + 1);
+    setDisplayText(revealed + '\u2588' + remaining); // █ block cursor
+
+    frameRef.current = setTimeout(() => {
+      setCursorPos((p) => p + 1);
+    }, 25); // ~25ms per character for a quick sweep
+
+    return () => {
+      if (frameRef.current) clearTimeout(frameRef.current);
+    };
+  }, [cursorPos]);
+
+  return (
+    <div className="timeline-item py-0.5">
+      <span className="timeline-dot-icon">
+        <span className="thinking-spinner text-muted-foreground/50 select-none" aria-hidden="true" />
+      </span>
+      <span className="text-xs font-mono text-muted-foreground/60 whitespace-pre">
+        {displayText}
+      </span>
+    </div>
+  );
 };
 
 /** Inline interrupt divider — shown where the user interrupted the AI's speech */
@@ -1342,24 +1423,41 @@ const AssistantMessage: FC = () => {
   const responseTiming = getResponseTiming(message);
   const badgeStartedAt = responseTiming?.startedAt ?? (isRunning ? activeRunStartedAt ?? undefined : undefined);
   const badgeFinishedAt = responseTiming?.finishedAt;
-  const showResponseBadge = Boolean(badgeStartedAt);
+
+  // Mark first/last .timeline-item so CSS can clip the line at the dots
+  const contentRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const allItems = Array.from(el.querySelectorAll('.timeline-item'));
+    const items = allItems.filter((item) => {
+      const parent = item.closest('.aui-typing-dots');
+      return !parent || getComputedStyle(parent).display !== 'none';
+    });
+    if (items.length >= 2) {
+      const containerRect = el.getBoundingClientRect();
+      const firstDot = items[0].querySelector('.timeline-dot, .timeline-dot-icon');
+      const lastDot = items[items.length - 1].querySelector('.timeline-dot, .timeline-dot-icon');
+      if (firstDot && lastDot) {
+        const firstRect = firstDot.getBoundingClientRect();
+        const lastRect = lastDot.getBoundingClientRect();
+        const top = firstRect.top + firstRect.height / 2 - containerRect.top;
+        const bottom = containerRect.bottom - (lastRect.top + lastRect.height / 2);
+        el.style.setProperty('--timeline-top', `${top}px`);
+        el.style.setProperty('--timeline-bottom', `${bottom}px`);
+        el.classList.add('has-timeline');
+      } else {
+        el.classList.remove('has-timeline');
+      }
+    } else {
+      el.classList.remove('has-timeline');
+    }
+  });
 
   return (
     <MessagePrimitive.Root className="group mb-8 flex justify-start">
       <div className="w-full max-w-4xl">
-        <div className={`aui-assistant-content relative rounded-[1.5rem] border border-border/45 bg-card/[0.22] px-4 py-3 text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-[2px] ${showResponseBadge ? 'pr-20' : ''}`}>
-          {showResponseBadge && (
-            <div
-              className="aui-assistant-badge pointer-events-none absolute z-10 flex"
-              style={{ top: '10px', right: '10px' }}
-            >
-              <ElapsedBadge
-                startedAt={badgeStartedAt}
-                finishedAt={badgeFinishedAt}
-                isRunning={isRunning}
-              />
-            </div>
-          )}
+        <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 py-3 text-foreground">
           {isEmpty ? (
             <div className="flex items-center gap-2 py-0.5 text-muted-foreground">
               <BanIcon className="h-3.5 w-3.5" />
@@ -1378,22 +1476,27 @@ const AssistantMessage: FC = () => {
           ) : (
             <>
               <MessagePrimitive.Content components={assistantContentComponents} />
-              {/* Typing dots: visible inside assistant bubble, hidden by CSS once content parts render */}
+              {/* Thinking spinner: visible inside assistant bubble, hidden by CSS once content parts render */}
               <div className="aui-typing-dots">
-                <div className="flex items-center gap-1.5 py-0.5">
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:0ms]" />
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:150ms]" />
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:300ms]" />
-                </div>
+                <ThinkingSpinner />
               </div>
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
           {tokenUsage && !isRunning && <TokenUsage usage={tokenUsage} />}
         </div>
-        <div className="flex items-center gap-1">
-          <MessageTimestamp date={message.createdAt} align="left" />
+        <div className={`flex items-center gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
+          <MessageTimestamp date={message.createdAt} align="left" />
+          {badgeStartedAt && (
+            <span className="ml-2 -translate-y-px">
+              <ElapsedBadge
+                startedAt={badgeStartedAt}
+                finishedAt={badgeFinishedAt}
+                isRunning={isRunning}
+              />
+            </span>
+          )}
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1406,7 +1509,7 @@ const AssistantActionBar: FC = () => {
     ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
     : true;
   return (
-    <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
+    <ActionBarPrimitive.Root className="flex items-center gap-1">
       <CopyButton />
       {ttsEnabled && <SpeakButton />}
       <ActionBarPrimitive.Reload asChild>
@@ -1559,10 +1662,40 @@ const StopButton: FC = () => {
   );
 };
 
-const DictationButton: FC = () => {
+interface DictationButtonProps {
+  onListeningChange?: (listening: boolean) => void;
+  startRef?: React.RefObject<(() => void) | null>;
+  stopRef?: React.RefObject<(() => void) | null>;
+}
+
+const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef, stopRef }) => {
   const composerRuntime = useComposerRuntime();
   const { config, updateConfig } = useConfig();
-  const [isListening, setIsListening] = useState(false);
+  const [isListening, _setIsListening] = useState(false);
+  const [isActivating, setIsActivating] = useState(false);
+  const setIsListening = useCallback((v: boolean) => {
+    _setIsListening(v);
+    if (v) setIsActivating(false); // transition from activating → listening
+    onListeningChange?.(v);
+  }, [onListeningChange]);
+
+  // Short audio feedback tones via Web Audio API
+  const playTone = useCallback((frequency: number, endFrequency: number, duration = 0.12) => {
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, ctx.currentTime);
+      osc.frequency.linearRampToValueAtTime(endFrequency, ctx.currentTime + duration);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + duration);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + duration);
+      setTimeout(() => ctx.close(), (duration + 0.1) * 1000);
+    } catch { /* audio not available */ }
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
@@ -1646,17 +1779,26 @@ const DictationButton: FC = () => {
     updateConfig('audio.dictation.inputDeviceId', deviceId);
   }, [updateConfig]);
 
-  const handleToggle = useCallback(() => {
-    setError(null);
+  const handleStop = useCallback(() => {
+    if (!isListening && !isActivating) return;
+    console.log('[DictationButton] Stopping...');
+    sessionRef.current?.stop();
+    setIsListening(false);
+    setIsActivating(false);
+    sessionRef.current = null;
+    playTone(480, 320); // falling tone — stop
+  }, [isListening, isActivating, setIsListening, playTone]);
 
-    if (isListening) {
-      console.log('[DictationButton] Stopping...');
-      sessionRef.current?.stop();
-      return;
-    }
+  const handleStart = useCallback(() => {
+    setError(null);
+    if (isListening || isActivating) return;
+
+    // Enter activating state (light blue) before the SDK is ready
+    setIsActivating(true);
 
     console.log('[DictationButton] Starting, provider=%s, deviceId=%s', audioProvider, selectedDeviceId ?? 'default');
     if (!isDictationSupportedForProvider(audioProvider, Boolean(azureConfig?.subscriptionKey))) {
+      setIsActivating(false);
       setError('Speech recognition is not supported');
       return;
     }
@@ -1677,11 +1819,27 @@ const DictationButton: FC = () => {
         } : undefined,
       });
 
-      if (!adapter) { setError('Failed to create dictation adapter'); return; }
+      if (!adapter) { setIsActivating(false); setError('Failed to create dictation adapter'); return; }
 
       const session = adapter.listen();
       sessionRef.current = session;
-      setIsListening(true);
+
+      // Transition to listening when the speech engine is actually ready
+      let transitioned = false;
+      const fallbackTimer = setTimeout(() => {
+        if (transitioned || !sessionRef.current) return;
+        transitioned = true;
+        setIsListening(true);
+        playTone(320, 480);
+      }, 500);
+
+      session.onSpeechStart(() => {
+        if (transitioned) return;
+        transitioned = true;
+        clearTimeout(fallbackTimer);
+        setIsListening(true); // clears isActivating
+        playTone(320, 480); // rising tone — listening
+      });
 
       // Track the committed text (finalized segments) vs partial preview
       let baseText = composerRuntime.getState().text ?? '';
@@ -1704,7 +1862,9 @@ const DictationButton: FC = () => {
       };
       extSession.onError?.((err) => {
         console.error('[DictationButton] onError:', err);
+        clearTimeout(fallbackTimer);
         setIsListening(false);
+        setIsActivating(false);
         sessionRef.current = null;
         setError(err === 'not-allowed' ? 'Microphone permission denied'
           : err === 'no-speech' ? 'No speech detected — try again'
@@ -1714,9 +1874,20 @@ const DictationButton: FC = () => {
     } catch (err) {
       console.error('[DictationButton] Failed:', err);
       setIsListening(false);
+      setIsActivating(false);
       setError('Failed to start dictation');
     }
-  }, [isListening, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId]);
+  }, [isListening, isActivating, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId, setIsListening, playTone]);
+
+  // Expose start/stop to parent via refs (for keyboard shortcut)
+  useEffect(() => {
+    if (startRef) (startRef as { current: (() => void) | null }).current = handleStart;
+    if (stopRef) (stopRef as { current: (() => void) | null }).current = handleStop;
+    return () => {
+      if (startRef) (startRef as { current: (() => void) | null }).current = null;
+      if (stopRef) (stopRef as { current: (() => void) | null }).current = null;
+    };
+  }, [startRef, stopRef, handleStart, handleStop]);
 
   // Poll session status for cleanup
   useEffect(() => {
@@ -1743,59 +1914,86 @@ const DictationButton: FC = () => {
   const isActive = isListening;
 
   return (
-    <div ref={rootRef} className="relative flex items-center gap-1">
-      {/* Split button: mic | caret */}
-      <div className={`flex items-center rounded-xl border overflow-hidden transition-colors ${
-        isListening ? 'border-emerald-500/50 bg-emerald-500/10'
-        : error ? 'border-yellow-500/50 bg-yellow-500/10'
-        : 'border-border/70 bg-card/70'
+    <div ref={rootRef} className="relative flex items-center">
+      {/* Joined button group: chevron/dots + mic */}
+      <div className={`flex items-center overflow-hidden rounded-xl border transition-colors ${
+        isActive
+          ? 'border-primary/50 bg-primary/10'
+          : isActivating
+            ? 'border-primary/30 bg-primary/5'
+            : 'border-border/70 bg-card/70'
       }`}>
-        {/* Mic toggle */}
-        <button
-          type="button"
-          onClick={handleToggle}
-          className={`flex h-8 w-7 items-center justify-center transition-colors ${
-            isActive ? '' : 'hover:bg-muted/50'
-          }`}
-          title={error ?? (isListening ? 'Stop dictation' : 'Start dictation')}
-        >
-          {isListening
-            ? <MicIcon className="h-3.5 w-3.5 text-emerald-500 animate-pulse" />
-            : <MicOffIcon className={`h-3.5 w-3.5 ${error ? 'text-yellow-500' : 'text-muted-foreground'}`} />
-          }
-        </button>
-        {/* Caret dropdown trigger — hidden on web where browser handles device selection */}
+        {/* Left segment: chevron (idle) or animated dots (active) */}
         {!isWebBridgeDictation && (
+          isActive || isActivating ? (
+            <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+            </div>
+          ) : (
+            <Tooltip content="Microphone settings" side="top" sideOffset={8}>
+              <button
+                type="button"
+                onClick={() => setPickerOpen(!pickerOpen)}
+                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+              >
+                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? 'rotate-180' : ''}`} />
+              </button>
+            </Tooltip>
+          )
+        )}
+
+        {/* Right segment: mic button */}
+        <Tooltip
+          content={
+            <span className="flex items-center gap-2">
+              Press and hold to record
+              <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
+            </span>
+          }
+          side="top"
+          sideOffset={8}
+        >
           <button
             type="button"
-            onClick={() => setPickerOpen(!pickerOpen)}
-            className={`flex h-8 w-4 items-center justify-center border-l transition-colors ${
-              isActive ? 'border-border/30' : 'border-border/50 hover:bg-muted/50'
+            onMouseDown={handleStart}
+            onMouseUp={handleStop}
+            onMouseLeave={handleStop}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+              isActive
+                ? 'bg-primary text-primary-foreground'
+                : isActivating
+                  ? 'bg-primary/40 text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted/50'
             }`}
-            title="Select microphone"
           >
-            <ChevronUpIcon className="h-2.5 w-2.5 text-muted-foreground" />
+            <MicIcon className="h-4 w-4" />
           </button>
-        )}
+        </Tooltip>
       </div>
-
-      {/* Status label */}
-      {isActive && (
-        <span className="text-[10px] font-medium animate-pulse text-emerald-500">
-          Listening...
-        </span>
-      )}
 
       {/* Error tooltip */}
       {error && (
-        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
+        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
           {error}
         </div>
       )}
 
-      {/* Device picker popover */}
-      {pickerOpen && (
-        <div className="absolute bottom-full left-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+      {/* Device picker popover — toggled by chevron button */}
+      {pickerOpen && !isWebBridgeDictation && (
+        <div className="absolute bottom-full right-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+          {/* Level indicator bar */}
+          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+            <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-75"
+                style={{ width: `${Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500))}%` }}
+              />
+            </div>
+          </div>
+
           <div className="px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
             Input Device
           </div>
@@ -1825,6 +2023,25 @@ const DictationButton: FC = () => {
               </div>
             )}
           </div>
+
+          {/* Hold to record toggle */}
+          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-1 px-2 py-2">
+            <div className="flex items-center gap-2">
+              <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="text-xs text-foreground">Hold to record</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => updateConfig('audio.dictation.continuous', !(dictationConfig?.continuous ?? true))}
+              className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
+                (dictationConfig?.continuous ?? true) ? 'bg-primary' : 'bg-muted-foreground/30'
+              }`}
+            >
+              <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                (dictationConfig?.continuous ?? true) ? 'translate-x-[21px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -1846,14 +2063,15 @@ const CallButton: FC = () => {
   }, [startCall]);
 
   return (
-    <button
-      type="button"
-      onClick={handleClick}
-      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50"
-      title="Start voice call"
-    >
-      <PhoneIcon className="h-3.5 w-3.5 text-muted-foreground" />
-    </button>
+    <Tooltip content="Start voice call" side="top" sideOffset={8}>
+      <button
+        type="button"
+        onClick={handleClick}
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
+      >
+        <PhoneIcon className="h-4 w-4" />
+      </button>
+    </Tooltip>
   );
 };
 
@@ -1878,6 +2096,37 @@ const Composer: FC<{
   const dictationEnabled = (config as Record<string, unknown> | null)?.audio
     ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
     : true;
+  const [isDictating, setIsDictating] = useState(false);
+  const dictationStartRef = useRef<(() => void) | null>(null);
+  const dictationStopRef = useRef<(() => void) | null>(null);
+
+  // ⌘D keyboard shortcut: hold to record, release to stop
+  const dictatingViaKeyboard = useRef(false);
+  useEffect(() => {
+    if (!dictationEnabled) return;
+    const onDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
+        e.preventDefault();
+        dictatingViaKeyboard.current = true;
+        dictationStartRef.current?.();
+      }
+    };
+    const stop = () => {
+      if (dictatingViaKeyboard.current) {
+        dictatingViaKeyboard.current = false;
+        dictationStopRef.current?.();
+      }
+    };
+    window.addEventListener('keydown', onDown);
+    window.addEventListener('keyup', stop);
+    window.addEventListener('blur', stop);
+    return () => {
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup', stop);
+      window.removeEventListener('blur', stop);
+    };
+  }, [dictationEnabled]);
 
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -2060,7 +2309,7 @@ const Composer: FC<{
                   </div>
                 )}
                 <ComposerInput
-                  placeholder={__BRAND_COMPOSER_PLACEHOLDER}
+                  placeholder={isDictating ? 'Listening...' : __BRAND_COMPOSER_PLACEHOLDER}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -2102,28 +2351,21 @@ const Composer: FC<{
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
-                    {dictationEnabled && <DictationButton />}
-                    <CallButton />
                     <ProfileSelector
                       selectedProfileKey={selectedProfileKey}
                       onSelectProfile={onSelectProfile}
                     />
-                    <div className="flex min-w-0 basis-full items-center gap-1.5 md:basis-auto md:gap-2">
-                      <FallbackToggle
-                        enabled={fallbackEnabled}
-                        onToggle={onToggleFallback}
-                      />
-                      <ModelSelector
-                        selectedModelKey={selectedModelKey}
-                        onSelectModel={onSelectModel}
-                        disabled={fallbackEnabled}
-                      />
-                      <ReasoningEffortSelector
-                        value={reasoningEffort}
-                        onChange={onChangeReasoningEffort}
-                      />
-                    </div>
                   </div>
+                  <ModelSettingsButton
+                    selectedModelKey={selectedModelKey}
+                    onSelectModel={onSelectModel}
+                    reasoningEffort={reasoningEffort}
+                    onChangeReasoningEffort={onChangeReasoningEffort}
+                    fallbackEnabled={fallbackEnabled}
+                    onToggleFallback={onToggleFallback}
+                  />
+                  {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
+                  <CallButton />
                   <ThreadPrimitive.If running={false}>
                     <button
                       type="button"

@@ -254,6 +254,22 @@ jobs:
             --title "$TAG" \
             --verify-tag
 
+      - name: Upload auto-update artifacts
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          # Upload the ZIP archive (used by electron-updater for macOS auto-updates)
+          zip_path="$(find dist -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          if [ -n "$zip_path" ]; then
+            gh release upload "$TAG" "$zip_path" --clobber
+          fi
+
+          # Upload the latest-mac.yml manifest (tells electron-updater where to find the update)
+          manifest_path="$(find dist -maxdepth 1 -type f -name 'latest-mac.yml' | head -n 1)"
+          if [ -n "$manifest_path" ]; then
+            gh release upload "$TAG" "$manifest_path" --clobber
+          fi
+
   update-cask:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs:

@@ -183,6 +183,10 @@ const appAPI = {
     save: (url: string, suggestedName?: string) => ipcRenderer.invoke('image:save', url, suggestedName) as Promise<{ canceled?: boolean; filePath?: string; error?: string }>,
   },
 
+  shell: {
+    openPath: (filePath: string) => ipcRenderer.invoke('shell:open-path', filePath) as Promise<{ ok: boolean; error?: string }>,
+  },
+
   platform: {
     homedir: () => ipcRenderer.invoke('platform:homedir'),
   },
@@ -285,6 +289,16 @@ const appAPI = {
     nonLlmEvents: (params?: Record<string, string>) => ipcRenderer.invoke('usage:non-llm-events', params),
     recordEvent: (event: unknown) => ipcRenderer.invoke('usage:record-event', event),
     exportCsv: () => ipcRenderer.invoke('usage:export-csv'),
+  },
+
+  autoUpdate: {
+    check: () => ipcRenderer.invoke('auto-update:check'),
+    install: () => ipcRenderer.invoke('auto-update:install'),
+    onStatus: (callback: (status: { state: string; version?: string }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: { state: string; version?: string }) => callback(status);
+      ipcRenderer.on('auto-update:status', handler);
+      return () => ipcRenderer.removeListener('auto-update:status', handler);
+    },
   },
 
   onMenuOpenSettings: (callback: () => void) => {

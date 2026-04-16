@@ -3,7 +3,7 @@ import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 
 interface TooltipProps {
   children: ReactNode;
-  content: string;
+  content: ReactNode;
   side?: 'top' | 'right' | 'bottom' | 'left';
   sideOffset?: number;
   delayDuration?: number;

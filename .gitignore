@@ -8,6 +8,8 @@ build/bin/
 .env.*
 !.env.example
 pnpm-debug.log*
+pnpm-lock.yaml
+.npmrc
 *.tsbuildinfo
 
 # Auto-generated from electron-builder.template.yml by scripts/generate-builder-config.ts
