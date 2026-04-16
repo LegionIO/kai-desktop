@@ -69,7 +69,8 @@ async function generateObjectWithJsonRepair<T extends z.ZodType>(
   request: Omit<Parameters<typeof generateObject>[0], 'model'>,
   model: Awaited<ReturnType<typeof createModel>>,
 ): Promise<z.infer<T>> {
-  const schemaJson = JSON.stringify(zodToJsonSchema(schema, 'result'), null, 2);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const schemaJson = JSON.stringify(zodToJsonSchema(schema as any, 'result'), null, 2);
   const jsonOnlyInstruction = [
     'Return only a JSON object that matches the JSON Schema exactly.',
     'Do not include markdown fences, explanations, or any text before or after the JSON.',
@@ -374,11 +375,12 @@ export async function createPlannerState(
     }),
     callbacks,
   );
+  const obj = result.object as z.infer<typeof plannerSchema>;
   return {
     state: {
-      summary: result.object.summary,
-      subgoals: result.object.subgoals,
-      successCriteria: result.object.successCriteria,
+      summary: obj.summary,
+      subgoals: obj.subgoals,
+      successCriteria: obj.successCriteria,
       activeSubgoalIndex: 0,
     },
     modelIndex: result.modelIndex,
@@ -567,12 +569,13 @@ export async function generateNextActions(params: {
     callbacks,
   );
 
+  const actionObj = result.object as z.infer<typeof actionSchema>;
   return {
     plannerState,
-    summary: result.object.summary,
-    complete: result.object.complete,
-    currentSubgoal: result.object.nextSubgoal ?? currentSubgoal,
-    actions: result.object.actions.map((action: z.infer<typeof actionSchema>['actions'][number]) => ({
+    summary: actionObj.summary,
+    complete: actionObj.complete,
+    currentSubgoal: actionObj.nextSubgoal ?? currentSubgoal,
+    actions: actionObj.actions.map((action: z.infer<typeof actionSchema>['actions'][number]) => ({
       id: makeComputerUseId('action'),
       sessionId: session.id,
       createdAt: new Date().toISOString(),

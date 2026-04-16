@@ -127,7 +127,7 @@ const ObserverActionSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('launch_tool'),
     toolName: z.string().min(1),
-    args: z.record(z.any()).default({}),
+    args: z.record(z.string(), z.any()).default({}),
     message: z.string().max(220).optional(),
     rationale: z.string().max(240).optional(),
     toolCallId: z.string().optional(),

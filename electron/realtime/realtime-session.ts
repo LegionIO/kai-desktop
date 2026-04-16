@@ -455,7 +455,8 @@ export class RealtimeSession {
     const toolDefinitions = effectiveTools.map((tool) => {
       let parameters: Record<string, unknown> = { type: 'object', properties: {} };
       if (tool.inputSchema) {
-        const schema = zodToJsonSchema(tool.inputSchema) as Record<string, unknown>;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const schema = zodToJsonSchema(tool.inputSchema as any) as Record<string, unknown>;
         // Remove $schema and additionalProperties — Realtime API doesn't need them
         delete schema.$schema;
         delete schema.additionalProperties;

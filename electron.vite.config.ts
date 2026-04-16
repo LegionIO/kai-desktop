@@ -1,5 +1,5 @@
 import { resolve } from 'path';
-import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
+import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/postcss';
 import autoprefixer from 'autoprefixer';
@@ -26,8 +26,9 @@ brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 
 export default defineConfig({
   main: {
-    plugins: [
-      externalizeDepsPlugin({
+    define: brandDefines,
+    build: {
+      externalizeDeps: {
         exclude: [
           '@ai-sdk/provider',
           '@ai-sdk/provider-utils',
@@ -39,10 +40,7 @@ export default defineConfig({
           'eventsource-parser',
           '@standard-schema/spec',
         ],
-      }),
-    ],
-    define: brandDefines,
-    build: {
+      },
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'electron/main.ts'),
@@ -51,7 +49,6 @@ export default defineConfig({
     },
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
     define: brandDefines,
     build: {
       rollupOptions: {

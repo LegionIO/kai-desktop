@@ -115,7 +115,7 @@ export function convertJsonSchemaToZod(schema: Record<string, unknown>): z.ZodTy
     case 'object': {
       const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
       const required = schema.required as string[] | undefined;
-      if (!properties) return finalize(z.record(z.any()));
+      if (!properties) return finalize(z.record(z.string(), z.any()));
 
       const shape: Record<string, z.ZodTypeAny> = {};
       for (const [key, propSchema] of Object.entries(properties)) {
@@ -298,7 +298,7 @@ async function runHttpExecution(
 
 /* ── Build a Mastra Workflow from a skill manifest ── */
 
-const anySchema = z.record(z.any());
+const anySchema = z.record(z.string(), z.any());
 
 export function skillToWorkflow(
   manifest: SkillManifest,
@@ -344,7 +344,8 @@ export function skillToWorkflow(
     inputSchema,
     outputSchema,
   })
-    .then(executionStep)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .then(executionStep as any)
     .commit();
 
   registerSkillWorkflow(workflow);
@@ -372,7 +373,8 @@ function buildCompositeWorkflow(
       description: manifest.description,
       inputSchema,
       outputSchema,
-    }).then(noOp).commit();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }).then(noOp as any).commit();
     registerSkillWorkflow(wf);
     return wf;
   }

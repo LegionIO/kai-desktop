@@ -118,7 +118,8 @@ function withTemperatureOmissionHeader(modelConfig: LLMModelConfig): LLMModelCon
 }
 
 function toMastraInputSchema(inputSchema: ToolDefinition['inputSchema']) {
-  const jsonSchema = zodToJsonSchema(inputSchema, {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const jsonSchema = zodToJsonSchema(inputSchema as any, {
     $refStrategy: 'none',
     target: 'jsonSchema7',
   });

@@ -37,14 +37,14 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         promptTemplate: z.string().optional().describe('Prompt template with {{input.field}} placeholders (for prompt type)'),
         url: z.string().optional().describe('HTTP endpoint URL (for http type)'),
         method: z.string().optional().describe('HTTP method (for http type, default: POST)'),
-        headers: z.record(z.string()).optional().describe('HTTP headers (for http type)'),
+        headers: z.record(z.string(), z.string()).optional().describe('HTTP headers (for http type)'),
         bodyTemplate: z.string().optional().describe('HTTP body template (for http type)'),
         steps: z.array(z.object({
           tool: z.string().describe('Tool name to call'),
-          args: z.record(z.any()).describe('Arguments to pass'),
+          args: z.record(z.string(), z.any()).describe('Arguments to pass'),
         })).optional().describe('Steps for composite type'),
       }).optional().describe('Execution configuration (required for create)'),
-      files: z.record(z.string()).optional().describe('Additional files to write in the skill directory, keyed by filename (e.g., {"run.sh": "#!/bin/bash\\necho hello", "index.mjs": "..."})'),
+      files: z.record(z.string(), z.string()).optional().describe('Additional files to write in the skill directory, keyed by filename (e.g., {"run.sh": "#!/bin/bash\\necho hello", "index.mjs": "..."})'),
     }),
     execute: async (input) => {
       const { action, name, description, version, inputSchema, execution, files } = input as {

@@ -29,7 +29,7 @@ const providerSchema = z.object({
   sessionToken: z.string().optional(),
   awsProfile: z.string().optional(),
   roleArn: z.string().optional(),
-  extraHeaders: z.record(z.string()).optional(),
+  extraHeaders: z.record(z.string(), z.string()).optional(),
 });
 
 const modelEntrySchema = z.object({
@@ -47,7 +47,7 @@ const modelEntrySchema = z.object({
 
 const modelsConfigSchema = z.object({
   defaultModelKey: z.string(),
-  providers: z.record(providerSchema),
+  providers: z.record(z.string(), providerSchema),
   catalog: z.array(modelEntrySchema),
 });
 
@@ -147,7 +147,7 @@ const mcpServerSchema = z.object({
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   url: z.string().optional(),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
   enabled: z.boolean().optional(),
 });
 
@@ -393,8 +393,8 @@ export const appConfigSchema = z.object({
     enabled: z.array(z.string()),
   }),
   systemPrompt: z.string(),
-  plugins: z.record(z.record(z.unknown())).optional(),
-  pluginApprovals: z.record(pluginApprovalSchema),
+  plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+  pluginApprovals: z.record(z.string(), pluginApprovalSchema),
   launchAtLogin: z.boolean(),
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),

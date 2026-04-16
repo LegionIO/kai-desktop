@@ -23,7 +23,7 @@ export function createMcpManageTool(appHome: string): ToolDefinition {
       url: z.string().optional().describe('Server URL for HTTP/SSE transport (for add/edit)'),
       command: z.string().optional().describe('Command to spawn for stdio transport (for add/edit)'),
       args: z.array(z.string()).optional().describe('Arguments for the stdio command (for add/edit)'),
-      env: z.record(z.string()).optional().describe('Environment variables for the server process (for add/edit)'),
+      env: z.record(z.string(), z.string()).optional().describe('Environment variables for the server process (for add/edit)'),
       enabled: z.boolean().optional().describe('Whether the server is enabled (for add/edit, defaults to true)'),
     }),
     execute: async (input) => {
