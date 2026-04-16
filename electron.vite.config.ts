@@ -37,6 +37,9 @@ export default defineConfig({
         external: [
           'electron',
           'original-fs',
+          // esbuild must stay external — its JS API locates its native
+          // binary via a relative path and breaks when bundled.
+          'esbuild',
           // Native addons that can't be bundled
           'better-sqlite3',
           'tiktoken',
