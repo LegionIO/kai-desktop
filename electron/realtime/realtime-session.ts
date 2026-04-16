@@ -10,7 +10,7 @@
 import { BrowserWindow } from 'electron';
 import WebSocket from 'ws';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
 import { compactToolResult, estimateToolTokens } from '../agent/compaction.js';
@@ -455,8 +455,7 @@ export class RealtimeSession {
     const toolDefinitions = effectiveTools.map((tool) => {
       let parameters: Record<string, unknown> = { type: 'object', properties: {} };
       if (tool.inputSchema) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const schema = zodToJsonSchema(tool.inputSchema as any) as Record<string, unknown>;
+        const schema = z.toJSONSchema(tool.inputSchema, { target: 'draft-7' }) as Record<string, unknown>;
         // Remove $schema and additionalProperties — Realtime API doesn't need them
         delete schema.$schema;
         delete schema.additionalProperties;

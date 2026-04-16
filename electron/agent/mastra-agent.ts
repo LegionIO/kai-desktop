@@ -1,7 +1,7 @@
 import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
 import { toStandardSchema as toJsonStandardSchema } from '@mastra/schema-compat/adapters/json-schema';
-import zodToJsonSchema from 'zod-to-json-schema';
+import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
@@ -118,11 +118,7 @@ function withTemperatureOmissionHeader(modelConfig: LLMModelConfig): LLMModelCon
 }
 
 function toMastraInputSchema(inputSchema: ToolDefinition['inputSchema']) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const jsonSchema = zodToJsonSchema(inputSchema as any, {
-    $refStrategy: 'none',
-    target: 'jsonSchema7',
-  });
+  const jsonSchema = z.toJSONSchema(inputSchema, { target: 'draft-7' });
 
   return toJsonStandardSchema(jsonSchema as JsonStandardSchemaInput);
 }

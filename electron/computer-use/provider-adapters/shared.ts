@@ -2,7 +2,6 @@ import { z } from 'zod';
 import { generateObject, generateText, Output } from 'ai';
 import { safeParseJSON } from '@ai-sdk/provider-utils';
 import { jsonrepair } from 'jsonrepair';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import type {
   ComputerActionProposal,
   ComputerDisplayLayout,
@@ -69,8 +68,7 @@ async function generateObjectWithJsonRepair<T extends z.ZodType>(
   request: Omit<Parameters<typeof generateObject>[0], 'model'>,
   model: Awaited<ReturnType<typeof createModel>>,
 ): Promise<z.infer<T>> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const schemaJson = JSON.stringify(zodToJsonSchema(schema as any, 'result'), null, 2);
+  const schemaJson = JSON.stringify(z.toJSONSchema(schema, { target: 'draft-7' }), null, 2);
   const jsonOnlyInstruction = [
     'Return only a JSON object that matches the JSON Schema exactly.',
     'Do not include markdown fences, explanations, or any text before or after the JSON.',
