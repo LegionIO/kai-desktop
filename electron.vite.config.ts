@@ -40,6 +40,9 @@ export default defineConfig({
           // Native addons that can't be bundled
           'better-sqlite3',
           'tiktoken',
+          // libsql uses platform-specific native binaries
+          'libsql',
+          /^@libsql\//,
         ],
         input: {
           index: resolve(__dirname, 'electron/main.ts'),
