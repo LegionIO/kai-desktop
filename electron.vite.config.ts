@@ -28,6 +28,9 @@ export default defineConfig({
   main: {
     define: brandDefines,
     build: {
+      // Bundle these into the main process JS instead of relying on
+      // node_modules resolution, because electron-builder + pnpm doesn't
+      // reliably include deep transitive dependencies in the asar.
       externalizeDeps: {
         exclude: [
           '@ai-sdk/provider',
@@ -39,6 +42,13 @@ export default defineConfig({
           'ai',
           'eventsource-parser',
           '@standard-schema/spec',
+          '@modelcontextprotocol/sdk',
+          'cross-spawn',
+          'which',
+          'path-key',
+          'shebang-command',
+          'shebang-regex',
+          'isexe',
         ],
       },
       rollupOptions: {
