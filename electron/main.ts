@@ -20,10 +20,12 @@ import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ip
 import type { AppConfig } from './config/schema.js';
 import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
+import { registerShellHandlers } from './ipc/shell.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers } from './ipc/auto-update.js';
-import { autoUpdater } from 'electron-updater';
+import { registerAutoUpdateHandlers, checkForUpdatesInteractive } from './ipc/auto-update.js';
+import electronUpdater from 'electron-updater';
+const { autoUpdater } = electronUpdater;
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
@@ -123,7 +125,7 @@ function buildMenu(): void {
     : {
         label: 'Check for Updates…',
         click: () => {
-          autoUpdater.checkForUpdates().catch(() => {});
+          checkForUpdatesInteractive();
         },
       };
   const template: Electron.MenuItemConstructorOptions[] = [
@@ -531,6 +533,7 @@ if (gotSingleInstanceLock) {
     registerLiveSttHandlers(ipcMain);
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
+    registerShellHandlers(ipcMain);
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;

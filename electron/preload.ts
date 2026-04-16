@@ -183,6 +183,10 @@ const appAPI = {
     save: (url: string, suggestedName?: string) => ipcRenderer.invoke('image:save', url, suggestedName) as Promise<{ canceled?: boolean; filePath?: string; error?: string }>,
   },
 
+  shell: {
+    openPath: (filePath: string) => ipcRenderer.invoke('shell:open-path', filePath) as Promise<{ ok: boolean; error?: string }>,
+  },
+
   platform: {
     homedir: () => ipcRenderer.invoke('platform:homedir'),
   },

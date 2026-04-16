@@ -27,7 +27,6 @@ import {
   Volume2Icon,
   SquareIcon,
   MicIcon,
-  MicOffIcon,
   ChevronUpIcon,
   PhoneIcon,
   MonitorIcon,
@@ -53,10 +52,10 @@ import { ComposerInput } from './ComposerInput';
 import { RichChatInput } from './RichChatInput';
 import { DeviceRow } from './DeviceRow';
 import { SearchBar } from './SearchBar';
-import { ModelSelector } from './ModelSelector';
-import { ReasoningEffortSelector, type ReasoningEffort } from './ReasoningEffortSelector';
+import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { ProfileSelector } from './ProfileSelector';
-import { FallbackToggle } from './FallbackToggle';
+import { ModelSettingsButton } from './ModelSettingsButton';
+import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
@@ -1074,7 +1073,7 @@ const UserMessage: FC = () => {
     <MessagePrimitive.Root className="group mb-6 flex justify-end">
       <div className="max-w-[88%] md:max-w-[72%]">
         <div
-          className="rounded-[1.6rem] border px-5 py-3 text-foreground backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.22),var(--app-user-bubble-shadow)]"
+          className="rounded-xl border px-4 py-2.5 text-foreground"
           style={{
             backgroundColor: 'var(--app-user-bubble)',
             borderColor: 'var(--app-user-bubble-border)',
@@ -1424,7 +1423,6 @@ const AssistantMessage: FC = () => {
   const responseTiming = getResponseTiming(message);
   const badgeStartedAt = responseTiming?.startedAt ?? (isRunning ? activeRunStartedAt ?? undefined : undefined);
   const badgeFinishedAt = responseTiming?.finishedAt;
-  const showResponseBadge = Boolean(badgeStartedAt);
 
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1459,19 +1457,7 @@ const AssistantMessage: FC = () => {
   return (
     <MessagePrimitive.Root className="group mb-8 flex justify-start">
       <div className="w-full max-w-4xl">
-        <div ref={contentRef} className={`aui-assistant-content relative rounded-[1.5rem] border border-border/45 bg-card/[0.22] pr-4 py-3 text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-[2px] ${showResponseBadge ? 'pr-20' : ''}`}>
-          {showResponseBadge && (
-            <div
-              className="aui-assistant-badge pointer-events-none absolute z-10 flex"
-              style={{ top: '10px', right: '10px' }}
-            >
-              <ElapsedBadge
-                startedAt={badgeStartedAt}
-                finishedAt={badgeFinishedAt}
-                isRunning={isRunning}
-              />
-            </div>
-          )}
+        <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 py-3 text-foreground">
           {isEmpty ? (
             <div className="flex items-center gap-2 py-0.5 text-muted-foreground">
               <BanIcon className="h-3.5 w-3.5" />
@@ -1502,6 +1488,15 @@ const AssistantMessage: FC = () => {
         <div className={`flex items-center gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
           <MessageTimestamp date={message.createdAt} align="left" />
+          {badgeStartedAt && (
+            <span className="ml-2 -translate-y-px">
+              <ElapsedBadge
+                startedAt={badgeStartedAt}
+                finishedAt={badgeFinishedAt}
+                isRunning={isRunning}
+              />
+            </span>
+          )}
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1667,10 +1662,20 @@ const StopButton: FC = () => {
   );
 };
 
-const DictationButton: FC = () => {
+interface DictationButtonProps {
+  onListeningChange?: (listening: boolean) => void;
+  startRef?: React.RefObject<(() => void) | null>;
+  stopRef?: React.RefObject<(() => void) | null>;
+}
+
+const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef, stopRef }) => {
   const composerRuntime = useComposerRuntime();
   const { config, updateConfig } = useConfig();
-  const [isListening, setIsListening] = useState(false);
+  const [isListening, _setIsListening] = useState(false);
+  const setIsListening = useCallback((v: boolean) => {
+    _setIsListening(v);
+    onListeningChange?.(v);
+  }, [onListeningChange]);
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
@@ -1754,14 +1759,15 @@ const DictationButton: FC = () => {
     updateConfig('audio.dictation.inputDeviceId', deviceId);
   }, [updateConfig]);
 
-  const handleToggle = useCallback(() => {
-    setError(null);
+  const handleStop = useCallback(() => {
+    if (!isListening) return;
+    console.log('[DictationButton] Stopping...');
+    sessionRef.current?.stop();
+  }, [isListening]);
 
-    if (isListening) {
-      console.log('[DictationButton] Stopping...');
-      sessionRef.current?.stop();
-      return;
-    }
+  const handleStart = useCallback(() => {
+    setError(null);
+    if (isListening) return;
 
     console.log('[DictationButton] Starting, provider=%s, deviceId=%s', audioProvider, selectedDeviceId ?? 'default');
     if (!isDictationSupportedForProvider(audioProvider, Boolean(azureConfig?.subscriptionKey))) {
@@ -1826,6 +1832,20 @@ const DictationButton: FC = () => {
     }
   }, [isListening, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId]);
 
+  // Expose start/stop to parent via refs (for keyboard shortcut)
+  useEffect(() => {
+    if (startRef) {
+      (startRef as { current: (() => void) | null }).current = handleStart;
+    }
+    if (stopRef) {
+      (stopRef as { current: (() => void) | null }).current = handleStop;
+    }
+    return () => {
+      if (startRef) (startRef as { current: (() => void) | null }).current = null;
+      if (stopRef) (stopRef as { current: (() => void) | null }).current = null;
+    };
+  }, [startRef, stopRef, handleStart, handleStop]);
+
   // Poll session status for cleanup
   useEffect(() => {
     if (!isListening || !sessionRef.current) return;
@@ -1852,58 +1872,73 @@ const DictationButton: FC = () => {
 
   return (
     <div ref={rootRef} className="relative flex items-center gap-1">
-      {/* Split button: mic | caret */}
-      <div className={`flex items-center rounded-xl border overflow-hidden transition-colors ${
-        isListening ? 'border-emerald-500/50 bg-emerald-500/10'
-        : error ? 'border-yellow-500/50 bg-yellow-500/10'
-        : 'border-border/70 bg-card/70'
-      }`}>
-        {/* Mic toggle */}
+      {/* Listening indicator: animated dots */}
+      {isActive && (
+        <div className="flex items-center gap-[3px] mr-0.5 px-1">
+          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+          <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+        </div>
+      )}
+
+      {/* Settings chevron button — opens device picker */}
+      {!isWebBridgeDictation && (
         <button
           type="button"
-          onClick={handleToggle}
-          className={`flex h-8 w-7 items-center justify-center transition-colors ${
-            isActive ? '' : 'hover:bg-muted/50'
-          }`}
-          title={error ?? (isListening ? 'Stop dictation' : 'Start dictation')}
+          onClick={() => setPickerOpen(!pickerOpen)}
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
         >
-          {isListening
-            ? <MicIcon className="h-3.5 w-3.5 text-emerald-500 animate-pulse" />
-            : <MicOffIcon className={`h-3.5 w-3.5 ${error ? 'text-yellow-500' : 'text-muted-foreground'}`} />
-          }
+          <ChevronUpIcon className="h-3.5 w-3.5" />
         </button>
-        {/* Caret dropdown trigger — hidden on web where browser handles device selection */}
-        {!isWebBridgeDictation && (
-          <button
-            type="button"
-            onClick={() => setPickerOpen(!pickerOpen)}
-            className={`flex h-8 w-4 items-center justify-center border-l transition-colors ${
-              isActive ? 'border-border/30' : 'border-border/50 hover:bg-muted/50'
-            }`}
-            title="Select microphone"
-          >
-            <ChevronUpIcon className="h-2.5 w-2.5 text-muted-foreground" />
-          </button>
-        )}
-      </div>
-
-      {/* Status label */}
-      {isActive && (
-        <span className="text-[10px] font-medium animate-pulse text-emerald-500">
-          Listening...
-        </span>
       )}
+
+      {/* Mic button */}
+      <Tooltip
+        content={
+          <span className="flex items-center gap-2">
+            Press and hold to record
+            <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
+          </span>
+        }
+        side="top"
+        sideOffset={8}
+      >
+        <button
+          type="button"
+          onMouseDown={handleStart}
+          onMouseUp={handleStop}
+          onMouseLeave={handleStop}
+          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors ${
+            isActive
+              ? 'bg-primary text-primary-foreground'
+              : 'bg-muted/60 text-muted-foreground hover:bg-muted'
+          }`}
+        >
+          <MicIcon className="h-4 w-4" />
+        </button>
+      </Tooltip>
 
       {/* Error tooltip */}
       {error && (
-        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
+        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
           {error}
         </div>
       )}
 
-      {/* Device picker popover */}
-      {pickerOpen && (
-        <div className="absolute bottom-full left-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+      {/* Device picker popover — toggled by chevron button */}
+      {pickerOpen && !isWebBridgeDictation && (
+        <div className="absolute bottom-full right-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+          {/* Level indicator bar */}
+          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+            <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-75"
+                style={{ width: `${Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500))}%` }}
+              />
+            </div>
+          </div>
+
           <div className="px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
             Input Device
           </div>
@@ -1933,6 +1968,25 @@ const DictationButton: FC = () => {
               </div>
             )}
           </div>
+
+          {/* Hold to record toggle */}
+          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-1 px-2 py-2">
+            <div className="flex items-center gap-2">
+              <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="text-xs text-foreground">Hold to record</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => updateConfig('audio.dictation.continuous', !(dictationConfig?.continuous ?? true))}
+              className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
+                (dictationConfig?.continuous ?? true) ? 'bg-primary' : 'bg-muted-foreground/30'
+              }`}
+            >
+              <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                (dictationConfig?.continuous ?? true) ? 'translate-x-[21px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -1954,14 +2008,15 @@ const CallButton: FC = () => {
   }, [startCall]);
 
   return (
-    <button
-      type="button"
-      onClick={handleClick}
-      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50"
-      title="Start voice call"
-    >
-      <PhoneIcon className="h-3.5 w-3.5 text-muted-foreground" />
-    </button>
+    <Tooltip content="Start voice call" side="top" sideOffset={8}>
+      <button
+        type="button"
+        onClick={handleClick}
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
+      >
+        <PhoneIcon className="h-4 w-4" />
+      </button>
+    </Tooltip>
   );
 };
 
@@ -1986,6 +2041,33 @@ const Composer: FC<{
   const dictationEnabled = (config as Record<string, unknown> | null)?.audio
     ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
     : true;
+  const [isDictating, setIsDictating] = useState(false);
+  const dictationStartRef = useRef<(() => void) | null>(null);
+  const dictationStopRef = useRef<(() => void) | null>(null);
+
+  // ⌘D keyboard shortcut: hold to record, release to stop
+  useEffect(() => {
+    if (!dictationEnabled) return;
+    const onDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
+        e.preventDefault();
+        dictationStartRef.current?.();
+      }
+    };
+    const onUp = (e: KeyboardEvent) => {
+      // Stop when either D or the modifier key (⌘/Ctrl) is released
+      if (e.key === 'd' || e.key === 'D' || e.key === 'Meta' || e.key === 'Control') {
+        dictationStopRef.current?.();
+      }
+    };
+    window.addEventListener('keydown', onDown);
+    window.addEventListener('keyup', onUp);
+    return () => {
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup', onUp);
+    };
+  }, [dictationEnabled]);
 
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -2168,7 +2250,7 @@ const Composer: FC<{
                   </div>
                 )}
                 <ComposerInput
-                  placeholder={__BRAND_COMPOSER_PLACEHOLDER}
+                  placeholder={isDictating ? 'Listening...' : __BRAND_COMPOSER_PLACEHOLDER}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -2210,28 +2292,21 @@ const Composer: FC<{
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
-                    {dictationEnabled && <DictationButton />}
-                    <CallButton />
                     <ProfileSelector
                       selectedProfileKey={selectedProfileKey}
                       onSelectProfile={onSelectProfile}
                     />
-                    <div className="flex min-w-0 basis-full items-center gap-1.5 md:basis-auto md:gap-2">
-                      <FallbackToggle
-                        enabled={fallbackEnabled}
-                        onToggle={onToggleFallback}
-                      />
-                      <ModelSelector
-                        selectedModelKey={selectedModelKey}
-                        onSelectModel={onSelectModel}
-                        disabled={fallbackEnabled}
-                      />
-                      <ReasoningEffortSelector
-                        value={reasoningEffort}
-                        onChange={onChangeReasoningEffort}
-                      />
-                    </div>
                   </div>
+                  <ModelSettingsButton
+                    selectedModelKey={selectedModelKey}
+                    onSelectModel={onSelectModel}
+                    reasoningEffort={reasoningEffort}
+                    onChangeReasoningEffort={onChangeReasoningEffort}
+                    fallbackEnabled={fallbackEnabled}
+                    onToggleFallback={onToggleFallback}
+                  />
+                  {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
+                  <CallButton />
                   <ThreadPrimitive.If running={false}>
                     <button
                       type="button"

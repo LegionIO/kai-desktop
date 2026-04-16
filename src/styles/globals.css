@@ -309,7 +309,7 @@
 .timeline-dot-icon {
   position: absolute;
   left: -23px;
-  top: 18px;
+  top: 3px;
   width: 14px;
   height: 14px;
   display: flex;
@@ -327,6 +327,33 @@
 }
 .aui-assistant-content > :not(.aui-typing-dots):not(.aui-assistant-badge) ~ .aui-typing-dots {
   display: none;
+}
+
+/* Wrap long lines inside tool-call detail code blocks so they stay within the bubble */
+.tool-detail-code pre,
+.tool-detail-code code {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Reset for rendered markdown inside tool details — MarkdownText manages its own layout */
+.tool-detail-markdown pre {
+  white-space: pre;
+  word-break: normal;
+}
+
+.tool-detail-markdown code {
+  white-space: revert;
+  word-break: normal;
+}
+
+/* Match Shiki code block background for non-code containers (e.g. rendered markdown preview) */
+.shiki-bg {
+  background-color: #fff;
+}
+
+.dark .shiki-bg {
+  background-color: #1e1e1e;
 }
 
 /* (System prompt uses contentEditable — no overlay CSS needed) */

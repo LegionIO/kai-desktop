@@ -109,6 +109,9 @@ type AppAPI = {
     fetch: (url: string) => Promise<{ data?: string; mime?: string; error?: string }>;
     save: (url: string, suggestedName?: string) => Promise<{ canceled?: boolean; filePath?: string; error?: string }>;
   };
+  shell: {
+    openPath: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+  };
   platform: {
     homedir: () => Promise<string>;
   };
