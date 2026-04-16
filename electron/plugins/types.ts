@@ -490,6 +490,14 @@ export type PluginAuthWindowOptions = {
   interceptHeader?: string;
   partition?: string;
   onReady?: (helpers: AuthWindowHelpers) => void;
+  /**
+   * Custom user-agent string for the auth window.
+   * - `undefined` (default): uses the branded user-agent.
+   * - `false`: keeps Electron's default Chromium user-agent (useful when
+   *   third-party login pages block non-browser user-agent strings).
+   * - `string`: uses the provided string as-is.
+   */
+  customUserAgent?: string | false;
 };
 
 export type AuthWindowHelpers = {
@@ -507,6 +515,13 @@ export type PluginBrowserWindowOptions = {
   width?: number;
   height?: number;
   partition?: string;
+  /**
+   * Custom user-agent string for the browser window.
+   * - `undefined` (default): uses the branded user-agent.
+   * - `false`: keeps Electron's default Chromium user-agent.
+   * - `string`: uses the provided string as-is.
+   */
+  customUserAgent?: string | false;
 };
 
 export type PluginAuthResult = {

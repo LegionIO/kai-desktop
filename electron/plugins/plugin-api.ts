@@ -1,5 +1,5 @@
 import { shell, BrowserWindow, safeStorage, session } from 'electron';
-import { applyBrandUserAgent } from '../utils/user-agent.js';
+import { getBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
 import { z } from 'zod';
@@ -480,6 +480,7 @@ export function createPluginAPI(
           interceptHeader,
           partition,
           onReady,
+          customUserAgent,
         } = options;
 
         return new Promise((resolve) => {
@@ -500,7 +501,11 @@ export function createPluginAPI(
               ...(ses ? { session: ses } : {}),
             },
           });
-          applyBrandUserAgent(authWin.webContents);
+          if (customUserAgent !== false) {
+            authWin.webContents.setUserAgent(
+              typeof customUserAgent === 'string' ? customUserAgent : getBrandUserAgent(),
+            );
+          }
 
           const clearRevealTimer = () => {
             if (revealTimer) {
@@ -668,6 +673,7 @@ export function createPluginAPI(
           width = 1280,
           height = 900,
           partition,
+          customUserAgent,
         } = options;
 
         const ses = partition ? session.fromPartition(partition) : undefined;
@@ -683,7 +689,11 @@ export function createPluginAPI(
             ...(ses ? { session: ses } : {}),
           },
         });
-        applyBrandUserAgent(browserWin.webContents);
+        if (customUserAgent !== false) {
+          browserWin.webContents.setUserAgent(
+            typeof customUserAgent === 'string' ? customUserAgent : getBrandUserAgent(),
+          );
+        }
 
         const partitionAttr = partition ? ` partition="${partition}"` : '';
         const jsUrl = JSON.stringify(url);
