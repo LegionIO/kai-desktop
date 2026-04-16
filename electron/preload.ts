@@ -287,6 +287,16 @@ const appAPI = {
     exportCsv: () => ipcRenderer.invoke('usage:export-csv'),
   },
 
+  autoUpdate: {
+    check: () => ipcRenderer.invoke('auto-update:check'),
+    install: () => ipcRenderer.invoke('auto-update:install'),
+    onStatus: (callback: (status: { state: string; version?: string }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: { state: string; version?: string }) => callback(status);
+      ipcRenderer.on('auto-update:status', handler);
+      return () => ipcRenderer.removeListener('auto-update:status', handler);
+    },
+  },
+
   onMenuOpenSettings: (callback: () => void) => {
     const handler = () => callback();
     ipcRenderer.on('menu:open-settings', handler);

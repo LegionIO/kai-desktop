@@ -247,16 +247,76 @@
 }
 
 /* Content part dividers for multi-part assistant messages.
-   The assistant message bubble wraps MessagePrimitive.Content which renders
-   parts as adjacent sibling elements. Target the bg-muted container's children. */
+   With the timeline layout, we use lighter spacing between parts. */
 .aui-assistant-content > :not(.aui-assistant-badge) + :not(.aui-assistant-badge) {
-  margin-top: 0.5rem;
-  padding-top: 0.5rem;
-  border-top: 1px solid oklch(0.5 0 0 / 12%);
+  margin-top: 0.125rem;
 }
 
-.dark .aui-assistant-content > :not(.aui-assistant-badge) + :not(.aui-assistant-badge) {
-  border-top-color: oklch(0.5 0 0 / 18%);
+/* ── Timeline layout ─────────────────────────────────────────────────────────
+   Each .timeline-item draws a vertical line segment through its full height.
+   Segments overlap to form a continuous line. The first item starts the line
+   at its dot; the last item ends it at its dot.
+
+   Axis center: 16px from content-box left edge.
+   ───────────────────────────────────────────────────────────────────────────── */
+.aui-assistant-content {
+  position: relative;
+  padding-left: 32px;
+}
+
+.timeline-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  min-height: 1.25rem;
+}
+
+/* Single vertical line — drawn on the container, positioned via JS-set custom properties.
+   Only shown when .has-timeline is added by the useEffect. */
+.aui-assistant-content.has-timeline::after {
+  content: '';
+  position: absolute;
+  left: 15.25px;
+  top: var(--timeline-top, 0);
+  bottom: var(--timeline-bottom, 0);
+  width: 1.5px;
+  background: oklch(0.5 0 0 / 14%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.dark .aui-assistant-content.has-timeline::after {
+  background: oklch(0.5 0 0 / 22%);
+}
+
+/* Dot — 8px circle, centered on the axis. */
+.timeline-dot {
+  position: absolute;
+  left: -20px;
+  top: 28px;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+  z-index: 2;
+}
+
+.timeline-dot.timeline-dot-tool {
+  top: 10px;
+}
+
+/* Icon variant — for the spinner (14px wide, centered on 16px axis) */
+.timeline-dot-icon {
+  position: absolute;
+  left: -23px;
+  top: 18px;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  z-index: 2;
 }
 
 /* Typing dots inside assistant bubble: hide once real content parts are rendered.
@@ -424,4 +484,30 @@ html:not(.dark) .app-gradient-text {
 /* Hide scrollbar on the sidebar dock while keeping scroll functional */
 .dock-scroll::-webkit-scrollbar {
   display: none;
+}
+
+/* Thinking spinner — Claude-style braille/dot rotation */
+@keyframes thinking-spin {
+  0%        { content: '⠋'; }
+  8.33%     { content: '⠙'; }
+  16.66%    { content: '⠹'; }
+  25%       { content: '⠸'; }
+  33.33%    { content: '⠼'; }
+  41.66%    { content: '⠴'; }
+  50%       { content: '⠦'; }
+  58.33%    { content: '⠧'; }
+  66.66%    { content: '⠇'; }
+  75%       { content: '⠏'; }
+  83.33%    { content: '⠋'; }
+  100%      { content: '⠙'; }
+}
+
+.thinking-spinner {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.thinking-spinner::before {
+  content: '⠋';
+  animation: thinking-spin 0.8s steps(1) infinite;
 }

@@ -1,9 +1,9 @@
-import { type FC, type ReactNode, useState, useCallback, memo } from 'react';
+import { type FC, type ReactNode, useState, useCallback, memo, Children, isValidElement } from 'react';
 import ReactMarkdown, { type Components, type Options, defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
-import { RefreshCwIcon } from 'lucide-react';
+import { RefreshCwIcon, CheckIcon, SquareIcon } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
 import { cn } from '@/lib/utils';
 
@@ -14,7 +14,7 @@ const isWebBridge = Boolean(
 
 const rehypeSanitizeOptions = {
   ...defaultSchema,
-  tagNames: [...(defaultSchema.tagNames || []), 'video'],
+  tagNames: [...(defaultSchema.tagNames || []), 'video', 'input'],
   protocols: {
     ...defaultSchema.protocols,
     src: [...(defaultSchema.protocols?.src || []), __BRAND_MEDIA_PROTOCOL],
@@ -28,6 +28,7 @@ const rehypeSanitizeOptions = {
       'width',
       'height',
     ],
+    input: ['type', 'checked', 'disabled'],
     video: ['src', 'controls', 'title', 'width', 'height', 'autoplay', 'loop', 'muted', 'preload', 'poster'],
     source: ['src', 'type', 'media', 'sizes', 'srcSet', 'srcset'],
   },
@@ -70,9 +71,37 @@ const ChatImage: FC<React.ImgHTMLAttributes<HTMLImageElement>> = ({ alt, src, ..
 const MdP: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => (
   <p className={cn('my-4 text-[0.95rem] leading-7 text-foreground/95', className)} {...props}>{children}</p>
 );
-const MdLi: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => (
-  <li className={cn('my-1.5 leading-7 marker:text-primary/70', className)} {...props}>{children}</li>
-);
+const MdLi: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => {
+  const isTaskItem = className?.includes('task-list-item');
+  if (isTaskItem) {
+    // Detect checked state from the input child rendered by remark-gfm
+    let checked = false;
+    const filteredChildren = Children.map(children, (child) => {
+      if (isValidElement(child) && (child.type === 'input' || child.type === MdInput)) {
+        const inputProps = child.props as { type?: string; checked?: boolean; disabled?: boolean };
+        if (inputProps.type === 'checkbox') {
+          checked = Boolean(inputProps.checked);
+          return null; // Remove the raw input — we render our own icon
+        }
+      }
+      return child;
+    });
+
+    return (
+      <li className={cn('my-1 flex items-start gap-2 list-none leading-7', checked && 'line-through text-muted-foreground')} {...props}>
+        {checked ? (
+          <CheckIcon className="mt-1.5 h-4 w-4 shrink-0 text-emerald-500" />
+        ) : (
+          <SquareIcon className="mt-1.5 h-4 w-4 shrink-0 text-muted-foreground/50" />
+        )}
+        <span>{filteredChildren}</span>
+      </li>
+    );
+  }
+  return (
+    <li className={cn('my-1.5 leading-7 marker:text-primary/70', className)} {...props}>{children}</li>
+  );
+};
 const MdH1: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => (
   <h1 className={cn('mt-8 mb-4 text-3xl font-semibold tracking-tight text-foreground', className)} {...props}>{children}</h1>
 );
@@ -97,9 +126,16 @@ const MdStrong: FC<{ children?: ReactNode } & Record<string, unknown>> = ({ chil
 const MdEm: FC<{ children?: ReactNode } & Record<string, unknown>> = ({ children, ...props }) => (
   <em {...props}>{children}</em>
 );
-const MdUl: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => (
-  <ul className={cn('my-4 ml-6 list-disc space-y-1 text-[0.95rem] text-foreground/95', className)} {...props}>{children}</ul>
-);
+const MdUl: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => {
+  const isTaskList = className?.includes('contains-task-list');
+  return (
+    <ul className={cn(
+      'my-4 space-y-1 text-[0.95rem] text-foreground/95',
+      isTaskList ? 'ml-0 list-none' : 'ml-6 list-disc',
+      className,
+    )} {...props}>{children}</ul>
+  );
+};
 const MdOl: FC<{ children?: ReactNode; className?: string } & Record<string, unknown>> = ({ children, className, ...props }) => (
   <ol className={cn('my-4 ml-6 list-decimal space-y-1 text-[0.95rem] text-foreground/95', className)} {...props}>{children}</ol>
 );
@@ -157,6 +193,8 @@ const MdTable: FC<{ children?: ReactNode } & Record<string, unknown>> = ({ child
     </table>
   </div>
 );
+/** Suppress native checkbox inputs from GFM task lists — MdLi handles rendering */
+const MdInput: FC<Record<string, unknown>> = () => null;
 const MdTh: FC<{ children?: ReactNode } & Record<string, unknown>> = ({ children, ...props }) => (
   <th className="border border-border bg-muted px-2 py-1 text-left text-xs font-semibold" {...props}>
     {children}
@@ -187,6 +225,7 @@ const markdownComponents = {
   code: MdCode,
   a: MdA,
   img: MdImg,
+  input: MdInput,
   video: MdVideo,
   table: MdTable,
   th: MdTh,

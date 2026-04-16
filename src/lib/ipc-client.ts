@@ -175,6 +175,11 @@ type AppAPI = {
     recordEvent: (event: unknown) => Promise<unknown>;
     exportCsv: () => Promise<unknown>;
   };
+  autoUpdate: {
+    check: () => Promise<{ ok?: boolean; error?: string }>;
+    install: () => Promise<void>;
+    onStatus: (callback: (status: { state: string; version?: string }) => void) => () => void;
+  };
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;

@@ -40,4 +40,11 @@ mac:
     - target: dmg
       arch:
         - arm64
+    - target: zip
+      arch:
+        - arm64
   artifactName: "{{artifactPrefix}}-${version}-arm64.${ext}"
+publish:
+  - provider: github
+    owner: legionio
+    repo: kai-desktop

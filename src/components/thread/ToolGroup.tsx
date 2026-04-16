@@ -4,14 +4,14 @@ import { ElapsedBadge } from './ElapsedBadge';
 import {
   ChevronDownIcon,
   ChevronRightIcon,
-  CheckCircle2Icon,
-  AlertCircleIcon,
+  CheckIcon,
+  SquareIcon,
+  AsteriskIcon,
   LoaderIcon,
   ScissorsIcon,
   DownloadIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { formatElapsed } from '@/lib/response-timing';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -64,40 +64,42 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
   const canShowOriginal = wasCompacted && part.originalResult !== undefined;
   const isSummarizing = part.compactionPhase === 'start';
   const mediaResult = hasResult && !isError ? detectMediaResult(part.result) : null;
+  const todoItems = detectTodoItems(part);
+
+  const summary = getToolSummary(part);
 
   return (
-    <div className="rounded-lg border bg-card text-sm overflow-hidden">
-      {/* Header */}
+    <div className="text-sm">
+      {/* Compact header row — label + description */}
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2 hover:bg-muted/50 transition-colors"
+        className="flex w-full items-center gap-2 py-1 hover:bg-muted/30 rounded-md px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        {expanded ? (
-          <ChevronDownIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-        ) : (
-          <ChevronRightIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+        <span className="font-semibold text-xs text-foreground">{getToolLabel(part.toolName)}</span>
+        {summary && (
+          <span className="text-xs text-muted-foreground truncate">{summary}</span>
         )}
-        <StatusBadge isRunning={isRunning} isError={isError} />
-        {wasCompacted && <CompactedBadge />}
-        {isSummarizing && <SummarizingBadge />}
-        <span className="font-mono text-xs font-semibold truncate">{part.toolName}</span>
-        <span className="text-[10px] text-muted-foreground ml-1 truncate">
-          {getToolSummary(part)}
+        {isSummarizing && (
+          <span className="text-[10px] text-amber-500 animate-pulse shrink-0">Summarizing...</span>
+        )}
+        <span className="ml-auto shrink-0">
+          <ToolElapsedBadge
+            isRunning={isRunning}
+            isError={Boolean(isError)}
+            startedAt={part.startedAt}
+            finishedAt={part.finishedAt}
+            durationMs={part.durationMs}
+          />
         </span>
-        <ToolElapsedBadge
-          isRunning={isRunning}
-          isError={Boolean(isError)}
-          startedAt={part.startedAt}
-          finishedAt={part.finishedAt}
-          durationMs={part.durationMs}
-        />
-        <ToolStatusIcon isRunning={isRunning} isError={isError} />
       </button>
+
+      {/* Todo items — always visible below header */}
+      {todoItems && <TodoListView items={todoItems} />}
 
       {/* Expanded detail */}
       {expanded && (
-        <div className="border-t">
+        <div className="ml-5 mt-1 mb-2 border-l-2 border-border/50 pl-3">
           {/* Arguments section */}
           <ToolSection title="Arguments" defaultOpen>
             <CodeBlock code={formatArgs(part.args)} language="json" />
@@ -105,7 +107,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
 
           {/* Pre-extraction / In-progress indicator */}
           {isRunning && !isSummarizing && (
-            <div className="px-3 py-2 border-t bg-blue-500/5">
+            <div className="py-1.5">
               <div className="flex items-center gap-2">
                 <LoaderIcon className="h-3.5 w-3.5 animate-spin text-blue-500" />
                 <span className="text-xs text-blue-600 dark:text-blue-400">Executing tool...</span>
@@ -115,7 +117,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
 
           {/* AI summarization in progress */}
           {isSummarizing && (
-            <div className="px-3 py-2 border-t bg-amber-500/5">
+            <div className="py-1.5">
               <div className="flex items-center gap-2">
                 <ScissorsIcon className="h-3.5 w-3.5 animate-pulse text-amber-500" />
                 <span className="text-xs text-amber-600 dark:text-amber-400">Summarizing large output...</span>
@@ -147,23 +149,71 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
               />
             </ToolSection>
           )}
-
-          {/* Metadata */}
-          <div className="px-3 py-1.5 border-t bg-muted/30 flex items-center gap-3 text-[10px] text-muted-foreground">
-            <span>ID: {part.toolCallId?.slice(0, 12)}...</span>
-            {hasResult && <span>{isError ? 'Failed' : 'Completed'}</span>}
-            {wasCompacted && part.compactionMeta && (
-              <span className="flex items-center gap-1">
-                <ScissorsIcon className="h-2.5 w-2.5" />
-                Compacted{part.compactionMeta.extractionDurationMs > 0 ? ` in ${formatElapsed(part.compactionMeta.extractionDurationMs)}` : ''}
-              </span>
-            )}
-          </div>
         </div>
       )}
     </div>
   );
 };
+
+/* ── Todo List Detection & Rendering ── */
+
+type TodoItem = {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+};
+
+/** Detect if tool args or result contains a todo list */
+function detectTodoItems(part: ToolCallPart): TodoItem[] | null {
+  // Check args.todos (e.g. a TodoWrite-style tool)
+  const args = part.args as Record<string, unknown> | null;
+  if (args?.todos && Array.isArray(args.todos)) {
+    const items = args.todos as Array<Record<string, unknown>>;
+    if (items.length > 0 && items.every((t) => typeof t.content === 'string' && typeof t.status === 'string')) {
+      return items.map((t) => ({ content: String(t.content), status: String(t.status) as TodoItem['status'] }));
+    }
+  }
+
+  // Check result.todos or result as array
+  const result = part.result;
+  if (result && typeof result === 'object') {
+    const r = result as Record<string, unknown>;
+    const candidates = Array.isArray(r.todos) ? r.todos : Array.isArray(result) ? result : null;
+    if (candidates && candidates.length > 0) {
+      const items = candidates as Array<Record<string, unknown>>;
+      if (items.every((t) => typeof t.content === 'string' && typeof t.status === 'string')) {
+        return items.map((t) => ({ content: String(t.content), status: String(t.status) as TodoItem['status'] }));
+      }
+    }
+  }
+
+  return null;
+}
+
+const TodoItemIcon: FC<{ status: TodoItem['status'] }> = ({ status }) => {
+  if (status === 'completed') return <CheckIcon className="h-3.5 w-3.5 shrink-0 text-emerald-500" />;
+  if (status === 'in_progress') return <AsteriskIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />;
+  return <SquareIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />;
+};
+
+const TodoListView: FC<{ items: TodoItem[] }> = ({ items }) => (
+  <div className="ml-5 mt-1 mb-1 space-y-0.5">
+    {items.map((item, i) => (
+      <div
+        key={`${item.content}-${i}`}
+        className={`flex items-center gap-2.5 py-0.5 text-xs ${
+          item.status === 'completed'
+            ? 'line-through text-muted-foreground'
+            : item.status === 'in_progress'
+              ? 'text-foreground'
+              : 'text-foreground/80'
+        }`}
+      >
+        <TodoItemIcon status={item.status} />
+        <span>{item.content}</span>
+      </div>
+    ))}
+  </div>
+);
 
 /* ── Media Result Detection & Preview ── */
 
@@ -253,32 +303,6 @@ const MediaPreview: FC<{ media: MediaResult }> = ({ media }) => {
   return null;
 };
 
-/* ── Status Badges ── */
-
-const StatusBadge: FC<{ isRunning: boolean; isError: boolean }> = ({ isRunning, isError }) => {
-  if (isRunning) {
-    return <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400">RUNNING</span>;
-  }
-  if (isError) {
-    return <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-destructive/10 text-destructive">ERROR</span>;
-  }
-  return <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400">DONE</span>;
-};
-
-const CompactedBadge: FC = () => (
-  <span className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400">
-    <ScissorsIcon className="h-2.5 w-2.5" />
-    COMPACTED
-  </span>
-);
-
-const SummarizingBadge: FC = () => (
-  <span className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 animate-pulse">
-    <ScissorsIcon className="h-2.5 w-2.5" />
-    SUMMARIZING
-  </span>
-);
-
 const CompactionToggle: FC<{ showOriginal: boolean; onToggle: () => void }> = ({ showOriginal, onToggle }) => (
   <span
     role="switch"
@@ -291,16 +315,6 @@ const CompactionToggle: FC<{ showOriginal: boolean; onToggle: () => void }> = ({
     {showOriginal ? 'Show Compacted' : 'Show Original'}
   </span>
 );
-
-const ToolStatusIcon: FC<{ isRunning: boolean; isError: boolean }> = ({ isRunning, isError }) => {
-  if (isRunning) {
-    return <LoaderIcon className="h-3.5 w-3.5 animate-spin text-blue-500 shrink-0" />;
-  }
-  if (isError) {
-    return <AlertCircleIcon className="h-3.5 w-3.5 text-destructive shrink-0" />;
-  }
-  return <CheckCircle2Icon className="h-3.5 w-3.5 text-green-500 shrink-0" />;
-};
 
 const ToolElapsedBadge: FC<{
   isRunning: boolean;
@@ -324,17 +338,17 @@ const ToolElapsedBadge: FC<{
 const ToolSection: FC<{ title: string; defaultOpen?: boolean; badge?: React.ReactNode; children: React.ReactNode }> = ({ title, defaultOpen = false, badge, children }) => {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="border-t">
+    <div className="mt-1">
       <button
         type="button"
-        className="flex w-full items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider hover:bg-muted/30"
+        className="flex w-full items-center gap-1.5 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider hover:text-foreground/70 transition-colors"
         onClick={() => setOpen(!open)}
       >
         {open ? <ChevronDownIcon className="h-2.5 w-2.5" /> : <ChevronRightIcon className="h-2.5 w-2.5" />}
         {title}
         {badge}
       </button>
-      {open && <div className="px-3 pb-2">{children}</div>}
+      {open && <div className="pb-1">{children}</div>}
     </div>
   );
 };
@@ -345,6 +359,24 @@ function isErrorResult(result: unknown): boolean {
   if (!result || typeof result !== 'object') return false;
   const r = result as Record<string, unknown>;
   return Boolean(r.error) || r.isError === true || (r.exitCode !== undefined && r.exitCode !== 0);
+}
+
+const toolLabels: Record<string, string> = {
+  sh: 'Bash',
+  file_read: 'Read',
+  file_write: 'Write',
+  file_edit: 'Edit',
+  grep: 'Grep',
+  glob: 'Glob',
+  list_directory: 'List Directory',
+  agent_lattice_chat: 'Agent',
+  sub_agent: 'Sub Agent',
+  generate_image: 'Image Generation',
+  generate_video: 'Video Generation',
+};
+
+function getToolLabel(toolName: string): string {
+  return toolLabels[toolName] ?? toolName.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function getToolSummary(part: ToolCallPart): string {

@@ -22,6 +22,8 @@ import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
+import { registerAutoUpdateHandlers } from './ipc/auto-update.js';
+import { autoUpdater } from 'electron-updater';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
@@ -108,13 +110,29 @@ function applyTheme(): void {
   }
 }
 
+let updateDownloaded = false;
+
 function buildMenu(): void {
+  const updateMenuItem: Electron.MenuItemConstructorOptions = updateDownloaded
+    ? {
+        label: 'Restart to Update',
+        click: () => {
+          autoUpdater.quitAndInstall();
+        },
+      }
+    : {
+        label: 'Check for Updates…',
+        click: () => {
+          autoUpdater.checkForUpdates().catch(() => {});
+        },
+      };
   const template: Electron.MenuItemConstructorOptions[] = [
     {
       label: app.name,
       submenu: [
         { role: 'about' },
         { type: 'separator' },
+        updateMenuItem,
         {
           label: 'Settings…',
           accelerator: 'Cmd+,',
@@ -514,6 +532,10 @@ if (gotSingleInstanceLock) {
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerUsageHandlers(ipcMain, APP_HOME);
+    registerAutoUpdateHandlers(ipcMain, () => {
+      updateDownloaded = true;
+      buildMenu();
+    });
 
     // Auto-seed computer use display settings on startup.
     // If allowedDisplays is empty, populate it with all discovered displays

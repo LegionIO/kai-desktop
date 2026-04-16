@@ -65,6 +65,7 @@ import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, type ComputerSession } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
+import { SPINNER_VERBS } from '@/config/spinner-verbs';
 const MATRIX_GLYPHS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*+-/~{[|`]}<>01';
 
 export type ThreadMode = 'chat' | 'computer';
@@ -1081,12 +1082,12 @@ const UserMessage: FC = () => {
         >
           <MessagePrimitive.Content components={userContentComponents} />
         </div>
-        <div className="flex items-center justify-end gap-1">
-          <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
+        <div className={`flex items-center justify-end gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+          <MessageTimestamp date={message.createdAt} align="right" />
+          <ActionBarPrimitive.Root className="flex items-center gap-1">
             <CopyButton />
             {ttsEnabled && <SpeakButton />}
           </ActionBarPrimitive.Root>
-          <MessageTimestamp date={message.createdAt} align="right" />
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1224,10 +1225,22 @@ const ToolFallback: FC<{
     stopped?: boolean;
   };
 }> = (props) => {
+  const hasResult = props.result !== undefined;
+  const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
+    (props.result as Record<string, unknown>).error || (props.result as Record<string, unknown>).isError === true
+  ));
+  const isRunning = !hasResult;
+  const dotColor = isRunning
+    ? 'bg-blue-500 animate-pulse'
+    : isError
+      ? 'bg-red-500'
+      : 'bg-emerald-500';
+
   // Render sub-agent tool calls with the specialized component
   if (props.toolName === 'sub_agent') {
     return (
-      <div className="my-1">
+      <div className="timeline-item my-1">
+        <span className={`timeline-dot timeline-dot-tool ${dotColor}`} />
         <SubAgentInline
           toolCallId={props.toolCallId}
           args={props.args}
@@ -1240,7 +1253,8 @@ const ToolFallback: FC<{
   }
 
   return (
-    <div className="my-1">
+    <div className="timeline-item my-1">
+      <span className={`timeline-dot timeline-dot-tool ${dotColor}`} />
       <ToolCallDisplay
         part={{
           type: 'tool-call',
@@ -1262,9 +1276,9 @@ const ToolFallback: FC<{
   );
 };
 
-/** Wraps consecutive tool calls with a divider above */
+/** Wraps consecutive tool calls */
 const ToolGroupWrapper: FC<PropsWithChildren> = ({ children }) => (
-  <div className="my-2 border-t border-border/40 pt-2 space-y-1.5">
+  <div className="space-y-0">
     {children}
   </div>
 );
@@ -1284,7 +1298,75 @@ const userContentComponents = {
 
 const AssistantTextPart: FC<{ text: string }> = ({ text }) => {
   if (!text) return null;
-  return <div className="py-0.5"><MarkdownText text={text} /></div>;
+  return (
+    <div className="timeline-item py-0.5">
+      <span className="timeline-dot bg-[oklch(0.55_0.01_0)]" />
+      <div className="min-w-0 flex-1"><MarkdownText text={text} /></div>
+    </div>
+  );
+};
+
+const ThinkingSpinner: FC = () => {
+  const [currentVerb, setCurrentVerb] = useState<string>(
+    () => SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)],
+  );
+  const [displayText, setDisplayText] = useState(() => currentVerb + '...');
+  const [cursorPos, setCursorPos] = useState(-1); // -1 = no cursor visible
+  const nextVerbRef = useRef('');
+  const frameRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Pick a new verb every ~4s and animate the transition
+  useEffect(() => {
+    const interval = setInterval(() => {
+      let next: string;
+      do {
+        next = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
+      } while (next === currentVerb);
+      nextVerbRef.current = next + '...';
+      setCursorPos(0); // start sweep
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [currentVerb]);
+
+  // Animate the block cursor sweep: reveal new text char-by-char
+  useEffect(() => {
+    if (cursorPos < 0) return; // no animation in progress
+
+    const target = nextVerbRef.current;
+    const maxLen = Math.max(displayText.length, target.length);
+
+    if (cursorPos > maxLen) {
+      // Animation complete — settle on new text
+      setDisplayText(target);
+      setCursorPos(-1);
+      setCurrentVerb(target.replace(/\.\.\.$/, ''));
+      return;
+    }
+
+    // Build the display: new chars up to cursor, then cursor block, then old chars after
+    const revealed = target.slice(0, cursorPos);
+    const remaining = displayText.slice(cursorPos + 1);
+    setDisplayText(revealed + '\u2588' + remaining); // █ block cursor
+
+    frameRef.current = setTimeout(() => {
+      setCursorPos((p) => p + 1);
+    }, 25); // ~25ms per character for a quick sweep
+
+    return () => {
+      if (frameRef.current) clearTimeout(frameRef.current);
+    };
+  }, [cursorPos]);
+
+  return (
+    <div className="timeline-item py-0.5">
+      <span className="timeline-dot-icon">
+        <span className="thinking-spinner text-muted-foreground/50 select-none" aria-hidden="true" />
+      </span>
+      <span className="text-xs font-mono text-muted-foreground/60 whitespace-pre">
+        {displayText}
+      </span>
+    </div>
+  );
 };
 
 /** Inline interrupt divider — shown where the user interrupted the AI's speech */
@@ -1344,10 +1426,40 @@ const AssistantMessage: FC = () => {
   const badgeFinishedAt = responseTiming?.finishedAt;
   const showResponseBadge = Boolean(badgeStartedAt);
 
+  // Mark first/last .timeline-item so CSS can clip the line at the dots
+  const contentRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const allItems = Array.from(el.querySelectorAll('.timeline-item'));
+    const items = allItems.filter((item) => {
+      const parent = item.closest('.aui-typing-dots');
+      return !parent || getComputedStyle(parent).display !== 'none';
+    });
+    if (items.length >= 2) {
+      const containerRect = el.getBoundingClientRect();
+      const firstDot = items[0].querySelector('.timeline-dot, .timeline-dot-icon');
+      const lastDot = items[items.length - 1].querySelector('.timeline-dot, .timeline-dot-icon');
+      if (firstDot && lastDot) {
+        const firstRect = firstDot.getBoundingClientRect();
+        const lastRect = lastDot.getBoundingClientRect();
+        const top = firstRect.top + firstRect.height / 2 - containerRect.top;
+        const bottom = containerRect.bottom - (lastRect.top + lastRect.height / 2);
+        el.style.setProperty('--timeline-top', `${top}px`);
+        el.style.setProperty('--timeline-bottom', `${bottom}px`);
+        el.classList.add('has-timeline');
+      } else {
+        el.classList.remove('has-timeline');
+      }
+    } else {
+      el.classList.remove('has-timeline');
+    }
+  });
+
   return (
     <MessagePrimitive.Root className="group mb-8 flex justify-start">
       <div className="w-full max-w-4xl">
-        <div className={`aui-assistant-content relative rounded-[1.5rem] border border-border/45 bg-card/[0.22] px-4 py-3 text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-[2px] ${showResponseBadge ? 'pr-20' : ''}`}>
+        <div ref={contentRef} className={`aui-assistant-content relative rounded-[1.5rem] border border-border/45 bg-card/[0.22] pr-4 py-3 text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-[2px] ${showResponseBadge ? 'pr-20' : ''}`}>
           {showResponseBadge && (
             <div
               className="aui-assistant-badge pointer-events-none absolute z-10 flex"
@@ -1378,22 +1490,18 @@ const AssistantMessage: FC = () => {
           ) : (
             <>
               <MessagePrimitive.Content components={assistantContentComponents} />
-              {/* Typing dots: visible inside assistant bubble, hidden by CSS once content parts render */}
+              {/* Thinking spinner: visible inside assistant bubble, hidden by CSS once content parts render */}
               <div className="aui-typing-dots">
-                <div className="flex items-center gap-1.5 py-0.5">
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:0ms]" />
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:150ms]" />
-                  <div className="h-2 w-2 rounded-full bg-foreground/30 animate-bounce [animation-delay:300ms]" />
-                </div>
+                <ThinkingSpinner />
               </div>
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
           {tokenUsage && !isRunning && <TokenUsage usage={tokenUsage} />}
         </div>
-        <div className="flex items-center gap-1">
-          <MessageTimestamp date={message.createdAt} align="left" />
+        <div className={`flex items-center gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
+          <MessageTimestamp date={message.createdAt} align="left" />
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1406,7 +1514,7 @@ const AssistantActionBar: FC = () => {
     ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
     : true;
   return (
-    <ActionBarPrimitive.Root className="mt-1 flex items-center gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
+    <ActionBarPrimitive.Root className="flex items-center gap-1">
       <CopyButton />
       {ttsEnabled && <SpeakButton />}
       <ActionBarPrimitive.Reload asChild>

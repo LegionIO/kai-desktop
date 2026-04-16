@@ -71,6 +71,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "dotenv": "^17.3.1",
+    "electron-updater": "6.8.3",
     "esbuild": "^0.25.12",
     "graphql": "^16.13.1",
     "highlight.js": "^11.11.1",
