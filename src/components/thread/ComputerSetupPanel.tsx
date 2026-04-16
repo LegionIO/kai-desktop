@@ -1,12 +1,11 @@
-import { useEffect, useRef, useState, useCallback, type FC, type KeyboardEvent } from 'react';
-import { ExternalLinkIcon, LoaderIcon, MonitorIcon, ShieldCheckIcon, MaximizeIcon } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback, type FC, type KeyboardEvent, type ReactNode } from 'react';
+import { ExternalLinkIcon, LoaderIcon, MonitorIcon, MaximizeIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { app } from '@/lib/ipc-client';
-import { ModelSelector } from './ModelSelector';
-import { ProfileSelector } from './ProfileSelector';
-import { FallbackToggle } from './FallbackToggle';
-import { ReasoningEffortSelector, type ReasoningEffort } from './ReasoningEffortSelector';
+import { ModelSettingsButton } from './ModelSettingsButton';
+import { ComputerSettingsButton } from './ComputerSettingsButton';
+import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { PermissionChecklist } from './PermissionChecklist';
 import type {
   ComputerSession,
@@ -29,18 +28,9 @@ type ComputerSetupPanelProps = {
   startSurface?: ComputerUseSurface;
   activeComputerSession?: ComputerSession;
   onOpenPopout?: () => void;
+  renderDictation?: (opts: { getText: () => string; setText: (text: string) => void; isDictating: boolean; onDictatingChange: (v: boolean) => void }) => ReactNode;
 };
 
-const TARGET_LABELS: Record<ComputerUseTarget, string> = {
-  'isolated-browser': 'Browser',
-  'local-macos': 'Local Mac',
-};
-
-const APPROVAL_LABELS: Record<string, string> = {
-  step: 'Step',
-  goal: 'Goal',
-  autonomous: 'Auto',
-};
 
 export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   conversationId,
@@ -55,6 +45,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   startSurface = 'docked',
   activeComputerSession,
   onOpenPopout,
+  renderDictation,
 }) => {
   const { config } = useConfig();
   const {
@@ -67,8 +58,9 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     probeInputMonitoring,
   } = useComputerUse();
   const [computerGoal, setComputerGoal] = useState('');
-  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>('isolated-browser');
-  const [computerApprovalMode, setComputerApprovalMode] = useState<'step' | 'goal' | 'autonomous'>('step');
+  const [isDictating, setIsDictating] = useState(false);
+  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>('local-macos');
+  const [computerApprovalMode, setComputerApprovalMode] = useState<'step' | 'goal' | 'autonomous'>('autonomous');
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
   const [probedLocalPermissionState, setProbedLocalPermissionState] = useState<ComputerUsePermissions | null>(null);
   const [isCheckingLocalPermissions, setIsCheckingLocalPermissions] = useState(false);
@@ -87,8 +79,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   } | undefined;
 
   useEffect(() => {
-    setComputerTarget(computerConfig?.defaultTarget ?? 'isolated-browser');
-    setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'step');
+    setComputerTarget(computerConfig?.defaultTarget ?? 'local-macos');
+    setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.approvalModeDefault, computerConfig?.defaultTarget]);
 
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
@@ -251,33 +243,31 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     }
   };
 
-  const cycleTarget = () => {
-    const targets: ComputerUseTarget[] = ['isolated-browser', 'local-macos'];
-    setComputerTarget(targets[(targets.indexOf(computerTarget) + 1) % targets.length]);
-  };
+  // Stable accessors for dictation to read/write the goal textarea
+  const goalTextRef = useRef(computerGoal);
+  goalTextRef.current = computerGoal;
+  const getGoalText = useCallback(() => goalTextRef.current, []);
+  const setGoalText = useCallback((text: string) => setComputerGoal(text), []);
 
-  const cycleApproval = () => {
-    const modes: Array<'step' | 'goal' | 'autonomous'> = ['step', 'goal', 'autonomous'];
-    setComputerApprovalMode(modes[(modes.indexOf(computerApprovalMode) + 1) % modes.length]);
-  };
 
   return (
-    <div className="space-y-3 px-1 pb-1">
-      {/* Goal input — Enter to start, Shift+Enter / Option+Enter for newline */}
-      <textarea
-        ref={goalRef}
-        value={computerGoal}
-        onChange={(event) => setComputerGoal(event.target.value)}
-        onKeyDown={handleGoalKeyDown}
-        placeholder={!conversationId ? 'Select a conversation first...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
-        disabled={!conversationId}
-        rows={2}
-        className="w-full resize-none rounded-xl border border-border/70 bg-card/80 px-3 py-2.5 text-base md:text-sm outline-none placeholder:text-muted-foreground/50 disabled:cursor-not-allowed disabled:opacity-50"
-      />
+    <div className="relative px-1 pb-1">
+      {/* Popout button — top-right corner */}
+      {onOpenPopout && !isWebBridge ? (
+        <button
+          type="button"
+          onClick={onOpenPopout}
+          className="absolute right-1 top-0 z-10 flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:bg-muted/50"
+          title="Open in popout window"
+        >
+          <ExternalLinkIcon className="h-3.5 w-3.5 text-muted-foreground" />
+        </button>
+      ) : null}
 
       {/* Permission alerts — only when there's a real problem */}
       {showLocalMacPreflight && (
-        isCheckingLocalPermissions && showLocalPermissionSpinner ? (
+        <div className="mb-3">
+        {isCheckingLocalPermissions && showLocalPermissionSpinner ? (
           <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
             <LoaderIcon className="h-3.5 w-3.5 animate-spin shrink-0" />
             <span>Checking permissions...</span>
@@ -293,12 +283,13 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
             onProbeInputMonitoring={() => { void handleRetryInputMonitoringProbe(); }}
             onOpenSettings={(section) => { void openLocalMacosPrivacySettings(section); }}
           />
-        ) : null
+        ) : null}
+        </div>
       )}
 
       {/* Full-screen app warning — only for local-macos target */}
       {computerTarget === 'local-macos' && fullScreenApps.length > 0 && (
-        <div className="flex items-start gap-2.5 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
+        <div className="mb-3 flex items-start gap-2.5 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
           <div className="flex-1">
             <div className="inline-flex items-center gap-1.5 font-medium">
               <MaximizeIcon className="h-3.5 w-3.5 text-amber-500 shrink-0" />
@@ -323,67 +314,44 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
         </div>
       )}
 
-      {/* Controls row — compact pills + selectors + start button */}
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 md:gap-2">
-          {/* Target selector (clickable pill) */}
-          <button
-            type="button"
-            onClick={cycleTarget}
-            title={`Target: ${TARGET_LABELS[computerTarget]} (click to change)`}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-muted/50"
-          >
-            <MonitorIcon className="h-3.5 w-3.5 text-muted-foreground" />
-            <span>{TARGET_LABELS[computerTarget]}</span>
-          </button>
+      {/* Goal input */}
+      <textarea
+        ref={goalRef}
+        value={computerGoal}
+        onChange={(event) => setComputerGoal(event.target.value)}
+        onKeyDown={handleGoalKeyDown}
+        placeholder={!conversationId ? 'Select a conversation first...' : isDictating ? 'Listening...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
+        disabled={!conversationId}
+        rows={2}
+        className="w-full resize-none bg-transparent px-1 py-0.5 text-base md:text-[15px] outline-none placeholder:text-muted-foreground/50 disabled:cursor-not-allowed disabled:opacity-50"
+      />
 
-          {/* Approval mode selector (clickable pill) */}
-          <button
-            type="button"
-            onClick={cycleApproval}
-            title={`Approval: ${APPROVAL_LABELS[computerApprovalMode]} (click to change)`}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-muted/50"
-          >
-            <ShieldCheckIcon className="h-3.5 w-3.5 text-muted-foreground" />
-            <span>{APPROVAL_LABELS[computerApprovalMode]}</span>
-          </button>
+      {/* Controls row — settings float right, matching chat composer */}
+      <div className="flex items-center justify-end gap-1.5 md:gap-2">
+        <ComputerSettingsButton
+          target={computerTarget}
+          onChangeTarget={setComputerTarget}
+          approvalMode={computerApprovalMode}
+          onChangeApprovalMode={setComputerApprovalMode}
+        />
 
-          <ProfileSelector
-            selectedProfileKey={selectedProfileKey}
-            onSelectProfile={onSelectProfile}
-          />
-          <div className="flex min-w-0 basis-full items-center gap-1.5 md:basis-auto md:gap-2">
-            <FallbackToggle
-              enabled={fallbackEnabled}
-              onToggle={onToggleFallback}
-            />
-            <ModelSelector
-              selectedModelKey={selectedModelKey}
-              onSelectModel={onSelectModel}
-              disabled={fallbackEnabled}
-              filter={(model) => Boolean(
-                (model.computerUseSupport && model.computerUseSupport !== 'none')
-                || model.visionCapable,
-              )}
-              fallbackToUnfilteredWhenEmpty
-            />
-            <ReasoningEffortSelector
-              value={reasoningEffort}
-              onChange={onChangeReasoningEffort}
-            />
-          </div>
+        <ModelSettingsButton
+          selectedModelKey={selectedModelKey}
+          onSelectModel={onSelectModel}
+          reasoningEffort={reasoningEffort}
+          onChangeReasoningEffort={onChangeReasoningEffort}
+          fallbackEnabled={fallbackEnabled}
+          onToggleFallback={onToggleFallback}
+          selectedProfileKey={selectedProfileKey}
+          onSelectProfile={onSelectProfile}
+          filter={(model) => Boolean(
+            (model.computerUseSupport && model.computerUseSupport !== 'none')
+            || model.visionCapable,
+          )}
+          fallbackToUnfilteredWhenEmpty
+        />
 
-          {onOpenPopout && !isWebBridge ? (
-            <button
-              type="button"
-              onClick={onOpenPopout}
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50"
-              title="Open in popout window"
-            >
-              <ExternalLinkIcon className="h-3.5 w-3.5 text-muted-foreground" />
-            </button>
-          ) : null}
-        </div>
+        {renderDictation?.({ getText: getGoalText, setText: setGoalText, isDictating, onDictatingChange: setIsDictating })}
 
         {/* Start button */}
         <button
@@ -403,7 +371,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
 
       {/* Active session indicator — compact */}
       {activeComputerSession ? (
-        <div className="text-[11px] text-muted-foreground">
+        <div className="mt-3 text-[11px] text-muted-foreground">
           Session <span className="font-medium text-foreground">{activeComputerSession.status}</span> — view in Computer tab above
         </div>
       ) : null}

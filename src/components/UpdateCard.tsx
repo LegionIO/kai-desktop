@@ -9,6 +9,7 @@ export const UpdateCard: FC = () => {
   const didAnimate = useRef(false);
 
   useEffect(() => {
+    if (!window.app?.autoUpdate?.onStatus) return;
     const cleanup = app.autoUpdate.onStatus(setStatus);
     return cleanup;
   }, []);

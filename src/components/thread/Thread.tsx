@@ -53,7 +53,6 @@ import { RichChatInput } from './RichChatInput';
 import { DeviceRow } from './DeviceRow';
 import { SearchBar } from './SearchBar';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
-import { ProfileSelector } from './ProfileSelector';
 import { ModelSettingsButton } from './ModelSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
@@ -1666,10 +1665,14 @@ interface DictationButtonProps {
   onListeningChange?: (listening: boolean) => void;
   startRef?: React.RefObject<(() => void) | null>;
   stopRef?: React.RefObject<(() => void) | null>;
+  getText?: () => string;
+  setText?: (text: string) => void;
 }
 
-const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef, stopRef }) => {
+const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef, stopRef, getText: externalGetText, setText: externalSetText }) => {
   const composerRuntime = useComposerRuntime();
+  const getTextFn = useCallback(() => externalGetText ? externalGetText() : (composerRuntime.getState().text ?? ''), [externalGetText, composerRuntime]);
+  const setTextFn = useCallback((text: string) => externalSetText ? externalSetText(text) : composerRuntime.setText(text), [externalSetText, composerRuntime]);
   const { config, updateConfig } = useConfig();
   const [isListening, _setIsListening] = useState(false);
   const [isActivating, setIsActivating] = useState(false);
@@ -1842,7 +1845,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       });
 
       // Track the committed text (finalized segments) vs partial preview
-      let baseText = composerRuntime.getState().text ?? '';
+      let baseText = getTextFn();
 
       session.onSpeech((result) => {
         const transcript = result.transcript?.trim();
@@ -1850,10 +1853,10 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
         console.log('[DictationButton] onSpeech: "%s" isFinal=%s', transcript, result.isFinal);
         if (result.isFinal) {
           baseText = baseText ? baseText.trimEnd() + ' ' + transcript : transcript;
-          composerRuntime.setText(baseText);
+          setTextFn(baseText);
         } else {
           const preview = baseText ? baseText.trimEnd() + ' ' + transcript : transcript;
-          composerRuntime.setText(preview);
+          setTextFn(preview);
         }
       });
 
@@ -1877,7 +1880,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       setIsActivating(false);
       setError('Failed to start dictation');
     }
-  }, [isListening, isActivating, audioProvider, dictationConfig, azureConfig, composerRuntime, selectedDeviceId, setIsListening, playTone]);
+  }, [isListening, isActivating, audioProvider, dictationConfig, azureConfig, getTextFn, setTextFn, selectedDeviceId, setIsListening, playTone]);
 
   // Expose start/stop to parent via refs (for keyboard shortcut)
   useEffect(() => {
@@ -2280,6 +2283,13 @@ const Composer: FC<{
                 onToggleFallback={onToggleFallback}
                 activeComputerSession={activeComputerSession}
                 onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
+                renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
+                  <DictationButton
+                    onListeningChange={onDictatingChange}
+                    getText={getText}
+                    setText={setText}
+                  />
+                ) : undefined}
               />
             ) : (
               <>
@@ -2351,10 +2361,6 @@ const Composer: FC<{
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
-                    <ProfileSelector
-                      selectedProfileKey={selectedProfileKey}
-                      onSelectProfile={onSelectProfile}
-                    />
                   </div>
                   <ModelSettingsButton
                     selectedModelKey={selectedModelKey}
@@ -2363,6 +2369,8 @@ const Composer: FC<{
                     onChangeReasoningEffort={onChangeReasoningEffort}
                     fallbackEnabled={fallbackEnabled}
                     onToggleFallback={onToggleFallback}
+                    selectedProfileKey={selectedProfileKey}
+                    onSelectProfile={onSelectProfile}
                   />
                   {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
                   <CallButton />
