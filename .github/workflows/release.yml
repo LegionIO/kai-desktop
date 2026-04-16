@@ -35,9 +35,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install
 
       - run: pnpm lint
 
@@ -58,14 +57,13 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.22.0
+          version: 10.33.0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install
 
       - run: pnpm build:mac
 
@@ -174,14 +172,13 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.22.0
+          version: 10.33.0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install
 
       - run: pnpm build:mac
 
