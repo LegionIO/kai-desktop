@@ -23,9 +23,7 @@ import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers, checkForUpdatesInteractive } from './ipc/auto-update.js';
-import electronUpdater from 'electron-updater';
-const { autoUpdater } = electronUpdater;
+import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
@@ -183,7 +181,7 @@ function buildMenu(): void {
     ? {
         label: 'Restart to Update',
         click: () => {
-          autoUpdater.quitAndInstall();
+          performQuitAndInstall();
         },
       }
     : {

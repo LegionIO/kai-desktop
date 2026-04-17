@@ -181,7 +181,14 @@ type AppAPI = {
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;
     install: () => Promise<void>;
-    onStatus: (callback: (status: { state: string; version?: string }) => void) => () => void;
+    onStatus: (callback: (status: {
+      state: string;
+      version?: string;
+      percent?: number;
+      transferred?: number;
+      total?: number;
+      bytesPerSecond?: number;
+    }) => void) => () => void;
   };
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;

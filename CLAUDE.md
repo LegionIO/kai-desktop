@@ -22,6 +22,29 @@ pnpm preview          # preview production build
 pnpm rebuild          # rebuild native deps (electron-builder install-app-deps)
 ```
 
+### Testing the Auto-Updater
+
+The auto-updater is disabled in dev mode by default. Set `KAI_UPDATE_TEST_VERSION` to a fake old version to enable it:
+
+```bash
+# Test against GitHub releases (default):
+KAI_UPDATE_TEST_VERSION=0.0.1 pnpm dev
+
+# Test against a different GitHub repo:
+KAI_UPDATE_TEST_VERSION=0.0.1 KAI_UPDATE_REPO=owner/repo pnpm dev
+
+# Test against a generic server (e.g. on-prem S3):
+KAI_UPDATE_TEST_VERSION=0.0.1 KAI_UPDATE_URL=https://example.com/releases/latest pnpm dev
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KAI_UPDATE_TEST_VERSION` | *(unset — updater disabled in dev)* | Fake current version (e.g. `0.0.1`) |
+| `KAI_UPDATE_REPO` | `legionio/kai-desktop` | GitHub `owner/repo` for release lookup |
+| `KAI_UPDATE_URL` | *(unset)* | Generic server URL (takes priority over `KAI_UPDATE_REPO`). Server must host `latest-mac.yml` + zip at this URL. |
+
+Note: the actual install/relaunch step will fail in dev mode (Squirrel expects a signed app bundle) but the full check → download → UI notification flow can be verified.
+
 ## Architecture
 
 Three Electron process layers with strict isolation:

@@ -294,8 +294,8 @@ const appAPI = {
   autoUpdate: {
     check: () => ipcRenderer.invoke('auto-update:check'),
     install: () => ipcRenderer.invoke('auto-update:install'),
-    onStatus: (callback: (status: { state: string; version?: string }) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, status: { state: string; version?: string }) => callback(status);
+    onStatus: (callback: (status: Record<string, unknown>) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: Record<string, unknown>) => callback(status);
       ipcRenderer.on('auto-update:status', handler);
       return () => ipcRenderer.removeListener('auto-update:status', handler);
     },
