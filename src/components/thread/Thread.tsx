@@ -1845,6 +1845,9 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
     };
   }, [pickerOpen, isWebBridgeDictation]);
 
+  // Whether "Hold to record" mode is active (continuous defaults to true = hold mode)
+  const holdToRecord = dictationConfig?.continuous ?? true;
+
   const selectDevice = useCallback((deviceId: string | undefined) => {
     updateConfig('audio.dictation.inputDeviceId', deviceId);
   }, [updateConfig]);
@@ -2017,7 +2020,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
         <Tooltip
           content={
             <span className="flex items-center gap-2">
-              Press and hold to record
+              {holdToRecord ? 'Press and hold to record' : 'Click to start/stop dictation'}
               <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
             </span>
           }
@@ -2026,9 +2029,12 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
         >
           <button
             type="button"
-            onMouseDown={handleStart}
-            onMouseUp={handleStop}
-            onMouseLeave={handleStop}
+            onMouseDown={holdToRecord ? handleStart : undefined}
+            onMouseUp={holdToRecord ? handleStop : undefined}
+            onMouseLeave={holdToRecord ? handleStop : undefined}
+            onClick={holdToRecord ? undefined : () => {
+              if (isListening || isActivating) { handleStop(); } else { handleStart(); }
+            }}
             className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
               isActive
                 ? 'bg-primary text-primary-foreground'

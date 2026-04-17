@@ -497,12 +497,27 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   // Hot-swap output device when config changes mid-call
   useEffect(() => {
     if (!callActiveRef.current || !playerRef.current) return;
-    const deviceId = realtimeConfig?.outputDeviceId;
+    let deviceId = realtimeConfig?.outputDeviceId;
     console.info('[RealtimeProvider] Output device changed mid-call, switching to:', deviceId ?? '(default)');
-    void playerRef.current.setOutputDevice(deviceId ?? '').then(() => {
+
+    void (async () => {
+      // On web, validate the device exists before attempting setSinkId
+      if (isWebBridge && deviceId) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const exists = devices.some((d) => d.kind === 'audiooutput' && d.deviceId === deviceId);
+          if (!exists) {
+            console.info('[RealtimeProvider] Output device not found on this browser, falling back to default');
+            deviceId = undefined;
+          }
+        } catch {
+          deviceId = undefined;
+        }
+      }
+      await playerRef.current?.setOutputDevice(deviceId ?? '');
       console.info('[RealtimeProvider] Output device switch completed');
-    });
-  }, [realtimeConfig?.outputDeviceId]);
+    })();
+  }, [realtimeConfig?.outputDeviceId, isWebBridge]);
 
   // Hot-swap input device when config changes mid-call
   useEffect(() => {
@@ -534,12 +549,24 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
           const processor = ctx.createScriptProcessor(4096, 1, 1);
           processor.onaudioprocess = (e) => {
             if (!callActiveRef.current) return;
+            if (mutedRef.current) {
+              setInputLevel(0);
+              return;
+            }
             const float32 = e.inputBuffer.getChannelData(0);
             const pcm = new Int16Array(float32.length);
             for (let i = 0; i < float32.length; i++) {
               const s = Math.max(-1, Math.min(1, float32[i]));
               pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
+            // Compute level
+            let maxA = 0;
+            for (let i = 0; i < float32.length; i++) {
+              const a = Math.abs(float32[i]);
+              if (a > maxA) maxA = a;
+            }
+            setInputLevel(Math.min(1, maxA * 3));
+            // Base64 encode and send
             const bytes = new Uint8Array(pcm.buffer);
             let bin = '';
             for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
