@@ -1979,6 +1979,8 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
             onMouseDown={holdToRecord ? handleStart : undefined}
             onMouseUp={holdToRecord ? handleStop : undefined}
             onMouseLeave={holdToRecord ? handleStop : undefined}
+            onTouchStart={holdToRecord ? (e) => { e.preventDefault(); handleStart(); } : undefined}
+            onTouchEnd={holdToRecord ? (e) => { e.preventDefault(); handleStop(); } : undefined}
             onClick={holdToRecord ? undefined : () => {
               if (isListening || isActivating) { handleStop(); } else { handleStart(); }
             }}
