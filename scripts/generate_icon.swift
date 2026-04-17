@@ -1,7 +1,43 @@
 import AppKit
 import Foundation
 
-let sourceIconScale: CGFloat = 0.96
+let macOSInsetThreshold: CGFloat = 1.0 / 0.84
+
+func computeFillScale(for image: NSImage) -> CGFloat {
+    guard
+        let tiff = image.tiffRepresentation,
+        let bitmap = NSBitmapImageRep(data: tiff)
+    else {
+        return macOSInsetThreshold
+    }
+
+    let w = bitmap.pixelsWide
+    let h = bitmap.pixelsHigh
+
+    var minX = w, maxX = 0, minY = h, maxY = 0
+
+    for y in 0..<h {
+        for x in 0..<w {
+            guard let color = bitmap.colorAt(x: x, y: y) else { continue }
+            if color.alphaComponent > 0.01 {
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+            }
+        }
+    }
+
+    guard maxX > minX, maxY > minY else {
+        return macOSInsetThreshold
+    }
+
+    let opaqueW = CGFloat(maxX - minX + 1)
+    let opaqueH = CGFloat(maxY - minY + 1)
+    let scale = max(CGFloat(w) / opaqueW, CGFloat(h) / opaqueH) * 1.01
+
+    return max(scale, macOSInsetThreshold)
+}
 
 func drawIcon(size: CGFloat, sourceImage: NSImage, scale: CGFloat) throws -> Data {
     let image = NSImage(size: NSSize(width: size, height: size))
@@ -92,11 +128,12 @@ func createICNS(from iconset: URL, to destination: URL) throws {
 let fileManager = FileManager.default
 let repoRoot = URL(fileURLWithPath: fileManager.currentDirectoryPath)
 
-// Read source from the branding repo (sibling directory).
+let buildDir = repoRoot.appendingPathComponent("build")
 let brandingBuildDir = repoRoot.appendingPathComponent("../kai-platform/branding/build")
 let sourceCandidates = [
     brandingBuildDir.appendingPathComponent("icon-source.png"),
     brandingBuildDir.appendingPathComponent("icon-master.png"),
+    buildDir.appendingPathComponent("icon-source.png"),
 ]
 
 guard
@@ -106,13 +143,15 @@ else {
     throw NSError(
         domain: "IconGen",
         code: 4,
-        userInfo: [NSLocalizedDescriptionKey: "No source icon found in ../kai-platform/branding/build"]
+        userInfo: [NSLocalizedDescriptionKey: "No source icon found in ../kai-platform/branding/build or build/"]
     )
 }
 
 // Write output into this repo's build/ directory.
-let buildDir = repoRoot.appendingPathComponent("build")
 try fileManager.createDirectory(at: buildDir, withIntermediateDirectories: true)
+
+let sourceIconScale = computeFillScale(for: sourceImage)
+print("Fill scale: \(sourceIconScale)")
 
 let master = buildDir.appendingPathComponent("icon-master.png")
 let iconPNG = buildDir.appendingPathComponent("icon.png")
