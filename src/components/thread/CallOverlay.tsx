@@ -71,6 +71,7 @@ function DevicePicker({
   selectedDeviceId,
   levels,
   onSelect,
+  onOpenChange,
 }: {
   label: string;
   icon: React.ReactNode;
@@ -78,19 +79,25 @@ function DevicePicker({
   selectedDeviceId: string | undefined;
   levels: Record<string, number>;
   onSelect: (deviceId: string | undefined) => void;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  const toggleOpen = useCallback((next: boolean) => {
+    setOpen(next);
+    onOpenChange?.(next);
+  }, [onOpenChange]);
 
   // Close on outside click
   useEffect(() => {
     if (!open) return;
     const handler = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+      if (!rootRef.current?.contains(e.target as Node)) toggleOpen(false);
     };
     window.addEventListener('pointerdown', handler);
     return () => window.removeEventListener('pointerdown', handler);
-  }, [open]);
+  }, [open, toggleOpen]);
 
   const selectedLabel =
     (!selectedDeviceId
@@ -101,7 +108,7 @@ function DevicePicker({
     <div ref={rootRef} className="relative">
       <button
         type="button"
-        onClick={() => setOpen(!open)}
+        onClick={() => toggleOpen(!open)}
         className="flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50"
       >
         {icon}
@@ -119,7 +126,7 @@ function DevicePicker({
               label="System Default"
               selected={!selectedDeviceId}
               level={levels['default'] ?? 0}
-              onClick={() => { onSelect(undefined); setOpen(false); }}
+              onClick={() => { onSelect(undefined); toggleOpen(false); }}
             />
             {devices.filter((d) => d.deviceId !== 'default').map((d) => (
               <DeviceRow
@@ -127,7 +134,7 @@ function DevicePicker({
                 label={d.label}
                 selected={selectedDeviceId === d.deviceId}
                 level={levels[d.deviceId] ?? 0}
-                onClick={() => { onSelect(d.deviceId); setOpen(false); }}
+                onClick={() => { onSelect(d.deviceId); toggleOpen(false); }}
               />
             ))}
             {devices.length === 0 && (
@@ -159,8 +166,104 @@ export const CallOverlay: FC = () => {
 
   const selectedInputDeviceId = realtimeConfig?.inputDeviceId;
   const selectedOutputDeviceId = realtimeConfig?.outputDeviceId;
-  const inputLevels = { [selectedInputDeviceId ?? 'default']: inputLevel };
+  const [inputPickerOpen, setInputPickerOpen] = useState(false);
+  const [monitoredInputLevels, setMonitoredInputLevels] = useState<Record<string, number>>({});
+  const inputLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const webInputMonitorRef = useRef<Array<{ stream: MediaStream; audioContext: AudioContext; analyser: AnalyserNode; data: Uint8Array<ArrayBuffer> }>>([]);
+
+  // When the input picker is open, monitor all input devices for per-device levels.
+  // When closed, fall back to the single active-device level from RealtimeProvider.
+  const inputLevels = inputPickerOpen
+    ? monitoredInputLevels
+    : { [selectedInputDeviceId ?? 'default']: inputLevel };
   const outputLevels = { [selectedOutputDeviceId ?? 'default']: outputLevel };
+
+  useEffect(() => {
+    if (!inputPickerOpen) {
+      // Cleanup
+      if (!isWebBridge) app.mic?.stopMonitor?.();
+      if (inputLevelTimerRef.current) { clearInterval(inputLevelTimerRef.current); inputLevelTimerRef.current = null; }
+      for (const item of webInputMonitorRef.current) {
+        try { item.audioContext.close(); } catch { /* ignore */ }
+        item.stream.getTracks().forEach(t => t.stop());
+      }
+      webInputMonitorRef.current = [];
+      setMonitoredInputLevels({});
+      return;
+    }
+
+    if (isWebBridge) {
+      // Browser: open a stream per device and monitor via Web Audio API
+      let cancelled = false;
+      (async () => {
+        try {
+          const monitors: typeof webInputMonitorRef.current = [];
+          for (const device of inputDevices) {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { deviceId: { exact: device.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+              });
+              if (cancelled) { stream.getTracks().forEach(t => t.stop()); break; }
+              const audioContext = new AudioContext();
+              const source = audioContext.createMediaStreamSource(stream);
+              const analyser = audioContext.createAnalyser();
+              analyser.fftSize = 2048;
+              source.connect(analyser);
+              monitors.push({ stream, audioContext, analyser, data: new Uint8Array(analyser.fftSize) as Uint8Array<ArrayBuffer> });
+            } catch { /* device open failed, skip */ }
+          }
+          if (cancelled) {
+            for (const m of monitors) { try { m.audioContext.close(); } catch { /* ignore */ } m.stream.getTracks().forEach(t => t.stop()); }
+            return;
+          }
+          webInputMonitorRef.current = monitors;
+
+          const deviceIdToMonitor = new Map<string, typeof monitors[number]>();
+          inputDevices.forEach((d, i) => { if (monitors[i]) deviceIdToMonitor.set(d.deviceId, monitors[i]); });
+
+          inputLevelTimerRef.current = setInterval(() => {
+            const lvls: Record<string, number> = {};
+            for (const [id, mon] of deviceIdToMonitor) {
+              mon.analyser.getByteTimeDomainData(mon.data);
+              let sum = 0;
+              for (let j = 0; j < mon.data.length; j++) {
+                const v = (mon.data[j] - 128) / 128;
+                sum += v * v;
+              }
+              lvls[id] = Math.sqrt(sum / mon.data.length);
+            }
+            if (inputDevices.length > 0 && lvls[inputDevices[0].deviceId] !== undefined) {
+              lvls['default'] = lvls[inputDevices[0].deviceId];
+            }
+            setMonitoredInputLevels(lvls);
+          }, 66);
+        } catch { /* ignore */ }
+      })();
+      return () => {
+        cancelled = true;
+        if (inputLevelTimerRef.current) { clearInterval(inputLevelTimerRef.current); inputLevelTimerRef.current = null; }
+        for (const item of webInputMonitorRef.current) {
+          try { item.audioContext.close(); } catch { /* ignore */ }
+          item.stream.getTracks().forEach(t => t.stop());
+        }
+        webInputMonitorRef.current = [];
+      };
+    } else {
+      // Desktop: use IPC mic monitor for all devices
+      const mic = app.mic;
+      if (!mic) return;
+      const ids = ['default', ...inputDevices.filter(d => d.deviceId !== 'default').map(d => d.deviceId)];
+      mic.startMonitor(ids).then(() => {
+        inputLevelTimerRef.current = setInterval(() => {
+          mic.getLevel().then(setMonitoredInputLevels).catch(() => setMonitoredInputLevels({}));
+        }, 66);
+      });
+      return () => {
+        mic.stopMonitor();
+        if (inputLevelTimerRef.current) { clearInterval(inputLevelTimerRef.current); inputLevelTimerRef.current = null; }
+      };
+    }
+  }, [inputPickerOpen, isWebBridge, inputDevices]);
 
   // Load devices on mount
   useEffect(() => {
@@ -243,6 +346,7 @@ export const CallOverlay: FC = () => {
               selectedDeviceId={selectedInputDeviceId}
               levels={inputLevels}
               onSelect={handleSelectInput}
+              onOpenChange={setInputPickerOpen}
             />
             <DevicePicker
               label="Output Device"
