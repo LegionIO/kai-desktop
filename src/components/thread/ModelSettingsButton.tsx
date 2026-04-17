@@ -3,6 +3,7 @@ import { BrainCircuitIcon, CheckIcon, ChevronUpIcon, CpuIcon, ShuffleIcon, UserC
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
 
 type ModelInfo = {
@@ -78,6 +79,7 @@ export const ModelSettingsButton: FC<{
   }, [isOpen]);
 
   const toggle = useCallback(() => setIsOpen((o) => !o), []);
+  const popover = usePopoverAlign();
 
   let models = catalog?.models ?? [];
   if (filter) {
@@ -131,7 +133,7 @@ export const ModelSettingsButton: FC<{
 
       {/* Settings popover */}
       {isOpen && (
-        <div className="absolute bottom-full right-0 z-50 mb-2 w-[280px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           {/* Profile section */}
           {hasProfiles && (
             <>

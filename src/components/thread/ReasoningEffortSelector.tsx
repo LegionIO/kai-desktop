@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FC } from 'react';
 import { BrainCircuitIcon, CheckIcon, ChevronDownIcon } from 'lucide-react';
+import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 
 export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
 
@@ -17,6 +18,7 @@ export const ReasoningEffortSelector: FC<{
 }> = ({ value, onChange, dropdownDirection = 'up' }) => {
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const popover = usePopoverAlign();
   const current = OPTIONS.find((option) => option.value === value) ?? OPTIONS[1];
 
   useEffect(() => {
@@ -46,7 +48,7 @@ export const ReasoningEffortSelector: FC<{
 
       {isOpen && (
         <>
-          <div className={`absolute ${dropdownDirection === 'down' ? 'top-full mt-2' : 'bottom-full mb-2'} left-0 z-50 w-[220px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl`}>
+          <div ref={popover.ref} style={popover.style} className={`absolute ${dropdownDirection === 'down' ? 'top-full mt-2' : 'bottom-full mb-2'} right-0 z-50 w-[220px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl`}>
             <div className="px-3 py-2 text-sm font-medium text-muted-foreground">Select reasoning</div>
             <div className="max-h-[280px] overflow-y-auto">
               {OPTIONS.map((option) => (

@@ -57,6 +57,7 @@ import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { ModelSettingsButton } from './ModelSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
+import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
@@ -1706,6 +1707,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   const [levels, setLevels] = useState<Record<string, number>>({});
   const sessionRef = useRef<DictationSession | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const popover = usePopoverAlign();
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const webMonitorUnsubRef = useRef<(() => void) | null>(null);
 
@@ -2006,7 +2008,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
 
       {/* Device picker popover — toggled by chevron button */}
       {pickerOpen && (
-        <div className="absolute bottom-full right-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[300px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           {/* Level indicator bar */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
             <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />

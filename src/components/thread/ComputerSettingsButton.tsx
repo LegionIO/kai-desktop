@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
 import { CheckIcon, ChevronUpIcon, MonitorIcon, ShieldCheckIcon } from 'lucide-react';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import type { ComputerUseTarget } from '../../../shared/computer-use';
 
 type ApprovalMode = 'step' | 'goal' | 'autonomous';
@@ -36,6 +37,7 @@ export const ComputerSettingsButton: FC<{
   }, [isOpen]);
 
   const toggle = useCallback(() => setIsOpen((o) => !o), []);
+  const popover = usePopoverAlign();
 
   const currentTarget = TARGET_OPTIONS.find((o) => o.value === target) ?? TARGET_OPTIONS[1];
   const currentApproval = APPROVAL_OPTIONS.find((o) => o.value === approvalMode) ?? APPROVAL_OPTIONS[2];
@@ -78,7 +80,7 @@ export const ComputerSettingsButton: FC<{
 
       {/* Settings popover */}
       {isOpen && (
-        <div className="absolute bottom-full right-0 z-50 mb-2 w-[280px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           {/* Target section */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
             <MonitorIcon className="h-3.5 w-3.5 text-muted-foreground" />

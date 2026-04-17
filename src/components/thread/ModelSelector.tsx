@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FC } from 'react';
 import { CheckIcon, ChevronDownIcon, CpuIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
+import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 
 type ModelInfo = {
   key: string;
@@ -30,6 +31,7 @@ export const ModelSelector: FC<ModelSelectorProps> = ({ selectedModelKey, onSele
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const popover = usePopoverAlign();
 
   useEffect(() => {
     app.modelCatalog()
@@ -79,7 +81,7 @@ export const ModelSelector: FC<ModelSelectorProps> = ({ selectedModelKey, onSele
 
       {isOpen && (
         <>
-          <div className={`absolute ${dropdownDirection === 'down' ? 'top-full mt-2' : 'bottom-full mb-2'} left-0 md:left-auto md:right-0 z-50 w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl`}>
+          <div ref={popover.ref} style={popover.style} className={`absolute ${dropdownDirection === 'down' ? 'top-full mt-2' : 'bottom-full mb-2'} right-0 z-50 w-[240px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl`}>
             <div className="px-3 py-2 text-sm font-medium text-muted-foreground">Select model</div>
             <div className="max-h-[300px] overflow-y-auto">
               {models.map((model) => {
