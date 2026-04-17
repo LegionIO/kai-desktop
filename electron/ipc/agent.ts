@@ -2,6 +2,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { join } from 'path';
+import { homedir } from 'os';
 import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
@@ -340,13 +341,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       fallbackEnabled?: boolean,
       cwd?: string,
     ) => {
+    const effectiveCwd = cwd || homedir();
+
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
 
     const controller = new AbortController();
     activeStreams.set(conversationId, { abort: () => controller.abort() });
-    const observerSessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const randomBytes = new Uint8Array(4);
+    crypto.getRandomValues(randomBytes);
+    const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
     activeObserverSessions.set(conversationId, observerSessionId);
 
     let config: AppConfig;
@@ -678,7 +683,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           return { ok: false, details: `Tool "${toolName}" is not registered.` };
         }
 
-        const toolCallId = `tc-obs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const tcBytes = new Uint8Array(4);
+        crypto.getRandomValues(tcBytes);
+        const toolCallId = `tc-obs-${Date.now()}-${Array.from(tcBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
         const startedAt = new Date().toISOString();
         const localAbortController = new AbortController();
         const cancel = (): void => {
@@ -944,7 +951,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           profileKey,
           fallbackEnabled,
           reasoningEffort,
-          cwd,
+          cwd: effectiveCwd,
           config,
           appHome,
           primaryModel: modelEntry,

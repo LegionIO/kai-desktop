@@ -7,6 +7,7 @@ export type AttachedFile = {
   size: number;
   dataUrl: string;
   text?: string;
+  filePath?: string;
 };
 
 type AttachmentContextValue = {

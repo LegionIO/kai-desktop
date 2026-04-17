@@ -1,4 +1,5 @@
 import { useState, useEffect, type FC } from 'react';
+import { createPortal } from 'react-dom';
 import { DownloadIcon, FileTextIcon, FileJsonIcon, CopyIcon, CheckIcon, XIcon } from 'lucide-react';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { app } from '@/lib/ipc-client';
@@ -132,7 +133,7 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
 
   const msgCount = conv?.messages?.length || 0;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div className="relative w-full max-w-xl rounded-xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
@@ -183,6 +184,7 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };

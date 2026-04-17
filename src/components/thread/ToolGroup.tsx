@@ -30,6 +30,7 @@ type ToolCallPart = {
   argsText?: string;
   result?: unknown;
   isError?: boolean;
+  isHung?: boolean;
   startedAt?: string;
   finishedAt?: string;
   durationMs?: number;
@@ -66,8 +67,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
   const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
   const hasResult = part.result !== undefined;
-  const isError = part.isError || (hasResult && isErrorResult(part.result));
-  const isRunning = !hasResult;
+  const isHung = Boolean(part.isHung);
+  const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
+  const isRunning = !hasResult && !isHung;
   const hasLiveOutput = Boolean(part.liveOutput?.stdout || part.liveOutput?.stderr);
   const wasCompacted = Boolean(part.compactionMeta?.wasCompacted);
   const canShowOriginal = wasCompacted && part.originalResult !== undefined;
@@ -90,6 +92,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
         {summary && (
           <span className="text-xs text-muted-foreground truncate min-w-0">{summary}</span>
         )}
+        {isHung && (
+          <span className="text-[10px] font-medium text-amber-500 shrink-0">HUNG</span>
+        )}
         {isSummarizing && (
           <span className="text-[10px] text-amber-500 animate-pulse shrink-0">Summarizing...</span>
         )}
@@ -97,6 +102,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
           <ToolElapsedBadge
             isRunning={isRunning}
             isError={Boolean(isError)}
+            isHung={isHung}
             startedAt={part.startedAt}
             finishedAt={part.finishedAt}
             durationMs={part.durationMs}
@@ -708,17 +714,18 @@ const CompactionToggle: FC<{ showOriginal: boolean; onToggle: () => void }> = ({
 const ToolElapsedBadge: FC<{
   isRunning: boolean;
   isError: boolean;
+  isHung?: boolean;
   startedAt?: string;
   finishedAt?: string;
   durationMs?: number;
-}> = ({ isRunning, isError, startedAt, finishedAt, durationMs }) => {
+}> = ({ isRunning, isError, isHung, startedAt, finishedAt, durationMs }) => {
   return (
     <ElapsedBadge
       startedAt={startedAt}
       finishedAt={finishedAt}
       durationMs={durationMs}
-      isRunning={isRunning}
-      isError={isError}
+      isRunning={isRunning && !isHung}
+      isError={isError || Boolean(isHung)}
       className="ml-auto"
     />
   );

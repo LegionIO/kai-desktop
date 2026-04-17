@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
-import { PlusIcon, SearchIcon, Trash2Icon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon } from 'lucide-react';
+import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, ArchiveRestoreIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
@@ -8,12 +8,13 @@ import type { ComputerSession } from '../../../shared/computer-use';
 import { useConversationPreferences } from './useConversationPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
+import { ExportDialog } from './ExportDialog';
 import { usePlugins } from '@/providers/PluginProvider';
 
 type ConversationSummary = Pick<
   ConversationRecord,
   'id' | 'title' | 'fallbackTitle' | 'createdAt' | 'updatedAt' | 'lastMessageAt' |
-  'messageCount' | 'userMessageCount' | 'runStatus' | 'hasUnread' | 'lastAssistantUpdateAt'
+  'messageCount' | 'userMessageCount' | 'runStatus' | 'hasUnread' | 'lastAssistantUpdateAt' | 'archived'
 > & {
   /** Computed server-side: true if any message contains a tool-call content part */
   hasToolCalls?: boolean;
@@ -138,6 +139,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
+  const removingIdsRef = useRef<Set<string>>(new Set());
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
@@ -147,6 +149,11 @@ export const ConversationList: FC<ConversationListProps> = ({
   const sortButtonRef = useRef<HTMLButtonElement>(null);
   const filterButtonRef = useRef<HTMLButtonElement>(null);
   const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters, isDefaultSort } = useConversationPreferences();
+  const [showArchived, setShowArchived] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [exportConvId, setExportConvId] = useState<string | null>(null);
   const { uiState: pluginUIState } = usePlugins();
   const conversationDecorations = pluginUIState?.conversationDecorations ?? [];
 
@@ -179,35 +186,32 @@ export const ConversationList: FC<ConversationListProps> = ({
     }
   }, [activeConversationId, activeThreadMode, sessionsByConversation]);
 
-  const loadConversations = async () => {
+  const loadConversations = useCallback(async () => {
     try {
       const list = await app.conversations.list() as ConversationSummary[];
 
-      // Detect conversations that were removed since last load (auto-cleanup)
-      // and animate them out before removing from state
       setConversations((prev) => {
         const newIds = new Set(list.map((c) => c.id));
-        const vanished = prev.filter((c) => !newIds.has(c.id) && !removingIds.has(c.id));
+        const vanished = prev.filter((c) => !newIds.has(c.id) && !removingIdsRef.current.has(c.id));
 
         if (vanished.length > 0) {
-          // Mark vanished items for animation
           setRemovingIds((ids) => {
             const next = new Set(ids);
             for (const c of vanished) next.add(c.id);
+            removingIdsRef.current = next;
             return next;
           });
-          // After animation, remove them from state
           setTimeout(() => {
             setRemovingIds((ids) => {
               const next = new Set(ids);
               for (const c of vanished) next.delete(c.id);
+              removingIdsRef.current = next;
               return next;
             });
             setConversations((current) =>
               current.filter((c) => !vanished.some((v) => v.id === c.id)),
             );
           }, 300);
-          // Keep old items in list during animation
           return prev;
         }
 
@@ -216,19 +220,23 @@ export const ConversationList: FC<ConversationListProps> = ({
     } catch {
       // IPC not ready
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadConversations();
-    const interval = setInterval(loadConversations, 1500);
-    return () => clearInterval(interval);
-  }, []);
+    let cancelled = false;
+    const safeLoad = () => { if (!cancelled) void loadConversations(); };
+    safeLoad();
+    const unsub = app.conversations.onChanged(() => { safeLoad(); });
+    return () => { cancelled = true; unsub(); };
+  }, [loadConversations]);
 
   const isSearchActive = searchQuery.trim().length > 0;
   const hasActiveFilters = activeFilterCount > 0;
 
   const processedConversations = useMemo(() => {
     let result = [...conversations];
+
+    result = result.filter((conv) => showArchived ? Boolean(conv.archived) : !conv.archived);
 
     // Stage 1: Apply filters
     if (hasActiveFilters) {
@@ -278,7 +286,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation]);
+  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived]);
 
   const handleDelete = async (id: string) => {
     const shouldCreateReplacementThread = id === activeConversationId;
@@ -296,6 +304,41 @@ export const ConversationList: FC<ConversationListProps> = ({
       setDeletingId(null);
     }
   };
+
+  const handleArchive = async (id: string) => {
+    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    if (!conv) return;
+    const isArchived = !conv.archived;
+    await app.conversations.put({ ...conv, archived: isArchived });
+    if (isArchived && id === activeConversationId) {
+      await onNewConversation();
+    }
+    await loadConversations();
+  };
+
+  const handleRename = async (id: string, newTitle: string) => {
+    const trimmed = newTitle.trim();
+    if (!trimmed) { setRenamingId(null); return; }
+    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    if (!conv) { setRenamingId(null); return; }
+    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
+    setRenamingId(null);
+    await loadConversations();
+  };
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, convId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, convId });
+  }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('contextmenu', close);
+    return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
+  }, [contextMenu]);
 
   const handleDeleteBulk = async () => {
     const idsToDelete = processedConversations.map((c) => c.id);
@@ -364,6 +407,15 @@ export const ConversationList: FC<ConversationListProps> = ({
               </span>
             )}
           </div>
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => setShowArchived((p) => !p)}
+            className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${showArchived ? 'text-primary' : ''}`}
+            title={showArchived ? 'Show active threads' : 'Show archived threads'}
+          >
+            <ArchiveIcon className="h-4 w-4" />
+          </button>
           {sortOpen && (
             <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortButtonRef} />
           )}
@@ -438,6 +490,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                     tabIndex={0}
                     onClick={() => handleClearUnread(conv.id)}
                     onKeyDown={(e) => e.key === 'Enter' && handleClearUnread(conv.id)}
+                    onContextMenu={(e) => handleContextMenu(e, conv.id)}
                     className={`
                       flex w-full items-start gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm transition-all group cursor-pointer relative
                       ${isActive ? 'shadow-[inset_0_0_0_1px_var(--app-active-item-ring)]' : 'hover:bg-sidebar-accent/65'}
@@ -447,9 +500,24 @@ export const ConversationList: FC<ConversationListProps> = ({
                   >
                     <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${hasUnread ? 'text-primary' : 'text-muted-foreground'}`} />
                     <div className="flex-1 min-w-0">
+                      {renamingId === conv.id ? (
+                        <input
+                          autoFocus
+                          className="w-full rounded bg-sidebar-accent/80 px-1 py-0.5 text-sm font-medium text-sidebar-foreground outline-none ring-1 ring-primary/50"
+                          value={renameValue}
+                          onChange={(e) => setRenameValue(e.target.value)}
+                          onBlur={() => handleRename(conv.id, renameValue)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') { e.preventDefault(); void handleRename(conv.id, renameValue); }
+                            if (e.key === 'Escape') setRenamingId(null);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      ) : (
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
                         {getDisplayTitle(conv, sessionsByConversation.get(conv.id))}
                       </span>
+                      )}
                       {decorations.length > 0 && (
                         <div className="mt-1 flex flex-wrap gap-1">
                           {decorations.slice(0, 3).map((decoration) => (
@@ -488,6 +556,16 @@ export const ConversationList: FC<ConversationListProps> = ({
                       >
                         <PinIcon className="h-3 w-3" />
                       </button>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); void handleArchive(conv.id); }}
+                        className="shrink-0 rounded p-0.5 opacity-0 transition-all group-hover:opacity-100 hover:bg-amber-500/10"
+                        title={conv.archived ? 'Unarchive' : 'Archive'}
+                      >
+                        {conv.archived
+                          ? <ArchiveRestoreIcon className="h-3 w-3 text-muted-foreground hover:text-amber-500" />
+                          : <ArchiveIcon className="h-3 w-3 text-muted-foreground hover:text-amber-500" />}
+                      </button>
                       <ConversationDeleteButton
                         onDelete={() => handleDelete(conv.id)}
                         isDeleting={deletingId === conv.id}
@@ -517,6 +595,51 @@ export const ConversationList: FC<ConversationListProps> = ({
           />
         </div>
       )}
+
+      {contextMenu && (
+        <div
+          className="fixed z-[100] min-w-[160px] rounded-lg border border-border/70 bg-popover py-1 shadow-lg"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            onClick={() => {
+              const conv = conversations.find((c) => c.id === contextMenu.convId);
+              setRenameValue(conv?.title || conv?.fallbackTitle || '');
+              setRenamingId(contextMenu.convId);
+              setContextMenu(null);
+            }}
+          >
+            <PencilIcon className="h-3 w-3" /> Rename
+          </button>
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            onClick={() => { void handleArchive(contextMenu.convId); setContextMenu(null); }}
+          >
+            <ArchiveIcon className="h-3 w-3" /> {conversations.find((c) => c.id === contextMenu.convId)?.archived ? 'Unarchive' : 'Archive'}
+          </button>
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            onClick={() => { setExportConvId(contextMenu.convId); setContextMenu(null); }}
+          >
+            <DownloadIcon className="h-3 w-3" /> Export
+          </button>
+          <div className="my-1 border-t border-border/50" />
+          <button
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 transition-colors"
+            onClick={() => { void handleDelete(contextMenu.convId); setContextMenu(null); }}
+          >
+            <Trash2Icon className="h-3 w-3" /> Delete
+          </button>
+        </div>
+      )}
+
+      <ExportDialog
+        open={exportConvId !== null}
+        onClose={() => setExportConvId(null)}
+        conversationId={exportConvId}
+      />
     </div>
   );
 };

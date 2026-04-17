@@ -120,6 +120,7 @@ export type ConversationRecord = {
   parentToolCallId?: string | null;
   subAgentDepth?: number;
   isSubAgent?: boolean;
+  archived?: boolean;
 };
 
 export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
@@ -386,6 +387,24 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
   if (idx < 0) {
     acc.pendingAssistantTiming = null;
     return;
+  }
+
+  const content = acc.messages[idx].content;
+  if (Array.isArray(content)) {
+    type ToolCallPart = { type: string; result?: unknown; finishedAt?: string; isError?: boolean; isHung?: boolean };
+    let mutated = false;
+    for (const part of content) {
+      const tc = part as ToolCallPart;
+      if (tc.type === 'tool-call' && tc.result === undefined) {
+        tc.result = { isHung: true, error: 'Stream ended before tool result was received.' };
+        tc.isHung = true;
+        tc.finishedAt = finishedAt;
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      acc.messages[idx] = { ...acc.messages[idx], content: [...content] };
+    }
   }
 
   acc.messages[idx] = withResponseTiming(acc.messages[idx], buildResponseTiming(startedAt, finishedAt));
@@ -1115,6 +1134,26 @@ export function RuntimeProvider({
     if (!conv) return false;
 
     const { tree: t, headId: h } = ensureTree(conv);
+
+    for (const msg of t) {
+      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+      type PersistedToolPart = { type: string; result?: unknown; isHung?: boolean; finishedAt?: string };
+      let repaired = false;
+      for (const part of msg.content) {
+        const tc = part as PersistedToolPart;
+        if (tc.type === 'tool-call' && tc.result === undefined) {
+          tc.result = { isHung: true, error: 'Stream ended before tool result was received.' };
+          tc.isHung = true;
+          tc.finishedAt = tc.finishedAt ?? new Date().toISOString();
+          repaired = true;
+        }
+      }
+      if (repaired) {
+        const idx = t.indexOf(msg);
+        if (idx >= 0) t[idx] = { ...msg, content: [...msg.content] };
+      }
+    }
+
     setActiveConversationId(id);
     setTree(t);
     setHeadId(h);
@@ -1148,6 +1187,8 @@ export function RuntimeProvider({
         }
         const newId = generateId();
         const now = nowIso();
+        let defaultCwd: string | null = null;
+        try { defaultCwd = await app.platform.homedir(); } catch { /* fallback to null */ }
         await app.conversations.put({
           id: newId, title: null, fallbackTitle: null, messages: [], messageTree: [], headId: null,
           conversationCompaction: null, lastContextUsage: null,
@@ -1157,14 +1198,14 @@ export function RuntimeProvider({
           runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
           selectedModelKey: null,
           selectedBackendKey: null,
-          currentWorkingDirectory: null,
+          currentWorkingDirectory: defaultCwd,
         } as ConversationRecord);
         await app.conversations.setActiveId(newId);
         setActiveConversationId(newId);
         setTree([]);
         setHeadId(null);
-        currentWorkingDirectoryRef.current = null;
-        setCurrentWorkingDirectoryState(null);
+        currentWorkingDirectoryRef.current = defaultCwd;
+        setCurrentWorkingDirectoryState(defaultCwd);
       } catch (err) {
         console.error('[Runtime] Failed to load conversation:', err);
       }
@@ -1589,15 +1630,16 @@ export function RuntimeProvider({
       else if (part.type === 'image') userContent.push({ type: 'image', image: (part as { image: string }).image });
     }
     for (const att of pendingAttachments) {
+      const pathLabel = att.filePath ? att.filePath : att.name;
       if (att.isImage) {
         userContent.push({ type: 'image', image: att.dataUrl });
-        userContent.push({ type: 'text', text: `\n[Attached image: ${att.name}]` });
+        userContent.push({ type: 'text', text: `\n[Attached image: ${pathLabel}]` });
       } else if (att.text) {
         userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
-        userContent.push({ type: 'text', text: `\n\n--- File: ${att.name} ---\n${att.text}\n--- End File ---\n` });
+        userContent.push({ type: 'text', text: `\n\n--- File: ${pathLabel} ---\n${att.text}\n--- End File ---\n` });
       } else {
         userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
-        userContent.push({ type: 'text', text: `\n[Attached file: ${att.name} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]` });
+        userContent.push({ type: 'text', text: `\n[Attached file: ${pathLabel} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]` });
       }
     }
     if (!userContent.some((p) => p.type === 'text')) return;

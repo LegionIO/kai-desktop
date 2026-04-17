@@ -524,24 +524,40 @@ function useMatrixCanvas() {
 
       frameId = window.setTimeout(() => {
         animationFrame = window.requestAnimationFrame(draw);
-      }, 65);
+      }, 130);
     };
 
-    setup();
-    draw();
-
-    const handleResize = () => {
+    const stop = () => {
       window.clearTimeout(frameId);
       window.cancelAnimationFrame(animationFrame);
-      setup();
+    };
+
+    const start = () => {
+      stop();
       draw();
     };
 
+    setup();
+    start();
+
+    const handleResize = () => { stop(); setup(); start(); };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') stop(); else start();
+    };
+    const handleBlur = () => stop();
+    const handleFocus = () => start();
+
     window.addEventListener('resize', handleResize);
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('focus', handleFocus);
+
     return () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
+      stop();
       window.removeEventListener('resize', handleResize);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('focus', handleFocus);
     };
   }, []);
 
@@ -1001,18 +1017,28 @@ function useConstellationCanvas() {
 
       frameId = window.setTimeout(() => {
         animationFrame = window.requestAnimationFrame(draw);
-      }, 65);
+      }, 130);
+    };
+
+    const stop = () => {
+      window.clearTimeout(frameId);
+      window.cancelAnimationFrame(animationFrame);
+    };
+
+    const start = () => {
+      stop();
+      draw();
     };
 
     setup();
-    draw();
+    start();
 
-    const handleResize = () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
-      setup();
-      draw();
+    const handleResize = () => { stop(); setup(); start(); };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') stop(); else start();
     };
+    const handleBlur = () => stop();
+    const handleFocus = () => start();
 
     // Use ResizeObserver on the container so the canvas is correctly sized
     // on first layout (Electron may render before the window is fully sized).
@@ -1024,10 +1050,16 @@ function useConstellationCanvas() {
     }
 
     window.addEventListener('resize', handleResize);
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('focus', handleFocus);
+
     return () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
+      stop();
       window.removeEventListener('resize', handleResize);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('focus', handleFocus);
       ro?.disconnect();
     };
   }, []);
