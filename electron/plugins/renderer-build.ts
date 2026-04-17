@@ -4,7 +4,7 @@ import { dirname, extname, join, normalize, relative, resolve } from 'path';
 import type * as Esbuild from 'esbuild';
 import type { PluginRendererBuild, PluginRendererScript, PluginRendererStyle } from './types.js';
 
-const CACHE_DIRNAME = 'plugin-renderers';
+const CACHE_DIRNAME = '.cache';
 const MANIFEST_FILENAME = 'renderer-build.json';
 
 const SCRIPT_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx']);
@@ -84,7 +84,7 @@ async function getEsbuild(): Promise<typeof Esbuild> {
 }
 
 function rendererCacheRoot(appHome: string, pluginName: string, fileHash: string): string {
-  return join(appHome, CACHE_DIRNAME, pluginName, fileHash);
+  return join(appHome, 'plugins', CACHE_DIRNAME, pluginName, fileHash);
 }
 
 function rendererBuildUrl(pluginName: string, fileHash: string, relativePath: string): string {

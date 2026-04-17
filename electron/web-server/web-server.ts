@@ -50,8 +50,8 @@ const LOGIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 
 /* ── File-backed session store ─────────────────────────────────────── */
 
-const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG);
-const SESSIONS_PATH = join(SESSIONS_DIR, 'sessions.json');
+const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
+const SESSIONS_PATH = join(SESSIONS_DIR, 'web-sessions.json');
 
 type SessionStore = Record<string, number>; // token -> expiry epoch ms
 
@@ -141,7 +141,7 @@ const MIME_TYPES: Record<string, string> = {
 const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
 
 /** Base directory where compiled plugin renderer bundles are cached. */
-const PLUGIN_RENDERERS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugin-renderers');
+const PLUGIN_RENDERERS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins', '.cache');
 
 /**
  * Client-side bridge script injected into the HTML served to web clients.
