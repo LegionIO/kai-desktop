@@ -244,7 +244,7 @@ const audioConfigSchema = z.object({
     enabled: z.boolean(),
     language: z.string().optional(),
     continuous: z.boolean(),
-    inputDeviceId: z.string().optional(),
+    inputDeviceId: z.string().nullable().optional(),
   }),
 });
 
@@ -273,8 +273,8 @@ const realtimeConfigSchema = z.object({
     silenceDurationMs: z.number().positive().optional(),
   }).optional(),
   inputAudioTranscription: z.boolean().optional(),
-  inputDeviceId: z.string().optional(),
-  outputDeviceId: z.string().optional(),
+  inputDeviceId: z.string().nullable().optional(),
+  outputDeviceId: z.string().nullable().optional(),
   autoEndCall: z.object({
     enabled: z.boolean().optional(),
     silenceTimeoutSec: z.number().positive().optional(),
