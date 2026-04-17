@@ -1,4 +1,4 @@
-import { shell, BrowserWindow, safeStorage, session } from 'electron';
+import { app, shell, BrowserWindow, safeStorage, session } from 'electron';
 import { getBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
@@ -646,6 +646,14 @@ export function createPluginAPI(
     safeStorage: {
       isEncryptionAvailable: () => {
         requirePermission('safe-storage');
+        // Avoid calling safeStorage.isEncryptionAvailable() eagerly — on
+        // macOS (especially MDM-managed machines) even the availability check
+        // can trigger a Keychain access prompt at startup.  Encryption is
+        // always available on macOS and Windows once the app is ready, so we
+        // only need to probe on other platforms.
+        if (process.platform === 'darwin' || process.platform === 'win32') {
+          return app.isReady();
+        }
         return safeStorage.isEncryptionAvailable();
       },
       encryptString: (plaintext: string) => {
