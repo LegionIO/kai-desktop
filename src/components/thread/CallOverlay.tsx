@@ -4,6 +4,7 @@ import { useConfig } from '@/providers/ConfigProvider';
 import { DeviceRow } from './DeviceRow';
 import { app } from '@/lib/ipc-client';
 import { listOutputDevices } from '@/lib/audio/realtime-playback';
+import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { PhoneOffIcon, MicIcon, MicOffIcon, Volume2Icon, ChevronUpIcon } from 'lucide-react';
 
 /* ── Helpers ── */
@@ -169,7 +170,7 @@ export const CallOverlay: FC = () => {
   const [inputPickerOpen, setInputPickerOpen] = useState(false);
   const [monitoredInputLevels, setMonitoredInputLevels] = useState<Record<string, number>>({});
   const inputLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const webInputMonitorRef = useRef<Array<{ stream: MediaStream; audioContext: AudioContext; analyser: AnalyserNode; data: Uint8Array<ArrayBuffer> }>>([]);
+  const webMonitorUnsubRef = useRef<(() => void) | null>(null);
 
   // When the input picker is open, monitor all input devices for per-device levels.
   // When closed, fall back to the single active-device level from RealtimeProvider.
@@ -183,70 +184,24 @@ export const CallOverlay: FC = () => {
       // Cleanup
       if (!isWebBridge) app.mic?.stopMonitor?.();
       if (inputLevelTimerRef.current) { clearInterval(inputLevelTimerRef.current); inputLevelTimerRef.current = null; }
-      for (const item of webInputMonitorRef.current) {
-        try { item.audioContext.close(); } catch { /* ignore */ }
-        item.stream.getTracks().forEach(t => t.stop());
-      }
-      webInputMonitorRef.current = [];
+      webMonitorUnsubRef.current?.();
+      webMonitorUnsubRef.current = null;
       setMonitoredInputLevels({});
       return;
     }
 
     if (isWebBridge) {
-      // Browser: open a stream per device and monitor via Web Audio API
-      let cancelled = false;
-      (async () => {
-        try {
-          const monitors: typeof webInputMonitorRef.current = [];
-          for (const device of inputDevices) {
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({
-                audio: { deviceId: { exact: device.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-              });
-              if (cancelled) { stream.getTracks().forEach(t => t.stop()); break; }
-              const audioContext = new AudioContext();
-              const source = audioContext.createMediaStreamSource(stream);
-              const analyser = audioContext.createAnalyser();
-              analyser.fftSize = 2048;
-              source.connect(analyser);
-              monitors.push({ stream, audioContext, analyser, data: new Uint8Array(analyser.fftSize) as Uint8Array<ArrayBuffer> });
-            } catch { /* device open failed, skip */ }
-          }
-          if (cancelled) {
-            for (const m of monitors) { try { m.audioContext.close(); } catch { /* ignore */ } m.stream.getTracks().forEach(t => t.stop()); }
-            return;
-          }
-          webInputMonitorRef.current = monitors;
-
-          const deviceIdToMonitor = new Map<string, typeof monitors[number]>();
-          inputDevices.forEach((d, i) => { if (monitors[i]) deviceIdToMonitor.set(d.deviceId, monitors[i]); });
-
-          inputLevelTimerRef.current = setInterval(() => {
-            const lvls: Record<string, number> = {};
-            for (const [id, mon] of deviceIdToMonitor) {
-              mon.analyser.getByteTimeDomainData(mon.data);
-              let sum = 0;
-              for (let j = 0; j < mon.data.length; j++) {
-                const v = (mon.data[j] - 128) / 128;
-                sum += v * v;
-              }
-              lvls[id] = Math.sqrt(sum / mon.data.length);
-            }
-            if (inputDevices.length > 0 && lvls[inputDevices[0].deviceId] !== undefined) {
-              lvls['default'] = lvls[inputDevices[0].deviceId];
-            }
-            setMonitoredInputLevels(lvls);
-          }, 66);
-        } catch { /* ignore */ }
-      })();
+      // Browser: use shared WebAudioMonitor for level monitoring
+      const monitor = WebAudioMonitor.getInstance();
+      const ids = inputDevices.map((d) => d.deviceId);
+      webMonitorUnsubRef.current = monitor.subscribeAll(ids);
+      inputLevelTimerRef.current = setInterval(() => {
+        setMonitoredInputLevels(monitor.getLevels());
+      }, 66);
       return () => {
-        cancelled = true;
         if (inputLevelTimerRef.current) { clearInterval(inputLevelTimerRef.current); inputLevelTimerRef.current = null; }
-        for (const item of webInputMonitorRef.current) {
-          try { item.audioContext.close(); } catch { /* ignore */ }
-          item.stream.getTracks().forEach(t => t.stop());
-        }
-        webInputMonitorRef.current = [];
+        webMonitorUnsubRef.current?.();
+        webMonitorUnsubRef.current = null;
       };
     } else {
       // Desktop: use IPC mic monitor for all devices
@@ -268,21 +223,9 @@ export const CallOverlay: FC = () => {
   // Load devices on mount
   useEffect(() => {
     if (isWebBridge) {
-      // Browser: enumerate via native API
-      (async () => {
-        try {
-          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          tempStream.getTracks().forEach(t => t.stop());
-          const allDevices = await navigator.mediaDevices.enumerateDevices();
-          setInputDevices(
-            allDevices
-              .filter((d) => d.kind === 'audioinput')
-              .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' })),
-          );
-        } catch {
-          setInputDevices([]);
-        }
-      })();
+      WebAudioMonitor.getInstance().listInputDevices()
+        .then(setInputDevices)
+        .catch(() => setInputDevices([]));
     } else {
       app.mic?.listDevices?.().then(setInputDevices).catch(() => setInputDevices([]));
     }

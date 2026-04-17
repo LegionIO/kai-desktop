@@ -40,6 +40,7 @@ import { useAssistantResponseTiming, useBranchNav, useCurrentWorkingDirectory, t
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { isDictationSupportedForProvider, createUnifiedDictationAdapter, type DictationSession, type AudioProvider } from '@/lib/audio/speech-adapters';
+import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
@@ -1706,7 +1707,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   const sessionRef = useRef<DictationSession | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const webMonitorRef = useRef<Array<{ stream: MediaStream; audioContext: AudioContext; analyser: AnalyserNode; data: Uint8Array<ArrayBuffer> }>>([]);
+  const webMonitorUnsubRef = useRef<(() => void) | null>(null);
 
   const audioConfig = (config as Record<string, unknown> | null)?.audio as {
     provider?: AudioProvider;
@@ -1736,77 +1737,26 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
     if (!pickerOpen) {
       if (!isWebBridgeDictation) window.app?.mic?.stopMonitor();
       if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-      // Clean up browser audio monitoring
-      for (const item of webMonitorRef.current) {
-        try { item.audioContext.close(); } catch { /* ignore */ }
-        item.stream.getTracks().forEach(t => t.stop());
-      }
-      webMonitorRef.current = [];
+      webMonitorUnsubRef.current?.();
+      webMonitorUnsubRef.current = null;
       setLevels({});
       return;
     }
 
     if (isWebBridgeDictation) {
-      // Browser: request permission for labels, enumerate, then monitor levels
+      // Browser: use shared WebAudioMonitor for level monitoring
       let cancelled = false;
+      const monitor = WebAudioMonitor.getInstance();
       (async () => {
         try {
-          // Request mic access so device labels are populated
-          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          tempStream.getTracks().forEach(t => t.stop());
+          const inputs = await monitor.listInputDevices();
           if (cancelled) return;
-
-          const allDevices = await navigator.mediaDevices.enumerateDevices();
-          if (cancelled) return;
-
-          const inputs = allDevices
-            .filter((d) => d.kind === 'audioinput')
-            .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' }));
           setDevices(inputs);
-
-          // Open a stream for each device and monitor levels via Web Audio API
-          const monitors: typeof webMonitorRef.current = [];
-          for (const device of inputs) {
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({
-                audio: { deviceId: { exact: device.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-              });
-              if (cancelled) { stream.getTracks().forEach(t => t.stop()); break; }
-              const audioContext = new AudioContext();
-              const source = audioContext.createMediaStreamSource(stream);
-              const analyser = audioContext.createAnalyser();
-              analyser.fftSize = 2048;
-              source.connect(analyser);
-              monitors.push({ stream, audioContext, analyser, data: new Uint8Array(analyser.fftSize) as Uint8Array<ArrayBuffer> });
-            } catch { /* device open failed, skip */ }
-          }
-          if (cancelled) {
-            for (const m of monitors) { try { m.audioContext.close(); } catch { /* ignore */ } m.stream.getTracks().forEach(t => t.stop()); }
-            return;
-          }
-          webMonitorRef.current = monitors;
-
-          // Map device IDs to monitors for level polling
-          const deviceIdToMonitor = new Map<string, typeof monitors[number]>();
-          inputs.forEach((d, i) => { if (monitors[i]) deviceIdToMonitor.set(d.deviceId, monitors[i]); });
-
-          // Poll levels at ~15 fps
+          const ids = inputs.map((d) => d.deviceId);
+          webMonitorUnsubRef.current = monitor.subscribeAll(ids);
+          // Poll levels from the shared monitor
           levelTimerRef.current = setInterval(() => {
-            const lvls: Record<string, number> = {};
-            for (const [id, mon] of deviceIdToMonitor) {
-              mon.analyser.getByteTimeDomainData(mon.data);
-              let sum = 0;
-              for (let j = 0; j < mon.data.length; j++) {
-                const v = (mon.data[j] - 128) / 128;
-                sum += v * v;
-              }
-              lvls[id] = Math.sqrt(sum / mon.data.length);
-            }
-            // Also set 'default' level from the first device
-            if (inputs.length > 0 && lvls[inputs[0].deviceId] !== undefined) {
-              lvls['default'] = lvls[inputs[0].deviceId];
-            }
-            setLevels(lvls);
+            setLevels(monitor.getLevels());
           }, 66);
         } catch {
           setDevices([]);
@@ -1815,11 +1765,8 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       return () => {
         cancelled = true;
         if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-        for (const item of webMonitorRef.current) {
-          try { item.audioContext.close(); } catch { /* ignore */ }
-          item.stream.getTracks().forEach(t => t.stop());
-        }
-        webMonitorRef.current = [];
+        webMonitorUnsubRef.current?.();
+        webMonitorUnsubRef.current = null;
       };
     }
 
