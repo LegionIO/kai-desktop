@@ -84,16 +84,25 @@ export function registerAutoUpdateHandlers(
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
-  autoUpdater.on('checking-for-update', () => broadcast('checking'));
-  autoUpdater.on('update-available', (info) => broadcast('available', info.version));
-  autoUpdater.on('update-not-available', () => broadcast('idle'));
+  let downloaded = false;
+
+  autoUpdater.on('checking-for-update', () => {
+    if (!downloaded) broadcast('checking');
+  });
+  autoUpdater.on('update-available', (info) => {
+    if (!downloaded) broadcast('available', info.version);
+  });
+  autoUpdater.on('update-not-available', () => {
+    if (!downloaded) broadcast('idle');
+  });
   autoUpdater.on('update-downloaded', (info) => {
+    downloaded = true;
     broadcast('downloaded', info.version);
     onUpdateDownloaded?.();
   });
   autoUpdater.on('error', (err) => {
     console.error('[auto-update] Error:', err.message);
-    broadcast('idle');
+    if (!downloaded) broadcast('idle');
   });
 
   ipcMain.handle('auto-update:check', async () => {
