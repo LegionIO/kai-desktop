@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen } from 'electron';
 import { join } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
@@ -35,6 +35,70 @@ import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
+
+// ── Window state persistence ──────────────────────────────────────────
+const WINDOW_STATE_FILE = join(APP_HOME, 'settings', 'window-state.json');
+
+interface WindowState {
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  isMaximized: boolean;
+}
+
+const DEFAULT_WINDOW_STATE: WindowState = { width: 1100, height: 750, isMaximized: false };
+
+function loadWindowState(): WindowState {
+  try {
+    if (existsSync(WINDOW_STATE_FILE)) {
+      const data = JSON.parse(readFileSync(WINDOW_STATE_FILE, 'utf-8')) as WindowState;
+      // Validate the saved position is still on a visible display
+      if (data.x !== undefined && data.y !== undefined) {
+        const visible = screen.getDisplayMatching({
+          x: data.x,
+          y: data.y,
+          width: data.width ?? DEFAULT_WINDOW_STATE.width,
+          height: data.height ?? DEFAULT_WINDOW_STATE.height,
+        });
+        if (!visible) {
+          // Display gone — drop saved position, keep size
+          return { width: data.width, height: data.height, isMaximized: !!data.isMaximized };
+        }
+      }
+      return {
+        x: data.x,
+        y: data.y,
+        width: data.width ?? DEFAULT_WINDOW_STATE.width,
+        height: data.height ?? DEFAULT_WINDOW_STATE.height,
+        isMaximized: !!data.isMaximized,
+      };
+    }
+  } catch {
+    // Corrupt file — fall through to defaults
+  }
+  return DEFAULT_WINDOW_STATE;
+}
+
+function saveWindowState(win: BrowserWindow): void {
+  if (win.isDestroyed()) return;
+  const isMaximized = win.isMaximized();
+  // Save the *normal* (non-maximized) bounds so restoring un-maximizes to
+  // the last manual size rather than to the full screen dimensions.
+  const bounds = isMaximized ? win.getNormalBounds() : win.getBounds();
+  const state: WindowState = {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    isMaximized,
+  };
+  try {
+    writeFileSync(WINDOW_STATE_FILE, JSON.stringify(state));
+  } catch {
+    // Best-effort — don't crash if settings dir is missing
+  }
+}
 
 // Set app name early so macOS menu bar and dock show the product name instead of "Electron"
 app.setName(__BRAND_PRODUCT_NAME);
@@ -208,9 +272,11 @@ const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
 
 function createWindow(): BrowserWindow {
+  const savedState = loadWindowState();
   const mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
+    ...(savedState.x !== undefined && savedState.y !== undefined ? { x: savedState.x, y: savedState.y } : {}),
+    width: savedState.width,
+    height: savedState.height,
     minWidth: 800,
     minHeight: 600,
     show: false,
@@ -347,7 +413,20 @@ function createWindow(): BrowserWindow {
   }
 
   mainWindow.once('ready-to-show', () => {
-    mainWindow.maximize();
+    if (savedState.isMaximized) mainWindow.maximize();
+  });
+
+  // Persist window bounds on resize / move / close (debounced)
+  let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+  const debouncedSave = () => {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => saveWindowState(mainWindow), 400);
+  };
+  mainWindow.on('resize', debouncedSave);
+  mainWindow.on('move', debouncedSave);
+  mainWindow.on('close', () => {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveWindowState(mainWindow);
   });
 
   return mainWindow;
