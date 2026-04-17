@@ -164,9 +164,27 @@ export const CallOverlay: FC = () => {
 
   // Load devices on mount
   useEffect(() => {
-    app.mic?.listDevices?.().then(setInputDevices).catch(() => setInputDevices([]));
+    if (isWebBridge) {
+      // Browser: enumerate via native API
+      (async () => {
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          tempStream.getTracks().forEach(t => t.stop());
+          const allDevices = await navigator.mediaDevices.enumerateDevices();
+          setInputDevices(
+            allDevices
+              .filter((d) => d.kind === 'audioinput')
+              .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' })),
+          );
+        } catch {
+          setInputDevices([]);
+        }
+      })();
+    } else {
+      app.mic?.listDevices?.().then(setInputDevices).catch(() => setInputDevices([]));
+    }
     listOutputDevices().then(setOutputDevices).catch(() => setOutputDevices([]));
-  }, []);
+  }, [isWebBridge]);
 
   const handleSelectInput = useCallback(
     (deviceId: string | undefined) => updateConfig('realtime.inputDeviceId', deviceId),
@@ -216,27 +234,25 @@ export const CallOverlay: FC = () => {
             </div>
           </div>
 
-          {/* Row 2: Device selectors — hidden on web where browser handles device selection */}
-          {!isWebBridge && (
-            <div className="flex items-center gap-2 px-1">
-              <DevicePicker
-                label="Input Device"
-                icon={<MicIcon className="h-3 w-3" />}
-                devices={inputDevices}
-                selectedDeviceId={selectedInputDeviceId}
-                levels={inputLevels}
-                onSelect={handleSelectInput}
-              />
-              <DevicePicker
-                label="Output Device"
-                icon={<Volume2Icon className="h-3 w-3" />}
-                devices={outputDevices}
-                selectedDeviceId={selectedOutputDeviceId}
-                levels={outputLevels}
-                onSelect={handleSelectOutput}
-              />
-            </div>
-          )}
+          {/* Row 2: Device selectors */}
+          <div className="flex items-center gap-2 px-1">
+            <DevicePicker
+              label="Input Device"
+              icon={<MicIcon className="h-3 w-3" />}
+              devices={inputDevices}
+              selectedDeviceId={selectedInputDeviceId}
+              levels={inputLevels}
+              onSelect={handleSelectInput}
+            />
+            <DevicePicker
+              label="Output Device"
+              icon={<Volume2Icon className="h-3 w-3" />}
+              devices={outputDevices}
+              selectedDeviceId={selectedOutputDeviceId}
+              levels={outputLevels}
+              onSelect={handleSelectOutput}
+            />
+          </div>
 
           {/* Row 3: Speaking status + End Call */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">

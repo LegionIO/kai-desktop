@@ -1706,6 +1706,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   const sessionRef = useRef<DictationSession | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const webMonitorRef = useRef<Array<{ stream: MediaStream; audioContext: AudioContext; analyser: AnalyserNode; data: Uint8Array<ArrayBuffer> }>>([]);
 
   const audioConfig = (config as Record<string, unknown> | null)?.audio as {
     provider?: AudioProvider;
@@ -1735,25 +1736,91 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
     if (!pickerOpen) {
       if (!isWebBridgeDictation) window.app?.mic?.stopMonitor();
       if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
+      // Clean up browser audio monitoring
+      for (const item of webMonitorRef.current) {
+        try { item.audioContext.close(); } catch { /* ignore */ }
+        item.stream.getTracks().forEach(t => t.stop());
+      }
+      webMonitorRef.current = [];
       setLevels({});
       return;
     }
 
     if (isWebBridgeDictation) {
-      // Browser: use navigator.mediaDevices.enumerateDevices
-      if (navigator.mediaDevices?.enumerateDevices) {
-        navigator.mediaDevices.enumerateDevices()
-          .then((allDevices) => {
-            const inputs = allDevices
-              .filter((d) => d.kind === 'audioinput')
-              .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' }));
-            setDevices(inputs);
-          })
-          .catch(() => setDevices([]));
-      } else {
-        setDevices([]);
-      }
-      return;
+      // Browser: request permission for labels, enumerate, then monitor levels
+      let cancelled = false;
+      (async () => {
+        try {
+          // Request mic access so device labels are populated
+          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          tempStream.getTracks().forEach(t => t.stop());
+          if (cancelled) return;
+
+          const allDevices = await navigator.mediaDevices.enumerateDevices();
+          if (cancelled) return;
+
+          const inputs = allDevices
+            .filter((d) => d.kind === 'audioinput')
+            .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Microphone' }));
+          setDevices(inputs);
+
+          // Open a stream for each device and monitor levels via Web Audio API
+          const monitors: typeof webMonitorRef.current = [];
+          for (const device of inputs) {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { deviceId: { exact: device.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+              });
+              if (cancelled) { stream.getTracks().forEach(t => t.stop()); break; }
+              const audioContext = new AudioContext();
+              const source = audioContext.createMediaStreamSource(stream);
+              const analyser = audioContext.createAnalyser();
+              analyser.fftSize = 2048;
+              source.connect(analyser);
+              monitors.push({ stream, audioContext, analyser, data: new Uint8Array(analyser.fftSize) as Uint8Array<ArrayBuffer> });
+            } catch { /* device open failed, skip */ }
+          }
+          if (cancelled) {
+            for (const m of monitors) { try { m.audioContext.close(); } catch { /* ignore */ } m.stream.getTracks().forEach(t => t.stop()); }
+            return;
+          }
+          webMonitorRef.current = monitors;
+
+          // Map device IDs to monitors for level polling
+          const deviceIdToMonitor = new Map<string, typeof monitors[number]>();
+          inputs.forEach((d, i) => { if (monitors[i]) deviceIdToMonitor.set(d.deviceId, monitors[i]); });
+
+          // Poll levels at ~15 fps
+          levelTimerRef.current = setInterval(() => {
+            const lvls: Record<string, number> = {};
+            for (const [id, mon] of deviceIdToMonitor) {
+              mon.analyser.getByteTimeDomainData(mon.data);
+              let sum = 0;
+              for (let j = 0; j < mon.data.length; j++) {
+                const v = (mon.data[j] - 128) / 128;
+                sum += v * v;
+              }
+              lvls[id] = Math.sqrt(sum / mon.data.length);
+            }
+            // Also set 'default' level from the first device
+            if (inputs.length > 0 && lvls[inputs[0].deviceId] !== undefined) {
+              lvls['default'] = lvls[inputs[0].deviceId];
+            }
+            setLevels(lvls);
+          }, 66);
+        } catch {
+          setDevices([]);
+        }
+      })();
+      return () => {
+        cancelled = true;
+        if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
+        for (const item of webMonitorRef.current) {
+          try { item.audioContext.close(); } catch { /* ignore */ }
+          item.stream.getTracks().forEach(t => t.stop());
+        }
+        webMonitorRef.current = [];
+      };
     }
 
     const mic = window.app?.mic;
@@ -1927,8 +1994,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
             : 'border-border/70 bg-card/70'
       }`}>
         {/* Left segment: chevron (idle) or animated dots (active) */}
-        {!isWebBridgeDictation && (
-          isActive || isActivating ? (
+        {isActive || isActivating ? (
             <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
               <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
               <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
@@ -1945,7 +2011,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
               </button>
             </Tooltip>
           )
-        )}
+        }
 
         {/* Right segment: mic button */}
         <Tooltip
@@ -1984,7 +2050,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       )}
 
       {/* Device picker popover — toggled by chevron button */}
-      {pickerOpen && !isWebBridgeDictation && (
+      {pickerOpen && (
         <div className="absolute bottom-full right-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           {/* Level indicator bar */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
