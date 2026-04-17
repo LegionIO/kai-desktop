@@ -1,80 +1,9 @@
 import AppKit
 import Foundation
 
-struct Palette {
-    static let void = NSColor(calibratedRed: 7/255, green: 6/255, blue: 15/255, alpha: 1)
-    static let deep = NSColor(calibratedRed: 18/255, green: 16/255, blue: 41/255, alpha: 1)
-    static let mid = NSColor(calibratedRed: 61/255, green: 56/255, blue: 138/255, alpha: 1)
-    static let cardinal = NSColor(calibratedRed: 95/255, green: 87/255, blue: 196/255, alpha: 1)
-    static let node = NSColor(calibratedRed: 127/255, green: 119/255, blue: 221/255, alpha: 1)
-    static let inner = NSColor(calibratedRed: 160/255, green: 154/255, blue: 232/255, alpha: 1)
-    static let light = NSColor(calibratedRed: 197/255, green: 194/255, blue: 245/255, alpha: 1)
-}
+let sourceIconScale: CGFloat = 0.96
 
-let gridPoints: [(CGFloat, CGFloat)] = [
-    (0.34, 0.66), (0.50, 0.66), (0.66, 0.66),
-    (0.34, 0.50), (0.50, 0.50), (0.66, 0.50),
-    (0.34, 0.34), (0.50, 0.34), (0.66, 0.34),
-]
-
-let gridConnections: [(Int, Int)] = [
-    (0, 1), (1, 2), (3, 4), (4, 5), (6, 7), (7, 8),
-    (0, 3), (3, 6), (1, 4), (4, 7), (2, 5), (5, 8),
-    (1, 3), (1, 5), (3, 7), (5, 7)
-]
-
-// Lit nodes and edges trace an "I" glyph across the 3x3 network.
-let litNodes: Set<Int> = [0, 1, 2, 4, 6, 7, 8]
-let litEdges: Set<String> = ["0-1", "1-2", "1-4", "4-7", "6-7", "7-8"]
-// When we have a source icon asset, scale it up to remove the transparent
-// margin that makes macOS present it as an inset icon on top of a system plate.
-let sourceIconScale: CGFloat = 1.0 / 0.84
-// Fill the export canvas with the app tile so macOS doesn't treat the icon as
-// an inset glyph sitting on top of a separate system plate.
-let iconScale: CGFloat = 1.42
-let tileScale: CGFloat = 1.0
-
-func edgeKey(_ a: Int, _ b: Int) -> String {
-    a < b ? "\(a)-\(b)" : "\(b)-\(a)"
-}
-
-func rect(_ size: CGFloat, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> NSRect {
-    NSRect(x: x * size, y: y * size, width: w * size, height: h * size)
-}
-
-func point(_ size: CGFloat, _ x: CGFloat, _ y: CGFloat) -> NSPoint {
-    NSPoint(x: x * size, y: y * size)
-}
-
-func roundedTile(size: CGFloat) -> NSBezierPath {
-    NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: size, height: size), xRadius: size * 0.23, yRadius: size * 0.23)
-}
-
-func scaleValue(_ value: CGFloat) -> CGFloat {
-    0.5 + (value - 0.5) * iconScale
-}
-
-func scaledGridPoint(_ size: CGFloat, index: Int) -> NSPoint {
-    let coords = gridPoints[index]
-    return point(size, scaleValue(coords.0), scaleValue(coords.1))
-}
-
-func fillCircle(center: NSPoint, radius: CGFloat, color: NSColor) {
-    color.setFill()
-    NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
-}
-
-func strokeLine(from: NSPoint, to: NSPoint, width: CGFloat, color: NSColor) {
-    let path = NSBezierPath()
-    path.move(to: from)
-    path.line(to: to)
-    path.lineWidth = width
-    path.lineCapStyle = .round
-    color.setStroke()
-    path.stroke()
-}
-
-func drawSourceIcon(size: CGFloat, sourceImage: NSImage) throws -> Data {
+func drawIcon(size: CGFloat, sourceImage: NSImage, scale: CGFloat) throws -> Data {
     let image = NSImage(size: NSSize(width: size, height: size))
     image.lockFocus()
     guard let context = NSGraphicsContext.current?.cgContext else {
@@ -84,7 +13,7 @@ func drawSourceIcon(size: CGFloat, sourceImage: NSImage) throws -> Data {
     context.setAllowsAntialiasing(true)
     context.interpolationQuality = .high
 
-    let drawSize = size * sourceIconScale
+    let drawSize = size * scale
     let drawRect = NSRect(
         x: (size - drawSize) / 2,
         y: (size - drawSize) / 2,
@@ -102,91 +31,8 @@ func drawSourceIcon(size: CGFloat, sourceImage: NSImage) throws -> Data {
     else {
         throw NSError(domain: "IconGen", code: 2)
     }
+
     return png
-}
-
-func drawGeneratedIcon(size: CGFloat) throws -> Data {
-    let image = NSImage(size: NSSize(width: size, height: size))
-    image.lockFocus()
-    guard let context = NSGraphicsContext.current?.cgContext else {
-        throw NSError(domain: "IconGen", code: 1)
-    }
-
-    context.setAllowsAntialiasing(true)
-    context.interpolationQuality = .high
-    context.saveGState()
-
-    let inset = (size - (size * tileScale)) / 2
-    context.translateBy(x: inset, y: inset)
-    context.scaleBy(x: tileScale, y: tileScale)
-
-    let canvas = NSRect(x: 0, y: 0, width: size, height: size)
-    roundedTile(size: size).addClip()
-
-    let background = NSGradient(colorsAndLocations:
-        (NSColor(calibratedRed: 18/255, green: 16/255, blue: 34/255, alpha: 1), 0.0),
-        (NSColor(calibratedRed: 30/255, green: 24/255, blue: 63/255, alpha: 1), 0.38),
-        (Palette.void, 1.0)
-    )!
-    background.draw(in: canvas, angle: -45)
-
-    let frame = NSBezierPath(
-        roundedRect: rect(size, scaleValue(0.23), scaleValue(0.23), 0.54 * iconScale, 0.54 * iconScale),
-        xRadius: size * 0.12 * iconScale,
-        yRadius: size * 0.12 * iconScale
-    )
-    frame.lineWidth = size * 0.022 * iconScale
-    Palette.inner.withAlphaComponent(0.72).setStroke()
-    frame.stroke()
-
-    for (a, b) in gridConnections {
-        let isLitPath = litEdges.contains(edgeKey(a, b))
-        let color = isLitPath ? Palette.light.withAlphaComponent(0.58) : Palette.node.withAlphaComponent(0.24)
-        strokeLine(
-            from: scaledGridPoint(size, index: a),
-            to: scaledGridPoint(size, index: b),
-            width: size * (isLitPath ? 0.028 : 0.013) * iconScale,
-            color: color
-        )
-    }
-
-    for index in gridPoints.indices {
-        let p = scaledGridPoint(size, index: index)
-        let isLit = litNodes.contains(index)
-
-        let outer = isLit ? Palette.light.withAlphaComponent(1.0) : Palette.inner.withAlphaComponent(0.84)
-        let inner = isLit ? Palette.cardinal : Palette.node
-        let radius = size * (isLit ? 0.038 : 0.024) * iconScale
-
-        fillCircle(center: p, radius: radius * 1.35, color: isLit ? Palette.light.withAlphaComponent(0.08) : .clear)
-        fillCircle(center: p, radius: radius, color: outer)
-        fillCircle(center: p, radius: radius * 0.58, color: inner)
-    }
-
-    context.restoreGState()
-
-    image.unlockFocus()
-
-    guard
-        let tiff = image.tiffRepresentation,
-        let bitmap = NSBitmapImageRep(data: tiff),
-        let png = bitmap.representation(using: .png, properties: [:])
-    else {
-        throw NSError(domain: "IconGen", code: 2)
-    }
-    return png
-}
-
-func drawIcon(size: CGFloat, sourceImage: NSImage?) throws -> Data {
-    if let sourceImage {
-        return try drawSourceIcon(size: size, sourceImage: sourceImage)
-    }
-
-    return try drawGeneratedIcon(size: size)
-}
-
-func writeIcon(size: CGFloat, to destination: URL, sourceImage: NSImage?) throws {
-    try drawIcon(size: size, sourceImage: sourceImage).write(to: destination)
 }
 
 func appendUInt16(_ value: UInt16, to data: inout Data) {
@@ -244,8 +90,28 @@ func createICNS(from iconset: URL, to destination: URL) throws {
 }
 
 let fileManager = FileManager.default
-let root = URL(fileURLWithPath: fileManager.currentDirectoryPath)
-let buildDir = root.appendingPathComponent("build")
+let repoRoot = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+
+// Read source from the branding repo (sibling directory).
+let brandingBuildDir = repoRoot.appendingPathComponent("../kai-platform/branding/build")
+let sourceCandidates = [
+    brandingBuildDir.appendingPathComponent("icon-source.png"),
+    brandingBuildDir.appendingPathComponent("icon-master.png"),
+]
+
+guard
+    let sourceURL = sourceCandidates.first(where: { fileManager.fileExists(atPath: $0.path) }),
+    let sourceImage = NSImage(contentsOf: sourceURL)
+else {
+    throw NSError(
+        domain: "IconGen",
+        code: 4,
+        userInfo: [NSLocalizedDescriptionKey: "No source icon found in ../kai-platform/branding/build"]
+    )
+}
+
+// Write output into this repo's build/ directory.
+let buildDir = repoRoot.appendingPathComponent("build")
 try fileManager.createDirectory(at: buildDir, withIntermediateDirectories: true)
 
 let master = buildDir.appendingPathComponent("icon-master.png")
@@ -253,7 +119,6 @@ let iconPNG = buildDir.appendingPathComponent("icon.png")
 let iconICO = buildDir.appendingPathComponent("icon.ico")
 let iconICNS = buildDir.appendingPathComponent("icon.icns")
 let iconset = buildDir.appendingPathComponent("icon.iconset")
-let sourceIcon = buildDir.appendingPathComponent("icon-source.png")
 
 if fileManager.fileExists(atPath: iconset.path) {
     try fileManager.removeItem(at: iconset)
@@ -262,10 +127,6 @@ try fileManager.createDirectory(at: iconset, withIntermediateDirectories: true)
 defer {
     try? fileManager.removeItem(at: iconset)
 }
-
-let sourceImage = fileManager.fileExists(atPath: sourceIcon.path)
-    ? NSImage(contentsOf: sourceIcon)
-    : nil
 
 let iconsetSpecs: [(String, CGFloat)] = [
     ("icon_16x16.png", 16),
@@ -277,24 +138,25 @@ let iconsetSpecs: [(String, CGFloat)] = [
     ("icon_256x256.png", 256),
     ("icon_256x256@2x.png", 512),
     ("icon_512x512.png", 512),
-    ("icon_512x512@2x.png", 1024)
+    ("icon_512x512@2x.png", 1024),
 ]
 
 for (name, size) in iconsetSpecs {
-    let pngData = try drawIcon(size: size, sourceImage: sourceImage)
+    let pngData = try drawIcon(size: size, sourceImage: sourceImage, scale: sourceIconScale)
     try pngData.write(to: iconset.appendingPathComponent(name))
 }
 
-try writeIcon(size: 1024, to: master, sourceImage: sourceImage)
-try writeIcon(size: 512, to: iconPNG, sourceImage: sourceImage)
+try drawIcon(size: 1024, sourceImage: sourceImage, scale: sourceIconScale).write(to: master)
+try drawIcon(size: 512, sourceImage: sourceImage, scale: sourceIconScale).write(to: iconPNG)
 
 let icoSizes = [16, 24, 32, 48, 64, 128, 256]
 let icoImages = try icoSizes.map { size in
-    (size, try drawIcon(size: CGFloat(size), sourceImage: sourceImage))
+    (size, try drawIcon(size: CGFloat(size), sourceImage: sourceImage, scale: sourceIconScale))
 }
 try createICO(from: icoImages, to: iconICO)
 try createICNS(from: iconset, to: iconICNS)
 
+print(sourceURL.path)
 print(master.path)
 print(iconPNG.path)
 print(iconICO.path)

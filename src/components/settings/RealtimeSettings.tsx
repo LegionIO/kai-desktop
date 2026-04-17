@@ -522,7 +522,7 @@ export const RealtimeSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
 
       {/* Computer Use Updates */}
       <fieldset className="rounded-lg border p-3 space-y-3">
-        <legend className="text-xs font-semibold px-1">Computer Use Updates</legend>
+        <legend className="text-xs font-semibold px-1">Autopilot Updates</legend>
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
           When a computer-use session is started during a realtime call, updates are streamed back so the voice AI can narrate progress.
         </div>

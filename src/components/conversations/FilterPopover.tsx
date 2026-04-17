@@ -198,7 +198,7 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
         onChange={(v) => update({ hasToolCalls: v })}
       />
       <FilterToggle
-        label="Has computer use"
+        label="Has autopilot"
         checked={filter.hasComputerUse}
         onChange={(v) => update({ hasComputerUse: v })}
       />

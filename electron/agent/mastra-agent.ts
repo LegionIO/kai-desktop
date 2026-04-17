@@ -228,21 +228,40 @@ function buildProviderOptions(
   modelConfig: LLMModelConfig,
   reasoningEffort?: ReasoningEffort,
 ): Record<string, unknown> | undefined {
-  if (modelConfig.provider !== 'openai-compatible') return undefined;
-  const usesResponsesApi = shouldUseOpenAIResponsesApi(modelConfig);
+  // OpenAI-compatible: pass reasoningEffort + store flag
+  if (modelConfig.provider === 'openai-compatible') {
+    const usesResponsesApi = shouldUseOpenAIResponsesApi(modelConfig);
 
-  const openaiOptions: Record<string, unknown> = {};
-  if (reasoningEffort) {
-    openaiOptions.reasoningEffort = reasoningEffort;
-  }
-  if (usesResponsesApi) {
-    // Prevent SDK-side item_reference replay during tool-follow-up turns.
-    openaiOptions.store = false;
+    const openaiOptions: Record<string, unknown> = {};
+    if (reasoningEffort) {
+      openaiOptions.reasoningEffort = reasoningEffort;
+    }
+    if (usesResponsesApi) {
+      // Prevent SDK-side item_reference replay during tool-follow-up turns.
+      openaiOptions.store = false;
+    }
+
+    return Object.keys(openaiOptions).length > 0
+      ? { openai: openaiOptions }
+      : undefined;
   }
 
-  return Object.keys(openaiOptions).length > 0
-    ? { openai: openaiOptions }
-    : undefined;
+  // Anthropic (direct or Bedrock with Claude models): map reasoning effort to thinking config
+  const isAnthropic =
+    modelConfig.provider === 'anthropic' ||
+    (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName));
+
+  if (isAnthropic && reasoningEffort) {
+    const thinkingByEffort: Record<ReasoningEffort, Record<string, unknown>> = {
+      low: { type: 'disabled' },
+      medium: { type: 'adaptive' },
+      high: { type: 'enabled', budgetTokens: 10_000 },
+      xhigh: { type: 'enabled', budgetTokens: 32_000 },
+    };
+    return { anthropic: { thinking: thinkingByEffort[reasoningEffort] } };
+  }
+
+  return undefined;
 }
 
 function buildMastraMemoryOptions(

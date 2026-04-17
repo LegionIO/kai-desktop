@@ -56,7 +56,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'audio', label: 'Audio' },
   { key: 'realtime', label: 'Realtime Audio' },
   { key: 'media-generation', label: 'Media Generation' },
-  { key: 'computer-use', label: 'Computer Use' },
+  { key: 'computer-use', label: 'Autopilot' },
   { key: 'web-server', label: 'Web UI' },
   { key: 'advanced', label: 'Advanced' },
   { key: 'usage', label: 'Usage' },

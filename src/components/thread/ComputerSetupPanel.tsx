@@ -333,6 +333,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           onChangeTarget={setComputerTarget}
           approvalMode={computerApprovalMode}
           onChangeApprovalMode={setComputerApprovalMode}
+          toggled={true}
+          onToggle={() => {}}
         />
 
         <ModelSettingsButton

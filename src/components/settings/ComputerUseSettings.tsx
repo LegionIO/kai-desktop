@@ -432,7 +432,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Computer Use</h3>
+      <h3 className="text-sm font-semibold">Autopilot</h3>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">General</legend>
@@ -514,7 +514,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
           <Toggle label="Auto-request permissions" checked={computerUse.localMacos.autoRequestPermissions} onChange={(value) => updateConfig('computerUse.localMacos.autoRequestPermissions', value)} />
           <Toggle label="Auto-open Privacy Settings" checked={computerUse.localMacos.autoOpenPrivacySettings} onChange={(value) => updateConfig('computerUse.localMacos.autoOpenPrivacySettings', value)} />
         </div>
-        <DisplayListPicker label="Allowed Displays" value={computerUse.localMacos.allowedDisplays ?? []} onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)} onDisplaysDiscovered={handleDisplaysDiscovered} hint="Select which displays computer use can capture. All displays are enabled by default." />
+        <DisplayListPicker label="Allowed Displays" value={computerUse.localMacos.allowedDisplays ?? []} onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)} onDisplaysDiscovered={handleDisplaysDiscovered} hint="Select which displays autopilot can capture. All displays are enabled by default." />
         <AppListPicker label="Capture Excluded Apps" value={computerUse.localMacos.captureExcludedApps ?? []} onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)} hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID." />
       </fieldset>
 

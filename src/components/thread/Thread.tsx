@@ -32,6 +32,7 @@ import {
   MonitorIcon,
   FolderOpenIcon,
   ImageIcon,
+  LoaderIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
@@ -61,9 +62,10 @@ import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
+import { ComputerSettingsButton } from './ComputerSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
-import { shouldShowComputerSetup, type ComputerSession } from '../../../shared/computer-use';
+import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
 const MATRIX_GLYPHS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*+-/~{[|`]}<>01';
@@ -81,7 +83,7 @@ export const Thread: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
@@ -102,7 +104,6 @@ export const Thread: FC<{
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
       <FallbackBanner />
       <ComputerUseFallbackBanner />
-      <ThreadModeTabs mode={mode} onChange={onChangeMode} />
       {threadDecorations.length > 0 && (
         <div className="border-b border-border/60 bg-background/65 px-3 py-2 backdrop-blur-sm md:px-6">
           <div className="mx-auto flex w-full max-w-5xl flex-wrap gap-2">
@@ -161,36 +162,6 @@ export const Thread: FC<{
         />
       )}
     </ThreadPrimitive.Root>
-  );
-};
-
-const ThreadModeTabs: FC<{ mode: ThreadMode; onChange: (mode: ThreadMode) => void }> = ({ mode, onChange }) => {
-  const { config } = useConfig();
-  const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
-    ? ((config as Record<string, unknown>).computerUse as { enabled?: boolean })?.enabled ?? false
-    : false;
-
-  if (!computerUseEnabled) return null;
-
-  return (
-    <div className="border-b border-border/70 bg-background/85 px-3 py-2 backdrop-blur-md md:px-6">
-      <div className="mx-auto flex w-full max-w-5xl items-center gap-1.5">
-        <button
-          type="button"
-          onClick={() => onChange('chat')}
-          className={`rounded-xl px-3 py-1.5 text-xs font-medium transition-colors ${mode === 'chat' ? 'bg-primary text-primary-foreground' : 'border border-border/70 bg-card/60 text-muted-foreground hover:bg-muted/50'}`}
-        >
-          Chat
-        </button>
-        <button
-          type="button"
-          onClick={() => onChange('computer')}
-          className={`rounded-xl px-3 py-1.5 text-xs font-medium transition-colors ${mode === 'computer' ? 'bg-primary text-primary-foreground' : 'border border-border/70 bg-card/60 text-muted-foreground hover:bg-muted/50'}`}
-        >
-          Computer
-        </button>
-      </div>
-    </div>
   );
 };
 
@@ -1656,7 +1627,7 @@ const StopButton: FC = () => {
         // Force-clear the composer so it doesn't restore the previous message text
         composerRuntime.setText('');
       }}
-      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
     >
       <StopCircleIcon className="h-4 w-4" />
     </button>
@@ -1938,7 +1909,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   return (
     <div ref={rootRef} className="relative flex items-center">
       {/* Joined button group: chevron/dots + mic */}
-      <div className={`flex items-center overflow-hidden rounded-xl border transition-colors ${
+      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
         isActive
           ? 'border-primary/50 bg-primary/10'
           : isActivating
@@ -1959,7 +1930,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
                 onClick={() => setPickerOpen(!pickerOpen)}
                 className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
               >
-                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? 'rotate-180' : ''}`} />
+                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
               </button>
             </Tooltip>
           )
@@ -2093,7 +2064,7 @@ const CallButton: FC = () => {
       <button
         type="button"
         onClick={handleClick}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors bg-muted/60 text-muted-foreground hover:bg-muted"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors text-muted-foreground hover:bg-muted/50"
       >
         <PhoneIcon className="h-4 w-4" />
       </button>
@@ -2116,9 +2087,28 @@ const Composer: FC<{
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
-  const { sessionsByConversation } = useComputerUse();
+  const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
+
+  // Computer-use inline toggle state
+  const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
+    ? ((config as Record<string, unknown>).computerUse as { enabled?: boolean })?.enabled ?? false
+    : false;
+  const computerConfig = (config as Record<string, unknown> | null)?.computerUse as {
+    defaultTarget?: ComputerUseTarget;
+    approvalModeDefault?: ComputerUseApprovalMode;
+  } | undefined;
+  const [computerUseToggled, setComputerUseToggled] = useState(false);
+  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(computerConfig?.defaultTarget ?? 'local-macos');
+  const [computerApprovalMode, setComputerApprovalMode] = useState<ComputerUseApprovalMode>(computerConfig?.approvalModeDefault ?? 'autonomous');
+  const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
+
+  useEffect(() => {
+    setComputerTarget(computerConfig?.defaultTarget ?? 'local-macos');
+    setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
+  }, [computerConfig?.defaultTarget, computerConfig?.approvalModeDefault]);
+
   const dictationEnabled = (config as Record<string, unknown> | null)?.audio
     ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
     : true;
@@ -2229,8 +2219,51 @@ const Composer: FC<{
 
   const handleSend = useCallback(() => {
     if (!composerText.trim() && attachments.length === 0) return;
+
+    if (computerUseToggled && mode === 'chat' && composerText.trim()) {
+      if (!activeConversationId) return;
+      setIsStartingComputerSession(true);
+
+      // Active non-terminal session → send guidance
+      if (activeComputerSession && !isComputerSessionTerminal(activeComputerSession.status)) {
+        void sendGuidance(activeComputerSession.id, composerText.trim()).then(() => {
+          composerRuntime.setText('');
+        }).finally(() => {
+          setIsStartingComputerSession(false);
+        });
+        return;
+      }
+
+      // Terminal session → continue; otherwise → start new
+      const canContinue = activeComputerSession && isComputerSessionTerminal(activeComputerSession.status);
+      const promise = canContinue
+        ? continueSession(activeComputerSession.id, composerText.trim())
+        : startSession(composerText.trim(), {
+            conversationId: activeConversationId,
+            target: computerTarget,
+            surface: 'docked',
+            approvalMode: computerApprovalMode,
+            modelKey: selectedModelKey,
+            profileKey: selectedProfileKey,
+            fallbackEnabled,
+            reasoningEffort,
+          });
+
+      void promise.then(() => {
+        composerRuntime.setText('');
+      }).finally(() => {
+        setIsStartingComputerSession(false);
+      });
+      return;
+    }
+
     composerRuntime.send();
-  }, [attachments.length, composerRuntime, composerText]);
+  }, [
+    attachments.length, composerRuntime, composerText, computerUseToggled, mode,
+    activeConversationId, activeComputerSession, startSession, continueSession, sendGuidance,
+    computerTarget, computerApprovalMode, selectedModelKey, selectedProfileKey,
+    fallbackEnabled, reasoningEffort,
+  ]);
 
   const canSend = composerText.trim().length > 0 || attachments.length > 0;
   const hasFileAttachments = attachments.length > 0;
@@ -2342,7 +2375,7 @@ const Composer: FC<{
                   </div>
                 )}
                 <ComposerInput
-                  placeholder={isDictating ? 'Listening...' : __BRAND_COMPOSER_PLACEHOLDER}
+                  placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : __BRAND_COMPOSER_PLACEHOLDER}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -2350,7 +2383,7 @@ const Composer: FC<{
                   <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 md:gap-2">
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
-                        <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">
+                        <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">
                           <PlusIcon className="h-4 w-4 text-muted-foreground" />
                         </button>
                       </DropdownMenu.Trigger>
@@ -2395,16 +2428,32 @@ const Composer: FC<{
                     selectedProfileKey={selectedProfileKey}
                     onSelectProfile={onSelectProfile}
                   />
+                  {computerUseEnabled && (
+                    <ComputerSettingsButton
+                      target={computerTarget}
+                      onChangeTarget={setComputerTarget}
+                      approvalMode={computerApprovalMode}
+                      onChangeApprovalMode={setComputerApprovalMode}
+                      toggled={computerUseToggled}
+                      onToggle={() => setComputerUseToggled((v) => !v)}
+                    />
+                  )}
                   {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
                   <CallButton />
                   <ThreadPrimitive.If running={false}>
                     <button
                       type="button"
                       onClick={handleSend}
-                      disabled={!canSend}
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                      disabled={!canSend || isStartingComputerSession}
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
                     >
+                      {isStartingComputerSession ? (
+                        <LoaderIcon className="h-4 w-4 animate-spin" />
+                      ) : computerUseToggled ? (
+                        <MonitorIcon className="h-4 w-4" />
+                      ) : (
                         <SendHorizontalIcon className="h-4 w-4" />
+                      )}
                     </button>
                   </ThreadPrimitive.If>
                   <ThreadPrimitive.If running>

@@ -22,7 +22,9 @@ export const ComputerSettingsButton: FC<{
   onChangeTarget: (value: ComputerUseTarget) => void;
   approvalMode: ApprovalMode;
   onChangeApprovalMode: (value: ApprovalMode) => void;
-}> = ({ target, onChangeTarget, approvalMode, onChangeApprovalMode }) => {
+  toggled: boolean;
+  onToggle: () => void;
+}> = ({ target, onChangeTarget, approvalMode, onChangeApprovalMode, toggled, onToggle }) => {
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -36,7 +38,9 @@ export const ComputerSettingsButton: FC<{
     return () => window.removeEventListener('pointerdown', handler);
   }, [isOpen]);
 
-  const toggle = useCallback(() => setIsOpen((o) => !o), []);
+  const togglePopover = useCallback(() => {
+    setIsOpen((o) => !o);
+  }, []);
   const popover = usePopoverAlign();
 
   const currentTarget = TARGET_OPTIONS.find((o) => o.value === target) ?? TARGET_OPTIONS[1];
@@ -44,34 +48,37 @@ export const ComputerSettingsButton: FC<{
 
   return (
     <div ref={rootRef} className="relative flex items-center">
-      {/* Joined button group: chevron + monitor icon */}
-      <div className="flex items-center overflow-hidden rounded-xl border border-border/70 bg-card/70 transition-colors">
-        {/* Left segment: chevron — opens settings popover */}
-        <Tooltip content="Session settings" side="top" sideOffset={8}>
+      {/* Joined button group: chevron + monitor toggle */}
+      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+        toggled
+          ? 'border-primary/50 bg-primary/10'
+          : 'border-border/70 bg-card/70'
+      }`}>
+        {/* Left segment: chevron — opens settings popover (only when toggled on) */}
+        <Tooltip content="Autopilot settings" side="top" sideOffset={8}>
           <button
             type="button"
-            onClick={toggle}
-            className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+            onClick={togglePopover}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+              toggled
+                ? 'text-primary hover:bg-primary/15'
+                : 'text-muted-foreground hover:bg-muted/50'
+            }`}
           >
-            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${isOpen ? '' : 'rotate-180'}`} />
           </button>
         </Tooltip>
 
-        {/* Right segment: monitor icon */}
-        <Tooltip
-          content={
-            <span className="flex items-center gap-1.5">
-              {currentTarget.label}
-              <span className="text-[10px] opacity-60">{currentApproval.label}</span>
-            </span>
-          }
-          side="top"
-          sideOffset={8}
-        >
+        {/* Right segment: monitor icon — toggles computer use on/off */}
+        <Tooltip content={toggled ? 'Disable autopilot' : 'Enable autopilot mode'} side="top" sideOffset={8}>
           <button
             type="button"
-            onClick={toggle}
-            className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+            onClick={onToggle}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+              toggled
+                ? 'text-primary hover:bg-primary/15'
+                : 'text-muted-foreground hover:bg-muted/50'
+            }`}
           >
             <MonitorIcon className="h-4 w-4" />
           </button>

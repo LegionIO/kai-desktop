@@ -135,7 +135,7 @@ const ModelCatalog: FC<{
                   <span className="text-xs font-medium truncate">{formatModelDisplayName(m.displayName)}</span>
                   <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5 shrink-0">{m.provider}</span>
                   {m.computerUseSupport && m.computerUseSupport !== 'none' && (
-                    <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">Computer Use</span>
+                    <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">Autopilot</span>
                   )}
                 </div>
                 <div className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">
@@ -303,7 +303,7 @@ const ModelForm: FC<{
 
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className="text-[10px] text-muted-foreground block mb-0.5">Computer Use Support</label>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Autopilot Support</label>
           <select
             className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
             value={computerUseSupport}

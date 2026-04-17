@@ -50,7 +50,8 @@ export const ModelSettingsButton: FC<{
   filter?: (model: ModelInfo) => boolean;
   fallbackToUnfilteredWhenEmpty?: boolean;
 }> = ({ selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, fallbackEnabled, onToggleFallback, selectedProfileKey, onSelectProfile, filter, fallbackToUnfilteredWhenEmpty }) => {
-  const [isOpen, setIsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modelOpen, setModelOpen] = useState(false);
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [profileCatalog, setProfileCatalog] = useState<ProfileCatalog | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -70,16 +71,29 @@ export const ModelSettingsButton: FC<{
 
   // Close on outside click
   useEffect(() => {
-    if (!isOpen) return;
+    if (!settingsOpen && !modelOpen) return;
     const handler = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setIsOpen(false);
+      if (!rootRef.current?.contains(e.target as Node)) {
+        setSettingsOpen(false);
+        setModelOpen(false);
+      }
     };
     window.addEventListener('pointerdown', handler);
     return () => window.removeEventListener('pointerdown', handler);
-  }, [isOpen]);
+  }, [settingsOpen, modelOpen]);
 
-  const toggle = useCallback(() => setIsOpen((o) => !o), []);
-  const popover = usePopoverAlign();
+  const toggleSettings = useCallback(() => {
+    setSettingsOpen((o) => !o);
+    setModelOpen(false);
+  }, []);
+
+  const toggleModel = useCallback(() => {
+    setModelOpen((o) => !o);
+    setSettingsOpen(false);
+  }, []);
+
+  const settingsPopover = usePopoverAlign();
+  const modelPopover = usePopoverAlign();
 
   let models = catalog?.models ?? [];
   if (filter) {
@@ -98,32 +112,23 @@ export const ModelSettingsButton: FC<{
   return (
     <div ref={rootRef} className="relative flex items-center">
       {/* Joined button group: chevron + model icon */}
-      <div className="flex items-center overflow-hidden rounded-xl border border-border/70 bg-card/70 transition-colors">
+      <div className="flex items-center overflow-hidden rounded-lg border border-border/70 bg-card/70 transition-colors">
         {/* Left segment: chevron — opens settings popover */}
         <Tooltip content="Model settings" side="top" sideOffset={8}>
           <button
             type="button"
-            onClick={toggle}
+            onClick={toggleSettings}
             className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
           >
-            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${settingsOpen ? '' : 'rotate-180'}`} />
           </button>
         </Tooltip>
 
-        {/* Right segment: model icon */}
-        <Tooltip
-          content={
-            <span className="flex items-center gap-1.5">
-              {currentLabel}
-              <span className="text-[10px] opacity-60">{currentReasoning.label}</span>
-            </span>
-          }
-          side="top"
-          sideOffset={8}
-        >
+        {/* Right segment: model icon — opens model picker */}
+        <Tooltip content={currentLabel} side="top" sideOffset={8}>
           <button
             type="button"
-            onClick={toggle}
+            onClick={toggleModel}
             className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
           >
             <CpuIcon className="h-4 w-4" />
@@ -131,9 +136,9 @@ export const ModelSettingsButton: FC<{
         </Tooltip>
       </div>
 
-      {/* Settings popover */}
-      {isOpen && (
-        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+      {/* Settings popover (profiles + reasoning + auto-routing) */}
+      {settingsOpen && (
+        <div ref={settingsPopover.ref} style={settingsPopover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           {/* Profile section */}
           {hasProfiles && (
             <>
@@ -181,13 +186,59 @@ export const ModelSettingsButton: FC<{
             </>
           )}
 
-          {/* Model section */}
+          {/* Reasoning section */}
+          <div className="flex items-center gap-2 px-2 pt-2 pb-1.5">
+            <BrainCircuitIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Reasoning</span>
+          </div>
+
+          <div className="flex gap-1 px-2 pb-2">
+            {REASONING_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => onChangeReasoningEffort(option.value)}
+                className={`flex-1 rounded-lg px-1.5 py-1.5 text-[11px] font-medium transition-colors ${
+                  option.value === reasoningEffort
+                    ? 'bg-primary/15 text-primary'
+                    : 'hover:bg-muted/60 text-muted-foreground'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Auto-routing toggle */}
+          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-0.5 px-2 py-2">
+            <div className="flex items-center gap-2">
+              <ShuffleIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="text-xs text-foreground">Auto-routing</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onToggleFallback(!fallbackEnabled)}
+              className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
+                fallbackEnabled ? 'bg-primary' : 'bg-muted-foreground/30'
+              }`}
+            >
+              <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                fallbackEnabled ? 'translate-x-[21px]' : 'translate-x-[3px]'
+              }`} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Model picker popover */}
+      {modelOpen && (
+        <div ref={modelPopover.ref} style={modelPopover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
             <CpuIcon className="h-3.5 w-3.5 text-muted-foreground" />
             <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Model</span>
           </div>
 
-          <div className="max-h-[240px] overflow-y-auto space-y-0.5">
+          <div className="max-h-[300px] overflow-y-auto space-y-0.5">
             {models.map((model) => {
               const label = formatModelDisplayName(model.displayName);
               return (
@@ -222,50 +273,6 @@ export const ModelSettingsButton: FC<{
                 No models available
               </div>
             )}
-          </div>
-
-          {/* Reasoning section */}
-          <div className="border-t border-border/50 mx-1.5 mt-1 pt-1">
-            <div className="flex items-center gap-2 px-2 pt-1 pb-1.5">
-              <BrainCircuitIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Reasoning</span>
-            </div>
-
-            <div className="flex gap-1 px-2 pb-2">
-              {REASONING_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => onChangeReasoningEffort(option.value)}
-                  className={`flex-1 rounded-lg px-1.5 py-1.5 text-[11px] font-medium transition-colors ${
-                    option.value === reasoningEffort
-                      ? 'bg-primary/15 text-primary'
-                      : 'hover:bg-muted/60 text-muted-foreground'
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Auto-routing toggle */}
-          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-0.5 px-2 py-2">
-            <div className="flex items-center gap-2">
-              <ShuffleIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-xs text-foreground">Auto-routing</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => onToggleFallback(!fallbackEnabled)}
-              className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
-                fallbackEnabled ? 'bg-primary' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
-                fallbackEnabled ? 'translate-x-[21px]' : 'translate-x-[3px]'
-              }`} />
-            </button>
           </div>
         </div>
       )}

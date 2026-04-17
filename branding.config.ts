@@ -31,7 +31,7 @@ export const branding = {
   /** Name used in the default system prompt: "You are {assistantName}, a powerful…" */
   assistantName: 'Kai',
   /** Placeholder inside the message composer. */
-  composerPlaceholder: 'Message Kai...',
+  composerPlaceholder: 'How can I help you today?',
   /** Text shown in the file drop zone overlay. */
   dropZoneText: 'Drop files for Kai',
   /** Heading shown in the error boundary fallback UI. */

@@ -630,6 +630,23 @@ export const RichChatInput: FC<RichChatInputProps> = ({
         if (event.target !== event.currentTarget) return;
         const lastRun = lastEditableRun;
         if (!lastRun) return;
+
+        if (event.detail >= 3) {
+          event.preventDefault();
+          const firstRun = editableSegments.find(
+            (s): s is Exclude<EditableSegment, UserFencedCodeSegment> => s.type !== 'fencedCode',
+          );
+          if (firstRun) {
+            const key = getRunKey(firstRun);
+            const handle = handlesRef.current.get(key);
+            if (handle) {
+              handle.focusAt(0);
+              document.execCommand('selectAll');
+            }
+          }
+          return;
+        }
+
         if (!clickTargetsLastVisualLine(event, event.currentTarget)) return;
         event.preventDefault();
         focusAtRawOffset(lastRun.end);
