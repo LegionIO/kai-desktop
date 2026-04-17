@@ -175,74 +175,113 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
       if (!SpeechRecognitionClass) {
         throw new Error('Speech recognition is not supported in this browser.');
       }
+      const SpeechRecClass = SpeechRecognitionClass; // narrow for closures
 
-      const recognition = new SpeechRecognitionClass();
+      let recognition = new SpeechRecClass();
       recognition.lang = config.language ?? 'en-US';
       recognition.continuous = config.continuous ?? true;
       recognition.interimResults = true;
 
       let status: DictationStatus = { type: 'starting' };
+      let stopRequested = false;
       const speechStartListeners = new Set<() => void>();
       const speechEndListeners = new Set<(result: DictationResult) => void>();
       const speechListeners = new Set<(result: DictationResult) => void>();
       const errorListeners = new Set<(error: string) => void>();
 
-      recognition.addEventListener('start', () => {
-        console.log('[Dictation] Recognition started');
-        status = { type: 'running' };
-      });
+      // Auto-restart: the Web Speech API in Chromium frequently disconnects
+      // with 'network' or 'no-speech' errors during longer utterances. We
+      // silently restart unless the user explicitly stopped/cancelled.
+      const restartableErrors = new Set(['network', 'no-speech', 'aborted']);
 
-      recognition.addEventListener('audiostart', () => {
-        console.log('[Dictation] Audio capture started');
-      });
+      function attachListeners(rec: SpeechRecognitionInstance) {
+        rec.addEventListener('start', () => {
+          console.log('[Dictation] Recognition started');
+          status = { type: 'running' };
+        });
 
-      recognition.addEventListener('soundstart', () => {
-        console.log('[Dictation] Sound detected');
-      });
+        rec.addEventListener('audiostart', () => {
+          console.log('[Dictation] Audio capture started');
+        });
 
-      recognition.addEventListener('speechstart', () => {
-        console.log('[Dictation] Speech detected');
-        speechStartListeners.forEach((cb) => cb());
-      });
+        rec.addEventListener('soundstart', () => {
+          console.log('[Dictation] Sound detected');
+        });
 
-      recognition.addEventListener('speechend', () => {
-        console.log('[Dictation] Speech ended');
-      });
+        rec.addEventListener('speechstart', () => {
+          console.log('[Dictation] Speech detected');
+          speechStartListeners.forEach((cb) => cb());
+        });
 
-      recognition.addEventListener('result', (event: Event) => {
-        const e = event as Event & { results: SpeechRecognitionResultList; resultIndex: number };
-        console.log('[Dictation] Result event:', e.results.length, 'results, index:', e.resultIndex);
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const result = e.results[i];
-          if (!result || !result[0]) continue;
-          const transcript = result[0].transcript;
-          const isFinal = result.isFinal;
-          console.log('[Dictation] Transcript:', JSON.stringify(transcript), 'isFinal:', isFinal);
-          speechListeners.forEach((cb) => cb({ transcript, isFinal }));
-          if (isFinal) {
-            speechEndListeners.forEach((cb) => cb({ transcript, isFinal: true }));
+        rec.addEventListener('speechend', () => {
+          console.log('[Dictation] Speech ended');
+        });
+
+        rec.addEventListener('result', (event: Event) => {
+          const e = event as Event & { results: SpeechRecognitionResultList; resultIndex: number };
+          console.log('[Dictation] Result event:', e.results.length, 'results, index:', e.resultIndex);
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const result = e.results[i];
+            if (!result || !result[0]) continue;
+            const transcript = result[0].transcript;
+            const isFinal = result.isFinal;
+            console.log('[Dictation] Transcript:', JSON.stringify(transcript), 'isFinal:', isFinal);
+            speechListeners.forEach((cb) => cb({ transcript, isFinal }));
+            if (isFinal) {
+              speechEndListeners.forEach((cb) => cb({ transcript, isFinal: true }));
+            }
           }
+        });
+
+        rec.addEventListener('nomatch', () => {
+          console.log('[Dictation] No speech match detected');
+        });
+
+        rec.addEventListener('end', () => {
+          console.log('[Dictation] Recognition ended, stopRequested=%s', stopRequested);
+          if (!stopRequested && status.type !== 'ended') {
+            // Unexpected end — restart
+            tryRestart();
+            return;
+          }
+          if (status.type !== 'ended') {
+            status = { type: 'ended', reason: 'stopped' };
+          }
+        });
+
+        rec.addEventListener('error', (event: Event) => {
+          const errorEvent = event as Event & { error?: string; message?: string };
+          const errorType = errorEvent.error ?? errorEvent.message ?? 'unknown';
+          console.warn('[Dictation] Error: %s, stopRequested=%s', errorType, stopRequested);
+
+          if (!stopRequested && restartableErrors.has(errorType)) {
+            // Transient error — the 'end' event will fire next and trigger restart
+            return;
+          }
+
+          status = { type: 'ended', reason: 'error' };
+          errorListeners.forEach((cb) => cb(errorType));
+        });
+      }
+
+      function tryRestart() {
+        if (stopRequested) return;
+        try {
+          console.log('[Dictation] Auto-restarting recognition...');
+          recognition = new SpeechRecClass();
+          recognition.lang = config.language ?? 'en-US';
+          recognition.continuous = config.continuous ?? true;
+          recognition.interimResults = true;
+          attachListeners(recognition);
+          recognition.start();
+        } catch (err) {
+          console.error('[Dictation] Restart failed:', err);
+          status = { type: 'ended', reason: 'error' };
+          errorListeners.forEach((cb) => cb('restart-failed'));
         }
-      });
+      }
 
-      recognition.addEventListener('nomatch', () => {
-        console.log('[Dictation] No speech match detected');
-      });
-
-      recognition.addEventListener('end', () => {
-        console.log('[Dictation] Recognition ended');
-        if (status.type !== 'ended') {
-          status = { type: 'ended', reason: 'stopped' };
-        }
-      });
-
-      recognition.addEventListener('error', (event: Event) => {
-        const errorEvent = event as Event & { error?: string; message?: string };
-        const errorType = errorEvent.error ?? errorEvent.message ?? 'unknown';
-        console.error('[Dictation] Error:', errorType);
-        status = { type: 'ended', reason: 'error' };
-        errorListeners.forEach((cb) => cb(errorType));
-      });
+      attachListeners(recognition);
 
       try {
         recognition.start();
@@ -258,9 +297,11 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
           return status;
         },
         async stop() {
+          stopRequested = true;
           recognition.stop();
         },
         cancel() {
+          stopRequested = true;
           recognition.abort();
           status = { type: 'ended', reason: 'cancelled' };
         },
