@@ -83,7 +83,7 @@ export const Thread: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
@@ -151,6 +151,7 @@ export const Thread: FC<{
       ) : (
         <Composer
           mode={mode}
+          onChangeMode={onChangeMode}
           selectedModelKey={selectedModelKey}
           onSelectModel={onSelectModel}
           reasoningEffort={reasoningEffort}
@@ -351,7 +352,7 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
   );
 };
 
-const GuidanceComposer: FC<{ sessionId: string }> = ({ sessionId }) => {
+const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = ({ sessionId, onReturnToChat }) => {
   const [text, setText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const { sendGuidance } = useComputerUse();
@@ -374,6 +375,15 @@ const GuidanceComposer: FC<{ sessionId: string }> = ({ sessionId }) => {
           placeholder="Guide the session... (Enter to send)"
           className="min-h-[36px] max-h-[180px] flex-1 bg-transparent px-1 py-1 text-sm outline-none"
         />
+        <Tooltip content="Return to chat">
+          <button
+            type="button"
+            onClick={onReturnToChat}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-500/15 text-blue-600 transition-colors hover:bg-blue-500/25 dark:text-blue-400"
+          >
+            <MonitorIcon className="h-3.5 w-3.5" />
+          </button>
+        </Tooltip>
         <button
           type="button"
           onClick={handleSend}
@@ -2106,6 +2116,7 @@ const CallButton: FC = () => {
 
 const Composer: FC<{
   mode: ThreadMode;
+  onChangeMode: (mode: ThreadMode) => void;
   selectedModelKey: string | null;
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -2114,7 +2125,7 @@ const Composer: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -2354,31 +2365,51 @@ const Composer: FC<{
         {mode === 'computer' && !showComputerSetup ? (
           /* Guidance composer — shown when a session is active */
           activeComputerSession ? (
-            <GuidanceComposer sessionId={activeComputerSession.id} />
+            <GuidanceComposer sessionId={activeComputerSession.id} onReturnToChat={() => {
+              setComputerUseToggled(false);
+              onChangeMode('chat');
+            }} />
           ) : null
         ) : (
           <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-[1.7rem] border border-border/70 bg-card/78 px-3 py-3 app-composer-shadow">
             {mode === 'computer' ? (
-              <ComputerSetupPanel
-                conversationId={activeConversationId}
-                selectedModelKey={selectedModelKey}
-                onSelectModel={onSelectModel}
-                reasoningEffort={reasoningEffort}
-                onChangeReasoningEffort={onChangeReasoningEffort}
-                selectedProfileKey={selectedProfileKey}
-                onSelectProfile={onSelectProfile}
-                fallbackEnabled={fallbackEnabled}
-                onToggleFallback={onToggleFallback}
-                activeComputerSession={activeComputerSession}
-                onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
-                renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
-                  <DictationButton
-                    onListeningChange={onDictatingChange}
-                    getText={getText}
-                    setText={setText}
-                  />
-                ) : undefined}
-              />
+              <>
+                <ComputerSetupPanel
+                  conversationId={activeConversationId}
+                  selectedModelKey={selectedModelKey}
+                  onSelectModel={onSelectModel}
+                  reasoningEffort={reasoningEffort}
+                  onChangeReasoningEffort={onChangeReasoningEffort}
+                  selectedProfileKey={selectedProfileKey}
+                  onSelectProfile={onSelectProfile}
+                  fallbackEnabled={fallbackEnabled}
+                  onToggleFallback={onToggleFallback}
+                  activeComputerSession={activeComputerSession}
+                  onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
+                  renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
+                    <DictationButton
+                      onListeningChange={onDictatingChange}
+                      getText={getText}
+                      setText={setText}
+                    />
+                  ) : undefined}
+                />
+                <div className="mt-2 flex justify-end">
+                  <Tooltip content="Return to chat">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setComputerUseToggled(false);
+                        onChangeMode('chat');
+                      }}
+                      className="flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                    >
+                      <MonitorIcon className="h-3.5 w-3.5" />
+                      <span>Back to Chat</span>
+                    </button>
+                  </Tooltip>
+                </div>
+              </>
             ) : (
               <>
                 {currentWorkingDirectory && (
@@ -2467,7 +2498,13 @@ const Composer: FC<{
                       approvalMode={computerApprovalMode}
                       onChangeApprovalMode={setComputerApprovalMode}
                       toggled={computerUseToggled}
-                      onToggle={() => setComputerUseToggled((v) => !v)}
+                      onToggle={() => {
+                        const next = !computerUseToggled;
+                        setComputerUseToggled(next);
+                        if (next && activeComputerSession && !isComputerSessionTerminal(activeComputerSession.status) && activeComputerSession.surface === 'docked') {
+                          onChangeMode('computer');
+                        }
+                      }}
                     />
                   )}
                   {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
