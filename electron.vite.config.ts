@@ -46,6 +46,9 @@ export default defineConfig({
           // libsql uses platform-specific native binaries
           'libsql',
           /^@libsql\//,
+          // Optional agent SDK packages — dynamically imported at runtime
+          '@anthropic-ai/claude-agent-sdk',
+          '@openai/codex-sdk',
         ],
         input: {
           index: resolve(__dirname, 'electron/main.ts'),

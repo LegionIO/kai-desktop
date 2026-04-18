@@ -27,8 +27,11 @@ const appAPI = {
       profileKey?: string,
       fallbackEnabled?: boolean,
       cwd?: string,
-    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd),
+      executionMode?: 'auto' | 'plan-first' | 'confirm-writes',
+    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd, executionMode),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
+    approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
+    rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     generateTitle: (messages: unknown[], modelKey?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey),
     listBackends: () => ipcRenderer.invoke('agent:list-backends') as Promise<Array<{
       key: string;

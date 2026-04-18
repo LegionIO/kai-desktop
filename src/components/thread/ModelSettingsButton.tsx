@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
-import { BrainCircuitIcon, CheckIcon, ChevronUpIcon, CpuIcon, ShuffleIcon, UserCircleIcon } from 'lucide-react';
+import { BrainCircuitIcon, CheckIcon, ChevronUpIcon, CpuIcon, ShuffleIcon, TerminalSquareIcon, UserCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -12,6 +12,8 @@ type ModelInfo = {
   maxInputTokens?: number;
   computerUseSupport?: string;
   visionCapable?: boolean;
+  resolvedBackend?: string;
+  resolvedBackendLabel?: string | null;
 };
 
 type ModelCatalog = {
@@ -45,11 +47,13 @@ export const ModelSettingsButton: FC<{
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
+  useAgentSdk: boolean;
+  onToggleAgentSdk: (value: boolean) => void;
   selectedProfileKey?: string | null;
   onSelectProfile?: (key: string | null, primaryModelKey: string | null) => void;
   filter?: (model: ModelInfo) => boolean;
   fallbackToUnfilteredWhenEmpty?: boolean;
-}> = ({ selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, fallbackEnabled, onToggleFallback, selectedProfileKey, onSelectProfile, filter, fallbackToUnfilteredWhenEmpty }) => {
+}> = ({ selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk, selectedProfileKey, onSelectProfile, filter, fallbackToUnfilteredWhenEmpty }) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
@@ -227,6 +231,27 @@ export const ModelSettingsButton: FC<{
               }`} />
             </button>
           </div>
+
+          {/* Agent SDK toggle */}
+          {currentModel?.resolvedBackendLabel && (
+            <div className="flex items-center justify-between border-t border-border/50 mx-1.5 px-2 py-2">
+              <div className="flex items-center gap-2">
+                <TerminalSquareIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-xs text-foreground">{currentModel.resolvedBackendLabel}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onToggleAgentSdk(!useAgentSdk)}
+                className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
+                  useAgentSdk ? 'bg-primary' : 'bg-muted-foreground/30'
+                }`}
+              >
+                <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                  useAgentSdk ? 'translate-x-[21px]' : 'translate-x-[3px]'
+                }`} />
+              </button>
+            </div>
+          )}
         </div>
       )}
 

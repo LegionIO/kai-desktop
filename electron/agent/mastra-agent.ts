@@ -12,7 +12,7 @@ export type { ReasoningEffort } from './model-catalog.js';
 
 export type StreamEvent = {
   conversationId: string;
-  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment';
+  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'tool-approval-required' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment';
   messageMeta?: Record<string, unknown>;
   text?: string;
   toolCallId?: string;
@@ -128,7 +128,7 @@ function toMastraTools(
   tools: ToolDefinition[],
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: {
       toolCallId: string;
@@ -158,7 +158,7 @@ function toMastraTools(
         };
 
         const mergedAbortSignal = mergeAbortSignals(mastraOptions?.abortSignal, localAbortController.signal);
-        hooks?.onToolExecutionStart?.({
+        await hooks?.onToolExecutionStart?.({
           toolCallId,
           toolName: tool.name,
           args: input,
@@ -336,7 +336,7 @@ export async function* streamAgentResponse(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
   },
@@ -363,7 +363,7 @@ export async function* streamAgentResponse(
     return new Agent({
       id: `${__BRAND_APP_SLUG}-${conversationId}`,
       name: __BRAND_APP_SLUG,
-      instructions: buildAgentInstructions(config.systemPrompt),
+      instructions: buildAgentInstructions(config.systemPrompt, config.tools?.executionMode),
       model: model as AgentConfig['model'],
       tools: mastraTools,
       ...(memory ? { memory } : {}),
@@ -791,7 +791,7 @@ export async function* streamWithFallback(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
   },
@@ -946,8 +946,8 @@ export async function* streamWithFallback(
   yield { conversationId, type: 'done' };
 }
 
-function buildAgentInstructions(basePrompt: string): string {
-  return [
+function buildAgentInstructions(basePrompt: string, executionMode?: string): string {
+  const lines = [
     basePrompt,
     '',
     'Runtime capabilities:',
@@ -955,7 +955,34 @@ function buildAgentInstructions(basePrompt: string): string {
     '- The runtime may emit mid-tool progress updates to the user.',
     '- A tool run may be cancelled if output indicates failure, risk, or mismatch with intent.',
     '- Do not claim that mid-tool progress updates are impossible in this environment.',
-  ].join('\n');
+  ];
+
+  if (executionMode === 'plan-first') {
+    lines.push(
+      '',
+      'PLAN MODE ACTIVE:',
+      '- You are in planning mode. Create a detailed plan before taking any action.',
+      '- Only use read-only tools (file_read, grep, glob, list_directory, web_fetch, web_search).',
+      '- Do NOT use file_write, file_edit, or sh tools — they are not available in this mode.',
+      '- Structure your response as:',
+      '  1. Analysis of the current state (use read tools to explore the codebase)',
+      '  2. A clear, step-by-step plan describing what changes you would make',
+      '  3. Expected impact and any risks',
+      '- Wait for the user to approve your plan before proceeding.',
+      '- Do NOT make any changes to files or run any commands that modify the system.',
+    );
+  } else if (executionMode === 'confirm-writes') {
+    lines.push(
+      '',
+      'CONFIRMATION MODE:',
+      '- Write operations (file_write, file_edit, sh) require explicit user approval before executing.',
+      '- The user will see your intended action and can approve or reject it.',
+      '- Before invoking a write tool, briefly explain what the tool call will do and why.',
+      '- Read-only tools execute normally without requiring approval.',
+    );
+  }
+
+  return lines.join('\n');
 }
 
 async function* asAsyncIterable<T>(stream: ReadableStream<T>): AsyncGenerator<T> {

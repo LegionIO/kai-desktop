@@ -8,7 +8,10 @@ import { streamAgentResponse, streamWithFallback } from '../agent/mastra-agent.j
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import { getAgentBackend, listAgentBackends, registerAgentBackend } from '../agent/backend-registry.js';
-import type { AppConfig } from '../config/schema.js';
+import { resolveAgentBackendKey } from '../agent/backend-resolution.js';
+import { createClaudeCodeBackend } from '../agent/claude-code-backend.js';
+import { createCodexBackend } from '../agent/codex-backend.js';
+import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import type { ToolCompactionConfig } from '../agent/compaction.js';
@@ -27,6 +30,9 @@ import { recordUsageEvent } from './usage.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
+
+// Pending tool approval promises for confirm-writes execution mode
+const pendingToolApprovals = new Map<string, { resolve: (approved: boolean) => void }>();
 
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
@@ -324,6 +330,9 @@ function ensureBuiltInAgentBackends(): void {
       );
     },
   });
+
+  registerAgentBackend(createClaudeCodeBackend());
+  registerAgentBackend(createCodexBackend());
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
@@ -340,6 +349,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       profileKey?: string,
       fallbackEnabled?: boolean,
       cwd?: string,
+      executionMode?: ExecutionMode,
     ) => {
     const effectiveCwd = cwd || homedir();
 
@@ -374,11 +384,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       fallbackEnabled: fallbackEnabled ?? false,
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
-    const requestedBackendKey = readConversationStore(appHome).conversations[conversationId]?.selectedBackendKey ?? null;
-    const requestedBackend = getAgentBackend(requestedBackendKey);
+
+    // Backend resolution: conversation override > model-level preference > mastra
+    const conversationBackendKey = readConversationStore(appHome).conversations[conversationId]?.selectedBackendKey ?? null;
+    const modelBackendKey = modelEntry ? resolveAgentBackendKey(modelEntry) : null;
+    const conversationBackend = getAgentBackend(conversationBackendKey);
+    const modelBackend = getAgentBackend(modelBackendKey);
     const defaultBackend = getAgentBackend('mastra');
-    const selectedBackend = requestedBackend && (requestedBackend.isAvailable?.() ?? true)
-      ? requestedBackend
+    const candidateBackend = conversationBackend ?? modelBackend;
+    const selectedBackend = (candidateBackend && (candidateBackend.isAvailable?.() ?? true))
+      ? candidateBackend
       : defaultBackend;
     const resolvedBackendKey = selectedBackend?.key ?? 'mastra';
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
@@ -917,11 +932,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                 broadcastStreamEvent(event);
               }
             },
-            onToolExecutionStart: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => {
+            onToolExecutionStart: async (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => {
               toolCancels.set(state.toolCallId, state.cancel);
               enqueueByToolName(pendingExecIdsByToolName, state.toolName, state.toolCallId);
               pairExecuteAndStreamToolCallIds(state.toolName);
               observer?.onToolExecutionStart(state);
+
+              // In confirm-writes mode, block mutating tools until user approves
+              const MUTATING_TOOLS = new Set(['file_write', 'file_edit', 'sh']);
+              if (executionMode === 'confirm-writes' && MUTATING_TOOLS.has(state.toolName)) {
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: state.toolCallId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                }
+              }
             },
             onToolExecutionEnd: ({ toolCallId }: { toolCallId: string; toolName: string }) => {
               toolCancels.delete(toolCallId);
@@ -944,6 +977,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             },
           };
 
+        // Filter tools for plan-first mode (remove mutating tools as a safety net)
+        const MUTATING_TOOL_NAMES = new Set(['file_write', 'file_edit', 'sh']);
+        const activeTools = executionMode === 'plan-first'
+          ? registeredTools.filter((t) => !MUTATING_TOOL_NAMES.has(t.name))
+          : registeredTools;
+
+        // Inject execution mode into config so system prompt can be augmented
+        const configWithExecutionMode: AppConfig = {
+          ...config,
+          tools: {
+            ...config.tools,
+            executionMode: executionMode ?? 'auto',
+          },
+        };
+
         const stream = selectedBackend.stream({
           conversationId,
           messages,
@@ -952,11 +1000,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           fallbackEnabled,
           reasoningEffort,
           cwd: effectiveCwd,
-          config,
+          config: configWithExecutionMode,
           appHome,
           primaryModel: modelEntry,
           streamConfig,
-          tools: registeredTools,
+          tools: activeTools,
           abortSignal: controller.signal,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
@@ -1050,6 +1098,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     return { ok: true };
   });
 
+  ipcMain.handle('agent:approve-tool', (_event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(true);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('agent:reject-tool', (_event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(false);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
   ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string) => {
     let config: AppConfig;
     try {
@@ -1140,14 +1206,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       const config = readEffectiveConfig(appHome);
       const catalog = resolveModelCatalog(config);
       return {
-        models: catalog.entries.map((e: { key: string; displayName: string; modelConfig: { maxInputTokens?: number }; computerUseSupport?: string; visionCapable?: boolean; preferredTarget?: string }) => ({
-          key: e.key,
-          displayName: e.displayName,
-          maxInputTokens: e.modelConfig.maxInputTokens,
-          computerUseSupport: e.computerUseSupport,
-          visionCapable: e.visionCapable,
-          preferredTarget: e.preferredTarget,
-        })),
+        models: catalog.entries.map((e) => {
+          const backendKey = resolveAgentBackendKey(e);
+          const backend = getAgentBackend(backendKey);
+          const backendAvailable = backend ? (backend.isAvailable?.() ?? true) : false;
+          return {
+            key: e.key,
+            displayName: e.displayName,
+            maxInputTokens: e.modelConfig.maxInputTokens,
+            computerUseSupport: e.computerUseSupport,
+            visionCapable: e.visionCapable,
+            preferredTarget: e.preferredTarget,
+            resolvedBackend: backendKey,
+            resolvedBackendLabel: backendAvailable && backendKey !== 'mastra' ? (backend?.displayName ?? backendKey) : null,
+          };
+        }),
         defaultKey: catalog.defaultEntry?.key ?? null,
       };
     } catch {

@@ -49,6 +49,8 @@ type ToolCallPart = {
     truncated?: boolean;
     stopped?: boolean;
   };
+  /** Approval status for confirm-writes execution mode */
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
 };
 
 export const ToolGroup: FC<{ parts: ToolCallPart[] }> = ({ parts }) => {
@@ -66,6 +68,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[] }> = ({ parts }) => {
 export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
   const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | null>(null);
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
@@ -77,6 +80,18 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
   const mediaResult = hasResult && !isError ? detectMediaResult(part.result) : null;
   const todoItems = detectTodoItems(part);
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
+  const approvalStatus = localApproval ?? part.approvalStatus;
+  const isPendingApproval = approvalStatus === 'pending';
+
+  const handleApprove = useCallback(() => {
+    setLocalApproval('approved');
+    void app.agent.approveToolCall(part.toolCallId);
+  }, [part.toolCallId]);
+
+  const handleReject = useCallback(() => {
+    setLocalApproval('rejected');
+    void app.agent.rejectToolCall(part.toolCallId);
+  }, [part.toolCallId]);
 
   const summary = getToolSummary(part);
 
@@ -109,6 +124,40 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
           />
         </span>
       </button>
+
+      {/* Tool approval — confirm-writes mode */}
+      {isPendingApproval && (
+        <div className="ml-1 mt-1.5 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+          <AlertTriangleIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+          <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">Requires approval to execute</span>
+          <button
+            type="button"
+            onClick={handleReject}
+            className="rounded-md border border-border/70 bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+          >
+            Reject
+          </button>
+          <button
+            type="button"
+            onClick={handleApprove}
+            className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Approve
+          </button>
+        </div>
+      )}
+      {approvalStatus === 'approved' && localApproval === 'approved' && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+          <CheckIcon className="h-3 w-3" />
+          <span>Approved</span>
+        </div>
+      )}
+      {approvalStatus === 'rejected' && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-destructive">
+          <SquareIcon className="h-3 w-3" />
+          <span>Rejected</span>
+        </div>
+      )}
 
       {/* Todo items — always visible below header */}
       {todoItems && <TodoListView items={todoItems} />}

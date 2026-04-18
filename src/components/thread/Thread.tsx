@@ -63,6 +63,8 @@ import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
+import { PlanModeButton } from './PlanModeButton';
+import type { ExecutionMode } from './PlanModeButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
@@ -79,11 +81,15 @@ export const Thread: FC<{
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
+  executionMode: ExecutionMode;
+  onChangeExecutionMode: (value: ExecutionMode) => void;
   selectedProfileKey: string | null;
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+  useAgentSdk: boolean;
+  onToggleAgentSdk: (value: boolean) => void;
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
@@ -156,10 +162,14 @@ export const Thread: FC<{
           onSelectModel={onSelectModel}
           reasoningEffort={reasoningEffort}
           onChangeReasoningEffort={onChangeReasoningEffort}
+          executionMode={executionMode}
+          onChangeExecutionMode={onChangeExecutionMode}
           selectedProfileKey={selectedProfileKey}
           onSelectProfile={onSelectProfile}
           fallbackEnabled={fallbackEnabled}
           onToggleFallback={onToggleFallback}
+          useAgentSdk={useAgentSdk}
+          onToggleAgentSdk={onToggleAgentSdk}
         />
       )}
     </ThreadPrimitive.Root>
@@ -2121,11 +2131,15 @@ const Composer: FC<{
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
+  executionMode: ExecutionMode;
+  onChangeExecutionMode: (value: ExecutionMode) => void;
   selectedProfileKey: string | null;
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+  useAgentSdk: boolean;
+  onToggleAgentSdk: (value: boolean) => void;
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk }) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -2384,6 +2398,8 @@ const Composer: FC<{
                   onSelectProfile={onSelectProfile}
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={onToggleFallback}
+                  useAgentSdk={useAgentSdk}
+                  onToggleAgentSdk={onToggleAgentSdk}
                   activeComputerSession={activeComputerSession}
                   onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
                   renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
@@ -2488,8 +2504,14 @@ const Composer: FC<{
                     onChangeReasoningEffort={onChangeReasoningEffort}
                     fallbackEnabled={fallbackEnabled}
                     onToggleFallback={onToggleFallback}
+                    useAgentSdk={useAgentSdk}
+                    onToggleAgentSdk={onToggleAgentSdk}
                     selectedProfileKey={selectedProfileKey}
                     onSelectProfile={onSelectProfile}
+                  />
+                  <PlanModeButton
+                    executionMode={executionMode}
+                    onChangeExecutionMode={onChangeExecutionMode}
                   />
                   {computerUseEnabled && (
                     <ComputerSettingsButton

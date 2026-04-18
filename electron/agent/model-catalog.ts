@@ -24,6 +24,8 @@ export type LLMModelConfig = {
   maxRetries?: number;
 };
 
+export type AgentBackendPreference = 'auto' | 'mastra' | 'claude-code' | 'codex';
+
 export type ModelCatalogEntry = {
   key: string;
   displayName: string;
@@ -31,6 +33,7 @@ export type ModelCatalogEntry = {
   computerUseSupport?: ComputerUseSupport;
   visionCapable?: boolean;
   preferredTarget?: ComputerUseTarget;
+  agentBackend?: AgentBackendPreference;
 };
 
 export function resolveModelCatalog(config: AppConfig): {
@@ -74,6 +77,7 @@ export function resolveModelCatalog(config: AppConfig): {
       computerUseSupport: model.computerUseSupport,
       visionCapable: model.visionCapable,
       preferredTarget: model.preferredTarget,
+      agentBackend: model.agentBackend as AgentBackendPreference | undefined,
     };
 
     entries.push(entry);

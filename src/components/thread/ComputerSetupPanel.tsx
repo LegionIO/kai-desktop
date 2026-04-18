@@ -25,6 +25,8 @@ type ComputerSetupPanelProps = {
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
+  useAgentSdk: boolean;
+  onToggleAgentSdk: (value: boolean) => void;
   startSurface?: ComputerUseSurface;
   activeComputerSession?: ComputerSession;
   onOpenPopout?: () => void;
@@ -42,6 +44,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   onSelectProfile,
   fallbackEnabled,
   onToggleFallback,
+  useAgentSdk,
+  onToggleAgentSdk,
   startSurface = 'docked',
   activeComputerSession,
   onOpenPopout,
@@ -344,6 +348,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           onChangeReasoningEffort={onChangeReasoningEffort}
           fallbackEnabled={fallbackEnabled}
           onToggleFallback={onToggleFallback}
+          useAgentSdk={useAgentSdk}
+          onToggleAgentSdk={onToggleAgentSdk}
           selectedProfileKey={selectedProfileKey}
           onSelectProfile={onSelectProfile}
           filter={(model) => Boolean(
