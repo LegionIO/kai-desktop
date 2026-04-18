@@ -27,7 +27,12 @@
       "Bash(npm ls *)",
       "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) p = d.get\\('models', {}\\).get\\('providers', {}\\).get\\('skynet_gateway', {}\\) print\\('type:', p.get\\('type'\\)\\) print\\('endpoint:', p.get\\('endpoint', ''\\)[:80]\\) print\\('apiKey set:', bool\\(p.get\\('apiKey'\\)\\)\\) print\\('apiKey length:', len\\(p.get\\('apiKey', ''\\)\\)\\) \")",
       "Bash(git fetch *)",
-      "Bash(git rebase *)"
+      "Bash(git rebase *)",
+      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) catalog = d.get\\('models', {}\\).get\\('catalog', []\\) for m in catalog: if 'gpt-5.4' in m.get\\('modelName', ''\\).lower\\(\\): print\\(f'{m[\\\\\"displayName\\\\\"]}: provider={m[\\\\\"provider\\\\\"]}, modelName={m[\\\\\"modelName\\\\\"]}'\\) p = d.get\\('models', {}\\).get\\('providers', {}\\).get\\('skynet_gateway', {}\\) print\\(f'\\\\\\\\nskynet_gateway endpoint: {p.get\\(\\\\\"endpoint\\\\\", \\\\\"\\\\\"\\)}'\\) print\\(f'skynet_gateway apiKey set: {bool\\(p.get\\(\\\\\"apiKey\\\\\"\\)\\)}'\\) \")",
+      "Bash(codex --version)",
+      "Bash(awk '/^export const .*=.*=>|^const .*=.*=>|^export const .*=.*\\\\\\(|^const .*=.*\\\\\\(/ {found_line=NR} NR==2331 {print found_line\": line 2331\"; exit} END {if \\(NR >= 2331\\) {print \"Found at line 2331\"}}' /Users/john_hollow@optum.com/Documents/kai/kai-desktop/src/components/thread/Thread.tsx)",
+      "mcp__chrome-devtools__list_pages",
+      "Bash(screencapture -x /tmp/kai-splash-test.png)"
     ]
   }
 }

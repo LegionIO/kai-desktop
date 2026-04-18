@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
+import { createPortal } from 'react-dom';
 import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, ArchiveRestoreIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
@@ -25,6 +26,7 @@ type ConversationListProps = {
   activeThreadMode?: 'chat' | 'computer';
   onSwitchConversation: (id: string) => void;
   onNewConversation: () => Promise<void> | void;
+  onDeleteConversation?: (id: string) => Promise<void> | void;
 };
 
 function formatRelativeTime(timestamp: string | null): string {
@@ -48,7 +50,7 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
     if (goal) return goal.length > 50 ? goal.slice(0, 47).trimEnd() + '...' : goal;
   }
 
-  return 'New Conversation';
+  return 'Untitled Thread';
 }
 
 const TypingBubble: FC = () => (
@@ -134,6 +136,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   activeThreadMode,
   onSwitchConversation,
   onNewConversation,
+  onDeleteConversation,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -161,9 +164,21 @@ export const ConversationList: FC<ConversationListProps> = ({
     setPinnedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
-      localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', JSON.stringify([...next]));
+      const serialized = JSON.stringify([...next]);
+      localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', serialized);
+      window.dispatchEvent(new CustomEvent('pinned-conversations-changed', { detail: serialized }));
       return next;
     });
+  }, []);
+
+  // Sync pin state when changed from the title bar dropdown
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      try { setPinnedIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+    };
+    window.addEventListener('pinned-conversations-changed', handler);
+    return () => window.removeEventListener('pinned-conversations-changed', handler);
   }, []);
 
   /** Get the computer-use session status for a conversation */
@@ -238,6 +253,9 @@ export const ConversationList: FC<ConversationListProps> = ({
 
     result = result.filter((conv) => showArchived ? Boolean(conv.archived) : !conv.archived);
 
+    // Hide empty threads (no messages, no title) — they only appear after the user sends a message
+    result = result.filter((conv) => conv.messageCount > 0 || Boolean(conv.title?.trim() || conv.fallbackTitle?.trim()));
+
     // Stage 1: Apply filters
     if (hasActiveFilters) {
       result = result.filter((conv) => {
@@ -289,16 +307,25 @@ export const ConversationList: FC<ConversationListProps> = ({
   }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived]);
 
   const handleDelete = async (id: string) => {
-    const shouldCreateReplacementThread = id === activeConversationId;
     setDeletingId(id);
-
     try {
-      await app.conversations.delete(id);
-
-      if (shouldCreateReplacementThread) {
-        await onNewConversation();
+      // Find the conversation right below the deleted one in visual order
+      if (id === activeConversationId) {
+        const idx = processedConversations.findIndex((c) => c.id === id);
+        // Pick the one below, or above if it's the last item
+        const next = processedConversations[idx + 1] ?? processedConversations[idx - 1];
+        if (next) {
+          await app.conversations.setActiveId(next.id);
+        }
+        await app.conversations.delete(id);
+        if (next) {
+          onSwitchConversation(next.id);
+        } else {
+          await onNewConversation();
+        }
+      } else {
+        await app.conversations.delete(id);
       }
-
       await loadConversations();
     } finally {
       setDeletingId(null);
@@ -538,38 +565,17 @@ export const ConversationList: FC<ConversationListProps> = ({
                           ))}
                         </div>
                       )}
-                      <span className="mt-1 block text-[12px] text-muted-foreground">
-                        {isRunning ? 'Running now' : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
+                      <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
+                        {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
                         {conv.messageCount > 0 && ` · ${conv.messageCount} msgs`}
                       </span>
                     </div>
-                    <div className="ml-1 flex shrink-0 flex-col items-center gap-1">
+                    <div className="ml-1 flex shrink-0 items-center gap-1">
                       {hasUnread && <div className="h-2 w-2 rounded-full bg-primary app-unread-glow" />}
-                      {isRunning && <TypingBubble />}
                       {computerStatus === 'running' && <ComputerActiveIndicator />}
                       {computerStatus === 'completed' && !(isActive && activeThreadMode === 'computer') && <ComputerCompletedIndicator />}
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); togglePin(conv.id); }}
-                        className={`shrink-0 rounded p-0.5 transition-all ${isPinned ? 'opacity-100 text-primary' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100 text-muted-foreground hover:text-primary'}`}
-                        title={isPinned ? 'Unpin' : 'Pin to top'}
-                      >
-                        <PinIcon className="h-3 w-3" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); void handleArchive(conv.id); }}
-                        className="shrink-0 rounded p-0.5 opacity-0 transition-all group-hover:opacity-100 hover:bg-amber-500/10"
-                        title={conv.archived ? 'Unarchive' : 'Archive'}
-                      >
-                        {conv.archived
-                          ? <ArchiveRestoreIcon className="h-3 w-3 text-muted-foreground hover:text-amber-500" />
-                          : <ArchiveIcon className="h-3 w-3 text-muted-foreground hover:text-amber-500" />}
-                      </button>
-                      <ConversationDeleteButton
-                        onDelete={() => handleDelete(conv.id)}
-                        isDeleting={deletingId === conv.id}
-                      />
+                      {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}
+                      {conv.archived && <ArchiveIcon className="h-3 w-3 text-muted-foreground" />}
                     </div>
                   </div>
                   </div>
@@ -596,14 +602,20 @@ export const ConversationList: FC<ConversationListProps> = ({
         </div>
       )}
 
-      {contextMenu && (
+      {contextMenu && createPortal(
         <div
-          className="fixed z-[100] min-w-[160px] rounded-lg border border-border/70 bg-popover py-1 shadow-lg"
+          className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >
           <button
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { togglePin(contextMenu.convId); setContextMenu(null); }}
+          >
+            <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedIds.has(contextMenu.convId) ? 'Unpin' : 'Pin'}
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
             onClick={() => {
               const conv = conversations.find((c) => c.id === contextMenu.convId);
               setRenameValue(conv?.title || conv?.fallbackTitle || '');
@@ -611,28 +623,29 @@ export const ConversationList: FC<ConversationListProps> = ({
               setContextMenu(null);
             }}
           >
-            <PencilIcon className="h-3 w-3" /> Rename
+            <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
           </button>
           <button
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
             onClick={() => { void handleArchive(contextMenu.convId); setContextMenu(null); }}
           >
-            <ArchiveIcon className="h-3 w-3" /> {conversations.find((c) => c.id === contextMenu.convId)?.archived ? 'Unarchive' : 'Archive'}
+            <ArchiveIcon className="h-4 w-4 text-muted-foreground" /> {conversations.find((c) => c.id === contextMenu.convId)?.archived ? 'Unarchive' : 'Archive'}
           </button>
           <button
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-popover-foreground hover:bg-accent transition-colors"
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
             onClick={() => { setExportConvId(contextMenu.convId); setContextMenu(null); }}
           >
-            <DownloadIcon className="h-3 w-3" /> Export
+            <DownloadIcon className="h-4 w-4 text-muted-foreground" /> Export
           </button>
-          <div className="my-1 border-t border-border/50" />
+          <div className="my-1 h-px bg-border/60" />
           <button
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 transition-colors"
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
             onClick={() => { void handleDelete(contextMenu.convId); setContextMenu(null); }}
           >
-            <Trash2Icon className="h-3 w-3" /> Delete
+            <Trash2Icon className="h-4 w-4" /> Delete
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
 
       <ExportDialog

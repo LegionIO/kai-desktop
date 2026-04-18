@@ -3,27 +3,46 @@ import type { StreamEvent } from './mastra-agent.js';
 import { binaryExistsInResolvedPath } from '../utils/shell-env.js';
 
 /**
- * Extract the last user message text from the conversation messages array.
+ * Build a prompt string from the full conversation history.
  */
-function extractLastUserPrompt(messages: unknown[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as { role?: string; content?: unknown };
-    if (msg.role !== 'user') continue;
+function buildPromptFromMessages(messages: unknown[]): string {
+  const msgArray = messages as Array<{ role?: string; content?: unknown }>;
+  if (msgArray.length === 0) return '';
 
-    if (typeof msg.content === 'string') return msg.content;
-    if (Array.isArray(msg.content)) {
-      const textParts: string[] = [];
-      for (const part of msg.content) {
-        const p = part as { type?: string; text?: string };
-        if (p.type === 'text' && typeof p.text === 'string') {
-          textParts.push(p.text);
-        }
-      }
-      if (textParts.length > 0) return textParts.join('\n');
-    }
-    return JSON.stringify(msg.content);
+  if (msgArray.length === 1 && msgArray[0].role === 'user') {
+    return extractTextContent(msgArray[0].content);
   }
-  return '';
+
+  const parts: string[] = [];
+  const lastIdx = msgArray.length - 1;
+
+  for (let i = 0; i < lastIdx; i++) {
+    const msg = msgArray[i];
+    const role = msg.role === 'assistant' ? 'Assistant' : 'User';
+    const text = extractTextContent(msg.content);
+    if (text) parts.push(`${role}: ${text}`);
+  }
+
+  const lastMsg = msgArray[lastIdx];
+  const lastText = extractTextContent(lastMsg.content);
+
+  if (parts.length === 0) return lastText;
+  return `Here is our conversation so far:\n\n${parts.join('\n\n')}\n\nUser: ${lastText}`;
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const textParts: string[] = [];
+    for (const part of content) {
+      const p = part as { type?: string; text?: string };
+      if (p.type === 'text' && typeof p.text === 'string') {
+        textParts.push(p.text);
+      }
+    }
+    if (textParts.length > 0) return textParts.join('\n');
+  }
+  return JSON.stringify(content);
 }
 
 /**
@@ -39,20 +58,37 @@ function buildCodexEnv(options: AgentBackendStreamOptions): Record<string, strin
   const modelConfig = options.primaryModel?.modelConfig;
   if (!modelConfig) return env;
 
+  // Codex uses CODEX_API_KEY internally, but also respects OPENAI_API_KEY
   if (modelConfig.apiKey) {
     env.OPENAI_API_KEY = modelConfig.apiKey;
-  }
-  if (modelConfig.endpoint) {
-    env.OPENAI_BASE_URL = modelConfig.endpoint;
   }
 
   return env;
 }
 
+// Codex SDK event types for casting
+type CodexItem = {
+  type: string;
+  id?: string;
+  text?: string;
+  command?: string;
+  aggregated_output?: string;
+  name?: string;
+  arguments?: string;
+  call_id?: string;
+  output?: string;
+};
+type CodexEvent = {
+  type: string;
+  item?: CodexItem;
+  usage?: { input_tokens?: number; output_tokens?: number; cached_input_tokens?: number };
+  error?: { message?: string };
+};
+
 export function createCodexBackend(): AgentBackendDefinition {
   return {
     key: 'codex',
-    displayName: 'Codex',
+    displayName: 'Codex SDK',
 
     isAvailable(): boolean {
       return binaryExistsInResolvedPath('codex');
@@ -61,8 +97,8 @@ export function createCodexBackend(): AgentBackendDefinition {
     async *stream(options: AgentBackendStreamOptions): AsyncGenerator<StreamEvent> {
       const { conversationId, abortSignal } = options;
 
-      // Dynamic import — graceful failure if SDK not installed
-      let CodexClass: new (options?: { env?: Record<string, string>; config?: Record<string, unknown> }) => { startThread: (options?: { workingDirectory?: string; skipGitRepoCheck?: boolean }) => { runStreamed: (prompt: string) => Promise<{ events: AsyncIterable<unknown> }> } };
+      // Dynamic import
+      let CodexClass: new (options?: Record<string, unknown>) => { startThread: (options?: Record<string, unknown>) => { runStreamed: (prompt: string) => Promise<{ events: AsyncIterable<unknown> }> } };
       try {
         const sdk = await import('@openai/codex-sdk');
         CodexClass = sdk.Codex;
@@ -76,7 +112,7 @@ export function createCodexBackend(): AgentBackendDefinition {
         return;
       }
 
-      const prompt = extractLastUserPrompt(options.messages);
+      const prompt = buildPromptFromMessages(options.messages);
       if (!prompt) {
         yield {
           conversationId,
@@ -90,11 +126,20 @@ export function createCodexBackend(): AgentBackendDefinition {
       const env = buildCodexEnv(options);
       const modelConfig = options.primaryModel?.modelConfig;
 
+      // Build base URL — Codex expects the full /v1 path
+      let baseUrl: string | undefined;
+      if (modelConfig?.endpoint) {
+        const ep = modelConfig.endpoint.replace(/\/+$/, '');
+        baseUrl = ep.endsWith('/v1') ? ep : `${ep}/v1`;
+      }
+
       try {
-        console.info(`[CodexBackend] Starting session for ${conversationId}`);
+        console.info(`[CodexBackend] Starting session for ${conversationId} model=${modelConfig?.modelName}`);
 
         const codex = new CodexClass({
           env,
+          ...(modelConfig?.apiKey ? { apiKey: modelConfig.apiKey } : {}),
+          ...(baseUrl ? { baseUrl } : {}),
           ...(modelConfig?.modelName ? { config: { model: modelConfig.modelName } } : {}),
         });
 
@@ -102,25 +147,10 @@ export function createCodexBackend(): AgentBackendDefinition {
         const thread = codex.startThread({
           workingDirectory: cwd,
           skipGitRepoCheck: true,
+          ...(modelConfig?.modelName ? { model: modelConfig.modelName } : {}),
         });
 
         const { events } = await thread.runStreamed(prompt);
-
-        // Local types for casting the loosely-typed SDK events
-        type CodexItem = {
-          type: string;
-          id?: string;
-          content?: Array<{ type: string; text?: string }>;
-          name?: string;
-          arguments?: string;
-          call_id?: string;
-          output?: string;
-        };
-        type CodexEvent = {
-          type: string;
-          item?: CodexItem;
-          usage?: { input_tokens?: number; output_tokens?: number };
-        };
 
         let accInputTokens = 0;
         let accOutputTokens = 0;
@@ -132,20 +162,42 @@ export function createCodexBackend(): AgentBackendDefinition {
           if (event.type === 'item.completed' && event.item) {
             const item = event.item;
 
-            // Message content (text response)
-            if (item.type === 'message' && item.content) {
-              for (const part of item.content) {
-                if (part.type === 'output_text' || part.type === 'text') {
-                  yield {
-                    conversationId,
-                    type: 'text-delta',
-                    text: part.text ?? '',
-                  };
-                }
+            // Agent message — text response
+            if (item.type === 'agent_message' && item.text) {
+              yield {
+                conversationId,
+                type: 'text-delta',
+                text: item.text,
+              };
+            }
+
+            // Command execution — tool call + result in one
+            if (item.type === 'command_execution') {
+              const toolCallId = item.id ?? `codex-tc-${Date.now()}`;
+              const startedAt = new Date().toISOString();
+              yield {
+                conversationId,
+                type: 'tool-call',
+                toolCallId,
+                toolName: 'shell',
+                args: { command: item.command },
+                startedAt,
+              };
+              if (item.aggregated_output !== undefined) {
+                const finishedAt = new Date().toISOString();
+                yield {
+                  conversationId,
+                  type: 'tool-result',
+                  toolCallId,
+                  toolName: 'shell',
+                  result: item.aggregated_output,
+                  startedAt,
+                  finishedAt,
+                };
               }
             }
 
-            // Function call (tool invocation)
+            // Function call (if Codex uses function-calling format)
             if (item.type === 'function_call') {
               const startedAt = new Date().toISOString();
               let parsedArgs: unknown = {};
@@ -164,7 +216,6 @@ export function createCodexBackend(): AgentBackendDefinition {
               };
             }
 
-            // Function call output (tool result)
             if (item.type === 'function_call_output') {
               const finishedAt = new Date().toISOString();
               yield {
@@ -182,6 +233,15 @@ export function createCodexBackend(): AgentBackendDefinition {
           if (event.type === 'turn.completed' && event.usage) {
             accInputTokens += event.usage.input_tokens ?? 0;
             accOutputTokens += event.usage.output_tokens ?? 0;
+          }
+
+          // Turn failed — emit error
+          if (event.type === 'turn.failed') {
+            yield {
+              conversationId,
+              type: 'error',
+              error: event.error?.message ?? 'Codex turn failed',
+            };
           }
         }
 

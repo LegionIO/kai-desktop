@@ -40,14 +40,14 @@ function resolveBackendLabel(entry: CatalogEntry, providers: Record<string, Prov
   if (explicit && explicit !== 'auto') {
     if (explicit === 'mastra') return null;
     if (explicit === 'claude-code') return 'Claude Code SDK';
-    if (explicit === 'codex') return 'Codex';
+    if (explicit === 'codex') return 'Codex SDK';
     return null;
   }
   const providerType = providers[entry.provider]?.type;
   if (providerType === 'anthropic') return 'Claude Code SDK';
   // Claude models on any provider (Bedrock, OpenAI-compatible gateways, etc.)
   if (/claude|anthropic/i.test(entry.modelName)) return 'Claude Code SDK';
-  if (providerType === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(entry.modelName)) return 'Codex';
+  if (providerType === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(entry.modelName)) return 'Codex SDK';
   return null;
 }
 
@@ -377,7 +377,7 @@ const ModelForm: FC<{
             <option value="claude-code">Claude Code SDK</option>
           )}
           {selectedProvider?.type === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(modelName) && (
-            <option value="codex">Codex</option>
+            <option value="codex">Codex SDK</option>
           )}
         </select>
       </div>

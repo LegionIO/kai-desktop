@@ -24,12 +24,17 @@ declare module '@anthropic-ai/claude-agent-sdk' {
 declare module '@openai/codex-sdk' {
   export interface CodexOptions {
     env?: Record<string, string>;
+    apiKey?: string;
+    baseUrl?: string;
+    codexPathOverride?: string;
     config?: Record<string, unknown>;
   }
 
   export interface CodexThreadOptions {
     workingDirectory?: string;
     skipGitRepoCheck?: boolean;
+    model?: string;
+    [key: string]: unknown;
   }
 
   export interface CodexRunStreamedResult {
@@ -44,5 +49,6 @@ declare module '@openai/codex-sdk' {
   export class Codex {
     constructor(options?: CodexOptions);
     startThread(options?: CodexThreadOptions): CodexThread;
+    resumeThread(id: string, options?: CodexThreadOptions): CodexThread;
   }
 }

@@ -23,10 +23,11 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   BanIcon,
-  CpuIcon,
+
   Volume2Icon,
   SquareIcon,
   MicIcon,
+  PointerIcon,
   ChevronUpIcon,
   PhoneIcon,
   MonitorIcon,
@@ -59,12 +60,12 @@ import { ModelSettingsButton } from './ModelSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
+import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
-import { PlanModeButton } from './PlanModeButton';
-import type { ExecutionMode } from './PlanModeButton';
+import type { ExecutionMode } from './ModelSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
@@ -134,43 +135,70 @@ export const Thread: FC<{
       )}
       {mode === 'chat' ? (
         <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
-          <ThreadPrimitive.Empty>
-            <EmptyThreadBackground />
-          </ThreadPrimitive.Empty>
-          <ThreadWelcome />
-          <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pt-4 md:px-6 md:pt-8">
-            <ThreadPrimitive.Messages
-              components={{
-                UserMessage,
-                AssistantMessage,
-              }}
-            />
+          <div className="flex min-h-full flex-col">
+            <div className="flex-1">
+              <FadingSplash>
+                <EmptyThreadBackground />
+              </FadingSplash>
+              <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
+                <ThreadPrimitive.Messages
+                  components={{
+                    UserMessage,
+                    AssistantMessage,
+                  }}
+                />
 
-            <div className="min-h-8" />
+                <div className="min-h-8" />
+              </div>
+            </div>
+            <div className="sticky bottom-0 z-20">
+            {callState.isInCall ? (
+              <CallOverlay />
+            ) : (
+              <Composer
+                mode={mode}
+                onChangeMode={onChangeMode}
+                selectedModelKey={selectedModelKey}
+                onSelectModel={onSelectModel}
+                reasoningEffort={reasoningEffort}
+                onChangeReasoningEffort={onChangeReasoningEffort}
+                executionMode={executionMode}
+                onChangeExecutionMode={onChangeExecutionMode}
+                selectedProfileKey={selectedProfileKey}
+                onSelectProfile={onSelectProfile}
+                fallbackEnabled={fallbackEnabled}
+                onToggleFallback={onToggleFallback}
+                useAgentSdk={useAgentSdk}
+                onToggleAgentSdk={onToggleAgentSdk}
+              />
+            )}
+          </div>
           </div>
         </ThreadPrimitive.Viewport>
       ) : (
-        <ComputerTabSurface />
-      )}
-      {callState.isInCall ? (
-        <CallOverlay />
-      ) : (
-        <Composer
-          mode={mode}
-          onChangeMode={onChangeMode}
-          selectedModelKey={selectedModelKey}
-          onSelectModel={onSelectModel}
-          reasoningEffort={reasoningEffort}
-          onChangeReasoningEffort={onChangeReasoningEffort}
-          executionMode={executionMode}
-          onChangeExecutionMode={onChangeExecutionMode}
-          selectedProfileKey={selectedProfileKey}
-          onSelectProfile={onSelectProfile}
-          fallbackEnabled={fallbackEnabled}
-          onToggleFallback={onToggleFallback}
-          useAgentSdk={useAgentSdk}
-          onToggleAgentSdk={onToggleAgentSdk}
-        />
+        <>
+          <ComputerTabSurface />
+          {callState.isInCall ? (
+            <CallOverlay />
+          ) : (
+            <Composer
+              mode={mode}
+              onChangeMode={onChangeMode}
+              selectedModelKey={selectedModelKey}
+              onSelectModel={onSelectModel}
+              reasoningEffort={reasoningEffort}
+              onChangeReasoningEffort={onChangeReasoningEffort}
+              executionMode={executionMode}
+              onChangeExecutionMode={onChangeExecutionMode}
+              selectedProfileKey={selectedProfileKey}
+              onSelectProfile={onSelectProfile}
+              fallbackEnabled={fallbackEnabled}
+              onToggleFallback={onToggleFallback}
+              useAgentSdk={useAgentSdk}
+              onToggleAgentSdk={onToggleAgentSdk}
+            />
+          )}
+        </>
       )}
     </ThreadPrimitive.Root>
   );
@@ -407,46 +435,6 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   );
 };
 
-const ThreadWelcome: FC = () => {
-  const threadRuntime = useThreadRuntime();
-  const gradientText = __BRAND_THEME_GRADIENT_TEXT !== 'false';
-
-  const handleSuggestion = useCallback((text: string) => {
-    threadRuntime.append({
-      role: 'user',
-      content: [{ type: 'text', text }],
-    });
-  }, [threadRuntime]);
-
-  return (
-    <ThreadPrimitive.Empty>
-      <div className="absolute inset-0 z-20 flex flex-col overflow-y-auto px-3 py-4 md:px-6 md:py-8">
-        <div className="m-auto flex w-full max-w-2xl select-none flex-col items-center">
-          <div className="mb-3 inline-flex items-center gap-0.5 text-2xl font-semibold md:text-4xl">
-            <span className={`app-wordmark ${gradientText ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
-            <CpuIcon className="h-6 w-6 text-primary/80 md:h-9 md:w-9" />
-          </div>
-          <p className="max-w-xl text-center text-sm text-muted-foreground">
-            Your local neural workspace for coding, tooling, and system automation.
-          </p>
-          <div className="mt-8 grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
-            {['List files in my home directory', 'Search for TODO comments in my code', 'Help me write a shell script', 'Explain a file in my project'].map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => handleSuggestion(s)}
-                className="rounded-2xl border border-border/70 bg-card/45 px-4 py-3 text-left text-xs transition-colors hover:bg-accent/70"
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    </ThreadPrimitive.Empty>
-  );
-};
-
 /** Build-time-configured background for the empty thread state */
 const EmptyThreadBackground: FC = () => {
   const background = __BRAND_THEME_BACKGROUND || 'matrix-rain';
@@ -455,6 +443,57 @@ const EmptyThreadBackground: FC = () => {
   if (background === 'gradient') return <GradientBackground />;
   if (background === 'constellation') return <ConstellationBackground />;
   return <MatrixRainBackground />;
+};
+
+/**
+ * Wrapper that keeps the splash visible while the thread is empty,
+ * then fades it out over 600ms when the first message is sent.
+ */
+const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
+  const threadRuntime = useThreadRuntime();
+  const [visible, setVisible] = useState(true);
+  const [fading, setFading] = useState(false);
+
+  // Reset when switching to a different thread
+  useEffect(() => {
+    const msgs = threadRuntime.getState().messages;
+    if (msgs.length === 0) {
+      setVisible(true);
+      setFading(false);
+    } else {
+      setVisible(false);
+      setFading(true);
+    }
+  }, [threadRuntime]);
+
+  useEffect(() => {
+    return threadRuntime.subscribe(() => {
+      const msgs = threadRuntime.getState().messages;
+      if (msgs.length > 0 && !fading) {
+        setFading(true);
+      } else if (msgs.length === 0) {
+        setVisible(true);
+        setFading(false);
+      }
+    });
+  }, [threadRuntime, fading]);
+
+  useEffect(() => {
+    if (!fading) return;
+    const timer = setTimeout(() => setVisible(false), 600);
+    return () => clearTimeout(timer);
+  }, [fading]);
+
+  if (!visible) return null;
+
+  return (
+    <div
+      className="absolute inset-0 z-10 transition-opacity duration-[600ms] ease-out"
+      style={{ opacity: fading ? 0 : 1 }}
+    >
+      {children}
+    </div>
+  );
 };
 
 /** Subtle radial gradient alternative to the matrix rain */
@@ -541,6 +580,24 @@ function useMatrixCanvas() {
 
         drops[index] += 1;
       }
+
+      // Punch a soft radial hole in the center for the wordmark
+      const cx = width / 2;
+      const cy = height / 2;
+      const rx = width * 0.22;
+      const ry = height * 0.14;
+      const r = Math.max(rx, ry);
+      context.save();
+      context.globalCompositeOperation = 'destination-out';
+      const hole = context.createRadialGradient(cx, cy, 0, cx, cy, r);
+      hole.addColorStop(0, 'rgba(0,0,0,1)');
+      hole.addColorStop(0.55, 'rgba(0,0,0,0.9)');
+      hole.addColorStop(1, 'rgba(0,0,0,0)');
+      context.beginPath();
+      context.ellipse(cx, cy, rx * 1.3, ry * 1.3, 0, 0, Math.PI * 2);
+      context.fillStyle = hole;
+      context.fill();
+      context.restore();
 
       frameId = window.setTimeout(() => {
         animationFrame = window.requestAnimationFrame(draw);
@@ -1097,7 +1154,7 @@ const UserMessage: FC = () => {
     <MessagePrimitive.Root className="group mb-6 flex justify-end">
       <div className="max-w-[88%] md:max-w-[72%]">
         <div
-          className="rounded-xl border px-4 py-2.5 text-foreground"
+          className="w-fit ml-auto rounded-xl border px-4 py-2.5 text-foreground"
           style={{
             backgroundColor: 'var(--app-user-bubble)',
             borderColor: 'var(--app-user-bubble-border)',
@@ -1957,9 +2014,10 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   }, [error]);
 
   const isActive = isListening;
+  const { expanded: dictationExpanded, containerProps: dictationContainerProps } = useSplitButtonHover({ popoverOpen: pickerOpen, forceExpanded: isActive || isActivating });
 
   return (
-    <div ref={rootRef} className="relative flex items-center">
+    <div ref={rootRef} {...dictationContainerProps} className="relative flex items-center">
       {/* Joined button group: chevron/dots + mic */}
       <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
         isActive
@@ -1969,24 +2027,28 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
             : 'border-border/70 bg-card/70'
       }`}>
         {/* Left segment: chevron (idle) or animated dots (active) */}
-        {isActive || isActivating ? (
-            <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
-            </div>
-          ) : (
-            <Tooltip content="Microphone settings" side="top" sideOffset={8}>
-              <button
-                type="button"
-                onClick={() => setPickerOpen(!pickerOpen)}
-                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
-              >
-                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
-              </button>
-            </Tooltip>
-          )
-        }
+        <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+          dictationExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+        }`}>
+          {isActive || isActivating ? (
+              <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+              </div>
+            ) : (
+              <Tooltip content="Microphone settings" side="top" sideOffset={8}>
+                <button
+                  type="button"
+                  onClick={() => setPickerOpen(!pickerOpen)}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+                >
+                  <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
+                </button>
+              </Tooltip>
+            )
+          }
+        </div>
 
         {/* Right segment: mic button */}
         <Tooltip
@@ -2032,19 +2094,22 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       {/* Device picker popover — toggled by chevron button */}
       {pickerOpen && (
         <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[300px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
-          {/* Level indicator bar */}
+          {/* Input device header with level indicator */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
-            <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <MicIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide shrink-0">Input Device</span>
             <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
-              <div
-                className="h-full rounded-full bg-primary transition-all duration-75"
-                style={{ width: `${Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500))}%` }}
-              />
+              {(() => {
+                const pct = Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500));
+                const barColor = pct > 60 ? '#22c55e' : pct > 20 ? '#eab308' : '#6b7280';
+                return (
+                  <div
+                    className="h-full rounded-full transition-all duration-75"
+                    style={{ width: `${pct}%`, backgroundColor: barColor }}
+                  />
+                );
+              })()}
             </div>
-          </div>
-
-          <div className="px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
-            Input Device
           </div>
 
           <div className="max-h-[280px] overflow-y-auto space-y-0.5">
@@ -2074,10 +2139,11 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
           </div>
 
           {/* Hold to record toggle */}
-          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-1 px-2 py-2">
+          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+          <div className="flex items-center justify-between px-3 py-2">
             <div className="flex items-center gap-2">
-              <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-xs text-foreground">Hold to record</span>
+              <PointerIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Hold to record</span>
             </div>
             <button
               type="button"
@@ -2204,7 +2270,23 @@ const Composer: FC<{
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  const [cwdPopoverOpen, setCwdPopoverOpen] = useState(false);
+  const cwdRootRef = useRef<HTMLDivElement>(null);
+  const cwdPopover = usePopoverAlign();
+  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({ popoverOpen: cwdPopoverOpen });
   const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
+
+  // Close CWD popover on outside click
+  useEffect(() => {
+    if (!cwdPopoverOpen) return;
+    const handler = (e: PointerEvent) => {
+      if (!cwdRootRef.current?.contains(e.target as Node)) {
+        setCwdPopoverOpen(false);
+      }
+    };
+    window.addEventListener('pointerdown', handler);
+    return () => window.removeEventListener('pointerdown', handler);
+  }, [cwdPopoverOpen]);
 
   const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
@@ -2328,7 +2410,7 @@ const Composer: FC<{
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   return (
-    <div className="relative z-20 border-t border-border/70 bg-background/88 px-3 pb-3 pt-3 backdrop-blur-md md:px-6 md:pb-6 md:pt-4">
+    <div className="relative z-20 bg-gradient-to-t from-background from-85% to-transparent px-3 pb-3 pt-4 md:px-6 md:pb-6 md:pt-5">
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input
@@ -2428,54 +2510,27 @@ const Composer: FC<{
               </>
             ) : (
               <>
-                {currentWorkingDirectory && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-border/60 bg-muted/25 px-3 py-2 text-[11px]">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <FolderOpenIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <span className="shrink-0 font-medium text-foreground/90">Working Dir</span>
-                      <span className="shrink-0 text-muted-foreground">/</span>
-                      <span className="max-w-[360px] truncate text-muted-foreground" title={currentWorkingDirectory}>
-                        {currentWorkingDirectory}
-                      </span>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1">
-                      <span className="max-w-[120px] truncate text-[10px] text-foreground/80" title={cwdName ?? undefined}>
-                        {cwdName}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => { void setCurrentWorkingDirectory(null); }}
-                        className="rounded-md p-1 transition-colors hover:bg-destructive/10"
-                        title="Clear current working directory"
-                      >
-                        <XIcon className="h-3 w-3 text-muted-foreground" />
-                      </button>
-                    </div>
-                  </div>
-                )}
                 <ComposerInput
                   placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : __BRAND_COMPOSER_PLACEHOLDER}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
-                <div className="flex items-center justify-between gap-2 md:gap-3">
-                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 md:gap-2">
+                <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5 md:gap-2">
                     <DropdownMenu.Root>
-                      <DropdownMenu.Trigger asChild>
-                        <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">
-                          <PlusIcon className="h-4 w-4 text-muted-foreground" />
-                        </button>
-                      </DropdownMenu.Trigger>
+                      <Tooltip content="Add files" side="top" sideOffset={8}>
+                        <DropdownMenu.Trigger asChild>
+                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors hover:bg-muted/50 text-muted-foreground">
+                            <PlusIcon className="h-4 w-4" />
+                          </button>
+                        </DropdownMenu.Trigger>
+                      </Tooltip>
                       <DropdownMenu.Portal>
                         <DropdownMenu.Content
                           align="start"
                           sideOffset={8}
                           className="z-50 min-w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                         >
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachDirectory(); }}>
-                            <FolderOpenIcon className="h-4 w-4 text-muted-foreground" />
-                            <span>Working Directory</span>
-                          </DropdownMenu.Item>
                           <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }]); }}>
                             <ImageIcon className="h-4 w-4 text-muted-foreground" />
                             <span>Image</span>
@@ -2496,7 +2551,70 @@ const Composer: FC<{
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
+                    {/* Working directory split button */}
+                    <div ref={cwdRootRef} {...cwdContainerProps} className="relative flex items-center">
+                      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+                        currentWorkingDirectory
+                          ? 'border-primary/50 bg-primary/10'
+                          : 'border-border/70 bg-card/70'
+                      }`}>
+                        {/* Left segment: folder icon — opens picker */}
+                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Set working directory'} side="top" sideOffset={8}>
+                          <button
+                            type="button"
+                            onClick={() => { void handleAttachDirectory(); }}
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+                              currentWorkingDirectory
+                                ? 'hover:bg-primary/15 text-primary'
+                                : 'hover:bg-muted/50 text-muted-foreground'
+                            }`}
+                          >
+                            <FolderOpenIcon className="h-4 w-4" />
+                          </button>
+                        </Tooltip>
+                        {/* Right segment: chevron — opens CWD popover (only when set) */}
+                        {currentWorkingDirectory && (
+                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+                            cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+                          }`}>
+                            <Tooltip content="Directory settings" side="top" sideOffset={8}>
+                              <button
+                                type="button"
+                                onClick={() => setCwdPopoverOpen((o) => !o)}
+                                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
+                              >
+                                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
+                              </button>
+                            </Tooltip>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* CWD popover */}
+                      {cwdPopoverOpen && currentWorkingDirectory && (
+                        <div ref={cwdPopover.ref} style={cwdPopover.style} className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+                          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                            <FolderOpenIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Working Directory</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>{cwdName}</p>
+                            <p className="mt-0.5 text-[10px] text-muted-foreground truncate" title={currentWorkingDirectory}>{currentWorkingDirectory}</p>
+                          </div>
+                          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+                          <button
+                            type="button"
+                            onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                            className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                          >
+                            <XIcon className="h-3.5 w-3.5" />
+                            <span>Clear directory</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
+                  <div className="flex items-center gap-1.5 md:gap-2">
                   <ModelSettingsButton
                     selectedModelKey={selectedModelKey}
                     onSelectModel={onSelectModel}
@@ -2508,8 +2626,6 @@ const Composer: FC<{
                     onToggleAgentSdk={onToggleAgentSdk}
                     selectedProfileKey={selectedProfileKey}
                     onSelectProfile={onSelectProfile}
-                  />
-                  <PlanModeButton
                     executionMode={executionMode}
                     onChangeExecutionMode={onChangeExecutionMode}
                   />
@@ -2550,6 +2666,7 @@ const Composer: FC<{
                   <ThreadPrimitive.If running>
                     <StopButton />
                   </ThreadPrimitive.If>
+                  </div>
                 </div>
               </>
             )}
