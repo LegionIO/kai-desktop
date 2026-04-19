@@ -46,6 +46,7 @@ import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
+import { backgrounds } from '@/components/backgrounds';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
@@ -71,7 +72,6 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
-const MATRIX_GLYPHS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*+-/~{[|`]}<>01';
 
 export type ThreadMode = 'chat' | 'computer';
 
@@ -435,714 +435,94 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   );
 };
 
-/** Build-time-configured background for the empty thread state */
-const EmptyThreadBackground: FC = () => {
-  const background = __BRAND_THEME_BACKGROUND || 'matrix-rain';
+/** Track last background to avoid repeats */
+let lastBackgroundIndex = -1;
 
-  if (background === 'none') return null;
-  if (background === 'gradient') return <GradientBackground />;
-  if (background === 'constellation') return <ConstellationBackground />;
-  return <MatrixRainBackground />;
+function pickBackground(): FC {
+  const available = backgrounds.length > 1
+    ? backgrounds.filter((_, i) => i !== lastBackgroundIndex)
+    : backgrounds;
+  const idx = Math.floor(Math.random() * available.length);
+  lastBackgroundIndex = backgrounds.indexOf(available[idx]);
+  return available[idx];
+}
+
+/** Randomly selected background for the empty thread state (never repeats consecutively) */
+const EmptyThreadBackground: FC = () => {
+  const [Background, setBackground] = useState<FC>(() => pickBackground());
+
+  // Pick a new background each time a new thread is created
+  useEffect(() => {
+    const handler = () => {
+      const next = pickBackground();
+      setBackground(() => next);
+    };
+    window.addEventListener('new-thread-created', handler);
+    return () => window.removeEventListener('new-thread-created', handler);
+  }, []);
+
+  return <Background />;
 };
 
 /**
- * Wrapper that keeps the splash visible while the thread is empty,
- * then fades it out over 600ms when the first message is sent.
+ * Wrapper that fades the splash IN when the thread is empty,
+ * then fades it OUT over 300ms when the first message is sent.
  */
 const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
   const threadRuntime = useThreadRuntime();
   const [visible, setVisible] = useState(true);
-  const [fading, setFading] = useState(false);
+  const [fadingOut, setFadingOut] = useState(false);
+  const [fadedIn, setFadedIn] = useState(false);
 
   // Reset when switching to a different thread
   useEffect(() => {
     const msgs = threadRuntime.getState().messages;
     if (msgs.length === 0) {
       setVisible(true);
-      setFading(false);
+      setFadingOut(false);
+      setFadedIn(false);
+      // Trigger fade-in on next frame
+      requestAnimationFrame(() => setFadedIn(true));
     } else {
       setVisible(false);
-      setFading(true);
+      setFadingOut(true);
     }
   }, [threadRuntime]);
 
   useEffect(() => {
     return threadRuntime.subscribe(() => {
       const msgs = threadRuntime.getState().messages;
-      if (msgs.length > 0 && !fading) {
-        setFading(true);
+      if (msgs.length > 0 && !fadingOut) {
+        setFadingOut(true);
       } else if (msgs.length === 0) {
         setVisible(true);
-        setFading(false);
+        setFadingOut(false);
+        setFadedIn(false);
+        requestAnimationFrame(() => setFadedIn(true));
       }
     });
-  }, [threadRuntime, fading]);
+  }, [threadRuntime, fadingOut]);
 
   useEffect(() => {
-    if (!fading) return;
-    const timer = setTimeout(() => setVisible(false), 600);
+    if (!fadingOut) return;
+    const timer = setTimeout(() => setVisible(false), 300);
     return () => clearTimeout(timer);
-  }, [fading]);
+  }, [fadingOut]);
 
   if (!visible) return null;
 
   return (
     <div
-      className="absolute inset-0 z-10 transition-opacity duration-[600ms] ease-out"
-      style={{ opacity: fading ? 0 : 1 }}
+      className="absolute inset-0 z-10 transition-opacity ease-out"
+      style={{
+        opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
+        transitionDuration: fadingOut ? '300ms' : '500ms',
+      }}
     >
       {children}
     </div>
   );
 };
-
-/** Subtle radial gradient alternative to the matrix rain */
-const GradientBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse 70% 50% at 50% 30%, var(--app-shell-glow), transparent)' }} />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at 30% 70%, var(--brand-accent-subtle), transparent 50%)' }} />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-  </div>
-);
-
-const MatrixRainBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <canvas ref={useMatrixCanvas()} className="absolute inset-0 h-full w-full opacity-45" />
-    <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-    <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
-    <div className="absolute inset-y-0 right-0 w-28 bg-gradient-to-l from-background via-background/85 to-transparent" />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at center, var(--brand-accent-subtle), transparent 58%)' }} />
-  </div>
-);
-
-function useMatrixCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const context = canvas.getContext('2d');
-    if (!context) return;
-
-    let frameId = 0;
-    let animationFrame = 0;
-    let drops: number[] = [];
-    let columnCount = 0;
-    const fontSize = 14;
-
-    const setup = () => {
-      const parent = canvas.parentElement;
-      const width = parent?.clientWidth ?? window.innerWidth;
-      const height = parent?.clientHeight ?? window.innerHeight;
-      const devicePixelRatio = window.devicePixelRatio || 1;
-
-      canvas.width = Math.floor(width * devicePixelRatio);
-      canvas.height = Math.floor(height * devicePixelRatio);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.scale(devicePixelRatio, devicePixelRatio);
-
-      columnCount = Math.ceil(width / fontSize);
-      drops = Array.from({ length: columnCount }, () => 1);
-    };
-
-    const draw = () => {
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      const styles = getComputedStyle(document.documentElement);
-
-      context.fillStyle = styles.getPropertyValue('--app-matrix-fade').trim() || 'rgba(10, 10, 10, 0.08)';
-      context.fillRect(0, 0, width, height);
-
-      context.fillStyle = styles.getPropertyValue('--app-matrix-glyph').trim() || 'rgba(160, 160, 160, 0.7)';
-      context.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
-
-      for (let index = 0; index < drops.length; index += 1) {
-        const glyph = MATRIX_GLYPHS[Math.floor(Math.random() * MATRIX_GLYPHS.length)];
-        const x = index * fontSize;
-        const y = drops[index] * fontSize;
-
-        context.fillText(glyph, x, y);
-
-        if (y > height && Math.random() > 0.975) {
-          drops[index] = 0;
-        }
-
-        drops[index] += 1;
-      }
-
-      // Punch a soft radial hole in the center for the wordmark
-      const cx = width / 2;
-      const cy = height / 2;
-      const rx = width * 0.22;
-      const ry = height * 0.14;
-      const r = Math.max(rx, ry);
-      context.save();
-      context.globalCompositeOperation = 'destination-out';
-      const hole = context.createRadialGradient(cx, cy, 0, cx, cy, r);
-      hole.addColorStop(0, 'rgba(0,0,0,1)');
-      hole.addColorStop(0.55, 'rgba(0,0,0,0.9)');
-      hole.addColorStop(1, 'rgba(0,0,0,0)');
-      context.beginPath();
-      context.ellipse(cx, cy, rx * 1.3, ry * 1.3, 0, 0, Math.PI * 2);
-      context.fillStyle = hole;
-      context.fill();
-      context.restore();
-
-      frameId = window.setTimeout(() => {
-        animationFrame = window.requestAnimationFrame(draw);
-      }, 130);
-    };
-
-    const stop = () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
-    };
-
-    const start = () => {
-      stop();
-      draw();
-    };
-
-    setup();
-    start();
-
-    const handleResize = () => { stop(); setup(); start(); };
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') stop(); else start();
-    };
-    const handleBlur = () => stop();
-    const handleFocus = () => start();
-
-    window.addEventListener('resize', handleResize);
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      stop();
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
-    };
-  }, []);
-
-  return canvasRef;
-}
-
-const ConstellationBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <canvas ref={useConstellationCanvas()} className="absolute inset-0 h-full w-full" />
-    <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-    <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
-    <div className="absolute inset-y-0 right-0 w-28 bg-gradient-to-l from-background via-background/85 to-transparent" />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at center, var(--brand-accent-subtle), transparent 58%)' }} />
-  </div>
-);
-
-interface Particle {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  radius: number;
-  opacity: number;
-  /** false = background star (twinkles, never connects) */
-  connectable: boolean;
-  /** Number of spikes on the star shape (3–6) */
-  spikes: number;
-  /** Rotation angle in radians — slowly drifts */
-  rotation: number;
-  /** Twinkle phase offset (radians) — used for blinking stars */
-  twinklePhase: number;
-  /** Ticks until next random velocity nudge */
-  nudgeCountdown: number;
-}
-
-/** Draw a spiked star: prominent circle body with thin needle spikes protruding outward */
-function drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, spikes: number, size: number, rotation: number) {
-  const bodyRadius = size * 0.7;
-  const spikeLength = size * 1.8;
-  const spikeHalfWidth = Math.PI * 0.06; /* narrow spike base */
-
-  /* Draw circle body */
-  ctx.beginPath();
-  ctx.arc(cx, cy, bodyRadius, 0, Math.PI * 2);
-  ctx.fill();
-
-  /* Draw each spike as a thin triangle from the circle edge outward */
-  for (let i = 0; i < spikes; i += 1) {
-    const angle = rotation + (i * Math.PI * 2) / spikes;
-    const tipX = cx + Math.cos(angle) * spikeLength;
-    const tipY = cy + Math.sin(angle) * spikeLength;
-    const baseX1 = cx + Math.cos(angle - spikeHalfWidth) * bodyRadius;
-    const baseY1 = cy + Math.sin(angle - spikeHalfWidth) * bodyRadius;
-    const baseX2 = cx + Math.cos(angle + spikeHalfWidth) * bodyRadius;
-    const baseY2 = cy + Math.sin(angle + spikeHalfWidth) * bodyRadius;
-
-    ctx.beginPath();
-    ctx.moveTo(baseX1, baseY1);
-    ctx.lineTo(tipX, tipY);
-    ctx.lineTo(baseX2, baseY2);
-    ctx.closePath();
-    ctx.fill();
-  }
-}
-
-function useConstellationCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const context = canvas.getContext('2d');
-    if (!context) return;
-
-    let frameId = 0;
-    let animationFrame = 0;
-    let particles: Particle[] = [];
-    let tick = 0;
-
-    const nodeCount = 35;
-    const starCount = 1200;
-    const totalCount = nodeCount + starCount;
-    const connectionDistance = 160;
-    const maxConnectionsPerNode = 3;
-    const nodeSpeed = 0.35;
-    const starSpeed = 0.06;
-
-    /**
-     * Persistent connection state. Keys are "i:j" (lower index first).
-     * `strength` lerps toward 1 when in range, toward 0 when out of range.
-     * Connections are removed once strength drops below 0.02.
-     */
-    const connections = new Map<string, { strength: number }>();
-    const fadeInRate = 0.04;   /* frames to reach full opacity: ~25 */
-    const fadeOutRate = 0.02;  /* frames to disappear: ~50 */
-
-    /** Shooting star state */
-    interface ShootingStar {
-      x: number; y: number;
-      vx: number; vy: number;
-      life: number;      /* frames remaining */
-      maxLife: number;    /* total lifespan */
-      tailLength: number; /* px */
-    }
-    let shootingStar: ShootingStar | null = null;
-    const shootingStarChance = 0.003; /* ~0.3% per frame ≈ one every ~20s */
-    const shootingStarFrames = 38;    /* ~2.5s at 65ms/frame */
-
-    const makeParticle = (width: number, height: number, connectable: boolean): Particle => ({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      vx: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
-      vy: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
-      radius: connectable ? 2.5 + Math.random() * 2.5 : 1.2 + Math.random() * 2,
-      opacity: connectable ? 0.6 + Math.random() * 0.35 : 0.3 + Math.random() * 0.6,
-      connectable,
-      spikes: 3 + Math.floor(Math.random() * 4),
-      rotation: Math.random() * Math.PI * 2,
-      twinklePhase: Math.random() * Math.PI * 2,
-      nudgeCountdown: 60 + Math.floor(Math.random() * 200),
-    });
-
-    let prevWidth = 0;
-    let prevHeight = 0;
-
-    const setup = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
-      const dpr = window.devicePixelRatio || 1;
-
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.scale(dpr, dpr);
-
-      // When the canvas grows, rescale existing particle positions so they
-      // spread across the full area instead of staying clumped in the old region.
-      if (prevWidth > 0 && prevHeight > 0 && (width > prevWidth || height > prevHeight)) {
-        const sx = width / prevWidth;
-        const sy = height / prevHeight;
-        for (const p of particles) {
-          p.x *= sx;
-          p.y *= sy;
-        }
-      }
-
-      prevWidth = width;
-      prevHeight = height;
-
-      const kept = particles.filter(
-        (p) => p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height,
-      );
-      const keptNodes = kept.filter((p) => p.connectable);
-      const keptStars = kept.filter((p) => !p.connectable);
-
-      const freshNodes = Array.from(
-        { length: Math.max(0, nodeCount - keptNodes.length) },
-        () => makeParticle(width, height, true),
-      );
-      const freshStars = Array.from(
-        { length: Math.max(0, starCount - keptStars.length) },
-        () => makeParticle(width, height, false),
-      );
-
-      particles = [...keptNodes, ...freshNodes, ...keptStars, ...freshStars];
-    };
-
-    const draw = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
-      const dpr = window.devicePixelRatio || 1;
-
-      /* If the container grew beyond the canvas buffer, resize immediately
-         so the full area is rendered without waiting for a resize event. */
-      const needW = Math.floor(width * dpr);
-      const needH = Math.floor(height * dpr);
-      if (canvas.width < needW || canvas.height < needH) {
-        canvas.width = needW;
-        canvas.height = needH;
-        canvas.style.width = `${width}px`;
-        canvas.style.height = `${height}px`;
-        context.setTransform(1, 0, 0, 1, 0, 0);
-        context.scale(dpr, dpr);
-      }
-
-      const styles = getComputedStyle(document.documentElement);
-      tick += 1;
-
-      const dotColor = styles.getPropertyValue('--app-constellation-dot').trim() || 'rgba(160, 160, 160, 0.5)';
-      const lineColor = styles.getPropertyValue('--app-constellation-line').trim() || 'rgba(160, 160, 160, 0.18)';
-
-      /* Clear frame completely — no motion trails */
-      context.globalAlpha = 1;
-      context.clearRect(0, 0, width, height);
-
-      /* Update positions + nudge velocities for organic movement */
-      for (const p of particles) {
-        p.x += p.vx;
-        p.y += p.vy;
-
-        if (p.x < 0 || p.x > width) p.vx *= -1;
-        if (p.y < 0 || p.y > height) p.vy *= -1;
-        p.x = Math.max(0, Math.min(width, p.x));
-        p.y = Math.max(0, Math.min(height, p.y));
-
-        /* Random velocity nudges — keeps constellations reshaping */
-        p.nudgeCountdown -= 1;
-        if (p.nudgeCountdown <= 0) {
-          const cap = p.connectable ? nodeSpeed : starSpeed;
-          p.vx += (Math.random() - 0.5) * cap * 1.2;
-          p.vy += (Math.random() - 0.5) * cap * 1.2;
-          /* Clamp speed */
-          const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
-          if (speed > cap) {
-            p.vx = (p.vx / speed) * cap;
-            p.vy = (p.vy / speed) * cap;
-          }
-          p.nudgeCountdown = 60 + Math.floor(Math.random() * 200);
-        }
-
-        /* Slow rotation drift */
-        p.rotation += p.connectable ? 0.003 : 0.006;
-
-        /* Randomly promote stars to connectors or demote connectors to stars.
-           ~0.1% chance per frame keeps the network evolving unpredictably. */
-        if (Math.random() < 0.001) {
-          p.connectable = !p.connectable;
-          if (p.connectable) {
-            /* Promoted: grow slightly, speed up */
-            p.radius = 2.5 + Math.random() * 2.5;
-            const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy) || 0.01;
-            const scale = nodeSpeed / Math.max(speed, 0.01);
-            p.vx *= scale;
-            p.vy *= scale;
-          } else {
-            /* Demoted: shrink, slow down */
-            p.radius = 1.2 + Math.random() * 2;
-            p.vx *= 0.2;
-            p.vy *= 0.2;
-          }
-        }
-      }
-
-      /* ── Update persistent connections ──────────────────────────────────
-         Build a set of in-range pairs, fade existing connections in/out,
-         and probabilistically form new ones. */
-      const inRangePairs = new Set<string>();
-      const connectionCounts = new Uint8Array(totalCount);
-
-      /* Count existing strong connections toward the cap */
-      for (const [key, conn] of connections) {
-        if (conn.strength < 0.3) continue;
-        const [a, b] = key.split(':').map(Number);
-        connectionCounts[a] += 1;
-        connectionCounts[b] += 1;
-      }
-
-      for (let i = 0; i < particles.length; i += 1) {
-        if (connectionCounts[i] >= maxConnectionsPerNode) continue;
-
-        for (let j = i + 1; j < particles.length; j += 1) {
-          if (connectionCounts[j] >= maxConnectionsPerNode) continue;
-          if (!particles[i].connectable && !particles[j].connectable) continue;
-
-          const dx = particles[i].x - particles[j].x;
-          const dy = particles[i].y - particles[j].y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          if (dist < connectionDistance) {
-            const key = `${i}:${j}`;
-            inRangePairs.add(key);
-
-            if (!connections.has(key)) {
-              /* New connection — probabilistic formation */
-              const proximity = 1 - dist / connectionDistance;
-              let chance = 0.008 + proximity * 0.015; /* slow: ~1-2% per frame */
-              if (!particles[i].connectable || !particles[j].connectable) chance *= 0.5;
-              if (Math.random() < chance) {
-                connections.set(key, { strength: 0.05 });
-                connectionCounts[i] += 1;
-                connectionCounts[j] += 1;
-              }
-            }
-          }
-        }
-      }
-
-      /* Fade connections in/out, detect loops, and draw */
-
-      /* First pass: build adjacency from strong connections for loop detection */
-      const neighbors = new Map<number, Set<number>>();
-      const activeEdges: Array<{ key: string; conn: { strength: number }; a: number; b: number }> = [];
-
-      for (const [key, conn] of connections) {
-        if (inRangePairs.has(key)) {
-          conn.strength = Math.min(1, conn.strength + fadeInRate);
-        } else {
-          conn.strength -= fadeOutRate;
-        }
-
-        if (conn.strength <= 0.02) {
-          connections.delete(key);
-          continue;
-        }
-
-        const [a, b] = key.split(':').map(Number);
-        if (!particles[a] || !particles[b]) { connections.delete(key); continue; }
-
-        activeEdges.push({ key, conn, a, b });
-
-        if (conn.strength > 0.3) {
-          if (!neighbors.has(a)) neighbors.set(a, new Set());
-          if (!neighbors.has(b)) neighbors.set(b, new Set());
-          neighbors.get(a)!.add(b);
-          neighbors.get(b)!.add(a);
-        }
-      }
-
-      /* Detect edges that are part of a triangle (3-node loop) */
-      const loopEdges = new Set<string>();
-      for (const { key, a, b } of activeEdges) {
-        const aN = neighbors.get(a);
-        const bN = neighbors.get(b);
-        if (!aN || !bN) continue;
-        /* If a and b share a common neighbor, this edge is part of a triangle */
-        for (const n of aN) {
-          if (n !== b && bN.has(n)) {
-            loopEdges.add(key);
-            /* Also mark the other two edges of the triangle */
-            const minAn = Math.min(a, n);
-            const maxAn = Math.max(a, n);
-            const minBn = Math.min(b, n);
-            const maxBn = Math.max(b, n);
-            loopEdges.add(`${minAn}:${maxAn}`);
-            loopEdges.add(`${minBn}:${maxBn}`);
-            break;
-          }
-        }
-      }
-
-      /* Draw edges */
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.08); /* slow pulsate for loop edges */
-      for (const { key, conn, a, b } of activeEdges) {
-        const pi = particles[a];
-        const pj = particles[b];
-        const dx = pi.x - pj.x;
-        const dy = pi.y - pj.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const distAlpha = dist < connectionDistance ? 1 - dist / connectionDistance : 0.3;
-        const isLoop = loopEdges.has(key);
-
-        context.globalAlpha = conn.strength * distAlpha * (isLoop ? pulse : 1);
-        context.strokeStyle = lineColor;
-        context.lineWidth = isLoop ? 2 : 1.2;
-        context.beginPath();
-        context.moveTo(pi.x, pi.y);
-        context.lineTo(pj.x, pj.y);
-        context.stroke();
-      }
-
-      /* Draw all particles as star shapes */
-      context.fillStyle = dotColor;
-      for (const p of particles) {
-        let alpha = p.opacity;
-
-        if (!p.connectable) {
-          /* Stars twinkle with a slow sine wave */
-          const twinkle = Math.sin(tick * 0.04 + p.twinklePhase);
-          alpha = p.opacity * (0.3 + 0.7 * ((twinkle + 1) / 2));
-        }
-
-        context.globalAlpha = alpha;
-        drawStar(context, p.x, p.y, p.spikes, p.radius, p.rotation);
-        context.fill();
-      }
-
-      /* ── Shooting star ──────────────────────────────────────────────────
-         Randomly spawns from a random edge, streaks across at a random
-         angle, fades in then out over ~2.5s, then disappears. */
-      if (!shootingStar && Math.random() < shootingStarChance) {
-        const edge = Math.floor(Math.random() * 4); /* 0=top 1=right 2=bottom 3=left */
-        let sx: number, sy: number;
-        if (edge === 0)      { sx = Math.random() * width;  sy = 0; }
-        else if (edge === 1) { sx = width;                   sy = Math.random() * height; }
-        else if (edge === 2) { sx = Math.random() * width;  sy = height; }
-        else                 { sx = 0;                       sy = Math.random() * height; }
-
-        /* Aim roughly toward center with some randomness */
-        const targetX = width * (0.3 + Math.random() * 0.4);
-        const targetY = height * (0.3 + Math.random() * 0.4);
-        const angle = Math.atan2(targetY - sy, targetX - sx) + (Math.random() - 0.5) * 0.6;
-        const speed = 12 + Math.random() * 8; /* fast! */
-
-        shootingStar = {
-          x: sx, y: sy,
-          vx: Math.cos(angle) * speed,
-          vy: Math.sin(angle) * speed,
-          life: shootingStarFrames,
-          maxLife: shootingStarFrames,
-          tailLength: 60 + Math.random() * 40,
-        };
-      }
-
-      if (shootingStar) {
-        const s = shootingStar;
-        s.x += s.vx;
-        s.y += s.vy;
-        s.life -= 1;
-
-        /* Fade in for first 20%, full brightness middle 60%, fade out last 20% */
-        const progress = 1 - s.life / s.maxLife;
-        let alpha: number;
-        if (progress < 0.2) alpha = progress / 0.2;
-        else if (progress > 0.8) alpha = (1 - progress) / 0.2;
-        else alpha = 1;
-
-        /* Draw tail (gradient line from current pos backward along velocity) */
-        const tailX = s.x - (s.vx / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
-        const tailY = s.y - (s.vy / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
-
-        const grad = context.createLinearGradient(tailX, tailY, s.x, s.y);
-        grad.addColorStop(0, 'transparent');
-        grad.addColorStop(1, dotColor);
-
-        context.globalAlpha = alpha * 0.9;
-        context.strokeStyle = grad;
-        context.lineWidth = 2;
-        context.beginPath();
-        context.moveTo(tailX, tailY);
-        context.lineTo(s.x, s.y);
-        context.stroke();
-
-        /* Bright head dot */
-        context.globalAlpha = alpha;
-        context.fillStyle = dotColor;
-        context.beginPath();
-        context.arc(s.x, s.y, 2.5, 0, Math.PI * 2);
-        context.fill();
-
-        /* Remove when expired or off-screen */
-        if (s.life <= 0 || s.x < -100 || s.x > width + 100 || s.y < -100 || s.y > height + 100) {
-          shootingStar = null;
-        }
-      }
-
-      context.globalAlpha = 1;
-
-      frameId = window.setTimeout(() => {
-        animationFrame = window.requestAnimationFrame(draw);
-      }, 130);
-    };
-
-    const stop = () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
-    };
-
-    const start = () => {
-      stop();
-      draw();
-    };
-
-    setup();
-    start();
-
-    const handleResize = () => { stop(); setup(); start(); };
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') stop(); else start();
-    };
-    const handleBlur = () => stop();
-    const handleFocus = () => start();
-
-    // Use ResizeObserver on the container so the canvas is correctly sized
-    // on first layout (Electron may render before the window is fully sized).
-    const container = canvas.parentElement;
-    let ro: ResizeObserver | undefined;
-    if (container) {
-      ro = new ResizeObserver(handleResize);
-      ro.observe(container);
-    }
-
-    window.addEventListener('resize', handleResize);
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      stop();
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
-      ro?.disconnect();
-    };
-  }, []);
-
-  return canvasRef;
-}
 
 const UserMessage: FC = () => {
   const message = useMessage();

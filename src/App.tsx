@@ -672,6 +672,7 @@ function AppShell() {
       setActiveView(CHAT_VIEW);
       setActiveConversationId(newId);
       setActiveConversationTitle('Untitled Thread');
+      window.dispatchEvent(new CustomEvent('new-thread-created'));
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);

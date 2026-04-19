@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/postcss';
 import autoprefixer from 'autoprefixer';
 import { branding } from './branding.config';
+import { resolveBranding } from './scripts/resolve-branding';
 import pkg from './package.json';
 
 // ---------------------------------------------------------------------------
@@ -18,8 +19,9 @@ function camelToScreamingSnake(s: string): string {
   return s.replace(/([A-Z])/g, '_$1').toUpperCase();
 }
 
+const resolved = resolveBranding(branding);
 const brandDefines: Record<string, string> = {};
-for (const [key, value] of Object.entries(branding)) {
+for (const [key, value] of Object.entries(resolved)) {
   brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
 }
 brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
