@@ -745,6 +745,67 @@ if (gotSingleInstanceLock) {
       return { canceled: false, filePaths: files };
     });
 
+    // Read file contents (capped at 100KB)
+    ipcMain.handle('fs:read-file', async (_event, filePath: string) => {
+      const fsPromises = await import('node:fs/promises');
+      try {
+        const content = await fsPromises.readFile(filePath, 'utf-8');
+        return { content: content.slice(0, 100000) }; // limit to 100KB
+      } catch (err) {
+        return { error: (err as Error).message };
+      }
+    });
+
+    // Git worktree management
+    ipcMain.handle('git:list-worktrees', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath });
+        const worktrees: Array<{ path: string; branch: string; head: string }> = [];
+        let current: Record<string, string> = {};
+        for (const line of stdout.split('\n')) {
+          if (line.startsWith('worktree ')) current.path = line.slice(9);
+          else if (line.startsWith('HEAD ')) current.head = line.slice(5);
+          else if (line.startsWith('branch ')) current.branch = line.slice(7).replace('refs/heads/', '');
+          else if (line === '') {
+            if (current.path) worktrees.push({ path: current.path, branch: current.branch ?? 'detached', head: current.head ?? '' });
+            current = {};
+          }
+        }
+        return { worktrees };
+      } catch (err) {
+        return { worktrees: [], error: (err as Error).message };
+      }
+    });
+
+    ipcMain.handle('git:create-worktree', async (_event, projectPath: string, branchName: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const path = await import('node:path');
+      const exec = promisify(execFile);
+      try {
+        const worktreePath = path.join(projectPath, '.worktrees', branchName);
+        await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: projectPath });
+        return { path: worktreePath, branch: branchName };
+      } catch (err) {
+        return { error: (err as Error).message };
+      }
+    });
+
+    ipcMain.handle('git:remove-worktree', async (_event, projectPath: string, worktreePath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: projectPath });
+        return { success: true };
+      } catch (err) {
+        return { error: (err as Error).message };
+      }
+    });
+
     // List directory contents on the host (used by web UI directory browser)
     ipcMain.handle('fs:list-directory', (_event, dirPath: string) => {
       try {

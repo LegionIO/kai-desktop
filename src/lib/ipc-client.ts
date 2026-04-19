@@ -178,6 +178,15 @@ type AppAPI = {
     recordEvent: (event: unknown) => Promise<unknown>;
     exportCsv: () => Promise<unknown>;
   };
+  fs: {
+    listDirectory: (dirPath: string) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }>;
+    readFile: (filePath: string) => Promise<{ content?: string; error?: string }>;
+  };
+  git: {
+    listWorktrees: (projectPath: string) => Promise<{ worktrees: Array<{ path: string; branch: string; head: string }>; error?: string }>;
+    createWorktree: (projectPath: string, branchName: string) => Promise<{ path?: string; branch?: string; error?: string }>;
+    removeWorktree: (projectPath: string, worktreePath: string) => Promise<{ success?: boolean; error?: string }>;
+  };
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;
     install: () => Promise<void>;

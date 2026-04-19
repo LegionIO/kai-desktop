@@ -1,12 +1,24 @@
 import { useState, type FC } from 'react';
-import { FileTextIcon, PlusIcon, CopyIcon, CheckIcon } from 'lucide-react';
+import { FileTextIcon, PlusIcon, CopyIcon, CheckIcon, InfoIcon, CalendarIcon } from 'lucide-react';
 import { generateId } from '@/lib/utils';
-import type { ChangelogRelease } from '../../../shared/workspace-types';
+import { useWorkspace } from '@/providers/WorkspaceProvider';
+import type { ChangelogRelease, ChangelogChange } from '../../../shared/workspace-types';
 import { ChangelogEntry } from './ChangelogEntry';
 
-/* ── Sample release generation ──────────────────────────── */
+/* ── Date formatting ───────────────────────────────────────── */
 
-function generateSampleRelease(): ChangelogRelease {
+function formatDate(date: Date): string {
+  return date.toLocaleDateString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+}
+
+/* ── Sample release generation (fallback) ──────────────────── */
+
+function generateFallbackRelease(projectName: string): ChangelogRelease {
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
 
@@ -14,9 +26,9 @@ function generateSampleRelease(): ChangelogRelease {
     id: generateId(),
     version: `1.${now.getMonth()}.${now.getDate()}`,
     date: dateStr,
-    summary: 'Workspace engine improvements and bug fixes from completed tasks.',
+    summary: `Workspace engine improvements and bug fixes for ${projectName} from completed tasks.`,
     changes: [
-      { type: 'added', description: 'Ideation engine with AI-powered code improvement suggestions' },
+      { type: 'added', description: `Ideation engine with AI-powered code improvement suggestions for ${projectName}` },
       { type: 'added', description: 'Worktree management panel for isolated branch workflows' },
       { type: 'changed', description: 'Kanban board cards now display progress bars for in-flight tasks' },
       { type: 'changed', description: 'Plugin settings use tabbed layout for better organization' },
@@ -30,11 +42,53 @@ function generateSampleRelease(): ChangelogRelease {
 /* ── Component ──────────────────────────────────────────── */
 
 export const ChangelogView: FC = () => {
+  const { project, tasks } = useWorkspace();
+  const projectName = project?.name ?? 'this project';
+
   const [releases, setReleases] = useState<ChangelogRelease[]>([]);
   const [copied, setCopied] = useState(false);
 
   const handleGenerate = () => {
-    setReleases((prev) => [generateSampleRelease(), ...prev]);
+    const doneTasks = tasks.filter((t) => t.status === 'done');
+
+    if (doneTasks.length > 0) {
+      // Compile changelog from completed tasks
+      const now = new Date();
+      const dateStr = now.toISOString().split('T')[0];
+      const changes: ChangelogChange[] = doneTasks.map((task) => {
+        // Heuristically categorize based on title keywords
+        let type: ChangelogChange['type'] = 'changed';
+        const title = task.title.toLowerCase();
+        if (title.includes('add') || title.includes('new') || title.includes('create') || title.includes('implement')) {
+          type = 'added';
+        } else if (title.includes('fix') || title.includes('bug') || title.includes('resolve') || title.includes('patch')) {
+          type = 'fixed';
+        } else if (title.includes('remove') || title.includes('delete') || title.includes('deprecate')) {
+          type = 'removed';
+        }
+
+        // Check for origin labels (Feature #14: Cross-Engine Linking)
+        const ideaLabel = task.labels.find((l) => l.startsWith('idea:'));
+        const roadmapLabel = task.labels.find((l) => l.startsWith('roadmap:'));
+        let origin = '';
+        if (ideaLabel) origin = ' (from Ideation)';
+        if (roadmapLabel) origin = ' (from Roadmap)';
+
+        return { type, description: `${task.title}${origin}`, taskId: task.id };
+      });
+
+      const release: ChangelogRelease = {
+        id: generateId(),
+        version: `1.${now.getMonth()}.${now.getDate()}`,
+        date: dateStr,
+        summary: `Release compiled from ${doneTasks.length} completed task${doneTasks.length > 1 ? 's' : ''} in ${projectName}.`,
+        changes,
+      };
+      setReleases((prev) => [release, ...prev]);
+    } else {
+      // No done tasks -- use sample data
+      setReleases((prev) => [generateFallbackRelease(projectName), ...prev]);
+    }
   };
 
   const handleCopy = async () => {
@@ -69,7 +123,19 @@ export const ChangelogView: FC = () => {
     <div className="flex h-full flex-col">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
-        <h2 className="text-sm font-semibold text-foreground">Changelog</h2>
+        <div>
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-semibold text-foreground">Changelog</h2>
+            <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400">
+              <InfoIcon className="h-3 w-3" />
+              AI generation coming soon
+            </span>
+          </div>
+          <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground/50">
+            <CalendarIcon className="h-3 w-3" />
+            {formatDate(new Date())}
+          </div>
+        </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -105,7 +171,9 @@ export const ChangelogView: FC = () => {
                 Generate a changelog from completed tasks
               </p>
               <p className="mt-1 text-xs text-muted-foreground/60">
-                AI will compile release notes from your done tasks.
+                {tasks.filter((t) => t.status === 'done').length > 0
+                  ? `${tasks.filter((t) => t.status === 'done').length} done task(s) will be compiled into release notes.`
+                  : 'Mark tasks as done in the Kanban board, then generate a changelog.'}
               </p>
             </div>
           </div>

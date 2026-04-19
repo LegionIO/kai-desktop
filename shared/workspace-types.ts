@@ -47,6 +47,12 @@ export interface InstalledPlugin extends WorkspacePlugin {
 export type TaskStatus = 'planning' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
+export interface ReviewComment {
+  author: string;
+  content: string;
+  timestamp: number;
+}
+
 export interface WorkspaceTask {
   id: string;
   title: string;
@@ -55,6 +61,7 @@ export interface WorkspaceTask {
   priority: TaskPriority;
   labels: string[];
   linkedPluginData?: Record<string, unknown>;
+  reviewComments?: ReviewComment[];
   createdAt: number;
   updatedAt: number;
 }

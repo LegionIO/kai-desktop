@@ -1,4 +1,4 @@
-import { useState, useMemo, type FC, type ReactNode } from 'react';
+import { useState, useMemo, useCallback, type FC, type ReactNode, type DragEvent } from 'react';
 import { PlusIcon, FileTextIcon, LoaderIcon, BotIcon, EyeIcon, CheckCircle2Icon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
@@ -21,7 +21,7 @@ const COLUMNS: ColumnDef[] = [
   {
     status: 'planning',
     label: 'Planning',
-    accentColor: 'rgb(148 163 184)', // slate-400
+    accentColor: 'rgb(148 163 184)',
     headerTextClass: 'text-slate-300',
     borderClass: 'border-t-slate-400/50',
     emptyIcon: <FileTextIcon className="h-5 w-5 text-slate-500/40" />,
@@ -31,7 +31,7 @@ const COLUMNS: ColumnDef[] = [
   {
     status: 'in_progress',
     label: 'In Progress',
-    accentColor: 'rgb(96 165 250)', // blue-400
+    accentColor: 'rgb(96 165 250)',
     headerTextClass: 'text-blue-400',
     borderClass: 'border-t-blue-500/50',
     emptyIcon: <LoaderIcon className="h-5 w-5 text-blue-500/30 animate-spin" style={{ animationDuration: '3s' }} />,
@@ -41,7 +41,7 @@ const COLUMNS: ColumnDef[] = [
   {
     status: 'ai_review',
     label: 'AI Review',
-    accentColor: 'rgb(168 85 247)', // purple-400
+    accentColor: 'rgb(168 85 247)',
     headerTextClass: 'text-purple-400',
     borderClass: 'border-t-purple-500/50',
     emptyIcon: <BotIcon className="h-5 w-5 text-purple-500/30" />,
@@ -51,7 +51,7 @@ const COLUMNS: ColumnDef[] = [
   {
     status: 'human_review',
     label: 'Human Review',
-    accentColor: 'rgb(251 191 36)', // amber-400
+    accentColor: 'rgb(251 191 36)',
     headerTextClass: 'text-amber-400',
     borderClass: 'border-t-amber-500/50',
     emptyIcon: <EyeIcon className="h-5 w-5 text-amber-500/30" />,
@@ -61,7 +61,7 @@ const COLUMNS: ColumnDef[] = [
   {
     status: 'done',
     label: 'Done',
-    accentColor: 'rgb(52 211 153)', // emerald-400
+    accentColor: 'rgb(52 211 153)',
     headerTextClass: 'text-emerald-400',
     borderClass: 'border-t-emerald-500/50',
     emptyIcon: <CheckCircle2Icon className="h-5 w-5 text-emerald-500/30" />,
@@ -71,8 +71,9 @@ const COLUMNS: ColumnDef[] = [
 ];
 
 export const KanbanBoard: FC = () => {
-  const { tasks, updateTaskStatus, removeTask } = useWorkspace();
+  const { tasks, updateTaskStatus, removeTask, executeTask, reviewTask } = useWorkspace();
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [dragOverColumn, setDragOverColumn] = useState<TaskStatus | null>(null);
 
   const grouped = useMemo(() => {
     const map: Record<TaskStatus, typeof tasks> = {
@@ -87,6 +88,30 @@ export const KanbanBoard: FC = () => {
     }
     return map;
   }, [tasks]);
+
+  const handleDragStart = useCallback((e: DragEvent, taskId: string) => {
+    e.dataTransfer.setData('text/plain', taskId);
+    e.dataTransfer.effectAllowed = 'move';
+  }, []);
+
+  const handleDragOver = useCallback((e: DragEvent, status: TaskStatus) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setDragOverColumn(status);
+  }, []);
+
+  const handleDragLeave = useCallback(() => {
+    setDragOverColumn(null);
+  }, []);
+
+  const handleDrop = useCallback((e: DragEvent, status: TaskStatus) => {
+    e.preventDefault();
+    setDragOverColumn(null);
+    const taskId = e.dataTransfer.getData('text/plain');
+    if (taskId) {
+      updateTaskStatus(taskId, status);
+    }
+  }, [updateTaskStatus]);
 
   return (
     <div className="flex h-full flex-col">
@@ -107,13 +132,18 @@ export const KanbanBoard: FC = () => {
       <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-4">
         {COLUMNS.map((col) => {
           const columnTasks = grouped[col.status];
+          const isDropTarget = dragOverColumn === col.status;
           return (
             <div
               key={col.status}
               className={cn(
-                'flex min-w-[220px] flex-1 flex-col rounded-xl border border-border/40 border-t-2 bg-muted/5',
+                'flex min-w-[220px] flex-1 flex-col rounded-xl border border-t-2 bg-muted/5 transition-colors',
                 col.borderClass,
+                isDropTarget ? 'border-primary/50 bg-primary/5' : 'border-border/40',
               )}
+              onDragOver={(e) => handleDragOver(e, col.status)}
+              onDragLeave={handleDragLeave}
+              onDrop={(e) => handleDrop(e, col.status)}
             >
               {/* Column header */}
               <div className="flex items-center justify-between px-3 py-2.5">
@@ -128,19 +158,30 @@ export const KanbanBoard: FC = () => {
               {/* Cards */}
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
                 {columnTasks.length === 0 ? (
-                  <div className="flex flex-1 flex-col items-center justify-center gap-2 py-12">
+                  <div className={cn(
+                    'flex flex-1 flex-col items-center justify-center gap-2 rounded-lg py-12 transition-colors',
+                    isDropTarget && 'bg-primary/5 border border-dashed border-primary/30',
+                  )}>
                     {col.emptyIcon}
                     <p className="text-[11px] font-medium text-muted-foreground/40">{col.emptyTitle}</p>
                     <p className="text-[10px] text-muted-foreground/25">{col.emptySubtitle}</p>
                   </div>
                 ) : (
                   columnTasks.map((task) => (
-                    <TaskCard
+                    <div
                       key={task.id}
-                      task={task}
-                      onStatusChange={(status) => updateTaskStatus(task.id, status)}
-                      onRemove={() => removeTask(task.id)}
-                    />
+                      draggable
+                      onDragStart={(e) => handleDragStart(e, task.id)}
+                      className="cursor-grab active:cursor-grabbing"
+                    >
+                      <TaskCard
+                        task={task}
+                        onStatusChange={(status) => updateTaskStatus(task.id, status)}
+                        onRemove={() => removeTask(task.id)}
+                        onExecute={() => executeTask(task.id)}
+                        onReview={(approved) => reviewTask(task.id, approved)}
+                      />
+                    </div>
                   ))
                 )}
               </div>

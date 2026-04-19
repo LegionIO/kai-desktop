@@ -1,4 +1,5 @@
 import type { FC } from 'react';
+import { ArrowRightIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { RoadmapFeature, RoadmapPriority } from '../../../shared/workspace-types';
 
@@ -28,16 +29,29 @@ const STATUS_BADGE: Record<RoadmapFeature['status'], { label: string; className:
 
 interface RoadmapFeatureCardProps {
   feature: RoadmapFeature;
+  onConvert?: () => void;
 }
 
-export const RoadmapFeatureCard: FC<RoadmapFeatureCardProps> = ({ feature }) => {
+export const RoadmapFeatureCard: FC<RoadmapFeatureCardProps> = ({ feature, onConvert }) => {
   const priority = PRIORITY_BADGE[feature.priority];
   const effort = EFFORT_BADGE[feature.effort];
   const status = STATUS_BADGE[feature.status];
 
   return (
-    <div className="rounded-lg border border-border/50 bg-card/60 p-3 transition-colors hover:border-border/80">
-      <h4 className="text-sm font-medium text-foreground">{feature.title}</h4>
+    <div className="group rounded-lg border border-border/50 bg-card/60 p-3 transition-colors hover:border-border/80">
+      <div className="flex items-start justify-between gap-2">
+        <h4 className="text-sm font-medium text-foreground">{feature.title}</h4>
+        {onConvert && (
+          <button
+            type="button"
+            onClick={onConvert}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium text-muted-foreground/40 transition-colors hover:bg-primary/10 hover:text-primary group-hover:text-muted-foreground/70"
+          >
+            Convert to Task
+            <ArrowRightIcon className="h-3 w-3" />
+          </button>
+        )}
+      </div>
       {feature.description && (
         <p className="mt-1 line-clamp-2 text-xs text-muted-foreground/70 leading-relaxed">
           {feature.description}

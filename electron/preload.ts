@@ -198,6 +198,13 @@ const appAPI = {
 
   fs: {
     listDirectory: (dirPath: string) => ipcRenderer.invoke('fs:list-directory', dirPath) as Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }>,
+    readFile: (filePath: string) => ipcRenderer.invoke('fs:read-file', filePath) as Promise<{ content?: string; error?: string }>,
+  },
+
+  git: {
+    listWorktrees: (projectPath: string) => ipcRenderer.invoke('git:list-worktrees', projectPath) as Promise<{ worktrees: Array<{ path: string; branch: string; head: string }>; error?: string }>,
+    createWorktree: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:create-worktree', projectPath, branchName) as Promise<{ path?: string; branch?: string; error?: string }>,
+    removeWorktree: (projectPath: string, worktreePath: string) => ipcRenderer.invoke('git:remove-worktree', projectPath, worktreePath) as Promise<{ success?: boolean; error?: string }>,
   },
 
   computerUse: {

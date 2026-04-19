@@ -13,7 +13,7 @@ import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSideb
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { WorkspaceView } from '@/components/workspace/WorkspaceView';
 import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
-import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
+import { WorkspaceProvider, useWorkspace } from '@/providers/WorkspaceProvider';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
 import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
@@ -44,7 +44,9 @@ export default function App() {
       <ConfigProvider>
         <PluginProvider>
           <ComputerUseProvider>
-            <AppRoot />
+            <WorkspaceProvider>
+              <AppRoot />
+            </WorkspaceProvider>
           </ComputerUseProvider>
         </PluginProvider>
       </ConfigProvider>
@@ -415,6 +417,7 @@ function AppShell() {
     consumeNavigationRequest,
     navigationRequests,
   } = usePlugins();
+  const { setActiveEngine } = useWorkspace();
 
   useEffect(() => {
     const ui = config?.ui as { sidebarWidth?: number } | undefined;
@@ -769,6 +772,37 @@ function AppShell() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [handleOpenSettings, handlePluginNavigationItem, pluginCommands]);
 
+  // Workspace engine keyboard shortcuts (single-key when in workspace mode)
+  useEffect(() => {
+    const WORKSPACE_SHORTCUTS: Record<string, string> = {
+      k: 'kanban',
+      a: 'terminals',
+      n: 'insights',
+      d: 'roadmap',
+      i: 'ideation',
+      l: 'changelog',
+      c: 'context',
+      w: 'worktrees',
+    };
+
+    const handleWorkspaceKey = (e: KeyboardEvent) => {
+      if (activeView !== WORKSPACE_VIEW) return;
+      // Don't fire when modifier keys are held
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // Don't fire when typing in an input or textarea
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || (e.target as HTMLElement)?.isContentEditable) return;
+
+      const engine = WORKSPACE_SHORTCUTS[e.key.toLowerCase()];
+      if (engine) {
+        e.preventDefault();
+        setActiveEngine(engine);
+      }
+    };
+    window.addEventListener('keydown', handleWorkspaceKey);
+    return () => window.removeEventListener('keydown', handleWorkspaceKey);
+  }, [activeView, setActiveEngine]);
+
   const dockItems: DockItem[] = useMemo(() => [
     {
       id: 'settings',
@@ -798,7 +832,6 @@ function AppShell() {
   ], [ThemeIcon, activeView, handlePluginNavigationItem, handleSettingsToggle, pluginNavigationItems, themeTitle, toggleTheme]);
 
   return (
-    <WorkspaceProvider>
     <AttachmentProvider>
       <DropZone>
       <RuntimeProvider
@@ -978,7 +1011,6 @@ function AppShell() {
       </RuntimeProvider>
     </DropZone>
     </AttachmentProvider>
-    </WorkspaceProvider>
   );
 }
 

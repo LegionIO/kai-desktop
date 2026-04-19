@@ -2,14 +2,15 @@ import { useState, type FC } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { ChevronDownIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import type { RoadmapPhase } from '../../../shared/workspace-types';
+import type { RoadmapPhase, RoadmapFeature } from '../../../shared/workspace-types';
 import { RoadmapFeatureCard } from './RoadmapFeatureCard';
 
 interface RoadmapPhaseCardProps {
   phase: RoadmapPhase;
+  onConvertFeature?: (feature: RoadmapFeature) => void;
 }
 
-export const RoadmapPhaseCard: FC<RoadmapPhaseCardProps> = ({ phase }) => {
+export const RoadmapPhaseCard: FC<RoadmapPhaseCardProps> = ({ phase, onConvertFeature }) => {
   const [open, setOpen] = useState(true);
 
   return (
@@ -52,7 +53,11 @@ export const RoadmapPhaseCard: FC<RoadmapPhaseCardProps> = ({ phase }) => {
               </p>
             ) : (
               phase.features.map((feature) => (
-                <RoadmapFeatureCard key={feature.id} feature={feature} />
+                <RoadmapFeatureCard
+                  key={feature.id}
+                  feature={feature}
+                  onConvert={onConvertFeature ? () => onConvertFeature(feature) : undefined}
+                />
               ))
             )}
           </div>

@@ -11,12 +11,18 @@ import { ContextView } from './ContextView';
 import { WorktreesView } from './WorktreesView';
 import { PluginManager } from './PluginManager';
 import { WorkspaceComposer } from './WorkspaceComposer';
+import { GitHubIssuesView } from './GitHubIssuesView';
 import { WorkspaceEmpty } from './WorkspaceEmpty';
 
 export const WorkspaceView: FC = () => {
   const { project, activeEngine } = useWorkspace();
 
   if (!project) return <ProjectSelector />;
+
+  // Plugin sidebar routes (e.g. "plugin:github:github-issues")
+  if (activeEngine.startsWith('plugin:github:')) {
+    return <GitHubIssuesView />;
+  }
 
   switch (activeEngine) {
     case 'kanban':    return <KanbanBoard />;
