@@ -11,6 +11,9 @@ import { DropZone } from '@/components/thread/DropZone';
 import { ConversationList } from '@/components/conversations/ConversationList';
 import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSidebarSection';
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
+import { WorkspaceView } from '@/components/workspace/WorkspaceView';
+import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
+import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
 import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
@@ -28,7 +31,7 @@ import { UpdateCard } from '@/components/UpdateCard';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import { app } from '@/lib/ipc-client';
-import { generateId } from '@/lib/utils';
+import { generateId, cn } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
@@ -352,6 +355,7 @@ type AppView = string;
 
 const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
+const WORKSPACE_VIEW = 'workspace';
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
@@ -794,6 +798,7 @@ function AppShell() {
   ], [ThemeIcon, activeView, handlePluginNavigationItem, handleSettingsToggle, pluginNavigationItems, themeTitle, toggleTheme]);
 
   return (
+    <WorkspaceProvider>
     <AttachmentProvider>
       <DropZone>
       <RuntimeProvider
@@ -841,19 +846,54 @@ function AppShell() {
                 <CpuIcon className="h-4 w-4 text-primary/80" />
               </span>
             </div>
+            {/* Chat / Workspace mode toggle */}
+            <div className="titlebar-no-drag flex" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+              <button
+                onClick={() => setActiveView(CHAT_VIEW)}
+                style={{ background: 'transparent', borderRadius: 0, boxShadow: 'none' }}
+                className={cn(
+                  'flex-1 px-3 py-2 text-xs font-medium transition-colors border-b-2',
+                  activeView !== WORKSPACE_VIEW
+                    ? 'text-primary border-primary'
+                    : 'text-muted-foreground border-transparent hover:text-foreground'
+                )}
+              >
+                Chat
+              </button>
+              <button
+                onClick={() => setActiveView(WORKSPACE_VIEW)}
+                style={{ background: 'transparent', borderRadius: 0, boxShadow: 'none' }}
+                className={cn(
+                  'flex-1 px-3 py-2 text-xs font-medium transition-colors border-b-2',
+                  activeView === WORKSPACE_VIEW
+                    ? 'text-primary border-primary'
+                    : 'text-muted-foreground border-transparent hover:text-foreground'
+                )}
+              >
+                Workspace
+              </button>
+            </div>
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="min-h-0 flex-1 overflow-y-auto">
-                <ConversationList
-                  activeConversationId={activeConversationId}
-                  activeThreadMode={threadMode}
-                  onSwitchConversation={handleSwitchConversation}
-                  onNewConversation={handleNewConversation}
-                />
+                {activeView === WORKSPACE_VIEW ? (
+                  <WorkspaceSidebar />
+                ) : (
+                  <ConversationList
+                    activeConversationId={activeConversationId}
+                    activeThreadMode={threadMode}
+                    onSwitchConversation={handleSwitchConversation}
+                    onNewConversation={handleNewConversation}
+                  />
+                )}
               </div>
-              <div className="shrink-0">
-                <SubAgentSidebarSection />
-              </div>
-              <UpdateCard />
+              {activeView !== WORKSPACE_VIEW && (
+                <>
+                  <div className="shrink-0">
+                    <SubAgentSidebarSection />
+                  </div>
+                  <UpdateCard />
+                </>
+              )}
               <SidebarDock items={dockItems} />
             </div>
           </aside>
@@ -913,6 +953,8 @@ function AppShell() {
             <div className="min-h-0 flex-1 overflow-hidden">
               {activeView === SETTINGS_VIEW ? (
                 <SettingsPanel onClose={() => setActiveView(CHAT_VIEW)} />
+              ) : activeView === WORKSPACE_VIEW ? (
+                <WorkspaceView />
               ) : activePluginPanel ? (
                 <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
               ) : (
@@ -936,6 +978,7 @@ function AppShell() {
       </RuntimeProvider>
     </DropZone>
     </AttachmentProvider>
+    </WorkspaceProvider>
   );
 }
 
