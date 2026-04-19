@@ -1,6 +1,13 @@
 import { useMemo, type FC } from 'react';
 import {
   LayoutGridIcon,
+  TerminalIcon,
+  SparklesIcon,
+  MapIcon,
+  LightbulbIcon,
+  FileTextIcon,
+  BookOpenIcon,
+  GitBranchIcon,
   MessageSquareIcon,
   PuzzleIcon,
   FolderOpenIcon,
@@ -16,11 +23,22 @@ interface EngineNavItem {
   engine: WorkspaceEngine;
   label: string;
   Icon: LucideIcon;
+  shortcut?: string;
 }
 
-const ENGINE_NAV: EngineNavItem[] = [
-  { engine: 'kanban', label: 'Kanban', Icon: LayoutGridIcon },
-  { engine: 'prompt', label: 'Prompt', Icon: MessageSquareIcon },
+const PROJECT_NAV: EngineNavItem[] = [
+  { engine: 'kanban',    label: 'Kanban Board', Icon: LayoutGridIcon,  shortcut: 'K' },
+  { engine: 'terminals', label: 'Terminals',    Icon: TerminalIcon,    shortcut: 'A' },
+  { engine: 'insights',  label: 'Insights',     Icon: SparklesIcon,    shortcut: 'N' },
+  { engine: 'roadmap',   label: 'Roadmap',      Icon: MapIcon,         shortcut: 'D' },
+  { engine: 'ideation',  label: 'Ideation',     Icon: LightbulbIcon,   shortcut: 'I' },
+  { engine: 'changelog', label: 'Changelog',    Icon: FileTextIcon,    shortcut: 'L' },
+  { engine: 'context',   label: 'Context',      Icon: BookOpenIcon,    shortcut: 'C' },
+  { engine: 'worktrees', label: 'Worktrees',    Icon: GitBranchIcon,   shortcut: 'W' },
+];
+
+const TOOLS_NAV: EngineNavItem[] = [
+  { engine: 'prompt',  label: 'Prompt',  Icon: MessageSquareIcon },
   { engine: 'plugins', label: 'Plugins', Icon: PuzzleIcon },
 ];
 
@@ -40,6 +58,26 @@ export const WorkspaceSidebar: FC = () => {
     return items;
   }, [plugins]);
 
+  const renderNavItem = ({ engine, label, Icon, shortcut }: EngineNavItem) => (
+    <button
+      key={engine}
+      type="button"
+      onClick={() => setActiveEngine(engine)}
+      className={cn(
+        'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
+        activeEngine === engine
+          ? 'bg-primary/10 text-primary'
+          : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+      )}
+    >
+      <Icon className="h-4 w-4" />
+      <span className="flex-1 text-left">{label}</span>
+      {shortcut && (
+        <kbd className="text-[9px] text-muted-foreground/30 font-mono">{shortcut}</kbd>
+      )}
+    </button>
+  );
+
   return (
     <div className="flex flex-col">
       {/* Project header */}
@@ -57,32 +95,33 @@ export const WorkspaceSidebar: FC = () => {
         )}
       </div>
 
-      {/* Engine navigation */}
-      <nav className="flex flex-col gap-0.5 p-2">
-        {ENGINE_NAV.map(({ engine, label, Icon }) => (
-          <button
-            key={engine}
-            type="button"
-            onClick={() => setActiveEngine(engine)}
-            className={cn(
-              'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors',
-              activeEngine === engine
-                ? 'bg-primary/10 text-primary'
-                : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
-            )}
-          >
-            <Icon className="h-[16px] w-[16px]" />
-            {label}
-          </button>
-        ))}
-      </nav>
+      {/* Project engines */}
+      <div className="px-2 pt-2 pb-1">
+        <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
+          Project
+        </p>
+        <nav className="flex flex-col gap-0.5">
+          {PROJECT_NAV.map(renderNavItem)}
+        </nav>
+      </div>
+
+      {/* Tools section */}
+      <div className="mx-3 my-1 h-px bg-sidebar-border/60" />
+      <div className="px-2 pb-1">
+        <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
+          Tools
+        </p>
+        <nav className="flex flex-col gap-0.5">
+          {TOOLS_NAV.map(renderNavItem)}
+        </nav>
+      </div>
 
       {/* Plugin sidebar items */}
       {pluginSidebarItems.length > 0 && (
         <>
-          <div className="mx-3 h-px bg-sidebar-border/80" />
-          <div className="p-2">
-            <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">
+          <div className="mx-3 my-1 h-px bg-sidebar-border/60" />
+          <div className="px-2 pb-1">
+            <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
               Plugins
             </p>
             <nav className="flex flex-col gap-0.5">
@@ -92,13 +131,13 @@ export const WorkspaceSidebar: FC = () => {
                   type="button"
                   onClick={() => setActiveEngine(`plugin:${item.pluginId}:${item.id}`)}
                   className={cn(
-                    'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors',
+                    'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
                     activeEngine === `plugin:${item.pluginId}:${item.id}`
                       ? 'bg-primary/10 text-primary'
                       : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
                   )}
                 >
-                  <PuzzleIcon className="h-[16px] w-[16px]" />
+                  <PuzzleIcon className="h-4 w-4" />
                   {item.label}
                 </button>
               ))}

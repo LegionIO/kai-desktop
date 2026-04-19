@@ -61,7 +61,101 @@ export interface WorkspaceTask {
 
 // ── Workspace Engine ────────────────────────────────────────
 
-export type WorkspaceEngine = 'kanban' | 'plugins' | 'prompt' | string;
+export type WorkspaceEngine =
+  | 'kanban' | 'terminals' | 'insights' | 'roadmap'
+  | 'ideation' | 'changelog' | 'context' | 'worktrees'
+  | 'plugins' | 'prompt'
+  | string;
+
+// ── Terminals ──────────────────────────────────────────────
+
+export type TerminalStatus = 'idle' | 'running' | 'completed' | 'failed';
+
+export interface WorkspaceTerminal {
+  id: string;
+  title: string;
+  taskId?: string;
+  status: TerminalStatus;
+  output: string[];
+  createdAt: number;
+}
+
+// ── Insights ───────────────────────────────────────────────
+
+export interface InsightMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
+
+// ── Roadmap ────────────────────────────────────────────────
+
+export type RoadmapPriority = 'low' | 'medium' | 'high' | 'critical';
+
+export interface RoadmapFeature {
+  id: string;
+  title: string;
+  description: string;
+  priority: RoadmapPriority;
+  effort: 'small' | 'medium' | 'large' | 'xlarge';
+  status: 'planned' | 'in_progress' | 'completed';
+}
+
+export interface RoadmapPhase {
+  id: string;
+  name: string;
+  description: string;
+  features: RoadmapFeature[];
+}
+
+// ── Ideation ───────────────────────────────────────────────
+
+export type IdeaCategory =
+  | 'code-improvement' | 'code-quality' | 'performance'
+  | 'security' | 'documentation' | 'ui-ux';
+
+export type IdeaSeverity = 'info' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface Idea {
+  id: string;
+  title: string;
+  description: string;
+  category: IdeaCategory;
+  severity: IdeaSeverity;
+  affectedFiles: string[];
+  createdAt: number;
+}
+
+// ── Changelog ──────────────────────────────────────────────
+
+export interface ChangelogChange {
+  type: 'added' | 'changed' | 'fixed' | 'removed';
+  description: string;
+  taskId?: string;
+}
+
+export interface ChangelogRelease {
+  id: string;
+  version: string;
+  date: string;
+  summary: string;
+  changes: ChangelogChange[];
+}
+
+// ── Worktrees ──────────────────────────────────────────────
+
+export type WorktreeStatus = 'active' | 'stale' | 'merging';
+
+export interface Worktree {
+  id: string;
+  branch: string;
+  path: string;
+  taskId?: string;
+  taskTitle?: string;
+  status: WorktreeStatus;
+  createdAt: number;
+}
 
 // ── Workspace State ─────────────────────────────────────────
 
