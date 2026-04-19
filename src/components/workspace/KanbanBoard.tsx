@@ -1,5 +1,5 @@
-import { useState, useMemo, type FC } from 'react';
-import { PlusIcon } from 'lucide-react';
+import { useState, useMemo, type FC, type ReactNode } from 'react';
+import { PlusIcon, FileTextIcon, LoaderIcon, BotIcon, EyeIcon, CheckCircle2Icon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
 import type { TaskStatus } from '../../../shared/workspace-types';
@@ -9,15 +9,65 @@ import { TaskCreationDialog } from './TaskCreationDialog';
 interface ColumnDef {
   status: TaskStatus;
   label: string;
-  accentClass: string;
+  accentColor: string;
   headerTextClass: string;
+  borderClass: string;
+  emptyIcon: ReactNode;
+  emptyTitle: string;
+  emptySubtitle: string;
 }
 
 const COLUMNS: ColumnDef[] = [
-  { status: 'backlog', label: 'Backlog', accentClass: 'border-t-muted-foreground/30', headerTextClass: 'text-muted-foreground' },
-  { status: 'in_progress', label: 'In Progress', accentClass: 'border-t-blue-500/50', headerTextClass: 'text-blue-400' },
-  { status: 'review', label: 'Review', accentClass: 'border-t-amber-500/50', headerTextClass: 'text-amber-400' },
-  { status: 'done', label: 'Done', accentClass: 'border-t-emerald-500/50', headerTextClass: 'text-emerald-400' },
+  {
+    status: 'planning',
+    label: 'Planning',
+    accentColor: 'rgb(148 163 184)', // slate-400
+    headerTextClass: 'text-slate-300',
+    borderClass: 'border-t-slate-400/50',
+    emptyIcon: <FileTextIcon className="h-5 w-5 text-slate-500/40" />,
+    emptyTitle: 'No tasks planned',
+    emptySubtitle: 'Create a task to get started',
+  },
+  {
+    status: 'in_progress',
+    label: 'In Progress',
+    accentColor: 'rgb(96 165 250)', // blue-400
+    headerTextClass: 'text-blue-400',
+    borderClass: 'border-t-blue-500/50',
+    emptyIcon: <LoaderIcon className="h-5 w-5 text-blue-500/30 animate-spin" style={{ animationDuration: '3s' }} />,
+    emptyTitle: 'Nothing running',
+    emptySubtitle: 'Start a task from Planning',
+  },
+  {
+    status: 'ai_review',
+    label: 'AI Review',
+    accentColor: 'rgb(168 85 247)', // purple-400
+    headerTextClass: 'text-purple-400',
+    borderClass: 'border-t-purple-500/50',
+    emptyIcon: <BotIcon className="h-5 w-5 text-purple-500/30" />,
+    emptyTitle: 'No tasks in review',
+    emptySubtitle: 'AI will review completed tasks',
+  },
+  {
+    status: 'human_review',
+    label: 'Human Review',
+    accentColor: 'rgb(251 191 36)', // amber-400
+    headerTextClass: 'text-amber-400',
+    borderClass: 'border-t-amber-500/50',
+    emptyIcon: <EyeIcon className="h-5 w-5 text-amber-500/30" />,
+    emptyTitle: 'No tasks to review',
+    emptySubtitle: 'Tasks pass through AI review first',
+  },
+  {
+    status: 'done',
+    label: 'Done',
+    accentColor: 'rgb(52 211 153)', // emerald-400
+    headerTextClass: 'text-emerald-400',
+    borderClass: 'border-t-emerald-500/50',
+    emptyIcon: <CheckCircle2Icon className="h-5 w-5 text-emerald-500/30" />,
+    emptyTitle: 'No completed tasks',
+    emptySubtitle: 'Completed tasks appear here',
+  },
 ];
 
 export const KanbanBoard: FC = () => {
@@ -26,13 +76,14 @@ export const KanbanBoard: FC = () => {
 
   const grouped = useMemo(() => {
     const map: Record<TaskStatus, typeof tasks> = {
-      backlog: [],
+      planning: [],
       in_progress: [],
-      review: [],
+      ai_review: [],
+      human_review: [],
       done: [],
     };
     for (const task of tasks) {
-      (map[task.status] ?? map.backlog).push(task);
+      (map[task.status] ?? map.planning).push(task);
     }
     return map;
   }, [tasks]);
@@ -53,15 +104,15 @@ export const KanbanBoard: FC = () => {
       </div>
 
       {/* Columns */}
-      <div className="flex min-h-0 flex-1 gap-4 overflow-x-auto p-4">
+      <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-4">
         {COLUMNS.map((col) => {
           const columnTasks = grouped[col.status];
           return (
             <div
               key={col.status}
               className={cn(
-                'flex w-64 shrink-0 flex-col rounded-lg border border-border/50 border-t-2 bg-muted/5',
-                col.accentClass,
+                'flex min-w-[220px] flex-1 flex-col rounded-xl border border-border/40 border-t-2 bg-muted/5',
+                col.borderClass,
               )}
             >
               {/* Column header */}
@@ -77,8 +128,10 @@ export const KanbanBoard: FC = () => {
               {/* Cards */}
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
                 {columnTasks.length === 0 ? (
-                  <div className="flex flex-1 items-center justify-center py-8">
-                    <p className="text-[11px] text-muted-foreground/40">No tasks</p>
+                  <div className="flex flex-1 flex-col items-center justify-center gap-2 py-12">
+                    {col.emptyIcon}
+                    <p className="text-[11px] font-medium text-muted-foreground/40">{col.emptyTitle}</p>
+                    <p className="text-[10px] text-muted-foreground/25">{col.emptySubtitle}</p>
                   </div>
                 ) : (
                   columnTasks.map((task) => (

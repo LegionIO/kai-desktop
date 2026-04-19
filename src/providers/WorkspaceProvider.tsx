@@ -66,7 +66,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       id: makeId(),
       title,
       description,
-      status: 'backlog',
+      status: 'planning',
       priority,
       labels: [],
       createdAt: Date.now(),

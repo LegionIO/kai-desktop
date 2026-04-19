@@ -44,7 +44,7 @@ export interface InstalledPlugin extends WorkspacePlugin {
 
 // ── Tasks ───────────────────────────────────────────────────
 
-export type TaskStatus = 'backlog' | 'in_progress' | 'review' | 'done';
+export type TaskStatus = 'planning' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
 export interface WorkspaceTask {
