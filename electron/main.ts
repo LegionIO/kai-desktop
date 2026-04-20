@@ -281,7 +281,7 @@ function createWindow(): BrowserWindow {
     title: __BRAND_PRODUCT_NAME,
     icon: APP_ICON,
     titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 15, y: 10 },
+    trafficLightPosition: { x: 20, y: 18 },
     transparent: IS_MAC,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     visualEffectState: IS_MAC ? 'active' : undefined,

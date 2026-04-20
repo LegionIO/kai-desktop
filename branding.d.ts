@@ -36,7 +36,6 @@ declare const __APP_VERSION: string;
 declare const __BRAND_THEME_HUE: string;
 declare const __BRAND_THEME_ACCENT_LIGHT: string;
 declare const __BRAND_THEME_ACCENT_DARK: string;
-declare const __BRAND_THEME_BACKGROUND: string;
 declare const __BRAND_THEME_GRADIENT_TEXT: string;
 
 // ── macOS permission-usage strings ────────────────────────────────────────

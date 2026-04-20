@@ -1,6 +1,5 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
-import type { AgentBackendDefinition } from '../agent/backend-registry.js';
 
 /* ── Manifest ── */
 
@@ -22,7 +21,7 @@ export type PluginPermission =
   | 'conversations:write'
   | 'navigation:open'
   | 'state:publish'
-  | 'agent:backend'
+  | 'agent:generate'
   | 'safe-storage'
   | 'browser:window';
 
@@ -57,7 +56,6 @@ export type PluginInstance = {
   error?: string;
   module: PluginModule | null;
   registeredTools: ToolDefinition[];
-  registeredBackendKeys: string[];
   preSendHooks: PreSendHook[];
   postReceiveHooks: PostReceiveHook[];
   uiBanners: PluginBannerDescriptor[];
@@ -299,7 +297,6 @@ export type PluginConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
-  selectedBackendKey?: string | null;
   metadata?: Record<string, unknown>;
 };
 
@@ -409,8 +406,6 @@ export type PluginAPI = {
   };
 
   agent: {
-    registerBackend: (definition: Omit<AgentBackendDefinition, 'pluginName'>) => void;
-    unregisterBackend: (key: string) => void;
     generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
   };
 

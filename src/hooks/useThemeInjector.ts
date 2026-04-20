@@ -9,7 +9,7 @@ import { useEffect } from 'react';
  */
 export function useThemeInjector(): void {
   useEffect(() => {
-    const hue = Number(__BRAND_THEME_HUE) || 292;
+    const hue = Number(__BRAND_THEME_HUE) || 90;
     document.documentElement.style.setProperty('--brand-hue', String(hue));
   }, []);
 }

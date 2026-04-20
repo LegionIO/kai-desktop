@@ -230,7 +230,6 @@ function getBridgeScript(): string {
       stream: function(cId, msgs, mk, re, pk, fb, cwd) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd); },
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
       generateTitle: function(msgs, mk) { return invoke('agent:generate-title', msgs, mk); },
-      listBackends: function() { return invoke('agent:list-backends'); },
       onStreamEvent: function(cb) { return on('agent:stream-event', cb); },
       sendSubAgentMessage: function(cId, msg) { return invoke('agent:sub-agent-message', cId, msg); },
       stopSubAgent: function(cId) { return invoke('agent:sub-agent-stop', cId); },

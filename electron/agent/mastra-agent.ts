@@ -7,12 +7,13 @@ import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, Reasoning
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
+import { classifyError, calculateDelay } from './retry.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
 export type StreamEvent = {
   conversationId: string;
-  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment';
+  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'tool-approval-required' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment' | 'retry';
   messageMeta?: Record<string, unknown>;
   text?: string;
   toolCallId?: string;
@@ -53,23 +54,6 @@ function getErrorMessage(error: unknown): string {
     if (typeof maybe.responseBody === 'string' && maybe.responseBody.length > 0) return maybe.responseBody;
   }
   return String(error);
-}
-
-function isRetryableBedrock503(error: unknown, modelConfig: LLMModelConfig): boolean {
-  if (modelConfig.provider !== 'amazon-bedrock') return false;
-  if (!error || typeof error !== 'object') return false;
-
-  const candidate = error as {
-    statusCode?: number;
-    isRetryable?: boolean;
-    responseHeaders?: Record<string, string | undefined>;
-  };
-
-  const errType = candidate.responseHeaders?.['x-amzn-errortype'] ?? candidate.responseHeaders?.['X-Amzn-Errortype'];
-  return candidate.statusCode === 503
-    && candidate.isRetryable === true
-    && typeof errType === 'string'
-    && errType.includes('ServiceUnavailableException');
 }
 
 function shouldRetryWithoutTemperature(
@@ -128,7 +112,7 @@ function toMastraTools(
   tools: ToolDefinition[],
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: {
       toolCallId: string;
@@ -158,7 +142,7 @@ function toMastraTools(
         };
 
         const mergedAbortSignal = mergeAbortSignals(mastraOptions?.abortSignal, localAbortController.signal);
-        hooks?.onToolExecutionStart?.({
+        await hooks?.onToolExecutionStart?.({
           toolCallId,
           toolName: tool.name,
           args: input,
@@ -336,7 +320,7 @@ export async function* streamAgentResponse(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
   },
@@ -363,7 +347,7 @@ export async function* streamAgentResponse(
     return new Agent({
       id: `${__BRAND_APP_SLUG}-${conversationId}`,
       name: __BRAND_APP_SLUG,
-      instructions: buildAgentInstructions(config.systemPrompt),
+      instructions: buildAgentInstructions(config.systemPrompt, config.tools?.executionMode),
       model: model as AgentConfig['model'],
       tools: mastraTools,
       ...(memory ? { memory } : {}),
@@ -407,8 +391,11 @@ async function* generateWithSyntheticEvents(
   let activeModelSettings = { ...modelSettings };
   let activeModelConfig = { ...modelConfig };
   let compatibilityRetried = false;
+  const MAX_RETRIES = 4;
+  const BASE_DELAY_MS = 500;
+  const MAX_DELAY_MS = 32_000;
 
-  while (true) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     const eventQueue: StreamEvent[] = [];
 
     try {
@@ -494,6 +481,29 @@ async function* generateWithSyntheticEvents(
         continue;
       }
 
+      // Classify error for retry decision
+      const errorInfo = classifyError(error);
+
+      if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
+        const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
+        console.warn(`[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`, errorInfo.message);
+
+        yield {
+          conversationId,
+          type: 'retry',
+          data: {
+            attempt: attempt + 1,
+            maxRetries: MAX_RETRIES,
+            delayMs: delay,
+            reason: errorInfo.message,
+            category: errorInfo.category,
+          },
+        };
+
+        await sleep(delay);
+        continue;
+      }
+
       for (const event of eventQueue) {
         yield event;
       }
@@ -546,13 +556,17 @@ async function* streamWithRealEvents(
   let accCacheReadTokens = 0;
   let accCacheWriteTokens = 0;
 
+  const MAX_RETRIES = 4;
+  const BASE_DELAY_MS = 500;
+  const MAX_DELAY_MS = 32_000;
+
   compatibilityLoop:
   while (true) {
     let requestCompleted = false;
     let compatibilityRetryRequested = false;
     const agent = await buildAgent(activeModelConfig);
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       try {
         console.info(
           `[Agent] Starting stream for ${conversationId}${attempt > 0 ? ` (retry ${attempt})` : ''}${compatibilityRetried ? ' [temp-omitted]' : ''}`,
@@ -704,19 +718,38 @@ async function* streamWithRealEvents(
       } catch (error) {
         if (options?.abortSignal?.aborted) break compatibilityLoop;
 
-        const shouldRetry = attempt === 0 && !emittedAnyOutput && isRetryableBedrock503(error, modelConfig);
-        if (shouldRetry) {
-          console.warn(`[Agent] Retrying transient Bedrock stream failure for ${conversationId}:`, error);
-          await sleep(700);
-          continue;
-        }
-
+        // Temperature compatibility retry (special case — not counted as a retry attempt)
         if (!compatibilityRetried && shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)) {
           compatibilityRetried = true;
           activeModelSettings = omitTemperature(activeModelSettings);
           activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
           console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility error:`, getErrorMessage(error));
           continue compatibilityLoop;
+        }
+
+        // Classify error for retry decision
+        const errorInfo = classifyError(error);
+
+        // Only retry transient errors when no content has been emitted
+        if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
+          const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
+          console.warn(`[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`, errorInfo.message);
+
+          // Emit retry event so UI can show progress
+          yield {
+            conversationId,
+            type: 'retry',
+            data: {
+              attempt: attempt + 1,
+              maxRetries: MAX_RETRIES,
+              delayMs: delay,
+              reason: errorInfo.message,
+              category: errorInfo.category,
+            },
+          };
+
+          await sleep(delay);
+          continue;
         }
 
         console.error(`[Agent] Stream error for ${conversationId}:`, error);
@@ -791,7 +824,7 @@ export async function* streamWithFallback(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void;
+    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
   },
@@ -946,8 +979,8 @@ export async function* streamWithFallback(
   yield { conversationId, type: 'done' };
 }
 
-function buildAgentInstructions(basePrompt: string): string {
-  return [
+function buildAgentInstructions(basePrompt: string, executionMode?: string): string {
+  const lines = [
     basePrompt,
     '',
     'Runtime capabilities:',
@@ -955,7 +988,41 @@ function buildAgentInstructions(basePrompt: string): string {
     '- The runtime may emit mid-tool progress updates to the user.',
     '- A tool run may be cancelled if output indicates failure, risk, or mismatch with intent.',
     '- Do not claim that mid-tool progress updates are impossible in this environment.',
-  ].join('\n');
+    '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
+    '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
+  ];
+
+  if (executionMode === 'plan-first') {
+    lines.push(
+      '',
+      'PLAN MODE ACTIVE:',
+      '- You are in planning mode. You MUST NOT make any edits, run non-readonly tools, or otherwise make changes to the system.',
+      '- Only use read-only tools (file_read, grep, glob, list_directory, web_fetch, web_search).',
+      '- Do NOT use file_write, file_edit, or sh tools — they are not available in this mode.',
+      '- Be extremely thorough in your exploration. Read all relevant files, trace code paths, and understand the full picture.',
+      '- Use ask_user throughout planning to clarify requirements, preferences, or decisions you cannot resolve from code alone. Never ask what you could find out by reading the code.',
+      '- Structure your plan as:',
+      '  1. Context: why this change is needed, the problem it addresses, and the intended outcome',
+      '  2. A clear, step-by-step implementation plan describing exactly what changes you would make',
+      '  3. Paths of critical files to be modified, and existing functions/utilities to reuse',
+      '  4. Expected impact, risks, edge cases, and how to verify the changes',
+      '- Include only your recommended approach, not all alternatives. Be concise enough to scan quickly but detailed enough to execute.',
+      '- Your turn should ONLY end by either using ask_user (to clarify requirements) or calling exit_plan_mode (to present the plan for approval). Do not stop for any other reason.',
+      '- Use exit_plan_mode to request plan approval. Do NOT ask about plan approval via text — phrases like "Is this plan okay?" or "Should I proceed?" MUST use exit_plan_mode instead.',
+      '- IMPORTANT: If exit_plan_mode has been called and its result indicates plan mode was deactivated, these restrictions no longer apply. You may proceed with edits and tool use on the next turn.',
+    );
+  } else if (executionMode === 'confirm-writes') {
+    lines.push(
+      '',
+      'CONFIRMATION MODE:',
+      '- Write operations (file_write, file_edit, sh) require explicit user approval before executing.',
+      '- The user will see your intended action and can approve or reject it.',
+      '- Before invoking a write tool, briefly explain what the tool call will do and why.',
+      '- Read-only tools execute normally without requiring approval.',
+    );
+  }
+
+  return lines.join('\n');
 }
 
 async function* asAsyncIterable<T>(stream: ReadableStream<T>): AsyncGenerator<T> {

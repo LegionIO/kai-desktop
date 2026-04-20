@@ -45,6 +45,8 @@ type RichChatInputProps = {
   placeholder?: string;
   className?: string;
   autoFocus?: boolean;
+  /** When this key changes, re-trigger auto-focus (e.g. pass conversationId to focus on new chat). */
+  focusKey?: string | null;
 };
 
 type RunHandle = {
@@ -513,12 +515,14 @@ export const RichChatInput: FC<RichChatInputProps> = ({
   placeholder,
   className,
   autoFocus,
+  focusKey,
 }) => {
   const editableSegments = useMemo(() => buildEditableSegments(value), [value]);
   const handlesRef = useRef(new Map<string, RunHandle>());
   const codeHandlesRef = useRef(new Map<string, CodeHandle>());
   const pendingFocusRawOffsetRef = useRef<number | null>(autoFocus ? value.length : null);
   const autoFocusedRef = useRef(false);
+  const prevFocusKeyRef = useRef(focusKey);
   const lastEditableRun = useMemo(() => findLastEditableRun(editableSegments), [editableSegments]);
   const lastEditableRunKey = lastEditableRun ? getRunKey(lastEditableRun) : null;
 
@@ -578,6 +582,16 @@ export const RichChatInput: FC<RichChatInputProps> = ({
     autoFocusedRef.current = true;
     pendingFocusRawOffsetRef.current = value.length;
   }, [autoFocus, value.length]);
+
+  useEffect(() => {
+    if (prevFocusKeyRef.current === focusKey) return;
+    prevFocusKeyRef.current = focusKey;
+    if (!autoFocus) return;
+    // Try to focus immediately; fall back to pending for next layout pass
+    if (!focusAtRawOffset(value.length)) {
+      pendingFocusRawOffsetRef.current = value.length;
+    }
+  }, [autoFocus, focusAtRawOffset, focusKey, value.length]);
 
   const handleRunChange = useCallback((segment: UserTextSegment | UserInlineCodeSegment | GapTextSegment, nextText: string, localOffset: number) => {
     if (segment.type === 'inlineCode') {
@@ -653,7 +667,7 @@ export const RichChatInput: FC<RichChatInputProps> = ({
       }}
     >
       {!value && placeholder ? (
-        <div className="pointer-events-none absolute inset-0 px-1 text-muted-foreground/60">
+        <div className="pointer-events-none absolute inset-0 px-1 pt-[2px] text-muted-foreground/60">
           {placeholder}
         </div>
       ) : null}

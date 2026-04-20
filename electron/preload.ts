@@ -27,14 +27,13 @@ const appAPI = {
       profileKey?: string,
       fallbackEnabled?: boolean,
       cwd?: string,
-    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd),
+      executionMode?: 'auto' | 'plan-first' | 'confirm-writes',
+    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd, executionMode),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
+    approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
+    rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
+    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
     generateTitle: (messages: unknown[], modelKey?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey),
-    listBackends: () => ipcRenderer.invoke('agent:list-backends') as Promise<Array<{
-      key: string;
-      displayName: string;
-      pluginName?: string | null;
-    }>>,
     onStreamEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('agent:stream-event', handler);
@@ -317,6 +316,12 @@ const appAPI = {
     const handler = (_event: Electron.IpcRendererEvent, modelKey: string) => callback(modelKey);
     ipcRenderer.on('agent:model-switched', handler);
     return () => ipcRenderer.removeListener('agent:model-switched', handler);
+  },
+
+  onExecutionModeChanged: (callback: (mode: string) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
+    ipcRenderer.on('agent:execution-mode-changed', handler);
+    return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
   },
 };
 

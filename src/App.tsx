@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef, type FC } from 'react';
+import { createPortal } from 'react-dom';
 import { ConfigProvider, useConfig } from '@/providers/ConfigProvider';
 import { AttachmentProvider } from '@/providers/AttachmentContext';
 import { RuntimeProvider, useSubAgents } from '@/providers/RuntimeProvider';
@@ -21,12 +22,13 @@ import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { CpuIcon, DownloadIcon, MenuIcon, SettingsIcon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, SettingsIcon, Trash2Icon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarDock, type DockItem } from '@/components/SidebarDock';
 import { UpdateCard } from '@/components/UpdateCard';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
+import type { ExecutionMode } from '@/components/thread/ModelSettingsButton';
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
@@ -34,6 +36,7 @@ import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface 
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
   return (
@@ -289,7 +292,7 @@ function getConversationDisplayTitle(
     }
   }
 
-  return 'New Conversation';
+  return 'Untitled Thread';
 }
 
 function getComputerSessionForConversation(
@@ -322,7 +325,7 @@ type ConversationsStore = {
 };
 
 /**
- * Delete all empty "New Conversation" entries except the currently active one.
+ * Delete all empty "Untitled Thread" entries except the currently active one.
  * If a conversation list is provided, uses it directly; otherwise fetches from IPC.
  * Returns the IDs of deleted conversations (for animation).
  */
@@ -385,11 +388,12 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 
 function AppShell() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
-  const [activeConversationTitle, setActiveConversationTitle] = useState('New Conversation');
+  const [activeConversationTitle, setActiveConversationTitle] = useState('Untitled Thread');
   const [activeView, setActiveView] = useState<AppView>('chat');
   const [threadMode, setThreadMode] = useState<ThreadMode>('chat');
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
   const { sessionsByConversation: cuSessionsByConversation } = useComputerUse();
@@ -398,6 +402,13 @@ function AppShell() {
   const [profilePrimaryModelKey, setProfilePrimaryModelKey] = useState<string | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [renamingTitle, setRenamingTitle] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [titleMenuOpen, setTitleMenuOpen] = useState(false);
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
+  });
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const isMobile = useIsMobile();
@@ -455,7 +466,7 @@ function AppShell() {
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
-          setActiveConversationTitle('New Conversation');
+          setActiveConversationTitle('Untitled Thread');
         }
       }
     };
@@ -472,9 +483,9 @@ function AppShell() {
   }, []);
 
   // Update conversation title when computer-use sessions become available
-  // (sessions load async, so the title may initially be "New Conversation")
+  // (sessions load async, so the title may initially be "Untitled Thread")
   useEffect(() => {
-    if (!activeConversationId || activeConversationTitle !== 'New Conversation') return;
+    if (!activeConversationId || activeConversationTitle !== 'Untitled Thread') return;
     const sessions = cuSessionsByConversation.get(activeConversationId);
     if (sessions?.length) {
       const goal = sessions[0].goal;
@@ -483,6 +494,73 @@ function AppShell() {
       }
     }
   }, [activeConversationId, activeConversationTitle, cuSessionsByConversation]);
+
+  const togglePin = useCallback((id: string) => {
+    const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]';
+    let ids: string[];
+    try { ids = JSON.parse(raw); } catch { ids = []; }
+    const set = new Set(ids);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    const serialized = JSON.stringify([...set]);
+    localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', serialized);
+    setPinnedIds(set);
+    window.dispatchEvent(new CustomEvent('pinned-conversations-changed', { detail: serialized }));
+  }, []);
+
+  // Sync pin state when changed from the sidebar
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      try {
+        const ids = JSON.parse(detail) as string[];
+        setPinnedIds(new Set(ids));
+      } catch { /* ignore */ }
+    };
+    window.addEventListener('pinned-conversations-changed', handler);
+    return () => window.removeEventListener('pinned-conversations-changed', handler);
+  }, []);
+
+  const handleRename = useCallback(async (id: string, newTitle: string) => {
+    const trimmed = newTitle.trim();
+    setRenamingTitle(false);
+    if (!trimmed) return;
+    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    if (!conv) return;
+    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' } as ConversationRecord);
+  }, []);
+
+  const handleDeleteConversation = useCallback(async (id: string) => {
+    const allConversations = await app.conversations.list() as ConversationRecord[];
+    const remaining = allConversations
+      .filter((c) => c.id !== id)
+      .sort((a, b) => {
+        const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
+        const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
+        return bTime - aTime;
+      });
+    // Set the next active conversation BEFORE deleting so the backend
+    // never broadcasts activeConversationId = null.
+    if (remaining.length > 0) {
+      await app.conversations.setActiveId(remaining[0].id);
+    }
+    await app.conversations.delete(id);
+    if (remaining.length > 0) {
+      setActiveConversationId(remaining[0].id);
+      setActiveConversationTitle(getConversationDisplayTitle(
+        remaining[0],
+        cuSessionsByConversation.get(remaining[0].id),
+      ));
+    } else {
+      setActiveConversationId(null);
+      setActiveConversationTitle('Untitled Thread');
+    }
+  }, [cuSessionsByConversation]);
+
+  const handleArchiveConversation = useCallback(async (id: string) => {
+    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    if (!conv) return;
+    await app.conversations.put({ ...conv, archived: !conv.archived } as ConversationRecord);
+  }, []);
 
   useEffect(() => {
     if (!dragState) return undefined;
@@ -525,7 +603,7 @@ function AppShell() {
 
       await app.conversations.delete(activeConversationId);
       setActiveConversationId(null);
-      setActiveConversationTitle('New Conversation');
+      setActiveConversationTitle('Untitled Thread');
     } catch {
       // Leave the current conversation intact if cleanup fails.
     }
@@ -571,13 +649,12 @@ function AppShell() {
         messageCount: 0, userMessageCount: 0,
         runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
         selectedModelKey: null,
-        selectedBackendKey: null,
         currentWorkingDirectory: null,
       });
       await app.conversations.setActiveId(newId);
       setActiveView(CHAT_VIEW);
       setActiveConversationId(newId);
-      setActiveConversationTitle('New Conversation');
+      setActiveConversationTitle('Untitled Thread');
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
@@ -615,6 +692,17 @@ function AppShell() {
   useEffect(() => {
     if (!window.app?.onModelSwitched) return;
     const cleanup = window.app.onModelSwitched((modelKey) => setSelectedModelKey(modelKey));
+    return cleanup;
+  }, []);
+
+  // Listen for AI-initiated execution mode changes (enter/exit plan mode)
+  useEffect(() => {
+    if (!window.app?.onExecutionModeChanged) return;
+    const cleanup = window.app.onExecutionModeChanged((mode) => {
+      if (mode === 'plan-first' || mode === 'auto' || mode === 'confirm-writes') {
+        setExecutionMode(mode as ExecutionMode);
+      }
+    });
     return cleanup;
   }, []);
 
@@ -785,13 +873,7 @@ function AppShell() {
         </span>
       ) : undefined,
     })),
-    {
-      id: 'theme',
-      label: themeTitle,
-      icon: <ThemeIcon className="h-[18px] w-[18px]" />,
-      onClick: toggleTheme,
-    },
-  ], [ThemeIcon, activeView, handlePluginNavigationItem, handleSettingsToggle, pluginNavigationItems, themeTitle, toggleTheme]);
+  ], [activeView, handlePluginNavigationItem, handleSettingsToggle, pluginNavigationItems]);
 
   return (
     <AttachmentProvider>
@@ -800,6 +882,7 @@ function AppShell() {
         conversationId={activeConversationId}
         selectedModelKey={selectedModelKey}
         reasoningEffort={reasoningEffort}
+        executionMode={executionMode}
         selectedProfileKey={selectedProfileKey}
         fallbackEnabled={fallbackEnabled}
         onModelFallback={setSelectedModelKey}
@@ -817,7 +900,66 @@ function AppShell() {
         <PluginToastHost />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
-        <div className="flex h-screen overflow-hidden bg-transparent text-foreground">
+        {renamingTitle && activeConversationId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onFocus={(e) => e.target.select()}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeConversationId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
+                className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRenamingTitle(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleRename(activeConversationId, renameValue)}
+                  className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+        {confirmingDelete && activeConversationId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingDelete(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Delete chat</h2>
+              <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDelete(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setConfirmingDelete(false); void handleDeleteConversation(activeConversationId); }}
+                  className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+        <div className="relative flex h-screen overflow-hidden text-foreground">
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
             <div
@@ -829,17 +971,25 @@ function AppShell() {
           <aside
             className={
               isMobile
-                ? `app-shell-panel fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
-                : 'app-shell-panel flex h-full shrink-0 flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground'
+                ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
+                : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
             }
             style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
+            <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
-              <span className="titlebar-no-drag inline-flex items-center gap-0.5 text-sm font-medium text-sidebar-foreground">
+              <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
-                <CpuIcon className="h-4 w-4 text-primary/80" />
               </span>
+              <button
+                type="button"
+                onClick={toggleTheme}
+                className="titlebar-no-drag absolute right-3 rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
+                title={themeTitle}
+              >
+                <ThemeIcon className="h-4 w-4" />
+              </button>
             </div>
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="min-h-0 flex-1 overflow-y-auto">
@@ -848,6 +998,7 @@ function AppShell() {
                   activeThreadMode={threadMode}
                   onSwitchConversation={handleSwitchConversation}
                   onNewConversation={handleNewConversation}
+                  onDeleteConversation={handleDeleteConversation}
                 />
               </div>
               <div className="shrink-0">
@@ -855,6 +1006,7 @@ function AppShell() {
               </div>
               <UpdateCard />
               <SidebarDock items={dockItems} />
+            </div>
             </div>
           </aside>
           {!isMobile && (
@@ -869,15 +1021,26 @@ function AppShell() {
                 event.preventDefault();
                 setDragState({ startX: event.clientX, startWidth: sidebarWidth });
               }}
-              className="group relative -ml-px h-full w-2 shrink-0 cursor-col-resize bg-transparent"
+              className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
             >
-              <div className="absolute inset-y-0 left-0 w-px bg-border/40 transition-colors group-hover:bg-primary/50" />
+              {/* Invisible hit area — wide enough to grab easily */}
+              <div className="absolute inset-y-0 -left-4 w-6" />
+              {/* Handle pill — on the panel border, appears on hover */}
+              <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
+              {/* Tooltip */}
+              <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
+                <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
+                  Drag to resize
+                </div>
+              </div>
             </div>
           )}
 
           {/* Main content area */}
-          <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            <div className="titlebar-drag flex h-12 items-center justify-between border-b border-border/70 bg-background/85 px-3 backdrop-blur-md md:h-14 md:px-6">
+          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {/* Interactive title bar */}
+            <div className={`${titleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+              <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
                   type="button"
@@ -892,22 +1055,68 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Settings</span>
                 ) : activePluginPanel ? (
                   <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
+                ) : activeConversationId ? (
+                  <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
+                    <DropdownMenu.Trigger asChild>
+                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                          {activeConversationTitle}
+                        </span>
+                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      </button>
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Portal>
+                      <DropdownMenu.Content
+                        align="start"
+                        sideOffset={4}
+                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                      >
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => togglePin(activeConversationId)}
+                        >
+                          <PinIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
+                        </DropdownMenu.Item>
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => { setRenameValue(activeConversationTitle); setRenamingTitle(true); }}
+                        >
+                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>Rename</span>
+                        </DropdownMenu.Item>
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => void handleArchiveConversation(activeConversationId)}
+                        >
+                          <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>Archive</span>
+                        </DropdownMenu.Item>
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => setExportOpen(true)}
+                        >
+                          <DownloadIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>Export</span>
+                        </DropdownMenu.Item>
+                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                          onSelect={() => setConfirmingDelete(true)}
+                        >
+                          <Trash2Icon className="h-4 w-4" />
+                          <span>Delete</span>
+                        </DropdownMenu.Item>
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Portal>
+                  </DropdownMenu.Root>
                 ) : (
-                  <span className="block truncate text-sm font-medium text-foreground">
+                  <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
                 )}
               </div>
-              {activeView === CHAT_VIEW && activeConversationId && (
-                <button
-                  type="button"
-                  onClick={() => setExportOpen(true)}
-                  className="titlebar-no-drag rounded-md p-1.5 text-muted-foreground hover:bg-muted/40 transition-colors"
-                  title="Export conversation"
-                >
-                  <DownloadIcon className="h-3.5 w-3.5" />
-                </button>
-              )}
+              </div>
             </div>
             <PluginBannerSlot />
             <div className="min-h-0 flex-1 overflow-hidden">
@@ -916,18 +1125,24 @@ function AppShell() {
               ) : activePluginPanel ? (
                 <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
               ) : (
-                <ThreadOrSubAgent
+                <>
+                  {/* Top fade — thread view only */}
+                  <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
+                  <ThreadOrSubAgent
                   mode={threadMode}
                   onChangeMode={setThreadMode}
                   selectedModelKey={selectedModelKey}
                   onSelectModel={setSelectedModelKey}
                   reasoningEffort={reasoningEffort}
                   onChangeReasoningEffort={setReasoningEffort}
+                  executionMode={executionMode}
+                  onChangeExecutionMode={setExecutionMode}
                   selectedProfileKey={selectedProfileKey}
                   onSelectProfile={handleSelectProfile}
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={handleToggleFallback}
                 />
+                </>
               )}
             </div>
           </main>
@@ -994,11 +1209,13 @@ const ThreadOrSubAgent: FC<{
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
+  executionMode: ExecutionMode;
+  onChangeExecutionMode: (value: ExecutionMode) => void;
   selectedProfileKey: string | null;
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const { activeSubAgentView, setActiveSubAgentView } = useSubAgents();
 
   if (activeSubAgentView) {
@@ -1018,6 +1235,8 @@ const ThreadOrSubAgent: FC<{
       onSelectModel={onSelectModel}
       reasoningEffort={reasoningEffort}
       onChangeReasoningEffort={onChangeReasoningEffort}
+      executionMode={executionMode}
+      onChangeExecutionMode={onChangeExecutionMode}
       selectedProfileKey={selectedProfileKey}
       onSelectProfile={onSelectProfile}
       fallbackEnabled={fallbackEnabled}

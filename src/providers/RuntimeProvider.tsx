@@ -77,6 +77,11 @@ type ContentPart =
       stopped?: boolean;
       subAgentConversationId?: string;
     };
+    /** Approval status for confirm-writes execution mode */
+    approvalStatus?: 'pending' | 'approved' | 'rejected';
+    /** The ID the backend uses for the approval promise — may differ from
+     *  toolCallId due to execute-side vs stream-side ID mismatch. */
+    approvalId?: string;
   };
 
 // A message with an ID and parentId for tree branching
@@ -113,7 +118,6 @@ export type ConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
-  selectedBackendKey?: string | null;
   metadata?: Record<string, unknown>;
   // Sub-agent metadata
   parentConversationId?: string | null;
@@ -144,6 +148,9 @@ type MessageAccumulator = {
   messages: StoredMessage[];
   headId: string | null;
   pendingAssistantTiming?: PendingAssistantTiming | null;
+  /** Deferred tool approvals keyed by toolName — handles race where
+   *  tool-approval-required arrives before the stream-side tool-call event. */
+  deferredApprovals?: Map<string, { toolCallId: string }>;
 };
 
 function nowIso(): string {
@@ -985,11 +992,14 @@ export function useFallbackBanner(): FallbackBannerActions {
 
 // =============================================================================
 
+export type ExecutionMode = 'auto' | 'plan-first' | 'confirm-writes';
+
 export function RuntimeProvider({
   children,
   conversationId,
   selectedModelKey,
   reasoningEffort,
+  executionMode,
   selectedProfileKey,
   fallbackEnabled,
   onModelFallback,
@@ -999,6 +1009,7 @@ export function RuntimeProvider({
   conversationId?: string | null;
   selectedModelKey?: string | null;
   reasoningEffort?: ReasoningEffort;
+  executionMode?: ExecutionMode;
   selectedProfileKey?: string | null;
   fallbackEnabled?: boolean;
   onModelFallback?: (toModelKey: string) => void;
@@ -1197,7 +1208,6 @@ export function RuntimeProvider({
           messageCount: 0, userMessageCount: 0,
           runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
           selectedModelKey: null,
-          selectedBackendKey: null,
           currentWorkingDirectory: defaultCwd,
         } as ConversationRecord);
         await app.conversations.setActiveId(newId);
@@ -1476,12 +1486,54 @@ export function RuntimeProvider({
         applyObserverMessage(acc, e.text ?? '', e.messageMeta);
       } else if (e.type === 'tool-call') {
         if (!e.toolCallId) return;
+        const toolName = e.toolName ?? 'unknown';
         applyToolCall(acc, {
           toolCallId: e.toolCallId,
-          toolName: e.toolName ?? 'unknown',
+          toolName,
           args: e.args,
           startedAt: e.startedAt,
         });
+        // Check for deferred approvals that arrived before this tool-call event
+        if (acc.deferredApprovals?.has(toolName)) {
+          const deferred = acc.deferredApprovals.get(toolName)!;
+          acc.deferredApprovals.delete(toolName);
+          const { msg, idx } = getOrCreateAssistantInAcc(acc);
+          const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+          const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+          if (tcIdx >= 0) {
+            const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
+            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId };
+            acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+          }
+        }
+      } else if (e.type === 'tool-approval-required') {
+        // Mark the tool call as needing approval
+        if (!e.toolCallId) return;
+        const { msg, idx } = getOrCreateAssistantInAcc(acc);
+        const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+        let tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+        // Fallback: the approval event may carry an execute-side ID that differs
+        // from the stream-side ID used in tool-call events.  Match by toolName
+        // against the most recent unapproved tool-call when exact ID lookup misses.
+        if (tcIdx < 0 && e.toolName) {
+          for (let i = content.length - 1; i >= 0; i--) {
+            const p = content[i];
+            if (p.type === 'tool-call' && p.toolName === e.toolName && !p.approvalStatus) {
+              tcIdx = i;
+              break;
+            }
+          }
+        }
+        if (tcIdx >= 0) {
+          const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
+          content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: e.toolCallId as string };
+          acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+        } else if (e.toolName) {
+          // tool-call event hasn't arrived yet — defer the approval so it can
+          // be applied when the matching tool-call stream event is processed.
+          if (!acc.deferredApprovals) acc.deferredApprovals = new Map();
+          acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string });
+        }
       } else if (e.type === 'tool-result') {
         applyToolResult(acc, {
           toolCallId: e.toolCallId,
@@ -1575,6 +1627,18 @@ export function RuntimeProvider({
             onModelFallbackRef.current?.(fbData.toModelKey);
           }
         }
+      } else if (e.type === 'retry') {
+        // Retry events are informational — show as observer message
+        const retryData = e.data as { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string } | undefined;
+        if (retryData) {
+          const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
+          const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
+          applyObserverMessage(acc, retryText);
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
+        }
       } else if (e.type === 'error') {
         finalizeAssistantResponse(acc);
         if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
@@ -1658,8 +1722,8 @@ export function RuntimeProvider({
     void maybeGenerateTitle(convId, branch);
     console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`);
     console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
-    app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined);
-  }, [tree, headId, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, consumeAttachments]);
+    app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto');
+  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, consumeAttachments]);
 
   const onReload = useCallback(async (parentId: string | null) => {
     const convId = activeIdRef.current;
@@ -1697,8 +1761,9 @@ export function RuntimeProvider({
       selectedProfileKey ?? undefined,
       fallbackEnabled ?? false,
       currentWorkingDirectoryRef.current ?? undefined,
+      executionMode ?? 'auto',
     );
-  }, [tree, headId, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled]);
+  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled]);
 
   const onCancel = useCallback(async () => {
     const convId = activeIdRef.current;

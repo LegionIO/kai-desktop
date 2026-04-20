@@ -3,6 +3,7 @@ import { open, readFile, stat } from 'fs/promises';
 import type { ToolDefinition } from './types.js';
 import { runToolExecution, throwIfAborted } from './execution.js';
 import { resolveToolPath } from './path-utils.js';
+import { detectEncoding, detectLineEnding, computeContentHash, getConversationCache } from './file-safety.js';
 
 async function safeStat(path: string): Promise<Awaited<ReturnType<typeof stat>> | null> {
   try {
@@ -69,6 +70,20 @@ export function createFileReadTool(): ToolDefinition {
 
         const content = await readFile(resolvedPath, 'utf-8');
         throwIfAborted(signal);
+
+        // Cache file metadata for staleness detection on subsequent writes
+        if (context.conversationId) {
+          const rawBuffer = Buffer.from(content, 'utf-8');
+          const cache = getConversationCache(context.conversationId);
+          cache.set(resolvedPath, {
+            path: resolvedPath,
+            mtimeMs: Number(fileStat.mtimeMs),
+            size: Number(fileStat.size),
+            contentHash: computeContentHash(content),
+            encoding: detectEncoding(rawBuffer),
+            lineEnding: detectLineEnding(content),
+          });
+        }
 
         if (typeof firstChars === 'number') {
           return { content: content.slice(0, firstChars), totalLength: content.length, path: resolvedPath };
