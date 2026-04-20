@@ -95,6 +95,13 @@ export const Thread: FC<{
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
   const activeConversationId = useActiveConversationId();
+  const threadRuntime = useThreadRuntime();
+  const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
+  useEffect(() => {
+    return threadRuntime.subscribe(() => {
+      setHasMessages(threadRuntime.getState().messages.length > 0);
+    });
+  }, [threadRuntime]);
   const { uiState: pluginUIState } = usePlugins();
   const threadDecorations = (pluginUIState?.threadDecorations ?? []).filter((decoration) => (
     decoration.visible && (!decoration.conversationId || decoration.conversationId === activeConversationId)
@@ -148,10 +155,11 @@ export const Thread: FC<{
                   }}
                 />
 
-                <div className="min-h-8" />
+                <div className="min-h-2" />
               </div>
             </div>
             <div className="sticky bottom-0 z-20">
+              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-48 bg-gradient-to-t from-background from-40% to-transparent md:h-56" />}
             {callState.isInCall ? (
               <CallOverlay />
             ) : (
@@ -404,7 +412,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   };
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
+    <div className="rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
       <div className="flex items-center gap-2">
         <RichChatInput
           value={text}
@@ -1868,7 +1876,7 @@ const Composer: FC<{
             }} />
           ) : null
         ) : (
-          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
+          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel

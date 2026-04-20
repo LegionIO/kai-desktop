@@ -25,6 +25,7 @@ interface Particle {
   connectable: boolean;
   twinklePhase: number;
   nudgeCountdown: number;
+  age: number; // frames since spawn, used for fade-in
 }
 
 /** Draw a fuzzy glowing star with soft halo */
@@ -141,7 +142,9 @@ function useConstellationsCanvas() {
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerleave', onPointerLeave);
 
-    const makeParticle = (width: number, height: number, connectable: boolean): Particle => ({
+    const FADE_IN_FRAMES = 40; // ~2s at 50ms/frame
+
+    const makeParticle = (width: number, height: number, connectable: boolean, preAged = false): Particle => ({
       x: Math.random() * width,
       y: Math.random() * height,
       vx: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
@@ -151,6 +154,7 @@ function useConstellationsCanvas() {
       connectable,
       twinklePhase: Math.random() * Math.PI * 2,
       nudgeCountdown: 60 + Math.floor(Math.random() * 200),
+      age: preAged ? FADE_IN_FRAMES : 0,
     });
 
     let prevWidth = 0;
@@ -187,13 +191,14 @@ function useConstellationsCanvas() {
       const keptNodes = kept.filter((p) => p.connectable);
       const keptStars = kept.filter((p) => !p.connectable);
 
+      const isInitial = particles.length === 0;
       const freshNodes = Array.from(
         { length: Math.max(0, nodeCount - keptNodes.length) },
-        () => makeParticle(width, height, true),
+        () => makeParticle(width, height, true, isInitial),
       );
       const freshStars = Array.from(
         { length: Math.max(0, starCount - keptStars.length) },
-        () => makeParticle(width, height, false),
+        () => makeParticle(width, height, false, isInitial),
       );
 
       particles = [...keptNodes, ...freshNodes, ...keptStars, ...freshStars];
@@ -356,12 +361,18 @@ function useConstellationsCanvas() {
 
       // Draw particles as glowing dots
       for (const p of particles) {
+        p.age = Math.min(p.age + 1, FADE_IN_FRAMES);
+        const fadeIn = p.age / FADE_IN_FRAMES;
+
         let alpha = p.opacity;
 
         if (!p.connectable) {
+          // Softer twinkle: range 0.5–1.0 instead of 0.3–1.0
           const twinkle = Math.sin(tick * 0.016 + p.twinklePhase);
-          alpha = p.opacity * (0.3 + 0.7 * ((twinkle + 1) / 2));
+          alpha = p.opacity * (0.5 + 0.5 * ((twinkle + 1) / 2));
         }
+
+        alpha *= fadeIn;
 
         // Brighten stars near the cursor
         let color = dotColor;

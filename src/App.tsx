@@ -979,7 +979,9 @@ function AppShell() {
           </div>,
           document.body,
         )}
-        <div className="flex h-screen overflow-hidden bg-background text-foreground">
+        <div className="relative flex h-screen overflow-hidden text-foreground">
+          {/* Full-width top fade — spans behind sidebar and main content */}
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
             <div
@@ -992,11 +994,11 @@ function AppShell() {
             className={
               isMobile
                 ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
-                : 'flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
+                : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
             }
             style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
-            <div className="app-shell-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-sidebar-border/80">
+            <div className="app-composer-glass app-composer-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
               <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
@@ -1058,8 +1060,6 @@ function AppShell() {
 
           {/* Main content area */}
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            {/* Fade overlay — purely visual, no interaction */}
-            <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
             {/* Interactive title bar */}
             <div className={`${titleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
