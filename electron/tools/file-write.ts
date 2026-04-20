@@ -1,9 +1,18 @@
 import { z } from 'zod';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile, stat } from 'fs/promises';
 import { dirname } from 'path';
 import type { ToolDefinition } from './types.js';
 import { runToolExecution, throwIfAborted } from './execution.js';
 import { resolveToolPath } from './path-utils.js';
+import {
+  checkStaleness,
+  checkFileSize,
+  getConversationCache,
+  encodeContent,
+  updateCacheAfterWrite,
+  detectEncoding,
+  detectLineEnding,
+} from './file-safety.js';
 
 async function readIfExists(path: string): Promise<string> {
   try {
@@ -40,19 +49,41 @@ export function createFileWriteTool(): ToolDefinition {
         };
         const resolvedPath = resolveToolPath(path, context.cwd);
 
+        // File size guard
+        const sizeError = await checkFileSize(resolvedPath);
+        if (sizeError) return { error: sizeError, isError: true };
+
+        // Staleness check
+        const convId = context.conversationId ?? '';
+        const staleError = await checkStaleness(resolvedPath, convId);
+        if (staleError) return { error: staleError, isError: true };
+
         if (createDirs) {
           await mkdir(dirname(resolvedPath), { recursive: true });
         }
         throwIfAborted(signal);
 
+        // Determine encoding from cached metadata or detect from file
+        const cache = getConversationCache(convId);
+        const cached = cache.get(resolvedPath);
+        const encoding = cached?.encoding ?? 'utf-8';
+        const lineEnding = cached?.lineEnding ?? 'lf';
+
         if (mode === 'overwrite') {
-          await writeFile(resolvedPath, content, 'utf-8');
-          return { success: true, path: resolvedPath, bytesWritten: Buffer.byteLength(content) };
+          const encoded = encodeContent(content, encoding, lineEnding);
+          await writeFile(resolvedPath, encoded);
+          const newStat = await stat(resolvedPath);
+          updateCacheAfterWrite(resolvedPath, convId, content, encoding, lineEnding, newStat.mtimeMs, newStat.size);
+          return { success: true, path: resolvedPath, bytesWritten: encoded.length };
         }
 
         if (mode === 'append') {
           const existing = await readIfExists(resolvedPath);
-          await writeFile(resolvedPath, existing + content, 'utf-8');
+          const combined = existing + content;
+          const encoded = encodeContent(combined, encoding, lineEnding);
+          await writeFile(resolvedPath, encoded);
+          const newStat = await stat(resolvedPath);
+          updateCacheAfterWrite(resolvedPath, convId, combined, encoding, lineEnding, newStat.mtimeMs, newStat.size);
           return { success: true, path: resolvedPath, mode: 'append' };
         }
 
@@ -61,7 +92,11 @@ export function createFileWriteTool(): ToolDefinition {
           const lines = existing.split('\n');
           const insertIdx = Math.max(0, Math.min(lines.length, atLine - 1));
           lines.splice(insertIdx, 0, content);
-          await writeFile(resolvedPath, lines.join('\n'), 'utf-8');
+          const combined = lines.join('\n');
+          const encoded = encodeContent(combined, encoding, lineEnding);
+          await writeFile(resolvedPath, encoded);
+          const newStat = await stat(resolvedPath);
+          updateCacheAfterWrite(resolvedPath, convId, combined, encoding, lineEnding, newStat.mtimeMs, newStat.size);
           return { success: true, path: resolvedPath, mode: 'insert_at_line', atLine: insertIdx + 1 };
         }
 
@@ -71,7 +106,11 @@ export function createFileWriteTool(): ToolDefinition {
           const start = Math.max(0, startLine - 1);
           const end = Math.min(lines.length, endLine);
           lines.splice(start, end - start, content);
-          await writeFile(resolvedPath, lines.join('\n'), 'utf-8');
+          const combined = lines.join('\n');
+          const encoded = encodeContent(combined, encoding, lineEnding);
+          await writeFile(resolvedPath, encoded);
+          const newStat = await stat(resolvedPath);
+          updateCacheAfterWrite(resolvedPath, convId, combined, encoding, lineEnding, newStat.mtimeMs, newStat.size);
           return { success: true, path: resolvedPath, mode: 'replace_lines', replacedRange: `${startLine}-${endLine}` };
         }
 
@@ -101,10 +140,31 @@ export function createFileEditTool(): ToolDefinition {
         };
         const resolvedPath = resolveToolPath(path, context.cwd);
 
-        const content = await readFile(resolvedPath, 'utf-8');
-        throwIfAborted(signal);
-        const occurrences = content.split(old_string).length - 1;
+        // File size guard
+        const sizeError = await checkFileSize(resolvedPath);
+        if (sizeError) return { error: sizeError, isError: true };
 
+        // Staleness check
+        const convId = context.conversationId ?? '';
+        const staleError = await checkStaleness(resolvedPath, convId);
+        if (staleError) return { error: staleError, isError: true };
+
+        // Read file preserving encoding info
+        const buffer = await readFile(resolvedPath);
+        const encoding = detectEncoding(buffer);
+        let content: string;
+        if (encoding === 'utf-16le') {
+          content = buffer.toString('utf16le');
+          if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+        } else {
+          content = buffer.toString('utf-8');
+          if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+        }
+
+        const lineEnding = detectLineEnding(content);
+        throwIfAborted(signal);
+
+        const occurrences = content.split(old_string).length - 1;
         if (occurrences === 0) return { error: 'old_string not found in file', isError: true };
         if (occurrences > 1 && !replace_all) {
           return { error: `old_string found ${occurrences} times. Use replace_all: true or provide more context.`, isError: true };
@@ -114,7 +174,13 @@ export function createFileEditTool(): ToolDefinition {
           ? content.replaceAll(old_string, new_string)
           : content.replace(old_string, new_string);
 
-        await writeFile(resolvedPath, updated, 'utf-8');
+        const encoded = encodeContent(updated, encoding, lineEnding);
+        await writeFile(resolvedPath, encoded);
+
+        // Update cache after successful write
+        const newStat = await stat(resolvedPath);
+        updateCacheAfterWrite(resolvedPath, convId, updated, encoding, lineEnding, newStat.mtimeMs, newStat.size);
+
         return { success: true, path: resolvedPath, replacements: replace_all ? occurrences : 1 };
       },
     }),

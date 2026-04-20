@@ -24,7 +24,7 @@ export type LLMModelConfig = {
   maxRetries?: number;
 };
 
-export type AgentBackendPreference = 'auto' | 'mastra' | 'claude-code' | 'codex';
+export type AgentBackendPreference = 'auto' | 'mastra';
 
 export type ModelCatalogEntry = {
   key: string;

@@ -9,8 +9,6 @@ import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import { getAgentBackend, listAgentBackends, registerAgentBackend } from '../agent/backend-registry.js';
 import { resolveAgentBackendKey } from '../agent/backend-resolution.js';
-import { createClaudeCodeBackend } from '../agent/claude-code-backend.js';
-import { createCodexBackend } from '../agent/codex-backend.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
@@ -173,14 +171,47 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): string {
+import { loadProjectInstructions, buildInstructionsPrompt } from '../agent/instructions.js';
+
+// Cache loaded instructions per cwd to avoid re-reading on every message
+const instructionsCache = new Map<string, { prompt: string; loadedAt: number }>();
+const INSTRUCTIONS_CACHE_TTL_MS = 30_000; // 30 seconds
+
+async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Promise<string> {
   if (!cwd) return basePrompt;
 
-  return [
+  const parts = [
     basePrompt,
     `Current working directory for this conversation: ${cwd}`,
     'Use this directory as the default base path for shell and filesystem work unless the user explicitly chooses another path.',
-  ].filter(Boolean).join('\n\n');
+  ];
+
+  // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
+  try {
+    const cached = instructionsCache.get(cwd);
+    const now = Date.now();
+    let instructionsPrompt: string;
+
+    if (cached && (now - cached.loadedAt) < INSTRUCTIONS_CACHE_TTL_MS) {
+      instructionsPrompt = cached.prompt;
+    } else {
+      const sources = await loadProjectInstructions(cwd);
+      instructionsPrompt = buildInstructionsPrompt(sources);
+      instructionsCache.set(cwd, { prompt: instructionsPrompt, loadedAt: now });
+
+      if (sources.length > 0) {
+        console.info(`[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`);
+      }
+    }
+
+    if (instructionsPrompt) {
+      parts.push(instructionsPrompt);
+    }
+  } catch (err) {
+    console.warn('[Instructions] Failed to load project instructions:', err);
+  }
+
+  return parts.filter(Boolean).join('\n\n');
 }
 
 function logToolCompactionDebug(stage: string, details: Record<string, unknown>): void {
@@ -271,35 +302,55 @@ function ensureBuiltInAgentBackends(): void {
     key: 'mastra',
     displayName: 'Mastra',
     stream: (options) => {
-      if (!options.primaryModel || !options.streamConfig) {
-        return (async function* missingModelStream(): AsyncGenerator<StreamEvent> {
+      return (async function* mastraStream(): AsyncGenerator<StreamEvent> {
+        if (!options.primaryModel || !options.streamConfig) {
           yield {
             conversationId: options.conversationId,
             type: 'text-delta',
             text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
           };
           yield { conversationId: options.conversationId, type: 'done' };
-        })();
-      }
+          return;
+        }
 
-      const dbPath = join(options.appHome, 'data', 'memory.db');
-      const configForStream: AppConfig = {
-        ...options.config,
-        systemPrompt: withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
-        advanced: {
-          ...options.config.advanced,
-          temperature: options.streamConfig.temperature,
-          maxSteps: options.streamConfig.maxSteps,
-          maxRetries: options.streamConfig.maxRetries,
-        },
-      };
+        const dbPath = join(options.appHome, 'data', 'memory.db');
+        const configForStream: AppConfig = {
+          ...options.config,
+          systemPrompt: await withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
+          advanced: {
+            ...options.config.advanced,
+            temperature: options.streamConfig.temperature,
+            maxSteps: options.streamConfig.maxSteps,
+            maxRetries: options.streamConfig.maxRetries,
+          },
+        };
 
-      if (options.streamConfig.fallbackEnabled) {
-        return streamWithFallback(
+        if (options.streamConfig.fallbackEnabled) {
+          yield* streamWithFallback(
+            options.conversationId,
+            options.messages,
+            options.streamConfig,
+            options.config,
+            options.tools,
+            dbPath,
+            {
+              reasoningEffort: options.reasoningEffort,
+              abortSignal: options.abortSignal,
+              cwd: options.cwd,
+              emitEvent: options.emitEvent,
+              onToolExecutionStart: options.onToolExecutionStart,
+              onToolExecutionEnd: options.onToolExecutionEnd,
+              augmentToolResult: options.augmentToolResult,
+            },
+          );
+          return;
+        }
+
+        yield* streamAgentResponse(
           options.conversationId,
           options.messages,
-          options.streamConfig,
-          options.config,
+          options.primaryModel.modelConfig,
+          configForStream,
           options.tools,
           dbPath,
           {
@@ -312,30 +363,9 @@ function ensureBuiltInAgentBackends(): void {
             augmentToolResult: options.augmentToolResult,
           },
         );
-      }
-
-      return streamAgentResponse(
-        options.conversationId,
-        options.messages,
-        options.primaryModel.modelConfig,
-        configForStream,
-        options.tools,
-        dbPath,
-        {
-          reasoningEffort: options.reasoningEffort,
-          abortSignal: options.abortSignal,
-          cwd: options.cwd,
-          emitEvent: options.emitEvent,
-          onToolExecutionStart: options.onToolExecutionStart,
-          onToolExecutionEnd: options.onToolExecutionEnd,
-          augmentToolResult: options.augmentToolResult,
-        },
-      );
+      })();
     },
   });
-
-  registerAgentBackend(createClaudeCodeBackend());
-  registerAgentBackend(createCodexBackend());
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
@@ -944,15 +974,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
               // In confirm-writes mode, block mutating tools until user approves
               const MUTATING_TOOLS = new Set(['file_write', 'file_edit', 'sh']);
               if (executionMode === 'confirm-writes' && MUTATING_TOOLS.has(state.toolName)) {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
                 broadcastStreamEvent({
                   conversationId,
                   type: 'tool-approval-required',
-                  toolCallId: state.toolCallId,
+                  toolCallId: streamId,
                   toolName: state.toolName,
                   args: state.args,
                 });
                 const approved = await new Promise<boolean>((resolve) => {
-                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                  pendingToolApprovals.set(streamId, { resolve });
                 });
                 if (!approved) {
                   state.cancel();
@@ -961,15 +992,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
 
               // Gate exit_plan_mode behind user approval regardless of execution mode
               if (state.toolName === 'exit_plan_mode') {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
                 broadcastStreamEvent({
                   conversationId,
                   type: 'tool-approval-required',
-                  toolCallId: state.toolCallId,
+                  toolCallId: streamId,
                   toolName: state.toolName,
                   args: state.args,
                 });
                 const approved = await new Promise<boolean>((resolve) => {
-                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                  pendingToolApprovals.set(streamId, { resolve });
                 });
                 if (!approved) {
                   state.cancel();
@@ -978,18 +1010,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
 
               // Gate ask_user behind user response — blocks until user submits answers
               if (state.toolName === 'ask_user') {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
                 broadcastStreamEvent({
                   conversationId,
                   type: 'tool-approval-required',
-                  toolCallId: state.toolCallId,
+                  toolCallId: streamId,
                   toolName: state.toolName,
                   args: state.args,
                 });
                 const approved = await new Promise<boolean>((resolve) => {
-                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                  pendingToolApprovals.set(streamId, { resolve });
                 });
                 if (!approved) {
                   state.cancel();
+                } else {
+                  // Copy answers from stream-side ID to execute-side ID so the tool's execute() can find them
+                  const answers = pendingQuestionAnswers.get(streamId);
+                  if (answers) {
+                    pendingQuestionAnswers.set(state.toolCallId, answers);
+                    pendingQuestionAnswers.delete(streamId);
+                  }
                 }
               }
             },
@@ -1255,9 +1295,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       const catalog = resolveModelCatalog(config);
       return {
         models: catalog.entries.map((e) => {
-          const backendKey = resolveAgentBackendKey(e);
-          const backend = getAgentBackend(backendKey);
-          const backendAvailable = backend ? (backend.isAvailable?.() ?? true) : false;
           return {
             key: e.key,
             displayName: e.displayName,
@@ -1265,8 +1302,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             computerUseSupport: e.computerUseSupport,
             visionCapable: e.visionCapable,
             preferredTarget: e.preferredTarget,
-            resolvedBackend: backendKey,
-            resolvedBackendLabel: backendAvailable && backendKey !== 'mastra' ? (backend?.displayName ?? backendKey) : null,
           };
         }),
         defaultKey: catalog.defaultEntry?.key ?? null,

@@ -156,7 +156,6 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
-  const [useAgentSdk, setUseAgentSdk] = useState(true);
   const [profilePrimaryModelKey, setProfilePrimaryModelKey] = useState<string | null>(null);
 
   useEffect(() => {
@@ -231,18 +230,6 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
     }
   }, [profilePrimaryModelKey, selectedProfileKey]);
 
-  const handleToggleAgentSdk = useCallback(async (enabled: boolean) => {
-    setUseAgentSdk(enabled);
-    // Persist to the active conversation so the main process picks it up
-    const id = conversationId ?? await app.conversations.getActiveId();
-    if (id) {
-      const conv = await app.conversations.get(id) as ConversationRecord | null;
-      if (conv) {
-        await app.conversations.put({ ...conv, selectedBackendKey: enabled ? null : 'mastra' });
-      }
-    }
-  }, [conversationId]);
-
   return (
     <div className="h-screen overflow-hidden bg-background px-6 py-6 text-foreground">
       <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-4">
@@ -268,8 +255,6 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
                 onSelectProfile={handleSelectProfile}
                 fallbackEnabled={fallbackEnabled}
                 onToggleFallback={handleToggleFallback}
-                useAgentSdk={useAgentSdk}
-                onToggleAgentSdk={handleToggleAgentSdk}
                 startSurface="window"
                 activeComputerSession={activeComputerSession}
               />
@@ -411,7 +396,6 @@ function AppShell() {
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
-  const [useAgentSdk, setUseAgentSdk] = useState(true);
   const { sessionsByConversation: cuSessionsByConversation } = useComputerUse();
   // Track the primary model key of the currently selected profile so we can
   // restore it when auto-routing is re-enabled.
@@ -665,7 +649,6 @@ function AppShell() {
         messageCount: 0, userMessageCount: 0,
         runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
         selectedModelKey: null,
-        selectedBackendKey: null,
         currentWorkingDirectory: null,
       });
       await app.conversations.setActiveId(newId);
@@ -746,17 +729,6 @@ function AppShell() {
     }
   }, [selectedProfileKey, profilePrimaryModelKey]);
 
-  const handleToggleAgentSdk = useCallback(async (enabled: boolean) => {
-    setUseAgentSdk(enabled);
-    const id = activeConversationId ?? await app.conversations.getActiveId();
-    if (id) {
-      const conv = await app.conversations.get(id) as ConversationRecord | null;
-      if (conv) {
-        await app.conversations.put({ ...conv, selectedBackendKey: enabled ? null : 'mastra' });
-      }
-    }
-  }, [activeConversationId]);
-
   // Restore per-conversation settings when switching conversations
   const handleConversationSettingsLoaded = useCallback((settings: {
     selectedModelKey: string | null;
@@ -769,8 +741,6 @@ function AppShell() {
     setSelectedProfileKey(settings.selectedProfileKey);
     setFallbackEnabled(settings.fallbackEnabled);
     setProfilePrimaryModelKey(settings.profilePrimaryModelKey);
-    // selectedBackendKey === 'mastra' means user explicitly disabled the SDK toggle
-    setUseAgentSdk(settings.selectedBackendKey !== 'mastra');
   }, []);
 
   // Persist per-conversation settings whenever they change
@@ -1172,8 +1142,6 @@ function AppShell() {
                   onSelectProfile={handleSelectProfile}
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={handleToggleFallback}
-                  useAgentSdk={useAgentSdk}
-                  onToggleAgentSdk={handleToggleAgentSdk}
                 />
                 </>
               )}
@@ -1248,9 +1216,7 @@ const ThreadOrSubAgent: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-  useAgentSdk: boolean;
-  onToggleAgentSdk: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const { activeSubAgentView, setActiveSubAgentView } = useSubAgents();
 
   if (activeSubAgentView) {
@@ -1276,8 +1242,6 @@ const ThreadOrSubAgent: FC<{
       onSelectProfile={onSelectProfile}
       fallbackEnabled={fallbackEnabled}
       onToggleFallback={onToggleFallback}
-      useAgentSdk={useAgentSdk}
-      onToggleAgentSdk={onToggleAgentSdk}
     />
   );
 };

@@ -31,25 +31,7 @@ type CatalogEntry = {
   computerUseSupport?: 'openai-responses' | 'anthropic-client-tool' | 'gemini-computer-use' | 'custom' | 'none';
   visionCapable?: boolean;
   preferredTarget?: 'isolated-browser' | 'local-macos';
-  agentBackend?: 'auto' | 'mastra' | 'claude-code' | 'codex';
 };
-
-/** Resolve which agent backend a catalog entry will use at runtime. */
-function resolveBackendLabel(entry: CatalogEntry, providers: Record<string, Provider>): string | null {
-  const explicit = entry.agentBackend;
-  if (explicit && explicit !== 'auto') {
-    if (explicit === 'mastra') return null;
-    if (explicit === 'claude-code') return 'Claude Code SDK';
-    if (explicit === 'codex') return 'Codex SDK';
-    return null;
-  }
-  const providerType = providers[entry.provider]?.type;
-  if (providerType === 'anthropic') return 'Claude Code SDK';
-  // Claude models on any provider (Bedrock, OpenAI-compatible gateways, etc.)
-  if (/claude|anthropic/i.test(entry.modelName)) return 'Claude Code SDK';
-  if (providerType === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(entry.modelName)) return 'Codex SDK';
-  return null;
-}
 
 export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const models = config.models as {
@@ -155,9 +137,6 @@ const ModelCatalog: FC<{
                   {m.computerUseSupport && m.computerUseSupport !== 'none' && (
                     <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">Autopilot</span>
                   )}
-                  {resolveBackendLabel(m, providers) && (
-                    <span className="text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 rounded px-1.5 py-0.5 shrink-0">{resolveBackendLabel(m, providers)}</span>
-                  )}
                 </div>
                 <div className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">
                   {m.modelName}
@@ -217,20 +196,6 @@ const ModelForm: FC<{
   const [visionCapable, setVisionCapable] = useState(initial.visionCapable ?? false);
   const [preferredTarget, setPreferredTarget] = useState(initial.preferredTarget ?? 'isolated-browser');
 
-  // Resolve the default backend from provider + model name when not explicitly set
-  const resolveDefaultBackend = (prov: string, model: string): NonNullable<CatalogEntry['agentBackend']> => {
-    const providerType = providers[prov]?.type;
-    if (providerType === 'anthropic') return 'claude-code';
-    if (/claude|anthropic/i.test(model)) return 'claude-code';
-    if (providerType === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(model)) return 'codex';
-    return 'mastra';
-  };
-  const [agentBackend, setAgentBackend] = useState<CatalogEntry['agentBackend']>(
-    initial.agentBackend && initial.agentBackend !== 'auto'
-      ? initial.agentBackend
-      : resolveDefaultBackend(initial.provider, initial.modelName),
-  );
-
   const selectedProvider = providers[provider];
 
   const canSave = key.trim() && displayName.trim() && provider && modelName.trim();
@@ -253,7 +218,6 @@ const ModelForm: FC<{
     entry.computerUseSupport = computerUseSupport;
     entry.visionCapable = visionCapable;
     entry.preferredTarget = preferredTarget;
-    if (agentBackend && agentBackend !== 'mastra') entry.agentBackend = agentBackend;
     onSave(entry);
   };
 
@@ -363,23 +327,6 @@ const ModelForm: FC<{
             <option value="local-macos">Local Mac</option>
           </select>
         </div>
-      </div>
-
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Agent Backend</label>
-        <select
-          className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
-          value={agentBackend}
-          onChange={(e) => setAgentBackend((e.target.value || 'auto') as NonNullable<CatalogEntry['agentBackend']>)}
-        >
-          <option value="mastra">Mastra</option>
-          {(selectedProvider?.type === 'anthropic' || /claude|anthropic/i.test(modelName)) && (
-            <option value="claude-code">Claude Code SDK</option>
-          )}
-          {selectedProvider?.type === 'openai-compatible' && /^(gpt|o[1-4]|chatgpt)/i.test(modelName) && (
-            <option value="codex">Codex SDK</option>
-          )}
-        </select>
       </div>
 
       <Toggle label="Vision Capable" checked={visionCapable} onChange={setVisionCapable} />

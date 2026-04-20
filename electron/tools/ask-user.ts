@@ -13,10 +13,10 @@ const questionOptionSchema = z.object({
 });
 
 const questionSchema = z.object({
-  question: z.string().describe('The question to ask the user'),
-  header: z.string().max(12).describe('Short tab label (max 12 chars), e.g. "Auth method"'),
-  options: z.array(questionOptionSchema).min(2).max(4).describe('Available choices (2-4 options)'),
-  multiSelect: z.boolean().optional().default(false).describe('Allow multiple selections'),
+  question: z.string().describe('The complete question to ask the user. Should be clear, specific, and end with a question mark.'),
+  header: z.string().max(12).describe('Very short tab label (max 12 chars), e.g. "Auth method", "Library", "Approach"'),
+  options: z.array(questionOptionSchema).min(2).max(4).describe('Available choices (2-4 options). Each should be distinct. Do NOT include an "Other" option — one is provided automatically by the UI.'),
+  multiSelect: z.boolean().optional().default(false).describe('Allow multiple selections. Use when choices are not mutually exclusive.'),
 });
 
 export function createAskUserTool(): ToolDefinition {

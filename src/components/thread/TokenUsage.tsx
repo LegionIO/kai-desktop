@@ -30,14 +30,14 @@ export const TokenUsage: FC<{ usage: TokenUsageData }> = ({ usage }) => {
               <span className="opacity-60">in</span>{' '}
               <span className="tabular-nums">{formatTokenCount(inputTokens)}</span>
             </span>
-            <span className="opacity-30">·</span>
+            <span className="opacity-30">&middot;</span>
             <span title="Output tokens">
               <span className="opacity-60">out</span>{' '}
               <span className="tabular-nums">{formatTokenCount(outputTokens)}</span>
             </span>
             {hasCacheTokens && (
               <>
-                <span className="opacity-30">·</span>
+                <span className="opacity-30">&middot;</span>
                 <span title={`Cache read: ${formatTokenCount(cacheReadTokens)} / Cache write: ${formatTokenCount(cacheWriteTokens)}`}>
                   <span className="opacity-60">cache</span>{' '}
                   <span className="tabular-nums">{formatTokenCount(cacheReadTokens + cacheWriteTokens)}</span>
@@ -46,7 +46,7 @@ export const TokenUsage: FC<{ usage: TokenUsageData }> = ({ usage }) => {
             )}
             {cacheHitRatio !== null && cacheHitRatio > 0 && (
               <>
-                <span className="opacity-30">·</span>
+                <span className="opacity-30">&middot;</span>
                 <span
                   className="tabular-nums text-emerald-500/60"
                   title={`Cache hit ratio: ${Math.round(cacheHitRatio * 100)}%`}

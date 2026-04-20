@@ -88,9 +88,7 @@ export const Thread: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-  useAgentSdk: boolean;
-  onToggleAgentSdk: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
@@ -176,8 +174,6 @@ export const Thread: FC<{
                 onSelectProfile={onSelectProfile}
                 fallbackEnabled={fallbackEnabled}
                 onToggleFallback={onToggleFallback}
-                useAgentSdk={useAgentSdk}
-                onToggleAgentSdk={onToggleAgentSdk}
               />
             )}
           </div>
@@ -202,8 +198,6 @@ export const Thread: FC<{
               onSelectProfile={onSelectProfile}
               fallbackEnabled={fallbackEnabled}
               onToggleFallback={onToggleFallback}
-              useAgentSdk={useAgentSdk}
-              onToggleAgentSdk={onToggleAgentSdk}
             />
           )}
         </>
@@ -713,6 +707,8 @@ const ToolFallback: FC<{
     truncated?: boolean;
     stopped?: boolean;
   };
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
+  approvalId?: string;
 }> = (props) => {
   const hasResult = props.result !== undefined;
   const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
@@ -767,6 +763,8 @@ const ToolFallback: FC<{
           compactionMeta: props.compactionMeta,
           compactionPhase: props.compactionPhase,
           liveOutput: props.liveOutput,
+          approvalStatus: props.approvalStatus,
+          approvalId: props.approvalId,
         }}
         onSendFeedback={handleSendFeedback}
       />
@@ -1621,9 +1619,7 @@ const Composer: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-  useAgentSdk: boolean;
-  onToggleAgentSdk: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback, useAgentSdk, onToggleAgentSdk }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -1898,8 +1894,6 @@ const Composer: FC<{
                   onSelectProfile={onSelectProfile}
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={onToggleFallback}
-                  useAgentSdk={useAgentSdk}
-                  onToggleAgentSdk={onToggleAgentSdk}
                   activeComputerSession={activeComputerSession}
                   onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
                   renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
@@ -2040,8 +2034,6 @@ const Composer: FC<{
                     onChangeReasoningEffort={onChangeReasoningEffort}
                     fallbackEnabled={fallbackEnabled}
                     onToggleFallback={onToggleFallback}
-                    useAgentSdk={useAgentSdk}
-                    onToggleAgentSdk={onToggleAgentSdk}
                     selectedProfileKey={selectedProfileKey}
                     onSelectProfile={onSelectProfile}
                     executionMode={executionMode}

@@ -29,7 +29,7 @@ export function createEnterPlanModeTool(): ToolDefinition {
       return {
         success: true,
         mode: 'plan-first',
-        message: 'Switched to plan-first mode. Write tools are now disabled. Focus on reading, exploring, and producing a detailed implementation plan. When your plan is complete, call exit_plan_mode to let the user review and approve.',
+        message: 'Switched to plan-first mode. Write tools (file_write, file_edit, sh) are disabled until the user exits plan mode. Focus on reading, exploring, and producing a detailed implementation plan. When your plan is complete, call exit_plan_mode to let the user review and approve.',
         ...(reason ? { reason } : {}),
       };
     },
@@ -53,7 +53,7 @@ export function createExitPlanModeTool(): ToolDefinition {
       return {
         success: true,
         mode: 'auto',
-        message: 'Exited plan mode. All tools are now available. You may proceed with implementation.',
+        message: 'Plan mode has been deactivated. All tools including file_write, file_edit, and sh are now available. The PLAN MODE ACTIVE restriction from the system prompt no longer applies. You may now proceed with implementation using any tools.',
         ...(summary ? { summary } : {}),
       };
     },

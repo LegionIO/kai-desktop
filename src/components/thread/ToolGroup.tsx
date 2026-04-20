@@ -53,6 +53,8 @@ type ToolCallPart = {
   };
   /** Approval status for confirm-writes execution mode */
   approvalStatus?: 'pending' | 'approved' | 'rejected';
+  /** Backend-side approval ID — may differ from toolCallId due to ID mismatch */
+  approvalId?: string;
 };
 
 export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: string) => void }> = ({ parts, onSendFeedback }) => {
@@ -90,21 +92,21 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
 
   const handleApprove = useCallback(() => {
     setLocalApproval('approved');
-    void app.agent.approveToolCall(part.toolCallId);
-  }, [part.toolCallId]);
+    void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
+  }, [part.toolCallId, part.approvalId]);
 
   const handleReject = useCallback(() => {
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.toolCallId);
-  }, [part.toolCallId]);
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+  }, [part.toolCallId, part.approvalId]);
 
   const handleFeedbackSubmit = useCallback(() => {
     if (!feedbackText.trim()) return;
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.toolCallId);
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
     onSendFeedback?.(feedbackText.trim());
     setFeedbackText('');
-  }, [part.toolCallId, feedbackText, onSendFeedback]);
+  }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback]);
 
   const summary = getToolSummary(part);
 
@@ -141,7 +143,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       {/* Ask user questionnaire UI */}
       {isPendingApproval && isAskUser && (
         <QuestionnaireView
-          toolCallId={part.toolCallId}
+          toolCallId={part.approvalId ?? part.toolCallId}
           args={part.args}
           onSubmit={() => setLocalApproval('approved')}
         />

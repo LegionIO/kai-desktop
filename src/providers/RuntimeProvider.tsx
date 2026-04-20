@@ -79,6 +79,9 @@ type ContentPart =
     };
     /** Approval status for confirm-writes execution mode */
     approvalStatus?: 'pending' | 'approved' | 'rejected';
+    /** The ID the backend uses for the approval promise — may differ from
+     *  toolCallId due to execute-side vs stream-side ID mismatch. */
+    approvalId?: string;
   };
 
 // A message with an ID and parentId for tree branching
@@ -146,6 +149,9 @@ type MessageAccumulator = {
   messages: StoredMessage[];
   headId: string | null;
   pendingAssistantTiming?: PendingAssistantTiming | null;
+  /** Deferred tool approvals keyed by toolName — handles race where
+   *  tool-approval-required arrives before the stream-side tool-call event. */
+  deferredApprovals?: Map<string, { toolCallId: string }>;
 };
 
 function nowIso(): string {
@@ -1483,22 +1489,53 @@ export function RuntimeProvider({
         applyObserverMessage(acc, e.text ?? '', e.messageMeta);
       } else if (e.type === 'tool-call') {
         if (!e.toolCallId) return;
+        const toolName = e.toolName ?? 'unknown';
         applyToolCall(acc, {
           toolCallId: e.toolCallId,
-          toolName: e.toolName ?? 'unknown',
+          toolName,
           args: e.args,
           startedAt: e.startedAt,
         });
+        // Check for deferred approvals that arrived before this tool-call event
+        if (acc.deferredApprovals?.has(toolName)) {
+          const deferred = acc.deferredApprovals.get(toolName)!;
+          acc.deferredApprovals.delete(toolName);
+          const { msg, idx } = getOrCreateAssistantInAcc(acc);
+          const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+          const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+          if (tcIdx >= 0) {
+            const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
+            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId };
+            acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+          }
+        }
       } else if (e.type === 'tool-approval-required') {
         // Mark the tool call as needing approval
         if (!e.toolCallId) return;
         const { msg, idx } = getOrCreateAssistantInAcc(acc);
         const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
-        const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+        let tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+        // Fallback: the approval event may carry an execute-side ID that differs
+        // from the stream-side ID used in tool-call events.  Match by toolName
+        // against the most recent unapproved tool-call when exact ID lookup misses.
+        if (tcIdx < 0 && e.toolName) {
+          for (let i = content.length - 1; i >= 0; i--) {
+            const p = content[i];
+            if (p.type === 'tool-call' && p.toolName === e.toolName && !p.approvalStatus) {
+              tcIdx = i;
+              break;
+            }
+          }
+        }
         if (tcIdx >= 0) {
           const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-          content[tcIdx] = { ...existing, approvalStatus: 'pending' };
+          content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: e.toolCallId as string };
           acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+        } else if (e.toolName) {
+          // tool-call event hasn't arrived yet — defer the approval so it can
+          // be applied when the matching tool-call stream event is processed.
+          if (!acc.deferredApprovals) acc.deferredApprovals = new Map();
+          acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string });
         }
       } else if (e.type === 'tool-result') {
         applyToolResult(acc, {
@@ -1591,6 +1628,18 @@ export function RuntimeProvider({
           // Update model selector to show the fallback model
           if (fbData.toModelKey) {
             onModelFallbackRef.current?.(fbData.toModelKey);
+          }
+        }
+      } else if (e.type === 'retry') {
+        // Retry events are informational — show as observer message
+        const retryData = e.data as { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string } | undefined;
+        if (retryData) {
+          const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
+          const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
+          applyObserverMessage(acc, retryText);
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
           }
         }
       } else if (e.type === 'error') {

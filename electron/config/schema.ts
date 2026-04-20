@@ -35,7 +35,7 @@ const providerSchema = z.object({
   extraHeaders: z.record(z.string(), z.string()).optional(),
 });
 
-const agentBackendSchema = z.enum(['auto', 'mastra', 'claude-code', 'codex']);
+const agentBackendSchema = z.enum(['auto', 'mastra']);
 
 const modelEntrySchema = z.object({
   key: z.string(),
