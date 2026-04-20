@@ -62,6 +62,8 @@ export interface WorkspaceTask {
   labels: string[];
   linkedPluginData?: Record<string, unknown>;
   reviewComments?: ReviewComment[];
+  worktreePath?: string;      // path to the task's worktree
+  worktreeBranch?: string;    // branch name
   createdAt: number;
   updatedAt: number;
 }
@@ -69,7 +71,7 @@ export interface WorkspaceTask {
 // ── Workspace Engine ────────────────────────────────────────
 
 export type WorkspaceEngine =
-  | 'kanban' | 'terminals' | 'insights' | 'roadmap'
+  | 'kanban' | 'changes' | 'insights' | 'roadmap'
   | 'ideation' | 'changelog' | 'context' | 'worktrees'
   | 'plugins' | 'prompt'
   | string;
@@ -85,6 +87,15 @@ export interface WorkspaceTerminal {
   status: TerminalStatus;
   output: string[];
   createdAt: number;
+}
+
+/** Info about a terminal spawned by task execution (tracked in WorkspaceProvider). */
+export interface WorkspaceTerminalInfo {
+  id: string;
+  taskId: string;
+  taskTitle: string;
+  cwd: string;
+  status: 'running' | 'completed' | 'failed';
 }
 
 // ── Insights ───────────────────────────────────────────────
@@ -162,6 +173,39 @@ export interface Worktree {
   taskTitle?: string;
   status: WorktreeStatus;
   createdAt: number;
+}
+
+// ── Git Types ──────────────────────────────────────────────
+
+export interface GitBranch {
+  name: string;
+  shortHash: string;
+  upstream: string;
+  isCurrent: boolean;
+  isDefault: boolean;
+  lastActivity: string; // relative timestamp like "12 days ago"
+}
+
+export interface GitCommit {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  timestamp: number;
+  message: string;
+  refs: string;
+}
+
+export interface GitStagedFile {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  staged: boolean;
+}
+
+export interface GitRemoteStatus {
+  ahead: number;
+  behind: number;
 }
 
 // ── Workspace State ─────────────────────────────────────────

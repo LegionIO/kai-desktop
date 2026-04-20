@@ -1,5 +1,5 @@
 import { useState, type FC } from 'react';
-import { FolderIcon, FolderOpenIcon, FileIcon } from 'lucide-react';
+import { FolderIcon, FolderOpenIcon, FileIcon, Loader2Icon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 /* ── Types ──────────────────────────────────────────────── */
@@ -8,64 +8,17 @@ export interface FileNode {
   name: string;
   type: 'file' | 'directory';
   children?: FileNode[];
+  loaded?: boolean;
 }
 
 interface FileTreeProps {
   nodes: FileNode[];
   selectedPath?: string;
   onSelect: (path: string) => void;
+  onExpandDirectory?: (path: string) => Promise<FileNode[]>;
   depth?: number;
   parentPath?: string;
 }
-
-/* ── Sample data ────────────────────────────────────────── */
-
-export const SAMPLE_TREE: FileNode[] = [
-  {
-    name: 'src',
-    type: 'directory',
-    children: [
-      {
-        name: 'components',
-        type: 'directory',
-        children: [
-          { name: 'App.tsx', type: 'file' },
-          { name: 'Header.tsx', type: 'file' },
-          { name: 'Sidebar.tsx', type: 'file' },
-        ],
-      },
-      {
-        name: 'hooks',
-        type: 'directory',
-        children: [
-          { name: 'useAuth.ts', type: 'file' },
-          { name: 'useTheme.ts', type: 'file' },
-        ],
-      },
-      {
-        name: 'utils',
-        type: 'directory',
-        children: [
-          { name: 'cn.ts', type: 'file' },
-          { name: 'api.ts', type: 'file' },
-        ],
-      },
-      { name: 'main.tsx', type: 'file' },
-      { name: 'index.css', type: 'file' },
-    ],
-  },
-  {
-    name: 'public',
-    type: 'directory',
-    children: [
-      { name: 'favicon.ico', type: 'file' },
-      { name: 'index.html', type: 'file' },
-    ],
-  },
-  { name: 'package.json', type: 'file' },
-  { name: 'tsconfig.json', type: 'file' },
-  { name: 'README.md', type: 'file' },
-];
 
 /* ── Component ──────────────────────────────────────────── */
 
@@ -73,6 +26,7 @@ export const FileTree: FC<FileTreeProps> = ({
   nodes,
   selectedPath,
   onSelect,
+  onExpandDirectory,
   depth = 0,
   parentPath = '',
 }) => {
@@ -88,6 +42,7 @@ export const FileTree: FC<FileTreeProps> = ({
             depth={depth}
             selectedPath={selectedPath}
             onSelect={onSelect}
+            onExpandDirectory={onExpandDirectory}
           />
         ) : (
           <button
@@ -111,7 +66,7 @@ export const FileTree: FC<FileTreeProps> = ({
   );
 };
 
-/* ── Directory node (manages own expand state) ──────────── */
+/* ── Directory node (manages own expand state + lazy loading) */
 
 interface DirectoryNodeProps {
   node: FileNode;
@@ -119,6 +74,7 @@ interface DirectoryNodeProps {
   depth: number;
   selectedPath?: string;
   onSelect: (path: string) => void;
+  onExpandDirectory?: (path: string) => Promise<FileNode[]>;
 }
 
 const DirectoryNode: FC<DirectoryNodeProps> = ({
@@ -127,32 +83,66 @@ const DirectoryNode: FC<DirectoryNodeProps> = ({
   depth,
   selectedPath,
   onSelect,
+  onExpandDirectory,
 }) => {
-  const [expanded, setExpanded] = useState(depth < 1);
+  const [expanded, setExpanded] = useState(false);
+  const [children, setChildren] = useState<FileNode[]>(node.children ?? []);
+  const [loaded, setLoaded] = useState(node.loaded ?? false);
+  const [loading, setLoading] = useState(false);
+
+  const handleToggle = async () => {
+    const willExpand = !expanded;
+    setExpanded(willExpand);
+
+    // Lazy-load children on first expand
+    if (willExpand && !loaded && onExpandDirectory) {
+      setLoading(true);
+      try {
+        const loadedChildren = await onExpandDirectory(fullPath);
+        setChildren(loadedChildren);
+        setLoaded(true);
+      } catch {
+        setChildren([]);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
 
   return (
     <div>
       <button
         type="button"
-        onClick={() => setExpanded((prev) => !prev)}
+        onClick={handleToggle}
         className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-xs font-medium text-foreground/80 transition-colors hover:bg-muted/40 hover:text-foreground"
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
       >
-        {expanded ? (
+        {loading ? (
+          <Loader2Icon className="h-3.5 w-3.5 shrink-0 animate-spin text-primary/70" />
+        ) : expanded ? (
           <FolderOpenIcon className="h-3.5 w-3.5 shrink-0 text-primary/70" />
         ) : (
           <FolderIcon className="h-3.5 w-3.5 shrink-0 text-primary/70" />
         )}
         <span className="truncate">{node.name}</span>
       </button>
-      {expanded && node.children && (
+      {expanded && children.length > 0 && (
         <FileTree
-          nodes={node.children}
+          nodes={children}
           selectedPath={selectedPath}
           onSelect={onSelect}
+          onExpandDirectory={onExpandDirectory}
           depth={depth + 1}
           parentPath={fullPath}
         />
+      )}
+      {expanded && !loading && loaded && children.length === 0 && (
+        <div
+          className="text-[10px] text-muted-foreground/30 italic"
+          style={{ paddingLeft: `${(depth + 1) * 12 + 6}px` }}
+        >
+          Empty
+        </div>
       )}
     </div>
   );

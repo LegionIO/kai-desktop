@@ -186,6 +186,37 @@ type AppAPI = {
     listWorktrees: (projectPath: string) => Promise<{ worktrees: Array<{ path: string; branch: string; head: string }>; error?: string }>;
     createWorktree: (projectPath: string, branchName: string) => Promise<{ path?: string; branch?: string; error?: string }>;
     removeWorktree: (projectPath: string, worktreePath: string) => Promise<{ success?: boolean; error?: string }>;
+    status: (projectPath: string) => Promise<{ files: Array<{ path: string; status: string }>; error?: string }>;
+    diff: (projectPath: string, filePath?: string) => Promise<{ diff: string; error?: string }>;
+    currentBranch: (projectPath: string) => Promise<{ branch: string; error?: string }>;
+    branches: (projectPath: string) => Promise<{ branches: Array<{ name: string; shortHash: string; upstream: string; isCurrent: boolean; isDefault: boolean; lastActivity: string }>; defaultBranch: string; error?: string }>;
+    checkout: (projectPath: string, branchName: string) => Promise<{ success: boolean; error?: string }>;
+    createBranch: (projectPath: string, branchName: string) => Promise<{ success: boolean; branch?: string; error?: string }>;
+    stage: (projectPath: string, filePaths: string[]) => Promise<{ success: boolean; error?: string }>;
+    unstage: (projectPath: string, filePaths: string[]) => Promise<{ success: boolean; error?: string }>;
+    commit: (projectPath: string, summary: string, description?: string) => Promise<{ success: boolean; hash?: string; error?: string }>;
+    log: (projectPath: string, limit?: number) => Promise<{ commits: Array<{ hash: string; shortHash: string; author: string; email: string; timestamp: number; message: string; refs: string }>; error?: string }>;
+    show: (projectPath: string, commitHash: string, filePath?: string) => Promise<{ files?: Array<{ path: string; status: string }>; diff?: string; error?: string }>;
+    fetch: (projectPath: string) => Promise<{ success: boolean; error?: string }>;
+    pull: (projectPath: string) => Promise<{ success: boolean; summary?: string; error?: string }>;
+    push: (projectPath: string) => Promise<{ success: boolean; error?: string }>;
+    remoteStatus: (projectPath: string) => Promise<{ ahead: number; behind: number; error?: string }>;
+    stagedStatus: (projectPath: string) => Promise<{ files: Array<{ path: string; indexStatus: string; worktreeStatus: string; staged: boolean }>; error?: string }>;
+    openInEditor: (projectPath: string) => Promise<{ success: boolean; error?: string }>;
+    showInFinder: (projectPath: string) => Promise<{ success: boolean }>;
+    remoteUrl: (projectPath: string) => Promise<{ url: string; error?: string }>;
+    openUrl: (url: string) => Promise<{ success: boolean }>;
+  };
+  pty: {
+    create: (id: string, cwd: string, cols?: number, rows?: number) => Promise<{ id: string; pid: number }>;
+    write: (id: string, data: string) => Promise<void>;
+    resize: (id: string, cols: number, rows: number) => Promise<void>;
+    destroy: (id: string) => Promise<void>;
+    drain: (id: string) => Promise<{ data: string; ready: boolean }>;
+    list: () => Promise<Array<{ id: string; pid: number; cwd: string }>>;
+    onData: (callback: (id: string, data: string) => void) => () => void;
+    onExit: (callback: (id: string, exitCode: number) => void) => () => void;
+    onReady: (callback: (id: string) => void) => () => void;
   };
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;

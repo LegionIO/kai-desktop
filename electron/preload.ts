@@ -205,6 +205,56 @@ const appAPI = {
     listWorktrees: (projectPath: string) => ipcRenderer.invoke('git:list-worktrees', projectPath) as Promise<{ worktrees: Array<{ path: string; branch: string; head: string }>; error?: string }>,
     createWorktree: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:create-worktree', projectPath, branchName) as Promise<{ path?: string; branch?: string; error?: string }>,
     removeWorktree: (projectPath: string, worktreePath: string) => ipcRenderer.invoke('git:remove-worktree', projectPath, worktreePath) as Promise<{ success?: boolean; error?: string }>,
+    status: (projectPath: string) => ipcRenderer.invoke('git:status', projectPath) as Promise<{ files: Array<{ path: string; status: string }>; error?: string }>,
+    diff: (projectPath: string, filePath?: string) => ipcRenderer.invoke('git:diff', projectPath, filePath) as Promise<{ diff: string; error?: string }>,
+    currentBranch: (projectPath: string) => ipcRenderer.invoke('git:current-branch', projectPath) as Promise<{ branch: string; error?: string }>,
+    branches: (projectPath: string) => ipcRenderer.invoke('git:branches', projectPath) as Promise<{ branches: Array<{ name: string; shortHash: string; upstream: string; isCurrent: boolean; isDefault: boolean; lastActivity: string }>; defaultBranch: string; error?: string }>,
+    checkout: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:checkout', projectPath, branchName) as Promise<{ success: boolean; error?: string }>,
+    createBranch: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:create-branch', projectPath, branchName) as Promise<{ success: boolean; branch?: string; error?: string }>,
+    stage: (projectPath: string, filePaths: string[]) => ipcRenderer.invoke('git:stage', projectPath, filePaths) as Promise<{ success: boolean; error?: string }>,
+    unstage: (projectPath: string, filePaths: string[]) => ipcRenderer.invoke('git:unstage', projectPath, filePaths) as Promise<{ success: boolean; error?: string }>,
+    commit: (projectPath: string, summary: string, description?: string) => ipcRenderer.invoke('git:commit', projectPath, summary, description) as Promise<{ success: boolean; hash?: string; error?: string }>,
+    log: (projectPath: string, limit?: number) => ipcRenderer.invoke('git:log', projectPath, limit) as Promise<{ commits: Array<{ hash: string; shortHash: string; author: string; email: string; timestamp: number; message: string; refs: string }>; error?: string }>,
+    show: (projectPath: string, commitHash: string, filePath?: string) => ipcRenderer.invoke('git:show', projectPath, commitHash, filePath) as Promise<{ files?: Array<{ path: string; status: string }>; diff?: string; error?: string }>,
+    fetch: (projectPath: string) => ipcRenderer.invoke('git:fetch', projectPath) as Promise<{ success: boolean; error?: string }>,
+    pull: (projectPath: string) => ipcRenderer.invoke('git:pull', projectPath) as Promise<{ success: boolean; summary?: string; error?: string }>,
+    push: (projectPath: string) => ipcRenderer.invoke('git:push', projectPath) as Promise<{ success: boolean; error?: string }>,
+    remoteStatus: (projectPath: string) => ipcRenderer.invoke('git:remote-status', projectPath) as Promise<{ ahead: number; behind: number; error?: string }>,
+    stagedStatus: (projectPath: string) => ipcRenderer.invoke('git:staged-status', projectPath) as Promise<{ files: Array<{ path: string; indexStatus: string; worktreeStatus: string; staged: boolean }>; error?: string }>,
+    openInEditor: (projectPath: string) => ipcRenderer.invoke('git:open-in-editor', projectPath) as Promise<{ success: boolean; error?: string }>,
+    showInFinder: (projectPath: string) => ipcRenderer.invoke('git:show-in-finder', projectPath) as Promise<{ success: boolean }>,
+    remoteUrl: (projectPath: string) => ipcRenderer.invoke('git:remote-url', projectPath) as Promise<{ url: string; error?: string }>,
+    openUrl: (url: string) => ipcRenderer.invoke('git:open-url', url) as Promise<{ success: boolean }>,
+  },
+
+  pty: {
+    create: (id: string, cwd: string, cols?: number, rows?: number) =>
+      ipcRenderer.invoke('pty:create', id, cwd, cols, rows) as Promise<{ id: string; pid: number }>,
+    write: (id: string, data: string) =>
+      ipcRenderer.invoke('pty:write', id, data),
+    resize: (id: string, cols: number, rows: number) =>
+      ipcRenderer.invoke('pty:resize', id, cols, rows),
+    destroy: (id: string) =>
+      ipcRenderer.invoke('pty:destroy', id),
+    drain: (id: string) =>
+      ipcRenderer.invoke('pty:drain', id) as Promise<{ data: string; ready: boolean }>,
+    list: () =>
+      ipcRenderer.invoke('pty:list') as Promise<Array<{ id: string; pid: number; cwd: string }>>,
+    onData: (callback: (id: string, data: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, id: string, data: string) => callback(id, data);
+      ipcRenderer.on('pty:data', handler);
+      return () => ipcRenderer.removeListener('pty:data', handler);
+    },
+    onExit: (callback: (id: string, exitCode: number) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, id: string, exitCode: number) => callback(id, exitCode);
+      ipcRenderer.on('pty:exit', handler);
+      return () => ipcRenderer.removeListener('pty:exit', handler);
+    },
+    onReady: (callback: (id: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, id: string) => callback(id);
+      ipcRenderer.on('pty:ready', handler);
+      return () => ipcRenderer.removeListener('pty:ready', handler);
+    },
   },
 
   computerUse: {

@@ -71,7 +71,7 @@ const COLUMNS: ColumnDef[] = [
 ];
 
 export const KanbanBoard: FC = () => {
-  const { tasks, updateTaskStatus, removeTask, executeTask, reviewTask } = useWorkspace();
+  const { tasks, updateTaskStatus, removeTask, executeTask, reviewTask, taskExecutions, setActiveEngine } = useWorkspace();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dragOverColumn, setDragOverColumn] = useState<TaskStatus | null>(null);
 
@@ -180,6 +180,8 @@ export const KanbanBoard: FC = () => {
                         onRemove={() => removeTask(task.id)}
                         onExecute={() => executeTask(task.id)}
                         onReview={(approved) => reviewTask(task.id, approved)}
+                        onViewChanges={() => setActiveEngine('changes')}
+                        executionState={taskExecutions.get(task.id)}
                       />
                     </div>
                   ))

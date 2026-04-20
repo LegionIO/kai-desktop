@@ -1,7 +1,9 @@
 import type { FC } from 'react';
+import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import type { WorkspaceTask, TaskStatus, TaskPriority } from '../../../shared/workspace-types';
-import { ChevronRightIcon, Trash2Icon, PlayIcon, ClockIcon, XIcon, CheckIcon, MessageSquareIcon, BotIcon } from 'lucide-react';
+import { ChevronRightIcon, Trash2Icon, PlayIcon, ClockIcon, XIcon, CheckIcon, MessageSquareIcon, BotIcon, ChevronDownIcon, ChevronUpIcon, WrenchIcon, SquareIcon, GitCompareIcon } from 'lucide-react';
+import type { TaskExecutionState } from '@/providers/WorkspaceProvider';
 
 /* ── Status config ───────────────────────────────────────── */
 
@@ -20,14 +22,14 @@ const PRIORITY_DOT: Record<TaskPriority, string> = {
   low: 'bg-muted-foreground/40',
 };
 
-/* ── Progress simulation ─────────────────────────────────── */
+/* ── Progress (discrete steps per status) ────────────────── */
 
 function getProgress(task: WorkspaceTask): number {
   switch (task.status) {
     case 'planning': return 0;
-    case 'in_progress': return 45 + Math.floor((Date.now() - task.updatedAt) / 10000) % 50;
-    case 'ai_review': return 85;
-    case 'human_review': return 95;
+    case 'in_progress': return 33;
+    case 'ai_review': return 66;
+    case 'human_review': return 90;
     case 'done': return 100;
     default: return 0;
   }
@@ -62,11 +64,15 @@ interface TaskCardProps {
   onRemove: () => void;
   onExecute?: () => void;
   onReview?: (approved: boolean) => void;
+  onViewChanges?: () => void;
+  executionState?: TaskExecutionState;
 }
 
-export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, onExecute, onReview }) => {
+export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, onExecute, onReview, onViewChanges, executionState }) => {
   const badge = STATUS_BADGE[task.status];
   const progress = getProgress(task);
+  const [showOutput, setShowOutput] = useState(false);
+  const hasOutput = executionState && executionState.output.length > 0;
 
   return (
     <div className="group rounded-xl border border-border/60 bg-card/80 p-3 transition-colors hover:border-border">
@@ -105,6 +111,49 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
               style={{ width: `${Math.min(progress, 100)}%` }}
             />
           </div>
+        </div>
+      )}
+
+      {/* Live execution output */}
+      {(task.status === 'in_progress' || task.status === 'ai_review') && hasOutput && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => setShowOutput(!showOutput)}
+            className="flex w-full items-center gap-1 text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider hover:text-muted-foreground transition-colors"
+          >
+            <WrenchIcon className="h-2.5 w-2.5" />
+            Agent Output ({executionState.output.length} lines)
+            {showOutput ? <ChevronUpIcon className="h-2.5 w-2.5 ml-auto" /> : <ChevronDownIcon className="h-2.5 w-2.5 ml-auto" />}
+          </button>
+          {showOutput && (
+            <div className="mt-1.5 max-h-32 overflow-y-auto rounded-md bg-black/40 p-2 font-mono text-[9px] leading-relaxed">
+              {executionState.output.slice(-20).map((line, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    'whitespace-pre-wrap break-all',
+                    line.startsWith('$ ') ? 'text-primary' :
+                    line.startsWith('✓') || line.includes('success') ? 'text-emerald-400' :
+                    line.startsWith('✗') || line.includes('error') || line.includes('Error') ? 'text-red-400' :
+                    line.startsWith('[tool:') ? 'text-amber-400' :
+                    'text-muted-foreground/70',
+                  )}
+                >
+                  {line}
+                </div>
+              ))}
+              {executionState.status === 'running' && (
+                <span className="inline-block h-2.5 w-1 bg-primary animate-pulse" />
+              )}
+            </div>
+          )}
+          {executionState.activeToolName && executionState.status === 'running' && (
+            <div className="mt-1 flex items-center gap-1 text-[9px] text-muted-foreground/40">
+              <WrenchIcon className="h-2.5 w-2.5 animate-spin" style={{ animationDuration: '2s' }} />
+              Using: {executionState.activeToolName}
+            </div>
+          )}
         </div>
       )}
 
@@ -175,15 +224,27 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
             </button>
           )}
 
-          {/* In Progress: just show running indicator (auto-transitions to ai_review) */}
+          {/* In Progress: running indicator + cancel */}
           {task.status === 'in_progress' && (
-            <span className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-blue-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
-              Executing...
-            </span>
+            <>
+              <span className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-blue-400">
+                <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
+                Executing...
+              </span>
+              {executionState?.cancel && (
+                <button
+                  type="button"
+                  onClick={() => executionState.cancel?.()}
+                  className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1 text-[10px] font-medium text-red-400 transition-colors hover:bg-red-500/15"
+                >
+                  <SquareIcon className="h-3 w-3" />
+                  Stop
+                </button>
+              )}
+            </>
           )}
 
-          {/* AI Review: Approve & Reject buttons */}
+          {/* AI Review: Approve & Reject buttons + View Changes */}
           {task.status === 'ai_review' && onReview && (
             <>
               <button
@@ -202,10 +263,20 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
                 <XIcon className="h-3 w-3" />
                 Reject
               </button>
+              {onViewChanges && (
+                <button
+                  type="button"
+                  onClick={onViewChanges}
+                  className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 text-[10px] font-medium text-cyan-400 transition-colors hover:bg-cyan-500/15"
+                >
+                  <GitCompareIcon className="h-3 w-3" />
+                  Diff
+                </button>
+              )}
             </>
           )}
 
-          {/* Human Review: Approve (→ done) & Needs Work (→ in_progress) */}
+          {/* Human Review: Approve (→ done) & Needs Work (→ planning) + View Changes */}
           {task.status === 'human_review' && (
             <>
               <button
@@ -218,12 +289,22 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
               </button>
               <button
                 type="button"
-                onClick={() => onStatusChange('in_progress')}
+                onClick={() => onStatusChange('planning')}
                 className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[10px] font-medium text-amber-400 transition-colors hover:bg-amber-500/15"
               >
                 <ChevronRightIcon className="h-3 w-3" />
                 Needs Work
               </button>
+              {onViewChanges && (
+                <button
+                  type="button"
+                  onClick={onViewChanges}
+                  className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 text-[10px] font-medium text-cyan-400 transition-colors hover:bg-cyan-500/15"
+                >
+                  <GitCompareIcon className="h-3 w-3" />
+                  Diff
+                </button>
+              )}
             </>
           )}
         </div>

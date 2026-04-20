@@ -1,8 +1,9 @@
-import { useState, useMemo, type FC } from 'react';
-import { LightbulbIcon, SparklesIcon, InfoIcon } from 'lucide-react';
+import { useState, useMemo, useCallback, type FC } from 'react';
+import { LightbulbIcon, SparklesIcon, LoaderIcon, WrenchIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { generateId } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
+import { extractJsonFromResponse } from '@/lib/workspace-agent';
 import type { Idea, IdeaCategory, IdeaSeverity } from '../../../shared/workspace-types';
 import { IdeaCard } from './IdeaCard';
 
@@ -27,24 +28,24 @@ const SEVERITY_COLORS: Record<IdeaSeverity, string> = {
   info: 'text-slate-400',
 };
 
-/* ── Sample idea generation (project-aware) ────────────── */
+/* ── Fallback sample ideas (used when LLM unavailable) ────── */
 
-function generateSampleIdeas(projectName: string): Idea[] {
+function generateFallbackIdeas(projectName: string): Idea[] {
   const now = Date.now();
   return [
     {
       id: generateId(),
       title: `Extract duplicated validation logic in ${projectName}`,
-      description: `Multiple route handlers in ${projectName} contain identical input validation. Extract into shared middleware to reduce duplication and ensure consistency across the codebase.`,
+      description: `Multiple route handlers contain identical input validation. Extract into shared middleware.`,
       category: 'code-improvement',
       severity: 'medium',
-      affectedFiles: ['src/api/routes/tasks.ts', 'src/api/routes/config.ts', 'src/api/routes/voice.ts'],
+      affectedFiles: ['src/api/routes/tasks.ts', 'src/api/routes/config.ts'],
       createdAt: now,
     },
     {
       id: generateId(),
-      title: `Add error boundaries to ${projectName} workspace views`,
-      description: `Workspace engine views in ${projectName} lack error boundaries. A failing component crashes the entire workspace panel instead of showing a recovery UI. This is a high-priority reliability concern.`,
+      title: `Add error boundaries to workspace views`,
+      description: `Workspace engine views lack error boundaries. A failing component crashes the entire workspace panel.`,
       category: 'code-quality',
       severity: 'high',
       affectedFiles: ['src/components/workspace/WorkspaceView.tsx'],
@@ -52,69 +53,64 @@ function generateSampleIdeas(projectName: string): Idea[] {
     },
     {
       id: generateId(),
-      title: `Lazy-load heavy workspace engines in ${projectName}`,
-      description: `All workspace engines in ${projectName} are imported eagerly. Use React.lazy for engines like Roadmap and Ideation to reduce initial bundle size by an estimated 35%.`,
+      title: `Lazy-load heavy workspace engines`,
+      description: `All workspace engines are imported eagerly. Use React.lazy for less-used engines to reduce initial bundle size.`,
       category: 'performance',
       severity: 'medium',
       affectedFiles: ['src/components/workspace/WorkspaceView.tsx'],
       createdAt: now - 120000,
     },
-    {
-      id: generateId(),
-      title: `Sanitize plugin configuration input in ${projectName}`,
-      description: `Plugin configuration values in ${projectName} are passed directly to executeCapability without sanitization. Add Zod validation schemas to prevent injection attacks through the plugin system.`,
-      category: 'security',
-      severity: 'critical',
-      affectedFiles: ['src/components/workspace/PluginManager.tsx', 'shared/workspace-types.ts'],
-      createdAt: now - 180000,
-    },
-    {
-      id: generateId(),
-      title: `Document ${projectName} IPC protocol`,
-      description: `The WorkspaceIPC interface in ${projectName} lacks JSDoc comments. Add descriptions for each method to improve developer onboarding and reduce integration errors.`,
-      category: 'documentation',
-      severity: 'low',
-      affectedFiles: ['shared/workspace-types.ts'],
-      createdAt: now - 240000,
-    },
-    {
-      id: generateId(),
-      title: `Improve task card visual hierarchy in ${projectName}`,
-      description: `Task cards in ${projectName} show too many elements at equal visual weight. Emphasize title and status, de-emphasize labels and timestamps to improve scanability.`,
-      category: 'ui-ux',
-      severity: 'low',
-      affectedFiles: ['src/components/workspace/TaskCard.tsx'],
-      createdAt: now - 300000,
-    },
-    {
-      id: generateId(),
-      title: `Cache vector embeddings for repeated queries`,
-      description: `The context engine in ${projectName} recomputes embeddings for identical search queries. Add an LRU cache to avoid redundant computation and reduce latency by ~60%.`,
-      category: 'performance',
-      severity: 'high',
-      affectedFiles: ['src/tools/context-engine/analysis/endpointAnalyzer.ts'],
-      createdAt: now - 360000,
-    },
-    {
-      id: generateId(),
-      title: `Enforce strict CSP headers in ${projectName}`,
-      description: `The Express server in ${projectName} does not set Content-Security-Policy headers. Add CSP to prevent XSS attacks in the dashboard. This is a critical security hardening measure.`,
-      category: 'security',
-      severity: 'critical',
-      affectedFiles: ['src/api/server.ts'],
-      createdAt: now - 420000,
-    },
   ];
+}
+
+/* ── Parse LLM response into Idea objects ────────────────── */
+
+function parseIdeasFromResponse(text: string): Idea[] | null {
+  type RawIdea = {
+    title?: string;
+    description?: string;
+    category?: string;
+    severity?: string;
+    affectedFiles?: string[];
+    suggestedFix?: string;
+  };
+
+  const parsed = extractJsonFromResponse<{ ideas: RawIdea[] }>(text);
+  if (!parsed?.ideas || !Array.isArray(parsed.ideas)) return null;
+
+  const validCategories = new Set<string>(CATEGORIES.map((c) => c.value));
+  const validSeverities = new Set<string>(['info', 'low', 'medium', 'high', 'critical']);
+  const now = Date.now();
+
+  return parsed.ideas
+    .filter((raw) => raw.title && raw.description)
+    .map((raw, idx) => ({
+      id: generateId(),
+      title: raw.title!,
+      description: raw.description! + (raw.suggestedFix ? `\n\n**Suggested fix:** ${raw.suggestedFix}` : ''),
+      category: (validCategories.has(raw.category ?? '') ? raw.category : 'code-improvement') as IdeaCategory,
+      severity: (validSeverities.has(raw.severity ?? '') ? raw.severity : 'medium') as IdeaSeverity,
+      affectedFiles: Array.isArray(raw.affectedFiles) ? raw.affectedFiles : [],
+      createdAt: now - idx * 1000,
+    }));
 }
 
 /* ── Component ──────────────────────────────────────────── */
 
 export const IdeationView: FC = () => {
-  const { project, convertIdeaToTask } = useWorkspace();
+  const { project, convertIdeaToTask, ideas, setIdeas, engineStreams, startEngineStream } = useWorkspace();
   const projectName = project?.name ?? 'this project';
+  const projectPath = project?.path ?? '';
 
-  const [ideas, setIdeas] = useState<Idea[]>([]);
   const [activeCategory, setActiveCategory] = useState<IdeaCategory | 'all'>('all');
+
+  // Derive streaming state from provider
+  const stream = engineStreams.get('ideation');
+  const isGenerating = stream?.status === 'streaming';
+  const activeToolName = stream?.activeToolName ?? null;
+  const streamProgress = isGenerating
+    ? (activeToolName ? `Using ${activeToolName}...` : `Analyzing... (${stream?.lineCount ?? 0} lines)`)
+    : '';
 
   const filteredIdeas =
     activeCategory === 'all'
@@ -140,9 +136,32 @@ export const IdeationView: FC = () => {
     return parts;
   }, [severityDistribution]);
 
-  const handleGenerate = () => {
-    setIdeas(generateSampleIdeas(projectName));
-  };
+  const handleGenerate = useCallback(() => {
+    if (isGenerating) return;
+
+    if (!projectPath) {
+      setIdeas(generateFallbackIdeas(projectName));
+      return;
+    }
+
+    startEngineStream({
+      engine: 'ideation',
+      prompt: `Analyze the codebase at ${projectPath} and generate improvement ideas. Focus on actionable, specific suggestions across all categories (code quality, performance, security, documentation, UI/UX, architecture).`,
+      freshConversation: true,
+      onComplete: (accumulated) => {
+        const parsed = parseIdeasFromResponse(accumulated);
+        if (parsed && parsed.length > 0) {
+          setIdeas(parsed);
+        } else {
+          setIdeas(generateFallbackIdeas(projectName));
+        }
+      },
+      onError: (error) => {
+        console.error('[IdeationView] Stream error:', error);
+        setIdeas(generateFallbackIdeas(projectName));
+      },
+    });
+  }, [isGenerating, projectPath, projectName, startEngineStream, setIdeas]);
 
   const handleConvertToTask = (idea: Idea) => {
     const priority = idea.severity === 'critical' ? 'critical' : idea.severity === 'high' ? 'high' : 'medium';
@@ -156,10 +175,12 @@ export const IdeationView: FC = () => {
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-semibold text-foreground">Ideation</h2>
-            <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400">
-              <InfoIcon className="h-3 w-3" />
-              AI generation coming soon
-            </span>
+            {isGenerating && activeToolName && (
+              <span className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-medium text-blue-400">
+                <WrenchIcon className="h-3 w-3 animate-pulse" />
+                {activeToolName}
+              </span>
+            )}
           </div>
           {ideas.length > 0 && (
             <div className="mt-1 flex items-center gap-2">
@@ -177,10 +198,15 @@ export const IdeationView: FC = () => {
         <button
           type="button"
           onClick={handleGenerate}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          disabled={isGenerating}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
-          <SparklesIcon className="h-3.5 w-3.5" />
-          Generate Ideas
+          {isGenerating ? (
+            <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <SparklesIcon className="h-3.5 w-3.5" />
+          )}
+          {isGenerating ? 'Analyzing...' : 'Generate Ideas'}
         </button>
       </div>
 
@@ -217,7 +243,19 @@ export const IdeationView: FC = () => {
 
       {/* Content */}
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
-        {filteredIdeas.length === 0 ? (
+        {isGenerating ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+            <LoaderIcon className="h-10 w-10 animate-spin text-primary/60" />
+            <div>
+              <p className="text-sm font-medium text-muted-foreground">
+                Analyzing {projectName}...
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground/60">
+                {streamProgress || 'Scanning codebase for improvements'}
+              </p>
+            </div>
+          </div>
+        ) : filteredIdeas.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
             <LightbulbIcon className="h-10 w-10 text-muted-foreground/40" />
             <div>

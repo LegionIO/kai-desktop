@@ -1,7 +1,7 @@
 import { useMemo, type FC } from 'react';
 import {
   LayoutGridIcon,
-  TerminalIcon,
+  GitCompareIcon,
   SparklesIcon,
   MapIcon,
   LightbulbIcon,
@@ -28,7 +28,7 @@ interface EngineNavItem {
 
 const PROJECT_NAV: EngineNavItem[] = [
   { engine: 'kanban',    label: 'Kanban Board', Icon: LayoutGridIcon,  shortcut: 'K' },
-  { engine: 'terminals', label: 'Terminals',    Icon: TerminalIcon,    shortcut: 'A' },
+  { engine: 'changes',   label: 'Changes',      Icon: GitCompareIcon,  shortcut: 'A' },
   { engine: 'insights',  label: 'Insights',     Icon: SparklesIcon,    shortcut: 'N' },
   { engine: 'roadmap',   label: 'Roadmap',      Icon: MapIcon,         shortcut: 'D' },
   { engine: 'ideation',  label: 'Ideation',     Icon: LightbulbIcon,   shortcut: 'I' },
@@ -45,7 +45,7 @@ const TOOLS_NAV: EngineNavItem[] = [
 /* ── Component ─────────────────────────────────────────── */
 
 export const WorkspaceSidebar: FC = () => {
-  const { project, setProject, activeEngine, setActiveEngine, plugins } = useWorkspace();
+  const { project, setProject, activeEngine, setActiveEngine, plugins, engineStreams } = useWorkspace();
 
   const pluginSidebarItems = useMemo(() => {
     const items: Array<PluginSidebarItem & { pluginId: string }> = [];
@@ -58,25 +58,33 @@ export const WorkspaceSidebar: FC = () => {
     return items;
   }, [plugins]);
 
-  const renderNavItem = ({ engine, label, Icon, shortcut }: EngineNavItem) => (
-    <button
-      key={engine}
-      type="button"
-      onClick={() => setActiveEngine(engine)}
-      className={cn(
-        'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
-        activeEngine === engine
-          ? 'bg-primary/10 text-primary'
-          : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
-      )}
-    >
-      <Icon className="h-4 w-4" />
-      <span className="flex-1 text-left">{label}</span>
-      {shortcut && (
-        <kbd className="text-[9px] text-muted-foreground/30 font-mono">{shortcut}</kbd>
-      )}
-    </button>
-  );
+  const renderNavItem = ({ engine, label, Icon, shortcut }: EngineNavItem) => {
+    const stream = engineStreams.get(engine);
+    const isActive = stream?.status === 'streaming';
+
+    return (
+      <button
+        key={engine}
+        type="button"
+        onClick={() => setActiveEngine(engine)}
+        className={cn(
+          'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
+          activeEngine === engine
+            ? 'bg-primary/10 text-primary'
+            : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+        )}
+      >
+        <Icon className="h-4 w-4" />
+        <span className="flex-1 text-left">{label}</span>
+        {isActive && (
+          <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" title={stream?.activeToolName ? `Using ${stream.activeToolName}` : 'Streaming...'} />
+        )}
+        {shortcut && !isActive && (
+          <kbd className="text-[9px] text-muted-foreground/30 font-mono">{shortcut}</kbd>
+        )}
+      </button>
+    );
+  };
 
   return (
     <div className="flex flex-col">

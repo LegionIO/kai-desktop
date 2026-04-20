@@ -24,6 +24,7 @@ import { registerShellHandlers } from './ipc/shell.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
 import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
+import { registerPtyHandlers, destroyAllPtys } from './workspace/pty-manager.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
@@ -611,6 +612,7 @@ if (gotSingleInstanceLock) {
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
+    registerPtyHandlers(() => BrowserWindow.getAllWindows().find((w) => !w.isDestroyed()) ?? null);
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;
@@ -760,9 +762,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:list-worktrees', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath });
+        const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath, env: getResolvedProcessEnv() });
         const worktrees: Array<{ path: string; branch: string; head: string }> = [];
         let current: Record<string, string> = {};
         for (const line of stdout.split('\n')) {
@@ -784,10 +787,11 @@ if (gotSingleInstanceLock) {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
       const path = await import('node:path');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
         const worktreePath = path.join(projectPath, '.worktrees', branchName);
-        await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: projectPath });
+        await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: projectPath, env: getResolvedProcessEnv() });
         return { path: worktreePath, branch: branchName };
       } catch (err) {
         return { error: (err as Error).message };
@@ -797,13 +801,424 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:remove-worktree', async (_event, projectPath: string, worktreePath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: projectPath });
+        await exec('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: projectPath, env: getResolvedProcessEnv() });
         return { success: true };
       } catch (err) {
         return { error: (err as Error).message };
       }
+    });
+
+    // Git status — returns list of changed files
+    ipcMain.handle('git:status', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 1024 * 1024 });
+        const files: Array<{ path: string; status: string }> = [];
+        for (const line of stdout.split('\n')) {
+          if (!line.trim()) continue;
+          const status = line.slice(0, 2).trim();
+          const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+          files.push({ path: filePath, status });
+        }
+        return { files };
+      } catch (err) {
+        return { files: [], error: (err as Error).message };
+      }
+    });
+
+    // Git diff — returns unified diff for a file or the whole repo
+    ipcMain.handle('git:diff', async (_event, projectPath: string, filePath?: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        // Get both staged and unstaged diffs
+        const args = ['diff', 'HEAD'];
+        if (filePath) args.push('--', filePath);
+        const { stdout } = await exec('git', args, { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 5 * 1024 * 1024 });
+
+        // If no diff against HEAD (new untracked file), try showing the file content as all-adds
+        if (!stdout.trim() && filePath) {
+          const { stdout: statusOut } = await exec('git', ['status', '--porcelain', '--', filePath], { cwd: projectPath, env: getResolvedProcessEnv() });
+          if (statusOut.startsWith('??') || statusOut.trim().startsWith('A')) {
+            // Untracked or newly added — show full file as diff
+            const { readFile } = await import('node:fs/promises');
+            const { join } = await import('node:path');
+            try {
+              const content = await readFile(join(projectPath, filePath), 'utf-8');
+              const lines = content.split('\n');
+              const fakeDiff = [
+                `diff --git a/${filePath} b/${filePath}`,
+                'new file mode 100644',
+                `--- /dev/null`,
+                `+++ b/${filePath}`,
+                `@@ -0,0 +1,${lines.length} @@`,
+                ...lines.map((l) => `+${l}`),
+              ].join('\n');
+              return { diff: fakeDiff };
+            } catch {
+              return { diff: '' };
+            }
+          }
+        }
+
+        return { diff: stdout };
+      } catch (err) {
+        return { diff: '', error: (err as Error).message };
+      }
+    });
+
+    // Git current branch
+    ipcMain.handle('git:current-branch', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        return { branch: stdout.trim() };
+      } catch (err) {
+        return { branch: '', error: (err as Error).message };
+      }
+    });
+
+    // Git branches — list all local branches with metadata
+    ipcMain.handle('git:branches', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const env = getResolvedProcessEnv();
+        // Get local branches with format
+        const { stdout } = await exec('git', ['branch', '--format=%(refname:short)\t%(objectname:short)\t%(upstream:short)\t%(HEAD)\t%(committerdate:relative)'], { cwd: projectPath, env });
+        const branches: Array<{ name: string; shortHash: string; upstream: string; isCurrent: boolean; isDefault: boolean; lastActivity: string }> = [];
+        // Detect default branch
+        let defaultBranch = 'main';
+        try {
+          const { stdout: defOut } = await exec('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], { cwd: projectPath, env });
+          defaultBranch = defOut.trim().replace('refs/remotes/origin/', '');
+        } catch {
+          // Fallback: check if 'main' or 'master' exists
+          try {
+            await exec('git', ['rev-parse', '--verify', 'main'], { cwd: projectPath, env });
+            defaultBranch = 'main';
+          } catch {
+            try {
+              await exec('git', ['rev-parse', '--verify', 'master'], { cwd: projectPath, env });
+              defaultBranch = 'master';
+            } catch {
+              // Keep 'main' as default
+            }
+          }
+        }
+        for (const line of stdout.split('\n')) {
+          if (!line.trim()) continue;
+          const parts = line.split('\t');
+          const name = parts[0]?.trim() ?? '';
+          if (!name) continue;
+          branches.push({
+            name,
+            shortHash: parts[1]?.trim() ?? '',
+            upstream: parts[2]?.trim() ?? '',
+            isCurrent: parts[3]?.trim() === '*',
+            isDefault: name === defaultBranch,
+            lastActivity: parts[4]?.trim() ?? '',
+          });
+        }
+        return { branches, defaultBranch };
+      } catch (err) {
+        return { branches: [], defaultBranch: 'main', error: (err as Error).message };
+      }
+    });
+
+    // Git checkout — switch branches
+    ipcMain.handle('git:checkout', async (_event, projectPath: string, branchName: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['checkout', branchName], { cwd: projectPath, env: getResolvedProcessEnv() });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git create branch — create and switch to new branch
+    ipcMain.handle('git:create-branch', async (_event, projectPath: string, branchName: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['checkout', '-b', branchName], { cwd: projectPath, env: getResolvedProcessEnv() });
+        return { success: true, branch: branchName };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git stage — add files to staging area
+    ipcMain.handle('git:stage', async (_event, projectPath: string, filePaths: string[]) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['add', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git unstage — remove files from staging area
+    ipcMain.handle('git:unstage', async (_event, projectPath: string, filePaths: string[]) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['reset', 'HEAD', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git commit — commit staged changes
+    ipcMain.handle('git:commit', async (_event, projectPath: string, summary: string, description?: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const args = ['commit', '-m', summary];
+        if (description) args.push('-m', description);
+        const { stdout } = await exec('git', args, { cwd: projectPath, env: getResolvedProcessEnv() });
+        // Extract commit hash from output
+        const hashMatch = stdout.match(/\[[\w/]+ ([a-f0-9]+)\]/);
+        return { success: true, hash: hashMatch?.[1] ?? '' };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git log — commit history
+    ipcMain.handle('git:log', async (_event, projectPath: string, limit?: number) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const n = limit ?? 50;
+        const { stdout } = await exec('git', ['log', `--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s%x00%D`, `-${n}`], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 2 * 1024 * 1024 });
+        const commits: Array<{ hash: string; shortHash: string; author: string; email: string; timestamp: number; message: string; refs: string }> = [];
+        for (const line of stdout.split('\n')) {
+          if (!line.trim()) continue;
+          const parts = line.split('\0');
+          if (parts.length < 6) continue;
+          commits.push({
+            hash: parts[0],
+            shortHash: parts[1],
+            author: parts[2],
+            email: parts[3],
+            timestamp: parseInt(parts[4], 10),
+            message: parts[5],
+            refs: parts[6] ?? '',
+          });
+        }
+        return { commits };
+      } catch (err) {
+        return { commits: [], error: (err as Error).message };
+      }
+    });
+
+    // Git show — files changed in a commit + optional diff for a specific file
+    ipcMain.handle('git:show', async (_event, projectPath: string, commitHash: string, filePath?: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      const env = getResolvedProcessEnv();
+      try {
+        if (filePath) {
+          // Return diff for a specific file in the commit
+          const { stdout } = await exec('git', ['diff', `${commitHash}^..${commitHash}`, '--', filePath], { cwd: projectPath, env, maxBuffer: 5 * 1024 * 1024 });
+          return { diff: stdout };
+        }
+        // Return list of changed files
+        const { stdout } = await exec('git', ['diff-tree', '--no-commit-id', '-r', '--name-status', commitHash], { cwd: projectPath, env, maxBuffer: 1024 * 1024 });
+        const files: Array<{ path: string; status: string }> = [];
+        for (const line of stdout.split('\n')) {
+          if (!line.trim()) continue;
+          const parts = line.split('\t');
+          if (parts.length >= 2) {
+            files.push({ status: parts[0], path: parts[1] });
+          }
+        }
+        return { files };
+      } catch (err) {
+        return { files: [], diff: '', error: (err as Error).message };
+      }
+    });
+
+    // Git fetch
+    ipcMain.handle('git:fetch', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['fetch', '--all'], { cwd: projectPath, env: getResolvedProcessEnv(), timeout: 30000 });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git pull
+    ipcMain.handle('git:pull', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['pull'], { cwd: projectPath, env: getResolvedProcessEnv(), timeout: 60000 });
+        return { success: true, summary: stdout.trim() };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git push
+    ipcMain.handle('git:push', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      const env = getResolvedProcessEnv();
+      try {
+        await exec('git', ['push'], { cwd: projectPath, env, timeout: 60000 });
+        return { success: true };
+      } catch (err) {
+        const errorMsg = (err as Error).message;
+        // If push fails because no upstream, try setting upstream
+        if (errorMsg.includes('no upstream') || errorMsg.includes('--set-upstream')) {
+          try {
+            const { stdout: branch } = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projectPath, env });
+            await exec('git', ['push', '--set-upstream', 'origin', branch.trim()], { cwd: projectPath, env, timeout: 60000 });
+            return { success: true };
+          } catch (retryErr) {
+            return { success: false, error: (retryErr as Error).message };
+          }
+        }
+        return { success: false, error: errorMsg };
+      }
+    });
+
+    // Git remote status — ahead/behind count
+    ipcMain.handle('git:remote-status', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      const env = getResolvedProcessEnv();
+      try {
+        let behind = 0;
+        let ahead = 0;
+        try {
+          const { stdout: behindOut } = await exec('git', ['rev-list', '--count', 'HEAD..@{u}'], { cwd: projectPath, env });
+          behind = parseInt(behindOut.trim(), 10) || 0;
+        } catch { /* no upstream */ }
+        try {
+          const { stdout: aheadOut } = await exec('git', ['rev-list', '--count', '@{u}..HEAD'], { cwd: projectPath, env });
+          ahead = parseInt(aheadOut.trim(), 10) || 0;
+        } catch { /* no upstream */ }
+        return { ahead, behind };
+      } catch (err) {
+        return { ahead: 0, behind: 0, error: (err as Error).message };
+      }
+    });
+
+    // Git staged status — enhanced status with staging info
+    ipcMain.handle('git:staged-status', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 1024 * 1024 });
+        const files: Array<{ path: string; indexStatus: string; worktreeStatus: string; staged: boolean }> = [];
+        for (const line of stdout.split('\n')) {
+          if (!line || line.length < 3) continue;
+          const indexStatus = line[0];
+          const worktreeStatus = line[1];
+          const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+          // A file is staged if index column is not ' ' and not '?'
+          const staged = indexStatus !== ' ' && indexStatus !== '?';
+          files.push({ path: filePath, indexStatus, worktreeStatus, staged });
+        }
+        return { files };
+      } catch (err) {
+        return { files: [], error: (err as Error).message };
+      }
+    });
+
+    // Open project in VS Code
+    ipcMain.handle('git:open-in-editor', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      try {
+        execFile('code', [projectPath], { env: getResolvedProcessEnv() });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Show project in Finder
+    ipcMain.handle('git:show-in-finder', async (_event, projectPath: string) => {
+      const { shell } = await import('electron');
+      shell.showItemInFolder(projectPath);
+      return { success: true };
+    });
+
+    // Get GitHub remote URL for the repo
+    ipcMain.handle('git:remote-url', async (_event, projectPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        const { stdout } = await exec('git', ['remote', 'get-url', 'origin'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        let url = stdout.trim();
+        // Convert SSH URL to HTTPS
+        if (url.startsWith('git@')) {
+          url = url.replace(/^git@([^:]+):/, 'https://$1/').replace(/\.git$/, '');
+        } else if (url.endsWith('.git')) {
+          url = url.replace(/\.git$/, '');
+        }
+        return { url };
+      } catch (err) {
+        return { url: '', error: (err as Error).message };
+      }
+    });
+
+    // Open URL in default browser
+    ipcMain.handle('git:open-url', async (_event, url: string) => {
+      const { shell } = await import('electron');
+      shell.openExternal(url);
+      return { success: true };
     });
 
     // List directory contents on the host (used by web UI directory browser)
@@ -1019,6 +1434,8 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // Stop web UI server
   stopWebServer().catch(() => {});
+  // Cleanup PTY sessions
+  destroyAllPtys();
   // Best-effort plugin cleanup (don't block quit on failures)
   pluginManagerRef?.unloadAll().catch((err) => {
     console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);

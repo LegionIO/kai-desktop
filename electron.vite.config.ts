@@ -46,6 +46,9 @@ export default defineConfig({
           // libsql uses platform-specific native binaries
           'libsql',
           /^@libsql\//,
+          // PTY for workspace terminals
+          '@lydell/node-pty',
+          /^@lydell\/node-pty/,
         ],
         input: {
           index: resolve(__dirname, 'electron/main.ts'),

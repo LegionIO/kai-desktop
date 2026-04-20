@@ -1,17 +1,18 @@
-import { useState, useCallback, useMemo, type FC } from 'react';
-import { MapIcon, WandSparklesIcon, InfoIcon } from 'lucide-react';
+import { useCallback, useMemo, type FC } from 'react';
+import { MapIcon, WandSparklesIcon, LoaderIcon, WrenchIcon } from 'lucide-react';
 import { generateId } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
+import { extractJsonFromResponse } from '@/lib/workspace-agent';
 import type { RoadmapPhase, RoadmapFeature } from '../../../shared/workspace-types';
 import { RoadmapPhaseCard } from './RoadmapPhaseCard';
 
-/* ── Sample data generator (project-aware) ─────────────────── */
+/* ── Fallback sample data (project-aware) ─────────────────── */
 
-function generateSamplePhases(projectName: string): RoadmapPhase[] {
+function generateFallbackPhases(projectName: string): RoadmapPhase[] {
   return [
     {
       id: generateId(),
-      name: `Phase 1 — ${projectName} Foundation`,
+      name: `Phase 1 -- ${projectName} Foundation`,
       description: `Core infrastructure and scaffolding for ${projectName}`,
       features: [
         {
@@ -30,19 +31,11 @@ function generateSamplePhases(projectName: string): RoadmapPhase[] {
           effort: 'large',
           status: 'in_progress',
         },
-        {
-          id: generateId(),
-          title: 'Database schema and data layer',
-          description: `Define core entities, relationships, and migration strategy for ${projectName}`,
-          priority: 'high',
-          effort: 'medium',
-          status: 'planned',
-        },
       ],
     },
     {
       id: generateId(),
-      name: `Phase 2 — ${projectName} Core Features`,
+      name: `Phase 2 -- ${projectName} Core Features`,
       description: `Primary user-facing functionality for ${projectName}`,
       features: [
         {
@@ -56,24 +49,16 @@ function generateSamplePhases(projectName: string): RoadmapPhase[] {
         {
           id: generateId(),
           title: 'REST API with validation',
-          description: `RESTful API with Zod validation, pagination, and structured error handling for ${projectName}`,
+          description: `RESTful API with Zod validation and structured error handling for ${projectName}`,
           priority: 'high',
           effort: 'xlarge',
-          status: 'planned',
-        },
-        {
-          id: generateId(),
-          title: 'Notification and alerting system',
-          description: `In-app and email notifications with user preference controls for ${projectName}`,
-          priority: 'medium',
-          effort: 'medium',
           status: 'planned',
         },
       ],
     },
     {
       id: generateId(),
-      name: `Phase 3 — ${projectName} Polish & Launch`,
+      name: `Phase 3 -- ${projectName} Polish & Launch`,
       description: `Quality assurance, performance tuning, and release prep for ${projectName}`,
       features: [
         {
@@ -82,14 +67,6 @@ function generateSamplePhases(projectName: string): RoadmapPhase[] {
           description: `Bundle splitting, caching, lazy loading, and query optimization for ${projectName}`,
           priority: 'medium',
           effort: 'large',
-          status: 'planned',
-        },
-        {
-          id: generateId(),
-          title: 'Accessibility audit (WCAG 2.1 AA)',
-          description: `WCAG 2.1 AA compliance review and remediation for all ${projectName} views`,
-          priority: 'medium',
-          effort: 'small',
           status: 'planned',
         },
         {
@@ -105,17 +82,89 @@ function generateSamplePhases(projectName: string): RoadmapPhase[] {
   ];
 }
 
+/* ── Parse LLM response into RoadmapPhase objects ────────── */
+
+function parsePhasesFromResponse(text: string): RoadmapPhase[] | null {
+  type RawFeature = {
+    title?: string;
+    description?: string;
+    priority?: string;
+    effort?: string;
+    status?: string;
+  };
+  type RawPhase = {
+    name?: string;
+    description?: string;
+    features?: RawFeature[];
+  };
+
+  const parsed = extractJsonFromResponse<{ phases: RawPhase[] }>(text);
+  if (!parsed?.phases || !Array.isArray(parsed.phases)) return null;
+
+  const validPriorities = new Set(['low', 'medium', 'high', 'critical']);
+  const validEfforts = new Set(['small', 'medium', 'large', 'xlarge']);
+  const validStatuses = new Set(['planned', 'in_progress', 'completed']);
+
+  return parsed.phases
+    .filter((raw) => raw.name)
+    .map((raw) => ({
+      id: generateId(),
+      name: raw.name!,
+      description: raw.description ?? '',
+      features: (raw.features ?? [])
+        .filter((f) => f.title)
+        .map((f) => ({
+          id: generateId(),
+          title: f.title!,
+          description: f.description ?? '',
+          priority: (validPriorities.has(f.priority ?? '') ? f.priority : 'medium') as RoadmapFeature['priority'],
+          effort: (validEfforts.has(f.effort ?? '') ? f.effort : 'medium') as RoadmapFeature['effort'],
+          status: (validStatuses.has(f.status ?? '') ? f.status : 'planned') as RoadmapFeature['status'],
+        })),
+    }));
+}
+
 /* ── Component ──────────────────────────────────────────────── */
 
 export const RoadmapView: FC = () => {
-  const { project, convertFeatureToTask } = useWorkspace();
+  const { project, convertFeatureToTask, roadmapPhases: phases, setRoadmapPhases: setPhases, engineStreams, startEngineStream } = useWorkspace();
   const projectName = project?.name ?? 'this project';
+  const projectPath = project?.path ?? '';
 
-  const [phases, setPhases] = useState<RoadmapPhase[]>([]);
+  // Derive streaming state from provider
+  const stream = engineStreams.get('roadmap');
+  const isGenerating = stream?.status === 'streaming';
+  const activeToolName = stream?.activeToolName ?? null;
+  const streamProgress = isGenerating
+    ? (activeToolName ? `Using ${activeToolName}...` : `Planning... (${stream?.lineCount ?? 0} lines)`)
+    : '';
 
   const generateRoadmap = useCallback(() => {
-    setPhases(generateSamplePhases(projectName));
-  }, [projectName]);
+    if (isGenerating) return;
+
+    if (!projectPath) {
+      setPhases(generateFallbackPhases(projectName));
+      return;
+    }
+
+    startEngineStream({
+      engine: 'roadmap',
+      prompt: `Analyze the project at ${projectPath} and create a development roadmap. Examine the current state of the codebase, identify what has been built, what is in progress, and what needs to be done. Create 3-4 phases with specific features.`,
+      freshConversation: true,
+      onComplete: (accumulated) => {
+        const parsed = parsePhasesFromResponse(accumulated);
+        if (parsed && parsed.length > 0) {
+          setPhases(parsed);
+        } else {
+          setPhases(generateFallbackPhases(projectName));
+        }
+      },
+      onError: (error) => {
+        console.error('[RoadmapView] Stream error:', error);
+        setPhases(generateFallbackPhases(projectName));
+      },
+    });
+  }, [isGenerating, projectPath, projectName, startEngineStream, setPhases]);
 
   /* ── Stats ────────────────────────────────────────────── */
   const stats = useMemo(() => {
@@ -139,10 +188,12 @@ export const RoadmapView: FC = () => {
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-semibold text-foreground">Roadmap</h2>
-            <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400">
-              <InfoIcon className="h-3 w-3" />
-              AI generation coming soon
-            </span>
+            {isGenerating && activeToolName && (
+              <span className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-medium text-blue-400">
+                <WrenchIcon className="h-3 w-3 animate-pulse" />
+                {activeToolName}
+              </span>
+            )}
           </div>
           {phases.length > 0 && (
             <div className="mt-1 flex items-center gap-3">
@@ -164,15 +215,32 @@ export const RoadmapView: FC = () => {
         <button
           type="button"
           onClick={generateRoadmap}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          disabled={isGenerating}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
-          <WandSparklesIcon className="h-3.5 w-3.5" />
-          Generate Roadmap
+          {isGenerating ? (
+            <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <WandSparklesIcon className="h-3.5 w-3.5" />
+          )}
+          {isGenerating ? 'Analyzing...' : 'Generate Roadmap'}
         </button>
       </div>
 
       {/* Content */}
-      {phases.length === 0 ? (
+      {isGenerating ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
+          <LoaderIcon className="h-10 w-10 animate-spin text-primary/60" />
+          <div>
+            <p className="text-sm font-medium text-muted-foreground">
+              Analyzing {projectName}...
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground/60">
+              {streamProgress || 'Examining project structure and planning phases'}
+            </p>
+          </div>
+        </div>
+      ) : phases.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
           <MapIcon className="h-10 w-10 text-muted-foreground/40" />
           <div>

@@ -2,7 +2,7 @@ import type { FC } from 'react';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
 import { ProjectSelector } from './ProjectSelector';
 import { KanbanBoard } from './KanbanBoard';
-import { TerminalGrid } from './TerminalGrid';
+import { ChangesView } from './ChangesView';
 import { InsightsView } from './InsightsView';
 import { RoadmapView } from './RoadmapView';
 import { IdeationView } from './IdeationView';
@@ -26,7 +26,7 @@ export const WorkspaceView: FC = () => {
 
   switch (activeEngine) {
     case 'kanban':    return <KanbanBoard />;
-    case 'terminals': return <TerminalGrid />;
+    case 'changes':   return <ChangesView />;
     case 'insights':  return <InsightsView />;
     case 'roadmap':   return <RoadmapView />;
     case 'ideation':  return <IdeationView />;

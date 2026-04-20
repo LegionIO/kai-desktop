@@ -2,21 +2,47 @@ import { useState, useCallback, useMemo, type FC } from 'react';
 import { PlusIcon, TerminalIcon, PlayIcon } from 'lucide-react';
 import { generateId } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
-import type { WorkspaceTerminal, TerminalStatus } from '../../../shared/workspace-types';
+import { app } from '@/lib/ipc-client';
+import type { WorkspaceTerminal, TerminalStatus, WorkspaceTerminalInfo } from '../../../shared/workspace-types';
 import { TerminalPanel } from './TerminalPanel';
 
 export const TerminalGrid: FC = () => {
-  const { project, tasks } = useWorkspace();
+  const { project, tasks, workspaceTerminals } = useWorkspace();
   const [terminals, setTerminals] = useState<WorkspaceTerminal[]>([]);
   const [showTaskPicker, setShowTaskPicker] = useState(false);
+
+  // Convert workspace (task-spawned) terminals into WorkspaceTerminal shape for display
+  const taskSpawnedTerminals = useMemo<WorkspaceTerminal[]>(() => {
+    return workspaceTerminals.map((wt: WorkspaceTerminalInfo) => ({
+      id: wt.id,
+      title: wt.taskTitle,
+      taskId: wt.taskId,
+      status: wt.status === 'running' ? 'running' as const : wt.status === 'completed' ? 'completed' as const : 'failed' as const,
+      output: [],
+      createdAt: Date.now(),
+    }));
+  }, [workspaceTerminals]);
+
+  // Merge local terminals with task-spawned terminals (task-spawned first, deduplicate by id)
+  const allTerminals = useMemo(() => {
+    const localIds = new Set(terminals.map((t) => t.id));
+    const taskTerminals = taskSpawnedTerminals.filter((t) => !localIds.has(t.id));
+    return [...taskTerminals, ...terminals];
+  }, [terminals, taskSpawnedTerminals]);
+
+  // Track which terminal IDs were pre-spawned by task execution
+  const preSpawnedIds = useMemo(() => {
+    return new Set(workspaceTerminals.map((wt: WorkspaceTerminalInfo) => wt.id));
+  }, [workspaceTerminals]);
 
   const addTerminal = useCallback((taskId?: string, taskTitle?: string) => {
     const idx = terminals.length + 1;
     const title = taskTitle ? `${taskTitle}` : `Terminal ${idx}`;
+    const id = generateId();
     setTerminals((prev) => [
       ...prev,
       {
-        id: generateId(),
+        id,
         title,
         taskId,
         status: 'idle' as const,
@@ -35,7 +61,24 @@ export const TerminalGrid: FC = () => {
     setTerminals((prev) =>
       prev.map((t) => (t.id === id ? { ...t, status } : t)),
     );
-  }, []);
+
+    // When a task-linked terminal starts running, send the task info after PTY spawns
+    if (status === 'running') {
+      setTerminals((prev) => {
+        const terminal = prev.find((t) => t.id === id);
+        if (terminal?.taskId) {
+          const task = tasks.find((t) => t.id === terminal.taskId);
+          if (task) {
+            // Send task context to the PTY after it has time to spawn
+            setTimeout(() => {
+              app.pty.write(id, `echo "Task: ${task.title.replace(/"/g, '\\"')}"\r`);
+            }, 600);
+          }
+        }
+        return prev;
+      });
+    }
+  }, [tasks]);
 
   const updateOutput = useCallback((id: string, output: string[]) => {
     setTerminals((prev) =>
@@ -43,15 +86,15 @@ export const TerminalGrid: FC = () => {
     );
   }, []);
 
-  // Feature #15: Terminal counts
+  // Terminal counts
   const terminalCounts = useMemo(() => {
-    const running = terminals.filter((t) => t.status === 'running').length;
-    const total = terminals.length;
-    const idle = terminals.filter((t) => t.status === 'idle').length;
+    const running = allTerminals.filter((t) => t.status === 'running').length;
+    const total = allTerminals.length;
+    const idle = allTerminals.filter((t) => t.status === 'idle').length;
     return { running, total, idle };
-  }, [terminals]);
+  }, [allTerminals]);
 
-  // Feature #15: Run All idle terminals
+  // Run All idle terminals
   const handleRunAll = useCallback(() => {
     setTerminals((prev) =>
       prev.map((t) => (t.status === 'idle' ? { ...t, status: 'running' as const } : t)),
@@ -60,13 +103,13 @@ export const TerminalGrid: FC = () => {
 
   // Determine grid layout columns based on terminal count
   const gridColumns = useMemo(() => {
-    const count = terminals.length;
+    const count = allTerminals.length;
     if (count <= 1) return 'repeat(1, 1fr)';
     if (count <= 2) return 'repeat(2, 1fr)';
     if (count <= 4) return 'repeat(2, 1fr)';
     if (count <= 6) return 'repeat(3, 1fr)';
     return 'repeat(auto-fill, minmax(400px, 1fr))';
-  }, [terminals.length]);
+  }, [allTerminals.length]);
 
   const activeTasks = tasks.filter((t) => t.status !== 'done');
 
@@ -76,7 +119,7 @@ export const TerminalGrid: FC = () => {
       <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold text-foreground">Terminals</h2>
-          {terminals.length > 0 && (
+          {allTerminals.length > 0 && (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-border/40 bg-muted/20 px-2.5 py-0.5 text-[10px] font-medium text-muted-foreground">
               <span className="font-mono text-blue-400">{terminalCounts.running}</span>
               <span className="text-muted-foreground/40">running</span>
@@ -143,7 +186,7 @@ export const TerminalGrid: FC = () => {
       </div>
 
       {/* Content */}
-      {terminals.length === 0 ? (
+      {allTerminals.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
           <TerminalIcon className="h-10 w-10 text-muted-foreground/40" />
           <div>
@@ -158,11 +201,12 @@ export const TerminalGrid: FC = () => {
           className="flex-1 overflow-y-auto p-4"
           style={{ display: 'grid', gridTemplateColumns: gridColumns, gap: '1rem', alignContent: 'start' }}
         >
-          {terminals.map((terminal) => (
+          {allTerminals.map((terminal) => (
             <TerminalPanel
               key={terminal.id}
               terminal={terminal}
               projectPath={project?.path}
+              preSpawned={preSpawnedIds.has(terminal.id)}
               onClose={() => removeTerminal(terminal.id)}
               onStatusChange={(status) => updateStatus(terminal.id, status)}
               onOutputUpdate={(lines) => updateOutput(terminal.id, lines)}

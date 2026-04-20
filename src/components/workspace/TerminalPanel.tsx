@@ -1,6 +1,9 @@
-import { useState, useEffect, useRef, type FC } from 'react';
-import { XIcon, PlayIcon, TerminalIcon } from 'lucide-react';
+import { useState, useEffect, useCallback, type FC } from 'react';
+import { XIcon, PlayIcon, TerminalIcon, WrenchIcon, BotIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useWorkspace } from '@/providers/WorkspaceProvider';
+import { app } from '@/lib/ipc-client';
+import { XTerminal } from './XTerminal';
 import type { WorkspaceTerminal, TerminalStatus } from '../../../shared/workspace-types';
 
 /* ── Status badge config ────────────────────────────────────── */
@@ -11,25 +14,6 @@ const STATUS_CONFIG: Record<TerminalStatus, { label: string; dotClass: string; t
   completed: { label: 'Completed', dotClass: 'bg-emerald-400',                  textClass: 'text-emerald-400' },
   failed:    { label: 'Failed',    dotClass: 'bg-red-400',                      textClass: 'text-red-400' },
 };
-
-/* ── Simulated build output ─────────────────────────────────── */
-
-function getSimulatedOutput(projectPath: string): string[] {
-  const dir = projectPath || '~/project';
-  return [
-    `$ cd ${dir}`,
-    '$ npm run build',
-    '',
-    '> building...',
-    '> Compiling TypeScript...',
-    '> Processing 47 source files...',
-    '> Resolving module dependencies...',
-    '> Bundling with tree-shaking enabled...',
-    `> ✓ 234 modules compiled successfully`,
-    '> Bundle size: 1.2MB (gzipped: 380KB)',
-    '> Build completed in 3.2s',
-  ];
-}
 
 /* ── Uptime helper ──────────────────────────────────────────── */
 
@@ -48,6 +32,8 @@ function formatUptime(createdAt: number): string {
 interface TerminalPanelProps {
   terminal: WorkspaceTerminal;
   projectPath?: string;
+  /** When true, the PTY was already created externally (task execution) — XTerminal will attach instead of creating. */
+  preSpawned?: boolean;
   onClose: () => void;
   onStatusChange: (status: TerminalStatus) => void;
   onOutputUpdate: (lines: string[]) => void;
@@ -56,13 +42,17 @@ interface TerminalPanelProps {
 export const TerminalPanel: FC<TerminalPanelProps> = ({
   terminal,
   projectPath,
+  preSpawned,
   onClose,
   onStatusChange,
   onOutputUpdate,
 }) => {
   const cfg = STATUS_CONFIG[terminal.status];
   const [uptime, setUptime] = useState(() => formatUptime(terminal.createdAt));
-  const outputRef = useRef<HTMLDivElement>(null);
+  const { tasks } = useWorkspace();
+
+  // Resolve the task linked to this terminal (if any)
+  const linkedTask = terminal.taskId ? tasks.find((t) => t.id === terminal.taskId) : undefined;
 
   // Tick uptime every second while running
   useEffect(() => {
@@ -74,45 +64,36 @@ export const TerminalPanel: FC<TerminalPanelProps> = ({
     return () => clearInterval(interval);
   }, [terminal.status, terminal.createdAt]);
 
-  // Simulate build output when status becomes 'running'
-  useEffect(() => {
-    if (terminal.status !== 'running') return;
-
-    const lines = getSimulatedOutput(projectPath ?? '');
-    let lineIndex = 0;
-
-    // Start with an empty output
-    onOutputUpdate([]);
-
-    const interval = setInterval(() => {
-      if (lineIndex < lines.length) {
-        const nextLine = lines[lineIndex];
-        lineIndex++;
-        onOutputUpdate(lines.slice(0, lineIndex));
-
-        // Auto-scroll
-        requestAnimationFrame(() => {
-          if (outputRef.current) {
-            outputRef.current.scrollTop = outputRef.current.scrollHeight;
-          }
-        });
-      } else {
-        clearInterval(interval);
-        onStatusChange('completed');
-      }
-    }, 500);
-
-    return () => clearInterval(interval);
-    // Only trigger on status change to running, not on every render
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminal.status === 'running' ? 'running' : 'other']);
-
-  const handleRun = () => {
+  const handleRun = useCallback(() => {
     onStatusChange('running');
-  };
+  }, [onStatusChange]);
+
+  const handleRunWithAI = useCallback(() => {
+    if (!linkedTask) return;
+    onStatusChange('running');
+    // After a short delay to let the PTY spawn, send the claude command
+    setTimeout(() => {
+      const escapedDesc = linkedTask.description.replace(/'/g, "'\\''");
+      app.pty.write(terminal.id, `claude --print --task '${escapedDesc}'\r`);
+    }, 500);
+  }, [linkedTask, onStatusChange, terminal.id]);
+
+  const handlePtyExit = useCallback((exitCode: number) => {
+    onStatusChange(exitCode === 0 ? 'completed' : 'failed');
+  }, [onStatusChange]);
+
+  const handleClose = useCallback(() => {
+    // Destroy PTY if running, then close
+    if (terminal.status === 'running') {
+      app.pty.destroy(terminal.id).catch(() => { /* ignore */ });
+    }
+    onClose();
+  }, [terminal.status, terminal.id, onClose]);
+
+  const effectiveCwd = projectPath || process.env.HOME || '/tmp';
 
   return (
-    <div className="flex flex-col overflow-hidden rounded-xl border border-border/60 bg-card/80">
+    <div className="flex flex-col overflow-hidden rounded-xl border border-border/60 bg-card/80" style={{ minHeight: '240px' }}>
       {/* Header */}
       <div className="flex items-center justify-between border-b border-border/40 px-3 py-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -125,6 +106,18 @@ export const TerminalPanel: FC<TerminalPanelProps> = ({
           )}
         </div>
         <div className="flex items-center gap-2">
+          {/* Run with AI button (only when idle and task is linked) */}
+          {terminal.status === 'idle' && linkedTask && (
+            <button
+              type="button"
+              onClick={handleRunWithAI}
+              className="inline-flex items-center gap-1 rounded-md bg-purple-500/10 px-2 py-1 text-[10px] font-medium text-purple-400 transition-colors hover:bg-purple-500/20"
+              title="Run with Claude AI"
+            >
+              <BotIcon className="h-3 w-3" />
+              AI
+            </button>
+          )}
           {/* Status badge */}
           <span className={cn('inline-flex items-center gap-1.5 text-[10px] font-medium', cfg.textClass)}>
             <span className={cn('h-1.5 w-1.5 rounded-full', cfg.dotClass)} />
@@ -133,7 +126,7 @@ export const TerminalPanel: FC<TerminalPanelProps> = ({
           {/* Close button */}
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="rounded-md p-0.5 text-muted-foreground/40 transition-colors hover:bg-muted/30 hover:text-muted-foreground"
           >
             <XIcon className="h-3.5 w-3.5" />
@@ -142,38 +135,46 @@ export const TerminalPanel: FC<TerminalPanelProps> = ({
       </div>
 
       {/* Body */}
-      <div ref={outputRef} className="relative flex min-h-[180px] flex-1 flex-col bg-black/40 p-3 font-mono text-xs">
+      <div className="relative flex min-h-0 flex-1 flex-col bg-[#0a0a0a]">
         {terminal.status === 'idle' ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-3">
-            <span className="text-muted-foreground/50">Ready</span>
-            <button
-              type="button"
-              onClick={handleRun}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-[11px] font-medium text-primary transition-colors hover:bg-primary/20"
-            >
-              <PlayIcon className="h-3 w-3" />
-              Run
-            </button>
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 p-3">
+            <span className="text-xs text-muted-foreground/50">Ready</span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleRun}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-[11px] font-medium text-primary transition-colors hover:bg-primary/20"
+              >
+                <PlayIcon className="h-3 w-3" />
+                Run
+              </button>
+              {linkedTask && (
+                <button
+                  type="button"
+                  onClick={handleRunWithAI}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-purple-500/10 px-3 py-1.5 text-[11px] font-medium text-purple-400 transition-colors hover:bg-purple-500/20"
+                >
+                  <BotIcon className="h-3 w-3" />
+                  Run with AI
+                </button>
+              )}
+            </div>
           </div>
         ) : (
-          <div className="flex-1 overflow-y-auto whitespace-pre-wrap text-muted-foreground/80 leading-relaxed">
-            {terminal.output.map((line, i) => (
-              <div key={i} className={cn(
-                line.startsWith('> ✓') ? 'text-emerald-400' :
-                line.startsWith('$') ? 'text-primary' :
-                line.startsWith('> Bundle') || line.startsWith('> Build completed') ? 'text-emerald-400/80' :
-                undefined
-              )}>
-                {line}
-              </div>
-            ))}
+          <div className="flex-1" style={{ minHeight: '180px' }}>
+            <XTerminal
+              sessionId={terminal.id}
+              cwd={effectiveCwd}
+              preSpawned={preSpawned}
+              onExit={handlePtyExit}
+            />
           </div>
         )}
       </div>
 
       {/* Status bar */}
       <div className="flex items-center justify-between border-t border-border/30 bg-muted/5 px-3 py-1">
-        <span className="text-[9px] font-mono text-muted-foreground/40">{terminal.id}</span>
+        <span className="text-[9px] font-mono text-muted-foreground/40">{terminal.id.slice(0, 8)}</span>
         <span className="text-[9px] font-mono text-muted-foreground/40">{uptime}</span>
       </div>
     </div>

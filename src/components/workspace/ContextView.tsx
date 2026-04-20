@@ -6,7 +6,6 @@ import { app } from '@/lib/ipc-client';
 
 /* ── Helpers ───────────────────────────────────────────── */
 
-/** Convert flat directory listing to FileNode[] */
 function entriesToNodes(
   entries: Array<{ name: string; isDirectory: boolean }>,
 ): FileNode[] {
@@ -14,6 +13,7 @@ function entriesToNodes(
     name: e.name,
     type: e.isDirectory ? 'directory' as const : 'file' as const,
     children: e.isDirectory ? [] : undefined,
+    loaded: false,
   }));
 }
 
@@ -54,12 +54,27 @@ export const ContextView: FC = () => {
     return () => { cancelled = true; };
   }, [project]);
 
+  // Lazy-load directory children when expanded
+  const handleExpandDirectory = useCallback(async (relativePath: string): Promise<FileNode[]> => {
+    if (!project) return [];
+    const fullPath = `${project.path}/${relativePath}`;
+    try {
+      const result = await app.fs.listDirectory(fullPath);
+      if (result.error) {
+        console.warn('[ContextView] Failed to list:', result.error);
+        return [];
+      }
+      return entriesToNodes(result.entries);
+    } catch {
+      return [];
+    }
+  }, [project]);
+
   // Load file content when a file is selected
   const handleSelect = useCallback((path: string) => {
     setSelectedFile(path);
     if (!project) return;
 
-    // Build full path
     const fullPath = `${project.path}/${path}`;
     setFileLoading(true);
     setFileError(null);
@@ -93,7 +108,7 @@ export const ContextView: FC = () => {
       {/* Split view */}
       <div className="flex min-h-0 flex-1">
         {/* File tree (left) */}
-        <div className="w-[250px] shrink-0 overflow-y-auto border-r border-border/40 p-2">
+        <div className="w-[280px] shrink-0 overflow-y-auto border-r border-border/40 p-2">
           {treeLoading ? (
             <div className="flex items-center justify-center py-8">
               <Loader2Icon className="h-5 w-5 animate-spin text-muted-foreground/40" />
@@ -103,6 +118,7 @@ export const ContextView: FC = () => {
               nodes={tree}
               selectedPath={selectedFile}
               onSelect={handleSelect}
+              onExpandDirectory={handleExpandDirectory}
             />
           ) : (
             <p className="px-2 py-4 text-xs text-muted-foreground/50">
@@ -144,7 +160,7 @@ export const ContextView: FC = () => {
               <div>
                 <p className="text-sm font-medium text-muted-foreground">Select a file to preview</p>
                 <p className="mt-1 text-xs text-muted-foreground/60">
-                  Browse the file tree on the left to view contents.
+                  Click any file in the tree to view its contents.
                 </p>
               </div>
             </div>
