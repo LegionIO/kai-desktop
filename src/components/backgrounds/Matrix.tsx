@@ -34,24 +34,38 @@ function useMatrixCanvas() {
     let drops: number[] = [];
     let columnCount = 0;
     const fontSize = 14;
+    const BOOST_RADIUS = 300;
 
-    // Second canvas for hover-highlighted version, third for clean default (never has hover color)
-    const hoverCanvas = document.createElement('canvas');
-    const hoverCtx = hoverCanvas.getContext('2d')!;
-    const goldCanvas = document.createElement('canvas');
-    const goldCtx = goldCanvas.getContext('2d')!;
+    // Offscreen canvas renders the rain with brighter glyphs.
+    // Each frame we copy a radial region from it onto the main canvas near the cursor.
+    const brightCanvas = document.createElement('canvas');
+    const brightCtx = brightCanvas.getContext('2d')!;
+    // Clean canvas stores the un-boosted state for restoring previously-boosted areas
+    const cleanCanvas = document.createElement('canvas');
+    const cleanCtx = cleanCanvas.getContext('2d')!;
+    // Small scratch canvas for radial masking (sized to boost diameter)
+    const scratchCanvas = document.createElement('canvas');
+    const scratchCtx = scratchCanvas.getContext('2d')!;
 
     // Theme-aware palette
-    const palette = { fade: '', glyph: '', glyphDim: '', glyphHover: '', bg: '' };
+    const palette = { fade: '', glyph: '', glyphBright: '', glyphDim: '', bg: '' };
     const refreshPalette = () => {
+      const isDark = document.documentElement.classList.contains('dark');
       const s = getComputedStyle(document.documentElement);
-      palette.fade = s.getPropertyValue('--app-matrix-fade').trim() || 'rgba(250, 248, 244, 0.12)';
-      palette.glyph = s.getPropertyValue('--app-matrix-glyph').trim() || 'rgba(120, 110, 90, 0.55)';
-      palette.glyphDim = s.getPropertyValue('--app-matrix-glyph-dim').trim() || 'rgba(120, 110, 90, 0.1)';
-      palette.glyphHover = s.getPropertyValue('--app-matrix-glyph-hover').trim() || 'rgba(255, 255, 255, 0.9)';
-      palette.bg = s.getPropertyValue('--background').trim() || '#000';
-      // Reset all canvases with opaque background on theme change
-      for (const [ctx, cvs] of [[context, canvas], [hoverCtx, hoverCanvas], [goldCtx, goldCanvas]] as const) {
+      const hue = s.getPropertyValue('--brand-hue').trim() || '85';
+      palette.bg = s.getPropertyValue('--background').trim() || (isDark ? '#000' : '#fff');
+      if (isDark) {
+        palette.fade = `oklch(0.10 0.006 ${hue} / 8%)`;
+        palette.glyph = `oklch(0.62 0.08 ${hue} / 50%)`;
+        palette.glyphBright = `oklch(0.85 0.14 ${hue} / 90%)`;
+        palette.glyphDim = `oklch(0.40 0.04 ${hue} / 10%)`;
+      } else {
+        palette.fade = `oklch(0.99 0.003 ${hue} / 10%)`;
+        palette.glyph = `oklch(0.40 0.10 ${hue} / 55%)`;
+        palette.glyphBright = `oklch(0.55 0.18 ${hue} / 90%)`;
+        palette.glyphDim = `oklch(0.50 0.06 ${hue} / 10%)`;
+      }
+      for (const [ctx, cvs] of [[context, canvas], [brightCtx, brightCanvas], [cleanCtx, cleanCanvas]] as const) {
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.fillStyle = palette.bg;
@@ -64,21 +78,23 @@ function useMatrixCanvas() {
     const themeObserver = new MutationObserver(refreshPalette);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 
-    // Pointer tracking for column highlight
-    const pointer = { col: -1 };
-    let prevCol = -1;
-    const HOVER_RADIUS = 3; // columns on each side of cursor also highlight
+    // Pointer tracking
+    const pointer = { x: -1, y: -1, active: false };
+    let prevPointer = { x: -1, y: -1, active: false };
     const onPointerMove = (e: PointerEvent) => {
       const rect = container.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      if (x >= 0 && x <= rect.width && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-        pointer.col = Math.floor(x / fontSize);
+      const y = e.clientY - rect.top;
+      if (x >= 0 && x <= rect.width && y >= 0 && y <= rect.height) {
+        pointer.x = x;
+        pointer.y = y;
+        pointer.active = true;
       } else {
-        pointer.col = -1;
+        pointer.active = false;
       }
     };
-    const onPointerLeave = () => { pointer.col = -1; };
-    window.addEventListener('pointermove', onPointerMove);
+    const onPointerLeave = () => { pointer.active = false; };
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
     window.addEventListener('pointerleave', onPointerLeave);
 
     const setup = () => {
@@ -90,26 +106,30 @@ function useMatrixCanvas() {
       canvas.height = Math.floor(height * devicePixelRatio);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
-
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.scale(devicePixelRatio, devicePixelRatio);
 
-      hoverCanvas.width = canvas.width;
-      hoverCanvas.height = canvas.height;
-      hoverCtx.setTransform(1, 0, 0, 1, 0, 0);
-      hoverCtx.scale(devicePixelRatio, devicePixelRatio);
+      brightCanvas.width = canvas.width;
+      brightCanvas.height = canvas.height;
+      brightCtx.setTransform(1, 0, 0, 1, 0, 0);
+      brightCtx.scale(devicePixelRatio, devicePixelRatio);
 
-      goldCanvas.width = canvas.width;
-      goldCanvas.height = canvas.height;
-      goldCtx.setTransform(1, 0, 0, 1, 0, 0);
-      goldCtx.scale(devicePixelRatio, devicePixelRatio);
+      cleanCanvas.width = canvas.width;
+      cleanCanvas.height = canvas.height;
+      cleanCtx.setTransform(1, 0, 0, 1, 0, 0);
+      cleanCtx.scale(devicePixelRatio, devicePixelRatio);
+
+      // Scratch canvas sized to boost diameter
+      const scratchSize = Math.ceil(BOOST_RADIUS * 2 * devicePixelRatio);
+      scratchCanvas.width = scratchSize;
+      scratchCanvas.height = scratchSize;
 
       columnCount = Math.ceil(width / fontSize);
       const rows = Math.ceil(height / fontSize);
       drops = Array.from({ length: columnCount }, () => -Math.floor(Math.random() * rows));
 
-      // Draw a dim static base layer of glyphs across the entire grid
-      for (const ctx of [context, hoverCtx, goldCtx]) {
+      // Draw dim static base layer on all canvases
+      for (const ctx of [context, brightCtx, cleanCtx]) {
         ctx.fillStyle = palette.glyphDim;
         ctx.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
         for (let col = 0; col < columnCount; col += 1) {
@@ -127,66 +147,78 @@ function useMatrixCanvas() {
       // Fade all three canvases
       context.fillStyle = palette.fade;
       context.fillRect(0, 0, width, height);
-      hoverCtx.fillStyle = palette.fade;
-      hoverCtx.fillRect(0, 0, width, height);
-      goldCtx.fillStyle = palette.fade;
-      goldCtx.fillRect(0, 0, width, height);
+      brightCtx.fillStyle = palette.fade;
+      brightCtx.fillRect(0, 0, width, height);
+      cleanCtx.fillStyle = palette.fade;
+      cleanCtx.fillRect(0, 0, width, height);
 
-      context.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
-      hoverCtx.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
-      goldCtx.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
+      const font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
+      context.font = font;
+      brightCtx.font = font;
+      cleanCtx.font = font;
 
       for (let index = 0; index < drops.length; index += 1) {
         const x = index * fontSize;
         const y = drops[index] * fontSize;
         const glyph = MATRIX_GLYPHS[Math.floor(Math.random() * MATRIX_GLYPHS.length)];
 
-        // Gold on main + gold canvas
+        // Normal color on main + clean canvas
         context.fillStyle = palette.glyph;
         context.fillText(glyph, x, y);
-        goldCtx.fillStyle = palette.glyph;
-        goldCtx.fillText(glyph, x, y);
+        cleanCtx.fillStyle = palette.glyph;
+        cleanCtx.fillText(glyph, x, y);
 
-        // Hover color on offscreen canvas
-        hoverCtx.fillStyle = palette.glyphHover;
-        hoverCtx.fillText(glyph, x, y);
+        // Bright color on offscreen canvas
+        brightCtx.fillStyle = palette.glyphBright;
+        brightCtx.fillText(glyph, x, y);
 
         if (y > height && Math.random() > 0.975) drops[index] = 0;
         drops[index] += 1;
       }
 
-      // Swap hovered columns: replace with hover-colored version
-      const dpr = window.devicePixelRatio || 1;
-      const hoverMin = pointer.col >= 0 ? Math.max(0, pointer.col - HOVER_RADIUS) : -1;
-      const hoverMax = pointer.col >= 0 ? Math.min(columnCount - 1, pointer.col + HOVER_RADIUS) : -1;
-      const prevMin = prevCol >= 0 ? Math.max(0, prevCol - HOVER_RADIUS) : -1;
-      const prevMax = prevCol >= 0 ? Math.min(columnCount - 1, prevCol + HOVER_RADIUS) : -1;
-
-      // Draw hover-highlighted columns
-      if (hoverMin >= 0) {
-        const srcX = Math.floor(hoverMin * fontSize * dpr);
-        const srcW = Math.ceil((hoverMax - hoverMin + 1) * fontSize * dpr);
-        const srcH = canvas.height;
+      // Restore previous cursor area from clean canvas
+      if (prevPointer.active) {
         context.save();
+        context.beginPath();
+        context.arc(prevPointer.x, prevPointer.y, BOOST_RADIUS, 0, Math.PI * 2);
+        context.clip();
         context.setTransform(1, 0, 0, 1, 0, 0);
-        context.drawImage(hoverCanvas, srcX, 0, srcW, srcH, srcX, 0, srcW, srcH);
+        context.drawImage(cleanCanvas, 0, 0);
         context.restore();
       }
 
-      // Restore previously hovered columns that are no longer in range
-      if (prevMin >= 0 && prevCol !== pointer.col) {
-        for (let c = prevMin; c <= prevMax; c += 1) {
-          if (hoverMin >= 0 && c >= hoverMin && c <= hoverMax) continue; // still hovered
-          const srcX = Math.floor(c * fontSize * dpr);
-          const srcW = Math.ceil(fontSize * dpr);
-          const srcH = canvas.height;
-          context.save();
-          context.setTransform(1, 0, 0, 1, 0, 0);
-          context.drawImage(goldCanvas, srcX, 0, srcW, srcH, srcX, 0, srcW, srcH);
-          context.restore();
-        }
+      // Stamp bright canvas with soft radial falloff around cursor
+      if (pointer.active) {
+        const dpr = window.devicePixelRatio || 1;
+        const r = BOOST_RADIUS;
+        const size = scratchCanvas.width;
+        const center = size / 2;
+
+        // Copy the bright canvas region into the scratch buffer
+        const sx = Math.round((pointer.x - r) * dpr);
+        const sy = Math.round((pointer.y - r) * dpr);
+        scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
+        scratchCtx.clearRect(0, 0, size, size);
+        scratchCtx.drawImage(brightCanvas, sx, sy, size, size, 0, 0, size, size);
+
+        // Mask with radial gradient (opaque center → transparent edge)
+        scratchCtx.globalCompositeOperation = 'destination-in';
+        const grad = scratchCtx.createRadialGradient(center, center, 0, center, center, center);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.5, 'rgba(255,255,255,0.6)');
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        scratchCtx.fillStyle = grad;
+        scratchCtx.fillRect(0, 0, size, size);
+        scratchCtx.globalCompositeOperation = 'source-over';
+
+        // Draw the masked scratch buffer onto the main canvas
+        context.save();
+        context.setTransform(1, 0, 0, 1, 0, 0);
+        context.drawImage(scratchCanvas, sx, sy);
+        context.restore();
       }
-      prevCol = pointer.col;
+
+      prevPointer = { ...pointer };
 
       frameId = window.setTimeout(() => {
         animationFrame = window.requestAnimationFrame(draw);

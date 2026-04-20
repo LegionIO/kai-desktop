@@ -1,12 +1,12 @@
 import { useRef, useEffect, type FC } from 'react';
 import { attachCanvasResizeFade } from '@/lib/canvasResizeFade';
 
-const Constellation: FC = () => (
+const Constellations: FC = () => (
   <div
     aria-hidden="true"
     className="pointer-events-none absolute inset-0 overflow-hidden"
   >
-    <canvas ref={useConstellationCanvas()} className="absolute inset-0 h-full w-full" />
+    <canvas ref={useConstellationsCanvas()} className="absolute inset-0 h-full w-full" />
     <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
     <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
     <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
@@ -23,40 +23,43 @@ interface Particle {
   radius: number;
   opacity: number;
   connectable: boolean;
-  spikes: number;
-  rotation: number;
   twinklePhase: number;
   nudgeCountdown: number;
 }
 
-function drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, spikes: number, size: number, rotation: number) {
-  const bodyRadius = size * 0.7;
-  const spikeLength = size * 1.8;
-  const spikeHalfWidth = Math.PI * 0.06;
+/** Draw a fuzzy glowing star with soft halo */
+function drawGlowDot(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, color: string, alpha: number) {
+  // Outer soft halo
+  ctx.globalAlpha = alpha * 0.08;
+  const outerGlow = ctx.createRadialGradient(x, y, 0, x, y, radius * 8);
+  outerGlow.addColorStop(0, color);
+  outerGlow.addColorStop(0.3, color);
+  outerGlow.addColorStop(1, 'transparent');
+  ctx.fillStyle = outerGlow;
+  ctx.fillRect(x - radius * 8, y - radius * 8, radius * 16, radius * 16);
 
+  // Inner glow
+  ctx.globalAlpha = alpha * 0.25;
+  const innerGlow = ctx.createRadialGradient(x, y, 0, x, y, radius * 3);
+  innerGlow.addColorStop(0, color);
+  innerGlow.addColorStop(0.5, color);
+  innerGlow.addColorStop(1, 'transparent');
+  ctx.fillStyle = innerGlow;
+  ctx.fillRect(x - radius * 3, y - radius * 3, radius * 6, radius * 6);
+
+  // Bright core
+  ctx.globalAlpha = alpha * 0.9;
+  const core = ctx.createRadialGradient(x, y, 0, x, y, radius * 1.2);
+  core.addColorStop(0, '#fff');
+  core.addColorStop(0.4, color);
+  core.addColorStop(1, 'transparent');
+  ctx.fillStyle = core;
   ctx.beginPath();
-  ctx.arc(cx, cy, bodyRadius, 0, Math.PI * 2);
+  ctx.arc(x, y, radius * 1.2, 0, Math.PI * 2);
   ctx.fill();
-
-  for (let i = 0; i < spikes; i += 1) {
-    const angle = rotation + (i * Math.PI * 2) / spikes;
-    const tipX = cx + Math.cos(angle) * spikeLength;
-    const tipY = cy + Math.sin(angle) * spikeLength;
-    const baseX1 = cx + Math.cos(angle - spikeHalfWidth) * bodyRadius;
-    const baseY1 = cy + Math.sin(angle - spikeHalfWidth) * bodyRadius;
-    const baseX2 = cx + Math.cos(angle + spikeHalfWidth) * bodyRadius;
-    const baseY2 = cy + Math.sin(angle + spikeHalfWidth) * bodyRadius;
-
-    ctx.beginPath();
-    ctx.moveTo(baseX1, baseY1);
-    ctx.lineTo(tipX, tipY);
-    ctx.lineTo(baseX2, baseY2);
-    ctx.closePath();
-    ctx.fill();
-  }
 }
 
-function useConstellationCanvas() {
+function useConstellationsCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -74,13 +77,13 @@ function useConstellationCanvas() {
     let particles: Particle[] = [];
     let tick = 0;
 
-    const nodeCount = 35;
-    const starCount = 1200;
+    const nodeCount = 25;
+    const starCount = 400;
     const totalCount = nodeCount + starCount;
     const connectionDistance = 160;
     const maxConnectionsPerNode = 3;
-    const nodeSpeed = 0.35;
-    const starSpeed = 0.06;
+    const nodeSpeed = 0.14;
+    const starSpeed = 0.025;
 
     const connections = new Map<string, { strength: number }>();
     const fadeInRate = 0.04;
@@ -95,30 +98,57 @@ function useConstellationCanvas() {
     }
     let shootingStar: ShootingStar | null = null;
     const shootingStarChance = 0.003;
-    const shootingStarFrames = 38;
+    const shootingStarFrames = 60;
 
-    // Theme-aware palette
-    const palette = { dot: '', line: '' };
+    // Theme-aware palette — derives colors from global --brand-hue + dark mode
+    const palette = { dot: '', line: '', dotHover: '' };
     const refreshPalette = () => {
+      const isDark = document.documentElement.classList.contains('dark');
       const s = getComputedStyle(document.documentElement);
-      palette.dot = s.getPropertyValue('--app-constellation-dot').trim() || 'rgba(160, 160, 160, 0.5)';
-      palette.line = s.getPropertyValue('--app-constellation-line').trim() || 'rgba(160, 160, 160, 0.18)';
+      const hue = s.getPropertyValue('--brand-hue').trim() || '85';
+      if (isDark) {
+        palette.dot = `oklch(0.78 0.12 ${hue} / 72%)`;
+        palette.line = `oklch(0.78 0.12 ${hue} / 45%)`;
+        palette.dotHover = `oklch(0.90 0.14 ${hue} / 95%)`;
+      } else {
+        palette.dot = `oklch(0.35 0.16 ${hue} / 85%)`;
+        palette.line = `oklch(0.35 0.16 ${hue} / 60%)`;
+        palette.dotHover = `oklch(0.55 0.20 ${hue} / 95%)`;
+      }
     };
     refreshPalette();
 
     const themeObserver = new MutationObserver(refreshPalette);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 
+    // Pointer tracking — used for star brightness AND constellation line reveal
+    const pointer = { x: -1, y: -1, active: false };
+    const GLOW_RADIUS = 150;
+    const LINE_REVEAL_RADIUS = 200;
+    const onPointerMove = (e: PointerEvent) => {
+      const rect = container.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      if (px >= 0 && py >= 0 && px <= rect.width && py <= rect.height) {
+        pointer.x = px;
+        pointer.y = py;
+        pointer.active = true;
+      } else {
+        pointer.active = false;
+      }
+    };
+    const onPointerLeave = () => { pointer.active = false; };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerleave', onPointerLeave);
+
     const makeParticle = (width: number, height: number, connectable: boolean): Particle => ({
       x: Math.random() * width,
       y: Math.random() * height,
       vx: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
       vy: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
-      radius: connectable ? 2.5 + Math.random() * 2.5 : 1.2 + Math.random() * 2,
+      radius: connectable ? 2 + Math.random() * 2 : 0.8 + Math.random() * 1.5,
       opacity: connectable ? 0.6 + Math.random() * 0.35 : 0.3 + Math.random() * 0.6,
       connectable,
-      spikes: 3 + Math.floor(Math.random() * 4),
-      rotation: Math.random() * Math.PI * 2,
       twinklePhase: Math.random() * Math.PI * 2,
       nudgeCountdown: 60 + Math.floor(Math.random() * 200),
     });
@@ -189,10 +219,12 @@ function useConstellationCanvas() {
 
       const dotColor = palette.dot;
       const lineColor = palette.line;
+      const dotHover = palette.dotHover;
 
       context.globalAlpha = 1;
       context.clearRect(0, 0, width, height);
 
+      // Update positions
       for (const p of particles) {
         p.x += p.vx;
         p.y += p.vy;
@@ -215,24 +247,23 @@ function useConstellationCanvas() {
           p.nudgeCountdown = 60 + Math.floor(Math.random() * 200);
         }
 
-        p.rotation += p.connectable ? 0.003 : 0.006;
-
         if (Math.random() < 0.001) {
           p.connectable = !p.connectable;
           if (p.connectable) {
-            p.radius = 2.5 + Math.random() * 2.5;
+            p.radius = 2 + Math.random() * 2;
             const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy) || 0.01;
             const scale = nodeSpeed / Math.max(speed, 0.01);
             p.vx *= scale;
             p.vy *= scale;
           } else {
-            p.radius = 1.2 + Math.random() * 2;
+            p.radius = 0.8 + Math.random() * 1.5;
             p.vx *= 0.2;
             p.vy *= 0.2;
           }
         }
       }
 
+      // Update connections
       const inRangePairs = new Set<string>();
       const connectionCounts = new Uint8Array(totalCount);
 
@@ -272,8 +303,8 @@ function useConstellationCanvas() {
         }
       }
 
-      const neighbors = new Map<number, Set<number>>();
-      const activeEdges: Array<{ key: string; conn: { strength: number }; a: number; b: number }> = [];
+      // Fade connections in/out
+      const activeEdges: Array<{ conn: { strength: number }; a: number; b: number }> = [];
 
       for (const [key, conn] of connections) {
         if (inRangePairs.has(key)) {
@@ -290,68 +321,65 @@ function useConstellationCanvas() {
         const [a, b] = key.split(':').map(Number);
         if (!particles[a] || !particles[b]) { connections.delete(key); continue; }
 
-        activeEdges.push({ key, conn, a, b });
+        activeEdges.push({ conn, a, b });
+      }
 
-        if (conn.strength > 0.3) {
-          if (!neighbors.has(a)) neighbors.set(a, new Set());
-          if (!neighbors.has(b)) neighbors.set(b, new Set());
-          neighbors.get(a)!.add(b);
-          neighbors.get(b)!.add(a);
+      // Draw edges — only visible near the cursor
+      if (pointer.active) {
+        for (const { conn, a, b } of activeEdges) {
+          const pi = particles[a];
+          const pj = particles[b];
+          const midX = (pi.x + pj.x) / 2;
+          const midY = (pi.y + pj.y) / 2;
+
+          // Check if the midpoint of the edge is near the cursor
+          const dxMid = midX - pointer.x;
+          const dyMid = midY - pointer.y;
+          const distMid = Math.sqrt(dxMid * dxMid + dyMid * dyMid);
+          if (distMid > LINE_REVEAL_RADIUS) continue;
+
+          const proximityFade = 1 - distMid / LINE_REVEAL_RADIUS;
+          const dx = pi.x - pj.x;
+          const dy = pi.y - pj.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const distAlpha = dist < connectionDistance ? 1 - dist / connectionDistance : 0.3;
+
+          context.globalAlpha = Math.min(1, conn.strength * distAlpha * proximityFade * 2.5);
+          context.strokeStyle = lineColor;
+          context.lineWidth = 1.5;
+          context.beginPath();
+          context.moveTo(pi.x, pi.y);
+          context.lineTo(pj.x, pj.y);
+          context.stroke();
         }
       }
 
-      const loopEdges = new Set<string>();
-      for (const { key, a, b } of activeEdges) {
-        const aN = neighbors.get(a);
-        const bN = neighbors.get(b);
-        if (!aN || !bN) continue;
-        for (const n of aN) {
-          if (n !== b && bN.has(n)) {
-            loopEdges.add(key);
-            const minAn = Math.min(a, n);
-            const maxAn = Math.max(a, n);
-            const minBn = Math.min(b, n);
-            const maxBn = Math.max(b, n);
-            loopEdges.add(`${minAn}:${maxAn}`);
-            loopEdges.add(`${minBn}:${maxBn}`);
-            break;
-          }
-        }
-      }
-
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.08);
-      for (const { key, conn, a, b } of activeEdges) {
-        const pi = particles[a];
-        const pj = particles[b];
-        const dx = pi.x - pj.x;
-        const dy = pi.y - pj.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const distAlpha = dist < connectionDistance ? 1 - dist / connectionDistance : 0.3;
-        const isLoop = loopEdges.has(key);
-
-        context.globalAlpha = Math.min(1, conn.strength * distAlpha * (isLoop ? pulse : 1));
-        context.strokeStyle = lineColor;
-        context.lineWidth = isLoop ? 2 : 1.2;
-        context.beginPath();
-        context.moveTo(pi.x, pi.y);
-        context.lineTo(pj.x, pj.y);
-        context.stroke();
-      }
-
-      context.fillStyle = dotColor;
+      // Draw particles as glowing dots
       for (const p of particles) {
         let alpha = p.opacity;
 
         if (!p.connectable) {
-          const twinkle = Math.sin(tick * 0.04 + p.twinklePhase);
+          const twinkle = Math.sin(tick * 0.016 + p.twinklePhase);
           alpha = p.opacity * (0.3 + 0.7 * ((twinkle + 1) / 2));
         }
 
-        context.globalAlpha = alpha;
-        drawStar(context, p.x, p.y, p.spikes, p.radius, p.rotation);
-        context.fill();
+        // Brighten stars near the cursor
+        let color = dotColor;
+        if (pointer.active) {
+          const dx = p.x - pointer.x;
+          const dy = p.y - pointer.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < GLOW_RADIUS) {
+            const proximity = 1 - dist / GLOW_RADIUS;
+            color = dotHover;
+            alpha = Math.min(1, alpha + proximity * 0.7);
+          }
+        }
+
+        drawGlowDot(context, p.x, p.y, p.radius, color, alpha);
       }
 
+      // Shooting star
       if (!shootingStar && Math.random() < shootingStarChance) {
         const edge = Math.floor(Math.random() * 4);
         let sx: number, sy: number;
@@ -363,7 +391,7 @@ function useConstellationCanvas() {
         const targetX = width * (0.3 + Math.random() * 0.4);
         const targetY = height * (0.3 + Math.random() * 0.4);
         const angle = Math.atan2(targetY - sy, targetX - sx) + (Math.random() - 0.5) * 0.6;
-        const speed = 12 + Math.random() * 8;
+        const speed = 6 + Math.random() * 4;
 
         shootingStar = {
           x: sx, y: sy,
@@ -387,9 +415,11 @@ function useConstellationCanvas() {
         else if (progress > 0.8) alpha = (1 - progress) / 0.2;
         else alpha = 1;
 
-        const tailX = s.x - (s.vx / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
-        const tailY = s.y - (s.vy / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
+        const speed = Math.sqrt(s.vx * s.vx + s.vy * s.vy);
+        const tailX = s.x - (s.vx / speed) * s.tailLength;
+        const tailY = s.y - (s.vy / speed) * s.tailLength;
 
+        // Glowing tail
         const grad = context.createLinearGradient(tailX, tailY, s.x, s.y);
         grad.addColorStop(0, 'transparent');
         grad.addColorStop(1, dotColor);
@@ -402,11 +432,8 @@ function useConstellationCanvas() {
         context.lineTo(s.x, s.y);
         context.stroke();
 
-        context.globalAlpha = alpha;
-        context.fillStyle = dotColor;
-        context.beginPath();
-        context.arc(s.x, s.y, 2.5, 0, Math.PI * 2);
-        context.fill();
+        // Glowing head (same style as floating stars)
+        drawGlowDot(context, s.x, s.y, 3, dotColor, alpha);
 
         if (s.life <= 0 || s.x < -100 || s.x > width + 100 || s.y < -100 || s.y > height + 100) {
           shootingStar = null;
@@ -417,7 +444,7 @@ function useConstellationCanvas() {
 
       frameId = window.setTimeout(() => {
         animationFrame = window.requestAnimationFrame(draw);
-      }, 130);
+      }, 50);
     };
 
     const stop = () => {
@@ -457,6 +484,8 @@ function useConstellationCanvas() {
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('blur', handleBlur);
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerleave', onPointerLeave);
       themeObserver.disconnect();
     };
   }, []);
@@ -464,4 +493,4 @@ function useConstellationCanvas() {
   return canvasRef;
 }
 
-export default Constellation;
+export default Constellations;

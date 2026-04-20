@@ -47,7 +47,6 @@ import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
 import { backgrounds } from '@/components/backgrounds';
-import { useCursorSpotlight } from '@/lib/useCursorSpotlight';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
@@ -459,7 +458,6 @@ function pickBackground(): FC {
  */
 const EmptyThreadBackground: FC = () => {
   const [Background] = useState<FC>(() => pickBackground());
-  const spotlightRef = useCursorSpotlight();
 
   // Persist which background is displayed — useEffect only commits once,
   // unlike useState initializers which StrictMode may call twice.
@@ -471,7 +469,6 @@ const EmptyThreadBackground: FC = () => {
   return (
     <div className="absolute inset-0">
       <Background />
-      <div ref={spotlightRef} className="pointer-events-none absolute inset-0 z-[1]" />
     </div>
   );
 };

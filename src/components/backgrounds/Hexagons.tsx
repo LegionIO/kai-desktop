@@ -7,17 +7,6 @@ const Hexagons: FC = () => (
     className="pointer-events-none absolute inset-0 overflow-hidden"
   >
     <canvas ref={useHexGridCanvas()} className="absolute inset-0 h-full w-full" style={{ opacity: 0.95 }} />
-    <div
-      className="absolute inset-0"
-      style={{
-        background: [
-          'radial-gradient(circle at 50% 32%, var(--app-hex-vignette-glow), transparent 30%)',
-          'radial-gradient(circle at 50% 70%, var(--app-hex-vignette-mid), var(--app-hex-vignette-outer) 72%)',
-          'linear-gradient(180deg, var(--app-hex-vignette-top) 0%, var(--app-hex-vignette-fade) 30%, var(--app-hex-vignette-bottom) 100%)',
-        ].join(', '),
-        pointerEvents: 'none',
-      }}
-    />
     <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
     <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
     <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
@@ -84,14 +73,23 @@ function useHexGridCanvas() {
     let disposed = false;
     let lastTime = performance.now();
 
-    // Theme-aware palette resolved from CSS variables
+    // Theme-aware palette — derives colors from global --brand-hue + dark mode
     const palette = { stroke: '', strokeBright: '', glow: '', hot: '' };
     const refreshPalette = () => {
+      const isDark = document.documentElement.classList.contains('dark');
       const s = getComputedStyle(document.documentElement);
-      palette.stroke = s.getPropertyValue('--app-hex-stroke').trim();
-      palette.strokeBright = s.getPropertyValue('--app-hex-stroke-bright').trim();
-      palette.glow = s.getPropertyValue('--app-hex-glow').trim();
-      palette.hot = s.getPropertyValue('--app-hex-hot').trim();
+      const hue = s.getPropertyValue('--brand-hue').trim() || '85';
+      if (isDark) {
+        palette.stroke = `oklch(0.78 0.12 ${hue})`;
+        palette.strokeBright = `oklch(0.88 0.08 ${hue})`;
+        palette.glow = `oklch(0.60 0.12 ${hue})`;
+        palette.hot = `oklch(0.92 0.08 ${hue})`;
+      } else {
+        palette.stroke = `oklch(0.32 0.16 ${hue})`;
+        palette.strokeBright = `oklch(0.42 0.14 ${hue})`;
+        palette.glow = `oklch(0.25 0.14 ${hue})`;
+        palette.hot = `oklch(0.48 0.12 ${hue})`;
+      }
     };
     refreshPalette();
 
@@ -130,17 +128,18 @@ function useHexGridCanvas() {
       const cols = Math.ceil(width / HEX_W) + 2;
       const rows = Math.ceil(height / HEX_H) + 2;
 
-      const centerCol = cols / 2;
-      const centerRow = rows / 2;
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const maxDist = Math.sqrt(centerX * centerX + centerY * centerY);
 
       for (let row = -1; row < rows; row++) {
         for (let col = -1; col < cols; col++) {
           const cx = col * HEX_W + (row % 2 !== 0 ? HEX_W / 2 : 0);
           const cy = row * HEX_H;
 
-          const dc = Math.abs(col - centerCol) / centerCol;
-          const dr = Math.abs(row - centerRow) / centerRow;
-          const distFromCenter = Math.sqrt(dc * dc + dr * dr);
+          const dx = cx - centerX;
+          const dy = cy - centerY;
+          const distFromCenter = Math.sqrt(dx * dx + dy * dy) / maxDist;
 
           const r = Math.random();
           let tier: number;
@@ -157,7 +156,7 @@ function useHexGridCanvas() {
 
           hexes.push({
             col, row, cx, cy,
-            baseAlpha: baseAlpha * (1 - distFromCenter * 0.3),
+            baseAlpha: baseAlpha * Math.max(0, 1 - distFromCenter * 1.2),
             glowAlpha: 0,
             glowTarget: 0,
             glowSpeed: rand(0.8, 2.5),
