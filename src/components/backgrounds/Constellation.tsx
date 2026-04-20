@@ -1,4 +1,5 @@
 import { useRef, useEffect, type FC } from 'react';
+import { attachCanvasResizeFade } from '@/lib/canvasResizeFade';
 
 const Constellation: FC = () => (
   <div
@@ -62,6 +63,9 @@ function useConstellationCanvas() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    const container = canvas.parentElement;
+    if (!container) return;
+
     const context = canvas.getContext('2d');
     if (!context) return;
 
@@ -93,6 +97,18 @@ function useConstellationCanvas() {
     const shootingStarChance = 0.003;
     const shootingStarFrames = 38;
 
+    // Theme-aware palette
+    const palette = { dot: '', line: '' };
+    const refreshPalette = () => {
+      const s = getComputedStyle(document.documentElement);
+      palette.dot = s.getPropertyValue('--app-constellation-dot').trim() || 'rgba(160, 160, 160, 0.5)';
+      palette.line = s.getPropertyValue('--app-constellation-line').trim() || 'rgba(160, 160, 160, 0.18)';
+    };
+    refreshPalette();
+
+    const themeObserver = new MutationObserver(refreshPalette);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+
     const makeParticle = (width: number, height: number, connectable: boolean): Particle => ({
       x: Math.random() * width,
       y: Math.random() * height,
@@ -111,9 +127,8 @@ function useConstellationCanvas() {
     let prevHeight = 0;
 
     const setup = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
+      const width = container.offsetWidth || window.innerWidth;
+      const height = container.offsetHeight || window.innerHeight;
       const dpr = window.devicePixelRatio || 1;
 
       canvas.width = Math.floor(width * dpr);
@@ -155,9 +170,8 @@ function useConstellationCanvas() {
     };
 
     const draw = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
+      const width = container.offsetWidth || window.innerWidth;
+      const height = container.offsetHeight || window.innerHeight;
       const dpr = window.devicePixelRatio || 1;
 
       const needW = Math.floor(width * dpr);
@@ -171,11 +185,10 @@ function useConstellationCanvas() {
         context.scale(dpr, dpr);
       }
 
-      const styles = getComputedStyle(document.documentElement);
       tick += 1;
 
-      const dotColor = styles.getPropertyValue('--app-constellation-dot').trim() || 'rgba(160, 160, 160, 0.5)';
-      const lineColor = styles.getPropertyValue('--app-constellation-line').trim() || 'rgba(160, 160, 160, 0.18)';
+      const dotColor = palette.dot;
+      const lineColor = palette.line;
 
       context.globalAlpha = 1;
       context.clearRect(0, 0, width, height);
@@ -316,7 +329,7 @@ function useConstellationCanvas() {
         const distAlpha = dist < connectionDistance ? 1 - dist / connectionDistance : 0.3;
         const isLoop = loopEdges.has(key);
 
-        context.globalAlpha = conn.strength * distAlpha * (isLoop ? pulse : 1);
+        context.globalAlpha = Math.min(1, conn.strength * distAlpha * (isLoop ? pulse : 1));
         context.strokeStyle = lineColor;
         context.lineWidth = isLoop ? 2 : 1.2;
         context.beginPath();
@@ -420,32 +433,31 @@ function useConstellationCanvas() {
     setup();
     start();
 
-    const handleResize = () => { stop(); setup(); start(); };
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') stop(); else start();
     };
     const handleBlur = () => stop();
     const handleFocus = () => start();
 
-    const container = canvas.parentElement;
-    let ro: ResizeObserver | undefined;
-    if (container) {
-      ro = new ResizeObserver(handleResize);
-      ro.observe(container);
-    }
+    const disposeResize = attachCanvasResizeFade({
+      canvas,
+      container,
+      setup,
+      start,
+      stop,
+    });
 
-    window.addEventListener('resize', handleResize);
     document.addEventListener('visibilitychange', handleVisibility);
     window.addEventListener('blur', handleBlur);
     window.addEventListener('focus', handleFocus);
 
     return () => {
       stop();
-      window.removeEventListener('resize', handleResize);
+      disposeResize();
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('blur', handleBlur);
       window.removeEventListener('focus', handleFocus);
-      ro?.disconnect();
+      themeObserver.disconnect();
     };
   }, []);
 

@@ -70,7 +70,7 @@ export const branding = {
 
   // ── Theme / visual identity ──────────────────────────────────────────
   /** OKLCh hue angle (0-360) used for the brand accent across the UI. */
-  themeHue: '85',
+  themeHue: '90',
   /** Fallback light-mode accent for contexts that need a hex color. */
   themeAccentLight: '#b8960f',
   /** Fallback dark-mode accent for contexts that need a hex color. */

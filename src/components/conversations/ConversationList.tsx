@@ -460,7 +460,7 @@ export const ConversationList: FC<ConversationListProps> = ({
       </div>
 
       <div className="px-3 pb-3">
-        <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/70 bg-sidebar-accent/45 px-3 py-2">
+        <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/60 bg-sidebar-accent/50 px-3 py-2">
           <SearchIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
           <EditableInput
             placeholder="Search..."

@@ -150,7 +150,7 @@ export const ModelSettingsButton: FC<{
       <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
         isNonAutoMode
           ? 'border-primary/50 bg-primary/10'
-          : 'border-border/70 bg-card/70'
+          : 'border-border/50 bg-muted/40'
       }`}>
         {/* Left segment: chevron — opens settings popover */}
         <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${

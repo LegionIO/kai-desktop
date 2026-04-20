@@ -1,6 +1,7 @@
 import { useRef, useEffect, type FC } from 'react';
+import { attachCanvasResizeFade } from '@/lib/canvasResizeFade';
 
-const HexGrid: FC = () => (
+const Hexagons: FC = () => (
   <div
     aria-hidden="true"
     className="pointer-events-none absolute inset-0 overflow-hidden"
@@ -61,17 +62,6 @@ interface Ripple {
   noise: number[];
 }
 
-/** Resolve a CSS color (including oklch) to "r, g, b" via a probe element. */
-function resolveToRgb(cssColor: string, fallback: string): string {
-  if (!cssColor) return fallback;
-  const probe = document.createElement('div');
-  probe.style.color = cssColor;
-  document.body.appendChild(probe);
-  const resolved = getComputedStyle(probe).color;
-  document.body.removeChild(probe);
-  const match = resolved.match(/[\d.]+/g);
-  return match ? `${match[0]}, ${match[1]}, ${match[2]}` : fallback;
-}
 
 function useHexGridCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -98,10 +88,10 @@ function useHexGridCanvas() {
     const palette = { stroke: '', strokeBright: '', glow: '', hot: '' };
     const refreshPalette = () => {
       const s = getComputedStyle(document.documentElement);
-      palette.stroke = resolveToRgb(s.getPropertyValue('--app-hex-stroke').trim(), '120, 100, 160');
-      palette.strokeBright = resolveToRgb(s.getPropertyValue('--app-hex-stroke-bright').trim(), '160, 140, 200');
-      palette.glow = resolveToRgb(s.getPropertyValue('--app-hex-glow').trim(), '90, 70, 130');
-      palette.hot = resolveToRgb(s.getPropertyValue('--app-hex-hot').trim(), '190, 170, 220');
+      palette.stroke = s.getPropertyValue('--app-hex-stroke').trim();
+      palette.strokeBright = s.getPropertyValue('--app-hex-stroke-bright').trim();
+      palette.glow = s.getPropertyValue('--app-hex-glow').trim();
+      palette.hot = s.getPropertyValue('--app-hex-hot').trim();
     };
     refreshPalette();
 
@@ -160,10 +150,10 @@ function useHexGridCanvas() {
           else tier = 0;
 
           const baseAlpha =
-            tier === 3 ? rand(0.6, 0.9) :
-            tier === 2 ? rand(0.25, 0.5) :
-            tier === 1 ? rand(0.08, 0.18) :
-            rand(0.02, 0.06);
+            tier === 3 ? rand(0.7, 1.0) :
+            tier === 2 ? rand(0.4, 0.7) :
+            tier === 1 ? rand(0.15, 0.35) :
+            rand(0.06, 0.15);
 
           hexes.push({
             col, row, cx, cy,
@@ -225,13 +215,15 @@ function useHexGridCanvas() {
       draw(lastTime);
     };
 
-    const drawHex = (hex: Hex, now: number) => {
-      const pulse = Math.sin(now * 0.5 + hex.phase) * 0.5 + 0.5;
+    const hexAlpha = (hex: Hex, now: number) => {
       const breathe = hex.tier >= 2
         ? Math.sin(now * 0.3 + hex.pulseDelay) * 0.15 + 0.85
         : 1;
+      return Math.min(1, hex.baseAlpha * breathe + hex.glowAlpha);
+    };
 
-      const alpha = (hex.baseAlpha * breathe + hex.glowAlpha);
+    const drawHexFill = (hex: Hex, now: number) => {
+      const alpha = hexAlpha(hex, now);
       if (alpha < 0.005) return;
 
       const r = HEX_RADIUS * hex.scale;
@@ -240,9 +232,10 @@ function useHexGridCanvas() {
       if (hex.tier >= 2 && alpha > 0.15) {
         const glowR = r * 2.8;
         const glow = context.createRadialGradient(hex.cx, hex.cy, r * 0.5, hex.cx, hex.cy, glowR);
-        glow.addColorStop(0, `rgba(${palette.glow}, ${alpha * 0.18})`);
-        glow.addColorStop(1, `rgba(${palette.glow}, 0)`);
+        glow.addColorStop(0, palette.glow);
+        glow.addColorStop(1, 'transparent');
         context.fillStyle = glow;
+        context.globalAlpha = alpha * 0.18;
         context.beginPath();
         context.arc(hex.cx, hex.cy, glowR, 0, Math.PI * 2);
         context.fill();
@@ -251,17 +244,28 @@ function useHexGridCanvas() {
       // Fill for tier 2+ (ambient)
       if (hex.tier >= 2) {
         hexPath(hex.cx, hex.cy, r * 0.95);
-        const fillAlpha = alpha * 0.06;
-        context.fillStyle = `rgba(${palette.stroke}, ${fillAlpha})`;
+        context.fillStyle = palette.stroke;
+        context.globalAlpha = alpha * 0.06;
         context.fill();
       }
 
       // Solid illumination fill from click ripple
       if (hex.rippleAlpha > 0.01) {
         hexPath(hex.cx, hex.cy, r * 0.95);
-        context.fillStyle = `rgba(${palette.strokeBright}, ${hex.rippleAlpha * 0.35})`;
+        context.fillStyle = palette.strokeBright;
+        context.globalAlpha = hex.rippleAlpha * 0.35;
         context.fill();
       }
+
+      context.globalAlpha = 1;
+    };
+
+    const drawHexStroke = (hex: Hex, now: number) => {
+      const pulse = Math.sin(now * 0.5 + hex.phase) * 0.5 + 0.5;
+      const alpha = hexAlpha(hex, now);
+      if (alpha < 0.005) return;
+
+      const r = HEX_RADIUS * hex.scale;
 
       // Stroke
       hexPath(hex.cx, hex.cy, r);
@@ -272,21 +276,25 @@ function useHexGridCanvas() {
           : alpha;
 
       context.strokeStyle = hex.tier >= 3
-        ? `rgba(${palette.strokeBright}, ${strokeAlpha})`
+        ? palette.strokeBright
         : hex.tier >= 2
-          ? `rgba(${palette.stroke}, ${strokeAlpha})`
-          : `rgba(${palette.glow}, ${strokeAlpha})`;
+          ? palette.stroke
+          : palette.glow;
 
+      context.globalAlpha = Math.min(1, strokeAlpha);
       context.lineWidth = hex.tier >= 3 ? 1.8 : hex.tier >= 2 ? 1.2 : 0.6;
       context.stroke();
 
       // Inner bright ring for hottest hexes
       if (hex.tier === 3) {
         hexPath(hex.cx, hex.cy, r * 0.7);
-        context.strokeStyle = `rgba(${palette.hot}, ${alpha * 0.3 * pulse})`;
+        context.strokeStyle = palette.hot;
+        context.globalAlpha = alpha * 0.3 * pulse;
         context.lineWidth = 0.8;
         context.stroke();
       }
+
+      context.globalAlpha = 1;
     };
 
     const drawConnector = (conn: Connector, now: number) => {
@@ -294,7 +302,8 @@ function useHexGridCanvas() {
       const alpha = conn.alpha * pulse;
       if (alpha < 0.005) return;
 
-      context.strokeStyle = `rgba(${palette.glow}, ${alpha})`;
+      context.strokeStyle = palette.glow;
+      context.globalAlpha = alpha;
       context.lineWidth = 0.8;
       context.beginPath();
       context.moveTo(conn.x1, conn.y1);
@@ -306,20 +315,26 @@ function useHexGridCanvas() {
       const px = conn.x1 + (conn.x2 - conn.x1) * t;
       const py = conn.y1 + (conn.y2 - conn.y1) * t;
       const dotGlow = context.createRadialGradient(px, py, 0, px, py, 6);
-      dotGlow.addColorStop(0, `rgba(${palette.strokeBright}, ${alpha * 1.5})`);
-      dotGlow.addColorStop(1, `rgba(${palette.strokeBright}, 0)`);
+      dotGlow.addColorStop(0, palette.strokeBright);
+      dotGlow.addColorStop(1, 'transparent');
       context.fillStyle = dotGlow;
+      context.globalAlpha = alpha * 1.5;
       context.beginPath();
       context.arc(px, py, 6, 0, Math.PI * 2);
       context.fill();
+
+      context.globalAlpha = 1;
     };
 
     const draw = (time: number) => {
       const now = time / 1000;
       context.clearRect(0, 0, width, height);
 
+      // Pass 1: connectors and hex fills (behind strokes)
       connectors.forEach((c) => drawConnector(c, now));
-      hexes.forEach((h) => drawHex(h, now));
+      hexes.forEach((h) => drawHexFill(h, now));
+      // Pass 2: hex strokes on top so they're never covered by neighboring fills
+      hexes.forEach((h) => drawHexStroke(h, now));
     };
 
     const tick = (time: number) => {
@@ -414,63 +429,57 @@ function useHexGridCanvas() {
       }
     };
 
-    resize();
-    animationFrame = window.requestAnimationFrame(tick);
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') {
-        disposed = true;
-        window.cancelAnimationFrame(animationFrame);
-      } else {
-        disposed = false;
-        lastTime = performance.now();
-        animationFrame = window.requestAnimationFrame(tick);
-      }
-    };
-
-    const handleBlur = () => {
+    const stopAnimation = () => {
       disposed = true;
       window.cancelAnimationFrame(animationFrame);
     };
 
-    const handleFocus = () => {
+    const startAnimation = () => {
       disposed = false;
       lastTime = performance.now();
       animationFrame = window.requestAnimationFrame(tick);
     };
 
-    let ro: ResizeObserver | undefined;
-    if (container) {
-      ro = new ResizeObserver(() => resize());
-      ro.observe(container);
-    }
+    resize();
+    animationFrame = window.requestAnimationFrame(tick);
 
-    window.addEventListener('resize', resize, { passive: true });
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') stopAnimation();
+      else startAnimation();
+    };
+
+    const disposeResize = attachCanvasResizeFade({
+      canvas,
+      container,
+      setup: resize,
+      start: startAnimation,
+      stop: stopAnimation,
+      baseOpacity: '0.95',
+    });
+
     window.addEventListener('pointermove', onPointerMove, { passive: true });
     container.addEventListener('pointerleave', onPointerLeave);
     container.addEventListener('click', onClick);
     reducedMotion.addEventListener('change', onReducedMotionChange);
     document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', stopAnimation);
+    window.addEventListener('focus', startAnimation);
 
     return () => {
-      disposed = true;
-      window.cancelAnimationFrame(animationFrame);
-      window.removeEventListener('resize', resize);
+      stopAnimation();
+      disposeResize();
       window.removeEventListener('pointermove', onPointerMove);
       container.removeEventListener('pointerleave', onPointerLeave);
       container.removeEventListener('click', onClick);
       reducedMotion.removeEventListener('change', onReducedMotionChange);
       document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', stopAnimation);
+      window.removeEventListener('focus', startAnimation);
       themeObserver.disconnect();
-      ro?.disconnect();
     };
   }, []);
 
   return canvasRef;
 }
 
-export default HexGrid;
+export default Hexagons;

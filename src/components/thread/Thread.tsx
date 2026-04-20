@@ -47,6 +47,7 @@ import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
 import { backgrounds } from '@/components/backgrounds';
+import { useCursorSpotlight } from '@/lib/useCursorSpotlight';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
@@ -404,7 +405,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   };
 
   return (
-    <div className="rounded-[1.7rem] border border-border/70 bg-card/78 px-3 py-3 app-composer-shadow">
+    <div className="rounded-[1.7rem] border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
       <div className="flex items-center gap-2">
         <RichChatInput
           value={text}
@@ -435,74 +436,97 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   );
 };
 
-/** Track last background to avoid repeats */
-let lastBackgroundIndex = -1;
-
+/** Pick a random background, never repeating the last one shown */
 function pickBackground(): FC {
+  const lastIndex = parseInt(sessionStorage.getItem('__bg_last_index') ?? '-1', 10);
   const available = backgrounds.length > 1
-    ? backgrounds.filter((_, i) => i !== lastBackgroundIndex)
+    ? backgrounds.filter((_, i) => i !== lastIndex)
     : backgrounds;
-  const idx = Math.floor(Math.random() * available.length);
-  lastBackgroundIndex = backgrounds.indexOf(available[idx]);
-  return available[idx];
+  return available[Math.floor(Math.random() * available.length)];
 }
 
-/** Randomly selected background for the empty thread state (never repeats consecutively) */
+/**
+ * Randomly selected background for the empty thread state.
+ * Never repeats the same background consecutively.
+ *
+ * Background is selected once on mount via useState initializer.
+ * FadingSplash unmounts children when fading out (visible=false),
+ * so each new empty thread triggers a fresh mount and a new pick.
+ *
+ * The last-shown index is persisted in sessionStorage so it survives
+ * HMR and component remounts. The write happens in a useEffect (not during
+ * pick) to avoid React StrictMode double-invocation issues.
+ */
 const EmptyThreadBackground: FC = () => {
-  const [Background, setBackground] = useState<FC>(() => pickBackground());
+  const [Background] = useState<FC>(() => pickBackground());
+  const spotlightRef = useCursorSpotlight();
 
-  // Pick a new background each time a new thread is created
+  // Persist which background is displayed — useEffect only commits once,
+  // unlike useState initializers which StrictMode may call twice.
   useEffect(() => {
-    const handler = () => {
-      const next = pickBackground();
-      setBackground(() => next);
-    };
-    window.addEventListener('new-thread-created', handler);
-    return () => window.removeEventListener('new-thread-created', handler);
-  }, []);
+    const idx = backgrounds.indexOf(Background);
+    if (idx !== -1) sessionStorage.setItem('__bg_last_index', String(idx));
+  }, [Background]);
 
-  return <Background />;
+  return (
+    <div className="absolute inset-0">
+      <Background />
+      <div ref={spotlightRef} className="pointer-events-none absolute inset-0 z-[1]" />
+    </div>
+  );
 };
 
 /**
- * Wrapper that fades the splash IN when the thread is empty,
- * then fades it OUT over 300ms when the first message is sent.
+ * Wrapper that fades the splash IN (500ms) when the thread is empty,
+ * then fades it OUT (300ms) when the first message is sent.
+ *
+ * When `visible` is false, children are unmounted (returned null).
+ * This means EmptyThreadBackground remounts on each new empty thread,
+ * triggering a fresh pickBackground() via its useState initializer.
  */
 const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
   const threadRuntime = useThreadRuntime();
   const [visible, setVisible] = useState(true);
   const [fadingOut, setFadingOut] = useState(false);
   const [fadedIn, setFadedIn] = useState(false);
+  const fadingOutRef = useRef(false);
 
-  // Reset when switching to a different thread
+  // Reset visibility when threadRuntime identity changes (thread switch)
   useEffect(() => {
     const msgs = threadRuntime.getState().messages;
     if (msgs.length === 0) {
       setVisible(true);
       setFadingOut(false);
+      fadingOutRef.current = false;
       setFadedIn(false);
-      // Trigger fade-in on next frame
-      requestAnimationFrame(() => setFadedIn(true));
+      // Double RAF: first frame paints at opacity:0, second frame triggers the transition
+      requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
     } else {
       setVisible(false);
       setFadingOut(true);
+      fadingOutRef.current = true;
     }
   }, [threadRuntime]);
 
+  // Subscribe to message changes — fade out when messages appear,
+  // fade in when messages go back to empty.
   useEffect(() => {
     return threadRuntime.subscribe(() => {
       const msgs = threadRuntime.getState().messages;
-      if (msgs.length > 0 && !fadingOut) {
+      if (msgs.length > 0 && !fadingOutRef.current) {
         setFadingOut(true);
+        fadingOutRef.current = true;
       } else if (msgs.length === 0) {
         setVisible(true);
         setFadingOut(false);
+        fadingOutRef.current = false;
         setFadedIn(false);
-        requestAnimationFrame(() => setFadedIn(true));
+        requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
       }
     });
-  }, [threadRuntime, fadingOut]);
+  }, [threadRuntime]);
 
+  // Unmount children after fade-out completes
   useEffect(() => {
     if (!fadingOut) return;
     const timer = setTimeout(() => setVisible(false), 300);
@@ -516,10 +540,10 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
       className="absolute inset-0 z-10 transition-opacity ease-out"
       style={{
         opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
-        transitionDuration: fadingOut ? '300ms' : '500ms',
+        transitionDuration: fadingOut ? '300ms' : '2000ms',
       }}
     >
-      {children}
+      <div>{children}</div>
     </div>
   );
 };
@@ -1404,7 +1428,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
           ? 'border-primary/50 bg-primary/10'
           : isActivating
             ? 'border-primary/30 bg-primary/5'
-            : 'border-border/70 bg-card/70'
+            : 'border-border/50 bg-muted/40'
       }`}>
         {/* Left segment: chevron (idle) or animated dots (active) */}
         <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
@@ -1466,7 +1490,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
 
       {/* Error tooltip */}
       {error && (
-        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
+        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-popover border border-border/50 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
           {error}
         </div>
       )}
@@ -1562,7 +1586,7 @@ const CallButton: FC = () => {
       <button
         type="button"
         onClick={handleClick}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors text-muted-foreground hover:bg-muted/50"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors text-muted-foreground hover:bg-muted/60"
       >
         <PhoneIcon className="h-4 w-4" />
       </button>
@@ -1816,7 +1840,7 @@ const Composer: FC<{
         {mode === 'chat' && hasFileAttachments && (
           <div className="mb-3 flex flex-wrap gap-2">
             {attachments.map((file, i) => (
-              <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/70 bg-card/65 px-2.5 py-2 text-xs">
+              <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs">
                 {file.isImage ? (
                   <img src={file.dataUrl} alt={file.name} className="h-10 w-10 rounded object-cover" />
                 ) : (
@@ -1847,7 +1871,7 @@ const Composer: FC<{
             }} />
           ) : null
         ) : (
-          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-[1.7rem] border border-border/70 bg-card/78 px-3 py-3 app-composer-shadow">
+          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-[1.7rem] border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel
@@ -1900,7 +1924,7 @@ const Composer: FC<{
                     <DropdownMenu.Root>
                       <Tooltip content="Add files" side="top" sideOffset={8}>
                         <DropdownMenu.Trigger asChild>
-                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors hover:bg-muted/50 text-muted-foreground">
+                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
                             <PlusIcon className="h-4 w-4" />
                           </button>
                         </DropdownMenu.Trigger>
@@ -1936,7 +1960,7 @@ const Composer: FC<{
                       <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
                         currentWorkingDirectory
                           ? 'border-primary/50 bg-primary/10'
-                          : 'border-border/70 bg-card/70'
+                          : 'border-border/50 bg-muted/40'
                       }`}>
                         {/* Left segment: folder icon — opens picker */}
                         <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Set working directory'} side="top" sideOffset={8}>

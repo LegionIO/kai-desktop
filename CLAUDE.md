@@ -155,6 +155,7 @@ Config schema: `models.providers` (keyed by name) + `models.catalog` (array of m
 - **Conversation cleanup** - the app auto-deletes empty/abandoned conversations on switch
 - **Tool registry is async** - tools build after window creation; MCP connections happen at startup
 - **Config persistence allowlist** - `desktopConfigPayload()` in `electron/ipc/config.ts` is an explicit allowlist; new config sections MUST be added there or they won't persist
+- **Claude Code settings** - Always write permissions and settings to `.claude/settings.local.json`, never to `.claude/settings.json`. The shared `settings.json` should stay empty; all personal permissions belong in the local file.
 
 ---
 

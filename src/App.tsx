@@ -672,7 +672,6 @@ function AppShell() {
       setActiveView(CHAT_VIEW);
       setActiveConversationId(newId);
       setActiveConversationTitle('Untitled Thread');
-      window.dispatchEvent(new CustomEvent('new-thread-created'));
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
@@ -980,7 +979,7 @@ function AppShell() {
           </div>,
           document.body,
         )}
-        <div className="flex h-screen overflow-hidden bg-transparent text-foreground">
+        <div className="flex h-screen overflow-hidden bg-background text-foreground">
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
             <div
@@ -992,11 +991,12 @@ function AppShell() {
           <aside
             className={
               isMobile
-                ? `app-shell-panel fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
-                : 'app-shell-panel flex h-full shrink-0 flex-col border-r border-sidebar-border/80 bg-sidebar text-sidebar-foreground'
+                ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
+                : 'flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
             }
             style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
+            <div className="app-shell-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-sidebar-border/80">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
               <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
@@ -1027,6 +1027,7 @@ function AppShell() {
               <UpdateCard />
               <SidebarDock items={dockItems} />
             </div>
+            </div>
           </aside>
           {!isMobile && (
             <div
@@ -1040,9 +1041,18 @@ function AppShell() {
                 event.preventDefault();
                 setDragState({ startX: event.clientX, startWidth: sidebarWidth });
               }}
-              className="group relative -ml-px h-full w-2 shrink-0 cursor-col-resize bg-transparent"
+              className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
             >
-              <div className="absolute inset-y-0 left-0 w-px bg-border/40 transition-colors group-hover:bg-primary/50" />
+              {/* Invisible hit area — wide enough to grab easily */}
+              <div className="absolute inset-y-0 -left-4 w-6" />
+              {/* Handle pill — on the panel border, appears on hover */}
+              <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
+              {/* Tooltip */}
+              <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
+                <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
+                  Drag to resize
+                </div>
+              </div>
             </div>
           )}
 
@@ -1070,7 +1080,7 @@ function AppShell() {
                 ) : activeConversationId ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-black/10 dark:hover:bg-white/15">
+                      <button type="button" className="flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
                         <span className="truncate text-sm font-medium text-foreground">
                           {activeConversationTitle}
                         </span>

@@ -1,38 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); v=d.get\\('dist-tags',{}\\).get\\('latest','?'\\); print\\(f'Latest: {v}'\\); desc=d.get\\('description',''\\); print\\(f'Description: {desc}'\\); readme=d.get\\('readme',''\\)[:3000]; print\\(readme\\)\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); v=d.get\\('dist-tags',{}\\).get\\('latest','?'\\); print\\(f'Latest: {v}'\\); desc=d.get\\('description',''\\); print\\(f'Description: {desc}'\\); readme=d.get\\('readme',''\\)[:5000]; print\\(readme\\)\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); items=d.get\\('items',[]\\); [print\\(f'{i[\\\\\"full_name\\\\\"]} - {i[\\\\\"description\\\\\"]} \\({i[\\\\\"html_url\\\\\"]}\\)'\\) for i in items]\")",
-      "Bash(python3 -c \"import sys,json; items=json.load\\(sys.stdin\\); [print\\(i['name']\\) for i in items]\")",
-      "Bash(python3 -c \"import sys,json; items=json.load\\(sys.stdin\\); [print\\(i['name']\\) for i in items if i['type']=='dir']\")",
-      "Read(//dev/**)",
-      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) print\\(f'Version: {d.get\\(\\\\\"version\\\\\", \\\\\"?\\\\\"\\)}'\\) print\\(f'Main: {d.get\\(\\\\\"main\\\\\", \\\\\"?\\\\\"\\)}'\\) print\\(f'Types: {d.get\\(\\\\\"types\\\\\", \\\\\"?\\\\\"\\)}'\\) exports = d.get\\('exports', {}\\) print\\(f'Exports: {json.dumps\\(exports, indent=2\\)[:2000]}'\\) deps = d.get\\('dependencies', {}\\) print\\(f'Dependencies: {json.dumps\\(deps, indent=2\\)}'\\) \")",
-      "Bash(python3 -c ' *)",
-      "Bash(npx tsc *)",
-      "Bash(npx eslint *)",
-      "Bash(pnpm type-check *)",
-      "Bash(pnpm dev *)",
-      "Bash(kill %1)",
-      "Bash(git stash *)",
-      "Bash(sips -g pixelWidth -g pixelHeight /Users/john_hollow@optum.com/Documents/kai/kai-desktop/build/dmg-background.png)",
-      "Bash(python3 -c \"from PIL import Image; print\\('Pillow available'\\)\")",
-      "Bash(python3 -c \"import subprocess; subprocess.check_call\\(['pip3', 'install', '--user', 'Pillow']\\)\")",
-      "Bash(pip3 install *)",
-      "Bash(claude --version)",
-      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) providers = d.get\\('models', {}\\).get\\('providers', {}\\) for name, p in providers.items\\(\\): print\\(f'{name}: type={p.get\\(\\\\\"type\\\\\"\\)}, endpoint={p.get\\(\\\\\"endpoint\\\\\", \\\\\"\\\\\"\\)[:60]}'\\) print\\(\\) catalog = d.get\\('models', {}\\).get\\('catalog', []\\) for m in catalog: if 'claude' in m.get\\('modelName', ''\\).lower\\(\\) or 'anthropic' in m.get\\('modelName', ''\\).lower\\(\\): print\\(f' {m[\\\\\"displayName\\\\\"]}: provider={m[\\\\\"provider\\\\\"]}, modelName={m[\\\\\"modelName\\\\\"]}'\\) \")",
-      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) providers = d.get\\('models', {}\\).get\\('providers', {}\\) for name, p in providers.items\\(\\): print\\(f'{name}: type={p.get\\(\\\\\"type\\\\\"\\)}'\\) print\\(\\) catalog = d.get\\('models', {}\\).get\\('catalog', []\\) for m in catalog: mn = m.get\\('modelName', ''\\) if 'claude' in mn.lower\\(\\) or 'anthropic' in mn.lower\\(\\): print\\(f' {m.get\\(\\\\\"displayName\\\\\", \\\\\"?\\\\\"\\)}: provider={m[\\\\\"provider\\\\\"]}, modelName={mn}'\\) \")",
-      "Read(//opt/homebrew/lib/node_modules/@anthropic-ai/**)",
-      "Read(//usr/local/lib/node_modules/**)",
-      "Bash(npm ls *)",
-      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) p = d.get\\('models', {}\\).get\\('providers', {}\\).get\\('skynet_gateway', {}\\) print\\('type:', p.get\\('type'\\)\\) print\\('endpoint:', p.get\\('endpoint', ''\\)[:80]\\) print\\('apiKey set:', bool\\(p.get\\('apiKey'\\)\\)\\) print\\('apiKey length:', len\\(p.get\\('apiKey', ''\\)\\)\\) \")",
-      "Bash(git fetch *)",
-      "Bash(git rebase *)",
-      "Bash(python3 -c \" import sys, json d = json.load\\(sys.stdin\\) catalog = d.get\\('models', {}\\).get\\('catalog', []\\) for m in catalog: if 'gpt-5.4' in m.get\\('modelName', ''\\).lower\\(\\): print\\(f'{m[\\\\\"displayName\\\\\"]}: provider={m[\\\\\"provider\\\\\"]}, modelName={m[\\\\\"modelName\\\\\"]}'\\) p = d.get\\('models', {}\\).get\\('providers', {}\\).get\\('skynet_gateway', {}\\) print\\(f'\\\\\\\\nskynet_gateway endpoint: {p.get\\(\\\\\"endpoint\\\\\", \\\\\"\\\\\"\\)}'\\) print\\(f'skynet_gateway apiKey set: {bool\\(p.get\\(\\\\\"apiKey\\\\\"\\)\\)}'\\) \")",
-      "Bash(codex --version)",
-      "Bash(awk '/^export const .*=.*=>|^const .*=.*=>|^export const .*=.*\\\\\\(|^const .*=.*\\\\\\(/ {found_line=NR} NR==2331 {print found_line\": line 2331\"; exit} END {if \\(NR >= 2331\\) {print \"Found at line 2331\"}}' /Users/john_hollow@optum.com/Documents/kai/kai-desktop/src/components/thread/Thread.tsx)",
-      "mcp__chrome-devtools__list_pages",
-      "Bash(screencapture -x /tmp/kai-splash-test.png)"
+      "mcp__chrome-devtools__take_screenshot",
+      "mcp__chrome-devtools__evaluate_script"
+    ],
+    "additionalDirectories": [
+      "/Users/john_hollow@optum.com/.claude/plans"
     ]
   }
 }
