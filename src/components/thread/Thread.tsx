@@ -108,7 +108,10 @@ export const Thread: FC<{
   }, []);
 
   return (
-    <ThreadPrimitive.Root className="flex h-full min-h-0 flex-col overflow-hidden">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col overflow-hidden">
+      <FadingSplash>
+        <EmptyThreadBackground />
+      </FadingSplash>
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
       <FallbackBanner />
       <ComputerUseFallbackBanner />
@@ -138,9 +141,6 @@ export const Thread: FC<{
         <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
-              <FadingSplash>
-                <EmptyThreadBackground />
-              </FadingSplash>
               <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
                 <ThreadPrimitive.Messages
                   components={{
@@ -405,7 +405,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   };
 
   return (
-    <div className="rounded-[1.7rem] border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
+    <div className="rounded-2xl border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
       <div className="flex items-center gap-2">
         <RichChatInput
           value={text}
@@ -537,7 +537,7 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
 
   return (
     <div
-      className="absolute inset-0 z-10 transition-opacity ease-out"
+      className="absolute inset-0 bottom-3 z-10 transition-opacity ease-out"
       style={{
         opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
         transitionDuration: fadingOut ? '300ms' : '2000ms',
@@ -1814,7 +1814,7 @@ const Composer: FC<{
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   return (
-    <div className="relative z-20 bg-gradient-to-t from-background from-85% to-transparent px-3 pb-3 pt-4 md:px-6 md:pb-6 md:pt-5">
+    <div className="relative z-20 px-3 pb-3 pt-4 md:px-6 md:pb-6 md:pt-5">
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input
@@ -1871,7 +1871,7 @@ const Composer: FC<{
             }} />
           ) : null
         ) : (
-          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-[1.7rem] border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
+          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 bg-sidebar app-shell-panel px-3 py-3 app-composer-shadow">
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel
