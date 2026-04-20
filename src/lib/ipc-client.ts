@@ -17,6 +17,7 @@ type AppAPI = {
     cancelStream: (conversationId: string) => Promise<unknown>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
+    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
     generateTitle: (messages: unknown[], modelKey?: string) => Promise<{ title: string | null }>;
     listBackends: () => Promise<Array<{ key: string; displayName: string; pluginName?: string | null }>>;
     onStreamEvent: (callback: (event: unknown) => void) => () => void;
@@ -195,6 +196,7 @@ type AppAPI = {
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
+  onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
 };
 
 declare global {

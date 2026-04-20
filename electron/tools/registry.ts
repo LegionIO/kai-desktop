@@ -17,6 +17,8 @@ import {
   createRealtimeSettingsTool,
 } from './config-manage.js';
 import { createModelSwitchTool } from './model-switch.js';
+import { createEnterPlanModeTool, createExitPlanModeTool } from './plan-mode.js';
+import { createAskUserTool } from './ask-user.js';
 import { createSubAgentTool } from './sub-agent.js';
 import { loadSkillsAsTools } from './skill-loader.js';
 import { createSkillManageTool } from './skill-manage.js';
@@ -224,6 +226,9 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
     tools.push(createAudioSettingsTool(appHome));
     tools.push(createRealtimeSettingsTool(appHome));
     tools.push(createModelSwitchTool(appHome));
+    tools.push(createEnterPlanModeTool());
+    tools.push(createExitPlanModeTool());
+    tools.push(createAskUserTool());
   }
 
   // Sub-agent tool

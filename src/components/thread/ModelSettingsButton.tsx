@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
-import { CheckIcon, ChevronUpIcon, ClipboardListIcon, CpuIcon, DumbbellIcon, PenLineIcon, ShuffleIcon, TerminalSquareIcon, UserCircleIcon } from 'lucide-react';
+import { CheckIcon, ChevronUpIcon, CpuIcon, DumbbellIcon, PenLineIcon, ScrollTextIcon, ShuffleIcon, TerminalSquareIcon, UserCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -45,7 +45,7 @@ export type ExecutionMode = 'auto' | 'plan-first';
 
 const MODE_ICONS: Record<ExecutionMode, typeof PenLineIcon> = {
   'auto': PenLineIcon,
-  'plan-first': ClipboardListIcon,
+  'plan-first': ScrollTextIcon,
 };
 
 export const ModelSettingsButton: FC<{
@@ -365,7 +365,7 @@ export const ModelSettingsButton: FC<{
               <div className="border-t border-border/50 mx-1.5 mt-0.5" />
               <div className="flex items-center justify-between px-3 py-2">
                 <div className="flex items-center gap-2">
-                  <ClipboardListIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                  <ScrollTextIcon className="h-3.5 w-3.5 text-muted-foreground" />
                   <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Plan Mode</span>
                 </div>
                 <button

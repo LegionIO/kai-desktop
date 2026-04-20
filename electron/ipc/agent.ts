@@ -34,6 +34,9 @@ const activeObserverSessions = new Map<string, string>();
 // Pending tool approval promises for confirm-writes execution mode
 const pendingToolApprovals = new Map<string, { resolve: (approved: boolean) => void }>();
 
+// Pending user answers for ask_user tool — populated by IPC handler before approval resolves
+import { pendingQuestionAnswers } from '../tools/ask-user.js';
+
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
 
@@ -955,6 +958,40 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   state.cancel();
                 }
               }
+
+              // Gate exit_plan_mode behind user approval regardless of execution mode
+              if (state.toolName === 'exit_plan_mode') {
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: state.toolCallId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                }
+              }
+
+              // Gate ask_user behind user response — blocks until user submits answers
+              if (state.toolName === 'ask_user') {
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: state.toolCallId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(state.toolCallId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                }
+              }
             },
             onToolExecutionEnd: ({ toolCallId }: { toolCallId: string; toolName: string }) => {
               toolCancels.delete(toolCallId);
@@ -1111,6 +1148,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     const pending = pendingToolApprovals.get(toolCallId);
     if (pending) {
       pending.resolve(false);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
+    // Store answers so the tool's execute() can read them, then approve the tool
+    pendingQuestionAnswers.set(toolCallId, answers);
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
     }
     return { ok: true };

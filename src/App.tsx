@@ -712,6 +712,17 @@ function AppShell() {
     return cleanup;
   }, []);
 
+  // Listen for AI-initiated execution mode changes (enter/exit plan mode)
+  useEffect(() => {
+    if (!window.app?.onExecutionModeChanged) return;
+    const cleanup = window.app.onExecutionModeChanged((mode) => {
+      if (mode === 'plan-first' || mode === 'auto' || mode === 'confirm-writes') {
+        setExecutionMode(mode as ExecutionMode);
+      }
+    });
+    return cleanup;
+  }, []);
+
   // When selecting a non-default profile, auto-enable fallback routing and
   // update the model selector to show the profile's primary model.
   const handleSelectProfile = useCallback((key: string | null, primaryModelKey: string | null) => {
@@ -980,8 +991,6 @@ function AppShell() {
           document.body,
         )}
         <div className="relative flex h-screen overflow-hidden text-foreground">
-          {/* Full-width top fade — spans behind sidebar and main content */}
-          <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
             <div
@@ -998,7 +1007,7 @@ function AppShell() {
             }
             style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
-            <div className="app-composer-glass app-composer-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
+            <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
               <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
@@ -1080,8 +1089,8 @@ function AppShell() {
                 ) : activeConversationId ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                        <span className="truncate text-sm font-medium text-foreground">
+                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
                           {activeConversationTitle}
                         </span>
                         <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1133,7 +1142,7 @@ function AppShell() {
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
                 ) : (
-                  <span className="block truncate text-sm font-medium text-foreground">
+                  <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
                 )}
@@ -1147,7 +1156,10 @@ function AppShell() {
               ) : activePluginPanel ? (
                 <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
               ) : (
-                <ThreadOrSubAgent
+                <>
+                  {/* Top fade — thread view only */}
+                  <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
+                  <ThreadOrSubAgent
                   mode={threadMode}
                   onChangeMode={setThreadMode}
                   selectedModelKey={selectedModelKey}
@@ -1163,6 +1175,7 @@ function AppShell() {
                   useAgentSdk={useAgentSdk}
                   onToggleAgentSdk={handleToggleAgentSdk}
                 />
+                </>
               )}
             </div>
           </main>

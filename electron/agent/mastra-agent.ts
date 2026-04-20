@@ -955,21 +955,24 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
     '- The runtime may emit mid-tool progress updates to the user.',
     '- A tool run may be cancelled if output indicates failure, risk, or mismatch with intent.',
     '- Do not claim that mid-tool progress updates are impossible in this environment.',
+    '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
+    '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
   ];
 
   if (executionMode === 'plan-first') {
     lines.push(
       '',
       'PLAN MODE ACTIVE:',
-      '- You are in planning mode. Create a detailed plan before taking any action.',
+      '- You are in planning mode. Think deeply and explore thoroughly before producing your plan.',
       '- Only use read-only tools (file_read, grep, glob, list_directory, web_fetch, web_search).',
       '- Do NOT use file_write, file_edit, or sh tools — they are not available in this mode.',
+      '- Be extremely thorough in your exploration. Read all relevant files, trace code paths, and understand the full picture.',
       '- Structure your response as:',
-      '  1. Analysis of the current state (use read tools to explore the codebase)',
-      '  2. A clear, step-by-step plan describing what changes you would make',
-      '  3. Expected impact and any risks',
-      '- Wait for the user to approve your plan before proceeding.',
+      '  1. Deep analysis of the current state (use read tools extensively to explore the codebase)',
+      '  2. A clear, step-by-step implementation plan describing exactly what changes you would make',
+      '  3. Expected impact, risks, and edge cases',
       '- Do NOT make any changes to files or run any commands that modify the system.',
+      '- When your plan is complete, call exit_plan_mode to present it to the user for approval. The user will see an approve/reject prompt.',
     );
   } else if (executionMode === 'confirm-writes') {
     lines.push(
