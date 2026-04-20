@@ -12,6 +12,7 @@ import { ConversationList } from '@/components/conversations/ConversationList';
 import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSidebarSection';
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { WorkspaceView } from '@/components/workspace/WorkspaceView';
+import { FloatingChat } from '@/components/workspace/FloatingChat';
 import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
 import { WorkspaceProvider, useWorkspace } from '@/providers/WorkspaceProvider';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
@@ -987,7 +988,12 @@ function AppShell() {
               {activeView === SETTINGS_VIEW ? (
                 <SettingsPanel onClose={() => setActiveView(CHAT_VIEW)} />
               ) : activeView === WORKSPACE_VIEW ? (
-                <WorkspaceView />
+                <div className="flex h-full">
+                  <div className="min-w-0 flex-1 overflow-hidden">
+                    <WorkspaceView />
+                  </div>
+                  <FloatingChat />
+                </div>
               ) : activePluginPanel ? (
                 <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
               ) : (

@@ -4,6 +4,7 @@ import type {
   ComputerUsePermissionSection,
   ComputerUseSurface,
 } from '../shared/computer-use.js';
+import type { WorkspaceTask } from '../shared/workspace-types.js';
 
 export type AppAPI = typeof appAPI;
 
@@ -225,6 +226,23 @@ const appAPI = {
     showInFinder: (projectPath: string) => ipcRenderer.invoke('git:show-in-finder', projectPath) as Promise<{ success: boolean }>,
     remoteUrl: (projectPath: string) => ipcRenderer.invoke('git:remote-url', projectPath) as Promise<{ url: string; error?: string }>,
     openUrl: (url: string) => ipcRenderer.invoke('git:open-url', url) as Promise<{ success: boolean }>,
+    diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch', projectPath, baseBranch, taskBranch) as Promise<{ diff: string; error?: string }>,
+    diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch-stat', projectPath, baseBranch, taskBranch) as Promise<{ files: Array<{ status: string; path: string }>; error?: string }>,
+    diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => ipcRenderer.invoke('git:diff-branch-file', projectPath, baseBranch, taskBranch, filePath) as Promise<{ diff: string; error?: string }>,
+    mergeBranch: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:merge-branch', projectPath, branchName) as Promise<{ success: boolean; summary?: string; error?: string }>,
+    deleteBranch: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:delete-branch', projectPath, branchName) as Promise<{ success: boolean; error?: string }>,
+  },
+
+  workspaceTasks: {
+    list: (projectPath: string) => ipcRenderer.invoke('workspace-tasks:list', projectPath) as Promise<WorkspaceTask[]>,
+    get: (projectPath: string, taskId: string) => ipcRenderer.invoke('workspace-tasks:get', projectPath, taskId) as Promise<WorkspaceTask | null>,
+    put: (projectPath: string, task: WorkspaceTask) => ipcRenderer.invoke('workspace-tasks:put', projectPath, task) as Promise<{ ok: boolean }>,
+    delete: (projectPath: string, taskId: string) => ipcRenderer.invoke('workspace-tasks:delete', projectPath, taskId) as Promise<{ ok: boolean }>,
+    onChanged: (callback: (data: { projectPath: string }) => void) => {
+      const handler = (_event: unknown, data: { projectPath: string }) => callback(data);
+      ipcRenderer.on('workspace-tasks:changed', handler);
+      return () => { ipcRenderer.removeListener('workspace-tasks:changed', handler); };
+    },
   },
 
   pty: {

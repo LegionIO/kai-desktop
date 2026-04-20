@@ -44,7 +44,14 @@ export interface InstalledPlugin extends WorkspacePlugin {
 
 // ── Tasks ───────────────────────────────────────────────────
 
-export type TaskStatus = 'planning' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
+// New lifecycle: defining → planning → queued → executing → review → done
+// Also: needs_input (sub-state of executing), rejected (terminal)
+export type TaskStatus =
+  | 'defining' | 'planning' | 'queued' | 'executing'
+  | 'needs_input' | 'review' | 'done' | 'rejected'
+  // Legacy (kept temporarily for migration)
+  | 'in_progress' | 'ai_review' | 'human_review';
+
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
 export interface ReviewComment {
@@ -52,6 +59,39 @@ export interface ReviewComment {
   content: string;
   timestamp: number;
 }
+
+// ── Task Planning ──────────────────────────────────────────
+
+export interface TaskPlanStep {
+  id: string;
+  description: string;
+  status: 'pending' | 'in_progress' | 'done' | 'skipped';
+}
+
+export interface TaskPlan {
+  approach: string;
+  steps: TaskPlanStep[];
+  filesToModify: string[];
+  testsToRun: string[];
+  risks: string[];
+}
+
+// ── Execution Thread ───────────────────────────────────────
+
+export type ExecutionEntryType =
+  | 'plan' | 'step_start' | 'step_complete'
+  | 'tool_call' | 'tool_result' | 'text'
+  | 'error' | 'user_input' | 'review_comment';
+
+export interface ExecutionEntry {
+  id: string;
+  type: ExecutionEntryType;
+  timestamp: number;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ── Workspace Task ─────────────────────────────────────────
 
 export interface WorkspaceTask {
   id: string;
@@ -62,18 +102,42 @@ export interface WorkspaceTask {
   labels: string[];
   linkedPluginData?: Record<string, unknown>;
   reviewComments?: ReviewComment[];
-  worktreePath?: string;      // path to the task's worktree
-  worktreeBranch?: string;    // branch name
+  worktreePath?: string;
+  worktreeBranch?: string;
   createdAt: number;
   updatedAt: number;
+
+  // Planning
+  plan?: TaskPlan;
+  planApprovedAt?: number;
+
+  // Execution
+  executionThread: ExecutionEntry[];
+  executionStartedAt?: number;
+  executionCompletedAt?: number;
+
+  // Review
+  reviewResult?: 'approved' | 'changes_requested' | 'rejected';
+
+  // Completion
+  completedAt?: number;
+  archivedAt?: number;
+
+  // Cross-linking
+  linkedInsightId?: string;
+  linkedChangelogEntry?: string;
 }
 
 // ── Workspace Engine ────────────────────────────────────────
 
 export type WorkspaceEngine =
+  // New primary routes
+  | 'tasks' | 'task-thread' | 'git' | 'analysis'
+  // Kept routes
+  | 'changelog' | 'plugins'
+  // Legacy (still rendered during transition)
   | 'kanban' | 'changes' | 'insights' | 'roadmap'
-  | 'ideation' | 'changelog' | 'context' | 'worktrees'
-  | 'plugins' | 'prompt'
+  | 'ideation' | 'context' | 'worktrees' | 'prompt'
   | string;
 
 // ── Terminals ──────────────────────────────────────────────
@@ -220,6 +284,14 @@ export interface WorkspaceState {
   activeEngine: WorkspaceEngine;
   tasks: WorkspaceTask[];
   plugins: InstalledPlugin[];
+}
+
+// ── Task Store (persistence) ───────────────────────────────
+
+export interface WorkspaceTaskStore {
+  tasks: Record<string, WorkspaceTask>;
+  version: number;
+  lastUpdated: string;
 }
 
 // ── IPC Types ───────────────────────────────────────────────

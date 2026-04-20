@@ -1,18 +1,18 @@
 import type { FC } from 'react';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
 import { ProjectSelector } from './ProjectSelector';
-import { KanbanBoard } from './KanbanBoard';
+import { TaskBoard } from './TaskBoard';
+import { TaskThreadView } from './TaskThreadView';
 import { ChangesView } from './ChangesView';
+import { AnalysisView } from './AnalysisView';
+import { ChangelogView } from './ChangelogView';
+import { PluginManager } from './PluginManager';
+import { GitHubIssuesView } from './GitHubIssuesView';
+// Legacy views (kept as fallbacks during transition)
+import { KanbanBoard } from './KanbanBoard';
 import { InsightsView } from './InsightsView';
 import { RoadmapView } from './RoadmapView';
 import { IdeationView } from './IdeationView';
-import { ChangelogView } from './ChangelogView';
-import { ContextView } from './ContextView';
-import { WorktreesView } from './WorktreesView';
-import { PluginManager } from './PluginManager';
-import { WorkspaceComposer } from './WorkspaceComposer';
-import { GitHubIssuesView } from './GitHubIssuesView';
-import { WorkspaceEmpty } from './WorkspaceEmpty';
 
 export const WorkspaceView: FC = () => {
   const { project, activeEngine } = useWorkspace();
@@ -25,16 +25,20 @@ export const WorkspaceView: FC = () => {
   }
 
   switch (activeEngine) {
-    case 'kanban':    return <KanbanBoard />;
-    case 'changes':   return <ChangesView />;
-    case 'insights':  return <InsightsView />;
-    case 'roadmap':   return <RoadmapView />;
-    case 'ideation':  return <IdeationView />;
-    case 'changelog': return <ChangelogView />;
-    case 'context':   return <ContextView />;
-    case 'worktrees': return <WorktreesView />;
-    case 'plugins':   return <PluginManager />;
-    case 'prompt':    return <WorkspaceComposer />;
-    default:          return <WorkspaceEmpty />;
+    // New primary routes
+    case 'tasks':       return <TaskBoard />;
+    case 'task-thread': return <TaskThreadView />;
+    case 'git':         return <ChangesView />;
+    case 'analysis':    return <AnalysisView />;
+    case 'changelog':   return <ChangelogView />;
+    case 'plugins':     return <PluginManager />;
+    // Legacy routes (still reachable via direct navigation)
+    case 'kanban':      return <KanbanBoard />;
+    case 'changes':     return <ChangesView />;
+    case 'insights':    return <InsightsView />;
+    case 'roadmap':     return <RoadmapView />;
+    case 'ideation':    return <IdeationView />;
+    // Default: task board
+    default:            return <TaskBoard />;
   }
 };

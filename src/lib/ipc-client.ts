@@ -5,6 +5,7 @@ import type {
   ComputerUsePermissionSection,
   ComputerUseSurface,
 } from '../../shared/computer-use';
+import type { WorkspaceTask } from '../../shared/workspace-types';
 
 type AppAPI = {
   config: {
@@ -206,6 +207,18 @@ type AppAPI = {
     showInFinder: (projectPath: string) => Promise<{ success: boolean }>;
     remoteUrl: (projectPath: string) => Promise<{ url: string; error?: string }>;
     openUrl: (url: string) => Promise<{ success: boolean }>;
+    diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ diff: string; error?: string }>;
+    diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ files: Array<{ status: string; path: string }>; error?: string }>;
+    diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => Promise<{ diff: string; error?: string }>;
+    mergeBranch: (projectPath: string, branchName: string) => Promise<{ success: boolean; summary?: string; error?: string }>;
+    deleteBranch: (projectPath: string, branchName: string) => Promise<{ success: boolean; error?: string }>;
+  };
+  workspaceTasks: {
+    list: (projectPath: string) => Promise<WorkspaceTask[]>;
+    get: (projectPath: string, taskId: string) => Promise<WorkspaceTask | null>;
+    put: (projectPath: string, task: WorkspaceTask) => Promise<{ ok: boolean }>;
+    delete: (projectPath: string, taskId: string) => Promise<{ ok: boolean }>;
+    onChanged: (callback: (data: { projectPath: string }) => void) => () => void;
   };
   pty: {
     create: (id: string, cwd: string, cols?: number, rows?: number) => Promise<{ id: string; pid: number }>;

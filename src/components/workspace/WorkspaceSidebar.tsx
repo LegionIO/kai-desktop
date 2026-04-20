@@ -1,52 +1,94 @@
-import { useMemo, type FC } from 'react';
+import { useState, useMemo, type FC } from 'react';
 import {
-  LayoutGridIcon,
+  GitBranchIcon,
   GitCompareIcon,
   SparklesIcon,
-  MapIcon,
-  LightbulbIcon,
   FileTextIcon,
-  BookOpenIcon,
-  GitBranchIcon,
-  MessageSquareIcon,
   PuzzleIcon,
-  FolderOpenIcon,
+  ChevronRightIcon,
+  ChevronDownIcon,
+  XIcon,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
-import type { WorkspaceEngine, PluginSidebarItem } from '../../../shared/workspace-types';
+import { TaskQuickInput } from './TaskQuickInput';
+import type { WorkspaceEngine, PluginSidebarItem, TaskStatus } from '../../../shared/workspace-types';
 
-/* ── Engine navigation entries ─────────────────────────── */
+/* ── Status section config ───────────────────────────────── */
 
-interface EngineNavItem {
+interface StatusSection {
+  key: string;
+  label: string;
+  statuses: TaskStatus[];
+  color: string;
+  defaultOpen?: boolean;
+}
+
+const TASK_SECTIONS: StatusSection[] = [
+  { key: 'defining', label: 'Defining', statuses: ['defining'], color: 'text-slate-400' },
+  { key: 'planning', label: 'Planning', statuses: ['planning', 'queued'], color: 'text-indigo-400' },
+  { key: 'executing', label: 'Executing', statuses: ['executing', 'needs_input', 'in_progress'], color: 'text-blue-400', defaultOpen: true },
+  { key: 'review', label: 'Review', statuses: ['review', 'ai_review', 'human_review'], color: 'text-purple-400' },
+  { key: 'done', label: 'Done', statuses: ['done', 'rejected'], color: 'text-emerald-400' },
+];
+
+interface WorkspaceNavItem {
   engine: WorkspaceEngine;
   label: string;
   Icon: LucideIcon;
-  shortcut?: string;
 }
 
-const PROJECT_NAV: EngineNavItem[] = [
-  { engine: 'kanban',    label: 'Kanban Board', Icon: LayoutGridIcon,  shortcut: 'K' },
-  { engine: 'changes',   label: 'Changes',      Icon: GitCompareIcon,  shortcut: 'A' },
-  { engine: 'insights',  label: 'Insights',     Icon: SparklesIcon,    shortcut: 'N' },
-  { engine: 'roadmap',   label: 'Roadmap',      Icon: MapIcon,         shortcut: 'D' },
-  { engine: 'ideation',  label: 'Ideation',     Icon: LightbulbIcon,   shortcut: 'I' },
-  { engine: 'changelog', label: 'Changelog',    Icon: FileTextIcon,    shortcut: 'L' },
-  { engine: 'context',   label: 'Context',      Icon: BookOpenIcon,    shortcut: 'C' },
-  { engine: 'worktrees', label: 'Worktrees',    Icon: GitBranchIcon,   shortcut: 'W' },
-];
-
-const TOOLS_NAV: EngineNavItem[] = [
-  { engine: 'prompt',  label: 'Prompt',  Icon: MessageSquareIcon },
-  { engine: 'plugins', label: 'Plugins', Icon: PuzzleIcon },
+const WORKSPACE_NAV: WorkspaceNavItem[] = [
+  { engine: 'git', label: 'Git', Icon: GitCompareIcon },
+  { engine: 'analysis', label: 'Analysis', Icon: SparklesIcon },
+  { engine: 'changelog', label: 'Changelog', Icon: FileTextIcon },
 ];
 
 /* ── Component ─────────────────────────────────────────── */
 
 export const WorkspaceSidebar: FC = () => {
-  const { project, setProject, activeEngine, setActiveEngine, plugins, engineStreams } = useWorkspace();
+  const {
+    project, setProject, activeEngine, setActiveEngine,
+    selectedTaskId, setSelectedTaskId,
+    tasks, taskExecutions, plugins, engineStreams,
+    createTaskFromNaturalLanguage,
+  } = useWorkspace();
 
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(
+    new Set(TASK_SECTIONS.filter((s) => s.defaultOpen).map((s) => s.key)),
+  );
+
+  // Group tasks by section
+  const sectionTasks = useMemo(() => {
+    const map: Record<string, typeof tasks> = {};
+    for (const section of TASK_SECTIONS) {
+      map[section.key] = [];
+    }
+    for (const task of tasks) {
+      // Skip archived tasks
+      if (task.archivedAt) continue;
+      const section = TASK_SECTIONS.find((s) => s.statuses.includes(task.status));
+      if (section) (map[section.key] ??= []).push(task);
+    }
+    return map;
+  }, [tasks]);
+
+  const toggleSection = (key: string) => {
+    setExpandedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const handleTaskClick = (taskId: string) => {
+    setSelectedTaskId(taskId);
+    setActiveEngine('task-thread');
+  };
+
+  // Plugin sidebar items
   const pluginSidebarItems = useMemo(() => {
     const items: Array<PluginSidebarItem & { pluginId: string }> = [];
     for (const plugin of plugins) {
@@ -58,114 +100,164 @@ export const WorkspaceSidebar: FC = () => {
     return items;
   }, [plugins]);
 
-  const renderNavItem = ({ engine, label, Icon, shortcut }: EngineNavItem) => {
-    const stream = engineStreams.get(engine);
-    const isActive = stream?.status === 'streaming';
-
-    return (
-      <button
-        key={engine}
-        type="button"
-        onClick={() => setActiveEngine(engine)}
-        className={cn(
-          'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
-          activeEngine === engine
-            ? 'bg-primary/10 text-primary'
-            : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
-        )}
-      >
-        <Icon className="h-4 w-4" />
-        <span className="flex-1 text-left">{label}</span>
-        {isActive && (
-          <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" title={stream?.activeToolName ? `Using ${stream.activeToolName}` : 'Streaming...'} />
-        )}
-        {shortcut && !isActive && (
-          <kbd className="text-[9px] text-muted-foreground/30 font-mono">{shortcut}</kbd>
-        )}
-      </button>
-    );
-  };
+  if (!project) return null;
 
   return (
-    <div className="flex flex-col">
+    <div className="flex h-full flex-col overflow-hidden">
       {/* Project header */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-sidebar-border/80">
-        {project ? (
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-xs font-semibold text-sidebar-foreground">{project.name}</p>
-            <p className="truncate text-[10px] text-muted-foreground/60">{project.path}</p>
+      <div className="shrink-0 border-b border-border/50 px-3 py-3">
+        <div className="text-sm font-semibold text-foreground truncate">{project.name}</div>
+        <div className="mt-0.5 text-[10px] text-muted-foreground/50 truncate">{project.path}</div>
+      </div>
+
+      {/* Scrollable content */}
+      <div className="flex-1 overflow-y-auto">
+        {/* TASKS section */}
+        <div className="px-2 pt-3">
+          <div className="px-1 pb-1.5 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50">Tasks</div>
+
+          {/* Quick task creation */}
+          <div className="mb-2">
+            <TaskQuickInput onSubmit={createTaskFromNaturalLanguage} />
           </div>
-        ) : (
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-            <FolderOpenIcon className="h-3.5 w-3.5" />
-            No Project
-          </span>
+
+          {/* Task status sections */}
+          {TASK_SECTIONS.map((section) => {
+            const sectionTaskList = sectionTasks[section.key] ?? [];
+            const count = sectionTaskList.length;
+            const isExpanded = expandedSections.has(section.key);
+
+            // Auto-expand sections with tasks
+            const shouldShow = count > 0 || section.defaultOpen;
+            if (!shouldShow && !isExpanded) {
+              // Still show the header but collapsed
+            }
+
+            return (
+              <div key={section.key}>
+                <button
+                  type="button"
+                  onClick={() => toggleSection(section.key)}
+                  className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors hover:bg-muted/20"
+                >
+                  {isExpanded ? (
+                    <ChevronDownIcon className="h-3 w-3 text-muted-foreground/40" />
+                  ) : (
+                    <ChevronRightIcon className="h-3 w-3 text-muted-foreground/40" />
+                  )}
+                  <span className={cn('font-medium', count > 0 ? section.color : 'text-muted-foreground/40')}>
+                    {section.label}
+                  </span>
+                  {count > 0 && (
+                    <span className="ml-auto rounded-full bg-muted/30 px-1.5 py-0.5 text-[9px] font-bold text-muted-foreground/60">
+                      {count}
+                    </span>
+                  )}
+                </button>
+
+                {/* Task list */}
+                {isExpanded && count > 0 && (
+                  <div className="ml-3 space-y-0.5 pb-1">
+                    {sectionTaskList.map((task) => {
+                      const isSelected = selectedTaskId === task.id && activeEngine === 'task-thread';
+                      const isRunning = taskExecutions.has(task.id) && taskExecutions.get(task.id)?.status === 'running';
+
+                      return (
+                        <button
+                          key={task.id}
+                          type="button"
+                          onClick={() => handleTaskClick(task.id)}
+                          className={cn(
+                            'flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[11px] transition-colors',
+                            isSelected
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground hover:bg-muted/20 hover:text-foreground',
+                          )}
+                        >
+                          {isRunning && (
+                            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400 animate-pulse" />
+                          )}
+                          <span className="flex-1 truncate">{task.title}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* WORKSPACE section */}
+        <div className="px-2 pt-4">
+          <div className="px-1 pb-1.5 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50">Workspace</div>
+          {WORKSPACE_NAV.map(({ engine, label, Icon }) => {
+            const stream = engineStreams.get(engine);
+            const isActive = stream?.status === 'streaming';
+
+            return (
+              <button
+                key={engine}
+                type="button"
+                onClick={() => {
+                  setSelectedTaskId(null);
+                  setActiveEngine(engine);
+                }}
+                className={cn(
+                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
+                  activeEngine === engine
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+                )}
+              >
+                <Icon className="h-4 w-4" />
+                <span className="flex-1 text-left">{label}</span>
+                {isActive && (
+                  <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* PLUGINS section */}
+        {pluginSidebarItems.length > 0 && (
+          <div className="px-2 pt-4">
+            <div className="px-1 pb-1.5 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50">Plugins</div>
+            {pluginSidebarItems.map((item) => (
+              <button
+                key={`${item.pluginId}:${item.id}`}
+                type="button"
+                onClick={() => {
+                  setSelectedTaskId(null);
+                  setActiveEngine(`plugin:${item.pluginId}:${item.id}`);
+                }}
+                className={cn(
+                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
+                  activeEngine === `plugin:${item.pluginId}:${item.id}`
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+                )}
+              >
+                <PuzzleIcon className="h-4 w-4" />
+                <span className="flex-1 text-left">{item.label}</span>
+              </button>
+            ))}
+          </div>
         )}
       </div>
 
-      {/* Project engines */}
-      <div className="px-2 pt-2 pb-1">
-        <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
-          Project
-        </p>
-        <nav className="flex flex-col gap-0.5">
-          {PROJECT_NAV.map(renderNavItem)}
-        </nav>
+      {/* Footer: Close project */}
+      <div className="shrink-0 border-t border-border/50 px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setProject(null)}
+          className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-muted-foreground/50 transition-colors hover:bg-muted/20 hover:text-muted-foreground"
+        >
+          <XIcon className="h-3.5 w-3.5" />
+          Close project
+        </button>
       </div>
-
-      {/* Tools section */}
-      <div className="mx-3 my-1 h-px bg-sidebar-border/60" />
-      <div className="px-2 pb-1">
-        <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
-          Tools
-        </p>
-        <nav className="flex flex-col gap-0.5">
-          {TOOLS_NAV.map(renderNavItem)}
-        </nav>
-      </div>
-
-      {/* Plugin sidebar items */}
-      {pluginSidebarItems.length > 0 && (
-        <>
-          <div className="mx-3 my-1 h-px bg-sidebar-border/60" />
-          <div className="px-2 pb-1">
-            <p className="mb-1 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/40">
-              Plugins
-            </p>
-            <nav className="flex flex-col gap-0.5">
-              {pluginSidebarItems.map((item) => (
-                <button
-                  key={`${item.pluginId}-${item.id}`}
-                  type="button"
-                  onClick={() => setActiveEngine(`plugin:${item.pluginId}:${item.id}`)}
-                  className={cn(
-                    'flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors',
-                    activeEngine === `plugin:${item.pluginId}:${item.id}`
-                      ? 'bg-primary/10 text-primary'
-                      : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
-                  )}
-                >
-                  <PuzzleIcon className="h-4 w-4" />
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-          </div>
-        </>
-      )}
-
-      {/* Close project link */}
-      {project && (
-        <div className="mt-auto border-t border-sidebar-border/80 px-3 py-2">
-          <button
-            type="button"
-            onClick={() => setProject(null)}
-            className="text-[10px] text-muted-foreground/50 transition-colors hover:text-muted-foreground"
-          >
-            Close project
-          </button>
-        </div>
-      )}
     </div>
   );
 };

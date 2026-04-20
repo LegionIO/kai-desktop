@@ -7,12 +7,19 @@ import type { TaskExecutionState } from '@/providers/WorkspaceProvider';
 
 /* ── Status config ───────────────────────────────────────── */
 
-const STATUS_BADGE: Record<TaskStatus, { label: string; className: string }> = {
-  planning:     { label: 'Pending',     className: 'border-slate-500/40 bg-slate-500/10 text-slate-400' },
+const STATUS_BADGE: Record<string, { label: string; className: string }> = {
+  defining:     { label: 'Defining',    className: 'border-slate-500/40 bg-slate-500/10 text-slate-400' },
+  planning:     { label: 'Planning',    className: 'border-indigo-500/40 bg-indigo-500/10 text-indigo-400' },
+  queued:       { label: 'Queued',      className: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-400' },
+  executing:    { label: 'Executing',   className: 'border-blue-500/40 bg-blue-500/10 text-blue-400' },
+  needs_input:  { label: 'Needs Input', className: 'border-amber-500/40 bg-amber-500/10 text-amber-400' },
+  review:       { label: 'Review',      className: 'border-purple-500/40 bg-purple-500/10 text-purple-400' },
+  done:         { label: 'Complete',    className: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' },
+  rejected:     { label: 'Rejected',    className: 'border-red-500/40 bg-red-500/10 text-red-400' },
+  // Legacy
   in_progress:  { label: 'Running',     className: 'border-blue-500/40 bg-blue-500/10 text-blue-400' },
   ai_review:    { label: 'AI Review',   className: 'border-purple-500/40 bg-purple-500/10 text-purple-400' },
   human_review: { label: 'Needs Review', className: 'border-amber-500/40 bg-amber-500/10 text-amber-400' },
-  done:         { label: 'Complete',    className: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' },
 };
 
 const PRIORITY_DOT: Record<TaskPriority, string> = {
@@ -26,21 +33,31 @@ const PRIORITY_DOT: Record<TaskPriority, string> = {
 
 function getProgress(task: WorkspaceTask): number {
   switch (task.status) {
-    case 'planning': return 0;
-    case 'in_progress': return 33;
-    case 'ai_review': return 66;
-    case 'human_review': return 90;
+    case 'defining': return 0;
+    case 'planning': return 15;
+    case 'queued': return 25;
+    case 'executing': case 'in_progress': return 50;
+    case 'needs_input': return 60;
+    case 'review': case 'ai_review': case 'human_review': return 80;
     case 'done': return 100;
+    case 'rejected': return 0;
     default: return 0;
   }
 }
 
-const PROGRESS_COLOR: Record<TaskStatus, string> = {
-  planning: 'bg-slate-500',
+const PROGRESS_COLOR: Record<string, string> = {
+  defining: 'bg-slate-500',
+  planning: 'bg-indigo-500',
+  queued: 'bg-cyan-500',
+  executing: 'bg-blue-500',
+  needs_input: 'bg-amber-500',
+  review: 'bg-purple-500',
+  done: 'bg-emerald-500',
+  rejected: 'bg-red-500',
+  // Legacy
   in_progress: 'bg-blue-500',
   ai_review: 'bg-purple-500',
   human_review: 'bg-amber-500',
-  done: 'bg-emerald-500',
 };
 
 /* ── Time ago ────────────────────────────────────────────── */
@@ -115,7 +132,7 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
       )}
 
       {/* Live execution output */}
-      {(task.status === 'in_progress' || task.status === 'ai_review') && hasOutput && (
+      {(task.status === 'executing' || task.status === 'in_progress' || task.status === 'review' || task.status === 'ai_review') && hasOutput && (
         <div className="mt-3">
           <button
             type="button"
@@ -212,8 +229,8 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
       {/* Action row — varies by status */}
       <div className="mt-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
-          {/* Planning: Start (execute) button */}
-          {task.status === 'planning' && onExecute && (
+          {/* Defining/Planning: Start (execute) button */}
+          {(task.status === 'defining' || task.status === 'planning') && onExecute && (
             <button
               type="button"
               onClick={onExecute}
@@ -224,8 +241,8 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
             </button>
           )}
 
-          {/* In Progress: running indicator + cancel */}
-          {task.status === 'in_progress' && (
+          {/* Executing: running indicator + cancel */}
+          {(task.status === 'executing' || task.status === 'in_progress') && (
             <>
               <span className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-blue-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
@@ -244,57 +261,29 @@ export const TaskCard: FC<TaskCardProps> = ({ task, onStatusChange, onRemove, on
             </>
           )}
 
-          {/* AI Review: Approve & Reject buttons + View Changes */}
-          {task.status === 'ai_review' && onReview && (
+          {/* Review: Approve & Reject buttons + View Changes */}
+          {(task.status === 'review' || task.status === 'ai_review' || task.status === 'human_review') && (
             <>
-              <button
-                type="button"
-                onClick={() => onReview(true)}
-                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 text-[10px] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/15"
-              >
-                <CheckIcon className="h-3 w-3" />
-                Approve
-              </button>
-              <button
-                type="button"
-                onClick={() => onReview(false)}
-                className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1 text-[10px] font-medium text-red-400 transition-colors hover:bg-red-500/15"
-              >
-                <XIcon className="h-3 w-3" />
-                Reject
-              </button>
-              {onViewChanges && (
+              {onReview && (
                 <button
                   type="button"
-                  onClick={onViewChanges}
-                  className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 text-[10px] font-medium text-cyan-400 transition-colors hover:bg-cyan-500/15"
+                  onClick={() => onReview(true)}
+                  className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 text-[10px] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/15"
                 >
-                  <GitCompareIcon className="h-3 w-3" />
-                  Diff
+                  <CheckIcon className="h-3 w-3" />
+                  Approve
                 </button>
               )}
-            </>
-          )}
-
-          {/* Human Review: Approve (→ done) & Needs Work (→ planning) + View Changes */}
-          {task.status === 'human_review' && (
-            <>
-              <button
-                type="button"
-                onClick={() => onStatusChange('done')}
-                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 text-[10px] font-medium text-emerald-400 transition-colors hover:bg-emerald-500/15"
-              >
-                <CheckIcon className="h-3 w-3" />
-                Approve
-              </button>
-              <button
-                type="button"
-                onClick={() => onStatusChange('planning')}
-                className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[10px] font-medium text-amber-400 transition-colors hover:bg-amber-500/15"
-              >
-                <ChevronRightIcon className="h-3 w-3" />
-                Needs Work
-              </button>
+              {onReview && (
+                <button
+                  type="button"
+                  onClick={() => onReview(false)}
+                  className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1 text-[10px] font-medium text-red-400 transition-colors hover:bg-red-500/15"
+                >
+                  <XIcon className="h-3 w-3" />
+                  Reject
+                </button>
+              )}
               {onViewChanges && (
                 <button
                   type="button"

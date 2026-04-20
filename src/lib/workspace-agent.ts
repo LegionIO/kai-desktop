@@ -40,6 +40,23 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
     'You may include explanatory text before the JSON block.',
   ].join(' '),
 
+  planning: [
+    'You are a senior software architect planning a code change.',
+    'The user will describe a task they want to accomplish in their codebase.',
+    'Analyze the codebase using available tools (file_read, list_directory, glob, file_search, sh) to understand the relevant code BEFORE planning.',
+    'Explore the project structure, read key files, and understand existing patterns.',
+    'After your analysis, output a JSON block fenced with ```json matching this schema:',
+    '{"approach": "Description of the overall strategy and why this approach was chosen",',
+    '"steps": [{"id": "1", "description": "Specific actionable step", "status": "pending"}, ...],',
+    '"filesToModify": ["relative/path/to/file.ts", ...],',
+    '"testsToRun": ["npm test -- --filter ...", ...],',
+    '"risks": ["Specific risk description", ...]}',
+    'Be specific — reference actual files, functions, and patterns you found in the codebase.',
+    'Keep steps actionable and ordered. Include 3-8 steps.',
+    'Identify real risks based on what you found, not generic ones.',
+    'You may include explanatory text before the JSON block.',
+  ].join(' '),
+
   execution: [
     'You are an autonomous software engineer. You have been assigned a task to implement.',
     'Plan your approach, then execute using the available tools (file_read, file_write, file_edit, sh, glob, file_search).',
@@ -62,6 +79,14 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
     'After your analysis, output a JSON block fenced with ```json that matches this schema:',
     '{"version": "x.y.z", "date": "YYYY-MM-DD", "summary": "...", "changes": [{"type": "added|changed|fixed|removed", "description": "..."}]}',
     'You may include explanatory text before the JSON block.',
+  ].join(' '),
+
+  'task-parse': [
+    'You are a task creation assistant. The user gives you a natural language description of something they want to accomplish in their codebase.',
+    'Extract a structured task from it. Output ONLY a JSON block fenced with ```json that matches this schema:',
+    '{"title": "concise title under 80 chars", "description": "full description of what needs to be done", "priority": "low|medium|high|critical", "labels": ["optional", "category", "labels"]}',
+    'Infer priority from urgency cues (fix/bug/broken → high, improve/refactor → medium, docs/style → low).',
+    'If the input is vague, do your best — a reasonable title and description is better than asking for clarification.',
   ].join(' '),
 };
 

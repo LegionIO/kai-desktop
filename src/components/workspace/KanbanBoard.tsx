@@ -19,18 +19,28 @@ interface ColumnDef {
 
 const COLUMNS: ColumnDef[] = [
   {
-    status: 'planning',
-    label: 'Planning',
+    status: 'defining',
+    label: 'Defining',
     accentColor: 'rgb(148 163 184)',
     headerTextClass: 'text-slate-300',
     borderClass: 'border-t-slate-400/50',
     emptyIcon: <FileTextIcon className="h-5 w-5 text-slate-500/40" />,
-    emptyTitle: 'No tasks planned',
+    emptyTitle: 'No tasks defined',
     emptySubtitle: 'Create a task to get started',
   },
   {
-    status: 'in_progress',
-    label: 'In Progress',
+    status: 'planning',
+    label: 'Planning',
+    accentColor: 'rgb(129 140 248)',
+    headerTextClass: 'text-indigo-400',
+    borderClass: 'border-t-indigo-500/50',
+    emptyIcon: <FileTextIcon className="h-5 w-5 text-indigo-500/40" />,
+    emptyTitle: 'No tasks planned',
+    emptySubtitle: 'Tasks move here after defining',
+  },
+  {
+    status: 'executing',
+    label: 'Executing',
     accentColor: 'rgb(96 165 250)',
     headerTextClass: 'text-blue-400',
     borderClass: 'border-t-blue-500/50',
@@ -39,24 +49,14 @@ const COLUMNS: ColumnDef[] = [
     emptySubtitle: 'Start a task from Planning',
   },
   {
-    status: 'ai_review',
-    label: 'AI Review',
+    status: 'review',
+    label: 'Review',
     accentColor: 'rgb(168 85 247)',
     headerTextClass: 'text-purple-400',
     borderClass: 'border-t-purple-500/50',
-    emptyIcon: <BotIcon className="h-5 w-5 text-purple-500/30" />,
+    emptyIcon: <EyeIcon className="h-5 w-5 text-purple-500/30" />,
     emptyTitle: 'No tasks in review',
-    emptySubtitle: 'AI will review completed tasks',
-  },
-  {
-    status: 'human_review',
-    label: 'Human Review',
-    accentColor: 'rgb(251 191 36)',
-    headerTextClass: 'text-amber-400',
-    borderClass: 'border-t-amber-500/50',
-    emptyIcon: <EyeIcon className="h-5 w-5 text-amber-500/30" />,
-    emptyTitle: 'No tasks to review',
-    emptySubtitle: 'Tasks pass through AI review first',
+    emptySubtitle: 'Completed tasks come here for review',
   },
   {
     status: 'done',
@@ -76,15 +76,22 @@ export const KanbanBoard: FC = () => {
   const [dragOverColumn, setDragOverColumn] = useState<TaskStatus | null>(null);
 
   const grouped = useMemo(() => {
-    const map: Record<TaskStatus, typeof tasks> = {
+    const map: Record<string, typeof tasks> = {
+      defining: [],
       planning: [],
-      in_progress: [],
-      ai_review: [],
-      human_review: [],
+      executing: [],
+      review: [],
       done: [],
     };
     for (const task of tasks) {
-      (map[task.status] ?? map.planning).push(task);
+      // Map legacy + new statuses to column keys
+      const key = task.status === 'in_progress' ? 'executing'
+        : task.status === 'ai_review' || task.status === 'human_review' ? 'review'
+        : task.status === 'queued' ? 'planning'
+        : task.status === 'needs_input' ? 'executing'
+        : task.status === 'rejected' ? 'done'
+        : task.status;
+      (map[key] ?? map.defining).push(task);
     }
     return map;
   }, [tasks]);
