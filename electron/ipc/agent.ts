@@ -3,12 +3,10 @@ import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { join } from 'path';
 import { homedir } from 'os';
-import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
+import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry, type ResolvedStreamConfig } from '../agent/model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
-import { getAgentBackend, listAgentBackends, registerAgentBackend } from '../agent/backend-registry.js';
-import { resolveAgentBackendKey } from '../agent/backend-resolution.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
@@ -23,7 +21,6 @@ import {
   type LaunchToolCallResult,
 } from '../agent/tool-observer.js';
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
-import { readConversationStore } from './conversations.js';
 import { recordUsageEvent } from './usage.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
@@ -297,79 +294,87 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
   registeredTools = [...nonCli, ...ensureSafeToolDefinitions(cliTools)];
 }
 
-function ensureBuiltInAgentBackends(): void {
-  registerAgentBackend({
-    key: 'mastra',
-    displayName: 'Mastra',
-    stream: (options) => {
-      return (async function* mastraStream(): AsyncGenerator<StreamEvent> {
-        if (!options.primaryModel || !options.streamConfig) {
-          yield {
-            conversationId: options.conversationId,
-            type: 'text-delta',
-            text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
-          };
-          yield { conversationId: options.conversationId, type: 'done' };
-          return;
-        }
+function streamMastra(options: {
+  conversationId: string;
+  messages: unknown[];
+  appHome: string;
+  config: AppConfig;
+  cwd?: string;
+  primaryModel: ModelCatalogEntry | null;
+  streamConfig: ResolvedStreamConfig | null;
+  tools: ToolDefinition[];
+  reasoningEffort?: ReasoningEffort;
+  abortSignal?: AbortSignal;
+  emitEvent?: (event: StreamEvent) => void;
+  onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => Promise<void> | void;
+  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
+  augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
+}): AsyncGenerator<StreamEvent> {
+  return (async function* (): AsyncGenerator<StreamEvent> {
+    if (!options.primaryModel || !options.streamConfig) {
+      yield {
+        conversationId: options.conversationId,
+        type: 'text-delta',
+        text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
+      };
+      yield { conversationId: options.conversationId, type: 'done' };
+      return;
+    }
 
-        const dbPath = join(options.appHome, 'data', 'memory.db');
-        const configForStream: AppConfig = {
-          ...options.config,
-          systemPrompt: await withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
-          advanced: {
-            ...options.config.advanced,
-            temperature: options.streamConfig.temperature,
-            maxSteps: options.streamConfig.maxSteps,
-            maxRetries: options.streamConfig.maxRetries,
-          },
-        };
+    const dbPath = join(options.appHome, 'data', 'memory.db');
+    const configForStream: AppConfig = {
+      ...options.config,
+      systemPrompt: await withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
+      advanced: {
+        ...options.config.advanced,
+        temperature: options.streamConfig.temperature,
+        maxSteps: options.streamConfig.maxSteps,
+        maxRetries: options.streamConfig.maxRetries,
+      },
+    };
 
-        if (options.streamConfig.fallbackEnabled) {
-          yield* streamWithFallback(
-            options.conversationId,
-            options.messages,
-            options.streamConfig,
-            options.config,
-            options.tools,
-            dbPath,
-            {
-              reasoningEffort: options.reasoningEffort,
-              abortSignal: options.abortSignal,
-              cwd: options.cwd,
-              emitEvent: options.emitEvent,
-              onToolExecutionStart: options.onToolExecutionStart,
-              onToolExecutionEnd: options.onToolExecutionEnd,
-              augmentToolResult: options.augmentToolResult,
-            },
-          );
-          return;
-        }
+    if (options.streamConfig.fallbackEnabled) {
+      yield* streamWithFallback(
+        options.conversationId,
+        options.messages,
+        options.streamConfig,
+        options.config,
+        options.tools,
+        dbPath,
+        {
+          reasoningEffort: options.reasoningEffort,
+          abortSignal: options.abortSignal,
+          cwd: options.cwd,
+          emitEvent: options.emitEvent,
+          onToolExecutionStart: options.onToolExecutionStart,
+          onToolExecutionEnd: options.onToolExecutionEnd,
+          augmentToolResult: options.augmentToolResult,
+        },
+      );
+      return;
+    }
 
-        yield* streamAgentResponse(
-          options.conversationId,
-          options.messages,
-          options.primaryModel.modelConfig,
-          configForStream,
-          options.tools,
-          dbPath,
-          {
-            reasoningEffort: options.reasoningEffort,
-            abortSignal: options.abortSignal,
-            cwd: options.cwd,
-            emitEvent: options.emitEvent,
-            onToolExecutionStart: options.onToolExecutionStart,
-            onToolExecutionEnd: options.onToolExecutionEnd,
-            augmentToolResult: options.augmentToolResult,
-          },
-        );
-      })();
-    },
-  });
+    yield* streamAgentResponse(
+      options.conversationId,
+      options.messages,
+      options.primaryModel.modelConfig,
+      configForStream,
+      options.tools,
+      dbPath,
+      {
+        reasoningEffort: options.reasoningEffort,
+        abortSignal: options.abortSignal,
+        cwd: options.cwd,
+        emitEvent: options.emitEvent,
+        onToolExecutionStart: options.onToolExecutionStart,
+        onToolExecutionEnd: options.onToolExecutionEnd,
+        augmentToolResult: options.augmentToolResult,
+      },
+    );
+  })();
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
-  ensureBuiltInAgentBackends();
 
   ipcMain.handle(
     'agent:stream',
@@ -418,24 +423,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
 
-    // Backend resolution: conversation override > model-level preference > mastra
-    const conversationBackendKey = readConversationStore(appHome).conversations[conversationId]?.selectedBackendKey ?? null;
-    const modelBackendKey = modelEntry ? resolveAgentBackendKey(modelEntry) : null;
-    const conversationBackend = getAgentBackend(conversationBackendKey);
-    const modelBackend = getAgentBackend(modelBackendKey);
-    const defaultBackend = getAgentBackend('mastra');
-    const candidateBackend = conversationBackend ?? modelBackend;
-    const selectedBackend = (candidateBackend && (candidateBackend.isAvailable?.() ?? true))
-      ? candidateBackend
-      : defaultBackend;
-    const resolvedBackendKey = selectedBackend?.key ?? 'mastra';
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
-    console.info(`[Agent:stream] conv=${conversationId} backend=${resolvedBackendKey} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
+    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
 
     // Track the model key for usage attribution
     activeStreamModelKeys.set(
       conversationId,
-      modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey ?? `backend:${resolvedBackendKey}`,
+      modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey,
     );
     for (const [index, message] of messageList.entries()) {
       const contentPreview = typeof message.content === 'string'
@@ -444,16 +438,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           ? JSON.stringify(message.content).slice(0, 200)
           : String(message.content ?? '').slice(0, 200);
       console.info(`[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${JSON.stringify(message.content ?? '').length} preview=${contentPreview}`);
-    }
-
-    if (!selectedBackend) {
-      broadcastStreamEvent({
-        conversationId,
-        type: 'error',
-        error: 'No agent backend is available for this conversation.',
-      });
-      broadcastStreamEvent({ conversationId, type: 'done' });
-      return { conversationId };
     }
 
     // Run streaming in background
@@ -1069,19 +1053,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           },
         };
 
-        const stream = selectedBackend.stream({
+        const stream = streamMastra({
           conversationId,
           messages,
-          modelKey,
-          profileKey,
-          fallbackEnabled,
-          reasoningEffort,
           cwd: effectiveCwd,
           config: configWithExecutionMode,
           appHome,
           primaryModel: modelEntry,
           streamConfig,
           tools: activeTools,
+          reasoningEffort,
           abortSignal: controller.signal,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
@@ -1276,16 +1257,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle('agent:sub-agent-list', async () => {
     return { ids: getActiveSubAgentIds() };
-  });
-
-  ipcMain.handle('agent:list-backends', async () => {
-    return listAgentBackends()
-      .filter((backend) => backend.isAvailable?.() ?? true)
-      .map((backend) => ({
-        key: backend.key,
-        displayName: backend.displayName,
-        pluginName: backend.pluginName ?? null,
-      }));
   });
 
   // Model catalog endpoint

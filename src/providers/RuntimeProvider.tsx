@@ -118,7 +118,6 @@ export type ConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
-  selectedBackendKey?: string | null;
   metadata?: Record<string, unknown>;
   // Sub-agent metadata
   parentConversationId?: string | null;
@@ -1014,7 +1013,7 @@ export function RuntimeProvider({
   selectedProfileKey?: string | null;
   fallbackEnabled?: boolean;
   onModelFallback?: (toModelKey: string) => void;
-  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null; selectedBackendKey: string | null }) => void;
+  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null }) => void;
 }) {
   const [tree, setTree] = useState<StoredMessage[]>([]);
   const [headId, setHeadId] = useState<string | null>(null);
@@ -1184,7 +1183,6 @@ export function RuntimeProvider({
       selectedProfileKey: conv.selectedProfileKey ?? null,
       fallbackEnabled: conv.fallbackEnabled ?? false,
       profilePrimaryModelKey: conv.profilePrimaryModelKey ?? null,
-      selectedBackendKey: conv.selectedBackendKey ?? null,
     });
 
     return true;
@@ -1210,7 +1208,6 @@ export function RuntimeProvider({
           messageCount: 0, userMessageCount: 0,
           runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
           selectedModelKey: null,
-          selectedBackendKey: null,
           currentWorkingDirectory: defaultCwd,
         } as ConversationRecord);
         await app.conversations.setActiveId(newId);

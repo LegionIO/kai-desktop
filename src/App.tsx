@@ -735,7 +735,6 @@ function AppShell() {
     selectedProfileKey: string | null;
     fallbackEnabled: boolean;
     profilePrimaryModelKey: string | null;
-    selectedBackendKey: string | null;
   }) => {
     setSelectedModelKey(settings.selectedModelKey);
     setSelectedProfileKey(settings.selectedProfileKey);

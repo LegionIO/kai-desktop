@@ -35,8 +35,6 @@ const providerSchema = z.object({
   extraHeaders: z.record(z.string(), z.string()).optional(),
 });
 
-const agentBackendSchema = z.enum(['auto', 'mastra']);
-
 const modelEntrySchema = z.object({
   key: z.string(),
   displayName: z.string(),
@@ -48,7 +46,6 @@ const modelEntrySchema = z.object({
   computerUseSupport: computerUseSupportSchema.optional(),
   visionCapable: z.boolean().optional(),
   preferredTarget: computerUseTargetSchema.optional(),
-  agentBackend: agentBackendSchema.optional(),
 });
 
 const modelsConfigSchema = z.object({

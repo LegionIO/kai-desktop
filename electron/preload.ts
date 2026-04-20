@@ -34,11 +34,6 @@ const appAPI = {
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
     generateTitle: (messages: unknown[], modelKey?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey),
-    listBackends: () => ipcRenderer.invoke('agent:list-backends') as Promise<Array<{
-      key: string;
-      displayName: string;
-      pluginName?: string | null;
-    }>>,
     onStreamEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('agent:stream-event', handler);
