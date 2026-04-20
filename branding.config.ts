@@ -70,9 +70,9 @@ export const branding = {
 
   // ── Theme / visual identity ──────────────────────────────────────────
   /** OKLCh hue angle (0-360) used for the brand accent across the UI. */
-  themeHue: '90',
+  themeHue: '85',
   /** Fallback light-mode accent for contexts that need a hex color. */
-  themeAccentLight: '#b8960f',
+  themeAccentLight: '#a8860f',
   /** Fallback dark-mode accent for contexts that need a hex color. */
   themeAccentDark: '#e8c94a',
   /** Whether to use the animated gradient wordmark text. */

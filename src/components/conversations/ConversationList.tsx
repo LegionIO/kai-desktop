@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, ArchiveRestoreIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon } from 'lucide-react';
+import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, ArchiveRestoreIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
@@ -359,6 +359,12 @@ export const ConversationList: FC<ConversationListProps> = ({
     setContextMenu({ x: e.clientX, y: e.clientY, convId });
   }, []);
 
+  const handleMoreClick = useCallback((e: React.MouseEvent<HTMLButtonElement>, convId: string) => {
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    setContextMenu({ x: rect.left, y: rect.bottom + 4, convId });
+  }, []);
+
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
@@ -525,7 +531,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                     `}
                     style={isActive ? { backgroundColor: 'var(--app-active-item)' } : undefined}
                   >
-                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${hasUnread ? 'text-primary' : 'text-muted-foreground'}`} />
+                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${isActive ? 'text-primary' : hasUnread ? 'text-primary' : 'text-muted-foreground'}`} {...(isActive ? { fill: 'currentColor' } : {})} />
                     <div className="flex-1 min-w-0">
                       {renamingId === conv.id ? (
                         <input
@@ -570,12 +576,21 @@ export const ConversationList: FC<ConversationListProps> = ({
                         {conv.messageCount > 0 && ` · ${conv.messageCount} msgs`}
                       </span>
                     </div>
-                    <div className="ml-1 flex shrink-0 items-center gap-1">
+                    <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
                       {hasUnread && <div className="h-2 w-2 rounded-full bg-primary app-unread-glow" />}
                       {computerStatus === 'running' && <ComputerActiveIndicator />}
                       {computerStatus === 'completed' && !(isActive && activeThreadMode === 'computer') && <ComputerCompletedIndicator />}
                       {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}
                       {conv.archived && <ArchiveIcon className="h-3 w-3 text-muted-foreground" />}
+                      <button
+                        type="button"
+                        onClick={(e) => handleMoreClick(e, conv.id)}
+                        className="shrink-0 rounded p-0.5 opacity-0 transition-all group-hover:opacity-100 hover:bg-sidebar-accent"
+                        title="More options"
+                        aria-label="More options"
+                      >
+                        <EllipsisVerticalIcon className="h-4 w-4 text-muted-foreground" />
+                      </button>
                     </div>
                   </div>
                   </div>

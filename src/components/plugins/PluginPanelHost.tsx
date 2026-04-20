@@ -1,5 +1,4 @@
 import type { FC } from 'react';
-import { XIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { usePlugins, type PluginPanelDescriptor } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
@@ -42,22 +41,7 @@ export const PluginPanelHost: FC<{
   const widthClass = widthClassMap[panel.width ?? 'default'];
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b border-border/50 px-6 py-4">
-        <div>
-          <h1 className="text-lg font-semibold">{panel.title}</h1>
-          <p className="text-xs text-muted-foreground">{panel.pluginName}</p>
-        </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50"
-          title="Close"
-        >
-          <XIcon className="h-4 w-4" />
-        </button>
-      </div>
-
+    <div className="flex h-full flex-col pt-12 md:pt-14">
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 h-full">
         <div className={`mx-auto w-full h-full ${widthClass}`}>
           {Component ? (
