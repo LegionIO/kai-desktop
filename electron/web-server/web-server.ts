@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
+import net from 'net';
 import { join, extname } from 'path';
 import { homedir } from 'os';
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from 'fs';
@@ -14,6 +15,7 @@ import { getLoginPageHtml } from './login-page.js';
 interface WebServerConfig {
   enabled: boolean;
   port: number;
+  bindAddress: string;
   tls: {
     enabled: boolean;
     mode: 'self-signed' | 'custom';
@@ -28,6 +30,8 @@ interface WebServerConfig {
 }
 
 let httpServer: http.Server | https.Server | null = null;
+let netServer: net.Server | null = null;
+let redirectServer: http.Server | null = null;
 let wss: WebSocketServer | null = null;
 
 /** Cached favicon PNG read from build/icon.png at module load. */
@@ -841,13 +845,47 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     });
   });
 
+  const bindAddress = config.bindAddress || '0.0.0.0';
+
+  if (tlsOptions) {
+    // TLS mode: listen the HTTPS and a redirect HTTP server on ephemeral
+    // loopback ports, then front them with a net.Server on the real port
+    // that peeks the first byte to decide which one gets the connection.
+    redirectServer = http.createServer((req, res) => {
+      const host = (req.headers.host ?? 'localhost').replace(/:\d+$/, '');
+      const location = `https://${host}:${config.port}${req.url ?? '/'}`;
+      res.writeHead(301, { Location: location });
+      res.end();
+    });
+
+    await Promise.all([
+      new Promise<void>((r) => httpServer!.listen(0, '127.0.0.1', r)),
+      new Promise<void>((r) => redirectServer!.listen(0, '127.0.0.1', r)),
+    ]);
+
+    netServer = net.createServer((socket) => {
+      socket.once('readable', () => {
+        const buf: Buffer | null = socket.read(1);
+        if (!buf || buf.length === 0) {
+          socket.destroy();
+          return;
+        }
+        socket.unshift(buf);
+        // 0x16 = TLS ClientHello
+        const target = buf[0] === 0x16 ? httpServer! : redirectServer!;
+        target.emit('connection', socket);
+      });
+    });
+
+    return new Promise<void>((resolve, reject) => {
+      netServer!.on('error', reject);
+      netServer!.listen(config.port, bindAddress, () => resolve());
+    });
+  }
+
   return new Promise<void>((resolve, reject) => {
-    httpServer!.on('error', (err) => {
-      reject(err);
-    });
-    httpServer!.listen(config.port, () => {
-      resolve();
-    });
+    httpServer!.on('error', reject);
+    httpServer!.listen(config.port, bindAddress, () => resolve());
   });
 }
 
@@ -863,15 +901,27 @@ export async function stopWebServer(): Promise<void> {
     wss = null;
   }
 
-  if (httpServer) {
-    const server = httpServer;
-    httpServer = null;
-    return new Promise<void>((resolve) => {
-      server.close(() => resolve());
-      // Force-close all keep-alive connections so .close() fires promptly
-      server.closeAllConnections();
-    });
+  const closers: Promise<void>[] = [];
+
+  if (netServer) {
+    const s = netServer;
+    netServer = null;
+    closers.push(new Promise<void>((r) => { s.close(() => r()); }));
   }
+
+  if (redirectServer) {
+    const s = redirectServer;
+    redirectServer = null;
+    closers.push(new Promise<void>((r) => { s.close(() => r()); s.closeAllConnections(); }));
+  }
+
+  if (httpServer) {
+    const s = httpServer;
+    httpServer = null;
+    closers.push(new Promise<void>((r) => { s.close(() => r()); s.closeAllConnections(); }));
+  }
+
+  await Promise.all(closers);
 }
 
 /**

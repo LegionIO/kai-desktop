@@ -577,7 +577,7 @@ if (gotSingleInstanceLock) {
           const wsConfig = config.webServer;
           if (wsConfig?.enabled) {
             restartWebServer(wsConfig)
-              .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://localhost:${wsConfig.port}`))
+              .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://${wsConfig.bindAddress || '0.0.0.0'}:${wsConfig.port}`))
               .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server restart failed:`, err));
           } else {
             stopWebServer()
@@ -950,7 +950,7 @@ if (gotSingleInstanceLock) {
       const webServerConfig = getConfig().webServer;
       if (webServerConfig?.enabled) {
         startWebServer(webServerConfig)
-          .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://localhost:${webServerConfig.port}`))
+          .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`))
           .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
       }
     }).catch((err) => {

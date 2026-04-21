@@ -112,6 +112,7 @@ function getDefaultConfig() {
     webServer: {
       enabled: false,
       port: 5243,
+      bindAddress: '0.0.0.0',
       tls: { enabled: true, mode: 'self-signed' as const, certPath: '', keyPath: '' },
       auth: { mode: 'anonymous' as const, username: '', password: '' },
     },

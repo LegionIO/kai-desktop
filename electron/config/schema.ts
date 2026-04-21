@@ -358,6 +358,7 @@ const cliToolSchema = z.object({
 const webServerConfigSchema = z.object({
   enabled: z.boolean(),
   port: z.number().positive(),
+  bindAddress: z.string(),
   tls: z.object({
     enabled: z.boolean(),
     mode: z.enum(['self-signed', 'custom']),

@@ -5,6 +5,7 @@ import { WebServerQRCode } from './WebServerQRCode';
 type WebServerConfig = {
   enabled: boolean;
   port: number;
+  bindAddress: string;
   tls: {
     enabled: boolean;
     mode: 'self-signed' | 'custom';
@@ -22,6 +23,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
   const ws = (config.webServer as WebServerConfig | undefined) ?? {
     enabled: false,
     port: 5243,
+    bindAddress: '0.0.0.0',
     tls: { enabled: true, mode: 'self-signed' as const, certPath: '', keyPath: '' },
     auth: { mode: 'anonymous' as const, username: '', password: '' },
   };
@@ -55,8 +57,18 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               min={1}
               max={65535}
             />
+            <TextField
+              label="Bind Address"
+              value={ws.bindAddress ?? '0.0.0.0'}
+              onChange={(v) => updateConfig('webServer.bindAddress', v)}
+              placeholder="0.0.0.0"
+              mono
+            />
             <p className="text-[10px] text-muted-foreground">
-              Access the Web UI at <span className="font-mono">{protocol}://localhost:{ws.port}</span>
+              Access the Web UI at{' '}
+              <span className="font-mono">
+                {protocol}://{['0.0.0.0', '::', ''].includes(ws.bindAddress) ? 'localhost' : ws.bindAddress}:{ws.port}
+              </span>
             </p>
           </fieldset>
 
