@@ -95,7 +95,7 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   }
 
   return (
-    <div className="flex h-full flex-col bg-background pt-12 md:flex-row md:pt-14">
+    <div className="flex h-full flex-col bg-background md:flex-row">
       <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
         <div className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
           {sections.map((section) => (

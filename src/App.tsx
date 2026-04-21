@@ -1129,6 +1129,8 @@ function AppShell() {
               </div>
               </div>
             </div>
+            {/* Spacer for the absolutely-positioned title bar */}
+            <div className="h-12 shrink-0 md:h-14" />
             <PluginBannerSlot />
             <div className="min-h-0 flex-1 overflow-hidden">
               {activeView === SETTINGS_VIEW ? (

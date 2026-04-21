@@ -41,7 +41,7 @@ export const PluginPanelHost: FC<{
   const widthClass = widthClassMap[panel.width ?? 'default'];
 
   return (
-    <div className="flex h-full flex-col pt-12 md:pt-14">
+    <div className="flex h-full flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 h-full">
         <div className={`mx-auto w-full h-full ${widthClass}`}>
           {Component ? (
