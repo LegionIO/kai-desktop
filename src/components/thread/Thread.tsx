@@ -157,7 +157,7 @@ export const Thread: FC<{
               </div>
             </div>
             <div className="sticky bottom-0 z-20">
-              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-48 bg-gradient-to-t from-background from-40% to-transparent md:h-56" />}
+              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />}
             {callState.isInCall ? (
               <CallOverlay />
             ) : (
