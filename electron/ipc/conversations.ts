@@ -30,7 +30,6 @@ type ConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
-  selectedBackendKey?: string | null;
   metadata?: Record<string, unknown>;
 };
 

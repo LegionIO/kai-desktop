@@ -18,6 +18,8 @@ import {
   AlertTriangleIcon,
   CodeIcon,
   BookOpenIcon,
+  ScrollTextIcon,
+  SendHorizontalIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -49,23 +51,29 @@ type ToolCallPart = {
     truncated?: boolean;
     stopped?: boolean;
   };
+  /** Approval status for confirm-writes execution mode */
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
+  /** Backend-side approval ID — may differ from toolCallId due to ID mismatch */
+  approvalId?: string;
 };
 
-export const ToolGroup: FC<{ parts: ToolCallPart[] }> = ({ parts }) => {
+export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: string) => void }> = ({ parts, onSendFeedback }) => {
   if (parts.length === 0) return null;
 
   return (
     <div className="my-2 space-y-1.5">
       {parts.map((part) => (
-        <ToolCallDisplay key={part.toolCallId} part={part} />
+        <ToolCallDisplay key={part.toolCallId} part={part} onSendFeedback={onSendFeedback} />
       ))}
     </div>
   );
 };
 
-export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
+export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void }> = ({ part, onSendFeedback }) => {
   const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | null>(null);
+  const [feedbackText, setFeedbackText] = useState('');
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
@@ -77,6 +85,28 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
   const mediaResult = hasResult && !isError ? detectMediaResult(part.result) : null;
   const todoItems = detectTodoItems(part);
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
+  const approvalStatus = localApproval ?? part.approvalStatus;
+  const isPendingApproval = approvalStatus === 'pending';
+  const isPlanApproval = part.toolName === 'exit_plan_mode';
+  const isAskUser = part.toolName === 'ask_user';
+
+  const handleApprove = useCallback(() => {
+    setLocalApproval('approved');
+    void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
+  }, [part.toolCallId, part.approvalId]);
+
+  const handleReject = useCallback(() => {
+    setLocalApproval('rejected');
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+  }, [part.toolCallId, part.approvalId]);
+
+  const handleFeedbackSubmit = useCallback(() => {
+    if (!feedbackText.trim()) return;
+    setLocalApproval('rejected');
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+    onSendFeedback?.(feedbackText.trim());
+    setFeedbackText('');
+  }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback]);
 
   const summary = getToolSummary(part);
 
@@ -109,6 +139,99 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
           />
         </span>
       </button>
+
+      {/* Ask user questionnaire UI */}
+      {isPendingApproval && isAskUser && (
+        <QuestionnaireView
+          toolCallId={part.approvalId ?? part.toolCallId}
+          args={part.args}
+          onSubmit={() => setLocalApproval('approved')}
+        />
+      )}
+      {approvalStatus === 'approved' && isAskUser && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+          <CheckIcon className="h-3 w-3" />
+          <span>Answered</span>
+        </div>
+      )}
+      {/* Tool approval — plan mode exit */}
+      {isPendingApproval && isPlanApproval && (
+        <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-3">
+          <div className="flex items-center gap-2">
+            <ScrollTextIcon className="h-4 w-4 shrink-0 text-primary" />
+            <span className="text-xs font-medium text-foreground">Accept this plan?</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleApprove}
+              className="rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              Yes, implement this plan
+            </button>
+            <button
+              type="button"
+              onClick={handleReject}
+              className="rounded-lg border border-border/70 bg-card px-3 py-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/50"
+            >
+              No, keep planning
+            </button>
+          </div>
+          {onSendFeedback && (
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={feedbackText}
+                onChange={(e) => setFeedbackText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleFeedbackSubmit(); }}
+                placeholder="Tell Kai what to do instead"
+                className="flex-1 rounded-lg border border-border/50 bg-background px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 outline-none focus:ring-1 focus:ring-primary/40"
+              />
+              <button
+                type="button"
+                onClick={handleFeedbackSubmit}
+                disabled={!feedbackText.trim()}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <SendHorizontalIcon className="h-3 w-3" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {/* Tool approval — generic confirm-writes mode */}
+      {isPendingApproval && !isPlanApproval && !isAskUser && (
+        <div className="ml-1 mt-1.5 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+          <AlertTriangleIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+          <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">Requires approval to execute</span>
+          <button
+            type="button"
+            onClick={handleReject}
+            className="rounded-md border border-border/70 bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+          >
+            Reject
+          </button>
+          <button
+            type="button"
+            onClick={handleApprove}
+            className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Approve
+          </button>
+        </div>
+      )}
+      {approvalStatus === 'approved' && localApproval === 'approved' && !isAskUser && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+          <CheckIcon className="h-3 w-3" />
+          <span>{isPlanApproval ? 'Plan accepted — implementing' : 'Approved'}</span>
+        </div>
+      )}
+      {approvalStatus === 'rejected' && !isAskUser && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <SquareIcon className="h-3 w-3" />
+          <span>{isPlanApproval ? 'Continuing to plan' : 'Rejected'}</span>
+        </div>
+      )}
 
       {/* Todo items — always visible below header */}
       {todoItems && <TodoListView items={todoItems} />}
@@ -172,6 +295,182 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart }> = ({ part }) => {
           )}
         </div>
       )}
+    </div>
+  );
+};
+
+/* ── Questionnaire UI for ask_user tool ── */
+
+type QuestionOption = { label: string; description?: string };
+type Question = { question: string; header: string; options: QuestionOption[]; multiSelect?: boolean };
+
+function parseQuestions(args: unknown): Question[] {
+  if (!args || typeof args !== 'object') return [];
+  const a = args as Record<string, unknown>;
+  if (!Array.isArray(a.questions)) return [];
+  return (a.questions as Array<Record<string, unknown>>).map((q) => ({
+    question: String(q.question ?? ''),
+    header: String(q.header ?? ''),
+    options: Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>).map((o) => ({
+      label: String(o.label ?? ''),
+      description: typeof o.description === 'string' ? o.description : undefined,
+    })) : [],
+    multiSelect: q.multiSelect === true,
+  }));
+}
+
+const QuestionnaireView: FC<{
+  toolCallId: string;
+  args: unknown;
+  onSubmit: () => void;
+}> = ({ toolCallId, args, onSubmit }) => {
+  const questions = parseQuestions(args);
+  const [activeTab, setActiveTab] = useState(0);
+  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
+
+  const handleSelect = useCallback((qIdx: number, value: string) => {
+    setAnswers((prev) => ({ ...prev, [qIdx]: value }));
+    // Clear "other" text when a predefined option is selected
+    if (value !== '__other__') {
+      setOtherTexts((prev) => { const next = { ...prev }; delete next[qIdx]; return next; });
+    }
+  }, []);
+
+  const handleOtherText = useCallback((qIdx: number, text: string) => {
+    setOtherTexts((prev) => ({ ...prev, [qIdx]: text }));
+    setAnswers((prev) => ({ ...prev, [qIdx]: '__other__' }));
+  }, []);
+
+  const handleSubmit = useCallback(() => {
+    const result: Record<string, string> = {};
+    questions.forEach((q, i) => {
+      const answer = answers[i];
+      if (answer === '__other__') {
+        result[q.question] = otherTexts[i] ?? '';
+      } else if (answer) {
+        result[q.question] = answer;
+      }
+    });
+    void app.agent.answerToolQuestion(toolCallId, result);
+    onSubmit();
+  }, [toolCallId, questions, answers, otherTexts, onSubmit]);
+
+  if (questions.length === 0) return null;
+
+  const active = questions[activeTab];
+  const hasAllAnswers = questions.every((_, i) => {
+    const a = answers[i];
+    return a && (a !== '__other__' || otherTexts[i]?.trim());
+  });
+
+  return (
+    <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 overflow-hidden">
+      {/* Tabs — only show when multiple questions */}
+      {questions.length > 1 && (
+        <div className="flex border-b border-border/30">
+          {questions.map((q, i) => {
+            const isAnswered = answers[i] && (answers[i] !== '__other__' || otherTexts[i]?.trim());
+            return (
+              <button
+                key={i}
+                type="button"
+                onClick={() => setActiveTab(i)}
+                className={`relative flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium transition-colors ${
+                  i === activeTab
+                    ? 'text-primary border-b-2 border-primary -mb-px'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-emerald-500" />}
+                {q.header}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Active question content */}
+      <div className="p-3 space-y-3">
+        <p className="text-xs font-medium text-foreground">{active.question}</p>
+
+        {/* Options */}
+        <div className="space-y-1.5">
+          {active.options.map((opt) => {
+            const isSelected = answers[activeTab] === opt.label;
+            return (
+              <button
+                key={opt.label}
+                type="button"
+                onClick={() => handleSelect(activeTab, opt.label)}
+                className={`flex w-full items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
+                  isSelected
+                    ? 'border-primary/50 bg-primary/10'
+                    : 'border-border/40 bg-card/50 hover:border-border/70 hover:bg-muted/30'
+                }`}
+              >
+                <span className={`mt-0.5 flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${
+                  isSelected
+                    ? 'border-primary bg-primary'
+                    : 'border-muted-foreground/40'
+                }`}>
+                  {isSelected && <span className="block h-1.5 w-1.5 rounded-full bg-primary-foreground" />}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <span className="text-xs font-medium text-foreground">{opt.label}</span>
+                  {opt.description && (
+                    <p className="mt-0.5 text-[11px] text-muted-foreground leading-snug">{opt.description}</p>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+
+          {/* Other option */}
+          <button
+            type="button"
+            onClick={() => handleSelect(activeTab, '__other__')}
+            className={`flex w-full items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
+              answers[activeTab] === '__other__'
+                ? 'border-primary/50 bg-primary/10'
+                : 'border-border/40 bg-card/50 hover:border-border/70 hover:bg-muted/30'
+            }`}
+          >
+            <span className={`mt-0.5 flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${
+              answers[activeTab] === '__other__'
+                ? 'border-primary bg-primary'
+                : 'border-muted-foreground/40'
+            }`}>
+              {answers[activeTab] === '__other__' && <span className="block h-1.5 w-1.5 rounded-full bg-primary-foreground" />}
+            </span>
+            <span className="text-xs font-medium text-muted-foreground">Other</span>
+          </button>
+
+          {/* Other text input */}
+          {answers[activeTab] === '__other__' && (
+            <input
+              type="text"
+              autoFocus
+              value={otherTexts[activeTab] ?? ''}
+              onChange={(e) => handleOtherText(activeTab, e.target.value)}
+              placeholder="Tell Kai what to do instead"
+              className="w-full rounded-lg border border-border/50 bg-background px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 outline-none focus:ring-1 focus:ring-primary/40"
+            />
+          )}
+        </div>
+
+        {/* Submit button */}
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={!hasAllAnswers}
+            className="rounded-lg bg-primary px-4 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            Submit answers
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -769,6 +1068,9 @@ const toolLabels: Record<string, string> = {
   sub_agent: 'Sub Agent',
   generate_image: 'Image Generation',
   generate_video: 'Video Generation',
+  ask_user: 'Question',
+  enter_plan_mode: 'Enter Plan Mode',
+  exit_plan_mode: 'Exit Plan Mode',
 };
 
 function getToolLabel(toolName: string): string {
@@ -787,6 +1089,12 @@ function getToolSummary(part: ToolCallPart): string {
   if (part.toolName === 'agent_lattice_chat') return 'Remote agent call';
   if (part.toolName === 'generate_image' && args.prompt) return String(args.prompt).slice(0, 60);
   if (part.toolName === 'generate_video' && args.prompt) return String(args.prompt).slice(0, 60);
+  if (part.toolName === 'ask_user' && Array.isArray(args.questions)) {
+    const count = (args.questions as unknown[]).length;
+    return `${count} question${count !== 1 ? 's' : ''}`;
+  }
+  if (part.toolName === 'enter_plan_mode') return (args as Record<string, unknown>).reason ? String((args as Record<string, unknown>).reason).slice(0, 60) : '';
+  if (part.toolName === 'exit_plan_mode') return (args as Record<string, unknown>).summary ? String((args as Record<string, unknown>).summary).slice(0, 60) : '';
   return '';
 }
 

@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+export const executionModeSchema = z.enum(['auto', 'plan-first', 'confirm-writes']);
+export type ExecutionMode = z.infer<typeof executionModeSchema>;
+
 const computerUseSupportSchema = z.enum([
   'openai-responses',
   'anthropic-client-tool',
@@ -380,6 +383,7 @@ export const appConfigSchema = z.object({
     fileAccess: fileAccessSchema,
     processStreaming: processStreamingSchema,
     subAgents: subAgentConfigSchema,
+    executionMode: executionModeSchema.default('auto'),
     webFetch: z.object({
       enabled: z.boolean().default(true),
     }).optional(),

@@ -11,6 +11,7 @@ import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { branding } from '../branding.config.js';
+import { resolveBranding } from './resolve-branding.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -62,7 +63,8 @@ function buildEsbuildExtraResourcesBlock(): string {
 }
 
 // Replace all {{key}} placeholders with values from branding config
-for (const [key, value] of Object.entries(branding)) {
+const resolved = resolveBranding(branding);
+for (const [key, value] of Object.entries(resolved)) {
   content = content.replaceAll(`{{${key}}}`, String(value));
 }
 

@@ -138,6 +138,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       placeholder={placeholder}
       className={className}
       autoFocus={autoFocus}
+      focusKey={conversationId}
     />
   );
 };

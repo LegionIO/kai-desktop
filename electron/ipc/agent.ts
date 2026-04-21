@@ -3,12 +3,11 @@ import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { join } from 'path';
 import { homedir } from 'os';
-import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
+import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry, type ResolvedStreamConfig } from '../agent/model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
-import { getAgentBackend, listAgentBackends, registerAgentBackend } from '../agent/backend-registry.js';
-import type { AppConfig } from '../config/schema.js';
+import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import type { ToolCompactionConfig } from '../agent/compaction.js';
@@ -22,11 +21,16 @@ import {
   type LaunchToolCallResult,
 } from '../agent/tool-observer.js';
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
-import { readConversationStore } from './conversations.js';
 import { recordUsageEvent } from './usage.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
+
+// Pending tool approval promises for confirm-writes execution mode
+const pendingToolApprovals = new Map<string, { resolve: (approved: boolean) => void }>();
+
+// Pending user answers for ask_user tool — populated by IPC handler before approval resolves
+import { pendingQuestionAnswers } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
@@ -164,14 +168,47 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): string {
+import { loadProjectInstructions, buildInstructionsPrompt } from '../agent/instructions.js';
+
+// Cache loaded instructions per cwd to avoid re-reading on every message
+const instructionsCache = new Map<string, { prompt: string; loadedAt: number }>();
+const INSTRUCTIONS_CACHE_TTL_MS = 30_000; // 30 seconds
+
+async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Promise<string> {
   if (!cwd) return basePrompt;
 
-  return [
+  const parts = [
     basePrompt,
     `Current working directory for this conversation: ${cwd}`,
     'Use this directory as the default base path for shell and filesystem work unless the user explicitly chooses another path.',
-  ].filter(Boolean).join('\n\n');
+  ];
+
+  // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
+  try {
+    const cached = instructionsCache.get(cwd);
+    const now = Date.now();
+    let instructionsPrompt: string;
+
+    if (cached && (now - cached.loadedAt) < INSTRUCTIONS_CACHE_TTL_MS) {
+      instructionsPrompt = cached.prompt;
+    } else {
+      const sources = await loadProjectInstructions(cwd);
+      instructionsPrompt = buildInstructionsPrompt(sources);
+      instructionsCache.set(cwd, { prompt: instructionsPrompt, loadedAt: now });
+
+      if (sources.length > 0) {
+        console.info(`[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`);
+      }
+    }
+
+    if (instructionsPrompt) {
+      parts.push(instructionsPrompt);
+    }
+  } catch (err) {
+    console.warn('[Instructions] Failed to load project instructions:', err);
+  }
+
+  return parts.filter(Boolean).join('\n\n');
 }
 
 function logToolCompactionDebug(stage: string, details: Record<string, unknown>): void {
@@ -257,59 +294,51 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
   registeredTools = [...nonCli, ...ensureSafeToolDefinitions(cliTools)];
 }
 
-function ensureBuiltInAgentBackends(): void {
-  registerAgentBackend({
-    key: 'mastra',
-    displayName: 'Mastra',
-    stream: (options) => {
-      if (!options.primaryModel || !options.streamConfig) {
-        return (async function* missingModelStream(): AsyncGenerator<StreamEvent> {
-          yield {
-            conversationId: options.conversationId,
-            type: 'text-delta',
-            text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
-          };
-          yield { conversationId: options.conversationId, type: 'done' };
-        })();
-      }
-
-      const dbPath = join(options.appHome, 'data', 'memory.db');
-      const configForStream: AppConfig = {
-        ...options.config,
-        systemPrompt: withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
-        advanced: {
-          ...options.config.advanced,
-          temperature: options.streamConfig.temperature,
-          maxSteps: options.streamConfig.maxSteps,
-          maxRetries: options.streamConfig.maxRetries,
-        },
+function streamMastra(options: {
+  conversationId: string;
+  messages: unknown[];
+  appHome: string;
+  config: AppConfig;
+  cwd?: string;
+  primaryModel: ModelCatalogEntry | null;
+  streamConfig: ResolvedStreamConfig | null;
+  tools: ToolDefinition[];
+  reasoningEffort?: ReasoningEffort;
+  abortSignal?: AbortSignal;
+  emitEvent?: (event: StreamEvent) => void;
+  onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => Promise<void> | void;
+  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
+  augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
+}): AsyncGenerator<StreamEvent> {
+  return (async function* (): AsyncGenerator<StreamEvent> {
+    if (!options.primaryModel || !options.streamConfig) {
+      yield {
+        conversationId: options.conversationId,
+        type: 'text-delta',
+        text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
       };
+      yield { conversationId: options.conversationId, type: 'done' };
+      return;
+    }
 
-      if (options.streamConfig.fallbackEnabled) {
-        return streamWithFallback(
-          options.conversationId,
-          options.messages,
-          options.streamConfig,
-          options.config,
-          options.tools,
-          dbPath,
-          {
-            reasoningEffort: options.reasoningEffort,
-            abortSignal: options.abortSignal,
-            cwd: options.cwd,
-            emitEvent: options.emitEvent,
-            onToolExecutionStart: options.onToolExecutionStart,
-            onToolExecutionEnd: options.onToolExecutionEnd,
-            augmentToolResult: options.augmentToolResult,
-          },
-        );
-      }
+    const dbPath = join(options.appHome, 'data', 'memory.db');
+    const configForStream: AppConfig = {
+      ...options.config,
+      systemPrompt: await withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
+      advanced: {
+        ...options.config.advanced,
+        temperature: options.streamConfig.temperature,
+        maxSteps: options.streamConfig.maxSteps,
+        maxRetries: options.streamConfig.maxRetries,
+      },
+    };
 
-      return streamAgentResponse(
+    if (options.streamConfig.fallbackEnabled) {
+      yield* streamWithFallback(
         options.conversationId,
         options.messages,
-        options.primaryModel.modelConfig,
-        configForStream,
+        options.streamConfig,
+        options.config,
         options.tools,
         dbPath,
         {
@@ -322,12 +351,30 @@ function ensureBuiltInAgentBackends(): void {
           augmentToolResult: options.augmentToolResult,
         },
       );
-    },
-  });
+      return;
+    }
+
+    yield* streamAgentResponse(
+      options.conversationId,
+      options.messages,
+      options.primaryModel.modelConfig,
+      configForStream,
+      options.tools,
+      dbPath,
+      {
+        reasoningEffort: options.reasoningEffort,
+        abortSignal: options.abortSignal,
+        cwd: options.cwd,
+        emitEvent: options.emitEvent,
+        onToolExecutionStart: options.onToolExecutionStart,
+        onToolExecutionEnd: options.onToolExecutionEnd,
+        augmentToolResult: options.augmentToolResult,
+      },
+    );
+  })();
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
-  ensureBuiltInAgentBackends();
 
   ipcMain.handle(
     'agent:stream',
@@ -340,6 +387,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       profileKey?: string,
       fallbackEnabled?: boolean,
       cwd?: string,
+      executionMode?: ExecutionMode,
     ) => {
     const effectiveCwd = cwd || homedir();
 
@@ -374,20 +422,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       fallbackEnabled: fallbackEnabled ?? false,
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
-    const requestedBackendKey = readConversationStore(appHome).conversations[conversationId]?.selectedBackendKey ?? null;
-    const requestedBackend = getAgentBackend(requestedBackendKey);
-    const defaultBackend = getAgentBackend('mastra');
-    const selectedBackend = requestedBackend && (requestedBackend.isAvailable?.() ?? true)
-      ? requestedBackend
-      : defaultBackend;
-    const resolvedBackendKey = selectedBackend?.key ?? 'mastra';
+
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
-    console.info(`[Agent:stream] conv=${conversationId} backend=${resolvedBackendKey} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
+    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
 
     // Track the model key for usage attribution
     activeStreamModelKeys.set(
       conversationId,
-      modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey ?? `backend:${resolvedBackendKey}`,
+      modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey,
     );
     for (const [index, message] of messageList.entries()) {
       const contentPreview = typeof message.content === 'string'
@@ -396,16 +438,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           ? JSON.stringify(message.content).slice(0, 200)
           : String(message.content ?? '').slice(0, 200);
       console.info(`[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${JSON.stringify(message.content ?? '').length} preview=${contentPreview}`);
-    }
-
-    if (!selectedBackend) {
-      broadcastStreamEvent({
-        conversationId,
-        type: 'error',
-        error: 'No agent backend is available for this conversation.',
-      });
-      broadcastStreamEvent({ conversationId, type: 'done' });
-      return { conversationId };
     }
 
     // Run streaming in background
@@ -917,11 +949,73 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                 broadcastStreamEvent(event);
               }
             },
-            onToolExecutionStart: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => {
+            onToolExecutionStart: async (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => {
               toolCancels.set(state.toolCallId, state.cancel);
               enqueueByToolName(pendingExecIdsByToolName, state.toolName, state.toolCallId);
               pairExecuteAndStreamToolCallIds(state.toolName);
               observer?.onToolExecutionStart(state);
+
+              // In confirm-writes mode, block mutating tools until user approves
+              const MUTATING_TOOLS = new Set(['file_write', 'file_edit', 'sh']);
+              if (executionMode === 'confirm-writes' && MUTATING_TOOLS.has(state.toolName)) {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: streamId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(streamId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                }
+              }
+
+              // Gate exit_plan_mode behind user approval regardless of execution mode
+              if (state.toolName === 'exit_plan_mode') {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: streamId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(streamId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                }
+              }
+
+              // Gate ask_user behind user response — blocks until user submits answers
+              if (state.toolName === 'ask_user') {
+                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-approval-required',
+                  toolCallId: streamId,
+                  toolName: state.toolName,
+                  args: state.args,
+                });
+                const approved = await new Promise<boolean>((resolve) => {
+                  pendingToolApprovals.set(streamId, { resolve });
+                });
+                if (!approved) {
+                  state.cancel();
+                } else {
+                  // Copy answers from stream-side ID to execute-side ID so the tool's execute() can find them
+                  const answers = pendingQuestionAnswers.get(streamId);
+                  if (answers) {
+                    pendingQuestionAnswers.set(state.toolCallId, answers);
+                    pendingQuestionAnswers.delete(streamId);
+                  }
+                }
+              }
             },
             onToolExecutionEnd: ({ toolCallId }: { toolCallId: string; toolName: string }) => {
               toolCancels.delete(toolCallId);
@@ -944,19 +1038,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             },
           };
 
-        const stream = selectedBackend.stream({
+        // Filter tools for plan-first mode (remove mutating tools as a safety net)
+        const MUTATING_TOOL_NAMES = new Set(['file_write', 'file_edit', 'sh']);
+        const activeTools = executionMode === 'plan-first'
+          ? registeredTools.filter((t) => !MUTATING_TOOL_NAMES.has(t.name))
+          : registeredTools;
+
+        // Inject execution mode into config so system prompt can be augmented
+        const configWithExecutionMode: AppConfig = {
+          ...config,
+          tools: {
+            ...config.tools,
+            executionMode: executionMode ?? 'auto',
+          },
+        };
+
+        const stream = streamMastra({
           conversationId,
           messages,
-          modelKey,
-          profileKey,
-          fallbackEnabled,
-          reasoningEffort,
           cwd: effectiveCwd,
-          config,
+          config: configWithExecutionMode,
           appHome,
           primaryModel: modelEntry,
           streamConfig,
-          tools: registeredTools,
+          tools: activeTools,
+          reasoningEffort,
           abortSignal: controller.signal,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
@@ -1050,6 +1156,35 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     return { ok: true };
   });
 
+  ipcMain.handle('agent:approve-tool', (_event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(true);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('agent:reject-tool', (_event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(false);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
+    // Store answers so the tool's execute() can read them, then approve the tool
+    pendingQuestionAnswers.set(toolCallId, answers);
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve(true);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
   ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string) => {
     let config: AppConfig;
     try {
@@ -1124,30 +1259,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     return { ids: getActiveSubAgentIds() };
   });
 
-  ipcMain.handle('agent:list-backends', async () => {
-    return listAgentBackends()
-      .filter((backend) => backend.isAvailable?.() ?? true)
-      .map((backend) => ({
-        key: backend.key,
-        displayName: backend.displayName,
-        pluginName: backend.pluginName ?? null,
-      }));
-  });
-
   // Model catalog endpoint
   ipcMain.handle('agent:model-catalog', () => {
     try {
       const config = readEffectiveConfig(appHome);
       const catalog = resolveModelCatalog(config);
       return {
-        models: catalog.entries.map((e: { key: string; displayName: string; modelConfig: { maxInputTokens?: number }; computerUseSupport?: string; visionCapable?: boolean; preferredTarget?: string }) => ({
-          key: e.key,
-          displayName: e.displayName,
-          maxInputTokens: e.modelConfig.maxInputTokens,
-          computerUseSupport: e.computerUseSupport,
-          visionCapable: e.visionCapable,
-          preferredTarget: e.preferredTarget,
-        })),
+        models: catalog.entries.map((e) => {
+          return {
+            key: e.key,
+            displayName: e.displayName,
+            maxInputTokens: e.modelConfig.maxInputTokens,
+            computerUseSupport: e.computerUseSupport,
+            visionCapable: e.visionCapable,
+            preferredTarget: e.preferredTarget,
+          };
+        }),
         defaultKey: catalog.defaultEntry?.key ?? null,
       };
     } catch {

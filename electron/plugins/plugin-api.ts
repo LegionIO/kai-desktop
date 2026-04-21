@@ -33,7 +33,6 @@ import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
-import { registerAgentBackend, unregisterAgentBackend } from '../agent/backend-registry.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 
 type PluginAPICallbacks = {
@@ -1020,24 +1019,8 @@ export function createPluginAPI(
     },
 
     agent: {
-      registerBackend: (definition) => {
-        requirePermission('agent:backend');
-        const fullDefinition = {
-          ...definition,
-          pluginName: manifest.name,
-        };
-        registerAgentBackend(fullDefinition);
-        if (!instance.registeredBackendKeys.includes(definition.key)) {
-          instance.registeredBackendKeys.push(definition.key);
-        }
-      },
-      unregisterBackend: (key: string) => {
-        requirePermission('agent:backend');
-        instance.registeredBackendKeys = instance.registeredBackendKeys.filter((backendKey) => backendKey !== key);
-        unregisterAgentBackend(key);
-      },
       generate: async (options) => {
-        requirePermission('agent:backend');
+        requirePermission('agent:generate');
         const config = callbacks.getConfig();
         const allTools = options.tools ? getRegisteredTools() : [];
         return generateForPlugin({

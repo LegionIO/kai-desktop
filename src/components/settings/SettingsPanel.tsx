@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, type FC } from 'react';
-import { XIcon, ChevronRightIcon } from 'lucide-react';
+import { ChevronRightIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { EditableTextarea } from '@/components/EditableTextarea';
 import { EditableInput } from '@/components/EditableInput';
@@ -95,15 +95,8 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   }
 
   return (
-    <div className="flex h-full flex-col bg-background md:flex-row">
+    <div className="flex h-full flex-col bg-background pt-12 md:flex-row md:pt-14">
       <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
-        <div className="flex items-center justify-between px-4 py-2 md:mb-3 md:px-2 md:py-1.5">
-          <span className="text-xs font-semibold uppercase tracking-[0.16em]">Settings</span>
-          <button type="button" onClick={onClose} className="rounded-xl p-1.5 transition-colors hover:bg-muted">
-            <XIcon className="h-4 w-4" />
-          </button>
-        </div>
-
         <div className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
           {sections.map((section) => (
             <button

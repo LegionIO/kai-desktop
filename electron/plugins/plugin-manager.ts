@@ -34,7 +34,6 @@ import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
-import { unregisterAgentBackend, unregisterAgentBackendsForPlugin } from '../agent/backend-registry.js';
 import { buildPluginRendererBundle, resolvePluginRendererRequest } from './renderer-build.js';
 
 const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
@@ -55,7 +54,7 @@ const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
   'conversations:write': 'Create or update conversation data',
   'navigation:open': 'Request in-app navigation actions',
   'state:publish': 'Publish plugin state and live events to the renderer',
-  'agent:backend': 'Register alternate agent backends',
+  'agent:generate': 'Generate AI responses via the agent',
   'safe-storage': 'Access encrypted safe storage',
   'browser:window': 'Open browser windows',
 };
@@ -332,7 +331,6 @@ export class PluginManager {
       state: 'loading',
       module: null,
       registeredTools: [],
-      registeredBackendKeys: [],
       preSendHooks: [],
       postReceiveHooks: [],
       uiBanners: [],
@@ -449,8 +447,6 @@ export class PluginManager {
       } catch (err) {
         console.error(`[PluginManager] Error deactivating plugin "${name}":`, err);
       }
-
-      unregisterAgentBackendsForPlugin(name);
     }
 
     for (const timer of this.notificationTimers.values()) {
@@ -835,15 +831,6 @@ export class PluginManager {
     };
     this.clearNotificationTimer(pluginName, id);
     this.broadcastUIState();
-  }
-
-  /* ── Agent Backends ── */
-
-  unregisterPluginBackend(pluginName: string, key: string): void {
-    const instance = this.plugins.get(pluginName);
-    if (!instance) return;
-    instance.registeredBackendKeys = instance.registeredBackendKeys.filter((backendKey) => backendKey !== key);
-    unregisterAgentBackend(key);
   }
 
   /* ── Conversation Helpers ── */

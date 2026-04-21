@@ -23,10 +23,11 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   BanIcon,
-  CpuIcon,
+
   Volume2Icon,
   SquareIcon,
   MicIcon,
+  PointerIcon,
   ChevronUpIcon,
   PhoneIcon,
   MonitorIcon,
@@ -45,6 +46,7 @@ import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
+import { backgrounds } from '@/components/backgrounds';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
@@ -59,16 +61,17 @@ import { ModelSettingsButton } from './ModelSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
+import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
+import type { ExecutionMode } from './ModelSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
-const MATRIX_GLYPHS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*+-/~{[|`]}<>01';
 
 export type ThreadMode = 'chat' | 'computer';
 
@@ -79,15 +82,24 @@ export const Thread: FC<{
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
+  executionMode: ExecutionMode;
+  onChangeExecutionMode: (value: ExecutionMode) => void;
   selectedProfileKey: string | null;
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
   const activeConversationId = useActiveConversationId();
+  const threadRuntime = useThreadRuntime();
+  const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
+  useEffect(() => {
+    return threadRuntime.subscribe(() => {
+      setHasMessages(threadRuntime.getState().messages.length > 0);
+    });
+  }, [threadRuntime]);
   const { uiState: pluginUIState } = usePlugins();
   const threadDecorations = (pluginUIState?.threadDecorations ?? []).filter((decoration) => (
     decoration.visible && (!decoration.conversationId || decoration.conversationId === activeConversationId)
@@ -100,7 +112,10 @@ export const Thread: FC<{
   }, []);
 
   return (
-    <ThreadPrimitive.Root className="flex h-full min-h-0 flex-col overflow-hidden">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col overflow-hidden">
+      <FadingSplash>
+        <EmptyThreadBackground />
+      </FadingSplash>
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
       <FallbackBanner />
       <ComputerUseFallbackBanner />
@@ -128,39 +143,64 @@ export const Thread: FC<{
       )}
       {mode === 'chat' ? (
         <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
-          <ThreadPrimitive.Empty>
-            <EmptyThreadBackground />
-          </ThreadPrimitive.Empty>
-          <ThreadWelcome />
-          <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pt-4 md:px-6 md:pt-8">
-            <ThreadPrimitive.Messages
-              components={{
-                UserMessage,
-                AssistantMessage,
-              }}
-            />
+          <div className="flex min-h-full flex-col">
+            <div className="flex-1">
+              <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
+                <ThreadPrimitive.Messages
+                  components={{
+                    UserMessage,
+                    AssistantMessage,
+                  }}
+                />
 
-            <div className="min-h-8" />
+                <div className="min-h-2" />
+              </div>
+            </div>
+            <div className="sticky bottom-0 z-20">
+              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-48 bg-gradient-to-t from-background from-40% to-transparent md:h-56" />}
+            {callState.isInCall ? (
+              <CallOverlay />
+            ) : (
+              <Composer
+                mode={mode}
+                onChangeMode={onChangeMode}
+                selectedModelKey={selectedModelKey}
+                onSelectModel={onSelectModel}
+                reasoningEffort={reasoningEffort}
+                onChangeReasoningEffort={onChangeReasoningEffort}
+                executionMode={executionMode}
+                onChangeExecutionMode={onChangeExecutionMode}
+                selectedProfileKey={selectedProfileKey}
+                onSelectProfile={onSelectProfile}
+                fallbackEnabled={fallbackEnabled}
+                onToggleFallback={onToggleFallback}
+              />
+            )}
+          </div>
           </div>
         </ThreadPrimitive.Viewport>
       ) : (
-        <ComputerTabSurface />
-      )}
-      {callState.isInCall ? (
-        <CallOverlay />
-      ) : (
-        <Composer
-          mode={mode}
-          onChangeMode={onChangeMode}
-          selectedModelKey={selectedModelKey}
-          onSelectModel={onSelectModel}
-          reasoningEffort={reasoningEffort}
-          onChangeReasoningEffort={onChangeReasoningEffort}
-          selectedProfileKey={selectedProfileKey}
-          onSelectProfile={onSelectProfile}
-          fallbackEnabled={fallbackEnabled}
-          onToggleFallback={onToggleFallback}
-        />
+        <>
+          <ComputerTabSurface />
+          {callState.isInCall ? (
+            <CallOverlay />
+          ) : (
+            <Composer
+              mode={mode}
+              onChangeMode={onChangeMode}
+              selectedModelKey={selectedModelKey}
+              onSelectModel={onSelectModel}
+              reasoningEffort={reasoningEffort}
+              onChangeReasoningEffort={onChangeReasoningEffort}
+              executionMode={executionMode}
+              onChangeExecutionMode={onChangeExecutionMode}
+              selectedProfileKey={selectedProfileKey}
+              onSelectProfile={onSelectProfile}
+              fallbackEnabled={fallbackEnabled}
+              onToggleFallback={onToggleFallback}
+            />
+          )}
+        </>
       )}
     </ThreadPrimitive.Root>
   );
@@ -366,7 +406,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   };
 
   return (
-    <div className="rounded-[1.7rem] border border-border/70 bg-card/78 px-3 py-3 app-composer-shadow">
+    <div className="rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
       <div className="flex items-center gap-2">
         <RichChatInput
           value={text}
@@ -397,685 +437,115 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   );
 };
 
-const ThreadWelcome: FC = () => {
-  const threadRuntime = useThreadRuntime();
-  const gradientText = __BRAND_THEME_GRADIENT_TEXT !== 'false';
+/** Pick a random background, never repeating the last one shown */
+function pickBackground(): FC {
+  const lastIndex = parseInt(sessionStorage.getItem('__bg_last_index') ?? '-1', 10);
+  const available = backgrounds.length > 1
+    ? backgrounds.filter((_, i) => i !== lastIndex)
+    : backgrounds;
+  return available[Math.floor(Math.random() * available.length)];
+}
 
-  const handleSuggestion = useCallback((text: string) => {
-    threadRuntime.append({
-      role: 'user',
-      content: [{ type: 'text', text }],
-    });
-  }, [threadRuntime]);
+/**
+ * Randomly selected background for the empty thread state.
+ * Never repeats the same background consecutively.
+ *
+ * Background is selected once on mount via useState initializer.
+ * FadingSplash unmounts children when fading out (visible=false),
+ * so each new empty thread triggers a fresh mount and a new pick.
+ *
+ * The last-shown index is persisted in sessionStorage so it survives
+ * HMR and component remounts. The write happens in a useEffect (not during
+ * pick) to avoid React StrictMode double-invocation issues.
+ */
+const EmptyThreadBackground: FC = () => {
+  const [Background] = useState<FC>(() => pickBackground());
+
+  // Persist which background is displayed — useEffect only commits once,
+  // unlike useState initializers which StrictMode may call twice.
+  useEffect(() => {
+    const idx = backgrounds.indexOf(Background);
+    if (idx !== -1) sessionStorage.setItem('__bg_last_index', String(idx));
+  }, [Background]);
 
   return (
-    <ThreadPrimitive.Empty>
-      <div className="absolute inset-0 z-20 flex flex-col overflow-y-auto px-3 py-4 md:px-6 md:py-8">
-        <div className="m-auto flex w-full max-w-2xl select-none flex-col items-center">
-          <div className="mb-3 inline-flex items-center gap-0.5 text-2xl font-semibold md:text-4xl">
-            <span className={`app-wordmark ${gradientText ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
-            <CpuIcon className="h-6 w-6 text-primary/80 md:h-9 md:w-9" />
-          </div>
-          <p className="max-w-xl text-center text-sm text-muted-foreground">
-            Your local neural workspace for coding, tooling, and system automation.
-          </p>
-          <div className="mt-8 grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
-            {['List files in my home directory', 'Search for TODO comments in my code', 'Help me write a shell script', 'Explain a file in my project'].map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => handleSuggestion(s)}
-                className="rounded-2xl border border-border/70 bg-card/45 px-4 py-3 text-left text-xs transition-colors hover:bg-accent/70"
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    </ThreadPrimitive.Empty>
+    <div className="absolute inset-0">
+      <Background />
+    </div>
   );
 };
 
-/** Build-time-configured background for the empty thread state */
-const EmptyThreadBackground: FC = () => {
-  const background = __BRAND_THEME_BACKGROUND || 'matrix-rain';
+/**
+ * Wrapper that fades the splash IN (500ms) when the thread is empty,
+ * then fades it OUT (300ms) when the first message is sent.
+ *
+ * When `visible` is false, children are unmounted (returned null).
+ * This means EmptyThreadBackground remounts on each new empty thread,
+ * triggering a fresh pickBackground() via its useState initializer.
+ */
+const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
+  const threadRuntime = useThreadRuntime();
+  const [visible, setVisible] = useState(true);
+  const [fadingOut, setFadingOut] = useState(false);
+  const [fadedIn, setFadedIn] = useState(false);
+  const fadingOutRef = useRef(false);
 
-  if (background === 'none') return null;
-  if (background === 'gradient') return <GradientBackground />;
-  if (background === 'constellation') return <ConstellationBackground />;
-  return <MatrixRainBackground />;
-};
-
-/** Subtle radial gradient alternative to the matrix rain */
-const GradientBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse 70% 50% at 50% 30%, var(--app-shell-glow), transparent)' }} />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at 30% 70%, var(--brand-accent-subtle), transparent 50%)' }} />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-  </div>
-);
-
-const MatrixRainBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <canvas ref={useMatrixCanvas()} className="absolute inset-0 h-full w-full opacity-45" />
-    <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-    <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
-    <div className="absolute inset-y-0 right-0 w-28 bg-gradient-to-l from-background via-background/85 to-transparent" />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at center, var(--brand-accent-subtle), transparent 58%)' }} />
-  </div>
-);
-
-function useMatrixCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
+  // Reset visibility when threadRuntime identity changes (thread switch)
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const context = canvas.getContext('2d');
-    if (!context) return;
-
-    let frameId = 0;
-    let animationFrame = 0;
-    let drops: number[] = [];
-    let columnCount = 0;
-    const fontSize = 14;
-
-    const setup = () => {
-      const parent = canvas.parentElement;
-      const width = parent?.clientWidth ?? window.innerWidth;
-      const height = parent?.clientHeight ?? window.innerHeight;
-      const devicePixelRatio = window.devicePixelRatio || 1;
-
-      canvas.width = Math.floor(width * devicePixelRatio);
-      canvas.height = Math.floor(height * devicePixelRatio);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.scale(devicePixelRatio, devicePixelRatio);
-
-      columnCount = Math.ceil(width / fontSize);
-      drops = Array.from({ length: columnCount }, () => 1);
-    };
-
-    const draw = () => {
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      const styles = getComputedStyle(document.documentElement);
-
-      context.fillStyle = styles.getPropertyValue('--app-matrix-fade').trim() || 'rgba(10, 10, 10, 0.08)';
-      context.fillRect(0, 0, width, height);
-
-      context.fillStyle = styles.getPropertyValue('--app-matrix-glyph').trim() || 'rgba(160, 160, 160, 0.7)';
-      context.font = `${fontSize}px Monaco, "Cascadia Code", monospace`;
-
-      for (let index = 0; index < drops.length; index += 1) {
-        const glyph = MATRIX_GLYPHS[Math.floor(Math.random() * MATRIX_GLYPHS.length)];
-        const x = index * fontSize;
-        const y = drops[index] * fontSize;
-
-        context.fillText(glyph, x, y);
-
-        if (y > height && Math.random() > 0.975) {
-          drops[index] = 0;
-        }
-
-        drops[index] += 1;
-      }
-
-      frameId = window.setTimeout(() => {
-        animationFrame = window.requestAnimationFrame(draw);
-      }, 130);
-    };
-
-    const stop = () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
-    };
-
-    const start = () => {
-      stop();
-      draw();
-    };
-
-    setup();
-    start();
-
-    const handleResize = () => { stop(); setup(); start(); };
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') stop(); else start();
-    };
-    const handleBlur = () => stop();
-    const handleFocus = () => start();
-
-    window.addEventListener('resize', handleResize);
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      stop();
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
-    };
-  }, []);
-
-  return canvasRef;
-}
-
-const ConstellationBackground: FC = () => (
-  <div
-    aria-hidden="true"
-    className="pointer-events-none absolute inset-0 overflow-hidden"
-  >
-    <canvas ref={useConstellationCanvas()} className="absolute inset-0 h-full w-full" />
-    <div className="absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-background via-background/70 to-transparent" />
-    <div className="absolute inset-x-0 bottom-0 h-28 bg-gradient-to-t from-background via-background/75 to-transparent" />
-    <div className="absolute inset-y-0 left-0 w-28 bg-gradient-to-r from-background via-background/85 to-transparent" />
-    <div className="absolute inset-y-0 right-0 w-28 bg-gradient-to-l from-background via-background/85 to-transparent" />
-    <div className="absolute inset-0" style={{ background: 'radial-gradient(circle at center, var(--brand-accent-subtle), transparent 58%)' }} />
-  </div>
-);
-
-interface Particle {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  radius: number;
-  opacity: number;
-  /** false = background star (twinkles, never connects) */
-  connectable: boolean;
-  /** Number of spikes on the star shape (3–6) */
-  spikes: number;
-  /** Rotation angle in radians — slowly drifts */
-  rotation: number;
-  /** Twinkle phase offset (radians) — used for blinking stars */
-  twinklePhase: number;
-  /** Ticks until next random velocity nudge */
-  nudgeCountdown: number;
-}
-
-/** Draw a spiked star: prominent circle body with thin needle spikes protruding outward */
-function drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, spikes: number, size: number, rotation: number) {
-  const bodyRadius = size * 0.7;
-  const spikeLength = size * 1.8;
-  const spikeHalfWidth = Math.PI * 0.06; /* narrow spike base */
-
-  /* Draw circle body */
-  ctx.beginPath();
-  ctx.arc(cx, cy, bodyRadius, 0, Math.PI * 2);
-  ctx.fill();
-
-  /* Draw each spike as a thin triangle from the circle edge outward */
-  for (let i = 0; i < spikes; i += 1) {
-    const angle = rotation + (i * Math.PI * 2) / spikes;
-    const tipX = cx + Math.cos(angle) * spikeLength;
-    const tipY = cy + Math.sin(angle) * spikeLength;
-    const baseX1 = cx + Math.cos(angle - spikeHalfWidth) * bodyRadius;
-    const baseY1 = cy + Math.sin(angle - spikeHalfWidth) * bodyRadius;
-    const baseX2 = cx + Math.cos(angle + spikeHalfWidth) * bodyRadius;
-    const baseY2 = cy + Math.sin(angle + spikeHalfWidth) * bodyRadius;
-
-    ctx.beginPath();
-    ctx.moveTo(baseX1, baseY1);
-    ctx.lineTo(tipX, tipY);
-    ctx.lineTo(baseX2, baseY2);
-    ctx.closePath();
-    ctx.fill();
-  }
-}
-
-function useConstellationCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const context = canvas.getContext('2d');
-    if (!context) return;
-
-    let frameId = 0;
-    let animationFrame = 0;
-    let particles: Particle[] = [];
-    let tick = 0;
-
-    const nodeCount = 35;
-    const starCount = 1200;
-    const totalCount = nodeCount + starCount;
-    const connectionDistance = 160;
-    const maxConnectionsPerNode = 3;
-    const nodeSpeed = 0.35;
-    const starSpeed = 0.06;
-
-    /**
-     * Persistent connection state. Keys are "i:j" (lower index first).
-     * `strength` lerps toward 1 when in range, toward 0 when out of range.
-     * Connections are removed once strength drops below 0.02.
-     */
-    const connections = new Map<string, { strength: number }>();
-    const fadeInRate = 0.04;   /* frames to reach full opacity: ~25 */
-    const fadeOutRate = 0.02;  /* frames to disappear: ~50 */
-
-    /** Shooting star state */
-    interface ShootingStar {
-      x: number; y: number;
-      vx: number; vy: number;
-      life: number;      /* frames remaining */
-      maxLife: number;    /* total lifespan */
-      tailLength: number; /* px */
+    const msgs = threadRuntime.getState().messages;
+    if (msgs.length === 0) {
+      setVisible(true);
+      setFadingOut(false);
+      fadingOutRef.current = false;
+      setFadedIn(false);
+      // Double RAF: first frame paints at opacity:0, second frame triggers the transition
+      requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
+    } else {
+      setVisible(false);
+      setFadingOut(true);
+      fadingOutRef.current = true;
     }
-    let shootingStar: ShootingStar | null = null;
-    const shootingStarChance = 0.003; /* ~0.3% per frame ≈ one every ~20s */
-    const shootingStarFrames = 38;    /* ~2.5s at 65ms/frame */
+  }, [threadRuntime]);
 
-    const makeParticle = (width: number, height: number, connectable: boolean): Particle => ({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      vx: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
-      vy: (Math.random() - 0.5) * (connectable ? nodeSpeed : starSpeed) * 2,
-      radius: connectable ? 2.5 + Math.random() * 2.5 : 1.2 + Math.random() * 2,
-      opacity: connectable ? 0.6 + Math.random() * 0.35 : 0.3 + Math.random() * 0.6,
-      connectable,
-      spikes: 3 + Math.floor(Math.random() * 4),
-      rotation: Math.random() * Math.PI * 2,
-      twinklePhase: Math.random() * Math.PI * 2,
-      nudgeCountdown: 60 + Math.floor(Math.random() * 200),
+  // Subscribe to message changes — fade out when messages appear,
+  // fade in when messages go back to empty.
+  useEffect(() => {
+    return threadRuntime.subscribe(() => {
+      const msgs = threadRuntime.getState().messages;
+      if (msgs.length > 0 && !fadingOutRef.current) {
+        setFadingOut(true);
+        fadingOutRef.current = true;
+      } else if (msgs.length === 0) {
+        setVisible(true);
+        setFadingOut(false);
+        fadingOutRef.current = false;
+        setFadedIn(false);
+        requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
+      }
     });
+  }, [threadRuntime]);
 
-    let prevWidth = 0;
-    let prevHeight = 0;
+  // Unmount children after fade-out completes
+  useEffect(() => {
+    if (!fadingOut) return;
+    const timer = setTimeout(() => setVisible(false), 300);
+    return () => clearTimeout(timer);
+  }, [fadingOut]);
 
-    const setup = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
-      const dpr = window.devicePixelRatio || 1;
+  if (!visible) return null;
 
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-
-      context.setTransform(1, 0, 0, 1, 0, 0);
-      context.scale(dpr, dpr);
-
-      // When the canvas grows, rescale existing particle positions so they
-      // spread across the full area instead of staying clumped in the old region.
-      if (prevWidth > 0 && prevHeight > 0 && (width > prevWidth || height > prevHeight)) {
-        const sx = width / prevWidth;
-        const sy = height / prevHeight;
-        for (const p of particles) {
-          p.x *= sx;
-          p.y *= sy;
-        }
-      }
-
-      prevWidth = width;
-      prevHeight = height;
-
-      const kept = particles.filter(
-        (p) => p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height,
-      );
-      const keptNodes = kept.filter((p) => p.connectable);
-      const keptStars = kept.filter((p) => !p.connectable);
-
-      const freshNodes = Array.from(
-        { length: Math.max(0, nodeCount - keptNodes.length) },
-        () => makeParticle(width, height, true),
-      );
-      const freshStars = Array.from(
-        { length: Math.max(0, starCount - keptStars.length) },
-        () => makeParticle(width, height, false),
-      );
-
-      particles = [...keptNodes, ...freshNodes, ...keptStars, ...freshStars];
-    };
-
-    const draw = () => {
-      const container = canvas.parentElement;
-      const width = container?.offsetWidth ?? window.innerWidth;
-      const height = container?.offsetHeight ?? window.innerHeight;
-      const dpr = window.devicePixelRatio || 1;
-
-      /* If the container grew beyond the canvas buffer, resize immediately
-         so the full area is rendered without waiting for a resize event. */
-      const needW = Math.floor(width * dpr);
-      const needH = Math.floor(height * dpr);
-      if (canvas.width < needW || canvas.height < needH) {
-        canvas.width = needW;
-        canvas.height = needH;
-        canvas.style.width = `${width}px`;
-        canvas.style.height = `${height}px`;
-        context.setTransform(1, 0, 0, 1, 0, 0);
-        context.scale(dpr, dpr);
-      }
-
-      const styles = getComputedStyle(document.documentElement);
-      tick += 1;
-
-      const dotColor = styles.getPropertyValue('--app-constellation-dot').trim() || 'rgba(160, 160, 160, 0.5)';
-      const lineColor = styles.getPropertyValue('--app-constellation-line').trim() || 'rgba(160, 160, 160, 0.18)';
-
-      /* Clear frame completely — no motion trails */
-      context.globalAlpha = 1;
-      context.clearRect(0, 0, width, height);
-
-      /* Update positions + nudge velocities for organic movement */
-      for (const p of particles) {
-        p.x += p.vx;
-        p.y += p.vy;
-
-        if (p.x < 0 || p.x > width) p.vx *= -1;
-        if (p.y < 0 || p.y > height) p.vy *= -1;
-        p.x = Math.max(0, Math.min(width, p.x));
-        p.y = Math.max(0, Math.min(height, p.y));
-
-        /* Random velocity nudges — keeps constellations reshaping */
-        p.nudgeCountdown -= 1;
-        if (p.nudgeCountdown <= 0) {
-          const cap = p.connectable ? nodeSpeed : starSpeed;
-          p.vx += (Math.random() - 0.5) * cap * 1.2;
-          p.vy += (Math.random() - 0.5) * cap * 1.2;
-          /* Clamp speed */
-          const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
-          if (speed > cap) {
-            p.vx = (p.vx / speed) * cap;
-            p.vy = (p.vy / speed) * cap;
-          }
-          p.nudgeCountdown = 60 + Math.floor(Math.random() * 200);
-        }
-
-        /* Slow rotation drift */
-        p.rotation += p.connectable ? 0.003 : 0.006;
-
-        /* Randomly promote stars to connectors or demote connectors to stars.
-           ~0.1% chance per frame keeps the network evolving unpredictably. */
-        if (Math.random() < 0.001) {
-          p.connectable = !p.connectable;
-          if (p.connectable) {
-            /* Promoted: grow slightly, speed up */
-            p.radius = 2.5 + Math.random() * 2.5;
-            const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy) || 0.01;
-            const scale = nodeSpeed / Math.max(speed, 0.01);
-            p.vx *= scale;
-            p.vy *= scale;
-          } else {
-            /* Demoted: shrink, slow down */
-            p.radius = 1.2 + Math.random() * 2;
-            p.vx *= 0.2;
-            p.vy *= 0.2;
-          }
-        }
-      }
-
-      /* ── Update persistent connections ──────────────────────────────────
-         Build a set of in-range pairs, fade existing connections in/out,
-         and probabilistically form new ones. */
-      const inRangePairs = new Set<string>();
-      const connectionCounts = new Uint8Array(totalCount);
-
-      /* Count existing strong connections toward the cap */
-      for (const [key, conn] of connections) {
-        if (conn.strength < 0.3) continue;
-        const [a, b] = key.split(':').map(Number);
-        connectionCounts[a] += 1;
-        connectionCounts[b] += 1;
-      }
-
-      for (let i = 0; i < particles.length; i += 1) {
-        if (connectionCounts[i] >= maxConnectionsPerNode) continue;
-
-        for (let j = i + 1; j < particles.length; j += 1) {
-          if (connectionCounts[j] >= maxConnectionsPerNode) continue;
-          if (!particles[i].connectable && !particles[j].connectable) continue;
-
-          const dx = particles[i].x - particles[j].x;
-          const dy = particles[i].y - particles[j].y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          if (dist < connectionDistance) {
-            const key = `${i}:${j}`;
-            inRangePairs.add(key);
-
-            if (!connections.has(key)) {
-              /* New connection — probabilistic formation */
-              const proximity = 1 - dist / connectionDistance;
-              let chance = 0.008 + proximity * 0.015; /* slow: ~1-2% per frame */
-              if (!particles[i].connectable || !particles[j].connectable) chance *= 0.5;
-              if (Math.random() < chance) {
-                connections.set(key, { strength: 0.05 });
-                connectionCounts[i] += 1;
-                connectionCounts[j] += 1;
-              }
-            }
-          }
-        }
-      }
-
-      /* Fade connections in/out, detect loops, and draw */
-
-      /* First pass: build adjacency from strong connections for loop detection */
-      const neighbors = new Map<number, Set<number>>();
-      const activeEdges: Array<{ key: string; conn: { strength: number }; a: number; b: number }> = [];
-
-      for (const [key, conn] of connections) {
-        if (inRangePairs.has(key)) {
-          conn.strength = Math.min(1, conn.strength + fadeInRate);
-        } else {
-          conn.strength -= fadeOutRate;
-        }
-
-        if (conn.strength <= 0.02) {
-          connections.delete(key);
-          continue;
-        }
-
-        const [a, b] = key.split(':').map(Number);
-        if (!particles[a] || !particles[b]) { connections.delete(key); continue; }
-
-        activeEdges.push({ key, conn, a, b });
-
-        if (conn.strength > 0.3) {
-          if (!neighbors.has(a)) neighbors.set(a, new Set());
-          if (!neighbors.has(b)) neighbors.set(b, new Set());
-          neighbors.get(a)!.add(b);
-          neighbors.get(b)!.add(a);
-        }
-      }
-
-      /* Detect edges that are part of a triangle (3-node loop) */
-      const loopEdges = new Set<string>();
-      for (const { key, a, b } of activeEdges) {
-        const aN = neighbors.get(a);
-        const bN = neighbors.get(b);
-        if (!aN || !bN) continue;
-        /* If a and b share a common neighbor, this edge is part of a triangle */
-        for (const n of aN) {
-          if (n !== b && bN.has(n)) {
-            loopEdges.add(key);
-            /* Also mark the other two edges of the triangle */
-            const minAn = Math.min(a, n);
-            const maxAn = Math.max(a, n);
-            const minBn = Math.min(b, n);
-            const maxBn = Math.max(b, n);
-            loopEdges.add(`${minAn}:${maxAn}`);
-            loopEdges.add(`${minBn}:${maxBn}`);
-            break;
-          }
-        }
-      }
-
-      /* Draw edges */
-      const pulse = 0.7 + 0.3 * Math.sin(tick * 0.08); /* slow pulsate for loop edges */
-      for (const { key, conn, a, b } of activeEdges) {
-        const pi = particles[a];
-        const pj = particles[b];
-        const dx = pi.x - pj.x;
-        const dy = pi.y - pj.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const distAlpha = dist < connectionDistance ? 1 - dist / connectionDistance : 0.3;
-        const isLoop = loopEdges.has(key);
-
-        context.globalAlpha = conn.strength * distAlpha * (isLoop ? pulse : 1);
-        context.strokeStyle = lineColor;
-        context.lineWidth = isLoop ? 2 : 1.2;
-        context.beginPath();
-        context.moveTo(pi.x, pi.y);
-        context.lineTo(pj.x, pj.y);
-        context.stroke();
-      }
-
-      /* Draw all particles as star shapes */
-      context.fillStyle = dotColor;
-      for (const p of particles) {
-        let alpha = p.opacity;
-
-        if (!p.connectable) {
-          /* Stars twinkle with a slow sine wave */
-          const twinkle = Math.sin(tick * 0.04 + p.twinklePhase);
-          alpha = p.opacity * (0.3 + 0.7 * ((twinkle + 1) / 2));
-        }
-
-        context.globalAlpha = alpha;
-        drawStar(context, p.x, p.y, p.spikes, p.radius, p.rotation);
-        context.fill();
-      }
-
-      /* ── Shooting star ──────────────────────────────────────────────────
-         Randomly spawns from a random edge, streaks across at a random
-         angle, fades in then out over ~2.5s, then disappears. */
-      if (!shootingStar && Math.random() < shootingStarChance) {
-        const edge = Math.floor(Math.random() * 4); /* 0=top 1=right 2=bottom 3=left */
-        let sx: number, sy: number;
-        if (edge === 0)      { sx = Math.random() * width;  sy = 0; }
-        else if (edge === 1) { sx = width;                   sy = Math.random() * height; }
-        else if (edge === 2) { sx = Math.random() * width;  sy = height; }
-        else                 { sx = 0;                       sy = Math.random() * height; }
-
-        /* Aim roughly toward center with some randomness */
-        const targetX = width * (0.3 + Math.random() * 0.4);
-        const targetY = height * (0.3 + Math.random() * 0.4);
-        const angle = Math.atan2(targetY - sy, targetX - sx) + (Math.random() - 0.5) * 0.6;
-        const speed = 12 + Math.random() * 8; /* fast! */
-
-        shootingStar = {
-          x: sx, y: sy,
-          vx: Math.cos(angle) * speed,
-          vy: Math.sin(angle) * speed,
-          life: shootingStarFrames,
-          maxLife: shootingStarFrames,
-          tailLength: 60 + Math.random() * 40,
-        };
-      }
-
-      if (shootingStar) {
-        const s = shootingStar;
-        s.x += s.vx;
-        s.y += s.vy;
-        s.life -= 1;
-
-        /* Fade in for first 20%, full brightness middle 60%, fade out last 20% */
-        const progress = 1 - s.life / s.maxLife;
-        let alpha: number;
-        if (progress < 0.2) alpha = progress / 0.2;
-        else if (progress > 0.8) alpha = (1 - progress) / 0.2;
-        else alpha = 1;
-
-        /* Draw tail (gradient line from current pos backward along velocity) */
-        const tailX = s.x - (s.vx / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
-        const tailY = s.y - (s.vy / Math.sqrt(s.vx * s.vx + s.vy * s.vy)) * s.tailLength;
-
-        const grad = context.createLinearGradient(tailX, tailY, s.x, s.y);
-        grad.addColorStop(0, 'transparent');
-        grad.addColorStop(1, dotColor);
-
-        context.globalAlpha = alpha * 0.9;
-        context.strokeStyle = grad;
-        context.lineWidth = 2;
-        context.beginPath();
-        context.moveTo(tailX, tailY);
-        context.lineTo(s.x, s.y);
-        context.stroke();
-
-        /* Bright head dot */
-        context.globalAlpha = alpha;
-        context.fillStyle = dotColor;
-        context.beginPath();
-        context.arc(s.x, s.y, 2.5, 0, Math.PI * 2);
-        context.fill();
-
-        /* Remove when expired or off-screen */
-        if (s.life <= 0 || s.x < -100 || s.x > width + 100 || s.y < -100 || s.y > height + 100) {
-          shootingStar = null;
-        }
-      }
-
-      context.globalAlpha = 1;
-
-      frameId = window.setTimeout(() => {
-        animationFrame = window.requestAnimationFrame(draw);
-      }, 130);
-    };
-
-    const stop = () => {
-      window.clearTimeout(frameId);
-      window.cancelAnimationFrame(animationFrame);
-    };
-
-    const start = () => {
-      stop();
-      draw();
-    };
-
-    setup();
-    start();
-
-    const handleResize = () => { stop(); setup(); start(); };
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') stop(); else start();
-    };
-    const handleBlur = () => stop();
-    const handleFocus = () => start();
-
-    // Use ResizeObserver on the container so the canvas is correctly sized
-    // on first layout (Electron may render before the window is fully sized).
-    const container = canvas.parentElement;
-    let ro: ResizeObserver | undefined;
-    if (container) {
-      ro = new ResizeObserver(handleResize);
-      ro.observe(container);
-    }
-
-    window.addEventListener('resize', handleResize);
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      stop();
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
-      ro?.disconnect();
-    };
-  }, []);
-
-  return canvasRef;
-}
+  return (
+    <div
+      className="absolute inset-0 bottom-3 z-10 transition-opacity ease-out"
+      style={{
+        opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
+        transitionDuration: fadingOut ? '300ms' : '2000ms',
+      }}
+    >
+      <div>{children}</div>
+    </div>
+  );
+};
 
 const UserMessage: FC = () => {
   const message = useMessage();
@@ -1087,7 +557,7 @@ const UserMessage: FC = () => {
     <MessagePrimitive.Root className="group mb-6 flex justify-end">
       <div className="max-w-[88%] md:max-w-[72%]">
         <div
-          className="rounded-xl border px-4 py-2.5 text-foreground"
+          className="w-fit ml-auto rounded-xl border px-4 py-2.5 text-foreground"
           style={{
             backgroundColor: 'var(--app-user-bubble)',
             borderColor: 'var(--app-user-bubble-border)',
@@ -1237,6 +707,8 @@ const ToolFallback: FC<{
     truncated?: boolean;
     stopped?: boolean;
   };
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
+  approvalId?: string;
 }> = (props) => {
   const hasResult = props.result !== undefined;
   const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
@@ -1248,6 +720,14 @@ const ToolFallback: FC<{
     : isError
       ? 'bg-red-500'
       : 'bg-emerald-500';
+
+  const threadRuntime = useThreadRuntime();
+  const handleSendFeedback = useCallback((text: string) => {
+    threadRuntime.append({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    });
+  }, [threadRuntime]);
 
   // Render sub-agent tool calls with the specialized component
   if (props.toolName === 'sub_agent') {
@@ -1283,7 +763,10 @@ const ToolFallback: FC<{
           compactionMeta: props.compactionMeta,
           compactionPhase: props.compactionPhase,
           liveOutput: props.liveOutput,
+          approvalStatus: props.approvalStatus,
+          approvalId: props.approvalId,
         }}
+        onSendFeedback={handleSendFeedback}
       />
     </div>
   );
@@ -1947,36 +1430,41 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
   }, [error]);
 
   const isActive = isListening;
+  const { expanded: dictationExpanded, containerProps: dictationContainerProps } = useSplitButtonHover({ popoverOpen: pickerOpen, forceExpanded: isActive || isActivating });
 
   return (
-    <div ref={rootRef} className="relative flex items-center">
+    <div ref={rootRef} {...dictationContainerProps} className="relative flex items-center">
       {/* Joined button group: chevron/dots + mic */}
       <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
         isActive
           ? 'border-primary/50 bg-primary/10'
           : isActivating
             ? 'border-primary/30 bg-primary/5'
-            : 'border-border/70 bg-card/70'
+            : 'border-border/50 bg-muted/40'
       }`}>
         {/* Left segment: chevron (idle) or animated dots (active) */}
-        {isActive || isActivating ? (
-            <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
-              <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
-            </div>
-          ) : (
-            <Tooltip content="Microphone settings" side="top" sideOffset={8}>
-              <button
-                type="button"
-                onClick={() => setPickerOpen(!pickerOpen)}
-                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
-              >
-                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
-              </button>
-            </Tooltip>
-          )
-        }
+        <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+          dictationExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+        }`}>
+          {isActive || isActivating ? (
+              <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+              </div>
+            ) : (
+              <Tooltip content="Microphone settings" side="top" sideOffset={8}>
+                <button
+                  type="button"
+                  onClick={() => setPickerOpen(!pickerOpen)}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
+                >
+                  <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
+                </button>
+              </Tooltip>
+            )
+          }
+        </div>
 
         {/* Right segment: mic button */}
         <Tooltip
@@ -2014,7 +1502,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
 
       {/* Error tooltip */}
       {error && (
-        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-card border border-border/70 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
+        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-popover border border-border/50 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
           {error}
         </div>
       )}
@@ -2022,19 +1510,22 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
       {/* Device picker popover — toggled by chevron button */}
       {pickerOpen && (
         <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[300px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
-          {/* Level indicator bar */}
+          {/* Input device header with level indicator */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
-            <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            <MicIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide shrink-0">Input Device</span>
             <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
-              <div
-                className="h-full rounded-full bg-primary transition-all duration-75"
-                style={{ width: `${Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500))}%` }}
-              />
+              {(() => {
+                const pct = Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500));
+                const barColor = pct > 60 ? '#22c55e' : pct > 20 ? '#eab308' : '#6b7280';
+                return (
+                  <div
+                    className="h-full rounded-full transition-all duration-75"
+                    style={{ width: `${pct}%`, backgroundColor: barColor }}
+                  />
+                );
+              })()}
             </div>
-          </div>
-
-          <div className="px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
-            Input Device
           </div>
 
           <div className="max-h-[280px] overflow-y-auto space-y-0.5">
@@ -2064,10 +1555,11 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
           </div>
 
           {/* Hold to record toggle */}
-          <div className="flex items-center justify-between border-t border-border/50 mx-1.5 mt-1 px-2 py-2">
+          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+          <div className="flex items-center justify-between px-3 py-2">
             <div className="flex items-center gap-2">
-              <MicIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-xs text-foreground">Hold to record</span>
+              <PointerIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Hold to record</span>
             </div>
             <button
               type="button"
@@ -2106,7 +1598,7 @@ const CallButton: FC = () => {
       <button
         type="button"
         onClick={handleClick}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors text-muted-foreground hover:bg-muted/50"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors text-muted-foreground hover:bg-muted/60"
       >
         <PhoneIcon className="h-4 w-4" />
       </button>
@@ -2121,11 +1613,13 @@ const Composer: FC<{
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
+  executionMode: ExecutionMode;
+  onChangeExecutionMode: (value: ExecutionMode) => void;
   selectedProfileKey: string | null;
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -2190,7 +1684,23 @@ const Composer: FC<{
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  const [cwdPopoverOpen, setCwdPopoverOpen] = useState(false);
+  const cwdRootRef = useRef<HTMLDivElement>(null);
+  const cwdPopover = usePopoverAlign();
+  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({ popoverOpen: cwdPopoverOpen });
   const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
+
+  // Close CWD popover on outside click
+  useEffect(() => {
+    if (!cwdPopoverOpen) return;
+    const handler = (e: PointerEvent) => {
+      if (!cwdRootRef.current?.contains(e.target as Node)) {
+        setCwdPopoverOpen(false);
+      }
+    };
+    window.addEventListener('pointerdown', handler);
+    return () => window.removeEventListener('pointerdown', handler);
+  }, [cwdPopoverOpen]);
 
   const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
@@ -2314,7 +1824,7 @@ const Composer: FC<{
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   return (
-    <div className="relative z-20 border-t border-border/70 bg-background/88 px-3 pb-3 pt-3 backdrop-blur-md md:px-6 md:pb-6 md:pt-4">
+    <div className="relative z-20 px-3 pb-3 pt-4 md:px-6 md:pb-6 md:pt-5">
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input
@@ -2340,7 +1850,7 @@ const Composer: FC<{
         {mode === 'chat' && hasFileAttachments && (
           <div className="mb-3 flex flex-wrap gap-2">
             {attachments.map((file, i) => (
-              <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/70 bg-card/65 px-2.5 py-2 text-xs">
+              <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs">
                 {file.isImage ? (
                   <img src={file.dataUrl} alt={file.name} className="h-10 w-10 rounded object-cover" />
                 ) : (
@@ -2371,7 +1881,7 @@ const Composer: FC<{
             }} />
           ) : null
         ) : (
-          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-[1.7rem] border border-border/70 bg-card/78 px-3 py-3 app-composer-shadow">
+          <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel
@@ -2412,54 +1922,27 @@ const Composer: FC<{
               </>
             ) : (
               <>
-                {currentWorkingDirectory && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-border/60 bg-muted/25 px-3 py-2 text-[11px]">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <FolderOpenIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      <span className="shrink-0 font-medium text-foreground/90">Working Dir</span>
-                      <span className="shrink-0 text-muted-foreground">/</span>
-                      <span className="max-w-[360px] truncate text-muted-foreground" title={currentWorkingDirectory}>
-                        {currentWorkingDirectory}
-                      </span>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1">
-                      <span className="max-w-[120px] truncate text-[10px] text-foreground/80" title={cwdName ?? undefined}>
-                        {cwdName}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => { void setCurrentWorkingDirectory(null); }}
-                        className="rounded-md p-1 transition-colors hover:bg-destructive/10"
-                        title="Clear current working directory"
-                      >
-                        <XIcon className="h-3 w-3 text-muted-foreground" />
-                      </button>
-                    </div>
-                  </div>
-                )}
                 <ComposerInput
                   placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : __BRAND_COMPOSER_PLACEHOLDER}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
-                <div className="flex items-center justify-between gap-2 md:gap-3">
-                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 md:gap-2">
+                <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5 md:gap-2">
                     <DropdownMenu.Root>
-                      <DropdownMenu.Trigger asChild>
-                        <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Add attachment">
-                          <PlusIcon className="h-4 w-4 text-muted-foreground" />
-                        </button>
-                      </DropdownMenu.Trigger>
+                      <Tooltip content="Add files" side="top" sideOffset={8}>
+                        <DropdownMenu.Trigger asChild>
+                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
+                            <PlusIcon className="h-4 w-4" />
+                          </button>
+                        </DropdownMenu.Trigger>
+                      </Tooltip>
                       <DropdownMenu.Portal>
                         <DropdownMenu.Content
                           align="start"
                           sideOffset={8}
                           className="z-50 min-w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                         >
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachDirectory(); }}>
-                            <FolderOpenIcon className="h-4 w-4 text-muted-foreground" />
-                            <span>Working Directory</span>
-                          </DropdownMenu.Item>
                           <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }]); }}>
                             <ImageIcon className="h-4 w-4 text-muted-foreground" />
                             <span>Image</span>
@@ -2480,7 +1963,70 @@ const Composer: FC<{
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
+                    {/* Working directory split button */}
+                    <div ref={cwdRootRef} {...cwdContainerProps} className="relative flex items-center">
+                      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+                        currentWorkingDirectory
+                          ? 'border-primary/50 bg-primary/10'
+                          : 'border-border/50 bg-muted/40'
+                      }`}>
+                        {/* Left segment: folder icon — opens picker */}
+                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Set working directory'} side="top" sideOffset={8}>
+                          <button
+                            type="button"
+                            onClick={() => { void handleAttachDirectory(); }}
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
+                              currentWorkingDirectory
+                                ? 'hover:bg-primary/15 text-primary'
+                                : 'hover:bg-muted/50 text-muted-foreground'
+                            }`}
+                          >
+                            <FolderOpenIcon className="h-4 w-4" />
+                          </button>
+                        </Tooltip>
+                        {/* Right segment: chevron — opens CWD popover (only when set) */}
+                        {currentWorkingDirectory && (
+                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+                            cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+                          }`}>
+                            <Tooltip content="Directory settings" side="top" sideOffset={8}>
+                              <button
+                                type="button"
+                                onClick={() => setCwdPopoverOpen((o) => !o)}
+                                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
+                              >
+                                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
+                              </button>
+                            </Tooltip>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* CWD popover */}
+                      {cwdPopoverOpen && currentWorkingDirectory && (
+                        <div ref={cwdPopover.ref} style={cwdPopover.style} className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+                          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                            <FolderOpenIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Working Directory</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>{cwdName}</p>
+                            <p className="mt-0.5 text-[10px] text-muted-foreground truncate" title={currentWorkingDirectory}>{currentWorkingDirectory}</p>
+                          </div>
+                          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+                          <button
+                            type="button"
+                            onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                            className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                          >
+                            <XIcon className="h-3.5 w-3.5" />
+                            <span>Clear directory</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
+                  <div className="flex items-center gap-1.5 md:gap-2">
                   <ModelSettingsButton
                     selectedModelKey={selectedModelKey}
                     onSelectModel={onSelectModel}
@@ -2490,6 +2036,8 @@ const Composer: FC<{
                     onToggleFallback={onToggleFallback}
                     selectedProfileKey={selectedProfileKey}
                     onSelectProfile={onSelectProfile}
+                    executionMode={executionMode}
+                    onChangeExecutionMode={onChangeExecutionMode}
                   />
                   {computerUseEnabled && (
                     <ComputerSettingsButton
@@ -2528,6 +2076,7 @@ const Composer: FC<{
                   <ThreadPrimitive.If running>
                     <StopButton />
                   </ThreadPrimitive.If>
+                  </div>
                 </div>
               </>
             )}

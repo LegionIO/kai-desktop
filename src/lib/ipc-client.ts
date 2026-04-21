@@ -14,10 +14,12 @@ type AppAPI = {
     onChanged: (callback: (config: unknown) => void) => () => void;
   };
   agent: {
-    stream: (conversationId: string, messages: unknown[], modelKey?: string, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', profileKey?: string, fallbackEnabled?: boolean, cwd?: string) => Promise<unknown>;
+    stream: (conversationId: string, messages: unknown[], modelKey?: string, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', profileKey?: string, fallbackEnabled?: boolean, cwd?: string, executionMode?: 'auto' | 'plan-first' | 'confirm-writes') => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
+    approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
+    rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
+    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
     generateTitle: (messages: unknown[], modelKey?: string) => Promise<{ title: string | null }>;
-    listBackends: () => Promise<Array<{ key: string; displayName: string; pluginName?: string | null }>>;
     onStreamEvent: (callback: (event: unknown) => void) => () => void;
     sendSubAgentMessage: (subAgentConversationId: string, message: string) => Promise<{ ok: boolean }>;
     stopSubAgent: (subAgentConversationId: string) => Promise<{ ok: boolean }>;
@@ -246,6 +248,7 @@ type AppAPI = {
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
+  onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
 };
 
 declare global {
