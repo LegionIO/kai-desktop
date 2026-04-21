@@ -362,7 +362,10 @@ export const CodeBlock: FC<CodeBlockProps> = memo(({ code: rawCode, language, is
           </button>
         </Tooltip>
       </div>
-      <div className="rounded-md overflow-hidden" style={{ maxHeight, overflow: 'auto' }}>
+      {/* min-height and shiki-bg reserve space and background color to prevent
+           layout shift while Shiki highlights the code asynchronously.
+           Shiki renders at font-size 0.75rem with ~17px line-height and 20px vertical padding. */}
+      <div className="shiki-bg rounded-md overflow-hidden" style={{ maxHeight, overflow: 'auto', minHeight: Math.min(displayCode.split('\n').length * 17 + 40, parseFloat(maxHeight as string) || 400) }}>
         <ShikiHighlighter
           language={detectedLang}
           theme={{ light: 'light-plus', dark: 'dark-plus' }}

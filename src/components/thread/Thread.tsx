@@ -103,22 +103,6 @@ export const Thread: FC<{
     });
   }, [threadRuntime]);
 
-  // Prevent flash of un-scrolled content when switching to an existing thread.
-  // The library renders messages at scrollTop=0 before restoring scroll position,
-  // causing a visible jump. We set up a MutationObserver in the ref callback to
-  // detect when messages are added and immediately scroll to bottom before paint.
-  // MutationObserver callbacks fire as microtasks (after DOM mutation, before paint).
-  const viewportRefCb = useCallback((node: HTMLDivElement | null) => {
-    (viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
-    if (!node) return;
-    const mo = new MutationObserver(() => {
-      if (node.scrollHeight > node.clientHeight) {
-        node.scrollTop = node.scrollHeight;
-        mo.disconnect();
-      }
-    });
-    mo.observe(node, { childList: true, subtree: true });
-  }, [threadRuntime]); // eslint-disable-line react-hooks/exhaustive-deps
   const { uiState: pluginUIState } = usePlugins();
   const threadDecorations = (pluginUIState?.threadDecorations ?? []).filter((decoration) => (
     decoration.visible && (!decoration.conversationId || decoration.conversationId === activeConversationId)
@@ -161,7 +145,7 @@ export const Thread: FC<{
         </div>
       )}
       {mode === 'chat' ? (
-        <ThreadPrimitive.Viewport ref={viewportRefCb} className="relative min-h-0 flex-1 overflow-y-auto">
+        <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
           <PinnedUserMessage viewportRef={viewportRef} />
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
@@ -674,8 +658,18 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
     return threadRuntime.subscribe(() => {
       const msgs = threadRuntime.getState().messages;
       if (msgs.length > 0 && !fadingOutRef.current) {
-        setFadingOut(true);
-        fadingOutRef.current = true;
+        // When loading an existing thread (many messages appear at once),
+        // hide the splash instantly to avoid a visible overlay during the
+        // scroll-to-bottom positioning. Only use the gradual fade when a
+        // single message is sent in a new conversation.
+        if (msgs.length > 1) {
+          setVisible(false);
+          setFadingOut(false);
+          fadingOutRef.current = true;
+        } else {
+          setFadingOut(true);
+          fadingOutRef.current = true;
+        }
       } else if (msgs.length === 0) {
         setVisible(true);
         setFadingOut(false);
