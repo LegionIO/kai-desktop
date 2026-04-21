@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen, nativeImage } from 'electron';
 import { join } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
@@ -469,9 +469,23 @@ if (gotSingleInstanceLock) {
       });
     }
 
-    // Set dock icon (macOS) — needed for dev mode since packager config doesn't apply
+    // Set dock icon (macOS) — needed for dev mode since packager config doesn't apply.
+    // The raw icon.png fills edge-to-edge with no padding, but macOS dock icons expect
+    // ~16% inset (the .icns in packaged builds gets this automatically). We shrink the
+    // artwork to 80% and center it on a transparent 128×128 canvas to match.
     if (process.platform === 'darwin' && app.dock && existsSync(APP_ICON)) {
-      app.dock.setIcon(APP_ICON);
+      const DOCK_SIZE = 128;
+      const INSET = 0.80;
+      const artworkSize = Math.round(DOCK_SIZE * INSET);
+      const offset = Math.round((DOCK_SIZE - artworkSize) / 2);
+      const artwork = nativeImage.createFromPath(APP_ICON).resize({ width: artworkSize, height: artworkSize });
+      const buf = Buffer.alloc(DOCK_SIZE * DOCK_SIZE * 4, 0);
+      const artBuf = artwork.toBitmap();
+      for (let y = 0; y < artworkSize; y++) {
+        artBuf.copy(buf, ((y + offset) * DOCK_SIZE + offset) * 4, y * artworkSize * 4, (y + 1) * artworkSize * 4);
+      }
+      const padded = nativeImage.createFromBuffer(buf, { width: DOCK_SIZE, height: DOCK_SIZE });
+      app.dock.setIcon(padded);
     }
 
     // Config reader (used by tools and OAuth)
