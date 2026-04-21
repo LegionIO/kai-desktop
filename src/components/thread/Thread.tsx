@@ -36,6 +36,7 @@ import {
   LoaderIcon,
   MessageSquareTextIcon,
   ArrowUpIcon,
+  ArrowDownIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
@@ -480,95 +481,129 @@ const EmptyThreadBackground: FC = () => {
 };
 
 /**
- * Pinned user message — sticks to the top of the viewport when the user
- * scrolls past their last message, so they always know what they asked.
+ * User-message navigator — sticks to the top of the viewport and lets you
+ * jump up/down between user messages in the thread.
  */
 const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null> }> = ({ viewportRef }) => {
   const threadRuntime = useThreadRuntime();
-  const [lastUserMessage, setLastUserMessage] = useState<{
-    text: string;
-    imageCount: number;
-    fileCount: number;
-  } | null>(null);
-  const [visible, setVisible] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const observerRef = useRef<IntersectionObserver | null>(null);
 
-  // Subscribe to thread messages and extract last user message content
+  // All user messages extracted from the thread (text + attachment counts)
+  const [userMessages, setUserMessages] = useState<
+    { text: string; imageCount: number; fileCount: number }[]
+  >([]);
+
+  // Navigation state computed from scroll position
+  const [prevIdx, setPrevIdx] = useState<number | null>(null);
+  const [nextIdx, setNextIdx] = useState<number | null>(null);
+  const [expanded, setExpanded] = useState(false);
+
+  // Subscribe to thread messages and extract all user messages
   useEffect(() => {
     const update = () => {
       const msgs = threadRuntime.getState().messages;
-      // Find the last user message
-      let lastUser = null;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i].role === 'user') {
-          lastUser = msgs[i];
-          break;
+      const users: { text: string; imageCount: number; fileCount: number }[] = [];
+      for (const msg of msgs) {
+        if (msg.role !== 'user') continue;
+        const textParts = (msg.content ?? [])
+          .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+          .map((p) => p.text)
+          .join('\n');
+        const imageCount = (msg.content ?? []).filter((p) => p.type === 'image').length;
+        const fileCount = (msg.content ?? []).filter((p) => p.type === 'file').length;
+        if (textParts || imageCount || fileCount) {
+          users.push({ text: textParts, imageCount, fileCount });
         }
       }
-      if (!lastUser || lastUser === msgs[msgs.length - 1]) {
-        // No user message, or user message is the very last message (no response yet)
-        setLastUserMessage(null);
-        return;
-      }
-      const textParts = (lastUser.content ?? [])
-        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-        .map((p) => p.text)
-        .join('\n');
-      const imageCount = (lastUser.content ?? []).filter((p) => p.type === 'image').length;
-      const fileCount = (lastUser.content ?? []).filter((p) => p.type === 'file').length;
-      setLastUserMessage(textParts || imageCount || fileCount ? { text: textParts, imageCount, fileCount } : null);
+      setUserMessages(users);
     };
     update();
     return threadRuntime.subscribe(update);
   }, [threadRuntime]);
 
-  // Collapse when the pinned message hides
+  // Collapse preview when the widget hides
   useEffect(() => {
-    if (!visible) setExpanded(false);
-  }, [visible]);
+    if (prevIdx === null && nextIdx === null) setExpanded(false);
+  }, [prevIdx, nextIdx]);
 
-  // IntersectionObserver: watch the sentinel element on the last user message
+  // Scroll listener: determine which user messages are above/below the viewport
   useEffect(() => {
-    if (!lastUserMessage) {
-      setVisible(false);
-      return;
-    }
     const viewport = viewportRef.current;
-    if (!viewport) return;
-
-    // Clean up previous observer
-    observerRef.current?.disconnect();
-
-    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
-    const sentinel = sentinels[sentinels.length - 1];
-    if (!sentinel) {
-      setVisible(false);
+    if (!viewport || userMessages.length === 0) {
+      setPrevIdx(null);
+      setNextIdx(null);
       return;
     }
 
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        // Show pinned message when the original is NOT intersecting (scrolled away)
-        setVisible(!entry.isIntersecting);
-      },
-      { root: viewport, threshold: 0 },
-    );
-    observer.observe(sentinel);
-    observerRef.current = observer;
+    let rafId = 0;
+    const compute = () => {
+      const sentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
+      if (sentinels.length === 0) {
+        setPrevIdx(null);
+        setNextIdx(null);
+        return;
+      }
 
-    return () => observer.disconnect();
-  }, [lastUserMessage, viewportRef]);
+      const viewTop = viewport.scrollTop;
+      const viewBottom = viewTop + viewport.clientHeight;
+      const threshold = 48; // px — sentinel must be this far outside the viewport to count
 
-  const scrollToOriginal = useCallback(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
-    const sentinel = sentinels[sentinels.length - 1];
-    sentinel?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, [viewportRef]);
+      let prev: number | null = null;
+      let next: number | null = null;
 
-  if (!lastUserMessage) return null;
+      for (let i = 0; i < sentinels.length; i++) {
+        const el = sentinels[i] as HTMLElement;
+        const top = el.offsetTop;
+        const bottom = top + el.offsetHeight;
+
+        if (bottom < viewTop + threshold) {
+          // Sentinel is above the viewport
+          prev = i;
+        } else if (top > viewBottom - threshold && next === null) {
+          // Sentinel is below the viewport
+          next = i;
+        }
+      }
+
+      setPrevIdx(prev);
+      setNextIdx(next);
+    };
+
+    const onScroll = () => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(compute);
+    };
+
+    // Initial computation
+    compute();
+
+    viewport.addEventListener('scroll', onScroll, { passive: true });
+    // Recompute when DOM changes (new messages)
+    const mo = new MutationObserver(compute);
+    mo.observe(viewport, { childList: true, subtree: true });
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      viewport.removeEventListener('scroll', onScroll);
+      mo.disconnect();
+    };
+  }, [viewportRef, userMessages.length]);
+
+  const scrollTo = useCallback(
+    (idx: number) => {
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+      const sentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
+      sentinels[idx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    },
+    [viewportRef],
+  );
+
+  const visible = prevIdx !== null || nextIdx !== null;
+  const prevMsg = prevIdx !== null ? userMessages[prevIdx] : null;
+  const nextMsg = nextIdx !== null ? userMessages[nextIdx] : null;
+  const hasAnyText = (prevMsg?.text || nextMsg?.text);
+
+  if (userMessages.length === 0) return null;
 
   return (
     <div
@@ -587,32 +622,60 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
               borderColor: 'var(--app-user-bubble-border)',
             }}
           >
-            {/* Expandable text area — grows to the left of the icons */}
-            {expanded && (
-              <div className="min-w-0 animate-in fade-in slide-in-from-right-2 duration-150">
-                <p className="px-4 py-2.5 text-sm leading-6">{lastUserMessage.text}</p>
+            {/* Stacked rows: each direction gets its own preview + arrow */}
+            <div className="flex min-w-0 flex-col">
+              {prevIdx !== null && (
+                <div className="flex items-center">
+                  {expanded && prevMsg?.text && (
+                    <div className="min-w-0 flex-1 animate-in fade-in slide-in-from-right-2 duration-150">
+                      <p className="line-clamp-2 px-4 py-2 text-sm leading-5 text-foreground/80">{prevMsg.text}</p>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => scrollTo(prevIdx)}
+                    className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                    title="Previous user message"
+                  >
+                    <ArrowUpIcon className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+              {prevIdx !== null && nextIdx !== null && (
+                <div className="mx-2 border-t border-foreground/10" />
+              )}
+              {nextIdx !== null && (
+                <div className="flex items-center">
+                  {expanded && nextMsg?.text && (
+                    <div className="min-w-0 flex-1 animate-in fade-in slide-in-from-right-2 duration-150">
+                      <p className="line-clamp-2 px-4 py-2 text-sm leading-5 text-foreground/80">{nextMsg.text}</p>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => scrollTo(nextIdx)}
+                    className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                    title="Next user message"
+                  >
+                    <ArrowDownIcon className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Toggle button for expand/collapse — sits on the right edge */}
+            {hasAnyText && (
+              <div className="flex items-center border-l border-foreground/10 px-1">
+                <button
+                  type="button"
+                  onClick={() => setExpanded((e) => !e)}
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                  title={expanded ? 'Collapse previews' : 'Show previews'}
+                >
+                  <MessageSquareTextIcon className="h-3.5 w-3.5" />
+                </button>
               </div>
             )}
-
-            {/* Action buttons — always anchored right, never move */}
-            <div className="flex shrink-0 items-start gap-0.5 px-2 py-1.5">
-              <button
-                type="button"
-                onClick={() => setExpanded((e) => !e)}
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                title={expanded ? 'Collapse message' : 'Show message'}
-              >
-                <MessageSquareTextIcon className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={scrollToOriginal}
-                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                title="Scroll to message"
-              >
-                <ArrowUpIcon className="h-3.5 w-3.5" />
-              </button>
-            </div>
           </div>
         </div>
       </div>
