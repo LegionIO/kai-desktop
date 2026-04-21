@@ -1,7 +1,19 @@
 import { z } from 'zod';
 import { BrowserWindow } from 'electron';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import type { ToolDefinition } from './types.js';
+
+const ADJECTIVES = ['bright', 'calm', 'cheerful', 'cosmic', 'drifting', 'elegant', 'floating', 'gentle', 'happy', 'luminous', 'merry', 'noble', 'quiet', 'radiant', 'serene', 'tender', 'vivid', 'warm', 'bold', 'crisp'];
+const VERBS = ['baking', 'brewing', 'doodling', 'gathering', 'humming', 'leaping', 'noodling', 'pondering', 'seeking', 'spinning', 'toasting', 'tumbling', 'weaving', 'wishing', 'splashing', 'sniffing', 'twirling', 'frolicking', 'prancing', 'sprouting'];
+const NOUNS = ['star', 'tiger', 'sparrow', 'duckling', 'raccoon', 'pretzel', 'pumpkin', 'horizon', 'island', 'glade', 'pudding', 'bunny', 'toast', 'pizza', 'dragonfly', 'fern', 'quokka', 'sphinx', 'goblet', 'sloth'];
+
+function generatePlanName(): string {
+  const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
+  return `${pick(ADJECTIVES)}-${pick(VERBS)}-${pick(NOUNS)}`;
+}
 
 function broadcastModeChange(mode: string): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -52,17 +64,31 @@ export function createExitPlanModeTool(): ToolDefinition {
     description: [
       'Exit plan-first mode and return to normal auto mode where all tools are available.',
       'Call this when you have finished producing your plan and the user is ready to proceed with implementation.',
-      'This tool requires user approval before executing — the user will see an approve/reject prompt.',
+      'Pass the full plan as markdown in planContent. This tool requires user approval before executing — the user will see the plan in a side panel and an approve/reject prompt.',
     ].join(' '),
     inputSchema: z.object({
+      planContent: z.string().describe('The full plan as markdown. Include Context, Implementation Steps, Files to Modify, and Verification sections.'),
+      planTitle: z.string().optional().describe('Short title for the plan file (e.g. "add-dark-mode"). If omitted, a random name is generated.'),
       summary: z.string().optional().describe('Brief summary of the plan that was produced'),
     }),
     execute: async (input) => {
-      const { summary } = input as { summary?: string };
+      const { planContent, planTitle, summary } = input as { planContent: string; planTitle?: string; summary?: string };
+
+      // Write the plan to ~/.kai/plans/<name>.md
+      const planName = planTitle
+        ? planTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60)
+        : generatePlanName();
+      const plansDir = join(homedir(), '.kai', 'plans');
+      mkdirSync(plansDir, { recursive: true });
+      const planFilePath = join(plansDir, `${planName}.md`);
+      writeFileSync(planFilePath, planContent, 'utf-8');
+
       broadcastModeChange('auto');
       return {
         success: true,
         mode: 'auto',
+        planFilePath,
+        planName: `${planName}.md`,
         message: 'Plan mode has been deactivated. All tools including file_write, file_edit, and sh are now available. The PLAN MODE ACTIVE restriction from the system prompt no longer applies. You may now proceed with implementation using any tools.',
         ...(summary ? { summary } : {}),
       };

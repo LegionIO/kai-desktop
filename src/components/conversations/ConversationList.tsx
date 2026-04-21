@@ -306,27 +306,38 @@ export const ConversationList: FC<ConversationListProps> = ({
     return result;
   }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived]);
 
+  // Tracks a conversation that is fading out but should still look "active"
+  // so the highlight doesn't jump to the next item during the removal animation.
+  const [fadingActiveId, setFadingActiveId] = useState<string | null>(null);
+
   const handleDelete = async (id: string) => {
     setDeletingId(id);
     try {
-      // Find the conversation right below the deleted one in visual order
-      if (id === activeConversationId) {
+      const wasDeletingActive = id === activeConversationId;
+      let next: ConversationSummary | undefined;
+
+      if (wasDeletingActive) {
         const idx = processedConversations.findIndex((c) => c.id === id);
-        // Pick the one below, or above if it's the last item
-        const next = processedConversations[idx + 1] ?? processedConversations[idx - 1];
-        if (next) {
-          await app.conversations.setActiveId(next.id);
-        }
-        await app.conversations.delete(id);
-        if (next) {
-          onSwitchConversation(next.id);
-        } else {
-          await onNewConversation();
-        }
-      } else {
-        await app.conversations.delete(id);
+        next = processedConversations[idx + 1] ?? processedConversations[idx - 1];
+        // Keep the deleted item visually "active" during the fade-out
+        setFadingActiveId(id);
       }
+
+      await app.conversations.delete(id);
       await loadConversations();
+
+      if (wasDeletingActive) {
+        // Wait for the 300ms removal animation to finish before switching
+        setTimeout(async () => {
+          setFadingActiveId(null);
+          if (next) {
+            await app.conversations.setActiveId(next.id);
+            onSwitchConversation(next.id);
+          } else {
+            await onNewConversation();
+          }
+        }, 300);
+      }
     } finally {
       setDeletingId(null);
     }
@@ -503,7 +514,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                 </div>
               )}
               {section.items.map((conv) => {
-                const isActive = conv.id === activeConversationId;
+                const isActive = conv.id === activeConversationId || conv.id === fadingActiveId;
                 const isRunning = conv.runStatus === 'running';
                 const hasUnread = conv.hasUnread && !isActive;
                 const isRemoving = removingIds.has(conv.id);

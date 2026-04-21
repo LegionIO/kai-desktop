@@ -36,6 +36,8 @@ import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface 
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { PlanPanelProvider } from '@/providers/PlanPanelContext';
+import { PlanPanel, PlanPanelDivider } from '@/components/thread/PlanPanel';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -406,6 +408,8 @@ function AppShell() {
   const [renameValue, setRenameValue] = useState('');
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
+  const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
+  const [planPanelWidth, setPlanPanelWidth] = useState(420);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
@@ -611,6 +615,7 @@ function AppShell() {
 
   const handleSwitchConversation = useCallback(async (id: string) => {
     if (isMobile) setSidebarOpen(false);
+    setPlanPanel(null);
     await cleanupAbandonedConversation(id);
     await app.conversations.setActiveId(id);
     setActiveView(CHAT_VIEW);
@@ -627,6 +632,7 @@ function AppShell() {
 
   const handleNewConversation = useCallback(async () => {
     if (isMobile) setSidebarOpen(false);
+    setPlanPanel(null);
     suppressStoreSync.current = true;
     try {
       if (activeConversationId) {
@@ -832,6 +838,10 @@ function AppShell() {
   }, [handleSwitchConversation, sendPluginAction]);
 
   const pluginCommands = pluginUIState?.commands?.filter((command) => command.visible) ?? [];
+
+  const handleOpenPlan = useCallback((content: string, filePath?: string) => {
+    setPlanPanel({ content, filePath });
+  }, []);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -1056,7 +1066,7 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Settings</span>
                 ) : activePluginPanel ? (
                   <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
-                ) : activeConversationId ? (
+                ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
                       <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
@@ -1111,11 +1121,11 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
-                ) : (
+                ) : activeConversationTitle !== 'Untitled Thread' ? (
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
-                )}
+                ) : null}
               </div>
               </div>
             </div>
@@ -1126,24 +1136,45 @@ function AppShell() {
               ) : activePluginPanel ? (
                 <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
               ) : (
-                <>
-                  {/* Top fade — thread view only */}
-                  <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
-                  <ThreadOrSubAgent
-                  mode={threadMode}
-                  onChangeMode={setThreadMode}
-                  selectedModelKey={selectedModelKey}
-                  onSelectModel={setSelectedModelKey}
-                  reasoningEffort={reasoningEffort}
-                  onChangeReasoningEffort={setReasoningEffort}
-                  executionMode={executionMode}
-                  onChangeExecutionMode={setExecutionMode}
-                  selectedProfileKey={selectedProfileKey}
-                  onSelectProfile={handleSelectProfile}
-                  fallbackEnabled={fallbackEnabled}
-                  onToggleFallback={handleToggleFallback}
-                />
-                </>
+                <PlanPanelProvider onOpenPlan={handleOpenPlan}>
+                  <div className="flex h-full min-h-0">
+                    {/* Chat column */}
+                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                      {/* Top fade — thread view only */}
+                      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
+                      <ThreadOrSubAgent
+                        mode={threadMode}
+                        onChangeMode={setThreadMode}
+                        selectedModelKey={selectedModelKey}
+                        onSelectModel={setSelectedModelKey}
+                        reasoningEffort={reasoningEffort}
+                        onChangeReasoningEffort={setReasoningEffort}
+                        executionMode={executionMode}
+                        onChangeExecutionMode={setExecutionMode}
+                        selectedProfileKey={selectedProfileKey}
+                        onSelectProfile={handleSelectProfile}
+                        fallbackEnabled={fallbackEnabled}
+                        onToggleFallback={handleToggleFallback}
+                      />
+                    </div>
+                    {/* Plan panel (side-by-side) */}
+                    {planPanel && (
+                      <>
+                        <PlanPanelDivider
+                          panelWidth={planPanelWidth}
+                          onWidthChange={setPlanPanelWidth}
+                        />
+                        <div style={{ width: `${planPanelWidth}px` }} className="shrink-0">
+                          <PlanPanel
+                            content={planPanel.content}
+                            filePath={planPanel.filePath}
+                            onClose={() => setPlanPanel(null)}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </PlanPanelProvider>
               )}
             </div>
           </main>

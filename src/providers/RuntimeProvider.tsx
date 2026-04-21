@@ -774,6 +774,15 @@ function applyError(acc: MessageAccumulator, error: string): void {
   acc.messages[idx] = { ...msg, content: toStoredContent(content) };
 }
 
+function formatStreamError(raw: string, category?: string, statusCode?: number): string {
+  if (category === 'auth') {
+    if (statusCode === 403) return 'Access denied — please contact your administrator for model access.';
+    if (statusCode === 401) return 'Authentication failed — please check your API key or sign in again.';
+    return 'Authorization error — please check your credentials and try again.';
+  }
+  return raw;
+}
+
 function applyEnrichments(
   acc: MessageAccumulator,
   data: Record<string, unknown>,
@@ -892,7 +901,13 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     if (!conv) return;
 
     const userMessageCount = messages.filter((m) => m.role === 'user').length;
-    if (userMessageCount !== 1) return;
+
+    // Always attempt on the first user message.
+    // On subsequent messages, retry only if the conversation still has no title
+    // (both title and fallbackTitle are empty), which means prior generation failed.
+    const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
+    if (userMessageCount !== 1 && !hasNoTitle) return;
+    if (userMessageCount < 1) return;
 
     // Dedup: don't regenerate if we already did for this exact user message count
     const lastCount = lastRetitleCount.get(conversationId);
@@ -930,6 +945,11 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
         if (latest && latest.titleStatus === 'generating') {
           const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
           await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
+          // If we still have no title at all, clear the dedup counter so the
+          // next user message can retry title generation.
+          if (!latest.title?.trim() && !fallbackTitle?.trim()) {
+            lastRetitleCount.delete(conversationId);
+          }
         }
       }
     } finally {
@@ -941,6 +961,8 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
       await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
     }
+    // Clear the dedup counter on error so subsequent messages can retry
+    lastRetitleCount.delete(conversationId);
     titleGenInFlight.delete(conversationId);
   }
 }
@@ -1258,6 +1280,7 @@ export function RuntimeProvider({
         messageMeta?: Record<string, unknown>;
         toolCallId?: string; toolName?: string; args?: unknown;
         result?: unknown; error?: string;
+        errorCategory?: string; errorStatusCode?: number;
         startedAt?: string; finishedAt?: string; durationMs?: number;
         compaction?: {
           originalContent: string;
@@ -1346,7 +1369,7 @@ export function RuntimeProvider({
         } else if (e.type === 'tool-progress') {
           applyToolProgress(saAcc, { toolCallId: e.toolCallId, toolName: e.toolName, data: e.data as { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean } | undefined });
         } else if (e.type === 'error') {
-          applyError(saAcc, e.error ?? 'Unknown error');
+          applyError(saAcc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         }
 
         const finalMessages = [...saAcc.messages];
@@ -1640,6 +1663,7 @@ export function RuntimeProvider({
           }
         }
       } else if (e.type === 'error') {
+        applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         finalizeAssistantResponse(acc);
         if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
         streamAccumulators.delete(convId);
@@ -1672,21 +1696,44 @@ export function RuntimeProvider({
           // Auto-continue after plan mode entry: the stream was aborted so we can
           // restart with the correct executionMode, system prompt, and tool set.
           const planModeRestart = (e.data as Record<string, unknown> | undefined)?.planModeRestart;
-          if (planModeRestart) {
-            console.info(`[UI:stream] Plan mode restart — auto-continuing with plan-first mode`);
+          // Auto-continue after plan rejection: the user clicked "No, keep planning"
+          // so we restart in plan-first mode with a synthetic user message telling the
+          // agent to continue refining the plan.
+          const planModeRejectRestart = (e.data as Record<string, unknown> | undefined)?.planModeRejectRestart;
+          if (planModeRestart || planModeRejectRestart) {
+            const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
+            console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
               const latestHeadId = headIdRef.current ?? acc.headId;
               if (latestHeadId) {
-                // Re-stream from the current head (includes the enter_plan_mode result)
                 const latestTree = treeRef.current;
-                const branch = getActiveBranch(latestTree, latestHeadId);
-                streamAccumulators.set(convId, { messages: [...latestTree], headId: latestHeadId, pendingAssistantTiming: createPendingAssistantTiming() });
+                let treeForStream = [...latestTree];
+                let headForStream = latestHeadId;
+
+                // For plan rejection, inject a synthetic user message so the agent
+                // understands the plan was not accepted and it should keep planning.
+                if (planModeRejectRestart) {
+                  const rejectMsg: StoredMessage = {
+                    id: msgId(),
+                    parentId: latestHeadId,
+                    role: 'user',
+                    content: [{ type: 'text', text: 'I rejected that plan. Please keep planning — ask me questions or refine your approach before presenting a new plan.' }],
+                    createdAt: new Date(),
+                  };
+                  treeForStream = [...treeForStream, rejectMsg];
+                  headForStream = rejectMsg.id;
+                  setTree(treeForStream);
+                  setHeadId(headForStream);
+                }
+
+                const branch = getActiveBranch(treeForStream, headForStream);
+                streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
-                persistConversation(convId, latestTree, latestHeadId, { runStatus: 'running' });
+                persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
                 const cfg = streamHandlerRef.current;
-                console.info(`[UI:stream:plan-restart] Firing agent:stream conv=${convId} executionMode=plan-first`);
+                console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
                 app.agent.stream(
                   convId,
                   branch,
