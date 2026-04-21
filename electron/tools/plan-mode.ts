@@ -18,18 +18,28 @@ export function createEnterPlanModeTool(): ToolDefinition {
       'Call this when the user asks you to plan, think first, explore before coding, or enter plan mode.',
       'In plan mode only read-only tools are available (file_read, grep, glob, list_directory, web_fetch, web_search).',
       'Write tools (file_write, file_edit, sh) are disabled.',
-      'The mode change takes effect on your next response turn.',
     ].join(' '),
     inputSchema: z.object({
       reason: z.string().optional().describe('Brief reason for entering plan mode'),
     }),
-    execute: async (input) => {
+    execute: async (input, context) => {
       const { reason } = input as { reason?: string };
       broadcastModeChange('plan-first');
+      const cwd = context.cwd;
       return {
         success: true,
         mode: 'plan-first',
-        message: 'Switched to plan-first mode. Write tools (file_write, file_edit, sh) are disabled until the user exits plan mode. Focus on reading, exploring, and producing a detailed implementation plan. When your plan is complete, call exit_plan_mode to let the user review and approve.',
+        message: [
+          'Switched to plan-first mode. The following rules apply IMMEDIATELY for the remainder of this turn:',
+          '',
+          'TOOLS: Only use read-only tools (file_read, grep, glob, list_directory, web_fetch, web_search). Do NOT use file_write, file_edit, or sh.',
+          '',
+          cwd
+            ? `WORKING DIRECTORY: ${cwd} — Use this as the base path for all tool calls. When calling grep, glob, or list_directory, either omit the path parameter or use this directory. NEVER navigate the filesystem from / or /Users.`
+            : '',
+          '',
+          'WORKFLOW: Be thorough in exploration. Read all relevant files, trace code paths. Use ask_user to clarify requirements. End your turn by calling exit_plan_mode to present your plan.',
+        ].filter(Boolean).join('\n'),
         ...(reason ? { reason } : {}),
       };
     },

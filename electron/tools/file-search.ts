@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { readdir, stat } from 'fs/promises';
 import { join } from 'path';
+import { homedir } from 'os';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import { runCommandWithStreaming, DEFAULT_PROCESS_STREAMING_CONFIG, resolveProcessStreamingConfig } from './process-runner.js';
@@ -35,7 +36,7 @@ export function createGrepTool(getConfig?: () => AppConfig): ToolDefinition {
     description: 'Search file contents using regex pattern. Returns matching lines with context.',
     inputSchema: z.object({
       pattern: z.string().describe('Regex pattern to search for'),
-      path: z.string().describe('Directory or file to search in'),
+      path: z.string().optional().describe('Directory or file to search in (defaults to working directory)'),
       glob: z.string().optional().describe('File glob filter (e.g. "*.ts", "*.py")'),
       context: z.number().optional().describe('Lines of context before/after match'),
       maxResults: z.number().optional().describe('Maximum results to return'),
@@ -46,10 +47,10 @@ export function createGrepTool(getConfig?: () => AppConfig): ToolDefinition {
       run: async (signal) => {
         throwIfAborted(signal);
         const { pattern, path, glob, context: lineContext = 0, maxResults = 50, caseInsensitive = false } = input as {
-          pattern: string; path: string; glob?: string;
+          pattern: string; path?: string; glob?: string;
           context?: number; maxResults?: number; caseInsensitive?: boolean;
         };
-        const resolvedPath = resolveToolPath(path, context.cwd);
+        const resolvedPath = await resolveToolPath(path || context.cwd || homedir(), context.cwd);
         const streaming = getConfig ? resolveProcessStreamingConfig(getConfig()) : DEFAULT_PROCESS_STREAMING_CONFIG;
 
         if (!(await pathExists(resolvedPath))) return { error: `Path not found: ${resolvedPath}`, isError: true };
@@ -119,7 +120,7 @@ export function createGlobTool(getConfig?: () => AppConfig): ToolDefinition {
     description: 'Find files matching a glob pattern in a directory.',
     inputSchema: z.object({
       pattern: z.string().describe('Glob pattern (e.g. "**/*.ts", "src/**/*.tsx")'),
-      path: z.string().describe('Root directory to search from'),
+      path: z.string().optional().describe('Root directory to search from (defaults to working directory)'),
       maxResults: z.number().optional().describe('Maximum results (default: 100)'),
     }),
     execute: async (input, context) => runToolExecution({
@@ -127,9 +128,9 @@ export function createGlobTool(getConfig?: () => AppConfig): ToolDefinition {
       run: async (signal) => {
         throwIfAborted(signal);
         const { pattern, path: rootPath, maxResults = 100 } = input as {
-          pattern: string; path: string; maxResults?: number;
+          pattern: string; path?: string; maxResults?: number;
         };
-        const resolvedRootPath = resolveToolPath(rootPath, context.cwd);
+        const resolvedRootPath = await resolveToolPath(rootPath || context.cwd || homedir(), context.cwd);
         const streaming = getConfig ? resolveProcessStreamingConfig(getConfig()) : DEFAULT_PROCESS_STREAMING_CONFIG;
 
         if (!(await pathExists(resolvedRootPath))) return { error: `Path not found: ${resolvedRootPath}`, isError: true };
@@ -157,7 +158,7 @@ export function createListDirectoryTool(): ToolDefinition {
     name: 'list_directory',
     description: 'List files and directories at a path with metadata (size, type, modified date).',
     inputSchema: z.object({
-      path: z.string().describe('Directory path to list'),
+      path: z.string().optional().describe('Directory path to list (defaults to working directory)'),
       showHidden: z.boolean().optional().describe('Include hidden files (default: false)'),
     }),
     execute: async (input, context) => runToolExecution({
@@ -165,8 +166,8 @@ export function createListDirectoryTool(): ToolDefinition {
       timeoutMs: 15000,
       run: async (signal) => {
         throwIfAborted(signal);
-        const { path: dirPath, showHidden = false } = input as { path: string; showHidden?: boolean };
-        const resolvedDirPath = resolveToolPath(dirPath, context.cwd);
+        const { path: dirPath, showHidden = false } = input as { path?: string; showHidden?: boolean };
+        const resolvedDirPath = await resolveToolPath(dirPath || context.cwd || homedir(), context.cwd);
 
         if (!(await pathExists(resolvedDirPath))) return { error: `Path not found: ${resolvedDirPath}`, isError: true };
         throwIfAborted(signal);

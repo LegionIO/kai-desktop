@@ -180,7 +180,7 @@ async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Pro
   const parts = [
     basePrompt,
     `Current working directory for this conversation: ${cwd}`,
-    'Use this directory as the default base path for shell and filesystem work unless the user explicitly chooses another path.',
+    'IMPORTANT: Use this directory as the default base path for ALL tool calls (grep, glob, list_directory, sh, file_read, file_write, file_edit). When a tool accepts a `path` parameter, either omit it to use the working directory automatically, or pass this exact directory. NEVER navigate the filesystem from / or /Users to find the project — the working directory is already set.',
   ];
 
   // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
@@ -424,7 +424,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     const modelEntry = streamConfig?.primaryModel ?? null;
 
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
-    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
+    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length} cwd=${effectiveCwd} executionMode=${executionMode ?? 'auto'}`);
 
     // Track the model key for usage attribution
     activeStreamModelKeys.set(
@@ -1086,6 +1086,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
             enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
             pairExecuteAndStreamToolCallIds(event.toolName);
+          }
+          if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
+            // Plan mode was entered mid-stream. Abort this stream so the renderer
+            // can re-send with executionMode='plan-first' (correct system prompt + tool set).
+            console.info(`[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`);
+            broadcastStreamEvent(event);
+            broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
+            controller.abort();
+            return { conversationId };
           }
           if (event.type === 'tool-result' && event.toolCallId) {
             observer?.onToolExecutionEnd(event.toolCallId);

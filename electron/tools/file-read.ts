@@ -40,7 +40,7 @@ export function createFileReadTool(): ToolDefinition {
           offset?: number;
           limit?: number;
         };
-        const resolvedPath = resolveToolPath(path, context.cwd);
+        const resolvedPath = await resolveToolPath(path, context.cwd);
 
         const fileStat = await safeStat(resolvedPath);
         if (!fileStat) {

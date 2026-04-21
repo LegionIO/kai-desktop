@@ -659,6 +659,7 @@ function AppShell() {
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
       setProfilePrimaryModelKey(null);
+      setExecutionMode('auto');
     } catch (err) {
       console.error('[AppShell] handleNewConversation failed:', err);
     } finally {

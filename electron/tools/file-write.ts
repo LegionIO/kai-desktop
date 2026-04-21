@@ -47,7 +47,7 @@ export function createFileWriteTool(): ToolDefinition {
           path: string; content: string; mode?: string;
           atLine?: number; startLine?: number; endLine?: number; createDirs?: boolean;
         };
-        const resolvedPath = resolveToolPath(path, context.cwd);
+        const resolvedPath = await resolveToolPath(path, context.cwd);
 
         // File size guard
         const sizeError = await checkFileSize(resolvedPath);
@@ -138,7 +138,7 @@ export function createFileEditTool(): ToolDefinition {
         const { path, old_string, new_string, replace_all = false } = input as {
           path: string; old_string: string; new_string: string; replace_all?: boolean;
         };
-        const resolvedPath = resolveToolPath(path, context.cwd);
+        const resolvedPath = await resolveToolPath(path, context.cwd);
 
         // File size guard
         const sizeError = await checkFileSize(resolvedPath);

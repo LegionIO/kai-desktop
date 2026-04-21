@@ -1247,8 +1247,8 @@ export function RuntimeProvider({
   }, []);
 
   // Stable ref for values the stream handler needs without re-subscribing
-  const streamHandlerRef = useRef({ tree, headId, schedulePersist });
-  useEffect(() => { streamHandlerRef.current = { tree, headId, schedulePersist }; }, [tree, headId, schedulePersist]);
+  const streamHandlerRef = useRef({ tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled });
+  useEffect(() => { streamHandlerRef.current = { tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled }; }, [tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled]);
 
   // Stream event listener — subscribes ONCE, reads mutable values via refs/globals
   useEffect(() => {
@@ -1660,7 +1660,6 @@ export function RuntimeProvider({
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
         });
         if (isActiveConv) {
-          setIsRunning(false);
           setTree([...acc.messages]);
           setHeadId(acc.headId);
           // Update the model selector to reflect the actual model used (may differ
@@ -1668,6 +1667,40 @@ export function RuntimeProvider({
           const resolvedModel = (e.data as Record<string, unknown> | undefined)?.model as string | undefined;
           if (resolvedModel) {
             onModelFallbackRef.current?.(resolvedModel);
+          }
+
+          // Auto-continue after plan mode entry: the stream was aborted so we can
+          // restart with the correct executionMode, system prompt, and tool set.
+          const planModeRestart = (e.data as Record<string, unknown> | undefined)?.planModeRestart;
+          if (planModeRestart) {
+            console.info(`[UI:stream] Plan mode restart — auto-continuing with plan-first mode`);
+            // Small delay to let the executionMode state update propagate from the
+            // onExecutionModeChanged listener in App.tsx.
+            setTimeout(() => {
+              const latestHeadId = headIdRef.current ?? acc.headId;
+              if (latestHeadId) {
+                // Re-stream from the current head (includes the enter_plan_mode result)
+                const latestTree = treeRef.current;
+                const branch = getActiveBranch(latestTree, latestHeadId);
+                streamAccumulators.set(convId, { messages: [...latestTree], headId: latestHeadId, pendingAssistantTiming: createPendingAssistantTiming() });
+                setIsRunning(true);
+                persistConversation(convId, latestTree, latestHeadId, { runStatus: 'running' });
+                const cfg = streamHandlerRef.current;
+                console.info(`[UI:stream:plan-restart] Firing agent:stream conv=${convId} executionMode=plan-first`);
+                app.agent.stream(
+                  convId,
+                  branch,
+                  cfg.selectedModelKey ?? undefined,
+                  cfg.reasoningEffort ?? 'medium',
+                  cfg.selectedProfileKey ?? undefined,
+                  cfg.fallbackEnabled ?? false,
+                  currentWorkingDirectoryRef.current ?? undefined,
+                  'plan-first',
+                );
+              }
+            }, 100);
+          } else {
+            setIsRunning(false);
           }
         }
         return;
@@ -1720,8 +1753,7 @@ export function RuntimeProvider({
     const branch = getActiveBranch(newTree, newHead);
     await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     void maybeGenerateTitle(convId, branch);
-    console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`);
-    console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
+    console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`);    console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
     app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto');
   }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, consumeAttachments]);
 

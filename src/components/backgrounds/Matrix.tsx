@@ -62,7 +62,7 @@ function useMatrixCanvas() {
       } else {
         palette.fade = `oklch(0.99 0.003 ${hue} / 10%)`;
         palette.glyph = `oklch(0.40 0.10 ${hue} / 55%)`;
-        palette.glyphBright = `oklch(0.55 0.18 ${hue} / 90%)`;
+        palette.glyphBright = `oklch(0.15 0.04 ${hue} / 95%)`;
         palette.glyphDim = `oklch(0.50 0.06 ${hue} / 10%)`;
       }
       for (const [ctx, cvs] of [[context, canvas], [brightCtx, brightCanvas], [cleanCtx, cleanCanvas]] as const) {
