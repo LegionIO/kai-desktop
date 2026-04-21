@@ -11,6 +11,7 @@ import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './la
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
 import { classifyError, calculateDelay } from './retry.js';
+import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -88,6 +89,23 @@ function shouldRetryWithoutTemperature(
   return /unsupported parameter:\s*'temperature'/.test(message)
     || message.includes('temperature is not supported')
     || /only (?:the )?default \(1\) value is supported/.test(message);
+}
+
+function shouldRetryWithSanitizedMessages(
+  error: unknown,
+  emittedAnyOutput: boolean,
+): boolean {
+  if (emittedAnyOutput) return false;
+
+  const message = getErrorMessage(error).toLowerCase();
+  return (
+    message.includes('expected toolresult') ||
+    message.includes('expected tool_result') ||
+    (message.includes('tool_use_id') && message.includes('not found')) ||
+    message.includes('item_reference') ||
+    message.includes('duplicate item found') ||
+    /item\b.*\bnot found/i.test(message)
+  );
 }
 
 function omitTemperature(modelSettings: Record<string, unknown>): Record<string, unknown> {
@@ -457,10 +475,13 @@ export async function* streamAgentResponse(
 
   const useGenerate = isReasoningGatewayModel(modelConfig);
 
+  const targetModelId = `${modelConfig.provider}:${modelConfig.modelName}`;
+  const sanitizedMessages = sanitizeMessagesForModel(messages, targetModelId);
+
   if (useGenerate) {
-    yield* generateWithSyntheticEvents(buildAgent, conversationId, messages, modelConfig, config, memory, modelSettings, providerOptions, options);
+    yield* generateWithSyntheticEvents(buildAgent, conversationId, sanitizedMessages, modelConfig, config, memory, modelSettings, providerOptions, options);
   } else {
-    yield* streamWithRealEvents(buildAgent, conversationId, messages, modelConfig, config, memory, modelSettings, providerOptions, options);
+    yield* streamWithRealEvents(buildAgent, conversationId, sanitizedMessages, modelConfig, config, memory, modelSettings, providerOptions, options);
   }
 }
 
@@ -486,6 +507,8 @@ async function* generateWithSyntheticEvents(
   let activeModelSettings = { ...modelSettings };
   let activeModelConfig = { ...modelConfig };
   let compatibilityRetried = false;
+  let sanitizationRetried = false;
+  let activeMessages = messages;
   const MAX_RETRIES = 4;
   const BASE_DELAY_MS = 500;
   const MAX_DELAY_MS = 32_000;
@@ -495,7 +518,7 @@ async function* generateWithSyntheticEvents(
 
     try {
       const agent = await buildAgent(activeModelConfig);
-      const msgArr = messages as Array<{ role?: string }>;
+      const msgArr = activeMessages as Array<{ role?: string }>;
       console.info(
         `[Agent:generate] conv=${conversationId} messageCount=${msgArr.length} roles=[${msgArr.map((m) => m.role ?? '?').join(',')}] maxSteps=${config.advanced.maxSteps} temp=${typeof activeModelSettings.temperature === 'number' ? activeModelSettings.temperature : 'default'}`,
       );
@@ -546,7 +569,7 @@ async function* generateWithSyntheticEvents(
         messageInput: Parameters<typeof agent.generate>[0],
         options: Record<string, unknown>,
       ) => ReturnType<typeof agent.generate>;
-      const result = await generate(messages as Parameters<typeof agent.generate>[0], generateOptions);
+      const result = await generate(activeMessages as Parameters<typeof agent.generate>[0], generateOptions);
 
       for (const event of eventQueue) {
         yield event;
@@ -573,6 +596,12 @@ async function* generateWithSyntheticEvents(
         activeModelSettings = omitTemperature(activeModelSettings);
         activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
         console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility error:`, getErrorMessage(error));
+        continue;
+      }
+      if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
+        sanitizationRetried = true;
+        activeMessages = deepSanitizeMessages(activeMessages);
+        console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`, getErrorMessage(error));
         continue;
       }
 
@@ -647,6 +676,8 @@ async function* streamWithRealEvents(
   let activeModelSettings = { ...modelSettings };
   let activeModelConfig = { ...modelConfig };
   let compatibilityRetried = false;
+  let sanitizationRetried = false;
+  let activeMessages = messages;
   // Accumulated token usage across all steps
   let accInputTokens = 0;
   let accOutputTokens = 0;
@@ -661,6 +692,7 @@ async function* streamWithRealEvents(
   while (true) {
     let requestCompleted = false;
     let compatibilityRetryRequested = false;
+    let sanitizationRetryRequested = false;
     const agent = await buildAgent(activeModelConfig);
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
@@ -681,7 +713,7 @@ async function* streamWithRealEvents(
           messageInput: Parameters<typeof agent.stream>[0],
           options: Record<string, unknown>,
         ) => ReturnType<typeof agent.stream>;
-        const streamResult = await stream(messages as Parameters<typeof agent.stream>[0], streamOptions);
+        const streamResult = await stream(activeMessages as Parameters<typeof agent.stream>[0], streamOptions);
 
         const fullStream = streamResult.fullStream;
         const iterator =
@@ -758,6 +790,13 @@ async function* streamWithRealEvents(
               console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`, errorMessage);
               break;
             }
+            if (!sanitizationRetried && shouldRetryWithSanitizedMessages(rawError, emittedAnyOutput)) {
+              sanitizationRetried = true;
+              activeMessages = deepSanitizeMessages(activeMessages);
+              sanitizationRetryRequested = true;
+              console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`, errorMessage);
+              break;
+            }
 
             emittedTerminalError = true;
             const inStreamErrorInfo = classifyError(rawError);
@@ -808,7 +847,7 @@ async function* streamWithRealEvents(
           }
         }
 
-        if (compatibilityRetryRequested) {
+        if (compatibilityRetryRequested || sanitizationRetryRequested) {
           continue compatibilityLoop;
         }
 
@@ -824,6 +863,14 @@ async function* streamWithRealEvents(
           activeModelSettings = omitTemperature(activeModelSettings);
           activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
           console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility error:`, getErrorMessage(error));
+          continue compatibilityLoop;
+        }
+
+        // Provider metadata sanitization retry (special case — not counted as a retry attempt)
+        if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
+          sanitizationRetried = true;
+          activeMessages = deepSanitizeMessages(activeMessages);
+          console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`, getErrorMessage(error));
           continue compatibilityLoop;
         }
 
