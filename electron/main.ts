@@ -1188,6 +1188,111 @@ if (gotSingleInstanceLock) {
       }
     });
 
+    // Git discard changes for specific files
+    ipcMain.handle('git:discard', async (_event, projectPath: string, filePaths: string[]) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        // Checkout tracked files to discard changes
+        await exec('git', ['checkout', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        // Clean untracked files
+        for (const fp of filePaths) {
+          try {
+            await exec('git', ['clean', '-fd', '--', fp], { cwd: projectPath, env: getResolvedProcessEnv() });
+          } catch { /* file might be tracked, ignore */ }
+        }
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Show a specific file in Finder
+    ipcMain.handle('git:show-file-in-finder', async (_event, projectPath: string, filePath: string) => {
+      const { shell } = await import('electron');
+      const path = await import('node:path');
+      shell.showItemInFolder(path.join(projectPath, filePath));
+      return { success: true };
+    });
+
+    // Open a specific file in VS Code
+    ipcMain.handle('git:open-file-in-editor', async (_event, projectPath: string, filePath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const path = await import('node:path');
+      try {
+        execFile('code', [path.join(projectPath, filePath)], { env: getResolvedProcessEnv() });
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git clone repository
+    ipcMain.handle('git:clone', async (_event, url: string, destPath: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      try {
+        await exec('git', ['clone', url, destPath], { env: getResolvedProcessEnv(), timeout: 120000, maxBuffer: 5 * 1024 * 1024 });
+        // Extract repo name from path
+        const path = await import('node:path');
+        const name = path.basename(destPath);
+        return { success: true, path: destPath, name };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Recent projects — persist to ~/.kai/data/recent-projects.json
+    ipcMain.handle('projects:list-recent', async () => {
+      const { readFileSync, existsSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const filePath = join(APP_HOME, 'data', 'recent-projects.json');
+      if (!existsSync(filePath)) return { projects: [] };
+      try {
+        const data = JSON.parse(readFileSync(filePath, 'utf-8'));
+        return { projects: data.projects ?? [] };
+      } catch { return { projects: [] }; }
+    });
+
+    ipcMain.handle('projects:add-recent', async (_event, project: { path: string; name: string }) => {
+      const { readFileSync, writeFileSync, existsSync, mkdirSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const filePath = join(APP_HOME, 'data', 'recent-projects.json');
+      const dir = join(APP_HOME, 'data');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      let projects: Array<{ path: string; name: string; lastOpened: number }> = [];
+      try {
+        if (existsSync(filePath)) {
+          projects = JSON.parse(readFileSync(filePath, 'utf-8')).projects ?? [];
+        }
+      } catch { /* ignore */ }
+      // Remove existing entry for this path, add to front
+      projects = projects.filter((p) => p.path !== project.path);
+      projects.unshift({ path: project.path, name: project.name, lastOpened: Date.now() });
+      // Keep max 20 recent projects
+      projects = projects.slice(0, 20);
+      writeFileSync(filePath, JSON.stringify({ projects }, null, 2), 'utf-8');
+      return { ok: true };
+    });
+
+    ipcMain.handle('projects:remove-recent', async (_event, projectPath: string) => {
+      const { readFileSync, writeFileSync, existsSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const filePath = join(APP_HOME, 'data', 'recent-projects.json');
+      if (!existsSync(filePath)) return { ok: true };
+      try {
+        const data = JSON.parse(readFileSync(filePath, 'utf-8'));
+        data.projects = (data.projects ?? []).filter((p: { path: string }) => p.path !== projectPath);
+        writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+      } catch { /* ignore */ }
+      return { ok: true };
+    });
+
     // Open project in VS Code
     ipcMain.handle('git:open-in-editor', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');

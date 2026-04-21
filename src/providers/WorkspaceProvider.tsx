@@ -74,9 +74,11 @@ interface WorkspaceContextValue {
   // Tasks
   tasks: WorkspaceTask[];
   addTask: (title: string, description: string, priority: TaskPriority, labels?: string[]) => void;
+  editTask: (taskId: string, title: string, description: string) => void;
   createTaskFromNaturalLanguage: (text: string) => Promise<void>;
-  generatePlan: (taskId: string) => void;
+  generatePlan: (taskId: string, userFeedback?: string) => void;
   approvePlan: (taskId: string) => void;
+  replanTask: (taskId: string) => void;
   updateTaskStatus: (taskId: string, status: TaskStatus) => void;
   removeTask: (taskId: string) => void;
 
@@ -159,8 +161,21 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const executionCancels = useRef<Map<string, () => void>>(new Map());
 
   // ── Task Persistence ───────────────────────────────────
-  // Load tasks from disk when project changes
+  // Load tasks from disk when project changes + reset all engine state
   useEffect(() => {
+    // Reset all per-project state when project changes
+    setIdeas([]);
+    setRoadmapPhases([]);
+    setInsightMessages([]);
+    setChangelogReleases([]);
+    setTaskExecutions(new Map());
+    setSelectedTaskId(null);
+    // Cancel all active engine streams
+    for (const cancel of engineCancels.current.values()) cancel();
+    engineCancels.current.clear();
+    for (const cancel of executionCancels.current.values()) cancel();
+    executionCancels.current.clear();
+
     if (!project?.path) {
       setTasks([]);
       return;
@@ -333,6 +348,46 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     persistTask(task);
   }, [persistTask]);
 
+  const editTask = useCallback((taskId: string, title: string, description: string) => {
+    setTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== taskId) return t;
+        const updated = { ...t, title: title.trim(), description: description.trim(), updatedAt: Date.now() };
+        persistTask(updated);
+        return updated;
+      }),
+    );
+  }, [persistTask]);
+
+  const replanTask = useCallback((taskId: string) => {
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task || !project) return;
+    // Move back to planning, keep previous context (plan, execution thread)
+    setTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== taskId) return t;
+        const updated = {
+          ...t,
+          status: 'planning' as TaskStatus,
+          planApprovedAt: undefined,
+          reviewResult: undefined,
+          reviewSummary: undefined,
+          executionCompletedAt: undefined,
+          updatedAt: Date.now(),
+        };
+        persistTask(updated);
+        return updated;
+      }),
+    );
+    // Clean up worktree if exists
+    if (task.worktreePath) {
+      app.git.removeWorktree(project.path, task.worktreePath).catch(() => {});
+    }
+    if (task.worktreeBranch) {
+      app.git.deleteBranch(project.path, task.worktreeBranch).catch(() => {});
+    }
+  }, [tasks, project, persistTask]);
+
   const nlParsingRef = useRef(false);
 
   const createTaskFromNaturalLanguage = useCallback(async (text: string) => {
@@ -406,11 +461,32 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       clearTimeout(timer);
       reviewTimers.current.delete(taskId);
     }
-    // Cancel any active execution
-    const cancel = executionCancels.current.get(taskId);
-    if (cancel) {
-      cancel();
+    // Cancel any active execution stream
+    const execCancel = executionCancels.current.get(taskId);
+    if (execCancel) {
+      execCancel();
       executionCancels.current.delete(taskId);
+    }
+    // Cancel any active engine streams (planning, etc.)
+    for (const [key, cancel] of engineCancels.current) {
+      if (key === 'planning' || key === 'execution') {
+        cancel();
+        engineCancels.current.delete(key);
+      }
+    }
+    // Clear pending persistence
+    const pending = pendingPersist.current.get(taskId);
+    if (pending) {
+      clearTimeout(pending);
+      pendingPersist.current.delete(taskId);
+    }
+    // Clean up worktree if task has one
+    const task = tasks.find((t) => t.id === taskId);
+    if (task?.worktreePath && project) {
+      app.git.removeWorktree(project.path, task.worktreePath).catch(() => {});
+    }
+    if (task?.worktreeBranch && project) {
+      app.git.deleteBranch(project.path, task.worktreeBranch).catch(() => {});
     }
     setTaskExecutions((prev) => {
       const next = new Map(prev);
@@ -419,7 +495,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     });
     setTasks((prev) => prev.filter((t) => t.id !== taskId));
     deleteTaskFromDisk(taskId);
-  }, [deleteTaskFromDisk]);
+  }, [tasks, project, deleteTaskFromDisk]);
 
   // ── Helper: update execution state immutably ──────────────
 
@@ -473,73 +549,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     );
   }, [persistTask]);
 
-  // ── AI Planning ─────────────────────────────────────────
-
-  const generatePlan = useCallback((taskId: string) => {
-    const task = tasks.find((t) => t.id === taskId);
-    if (!task || !project) return;
-
-    updateTaskStatus(taskId, 'planning');
-
-    const prompt = [
-      `Task: ${task.title}`,
-      '',
-      `Description: ${task.description}`,
-      '',
-      `Project directory: ${project.path}`,
-    ].join('\n');
-
-    startEngineStream({
-      engine: 'planning',
-      prompt,
-      freshConversation: true,
-      onComplete: (accumulated) => {
-        const parsed = extractJsonFromResponse(accumulated) as {
-          approach?: string; steps?: Array<{ id?: string; description?: string; status?: string }>;
-          filesToModify?: string[]; testsToRun?: string[]; risks?: string[];
-        } | null;
-        if (parsed?.approach && Array.isArray(parsed.steps)) {
-          const plan: TaskPlan = {
-            approach: parsed.approach,
-            steps: parsed.steps.map((s, i) => ({
-              id: s.id ?? String(i + 1),
-              description: s.description ?? '',
-              status: 'pending' as const,
-            })),
-            filesToModify: parsed.filesToModify ?? [],
-            testsToRun: parsed.testsToRun ?? [],
-            risks: parsed.risks ?? [],
-          };
-          setTasks((prev) =>
-            prev.map((t) => {
-              if (t.id !== taskId) return t;
-              const updated = { ...t, plan, updatedAt: Date.now() };
-              persistTask(updated);
-              return updated;
-            }),
-          );
-          appendExecutionEntry(taskId, 'plan', 'AI generated implementation plan');
-        } else {
-          appendExecutionEntry(taskId, 'error', 'Failed to parse plan from AI response');
-        }
-      },
-      onError: (error) => {
-        appendExecutionEntry(taskId, 'error', `Planning failed: ${error}`);
-      },
-    });
-  }, [tasks, project, updateTaskStatus, startEngineStream, persistTask, appendExecutionEntry]);
-
-  const approvePlan = useCallback((taskId: string) => {
-    setTasks((prev) =>
-      prev.map((t) => {
-        if (t.id !== taskId) return t;
-        const updated = { ...t, planApprovedAt: Date.now(), status: 'queued' as TaskStatus, updatedAt: Date.now() };
-        persistTask(updated);
-        return updated;
-      }),
-    );
-  }, [persistTask]);
-
   // ── Feature #11: Autonomous Task Execution (LLM Agent) ──
 
   // Track partial text lines for streaming accumulation
@@ -566,26 +575,156 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     partialLines.current.set(taskId, lines[lines.length - 1]);
   }, []);
 
+  // ── AI Planning ─────────────────────────────────────────
+
+  const generatePlan = useCallback((taskId: string, userFeedback?: string) => {
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task || !project) return;
+
+    updateTaskStatus(taskId, 'planning');
+
+    const initialState: TaskExecutionState = {
+      taskId,
+      status: 'running',
+      output: userFeedback ? [`You: ${userFeedback}`, '', 'Revising plan...'] : ['Analyzing codebase and generating plan...'],
+      activeToolName: null,
+      cancel: null,
+    };
+    setTaskExecutions((prev) => new Map(prev).set(taskId, initialState));
+    partialLines.current.delete(taskId);
+
+    const prompt = userFeedback
+      ? [
+          `Task: ${task.title}`,
+          `Description: ${task.description}`,
+          `Project directory: ${project.path}`,
+          '',
+          `User feedback on previous plan: ${userFeedback}`,
+          '',
+          'Please revise the plan based on this feedback.',
+        ].join('\n')
+      : [
+          `Task: ${task.title}`,
+          '',
+          `Description: ${task.description}`,
+          '',
+          `Project directory: ${project.path}`,
+        ].join('\n');
+
+    // Track accumulated text for JSON parsing at completion
+    let planAccumulated = '';
+
+    const cancel = streamWorkspaceEngine({
+      workspaceId: project.path,
+      engine: 'planning',
+      userMessage: prompt,
+      projectPath: project.path,
+      freshConversation: !userFeedback,
+      executionMode: 'auto',
+      onTextDelta: (text) => {
+        planAccumulated += text;
+        appendStreamText(taskId, text);
+      },
+      onToolCall: (_id, name) => {
+        updateExecution(taskId, { activeToolName: name });
+        appendExecutionOutput(taskId, `[${name}]`);
+      },
+      onToolResult: (_id, name, result) => {
+        updateExecution(taskId, { activeToolName: null });
+        const summary = typeof result === 'string' ? result.slice(0, 150) : JSON.stringify(result).slice(0, 150);
+        appendExecutionOutput(taskId, `  ${summary}`);
+      },
+      onDone: () => {
+        const remaining = partialLines.current.get(taskId);
+        if (remaining?.trim()) appendExecutionOutput(taskId, remaining);
+        partialLines.current.delete(taskId);
+
+        updateExecution(taskId, { status: 'done', activeToolName: null, cancel: null });
+
+        // Parse plan from accumulated text
+        const parsed = extractJsonFromResponse(planAccumulated) as {
+          approach?: string; steps?: Array<{ id?: string; description?: string; status?: string }>;
+          filesToModify?: string[]; testsToRun?: string[]; risks?: string[];
+        } | null;
+
+        if (parsed?.approach && Array.isArray(parsed.steps)) {
+          const plan: TaskPlan = {
+            approach: parsed.approach,
+            steps: parsed.steps.map((s, i) => ({
+              id: s.id ?? String(i + 1),
+              description: s.description ?? '',
+              status: 'pending' as const,
+            })),
+            filesToModify: parsed.filesToModify ?? [],
+            testsToRun: parsed.testsToRun ?? [],
+            risks: parsed.risks ?? [],
+          };
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId) return t;
+              const updated = { ...t, plan, updatedAt: Date.now() };
+              persistTask(updated);
+              return updated;
+            }),
+          );
+        } else {
+          appendExecutionOutput(taskId, '[Planning complete — could not parse structured plan]');
+        }
+      },
+      onError: (error) => {
+        appendExecutionOutput(taskId, `[Error] Planning failed: ${error}`);
+        updateExecution(taskId, { status: 'error', activeToolName: null, cancel: null });
+      },
+    });
+
+    updateExecution(taskId, { cancel });
+  }, [tasks, project, updateTaskStatus, engineStreams, persistTask, appendExecutionOutput, appendStreamText, updateExecution]);
+
+  const approvePlan = useCallback((taskId: string) => {
+    // Clear old planning execution state so auto-execute can start fresh
+    setTaskExecutions((prev) => {
+      const next = new Map(prev);
+      next.delete(taskId);
+      return next;
+    });
+    setTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== taskId) return t;
+        const updated = { ...t, planApprovedAt: Date.now(), status: 'queued' as TaskStatus, updatedAt: Date.now() };
+        persistTask(updated);
+        return updated;
+      }),
+    );
+  }, [persistTask]);
+
   const MAX_PARALLEL_TASKS = 3;
 
   const executeTask = useCallback(async (taskId: string) => {
     const task = tasks.find((t) => t.id === taskId);
     if (!task || !project) return;
 
-    // Move to executing
+    // Move to executing and mark first plan step as in_progress
     updateTaskStatus(taskId, 'executing');
+    if (task.plan?.steps?.length) {
+      setTasks((prev) =>
+        prev.map((t) => {
+          if (t.id !== taskId || !t.plan) return t;
+          const steps = t.plan.steps.map((s, i) => i === 0 ? { ...s, status: 'in_progress' as const } : s);
+          return { ...t, plan: { ...t.plan, steps } };
+        }),
+      );
+    }
     appendExecutionEntry(taskId, 'step_start', `Starting execution: ${task.title}`);
 
     // Create isolated worktree for this task
     const slug = task.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
-    const branchName = `task/${taskId.slice(0, 8)}-${slug}`;
+    const branchName = `task/${taskId.slice(0, 8)}-${slug}-${Date.now().toString(36)}`;
     let executionPath = project.path;
 
     try {
       const worktreeResult = await app.git.createWorktree(project.path, branchName);
       if (worktreeResult.path) {
         executionPath = worktreeResult.path;
-        // Store worktree info on task
         setTasks((prev) =>
           prev.map((t) => {
             if (t.id !== taskId) return t;
@@ -594,10 +733,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
             return updated;
           }),
         );
-        appendExecutionEntry(taskId, 'step_start', `Created isolated worktree: ${branchName}`);
+        appendExecutionOutput(taskId, `Created worktree: ${branchName}`);
+      } else if (worktreeResult.error) {
+        appendExecutionOutput(taskId, `Worktree warning: ${worktreeResult.error}`);
+        appendExecutionOutput(taskId, 'Executing in main project directory');
       }
-    } catch {
-      appendExecutionEntry(taskId, 'text', 'Could not create worktree, executing in main directory');
+    } catch (err) {
+      appendExecutionOutput(taskId, `Worktree error: ${(err as Error).message}`);
+      appendExecutionOutput(taskId, 'Executing in main project directory');
     }
 
     // Initialize execution state
@@ -611,17 +754,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setTaskExecutions((prev) => new Map(prev).set(taskId, initialState));
     partialLines.current.delete(taskId);
 
-    // Build execution prompt — use worktree path
+    // Build execution prompt — include plan steps if available
+    const planSteps = task.plan?.steps
+      ? '\n\nIMPLEMENTATION PLAN (execute each step by making REAL file changes):\n' + task.plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n') + '\n\nFiles to modify: ' + (task.plan.filesToModify?.join(', ') || 'as needed') + '\n\nAfter completing each step, output [STEP_COMPLETE:N] where N is the step number.'
+      : '';
+
     const prompt = [
       `Task: ${task.title}`,
       '',
       `Description: ${task.description}`,
+      planSteps,
       '',
       `Project directory: ${executionPath}`,
       '',
-      'Work through this task step by step. Use available tools to explore the codebase, make changes, and verify your work.',
-      'IMPORTANT: All file operations must be within the project directory shown above.',
+      'IMPORTANT: You must make ACTUAL code changes using file_edit and file_write tools. Do NOT just analyze or describe changes — IMPLEMENT them. Start now.',
     ].join('\n');
+
+    appendExecutionOutput(taskId, `Execution path: ${executionPath}`);
+    appendExecutionOutput(taskId, `Plan steps: ${task.plan?.steps?.length ?? 0}`);
 
     // Stream using the existing workspace agent
     const cancel = streamWorkspaceEngine({
@@ -630,11 +780,27 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       userMessage: prompt,
       projectPath: executionPath,
       freshConversation: true,
+      executionMode: 'auto',
       onTextDelta: (text) => {
         appendStreamText(taskId, text);
+        // Detect step completion markers: [STEP_COMPLETE:N]
+        const stepMatch = text.match(/\[STEP_COMPLETE:(\d+)\]/);
+        if (stepMatch) {
+          const stepNum = parseInt(stepMatch[1], 10);
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId || !t.plan) return t;
+              const steps = t.plan.steps.map((s, i) =>
+                i + 1 === stepNum ? { ...s, status: 'done' as const } : i + 1 === stepNum + 1 ? { ...s, status: 'in_progress' as const } : s,
+              );
+              return { ...t, plan: { ...t.plan, steps }, updatedAt: Date.now() };
+            }),
+          );
+        }
       },
       onToolCall: (_id, name) => {
         updateExecution(taskId, { activeToolName: name });
+        appendExecutionOutput(taskId, `> [tool: ${name}]`);
       },
       onToolResult: (_id, name, result) => {
         updateExecution(taskId, { activeToolName: null });
@@ -651,11 +817,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         updateExecution(taskId, { status: 'done', activeToolName: null, cancel: null });
         executionCancels.current.delete(taskId);
 
-        // Transition to review in a single setTasks call to avoid race conditions
+        // Mark all plan steps as done on completion + generate review summary
         setTasks((prev) =>
           prev.map((t) => {
             if (t.id !== taskId) return t;
-            const updated = { ...t, status: 'review' as TaskStatus, executionCompletedAt: Date.now(), updatedAt: Date.now() };
+            const plan = t.plan ? { ...t.plan, steps: t.plan.steps.map((s) => ({ ...s, status: 'done' as const })) } : t.plan;
+            // Build a brief summary from the execution output
+            const execState = taskExecutions.get(taskId);
+            const outputLines = execState?.output ?? [];
+            const toolCalls = outputLines.filter((l) => l.startsWith('[')).length;
+            const summary = `Executed ${plan?.steps?.length ?? 0} plan steps with ${toolCalls} tool operations. ${t.worktreeBranch ? `Changes on branch ${t.worktreeBranch}.` : ''}`;
+            const updated = { ...t, plan, status: 'review' as TaskStatus, reviewSummary: summary, executionCompletedAt: Date.now(), updatedAt: Date.now() };
             persistTask(updated);
             return updated;
           }),
@@ -883,9 +1055,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (available <= 0) return;
 
     for (const task of queued.slice(0, available)) {
-      if (!taskExecutions.has(task.id)) {
-        executeTask(task.id);
-      }
+      const exec = taskExecutions.get(task.id);
+      // Only skip if there's an actively running execution (not a completed planning state)
+      if (exec?.status === 'running') continue;
+      executeTask(task.id);
     }
   }, [tasks, project, taskExecutions, executeTask]);
 
@@ -974,9 +1147,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       setSelectedTaskId,
       tasks,
       addTask,
+      editTask,
       createTaskFromNaturalLanguage,
       generatePlan,
       approvePlan,
+      replanTask,
       updateTaskStatus,
       removeTask,
       executeTask,
@@ -1009,7 +1184,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [
       project, activeEngine, selectedTaskId, tasks, plugins, allCapabilities, autoReviewEnabled, taskExecutions,
       workspaceTerminals, ideas, roadmapPhases, insightMessages, changelogReleases, engineStreams,
-      addTask, createTaskFromNaturalLanguage, generatePlan, approvePlan, updateTaskStatus, removeTask, executeTask, reviewTask, mergeTask,
+      addTask, editTask, createTaskFromNaturalLanguage, generatePlan, approvePlan, replanTask, updateTaskStatus, removeTask, executeTask, reviewTask, mergeTask,
       startEngineStream, cancelEngineStream,
       convertIdeaToTask, convertFeatureToTask,
       installPlugin, removePlugin, togglePlugin, updatePluginConfig,

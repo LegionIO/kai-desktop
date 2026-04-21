@@ -225,6 +225,9 @@ const appAPI = {
     showInFinder: (projectPath: string) => ipcRenderer.invoke('git:show-in-finder', projectPath) as Promise<{ success: boolean }>,
     remoteUrl: (projectPath: string) => ipcRenderer.invoke('git:remote-url', projectPath) as Promise<{ url: string; error?: string }>,
     openUrl: (url: string) => ipcRenderer.invoke('git:open-url', url) as Promise<{ success: boolean }>,
+    discard: (projectPath: string, filePaths: string[]) => ipcRenderer.invoke('git:discard', projectPath, filePaths) as Promise<{ success: boolean; error?: string }>,
+    showFileInFinder: (projectPath: string, filePath: string) => ipcRenderer.invoke('git:show-file-in-finder', projectPath, filePath) as Promise<{ success: boolean }>,
+    openFileInEditor: (projectPath: string, filePath: string) => ipcRenderer.invoke('git:open-file-in-editor', projectPath, filePath) as Promise<{ success: boolean; error?: string }>,
     diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch', projectPath, baseBranch, taskBranch) as Promise<{ diff: string; error?: string }>,
     diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch-stat', projectPath, baseBranch, taskBranch) as Promise<{ files: Array<{ status: string; path: string }>; error?: string }>,
     diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => ipcRenderer.invoke('git:diff-branch-file', projectPath, baseBranch, taskBranch, filePath) as Promise<{ diff: string; error?: string }>,
@@ -242,6 +245,13 @@ const appAPI = {
       ipcRenderer.on('workspace-tasks:changed', handler);
       return () => { ipcRenderer.removeListener('workspace-tasks:changed', handler); };
     },
+  },
+
+  projects: {
+    listRecent: () => ipcRenderer.invoke('projects:list-recent') as Promise<{ projects: Array<{ path: string; name: string; lastOpened: number }> }>,
+    addRecent: (project: { path: string; name: string }) => ipcRenderer.invoke('projects:add-recent', project) as Promise<{ ok: boolean }>,
+    removeRecent: (projectPath: string) => ipcRenderer.invoke('projects:remove-recent', projectPath) as Promise<{ ok: boolean }>,
+    clone: (url: string, destPath: string) => ipcRenderer.invoke('git:clone', url, destPath) as Promise<{ success: boolean; path?: string; name?: string; error?: string }>,
   },
 
   pty: {

@@ -4,6 +4,7 @@ import {
   GitCompareIcon,
   SparklesIcon,
   FileTextIcon,
+  BookOpenIcon,
   PuzzleIcon,
   ChevronRightIcon,
   ChevronDownIcon,
@@ -13,6 +14,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/providers/WorkspaceProvider';
 import { TaskQuickInput } from './TaskQuickInput';
+import { RepositorySelector } from './RepositorySelector';
 import type { WorkspaceEngine, PluginSidebarItem, TaskStatus } from '../../../shared/workspace-types';
 
 /* ── Status section config ───────────────────────────────── */
@@ -43,6 +45,8 @@ const WORKSPACE_NAV: WorkspaceNavItem[] = [
   { engine: 'git', label: 'Git', Icon: GitCompareIcon },
   { engine: 'analysis', label: 'Analysis', Icon: SparklesIcon },
   { engine: 'changelog', label: 'Changelog', Icon: FileTextIcon },
+  { engine: 'context', label: 'Context', Icon: BookOpenIcon },
+  { engine: 'worktrees', label: 'Worktrees', Icon: GitBranchIcon },
 ];
 
 /* ── Component ─────────────────────────────────────────── */
@@ -52,7 +56,7 @@ export const WorkspaceSidebar: FC = () => {
     project, setProject, activeEngine, setActiveEngine,
     selectedTaskId, setSelectedTaskId,
     tasks, taskExecutions, plugins, engineStreams,
-    createTaskFromNaturalLanguage,
+    addTask,
   } = useWorkspace();
 
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -100,25 +104,59 @@ export const WorkspaceSidebar: FC = () => {
     return items;
   }, [plugins]);
 
-  if (!project) return null;
+  if (!project) {
+    return (
+      <div className="relative flex h-full flex-col overflow-hidden">
+        <div className="shrink-0">
+          <RepositorySelector />
+        </div>
+        <div className="flex flex-1 items-center justify-center px-4 text-center">
+          <p className="text-xs text-muted-foreground/50">Select a repository to get started</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Project header */}
-      <div className="shrink-0 border-b border-border/50 px-3 py-3">
-        <div className="text-sm font-semibold text-foreground truncate">{project.name}</div>
-        <div className="mt-0.5 text-[10px] text-muted-foreground/50 truncate">{project.path}</div>
+    <div className="relative flex h-full flex-col overflow-hidden">
+      {/* Repository selector */}
+      <div className="shrink-0">
+        <RepositorySelector />
       </div>
 
       {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto">
         {/* TASKS section */}
         <div className="px-2 pt-3">
-          <div className="px-1 pb-1.5 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/50">Tasks</div>
+          <button
+            type="button"
+            onClick={() => { setSelectedTaskId(null); setActiveEngine('tasks'); }}
+            className={cn(
+              'flex w-full items-center gap-2 rounded-lg px-2 py-1 mb-1 text-[9px] font-semibold uppercase tracking-wider transition-colors',
+              activeEngine === 'tasks' && !selectedTaskId
+                ? 'text-primary bg-primary/5'
+                : 'text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/10',
+            )}
+          >
+            Task Board
+          </button>
 
           {/* Quick task creation */}
           <div className="mb-2">
-            <TaskQuickInput onSubmit={createTaskFromNaturalLanguage} />
+            <TaskQuickInput onSubmit={async (text) => {
+              // Auto-generate labels from common keywords
+              const lower = text.toLowerCase();
+              const labels: string[] = [];
+              if (lower.includes('fix') || lower.includes('bug')) labels.push('bug-fix');
+              if (lower.includes('test')) labels.push('testing');
+              if (lower.includes('doc') || lower.includes('readme')) labels.push('documentation');
+              if (lower.includes('refactor')) labels.push('refactor');
+              if (lower.includes('feature') || lower.includes('add')) labels.push('feature');
+              if (lower.includes('style') || lower.includes('css') || lower.includes('ui')) labels.push('ui');
+              if (lower.includes('perf') || lower.includes('optim')) labels.push('performance');
+              if (lower.includes('security') || lower.includes('auth')) labels.push('security');
+              addTask(text, text, 'medium', labels.length > 0 ? labels.slice(0, 3) : undefined);
+            }} />
           </div>
 
           {/* Task status sections */}
@@ -161,14 +199,16 @@ export const WorkspaceSidebar: FC = () => {
                     {sectionTaskList.map((task) => {
                       const isSelected = selectedTaskId === task.id && activeEngine === 'task-thread';
                       const isRunning = taskExecutions.has(task.id) && taskExecutions.get(task.id)?.status === 'running';
+                      const isDefining = task.status === 'defining';
 
                       return (
                         <button
                           key={task.id}
                           type="button"
-                          onClick={() => handleTaskClick(task.id)}
+                          onClick={() => { if (!isDefining) handleTaskClick(task.id); }}
                           className={cn(
                             'flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[11px] transition-colors',
+                            isDefining ? 'cursor-default text-muted-foreground/60' :
                             isSelected
                               ? 'bg-primary/10 text-primary'
                               : 'text-muted-foreground hover:bg-muted/20 hover:text-foreground',

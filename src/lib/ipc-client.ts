@@ -209,6 +209,9 @@ type AppAPI = {
     showInFinder: (projectPath: string) => Promise<{ success: boolean }>;
     remoteUrl: (projectPath: string) => Promise<{ url: string; error?: string }>;
     openUrl: (url: string) => Promise<{ success: boolean }>;
+    discard: (projectPath: string, filePaths: string[]) => Promise<{ success: boolean; error?: string }>;
+    showFileInFinder: (projectPath: string, filePath: string) => Promise<{ success: boolean }>;
+    openFileInEditor: (projectPath: string, filePath: string) => Promise<{ success: boolean; error?: string }>;
     diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ diff: string; error?: string }>;
     diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ files: Array<{ status: string; path: string }>; error?: string }>;
     diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => Promise<{ diff: string; error?: string }>;
@@ -221,6 +224,12 @@ type AppAPI = {
     put: (projectPath: string, task: WorkspaceTask) => Promise<{ ok: boolean }>;
     delete: (projectPath: string, taskId: string) => Promise<{ ok: boolean }>;
     onChanged: (callback: (data: { projectPath: string }) => void) => () => void;
+  };
+  projects: {
+    listRecent: () => Promise<{ projects: Array<{ path: string; name: string; lastOpened: number }> }>;
+    addRecent: (project: { path: string; name: string }) => Promise<{ ok: boolean }>;
+    removeRecent: (projectPath: string) => Promise<{ ok: boolean }>;
+    clone: (url: string, destPath: string) => Promise<{ success: boolean; path?: string; name?: string; error?: string }>;
   };
   pty: {
     create: (id: string, cwd: string, cols?: number, rows?: number) => Promise<{ id: string; pid: number }>;

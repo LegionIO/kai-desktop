@@ -1059,13 +1059,17 @@ function AppShell() {
             </div>
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="min-h-0 flex-1 overflow-y-auto">
-                <ConversationList
-                  activeConversationId={activeConversationId}
-                  activeThreadMode={threadMode}
-                  onSwitchConversation={handleSwitchConversation}
-                  onNewConversation={handleNewConversation}
-                  onDeleteConversation={handleDeleteConversation}
-                />
+                {activeView === WORKSPACE_VIEW ? (
+                  <WorkspaceSidebar />
+                ) : (
+                  <ConversationList
+                    activeConversationId={activeConversationId}
+                    activeThreadMode={threadMode}
+                    onSwitchConversation={handleSwitchConversation}
+                    onNewConversation={handleNewConversation}
+                    onDeleteConversation={handleDeleteConversation}
+                  />
+                )}
               </div>
               {activeView !== WORKSPACE_VIEW && (
                 <>
@@ -1108,7 +1112,8 @@ function AppShell() {
 
           {/* Main content area */}
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            {/* Interactive title bar */}
+            {/* Interactive title bar — only shown outside workspace view */}
+            {activeView !== WORKSPACE_VIEW && (
             <div className={`${titleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
               {isMobile && (
@@ -1123,6 +1128,8 @@ function AppShell() {
               <div className="titlebar-no-drag min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Settings</span>
+                ) : activeView === WORKSPACE_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Workspace</span>
                 ) : activePluginPanel ? (
                   <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
                 ) : activeConversationId ? (
@@ -1188,6 +1195,7 @@ function AppShell() {
               </div>
               </div>
             </div>
+            )}
             <PluginBannerSlot />
             <div className="min-h-0 flex-1 overflow-hidden">
               {activeView === SETTINGS_VIEW ? (

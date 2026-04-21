@@ -58,10 +58,13 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
   ].join(' '),
 
   execution: [
-    'You are an autonomous software engineer. You have been assigned a task to implement.',
-    'Plan your approach, then execute using the available tools (file_read, file_write, file_edit, sh, glob, file_search).',
-    'Work step by step: 1) Understand the codebase, 2) Plan changes, 3) Implement, 4) Verify.',
-    'Report progress as you work. If you encounter issues, explain them clearly.',
+    'You are an autonomous software engineer that WRITES CODE. You are NOT an assistant — you are a code implementer.',
+    'Your ONLY job is to use tools to make real file changes. You MUST call file_edit, file_write, or sh tools.',
+    'WORKFLOW: 1) Use file_read to understand current code. 2) Use file_edit or file_write to make changes. 3) Use sh to run tests.',
+    'Start by reading the first file that needs changes, then edit it. Do NOT output analysis without tool calls.',
+    'After each plan step is implemented, output: [STEP_COMPLETE:N]',
+    'You have FULL permission to edit any file. Do not ask for confirmation. Just do it.',
+    'CRITICAL RULE: Your very first action must be a tool call (file_read or list_directory). Never start with just text.',
   ].join(' '),
 
   review: [
@@ -135,10 +138,10 @@ export function streamWorkspaceEngine(opts: {
   engine: string;
   userMessage: string;
   projectPath: string;
-  /** If true, create a fresh conversation instead of continuing the existing one. */
   freshConversation?: boolean;
+  executionMode?: 'auto' | 'plan-first' | 'confirm-writes';
 } & WorkspaceStreamCallbacks): () => void {
-  const { workspaceId, engine, userMessage, projectPath, freshConversation } = opts;
+  const { workspaceId, engine, userMessage, projectPath, freshConversation, executionMode } = opts;
 
   // Optionally reset conversation context
   if (freshConversation) {
@@ -173,17 +176,28 @@ export function streamWorkspaceEngine(opts: {
       error?: string;
       data?: unknown;
       subAgentConversationId?: string;
+      approvalStatus?: string;
+      approvalId?: string;
     };
 
     // Ignore events for other conversations and sub-agent events
     if (e.conversationId !== conversationId) return;
     if (e.subAgentConversationId) return;
 
+    // Auto-approve any tool calls waiting for approval (workspace execution is autonomous)
+    if (e.approvalStatus === 'pending' && e.toolCallId) {
+      app.agent.approveToolCall(e.toolCallId).catch(() => {});
+    }
+
     switch (e.type) {
       case 'text-delta':
         opts.onTextDelta?.(e.text ?? '');
         break;
       case 'tool-call':
+        // Auto-answer ask_user tools (execution is autonomous)
+        if (e.toolName === 'ask_user' && e.toolCallId) {
+          app.agent.answerToolQuestion(e.toolCallId, { answer: 'Yes, proceed with the implementation.' }).catch(() => {});
+        }
         opts.onToolCall?.(e.toolCallId ?? '', e.toolName ?? 'unknown', e.args);
         break;
       case 'tool-result':
@@ -219,6 +233,7 @@ export function streamWorkspaceEngine(opts: {
     undefined,  // profile key
     false,      // fallback enabled
     projectPath,
+    executionMode ?? 'auto',  // default to auto for workspace engines
   ).catch((err: unknown) => {
     opts.onError?.((err as Error).message ?? String(err));
     cleanup();

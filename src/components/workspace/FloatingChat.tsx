@@ -20,6 +20,15 @@ export const FloatingChat: FC = () => {
   const stream = engineStreams.get('insights');
   const isStreaming = stream?.status === 'streaming';
 
+  // Clear messages when project changes (chat is project-scoped)
+  const prevProjectRef = useRef(project?.path);
+  useEffect(() => {
+    if (project?.path !== prevProjectRef.current) {
+      setInsightMessages([]);
+      prevProjectRef.current = project?.path;
+    }
+  }, [project?.path, setInsightMessages]);
+
   // Auto-scroll on new messages
   useEffect(() => {
     if (scrollRef.current) {
@@ -179,6 +188,7 @@ export const FloatingChat: FC = () => {
             type="button"
             onClick={isStreaming ? () => cancelEngineStream('insights') : handleSend}
             disabled={!isStreaming && !input.trim()}
+            title={isStreaming ? 'Cancel' : 'Send'}
             className={cn(
               'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors',
               isStreaming

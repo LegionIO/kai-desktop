@@ -118,6 +118,7 @@ export interface WorkspaceTask {
 
   // Review
   reviewResult?: 'approved' | 'changes_requested' | 'rejected';
+  reviewSummary?: string;
 
   // Completion
   completedAt?: number;

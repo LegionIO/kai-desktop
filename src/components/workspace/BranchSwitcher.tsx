@@ -70,10 +70,14 @@ export const BranchSwitcher: FC<BranchSwitcherProps> = ({
   };
 
   const handleCreate = async () => {
-    if (!newBranchName.trim()) return;
+    let name = newBranchName.trim();
+    if (!name) return;
+    // Sanitize branch name for git
+    name = name.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9_.\-/]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    if (!name) { setError('Invalid branch name'); return; }
     setSwitching(true);
     setError('');
-    const result = await onCreateBranch(newBranchName.trim());
+    const result = await onCreateBranch(name);
     setSwitching(false);
     if (result.success) {
       setIsOpen(false);
