@@ -4,7 +4,7 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { join } from 'path';
 import { homedir } from 'os';
 import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry, type ResolvedStreamConfig } from '../agent/model-catalog.js';
-import { streamAgentResponse, streamWithFallback } from '../agent/mastra-agent.js';
+import { streamAgentResponse, streamWithFallback, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -180,7 +180,7 @@ async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Pro
   const parts = [
     basePrompt,
     `Current working directory for this conversation: ${cwd}`,
-    'Use this directory as the default base path for shell and filesystem work unless the user explicitly chooses another path.',
+    'IMPORTANT: Use this directory as the default base path for ALL tool calls (mastra_workspace_grep, mastra_workspace_list_files, mastra_workspace_execute_command, mastra_workspace_read_file, mastra_workspace_write_file, mastra_workspace_edit_file). When a tool accepts a `path` parameter, either omit it to use the working directory automatically, or pass this exact directory. NEVER navigate the filesystem from / or /Users to find the project — the working directory is already set.',
   ];
 
   // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
@@ -424,7 +424,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     const modelEntry = streamConfig?.primaryModel ?? null;
 
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
-    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length}`);
+    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length} cwd=${effectiveCwd} executionMode=${executionMode ?? 'auto'}`);
 
     // Track the model key for usage attribution
     activeStreamModelKeys.set(
@@ -956,8 +956,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
               observer?.onToolExecutionStart(state);
 
               // In confirm-writes mode, block mutating tools until user approves
-              const MUTATING_TOOLS = new Set(['file_write', 'file_edit', 'sh']);
-              if (executionMode === 'confirm-writes' && MUTATING_TOOLS.has(state.toolName)) {
+              if (executionMode === 'confirm-writes' && WORKSPACE_MUTATING_TOOLS.has(state.toolName)) {
                 const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
                 broadcastStreamEvent({
                   conversationId,
@@ -989,6 +988,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                 });
                 if (!approved) {
                   state.cancel();
+                  // Re-broadcast plan-first mode so the UI toggle stays in plan mode
+                  // even if a race with the tool's execute() emitted 'auto'.
+                  for (const win of BrowserWindow.getAllWindows()) {
+                    win.webContents.send('agent:execution-mode-changed', 'plan-first');
+                  }
+                  broadcastToWebClients('agent:execution-mode-changed', 'plan-first');
+                  // Abort the stream and signal the renderer to restart in plan-first
+                  // mode so the agent can continue planning with the user.
+                  console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
+                  broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
+                  controller.abort();
+                  return;
                 }
               }
 
@@ -1038,11 +1049,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             },
           };
 
-        // Filter tools for plan-first mode (remove mutating tools as a safety net)
-        const MUTATING_TOOL_NAMES = new Set(['file_write', 'file_edit', 'sh']);
-        const activeTools = executionMode === 'plan-first'
-          ? registeredTools.filter((t) => !MUTATING_TOOL_NAMES.has(t.name))
-          : registeredTools;
+        // NOTE: Plan-first mode filtering for workspace tools (file write/edit, shell)
+        // is now handled in createWorkspaceForAgent() in mastra-agent.ts.
+        // The registeredTools array only contains custom (non-workspace) tools.
+        const activeTools = registeredTools;
 
         // Inject execution mode into config so system prompt can be augmented
         const configWithExecutionMode: AppConfig = {
@@ -1086,6 +1096,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
             enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
             pairExecuteAndStreamToolCallIds(event.toolName);
+          }
+          if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
+            // Plan mode was entered mid-stream. Abort this stream so the renderer
+            // can re-send with executionMode='plan-first' (correct system prompt + tool set).
+            console.info(`[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`);
+            broadcastStreamEvent(event);
+            broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
+            controller.abort();
+            return { conversationId };
           }
           if (event.type === 'tool-result' && event.toolCallId) {
             observer?.onToolExecutionEnd(event.toolCallId);

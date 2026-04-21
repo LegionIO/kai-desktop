@@ -34,6 +34,8 @@ import {
   FolderOpenIcon,
   ImageIcon,
   LoaderIcon,
+  MessageSquareTextIcon,
+  ArrowUpIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
@@ -100,6 +102,23 @@ export const Thread: FC<{
       setHasMessages(threadRuntime.getState().messages.length > 0);
     });
   }, [threadRuntime]);
+
+  // Prevent flash of un-scrolled content when switching to an existing thread.
+  // The library renders messages at scrollTop=0 before restoring scroll position,
+  // causing a visible jump. We set up a MutationObserver in the ref callback to
+  // detect when messages are added and immediately scroll to bottom before paint.
+  // MutationObserver callbacks fire as microtasks (after DOM mutation, before paint).
+  const viewportRefCb = useCallback((node: HTMLDivElement | null) => {
+    (viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
+    if (!node) return;
+    const mo = new MutationObserver(() => {
+      if (node.scrollHeight > node.clientHeight) {
+        node.scrollTop = node.scrollHeight;
+        mo.disconnect();
+      }
+    });
+    mo.observe(node, { childList: true, subtree: true });
+  }, [threadRuntime]); // eslint-disable-line react-hooks/exhaustive-deps
   const { uiState: pluginUIState } = usePlugins();
   const threadDecorations = (pluginUIState?.threadDecorations ?? []).filter((decoration) => (
     decoration.visible && (!decoration.conversationId || decoration.conversationId === activeConversationId)
@@ -142,7 +161,8 @@ export const Thread: FC<{
         </div>
       )}
       {mode === 'chat' ? (
-        <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
+        <ThreadPrimitive.Viewport ref={viewportRefCb} className="relative min-h-0 flex-1 overflow-y-auto">
+          <PinnedUserMessage viewportRef={viewportRef} />
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
               <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
@@ -157,7 +177,7 @@ export const Thread: FC<{
               </div>
             </div>
             <div className="sticky bottom-0 z-20">
-              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-48 bg-gradient-to-t from-background from-40% to-transparent md:h-56" />}
+              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />}
             {callState.isInCall ? (
               <CallOverlay />
             ) : (
@@ -476,6 +496,147 @@ const EmptyThreadBackground: FC = () => {
 };
 
 /**
+ * Pinned user message — sticks to the top of the viewport when the user
+ * scrolls past their last message, so they always know what they asked.
+ */
+const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null> }> = ({ viewportRef }) => {
+  const threadRuntime = useThreadRuntime();
+  const [lastUserMessage, setLastUserMessage] = useState<{
+    text: string;
+    imageCount: number;
+    fileCount: number;
+  } | null>(null);
+  const [visible, setVisible] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const observerRef = useRef<IntersectionObserver | null>(null);
+
+  // Subscribe to thread messages and extract last user message content
+  useEffect(() => {
+    const update = () => {
+      const msgs = threadRuntime.getState().messages;
+      // Find the last user message
+      let lastUser = null;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === 'user') {
+          lastUser = msgs[i];
+          break;
+        }
+      }
+      if (!lastUser || lastUser === msgs[msgs.length - 1]) {
+        // No user message, or user message is the very last message (no response yet)
+        setLastUserMessage(null);
+        return;
+      }
+      const textParts = (lastUser.content ?? [])
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+      const imageCount = (lastUser.content ?? []).filter((p) => p.type === 'image').length;
+      const fileCount = (lastUser.content ?? []).filter((p) => p.type === 'file').length;
+      setLastUserMessage(textParts || imageCount || fileCount ? { text: textParts, imageCount, fileCount } : null);
+    };
+    update();
+    return threadRuntime.subscribe(update);
+  }, [threadRuntime]);
+
+  // Collapse when the pinned message hides
+  useEffect(() => {
+    if (!visible) setExpanded(false);
+  }, [visible]);
+
+  // IntersectionObserver: watch the sentinel element on the last user message
+  useEffect(() => {
+    if (!lastUserMessage) {
+      setVisible(false);
+      return;
+    }
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    // Clean up previous observer
+    observerRef.current?.disconnect();
+
+    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
+    const sentinel = sentinels[sentinels.length - 1];
+    if (!sentinel) {
+      setVisible(false);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        // Show pinned message when the original is NOT intersecting (scrolled away)
+        setVisible(!entry.isIntersecting);
+      },
+      { root: viewport, threshold: 0 },
+    );
+    observer.observe(sentinel);
+    observerRef.current = observer;
+
+    return () => observer.disconnect();
+  }, [lastUserMessage, viewportRef]);
+
+  const scrollToOriginal = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
+    const sentinel = sentinels[sentinels.length - 1];
+    sentinel?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [viewportRef]);
+
+  if (!lastUserMessage) return null;
+
+  return (
+    <div
+      className={`sticky top-0 z-[35] transition-all duration-200 ${
+        visible
+          ? 'pt-14 md:pt-16 translate-y-0 opacity-100'
+          : 'h-0 overflow-hidden pointer-events-none opacity-0'
+      }`}
+    >
+      <div className="mx-auto flex w-full max-w-5xl justify-end px-3 pr-5 md:px-6 md:pr-8">
+        <div className="max-w-[88%] md:max-w-[72%]">
+          <div
+            className="ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
+            style={{
+              backgroundColor: 'var(--app-user-bubble)',
+              borderColor: 'var(--app-user-bubble-border)',
+            }}
+          >
+            {/* Expandable text area — grows to the left of the icons */}
+            {expanded && (
+              <div className="min-w-0 animate-in fade-in slide-in-from-right-2 duration-150">
+                <p className="px-4 py-2.5 text-sm leading-6">{lastUserMessage.text}</p>
+              </div>
+            )}
+
+            {/* Action buttons — always anchored right, never move */}
+            <div className="flex shrink-0 items-start gap-0.5 px-2 py-1.5">
+              <button
+                type="button"
+                onClick={() => setExpanded((e) => !e)}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                title={expanded ? 'Collapse message' : 'Show message'}
+              >
+                <MessageSquareTextIcon className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={scrollToOriginal}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                title="Scroll to message"
+              >
+                <ArrowUpIcon className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/**
  * Wrapper that fades the splash IN (500ms) when the thread is empty,
  * then fades it OUT (300ms) when the first message is sent.
  *
@@ -554,7 +715,7 @@ const UserMessage: FC = () => {
     ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
     : true;
   return (
-    <MessagePrimitive.Root className="group mb-6 flex justify-end">
+    <MessagePrimitive.Root className="group mb-6 flex justify-end" data-pinned-sentinel>
       <div className="max-w-[88%] md:max-w-[72%]">
         <div
           className="w-fit ml-auto rounded-xl border px-4 py-2.5 text-foreground"

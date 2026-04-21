@@ -1,10 +1,6 @@
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ComputerSession } from '../../shared/computer-use.js';
-import { createShellTool } from './shell.js';
-import { createFileReadTool } from './file-read.js';
-import { createFileWriteTool, createFileEditTool } from './file-write.js';
-import { createGrepTool, createGlobTool, createListDirectoryTool } from './file-search.js';
 import { connectAllMcpServers } from './mcp-client.js';
 import { createMcpManageTool } from './mcp-manage.js';
 import {
@@ -164,23 +160,11 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
     config = getConfig();
   } catch {
     console.warn('[ToolRegistry] Config not available yet, registering default tools');
-    // Return basic tools even without config
-    return [
-      createFileReadTool(),
-      createFileWriteTool(),
-      createFileEditTool(),
-      createGrepTool(),
-      createGlobTool(),
-      createListDirectoryTool(),
-    ];
+    // File/shell tools are now provided by Mastra workspace — return empty for custom tools
+    return [];
   }
 
   const tools: ToolDefinition[] = [];
-
-  // Shell tool
-  if (config?.tools?.shell?.enabled !== false) {
-    tools.push(createShellTool(getConfig));
-  }
 
   // CLI tools (gh/git, brew, wget, jq, tree, python, ollama, klist, jfrog)
   // Only included if the binary exists on the system
@@ -189,15 +173,9 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
     tools.push(...buildCliTools(getConfig));
   }
 
-  // File tools
-  if (config?.tools?.fileAccess?.enabled !== false) {
-    tools.push(createFileReadTool());
-    tools.push(createFileWriteTool());
-    tools.push(createFileEditTool());
-    tools.push(createGrepTool(getConfig));
-    tools.push(createGlobTool(getConfig));
-    tools.push(createListDirectoryTool());
-  }
+  // NOTE: File tools (read, write, edit, grep, glob, list_directory) and shell (sh)
+  // are now provided by Mastra workspace tools via createWorkspaceForAgent() in mastra-agent.ts.
+  // They are no longer registered here as custom ToolDefinition instances.
 
   // Web tools
   if (config?.tools?.webFetch?.enabled !== false) {

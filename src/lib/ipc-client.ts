@@ -114,6 +114,9 @@ type AppAPI = {
   shell: {
     openPath: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
   };
+  plans: {
+    readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
+  };
   platform: {
     homedir: () => Promise<string>;
   };

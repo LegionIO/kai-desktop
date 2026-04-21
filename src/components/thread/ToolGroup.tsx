@@ -1,4 +1,4 @@
-import { useState, useCallback, type FC } from 'react';
+import { useState, useCallback, useEffect, useRef, type FC } from 'react';
 import { CodeBlock } from './CodeBlock';
 import { MarkdownText } from './MarkdownText';
 import { ElapsedBadge } from './ElapsedBadge';
@@ -12,6 +12,7 @@ import {
   ScissorsIcon,
   DownloadIcon,
   FileIcon,
+  FileTextIcon,
   FolderIcon,
   ExternalLinkIcon,
   TerminalIcon,
@@ -20,9 +21,11 @@ import {
   BookOpenIcon,
   ScrollTextIcon,
   SendHorizontalIcon,
+  XIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { usePlanPanel } from '@/providers/PlanPanelContext';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -74,6 +77,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
+  const planPanelCtx = usePlanPanel();
+  const onOpenPlan = planPanelCtx?.openPlan;
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
@@ -86,9 +91,20 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const todoItems = detectTodoItems(part);
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
   const approvalStatus = localApproval ?? part.approvalStatus;
-  const isPendingApproval = approvalStatus === 'pending';
+  // If the tool already has a result, it was already approved/executed in a prior
+  // session — don't re-show the approval modal on conversation reload.
+  const isPendingApproval = approvalStatus === 'pending' && !hasResult;
   const isPlanApproval = part.toolName === 'exit_plan_mode';
   const isAskUser = part.toolName === 'ask_user';
+
+  // Extract plan content and filename from exit_plan_mode args
+  const planArgs = isPlanApproval && part.args && typeof part.args === 'object' ? part.args as Record<string, unknown> : null;
+  const planContent = planArgs?.planContent ? String(planArgs.planContent) : null;
+  const planFileName = planArgs?.planTitle
+    ? String(planArgs.planTitle).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) + '.md'
+    : (part.result && typeof part.result === 'object' && (part.result as Record<string, unknown>).planName)
+      ? String((part.result as Record<string, unknown>).planName)
+      : null;
 
   const handleApprove = useCallback(() => {
     setLocalApproval('approved');
@@ -146,16 +162,33 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           toolCallId={part.approvalId ?? part.toolCallId}
           args={part.args}
           onSubmit={() => setLocalApproval('approved')}
+          onCancel={handleReject}
         />
       )}
-      {approvalStatus === 'approved' && isAskUser && (
+      {!isPendingApproval && isAskUser && (approvalStatus === 'approved' || hasResult) && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
           <span>Answered</span>
         </div>
       )}
-      {/* Tool approval — plan mode exit */}
-      {isPendingApproval && isPlanApproval && (
+      {/* Tool approval — plan mode exit: "Kai's Plan" card */}
+      {isPlanApproval && planContent && (
+        <PlanApprovalCard
+          planContent={planContent}
+          planFileName={planFileName}
+          isPendingApproval={isPendingApproval}
+          approvalStatus={approvalStatus}
+          feedbackText={feedbackText}
+          onFeedbackChange={setFeedbackText}
+          onApprove={handleApprove}
+          onReject={handleReject}
+          onFeedbackSubmit={handleFeedbackSubmit}
+          onOpenPlan={onOpenPlan}
+          showFeedback={Boolean(onSendFeedback)}
+        />
+      )}
+      {/* Fallback: plan approval without planContent (legacy/edge case) */}
+      {isPendingApproval && isPlanApproval && !planContent && (
         <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-3">
           <div className="flex items-center gap-2">
             <ScrollTextIcon className="h-4 w-4 shrink-0 text-primary" />
@@ -177,26 +210,6 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
               No, keep planning
             </button>
           </div>
-          {onSendFeedback && (
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={feedbackText}
-                onChange={(e) => setFeedbackText(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleFeedbackSubmit(); }}
-                placeholder="Tell Kai what to do instead"
-                className="flex-1 rounded-lg border border-border/50 bg-background px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 outline-none focus:ring-1 focus:ring-primary/40"
-              />
-              <button
-                type="button"
-                onClick={handleFeedbackSubmit}
-                disabled={!feedbackText.trim()}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                <SendHorizontalIcon className="h-3 w-3" />
-              </button>
-            </div>
-          )}
         </div>
       )}
       {/* Tool approval — generic confirm-writes mode */}
@@ -220,13 +233,13 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           </button>
         </div>
       )}
-      {approvalStatus === 'approved' && localApproval === 'approved' && !isAskUser && (
+      {!isPendingApproval && (approvalStatus === 'approved' || (part.approvalStatus === 'pending' && hasResult)) && !isAskUser && !(isPlanApproval && planContent) && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
           <span>{isPlanApproval ? 'Plan accepted — implementing' : 'Approved'}</span>
         </div>
       )}
-      {approvalStatus === 'rejected' && !isAskUser && (
+      {approvalStatus === 'rejected' && !isAskUser && !(isPlanApproval && planContent) && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
           <SquareIcon className="h-3 w-3" />
           <span>{isPlanApproval ? 'Continuing to plan' : 'Rejected'}</span>
@@ -323,11 +336,23 @@ const QuestionnaireView: FC<{
   toolCallId: string;
   args: unknown;
   onSubmit: () => void;
-}> = ({ toolCallId, args, onSubmit }) => {
+  onCancel: () => void;
+}> = ({ toolCallId, args, onSubmit, onCancel }) => {
   const questions = parseQuestions(args);
   const [activeTab, setActiveTab] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onCancel();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onCancel]);
 
   const handleSelect = useCallback((qIdx: number, value: string) => {
     setAnswers((prev) => ({ ...prev, [qIdx]: value }));
@@ -366,29 +391,40 @@ const QuestionnaireView: FC<{
 
   return (
     <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 overflow-hidden">
-      {/* Tabs — only show when multiple questions */}
-      {questions.length > 1 && (
-        <div className="flex border-b border-border/30">
-          {questions.map((q, i) => {
-            const isAnswered = answers[i] && (answers[i] !== '__other__' || otherTexts[i]?.trim());
-            return (
-              <button
-                key={i}
-                type="button"
-                onClick={() => setActiveTab(i)}
-                className={`relative flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium transition-colors ${
-                  i === activeTab
-                    ? 'text-primary border-b-2 border-primary -mb-px'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-emerald-500" />}
-                {q.header}
-              </button>
-            );
-          })}
-        </div>
-      )}
+      {/* Header — tabs (if multiple questions) + close button */}
+      <div className="flex items-center border-b border-border/30">
+        {questions.length > 1 && (
+          <div className="flex flex-1 min-w-0">
+            {questions.map((q, i) => {
+              const isAnswered = answers[i] && (answers[i] !== '__other__' || otherTexts[i]?.trim());
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => setActiveTab(i)}
+                  className={`relative flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium transition-colors ${
+                    i === activeTab
+                      ? 'text-primary border-b-2 border-primary -mb-px'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-emerald-500" />}
+                  {q.header}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {questions.length === 1 && <div className="flex-1" />}
+        <button
+          type="button"
+          onClick={onCancel}
+          className="shrink-0 p-2 text-muted-foreground hover:text-foreground transition-colors"
+          aria-label="Cancel"
+        >
+          <XIcon className="h-3.5 w-3.5" />
+        </button>
+      </div>
 
       {/* Active question content */}
       <div className="p-3 space-y-3">
@@ -459,8 +495,9 @@ const QuestionnaireView: FC<{
           )}
         </div>
 
-        {/* Submit button */}
-        <div className="flex justify-end">
+        {/* Submit button + Esc hint */}
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-muted-foreground/60">Esc to cancel</span>
           <button
             type="button"
             onClick={handleSubmit}
@@ -471,6 +508,115 @@ const QuestionnaireView: FC<{
           </button>
         </div>
       </div>
+    </div>
+  );
+};
+
+/* ── Plan Approval Card ── */
+
+const PlanApprovalCard: FC<{
+  planContent: string;
+  planFileName: string | null;
+  isPendingApproval: boolean;
+  approvalStatus: 'pending' | 'approved' | 'rejected' | undefined;
+  feedbackText: string;
+  onFeedbackChange: (text: string) => void;
+  onApprove: () => void;
+  onReject: () => void;
+  onFeedbackSubmit: () => void;
+  onOpenPlan?: (content: string, filePath?: string) => void;
+  showFeedback: boolean;
+}> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onFeedbackSubmit, onOpenPlan, showFeedback }) => {
+  const autoOpenedRef = useRef(false);
+
+  // Auto-open the plan panel when this card first appears
+  useEffect(() => {
+    if (planContent && onOpenPlan && !autoOpenedRef.current) {
+      autoOpenedRef.current = true;
+      onOpenPlan(planContent, planFileName ?? undefined);
+    }
+  }, [planContent, planFileName, onOpenPlan]);
+
+  const handleOpenPlan = useCallback(() => {
+    onOpenPlan?.(planContent, planFileName ?? undefined);
+  }, [planContent, planFileName, onOpenPlan]);
+
+  return (
+    <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-3">
+      {/* Header: "Kai's Plan" + filename link */}
+      <div className="flex items-center gap-2">
+        <ScrollTextIcon className="h-4 w-4 shrink-0 text-primary" />
+        <span className="text-xs font-semibold text-foreground">Kai&apos;s Plan</span>
+        {planFileName && (
+          <button
+            type="button"
+            onClick={handleOpenPlan}
+            className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors"
+          >
+            <FileTextIcon className="h-3 w-3" />
+            <span className="underline underline-offset-2">{planFileName}</span>
+          </button>
+        )}
+      </div>
+
+      {/* Approval buttons */}
+      {isPendingApproval && (
+        <>
+          <div className="text-[11px] text-muted-foreground">
+            Review the plan in the side panel, then accept or reject.
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onApprove}
+              className="rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              Yes, implement this plan
+            </button>
+            <button
+              type="button"
+              onClick={onReject}
+              className="rounded-lg border border-border/70 bg-card px-3 py-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/50"
+            >
+              No, keep planning
+            </button>
+          </div>
+          {showFeedback && (
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={feedbackText}
+                onChange={(e) => onFeedbackChange(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') onFeedbackSubmit(); }}
+                placeholder="Tell Kai what to do instead"
+                className="flex-1 rounded-lg border border-border/50 bg-background px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 outline-none focus:ring-1 focus:ring-primary/40"
+              />
+              <button
+                type="button"
+                onClick={onFeedbackSubmit}
+                disabled={!feedbackText.trim()}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <SendHorizontalIcon className="h-3 w-3" />
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Post-approval states */}
+      {approvalStatus === 'approved' && (
+        <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+          <CheckIcon className="h-3 w-3" />
+          <span>Plan accepted — implementing</span>
+        </div>
+      )}
+      {approvalStatus === 'rejected' && (
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <SquareIcon className="h-3 w-3" />
+          <span>Continuing to plan</span>
+        </div>
+      )}
     </div>
   );
 };
@@ -702,7 +848,7 @@ function detectListDirResult(result: unknown): ListDirData | null {
 }
 
 function detectShResult(result: unknown, toolName: string): ShData | null {
-  if (toolName !== 'sh') return null;
+  if (toolName !== 'sh' && toolName !== 'mastra_workspace_execute_command') return null;
   if (typeof result === 'string') {
     return { stdout: result, stderr: '', exitCode: null };
   }
@@ -721,7 +867,7 @@ function detectShResult(result: unknown, toolName: string): ShData | null {
 /** Detect the smart result type for a tool call */
 function detectSmartResult(part: ToolCallPart): { type: 'file_read'; data: FileReadData } | { type: 'glob'; data: GlobData } | { type: 'list_dir'; data: ListDirData } | { type: 'sh'; data: ShData } | null {
   const result = sanitizeResultForDisplay(part.result);
-  if (part.toolName === 'file_read') {
+  if (part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') {
     const data = detectFileReadResult(result);
     if (data) return { type: 'file_read', data };
   }
@@ -729,7 +875,7 @@ function detectSmartResult(part: ToolCallPart): { type: 'file_read'; data: FileR
     const data = detectGlobResult(result);
     if (data) return { type: 'glob', data };
   }
-  if (part.toolName === 'list_directory') {
+  if (part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') {
     const data = detectListDirResult(result);
     if (data) return { type: 'list_dir', data };
   }
@@ -1058,12 +1204,18 @@ function isErrorResult(result: unknown): boolean {
 
 const toolLabels: Record<string, string> = {
   sh: 'Bash',
+  mastra_workspace_execute_command: 'Bash',
   file_read: 'Read',
+  mastra_workspace_read_file: 'Read',
   file_write: 'Write',
+  mastra_workspace_write_file: 'Write',
   file_edit: 'Edit',
+  mastra_workspace_edit_file: 'Edit',
   grep: 'Grep',
+  mastra_workspace_grep: 'Grep',
   glob: 'Glob',
   list_directory: 'List Directory',
+  mastra_workspace_list_files: 'List Files',
   agent_lattice_chat: 'Agent',
   sub_agent: 'Sub Agent',
   generate_image: 'Image Generation',
@@ -1079,13 +1231,13 @@ function getToolLabel(toolName: string): string {
 
 function getToolSummary(part: ToolCallPart): string {
   const args = part.args as Record<string, unknown>;
-  if (part.toolName === 'sh' && args.command) return String(args.command).slice(0, 60);
-  if (part.toolName === 'file_read' && args.path) return String(args.path).split('/').pop() ?? '';
-  if (part.toolName === 'file_write' && args.path) return String(args.path).split('/').pop() ?? '';
-  if (part.toolName === 'file_edit' && args.path) return String(args.path).split('/').pop() ?? '';
-  if (part.toolName === 'grep' && args.pattern) return `/${args.pattern}/`;
-  if (part.toolName === 'glob' && args.pattern) return String(args.pattern);
-  if (part.toolName === 'list_directory' && args.path) return String(args.path);
+  if ((part.toolName === 'sh' || part.toolName === 'mastra_workspace_execute_command') && args.command) return String(args.command).slice(0, 60);
+  if ((part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') && args.path) return String(args.path).split('/').pop() ?? '';
+  if ((part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file') && args.path) return String(args.path).split('/').pop() ?? '';
+  if ((part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file') && args.path) return String(args.path).split('/').pop() ?? '';
+  if ((part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') && args.pattern) return `/${args.pattern}/`;
+  if ((part.toolName === 'glob') && args.pattern) return String(args.pattern);
+  if ((part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') && args.path) return String(args.path);
   if (part.toolName === 'agent_lattice_chat') return 'Remote agent call';
   if (part.toolName === 'generate_image' && args.prompt) return String(args.prompt).slice(0, 60);
   if (part.toolName === 'generate_video' && args.prompt) return String(args.prompt).slice(0, 60);

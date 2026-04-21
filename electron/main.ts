@@ -708,7 +708,7 @@ if (gotSingleInstanceLock) {
       const win = BrowserWindow.getFocusedWindow();
       if (!win) return { canceled: true };
       const result = await dialog.showOpenDialog(win, {
-        properties: ['openDirectory'],
+        properties: ['openDirectory', 'createDirectory'],
       });
       if (result.canceled || result.filePaths.length === 0) return { canceled: true };
 
@@ -762,6 +762,22 @@ if (gotSingleInstanceLock) {
         return { path: resolved, entries };
       } catch (err) {
         return { error: String(err), entries: [] };
+      }
+    });
+
+    // Read a plan file from ~/.kai/plans/ (for the plan side panel)
+    ipcMain.handle('plans:read-file', (_event, filename: string) => {
+      try {
+        const plansDir = join(homedir(), '.kai', 'plans');
+        // Security: strip directory components and only allow reading from the plans directory
+        const safeName = String(filename).replace(/[/\\]/g, '');
+        const resolved = join(plansDir, safeName);
+        if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+          return { error: 'File not found' };
+        }
+        return { content: readFileSync(resolved, 'utf-8') };
+      } catch (err) {
+        return { error: String(err) };
       }
     });
 

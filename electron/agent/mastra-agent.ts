@@ -1,7 +1,10 @@
 import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
+import { Workspace, LocalFilesystem, LocalSandbox, createWorkspaceTools, WORKSPACE_TOOLS } from '@mastra/core/workspace';
+import type { BackgroundProcessConfig } from '@mastra/core/workspace';
 import { toStandardSchema as toJsonStandardSchema } from '@mastra/schema-compat/adapters/json-schema';
 import { z } from 'zod';
+import { homedir } from 'os';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
@@ -31,6 +34,8 @@ export type StreamEvent = {
     wasCompacted: boolean;
     extractionDurationMs: number;
   };
+  errorCategory?: string;
+  errorStatusCode?: number;
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -308,6 +313,71 @@ function isExpectedMastraStructuralEvent(type: string): boolean {
     || type === 'raw';
 }
 
+/** Mutating workspace tool names — used for confirm-writes gating and plan-mode filtering. */
+export const WORKSPACE_MUTATING_TOOLS: Set<string> = new Set([
+  WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.DELETE,
+  WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND,
+]);
+
+/**
+ * Create a Mastra Workspace with LocalFilesystem and LocalSandbox
+ * and return the workspace tools for the agent.
+ */
+async function createWorkspaceForAgent(
+  cwd: string,
+  executionMode?: string,
+  progressHook?: (toolCallId: string, stream: 'stdout' | 'stderr', data: string) => void,
+): Promise<{ workspace: Workspace; tools: Record<string, unknown> }> {
+  const backgroundProcesses: BackgroundProcessConfig | undefined = progressHook
+    ? {
+        onStdout: (data, meta) => progressHook(meta.toolCallId ?? '', 'stdout', data),
+        onStderr: (data, meta) => progressHook(meta.toolCallId ?? '', 'stderr', data),
+      }
+    : undefined;
+
+  const workspace = new Workspace({
+    filesystem: new LocalFilesystem({
+      basePath: cwd,
+      contained: false, // Agent needs unrestricted host access
+    }),
+    sandbox: new LocalSandbox({
+      workingDirectory: cwd,
+      env: process.env,
+    }),
+    tools: {
+      mastra_workspace_write_file: { requireReadBeforeWrite: true },
+      mastra_workspace_edit_file: { requireReadBeforeWrite: true },
+      mastra_workspace_execute_command: {
+        ...(backgroundProcesses ? { backgroundProcesses } : {}),
+      },
+      // Disable tools we don't need
+      mastra_workspace_delete: { enabled: false },
+      mastra_workspace_file_stat: { enabled: false },
+      mastra_workspace_mkdir: { enabled: false },
+      mastra_workspace_search: { enabled: false },
+      mastra_workspace_index: { enabled: false },
+      mastra_workspace_lsp_inspect: { enabled: false },
+      mastra_workspace_ast_edit: { enabled: false },
+      mastra_workspace_get_process_output: { enabled: false },
+      mastra_workspace_kill_process: { enabled: false },
+    },
+  });
+  await workspace.init();
+
+  const tools = await createWorkspaceTools(workspace);
+
+  // If in plan-first mode, remove mutating workspace tools
+  if (executionMode === 'plan-first') {
+    for (const name of WORKSPACE_MUTATING_TOOLS) {
+      delete (tools as Record<string, unknown>)[name];
+    }
+  }
+
+  return { workspace, tools };
+}
+
 export async function* streamAgentResponse(
   conversationId: string,
   messages: unknown[],
@@ -335,21 +405,46 @@ export async function* streamAgentResponse(
   console.info(`[Agent:upstream] messageCount=${msgArray.length} roles=[${msgArray.map((m) => m.role ?? '?').join(',')}]`);
 
   const memory = getSharedMemory(config, dbPath);
-  const mastraTools = toMastraTools(conversationId, tools, {
+
+  // Create Mastra workspace tools (file read/write/edit, grep, list, shell)
+  const effectiveCwd = options?.cwd || homedir();
+  const executionMode = config.tools?.executionMode;
+  const { workspace, tools: workspaceTools } = await createWorkspaceForAgent(
+    effectiveCwd,
+    executionMode,
+    options?.emitEvent
+      ? (toolCallId, stream, data) => {
+          options.emitEvent!({
+            conversationId,
+            type: 'tool-progress',
+            toolCallId,
+            toolName: WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND,
+            data: { stream, delta: data, output: data, bytesSeen: 0, truncated: false, stopped: false },
+          });
+        }
+      : undefined,
+  );
+
+  // Wrap custom (non-workspace) tools through the bridge
+  const mastraCustomTools = toMastraTools(conversationId, tools, {
     emitEvent: options?.emitEvent,
     onToolExecutionStart: options?.onToolExecutionStart,
     onToolExecutionEnd: options?.onToolExecutionEnd,
     augmentToolResult: options?.augmentToolResult,
   }, { cwd: options?.cwd });
 
+  // Merge: workspace tools (native Mastra) + custom tools (bridged)
+  const allTools = { ...mastraCustomTools, ...workspaceTools };
+
   const buildAgent = async (activeModelConfig: LLMModelConfig): Promise<Agent> => {
     const model = await createLanguageModelFromConfig(activeModelConfig);
     return new Agent({
       id: `${__BRAND_APP_SLUG}-${conversationId}`,
       name: __BRAND_APP_SLUG,
-      instructions: buildAgentInstructions(config.systemPrompt, config.tools?.executionMode),
+      instructions: buildAgentInstructions(config.systemPrompt, executionMode),
       model: model as AgentConfig['model'],
-      tools: mastraTools,
+      tools: allTools as AgentConfig['tools'],
+      workspace: workspace as unknown as AgentConfig['workspace'],
       ...(memory ? { memory } : {}),
     });
   };
@@ -514,6 +609,8 @@ async function* generateWithSyntheticEvents(
           conversationId,
           type: 'error',
           error: error instanceof Error ? error.message : String(error),
+          errorCategory: errorInfo.category,
+          errorStatusCode: errorInfo.statusCode,
         };
       }
       break;
@@ -663,10 +760,13 @@ async function* streamWithRealEvents(
             }
 
             emittedTerminalError = true;
+            const inStreamErrorInfo = classifyError(rawError);
             yield {
               conversationId,
               type: 'error',
               error: errorMessage,
+              errorCategory: inStreamErrorInfo.category,
+              errorStatusCode: inStreamErrorInfo.statusCode,
             };
           } else if (type === 'finish') {
             const finishReason = extractStreamFinishReason(payload);
@@ -758,8 +858,9 @@ async function* streamWithRealEvents(
           conversationId,
           type: 'error',
           error: getErrorMessage(error),
+          errorCategory: errorInfo.category,
+          errorStatusCode: errorInfo.statusCode,
         };
-        break compatibilityLoop;
       }
     }
 
@@ -965,10 +1066,13 @@ export async function* streamWithFallback(
       }
 
       // Last model also failed
+      const lastErrorInfo = classifyError(outerError);
       yield {
         conversationId,
         type: 'error',
         error: getErrorMessage(outerError),
+        errorCategory: lastErrorInfo.category,
+        errorStatusCode: lastErrorInfo.statusCode,
       };
       yield { conversationId, type: 'done' };
       return;
@@ -997,16 +1101,19 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
       '',
       'PLAN MODE ACTIVE:',
       '- You are in planning mode. You MUST NOT make any edits, run non-readonly tools, or otherwise make changes to the system.',
-      '- Only use read-only tools (file_read, grep, glob, list_directory, web_fetch, web_search).',
-      '- Do NOT use file_write, file_edit, or sh tools — they are not available in this mode.',
+      '- Only use read-only tools (mastra_workspace_read_file, mastra_workspace_grep, mastra_workspace_list_files, web_fetch, web_search).',
+      '- Do NOT use mastra_workspace_write_file, mastra_workspace_edit_file, or mastra_workspace_execute_command tools — they are not available in this mode.',
       '- Be extremely thorough in your exploration. Read all relevant files, trace code paths, and understand the full picture.',
       '- Use ask_user throughout planning to clarify requirements, preferences, or decisions you cannot resolve from code alone. Never ask what you could find out by reading the code.',
-      '- Structure your plan as:',
-      '  1. Context: why this change is needed, the problem it addresses, and the intended outcome',
-      '  2. A clear, step-by-step implementation plan describing exactly what changes you would make',
-      '  3. Paths of critical files to be modified, and existing functions/utilities to reuse',
-      '  4. Expected impact, risks, edge cases, and how to verify the changes',
+      '- When your plan is ready, call exit_plan_mode with the planContent parameter containing the full plan as markdown. Optionally provide a planTitle for the filename.',
+      '- The plan markdown should be structured as:',
+      '  1. A top-level heading with the plan title (e.g. "# Plan: Add Dark Mode")',
+      '  2. Context: why this change is needed, the problem it addresses, and the intended outcome',
+      '  3. A clear, step-by-step implementation plan describing exactly what changes you would make',
+      '  4. Paths of critical files to be modified, and existing functions/utilities to reuse',
+      '  5. Expected impact, risks, edge cases, and how to verify the changes',
       '- Include only your recommended approach, not all alternatives. Be concise enough to scan quickly but detailed enough to execute.',
+      '- Do NOT write the plan as regular text in the conversation. Instead, pass the entire plan as the planContent argument to exit_plan_mode. The user will see it in a dedicated side panel.',
       '- Your turn should ONLY end by either using ask_user (to clarify requirements) or calling exit_plan_mode (to present the plan for approval). Do not stop for any other reason.',
       '- Use exit_plan_mode to request plan approval. Do NOT ask about plan approval via text — phrases like "Is this plan okay?" or "Should I proceed?" MUST use exit_plan_mode instead.',
       '- IMPORTANT: If exit_plan_mode has been called and its result indicates plan mode was deactivated, these restrictions no longer apply. You may proceed with edits and tool use on the next turn.',
@@ -1015,7 +1122,7 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
     lines.push(
       '',
       'CONFIRMATION MODE:',
-      '- Write operations (file_write, file_edit, sh) require explicit user approval before executing.',
+      '- Write operations (mastra_workspace_write_file, mastra_workspace_edit_file, mastra_workspace_execute_command) require explicit user approval before executing.',
       '- The user will see your intended action and can approve or reject it.',
       '- Before invoking a write tool, briefly explain what the tool call will do and why.',
       '- Read-only tools execute normally without requiring approval.',
