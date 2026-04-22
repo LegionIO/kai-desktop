@@ -13,6 +13,9 @@ pnpm-lock.yaml
 .npmrc
 *.tsbuildinfo
 
+# Debug logs written during development (see CLAUDE.md § Debug Logging)
+debug-logs/
+
 # Auto-generated from electron-builder.template.yml by scripts/generate-builder-config.ts
 electron-builder.yml
 

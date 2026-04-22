@@ -892,6 +892,14 @@ async function getTitleSettings(): Promise<TitleSettings> {
   }
 }
 
+/** Update only specific fields on a conversation without overwriting message data.
+ *  Reads the latest record from disk immediately before writing to minimize race windows. */
+async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
+  const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+  if (!latest) return;
+  await app.conversations.put({ ...latest, ...patch });
+}
+
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[]): Promise<void> {
   try {
     const settings = await getTitleSettings();
@@ -920,8 +928,8 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     titleGenInFlight.add(conversationId);
 
     try {
-      // Mark as generating
-      await app.conversations.put({ ...conv, titleStatus: 'generating' });
+      // Mark as generating — use patchConversation to avoid overwriting message data
+      await patchConversation(conversationId, { titleStatus: 'generating' });
 
       // Stagger the title request slightly so Bedrock is less likely to reject
       // it when the main response request starts at the exact same moment.
@@ -929,22 +937,18 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
 
       const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined);
       if (result.title) {
-        const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
-        if (latest) {
-          await app.conversations.put({
-            ...latest,
-            title: result.title,
-            fallbackTitle: result.title,
-            titleStatus: 'ready',
-            titleUpdatedAt: nowIso(),
-          });
-        }
+        await patchConversation(conversationId, {
+          title: result.title,
+          fallbackTitle: result.title,
+          titleStatus: 'ready',
+          titleUpdatedAt: nowIso(),
+        });
       } else {
         // Title gen returned nothing — keep the UI moving with a simple fallback.
         const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
         if (latest && latest.titleStatus === 'generating') {
           const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
-          await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
+          await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
           // If we still have no title at all, clear the dedup counter so the
           // next user message can retry title generation.
           if (!latest.title?.trim() && !fallbackTitle?.trim()) {
@@ -959,7 +963,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (latest && latest.titleStatus === 'generating') {
       const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
-      await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
+      await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
     }
     // Clear the dedup counter on error so subsequent messages can retry
     lastRetitleCount.delete(conversationId);
@@ -976,7 +980,8 @@ function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: 
       ...m,
       createdAt: m.createdAt ? new Date(m.createdAt as unknown as string) : undefined,
     }));
-    return { tree, headId: conv.headId ?? tree[tree.length - 1]?.id ?? null };
+    const headId = conv.headId ?? tree[tree.length - 1]?.id ?? null;
+    return { tree, headId };
   }
   // Convert flat messages to tree
   let parentId: string | null = null;
@@ -1048,7 +1053,7 @@ export function RuntimeProvider({
   const treeRef = useRef<StoredMessage[]>([]);
   const headIdRef = useRef<string | null>(null);
   const currentWorkingDirectoryRef = useRef<string | null>(null);
-  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const onModelFallbackRef = useRef(onModelFallback);
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
@@ -1251,8 +1256,10 @@ export function RuntimeProvider({
   }, [conversationId, activeConversationId, loadConversationState]);
 
   const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
-    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-    persistTimerRef.current = setTimeout(() => { persistConversation(conversationId, t, h, extra); }, 300);
+    const timers = persistTimersRef.current;
+    const existing = timers.get(conversationId);
+    if (existing) clearTimeout(existing);
+    timers.set(conversationId, setTimeout(() => { timers.delete(conversationId); persistConversation(conversationId, t, h, extra); }, 300));
   }, []);
 
   const setCurrentWorkingDirectory = useCallback(async (cwd: string | null) => {
@@ -1406,7 +1413,9 @@ export function RuntimeProvider({
           const { tree: curTree, headId: curHead } = streamHandlerRef.current;
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
         } else {
-          streamAccumulators.set(convId, { messages: [], headId: null });
+          // No accumulator for a non-active conversation — the stream already
+          // completed and was persisted by the done/error handler.  Drop stale events.
+          return;
         }
       }
 
@@ -1493,7 +1502,7 @@ export function RuntimeProvider({
         // from merging into the previous call's last assistant message.
         if (rtStatus === 'connected' && acc.messages.length > 0) {
           finalizeAssistantResponse(acc);
-          if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+          const _pt1 = persistTimersRef.current.get(convId); if (_pt1) { clearTimeout(_pt1); persistTimersRef.current.delete(convId); }
           streamAccumulators.delete(convId);
           forceNewAssistant.add(convId);
           persistConversation(convId, acc.messages, acc.headId, {
@@ -1665,7 +1674,7 @@ export function RuntimeProvider({
       } else if (e.type === 'error') {
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         finalizeAssistantResponse(acc);
-        if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+        const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
@@ -1678,7 +1687,7 @@ export function RuntimeProvider({
         return;
       } else if (e.type === 'done') {
         finalizeAssistantResponse(acc);
-        if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+        const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,

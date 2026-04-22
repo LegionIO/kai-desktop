@@ -23,12 +23,12 @@ export const branding = {
   productName: 'Kai',
   /** Lowercase slug used for the config directory (~/.kai/), localStorage keys, temp dirs, etc. */
   appSlug: 'kai',
+  /** Short wordmark shown in the sidebar title bar (typically uppercased). */
+  wordmark: 'KAI',
   /** macOS bundle identifier / Windows app user model ID. */
   appId: 'com.{{appSlug}}.desktop',
   /** Executable / binary name on disk. */
   executableName: '{{productName}}',
-  /** Short wordmark shown in the sidebar title bar (typically uppercased). */
-  wordmark: 'KAI',
   /** One-line description for package.json and store listings. */
   description: '{{productName}} - Local AI Assistant',
 

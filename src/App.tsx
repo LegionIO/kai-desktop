@@ -202,6 +202,12 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
     app.conversations.get(conversationId).then((conv: unknown) => {
       const record = conv as ConversationRecord | null;
       if (!record) return;
+      // Skip if values haven't actually changed to avoid unnecessary writes
+      // that could race with concurrent stream persistence.
+      if (record.selectedModelKey === selectedModelKey
+        && record.selectedProfileKey === selectedProfileKey
+        && record.fallbackEnabled === fallbackEnabled
+        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
       app.conversations.put({
         ...record,
         selectedModelKey,
@@ -305,53 +311,10 @@ function getComputerSessionForConversation(
   return sessionsByConversation.get(conversationId)?.[0];
 }
 
-function isDisposableNewConversation(conversation: ConversationRecord | null, hasComputerSessions = false): boolean {
-  if (!conversation) return false;
-  if (hasComputerSessions) return false; // Never auto-delete conversations with computer-use history
-
-  const hasMessages = Array.isArray(conversation.messages) && conversation.messages.length > 0;
-  const hasTreeMessages = Array.isArray(conversation.messageTree) && conversation.messageTree.length > 0;
-  const hasTitle = Boolean(conversation.title?.trim() || conversation.fallbackTitle?.trim());
-
-  return !hasTitle
-    && !hasMessages
-    && !hasTreeMessages
-    && (conversation.messageCount ?? 0) === 0
-    && (conversation.userMessageCount ?? 0) === 0
-    && conversation.runStatus === 'idle';
-}
-
 type ConversationsStore = {
   conversations?: Record<string, ConversationRecord>;
   activeConversationId?: string | null;
 };
-
-/**
- * Delete all empty "Untitled Thread" entries except the currently active one.
- * If a conversation list is provided, uses it directly; otherwise fetches from IPC.
- * Returns the IDs of deleted conversations (for animation).
- */
-async function cleanupEmptyConversations(
-  activeId?: string | null,
-  existingList?: ConversationRecord[],
-  sessionsByConversation?: Map<string, ComputerSession[]>,
-): Promise<string[]> {
-  try {
-    const list = existingList ?? (await app.conversations.list()) as ConversationRecord[];
-    const disposableIds = list
-      .filter((conv) => conv.id !== activeId && isDisposableNewConversation(conv, Boolean(sessionsByConversation?.has(conv.id))))
-      .map((conv) => conv.id);
-
-    if (disposableIds.length === 0) return [];
-
-    console.info(`[Conversations] Cleaning up ${disposableIds.length} empty conversations`);
-    await Promise.all(disposableIds.map((id) => app.conversations.delete(id)));
-    return disposableIds;
-  } catch (err) {
-    console.warn('[Conversations] Cleanup failed:', err);
-    return [];
-  }
-}
 
 type AppView = string;
 
@@ -465,8 +428,6 @@ function AppShell() {
         );
         applyStore({ activeConversationId: id, conversations });
 
-        // Clean up historical empty conversations on load
-        void cleanupEmptyConversations(id, list as ConversationRecord[], cuSessionsByConversation);
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
@@ -597,26 +558,9 @@ function AppShell() {
     };
   }, [dragState, sidebarWidth, updateConfig]);
 
-  const cleanupAbandonedConversation = useCallback(async (nextConversationId?: string | null) => {
-    if (!activeConversationId || activeConversationId === nextConversationId) return;
-
-    try {
-      const conversation = await app.conversations.get(activeConversationId) as ConversationRecord | null;
-      const hasComputerSessions = cuSessionsByConversation.has(activeConversationId);
-      if (!isDisposableNewConversation(conversation, hasComputerSessions)) return;
-
-      await app.conversations.delete(activeConversationId);
-      setActiveConversationId(null);
-      setActiveConversationTitle('Untitled Thread');
-    } catch {
-      // Leave the current conversation intact if cleanup fails.
-    }
-  }, [activeConversationId, cuSessionsByConversation]);
-
   const handleSwitchConversation = useCallback(async (id: string) => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
-    await cleanupAbandonedConversation(id);
     await app.conversations.setActiveId(id);
     setActiveView(CHAT_VIEW);
     setActiveConversationId(id);
@@ -626,24 +570,13 @@ function AppShell() {
       conv,
       cuSessionsByConversation.get(id),
     ));
-    // Clean up any other empty conversations in the background
-    void cleanupEmptyConversations(id, undefined, cuSessionsByConversation);
-  }, [cleanupAbandonedConversation, cuSessionsByConversation, isMobile]);
+  }, [cuSessionsByConversation, isMobile]);
 
   const handleNewConversation = useCallback(async () => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
     suppressStoreSync.current = true;
     try {
-      if (activeConversationId) {
-        try {
-          const conversation = await app.conversations.get(activeConversationId) as ConversationRecord | null;
-          const hasComputerSessions = cuSessionsByConversation.has(activeConversationId);
-          if (isDisposableNewConversation(conversation, hasComputerSessions)) {
-            await app.conversations.delete(activeConversationId);
-          }
-        } catch { /* ignore */ }
-      }
       const newId = generateId();
       const now = new Date().toISOString();
       await app.conversations.put({
@@ -671,21 +604,17 @@ function AppShell() {
     } finally {
       suppressStoreSync.current = false;
     }
-  }, [activeConversationId, cuSessionsByConversation, isMobile]);
+  }, [isMobile]);
 
   const handleSettingsToggle = useCallback(async () => {
-    if (activeView !== 'settings') {
-      await cleanupAbandonedConversation();
-    }
     setActiveView((v) => v === SETTINGS_VIEW ? CHAT_VIEW : SETTINGS_VIEW);
     if (isMobile) setSidebarOpen(false);
-  }, [cleanupAbandonedConversation, activeView, isMobile]);
+  }, [activeView, isMobile]);
 
   const handleOpenSettings = useCallback(async () => {
-    await cleanupAbandonedConversation();
     setActiveView(SETTINGS_VIEW);
     if (isMobile) setSidebarOpen(false);
-  }, [cleanupAbandonedConversation, isMobile]);
+  }, [isMobile]);
 
   // Listen for Cmd+, / menu Settings
   useEffect(() => {
@@ -755,6 +684,12 @@ function AppShell() {
     app.conversations.get(activeConversationId).then((conv: unknown) => {
       const record = conv as ConversationRecord | null;
       if (!record) return;
+      // Skip if values haven't actually changed to avoid unnecessary writes
+      // that could race with concurrent stream persistence.
+      if (record.selectedModelKey === selectedModelKey
+        && record.selectedProfileKey === selectedProfileKey
+        && record.fallbackEnabled === fallbackEnabled
+        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
       app.conversations.put({
         ...record,
         selectedModelKey,
