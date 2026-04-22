@@ -85,6 +85,8 @@ export const branding = {
     '{{productName}} uses Apple Events to activate apps and inspect focused windows during local Mac computer control.',
   screenCaptureUsage:
     '{{productName}} captures your screen to enable local Mac computer control and allow the AI to see what\'s on your display.',
+  localNetworkUsage:
+    '{{productName}} connects to services on your local network (e.g. MCP servers, APIs, and plugins).',
 
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */

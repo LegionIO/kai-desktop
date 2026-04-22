@@ -36,6 +36,7 @@ mac:
     NSMicrophoneUsageDescription: "{{microphoneUsage}}"
     NSAppleEventsUsageDescription: "{{appleEventsUsage}}"
     NSScreenCaptureUsageDescription: "{{screenCaptureUsage}}"
+    NSLocalNetworkUsageDescription: "{{localNetworkUsage}}"
   target:
     - target: dmg
       arch:
