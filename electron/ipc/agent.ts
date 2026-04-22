@@ -446,6 +446,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
       let observer: ToolObserverManager | null = null;
+      // Track the provider:modelName that is producing the current response.
+      // Updated on model-fallback events so persisted messages carry the
+      // correct source even after automatic fallback.
+      let activeSourceModel = modelEntry?.modelConfig
+        ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
+        : null;
       // Compaction metadata keyed by execute-side toolCallId.
       // Populated in augmentToolResult, consumed when the matching
       // tool-result stream event is broadcast.
@@ -1133,6 +1139,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           if (event.type === 'done' && !controller.signal.aborted) {
             observerLaunchesEnabled = false;
             await waitForObserverToolExecutions();
+          }
+          if (event.type === 'model-fallback') {
+            const fbData = event.data as { toModelKey?: string } | undefined;
+            if (fbData?.toModelKey && streamConfig) {
+              const fallbackEntry = streamConfig.fallbackModels.find(
+                (m) => m.key === fbData.toModelKey,
+              );
+              if (fallbackEntry?.modelConfig) {
+                activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
+              }
+            }
+          }
+          if (event.type === 'text-delta' && activeSourceModel) {
+            (event as Record<string, unknown>).messageMeta = {
+              ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
+              sourceModel: activeSourceModel,
+            };
           }
           if (activeObserverSessions.get(conversationId) !== observerSessionId) {
             continue;

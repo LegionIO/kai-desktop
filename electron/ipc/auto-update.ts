@@ -20,7 +20,7 @@ if (isUpdateTestMode) {
       provider: 'generic',
       url: updateUrl,
       useMultipleRangeRequest: false,
-    } as any);
+    } as Parameters<typeof autoUpdater.setFeedURL>[0]);
     console.info(`[auto-update] TEST MODE: faking version ${DEV_TEST_VERSION}, url ${updateUrl}`);
   } else {
     const repo = process.env.KAI_UPDATE_REPO ?? 'legionio/kai-desktop';
@@ -31,8 +31,8 @@ if (isUpdateTestMode) {
   // Reuse the SemVer constructor from the existing currentVersion instance
   // so we get a real SemVer object without importing semver directly
   // (pnpm doesn't hoist it).
-  const SemVer = (autoUpdater.currentVersion as any).constructor;
-  (autoUpdater as any).currentVersion = new SemVer(DEV_TEST_VERSION);
+  const SemVer = (autoUpdater.currentVersion as unknown as { constructor: new (v: string) => typeof autoUpdater.currentVersion }).constructor;
+  (autoUpdater as { currentVersion: typeof autoUpdater.currentVersion }).currentVersion = new SemVer(DEV_TEST_VERSION!);
 }
 
 interface UpdateStatus {

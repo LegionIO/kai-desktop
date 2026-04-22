@@ -45,8 +45,6 @@ export const ComputerSettingsButton: FC<{
   const popover = usePopoverAlign();
   const { expanded, containerProps } = useSplitButtonHover({ popoverOpen: isOpen });
 
-  const currentTarget = TARGET_OPTIONS.find((o) => o.value === target) ?? TARGET_OPTIONS[1];
-
   return (
     <div ref={rootRef} {...containerProps} className="relative flex items-center">
       {/* Joined button group: chevron + monitor toggle */}

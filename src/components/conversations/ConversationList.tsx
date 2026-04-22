@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, ArchiveRestoreIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
+import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
@@ -110,38 +110,16 @@ function useDoubleClickConfirm(onConfirm: () => void, timeoutMs = 2500) {
   return { armed, onClick, reset };
 }
 
-/** Per-conversation delete button with single-click delete */
-const ConversationDeleteButton: FC<{ onDelete: () => Promise<void>; isDeleting: boolean }> = ({ onDelete, isDeleting }) => {
-  if (isDeleting) {
-    return <LoaderIcon className="h-3 w-3 animate-spin text-muted-foreground shrink-0" />;
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        void onDelete();
-      }}
-      className="shrink-0 rounded p-0.5 opacity-100 transition-all md:opacity-0 md:group-hover:opacity-100 hover:bg-destructive/10"
-      title="Delete conversation"
-      aria-label="Delete conversation"
-    >
-      <Trash2Icon className="h-3 w-3 text-muted-foreground hover:text-destructive" />
-    </button>
-  );
-};
-
 export const ConversationList: FC<ConversationListProps> = ({
   activeConversationId,
   activeThreadMode,
   onSwitchConversation,
   onNewConversation,
-  onDeleteConversation,
+  onDeleteConversation: _onDeleteConversation,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [, setDeletingId] = useState<string | null>(null);
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const removingIdsRef = useRef<Set<string>>(new Set());
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
