@@ -11,6 +11,7 @@ import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
 import { usePlugins } from '@/providers/PluginProvider';
+import { Tooltip } from '@/components/ui/Tooltip';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -402,42 +403,45 @@ export const ConversationList: FC<ConversationListProps> = ({
       <div className="flex items-center justify-between px-4 pb-2 pt-4">
         <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Threads</span>
         <div className="flex items-center gap-1 text-muted-foreground">
-          <button
-            ref={sortButtonRef}
-            type="button"
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => { setSortOpen((p) => !p); setFilterOpen(false); }}
-            className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${!isDefaultSort ? 'text-primary' : ''}`}
-            title="Sort threads"
-          >
-            <PanelTopOpenIcon className="h-4 w-4" />
-          </button>
-          <div className="relative">
+          <Tooltip content="Sort threads" side="bottom" sideOffset={6}>
             <button
-              ref={filterButtonRef}
+              ref={sortButtonRef}
               type="button"
               onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => { setFilterOpen((p) => !p); setSortOpen(false); }}
-              className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80"
-              title="Filter threads"
+              onClick={() => { setSortOpen((p) => !p); setFilterOpen(false); }}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${!isDefaultSort ? 'text-primary' : ''}`}
             >
-              <SlidersHorizontalIcon className="h-4 w-4" />
+              <PanelTopOpenIcon className="h-4 w-4" />
             </button>
+          </Tooltip>
+          <div className="relative">
+            <Tooltip content="Filter threads" side="bottom" sideOffset={6}>
+              <button
+                ref={filterButtonRef}
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => { setFilterOpen((p) => !p); setSortOpen(false); }}
+                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80"
+              >
+                <SlidersHorizontalIcon className="h-4 w-4" />
+              </button>
+            </Tooltip>
             {activeFilterCount > 0 && (
               <span className="absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-[9px] font-bold text-primary-foreground pointer-events-none">
                 {activeFilterCount > 9 ? '9+' : activeFilterCount}
               </span>
             )}
           </div>
-          <button
-            type="button"
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => setShowArchived((p) => !p)}
-            className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${showArchived ? 'text-primary' : ''}`}
-            title={showArchived ? 'Show active threads' : 'Show archived threads'}
-          >
-            <ArchiveIcon className="h-4 w-4" />
-          </button>
+          <Tooltip content={showArchived ? 'Show active threads' : 'Show archived threads'} side="bottom" sideOffset={6}>
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setShowArchived((p) => !p)}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${showArchived ? 'text-primary' : ''}`}
+            >
+              <ArchiveIcon className="h-4 w-4" />
+            </button>
+          </Tooltip>
           {sortOpen && (
             <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortButtonRef} />
           )}

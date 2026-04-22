@@ -36,7 +36,6 @@ import {
   LoaderIcon,
   MessageSquareTextIcon,
   ArrowUpIcon,
-  ArrowDownIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
@@ -116,10 +115,18 @@ export const Thread: FC<{
   }, []);
 
   return (
-    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col overflow-hidden">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col">
       <FadingSplash>
         <EmptyThreadBackground />
       </FadingSplash>
+      <div
+        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
+        style={{
+          opacity: hasMessages ? 1 : 0,
+          transitionDuration: hasMessages ? '0ms' : '50ms',
+          transitionDelay: hasMessages ? '0ms' : '0ms',
+        }}
+      />
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
       <FallbackBanner />
       <ComputerUseFallbackBanner />
@@ -481,129 +488,119 @@ const EmptyThreadBackground: FC = () => {
 };
 
 /**
- * User-message navigator — sticks to the top of the viewport and lets you
- * jump up/down between user messages in the thread.
+ * Pinned user message — sticks to the top of the viewport when the user
+ * scrolls past their last message, so they always know what they asked.
  */
 const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null> }> = ({ viewportRef }) => {
   const threadRuntime = useThreadRuntime();
-
-  // All user messages extracted from the thread (text + attachment counts)
-  const [userMessages, setUserMessages] = useState<
-    { text: string; imageCount: number; fileCount: number }[]
-  >([]);
-
-  // Navigation state computed from scroll position
-  const [prevIdx, setPrevIdx] = useState<number | null>(null);
-  const [nextIdx, setNextIdx] = useState<number | null>(null);
+  const [lastUserMessage, setLastUserMessage] = useState<{
+    text: string;
+    imageCount: number;
+    fileCount: number;
+  } | null>(null);
+  const [visible, setVisible] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
-  // Subscribe to thread messages and extract all user messages
+  // Subscribe to thread messages and extract last user message content
   useEffect(() => {
     const update = () => {
       const msgs = threadRuntime.getState().messages;
-      const users: { text: string; imageCount: number; fileCount: number }[] = [];
-      for (const msg of msgs) {
-        if (msg.role !== 'user') continue;
-        const textParts = (msg.content ?? [])
-          .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-          .map((p) => p.text)
-          .join('\n');
-        const imageCount = (msg.content ?? []).filter((p) => p.type === 'image').length;
-        const fileCount = (msg.content ?? []).filter((p) => p.type === 'file').length;
-        if (textParts || imageCount || fileCount) {
-          users.push({ text: textParts, imageCount, fileCount });
+      // Find the last user message
+      let lastUser = null;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === 'user') {
+          lastUser = msgs[i];
+          break;
         }
       }
-      setUserMessages(users);
+      if (!lastUser || lastUser === msgs[msgs.length - 1]) {
+        // No user message, or user message is the very last message (no response yet)
+        setLastUserMessage(null);
+        return;
+      }
+      const textParts = (lastUser.content ?? [])
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+      const imageCount = (lastUser.content ?? []).filter((p) => p.type === 'image').length;
+      const fileCount = (lastUser.content ?? []).filter((p) => p.type === 'file').length;
+      setLastUserMessage(textParts || imageCount || fileCount ? { text: textParts, imageCount, fileCount } : null);
     };
     update();
     return threadRuntime.subscribe(update);
   }, [threadRuntime]);
 
-  // Collapse preview when the widget hides
+  // Collapse when the pinned message hides
   useEffect(() => {
-    if (prevIdx === null && nextIdx === null) setExpanded(false);
-  }, [prevIdx, nextIdx]);
+    if (!visible) setExpanded(false);
+  }, [visible]);
 
-  // Scroll listener: determine which user messages are above/below the viewport
+  // Only show the indicator when the user's last message has scrolled far
+  // enough out of view that finding it again is non-trivial (at least 0.75x
+  // viewport height above the visible area).
+  // Uses scroll listener + rAF polling (not MutationObserver — that causes
+  // infinite loops because the indicator itself changing visibility mutates
+  // the DOM). The rAF polling is needed because Electron's programmatic
+  // scrollTo() (used by assistant-ui auto-scroll) may not fire DOM scroll
+  // events reliably.
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport || userMessages.length === 0) {
-      setPrevIdx(null);
-      setNextIdx(null);
+    if (!lastUserMessage) {
+      setVisible(false);
       return;
     }
+    const viewport = viewportRef.current;
+    if (!viewport) return;
 
-    let rafId = 0;
-    const compute = () => {
-      const sentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
-      if (sentinels.length === 0) {
-        setPrevIdx(null);
-        setNextIdx(null);
+    const recompute = () => {
+      const currentSentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
+      const currentSentinel = currentSentinels[currentSentinels.length - 1] as HTMLElement | undefined;
+      if (!currentSentinel) {
+        setVisible(false);
         return;
       }
+      const viewportRect = viewport.getBoundingClientRect();
+      const sentinelRect = currentSentinel.getBoundingClientRect();
+      // How far the bottom of the sentinel is above the top of the viewport.
+      // Positive means the sentinel is above the visible area (scrolled past).
+      const distanceAboveViewport = viewportRect.top - sentinelRect.bottom;
+      // Show when the sentinel is scrolled well out of view — at least 200px
+      // above the viewport top. This is a fixed threshold rather than
+      // viewport-relative to work consistently across different window sizes.
+      setVisible(distanceAboveViewport >= 200);
+    };
 
-      const viewTop = viewport.scrollTop;
-      const viewBottom = viewTop + viewport.clientHeight;
-      const threshold = 48; // px — sentinel must be this far outside the viewport to count
-
-      let prev: number | null = null;
-      let next: number | null = null;
-
-      for (let i = 0; i < sentinels.length; i++) {
-        const el = sentinels[i] as HTMLElement;
-        const top = el.offsetTop;
-        const bottom = top + el.offsetHeight;
-
-        if (bottom < viewTop + threshold) {
-          // Sentinel is above the viewport
-          prev = i;
-        } else if (top > viewBottom - threshold && next === null) {
-          // Sentinel is below the viewport
-          next = i;
-        }
+    // Poll via rAF for 1.5s after mount to catch auto-scroll settling.
+    // This is needed because Electron's programmatic scrollTo() may not
+    // fire DOM scroll events.
+    let rafId = 0;
+    const startTime = Date.now();
+    const poll = () => {
+      recompute();
+      if (Date.now() - startTime < 1500) {
+        rafId = requestAnimationFrame(poll);
       }
-
-      setPrevIdx(prev);
-      setNextIdx(next);
     };
+    rafId = requestAnimationFrame(poll);
 
-    const onScroll = () => {
-      cancelAnimationFrame(rafId);
-      rafId = requestAnimationFrame(compute);
-    };
-
-    // Initial computation
-    compute();
-
-    viewport.addEventListener('scroll', onScroll, { passive: true });
-    // Recompute when DOM changes (new messages)
-    const mo = new MutationObserver(compute);
-    mo.observe(viewport, { childList: true, subtree: true });
+    // Re-evaluate on scroll (works in browser, may not fire in Electron
+    // for programmatic scrolls)
+    viewport.addEventListener('scroll', recompute, { passive: true });
 
     return () => {
       cancelAnimationFrame(rafId);
-      viewport.removeEventListener('scroll', onScroll);
-      mo.disconnect();
+      viewport.removeEventListener('scroll', recompute);
     };
-  }, [viewportRef, userMessages.length]);
+  }, [lastUserMessage, viewportRef]);
 
-  const scrollTo = useCallback(
-    (idx: number) => {
-      const viewport = viewportRef.current;
-      if (!viewport) return;
-      const sentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
-      sentinels[idx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    },
-    [viewportRef],
-  );
+  const scrollToOriginal = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
+    const sentinel = sentinels[sentinels.length - 1];
+    sentinel?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [viewportRef]);
 
-  const visible = prevIdx !== null || nextIdx !== null;
-  const prevMsg = prevIdx !== null ? userMessages[prevIdx] : null;
-  const nextMsg = nextIdx !== null ? userMessages[nextIdx] : null;
-  const hasAnyText = (prevMsg?.text || nextMsg?.text);
-
-  if (userMessages.length === 0) return null;
+  if (!lastUserMessage) return null;
 
   return (
     <div
@@ -622,60 +619,32 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
               borderColor: 'var(--app-user-bubble-border)',
             }}
           >
-            {/* Stacked rows: each direction gets its own preview + arrow */}
-            <div className="flex min-w-0 flex-col">
-              {prevIdx !== null && (
-                <div className="flex items-center">
-                  {expanded && prevMsg?.text && (
-                    <div className="min-w-0 flex-1 animate-in fade-in slide-in-from-right-2 duration-150">
-                      <p className="line-clamp-2 px-4 py-2 text-sm leading-5 text-foreground/80">{prevMsg.text}</p>
-                    </div>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => scrollTo(prevIdx)}
-                    className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                    title="Previous user message"
-                  >
-                    <ArrowUpIcon className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              )}
-              {prevIdx !== null && nextIdx !== null && (
-                <div className="mx-2 border-t border-foreground/10" />
-              )}
-              {nextIdx !== null && (
-                <div className="flex items-center">
-                  {expanded && nextMsg?.text && (
-                    <div className="min-w-0 flex-1 animate-in fade-in slide-in-from-right-2 duration-150">
-                      <p className="line-clamp-2 px-4 py-2 text-sm leading-5 text-foreground/80">{nextMsg.text}</p>
-                    </div>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => scrollTo(nextIdx)}
-                    className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                    title="Next user message"
-                  >
-                    <ArrowDownIcon className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Toggle button for expand/collapse — sits on the right edge */}
-            {hasAnyText && (
-              <div className="flex items-center border-l border-foreground/10 px-1">
-                <button
-                  type="button"
-                  onClick={() => setExpanded((e) => !e)}
-                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                  title={expanded ? 'Collapse previews' : 'Show previews'}
-                >
-                  <MessageSquareTextIcon className="h-3.5 w-3.5" />
-                </button>
+            {/* Expandable text area — grows to the left of the icons */}
+            {expanded && (
+              <div className="min-w-0 animate-in fade-in slide-in-from-right-2 duration-150">
+                <p className="px-4 py-2.5 text-sm leading-6">{lastUserMessage.text}</p>
               </div>
             )}
+
+            {/* Action buttons — always anchored right, never move */}
+            <div className="flex shrink-0 items-start gap-0.5 px-2 py-1.5">
+              <button
+                type="button"
+                onClick={() => setExpanded((e) => !e)}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                title={expanded ? 'Collapse message' : 'Show message'}
+              >
+                <MessageSquareTextIcon className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={scrollToOriginal}
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full text-foreground/50 transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                title="Scroll to message"
+              >
+                <ArrowUpIcon className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -754,13 +723,18 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
 
   return (
     <div
-      className="absolute inset-0 bottom-3 z-10 transition-opacity ease-out"
+      className="absolute inset-0 -top-28 z-10 transition-opacity ease-out md:-top-[8.5rem]"
       style={{
         opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
         transitionDuration: fadingOut ? '300ms' : '2000ms',
       }}
     >
-      <div>{children}</div>
+      <div
+        className="relative h-full w-full"
+        style={{ maskImage: 'linear-gradient(to right, transparent, black 8%)' }}
+      >
+        {children}
+      </div>
     </div>
   );
 };

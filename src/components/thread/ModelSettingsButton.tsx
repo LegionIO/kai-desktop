@@ -111,13 +111,16 @@ export const ModelSettingsButton: FC<{
     const filtered = models.filter(filter);
     models = filtered.length > 0 || !fallbackToUnfilteredWhenEmpty ? filtered : models;
   }
-  const currentKey = selectedModelKey ?? catalog?.defaultKey ?? models[0]?.key;
-  const currentModel = models.find((m) => m.key === currentKey) ?? models[0];
-  const currentLabel = formatModelDisplayName(currentModel?.displayName ?? 'Model');
-
   const profiles = profileCatalog?.profiles ?? [];
   const hasProfiles = onSelectProfile && profiles.length > 0;
   const currentProfileKey = selectedProfileKey ?? profileCatalog?.defaultKey;
+  const effectiveProfileModelKey = currentProfileKey
+    ? profiles.find((p) => p.key === currentProfileKey)?.primaryModelKey
+    : undefined;
+
+  const currentKey = selectedModelKey ?? effectiveProfileModelKey ?? catalog?.defaultKey ?? models[0]?.key;
+  const currentModel = models.find((m) => m.key === currentKey) ?? models[0];
+  const currentLabel = formatModelDisplayName(currentModel?.displayName ?? 'Model');
 
   const hasExecutionMode = executionMode !== undefined && onChangeExecutionMode !== undefined;
   const isNonAutoMode = hasExecutionMode && executionMode !== 'auto';

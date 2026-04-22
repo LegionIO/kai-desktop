@@ -66,6 +66,8 @@ export const SidebarDock: FC<SidebarDockProps> = ({ items, className }) => {
     setMouseX(null);
   }, []);
 
+  if (items.length === 0) return null;
+
   return (
     <div
       className={cn(
