@@ -33,7 +33,7 @@ export const WorktreesView: FC = () => {
       } else {
         setWorktrees(
           result.worktrees.map((wt) => ({
-            id: wt.head || generateId(),
+            id: wt.path || wt.head || generateId(),
             branch: wt.branch,
             path: wt.path,
             status: 'active' as const,

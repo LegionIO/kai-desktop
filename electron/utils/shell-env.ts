@@ -176,6 +176,18 @@ export function getResolvedProcessEnv(env: NodeJS.ProcessEnv = process.env): Nod
   };
 }
 
+/** Like getResolvedProcessEnv but strips git-specific env vars that can leak across worktrees. */
+export function getGitSafeEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const resolved = getResolvedProcessEnv(env);
+  // Strip variables that cause git to operate on the wrong repository/worktree
+  const {
+    GIT_DIR: _1, GIT_WORK_TREE: _2, GIT_INDEX_FILE: _3,
+    GIT_COMMON_DIR: _4, GIT_OBJECT_DIRECTORY: _5,
+    ...safe
+  } = resolved;
+  return safe;
+}
+
 function isExecutable(filePath: string): boolean {
   try {
     accessSync(filePath, process.platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK);

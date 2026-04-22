@@ -8,13 +8,15 @@ const CHANGE_TYPE_CONFIG: Record<
   ChangelogChange['type'],
   { label: string; textClass: string; dotClass: string }
 > = {
-  added:   { label: 'Added',   textClass: 'text-emerald-400', dotClass: 'bg-emerald-400' },
-  changed: { label: 'Changed', textClass: 'text-blue-400',    dotClass: 'bg-blue-400' },
-  fixed:   { label: 'Fixed',   textClass: 'text-amber-400',   dotClass: 'bg-amber-400' },
-  removed: { label: 'Removed', textClass: 'text-red-400',     dotClass: 'bg-red-400' },
+  added:      { label: 'Added',      textClass: 'text-emerald-400', dotClass: 'bg-emerald-400' },
+  changed:    { label: 'Changed',    textClass: 'text-blue-400',    dotClass: 'bg-blue-400' },
+  fixed:      { label: 'Fixed',      textClass: 'text-amber-400',   dotClass: 'bg-amber-400' },
+  removed:    { label: 'Removed',    textClass: 'text-red-400',     dotClass: 'bg-red-400' },
+  deprecated: { label: 'Deprecated', textClass: 'text-orange-400',  dotClass: 'bg-orange-400' },
+  security:   { label: 'Security',   textClass: 'text-purple-400',  dotClass: 'bg-purple-400' },
 };
 
-const CHANGE_TYPE_ORDER: ChangelogChange['type'][] = ['added', 'changed', 'fixed', 'removed'];
+const CHANGE_TYPE_ORDER: ChangelogChange['type'][] = ['added', 'changed', 'deprecated', 'removed', 'fixed', 'security'];
 
 /* ── Component ──────────────────────────────────────────── */
 

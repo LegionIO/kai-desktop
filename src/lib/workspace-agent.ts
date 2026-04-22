@@ -1,15 +1,17 @@
 /**
- * Workspace Agent — streams LLM responses for workspace engines
+ * Workspace Agent — streams LLM responses for workspace engines.
  *
- * Each engine (insights, ideation, roadmap, execution, changelog) gets a
- * dedicated conversation with a custom system prompt.  Under the hood this
- * reuses the existing `agent:stream` IPC and `agent:stream-event` broadcast,
- * so every feature of the main chat pipeline (tool use, compaction, etc.) is
- * available to workspace engines automatically.
+ * Each engine (insights, ideation, roadmap, execution, changelog, etc.) gets a
+ * stateless call with a custom system prompt.  Under the hood this calls the
+ * `workspace:stream` IPC which uses the AI SDK's `streamText()` directly,
+ * bypassing the full Mastra agent pipeline.
  */
 
 import { app } from './ipc-client';
 import { generateId } from './utils';
+
+// Debug: confirm this module is loaded and using the new IPC
+console.warn('[workspace-agent] Module loaded — using workspace:stream IPC (not agent:stream)');
 
 // ── Engine system prompts ──────────────────────────────────────
 
@@ -18,7 +20,6 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
     'You are a codebase analysis assistant embedded in a workspace IDE.',
     'The user has opened a project and wants to understand their codebase.',
     'Analyze code structure, explain patterns, identify dependencies, and answer questions about the project.',
-    'Use the available tools (file_read, list_directory, glob, file_search, sh) to explore the codebase before answering.',
     'Be concise but thorough. Reference specific files and line numbers when relevant.',
   ].join(' '),
 
@@ -26,7 +27,7 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
     'You are an AI code improvement analyst. Analyze the user\'s codebase and generate actionable improvement ideas.',
     'Categories to analyze: code quality, performance, security, documentation, UI/UX, architecture.',
     'For each idea: provide a title, description, severity (info/low/medium/high/critical), category (code-improvement/code-quality/performance/security/documentation/ui-ux), affected files, and suggested fix.',
-    'Use tools to scan the codebase. After your analysis, output a JSON block fenced with ```json that matches this schema:',
+    'After your analysis, output a JSON block fenced with ```json that matches this schema:',
     '{"ideas": [{"title": "...", "description": "...", "category": "code-improvement|code-quality|performance|security|documentation|ui-ux", "severity": "info|low|medium|high|critical", "affectedFiles": ["..."], "suggestedFix": "..."}]}',
     'You may include explanatory text before the JSON block.',
   ].join(' '),
@@ -34,7 +35,6 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
   roadmap: [
     'You are a technical product manager AI. Analyze the user\'s project and generate a development roadmap.',
     'Break the roadmap into phases (3-4 phases). Each phase has features with priorities and effort estimates.',
-    'Use tools to understand the current state of the project before planning.',
     'After your analysis, output a JSON block fenced with ```json that matches this schema:',
     '{"phases": [{"name": "...", "description": "...", "features": [{"title": "...", "description": "...", "priority": "low|medium|high|critical", "effort": "small|medium|large|xlarge", "status": "planned|in_progress|completed"}]}]}',
     'You may include explanatory text before the JSON block.',
@@ -43,29 +43,38 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
   planning: [
     'You are a senior software architect planning a code change.',
     'The user will describe a task they want to accomplish in their codebase.',
-    'Analyze the codebase using available tools (file_read, list_directory, glob, file_search, sh) to understand the relevant code BEFORE planning.',
-    'Explore the project structure, read key files, and understand existing patterns.',
-    'After your analysis, output a JSON block fenced with ```json matching this schema:',
+    'Think carefully about the project structure and existing patterns based on the information provided.',
+    'Output a JSON block fenced with ```json matching this schema:',
     '{"approach": "Description of the overall strategy and why this approach was chosen",',
     '"steps": [{"id": "1", "description": "Specific actionable step", "status": "pending"}, ...],',
     '"filesToModify": ["relative/path/to/file.ts", ...],',
     '"testsToRun": ["npm test -- --filter ...", ...],',
     '"risks": ["Specific risk description", ...]}',
-    'Be specific — reference actual files, functions, and patterns you found in the codebase.',
+    'Be specific — reference actual files, functions, and patterns.',
     'Keep steps actionable and ordered. Include 3-8 steps.',
-    'Identify real risks based on what you found, not generic ones.',
+    'Identify real risks, not generic ones.',
     'You may include explanatory text before the JSON block.',
   ].join(' '),
 
   execution: [
-    'You are an autonomous software engineer that WRITES CODE. You are NOT an assistant — you are a code implementer.',
-    'Your ONLY job is to use tools to make real file changes. You MUST call file_edit, file_write, or sh tools.',
-    'WORKFLOW: 1) Use file_read to understand current code. 2) Use file_edit or file_write to make changes. 3) Use sh to run tests.',
-    'Start by reading the first file that needs changes, then edit it. Do NOT output analysis without tool calls.',
-    'After each plan step is implemented, output: [STEP_COMPLETE:N]',
-    'You have FULL permission to edit any file. Do not ask for confirmation. Just do it.',
-    'CRITICAL RULE: Your very first action must be a tool call (file_read or list_directory). Never start with just text.',
-  ].join(' '),
+    'You are an autonomous code execution agent. You MUST use tools to make real file changes.',
+    '',
+    'AVAILABLE TOOLS: file_read, file_write, file_edit, sh, glob, grep, list_directory',
+    '',
+    'MANDATORY WORKFLOW for each step:',
+    '1. Call file_read to read the file you need to change',
+    '2. Call file_edit or file_write to make the actual change',
+    '3. Optionally call file_read again to verify the change',
+    '4. Output [STEP_COMPLETE:N] after the step is done',
+    '',
+    'CRITICAL RULES:',
+    '- You MUST call file_edit or file_write for EVERY change. Text descriptions of changes are WORTHLESS.',
+    '- NEVER output [STEP_COMPLETE:N] unless you have called file_edit or file_write in that step.',
+    '- Do NOT describe what you would do. DO IT by calling tools.',
+    '- If file_edit fails, try file_write with the complete new file content.',
+    '- You have FULL permission to modify any file. No confirmation needed.',
+    '- Execute ALL plan steps, not just the first one.',
+  ].join('\n'),
 
   review: [
     'You are a senior code reviewer. You are given a task description and the git diff of changes made to fulfill that task.',
@@ -76,13 +85,27 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
   ].join(' '),
 
   changelog: [
-    'You are a release notes generator. Analyze the git history and completed tasks to generate a changelog.',
-    'Use the "sh" tool to run "git log" commands to understand recent changes.',
-    'Categorize changes as Added, Changed, Fixed, or Removed.',
-    'After your analysis, output a JSON block fenced with ```json that matches this schema:',
-    '{"version": "x.y.z", "date": "YYYY-MM-DD", "summary": "...", "changes": [{"type": "added|changed|fixed|removed", "description": "..."}]}',
+    'You are a changelog generator with access to git tools.',
+    'You MUST use the `sh` tool to run git commands to gather real information.',
+    '',
+    'WORKFLOW:',
+    '1. Run `sh` with command `git log --oneline -30` to see recent commits',
+    '2. Run `sh` with command `git tag --sort=-creatordate | head -5` to find latest tags',
+    '3. If a previous tag exists, run `sh` with `git log {lastTag}..HEAD --oneline` for changes since last release',
+    '4. Analyze the commits and categorize them',
+    '5. Suggest a version bump: major (breaking), minor (features), patch (fixes)',
+    '',
+    'FORMAT: Follow Keep-a-Changelog (https://keepachangelog.com) format.',
+    'Group changes under: Added, Changed, Deprecated, Removed, Fixed, Security.',
+    '',
+    'After analysis, output a JSON block fenced with ```json matching this schema:',
+    '{"version": "x.y.z", "date": "YYYY-MM-DD", "summary": "...",',
+    ' "versionBump": "major|minor|patch",',
+    ' "changes": [{"type": "added|changed|fixed|removed|deprecated|security", "description": "..."}],',
+    ' "keepAChangelog": "full formatted markdown for CHANGELOG.md"}',
+    '',
     'You may include explanatory text before the JSON block.',
-  ].join(' '),
+  ].join('\n'),
 
   'task-parse': [
     'You are a task creation assistant. The user gives you a natural language description of something they want to accomplish in their codebase.',
@@ -93,28 +116,6 @@ const ENGINE_SYSTEM_PROMPTS: Record<string, string> = {
   ].join(' '),
 };
 
-// ── Conversation ID tracking ───────────────────────────────────
-
-const conversationMap = new Map<string, string>();
-
-function getConversationKey(workspaceId: string, engine: string): string {
-  return `ws:${workspaceId}:${engine}`;
-}
-
-function getOrCreateConversationId(workspaceId: string, engine: string): string {
-  const key = getConversationKey(workspaceId, engine);
-  if (!conversationMap.has(key)) {
-    conversationMap.set(key, `workspace-${engine}-${generateId()}`);
-  }
-  return conversationMap.get(key)!;
-}
-
-/** Reset the conversation for an engine, forcing a fresh context on next use. */
-export function resetEngineConversation(workspaceId: string, engine: string): void {
-  const key = getConversationKey(workspaceId, engine);
-  conversationMap.delete(key);
-}
-
 // ── Stream event types ─────────────────────────────────────────
 
 export type WorkspaceStreamCallbacks = {
@@ -123,15 +124,30 @@ export type WorkspaceStreamCallbacks = {
   onToolResult?: (toolCallId: string, toolName: string, result: unknown) => void;
   onToolProgress?: (toolCallId: string, toolName: string, data: unknown) => void;
   onDone?: () => void;
+  onCancelled?: () => void;
   onError?: (error: string) => void;
 };
+
+// ── History key helper ──────────────────────────────────────────
+
+function getHistoryKey(workspaceId: string, engine: string): string {
+  return `ws:${workspaceId}:${engine}`;
+}
+
+/** Reset the conversation history for an engine on the server side. */
+export function resetEngineConversation(workspaceId: string, engine: string): void {
+  const historyKey = getHistoryKey(workspaceId, engine);
+  app.workspaceStream.resetHistory(historyKey).catch(() => {});
+}
 
 // ── Main streaming function ────────────────────────────────────
 
 /**
  * Stream an LLM response for a workspace engine.
  *
- * Returns a cancel function.  Calling it aborts the active stream.
+ * Calls the LLM directly via `workspace:stream` IPC (no Mastra agent).
+ * Conversation history is maintained server-side per (workspace + engine) pair.
+ * Returns a cancel function.
  */
 export function streamWorkspaceEngine(opts: {
   workspaceId: string;
@@ -141,63 +157,43 @@ export function streamWorkspaceEngine(opts: {
   freshConversation?: boolean;
   executionMode?: 'auto' | 'plan-first' | 'confirm-writes';
 } & WorkspaceStreamCallbacks): () => void {
-  const { workspaceId, engine, userMessage, projectPath, freshConversation, executionMode } = opts;
+  const { workspaceId, engine, userMessage, projectPath, freshConversation } = opts;
 
-  // Optionally reset conversation context
-  if (freshConversation) {
-    resetEngineConversation(workspaceId, engine);
-  }
+  console.info(`[workspace-agent] streamWorkspaceEngine called: engine=${engine} tools=${engine === 'execution'}`);
 
-  const conversationId = getOrCreateConversationId(workspaceId, engine);
+  const streamId = `ws-${engine}-${generateId()}`;
+  const historyKey = getHistoryKey(workspaceId, engine);
   const systemPrompt = ENGINE_SYSTEM_PROMPTS[engine] ?? '';
 
-  // Build the message list: system prompt first, then the user message
+  // Enable tools for execution and changelog engines
+  const enableTools = engine === 'execution' || engine === 'changelog';
+
   const messages = [
-    {
-      role: 'system',
-      content: [{ type: 'text', text: `${systemPrompt}\n\nProject directory: ${projectPath}` }],
-    },
-    {
-      role: 'user',
-      content: [{ type: 'text', text: userMessage }],
-    },
+    { role: 'system', content: `${systemPrompt}\n\nProject directory: ${projectPath}` },
+    { role: 'user', content: userMessage },
   ];
 
-  // Subscribe to stream events, filtering to our conversation
-  const unsubscribe = app.agent.onStreamEvent((event: unknown) => {
+  // Subscribe to stream events, filtering to our stream ID
+  const unsubscribe = app.workspaceStream.onStreamEvent((event: unknown) => {
     const e = event as {
-      conversationId: string;
+      streamId: string;
       type: string;
       text?: string;
       toolCallId?: string;
       toolName?: string;
       args?: unknown;
       result?: unknown;
-      error?: string;
       data?: unknown;
-      subAgentConversationId?: string;
-      approvalStatus?: string;
-      approvalId?: string;
+      error?: string;
     };
 
-    // Ignore events for other conversations and sub-agent events
-    if (e.conversationId !== conversationId) return;
-    if (e.subAgentConversationId) return;
-
-    // Auto-approve any tool calls waiting for approval (workspace execution is autonomous)
-    if (e.approvalStatus === 'pending' && e.toolCallId) {
-      app.agent.approveToolCall(e.toolCallId).catch(() => {});
-    }
+    if (e.streamId !== streamId) return;
 
     switch (e.type) {
       case 'text-delta':
         opts.onTextDelta?.(e.text ?? '');
         break;
       case 'tool-call':
-        // Auto-answer ask_user tools (execution is autonomous)
-        if (e.toolName === 'ask_user' && e.toolCallId) {
-          app.agent.answerToolQuestion(e.toolCallId, { answer: 'Yes, proceed with the implementation.' }).catch(() => {});
-        }
         opts.onToolCall?.(e.toolCallId ?? '', e.toolName ?? 'unknown', e.args);
         break;
       case 'tool-result':
@@ -208,6 +204,11 @@ export function streamWorkspaceEngine(opts: {
         break;
       case 'error':
         opts.onError?.(e.error ?? 'Unknown error');
+        cleanup();
+        break;
+      case 'cancelled':
+        // User-initiated stop — use dedicated callback or fall back to onDone
+        (opts.onCancelled ?? opts.onDone)?.();
         cleanup();
         break;
       case 'done':
@@ -224,24 +225,22 @@ export function streamWorkspaceEngine(opts: {
     unsubscribe();
   };
 
-  // Fire off the stream via the existing IPC
-  app.agent.stream(
-    conversationId,
-    messages,
-    undefined,  // use default model key
-    'medium',   // reasoning effort
-    undefined,  // profile key
-    false,      // fallback enabled
-    projectPath,
-    executionMode ?? 'auto',  // default to auto for workspace engines
-  ).catch((err: unknown) => {
+  // Fire off the stream (server accumulates history)
+  try {
+    app.workspaceStream.stream(streamId, historyKey, messages, undefined, freshConversation, enableTools).catch((err: unknown) => {
+      console.error('[workspace-agent] Stream promise rejected:', err);
+      opts.onError?.((err as Error).message ?? String(err));
+      cleanup();
+    });
+  } catch (err) {
+    console.error('[workspace-agent] Stream call threw synchronously:', err);
     opts.onError?.((err as Error).message ?? String(err));
     cleanup();
-  });
+  }
 
   // Return cancel function
   return () => {
-    app.agent.cancelStream(conversationId).catch(() => { /* ignore cancel errors */ });
+    app.workspaceStream.cancelStream(streamId).catch(() => {});
     cleanup();
   };
 }

@@ -213,7 +213,7 @@ export interface Idea {
 // ── Changelog ──────────────────────────────────────────────
 
 export interface ChangelogChange {
-  type: 'added' | 'changed' | 'fixed' | 'removed';
+  type: 'added' | 'changed' | 'fixed' | 'removed' | 'deprecated' | 'security';
   description: string;
   taskId?: string;
 }
@@ -224,6 +224,8 @@ export interface ChangelogRelease {
   date: string;
   summary: string;
   changes: ChangelogChange[];
+  versionBump?: 'major' | 'minor' | 'patch';
+  keepAChangelog?: string;
 }
 
 // ── Worktrees ──────────────────────────────────────────────

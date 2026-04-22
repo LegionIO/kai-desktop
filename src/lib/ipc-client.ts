@@ -215,8 +215,10 @@ type AppAPI = {
     diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ diff: string; error?: string }>;
     diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => Promise<{ files: Array<{ status: string; path: string }>; error?: string }>;
     diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => Promise<{ diff: string; error?: string }>;
+    previewMerge: (projectPath: string, branchName: string) => Promise<{ hasConflicts: boolean; conflictFiles: string[]; canAutoMerge: boolean; error?: string }>;
     mergeBranch: (projectPath: string, branchName: string) => Promise<{ success: boolean; summary?: string; error?: string }>;
     deleteBranch: (projectPath: string, branchName: string) => Promise<{ success: boolean; error?: string }>;
+    stageAllAndCommit: (worktreePath: string, message: string) => Promise<{ success: boolean; hash?: string; skipped?: boolean; reason?: string; error?: string }>;
   };
   workspaceTasks: {
     list: (projectPath: string) => Promise<WorkspaceTask[]>;
@@ -224,6 +226,12 @@ type AppAPI = {
     put: (projectPath: string, task: WorkspaceTask) => Promise<{ ok: boolean }>;
     delete: (projectPath: string, taskId: string) => Promise<{ ok: boolean }>;
     onChanged: (callback: (data: { projectPath: string }) => void) => () => void;
+  };
+  workspaceStream: {
+    stream: (streamId: string, historyKey: string, messages: Array<{ role: string; content: string }>, modelKey?: string, freshConversation?: boolean, enableTools?: boolean) => Promise<{ streamId: string }>;
+    cancelStream: (streamId: string) => Promise<{ ok: boolean }>;
+    resetHistory: (historyKey: string) => Promise<{ ok: boolean }>;
+    onStreamEvent: (callback: (event: unknown) => void) => () => void;
   };
   projects: {
     listRecent: () => Promise<{ projects: Array<{ path: string; name: string; lastOpened: number }> }>;

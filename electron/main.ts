@@ -6,6 +6,7 @@ import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import { registerAgentHandlers, registerTools, updateMcpTools, updateSkillTools, updatePluginTools, updateCliTools, getRegisteredTools } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { registerWorkspaceTaskHandlers } from './ipc/workspace-tasks.js';
+import { registerWorkspaceStreamHandlers } from './ipc/workspace-stream.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
@@ -606,6 +607,25 @@ if (gotSingleInstanceLock) {
     registerAgentHandlers(ipcMain, APP_HOME);
     registerConversationHandlers(ipcMain, APP_HOME, getConfig);
     registerWorkspaceTaskHandlers(ipcMain, APP_HOME);
+    registerWorkspaceStreamHandlers(ipcMain, APP_HOME);
+
+    // Prune stale worktrees for recently opened projects on startup
+    (async () => {
+      try {
+        const { execFile: ef } = await import('node:child_process');
+        const { promisify: p } = await import('node:util');
+        const { getGitSafeEnv: gsEnv } = await import('./utils/shell-env.js');
+        const run = p(ef);
+        const projFile = join(APP_HOME, 'data', 'recent-projects.json');
+        if (existsSync(projFile)) {
+          const data = JSON.parse(readFileSync(projFile, 'utf-8')) as { projects?: Array<{ path: string }> };
+          for (const proj of data.projects ?? []) {
+            try { await run('git', ['worktree', 'prune'], { cwd: proj.path, env: gsEnv() }); } catch { /* non-fatal */ }
+          }
+        }
+      } catch { /* non-fatal startup task */ }
+    })();
+
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
@@ -764,10 +784,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:list-worktrees', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath, env: getGitSafeEnv() });
         const worktrees: Array<{ path: string; branch: string; head: string }> = [];
         let current: Record<string, string> = {};
         for (const line of stdout.split('\n')) {
@@ -790,8 +810,9 @@ if (gotSingleInstanceLock) {
       const { promisify } = await import('node:util');
       const path = await import('node:path');
       const fs = await import('node:fs');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
+      const env = getGitSafeEnv();
       try {
         // Ensure .worktrees is in .gitignore
         const gitignorePath = path.join(projectPath, '.gitignore');
@@ -802,8 +823,32 @@ if (gotSingleInstanceLock) {
           }
         } catch { /* ignore gitignore errors */ }
 
+        // Ensure .worktrees directory exists
+        const worktreesDir = path.join(projectPath, '.worktrees');
+        fs.mkdirSync(worktreesDir, { recursive: true });
+
         const worktreePath = path.join(projectPath, '.worktrees', branchName);
-        await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: projectPath, env: getResolvedProcessEnv() });
+
+        // Idempotent: check if worktree already exists
+        try {
+          const { stdout: wtList } = await exec('git', ['worktree', 'list', '--porcelain'], { cwd: projectPath, env });
+          if (wtList.includes(worktreePath)) {
+            return { path: worktreePath, branch: branchName };
+          }
+        } catch { /* continue to creation */ }
+
+        // Prune stale worktree references first
+        try { await exec('git', ['worktree', 'prune'], { cwd: projectPath, env }); } catch { /* ignore */ }
+
+        // Check if branch already exists
+        const { stdout: branchList } = await exec('git', ['branch', '--list', branchName], { cwd: projectPath, env });
+        if (branchList.trim()) {
+          // Branch exists — create worktree without -b
+          await exec('git', ['worktree', 'add', worktreePath, branchName], { cwd: projectPath, env });
+        } else {
+          // New branch
+          await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: projectPath, env });
+        }
         return { path: worktreePath, branch: branchName };
       } catch (err) {
         return { error: (err as Error).message };
@@ -813,24 +858,41 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:remove-worktree', async (_event, projectPath: string, worktreePath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
-      try {
-        await exec('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: projectPath, env: getResolvedProcessEnv() });
-        return { success: true };
-      } catch (err) {
-        return { error: (err as Error).message };
+      const env = getGitSafeEnv();
+
+      // Retry with backoff (3 attempts)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await exec('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: projectPath, env });
+          await exec('git', ['worktree', 'prune'], { cwd: projectPath, env });
+          return { success: true };
+        } catch (err) {
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          } else {
+            // Final fallback: try prune-only
+            try {
+              await exec('git', ['worktree', 'prune'], { cwd: projectPath, env });
+              return { success: true };
+            } catch {
+              return { error: (err as Error).message };
+            }
+          }
+        }
       }
+      return { success: false, error: 'Retry exhausted' };
     });
 
     // Git status — returns list of changed files
     ipcMain.handle('git:status', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 1024 * 1024 });
+        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 1024 * 1024 });
         const files: Array<{ path: string; status: string }> = [];
         for (const line of stdout.split('\n')) {
           if (!line.trim()) continue;
@@ -849,17 +911,17 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:diff', async (_event, projectPath: string, filePath?: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
         // Get both staged and unstaged diffs
         const args = ['diff', 'HEAD'];
         if (filePath) args.push('--', filePath);
-        const { stdout } = await exec('git', args, { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 5 * 1024 * 1024 });
+        const { stdout } = await exec('git', args, { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 5 * 1024 * 1024 });
 
         // If no diff against HEAD (new untracked file), try showing the file content as all-adds
         if (!stdout.trim() && filePath) {
-          const { stdout: statusOut } = await exec('git', ['status', '--porcelain', '--', filePath], { cwd: projectPath, env: getResolvedProcessEnv() });
+          const { stdout: statusOut } = await exec('git', ['status', '--porcelain', '--', filePath], { cwd: projectPath, env: getGitSafeEnv() });
           if (statusOut.startsWith('??') || statusOut.trim().startsWith('A')) {
             // Untracked or newly added — show full file as diff
             const { readFile } = await import('node:fs/promises');
@@ -892,10 +954,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:current-branch', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        const { stdout } = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projectPath, env: getGitSafeEnv() });
         return { branch: stdout.trim() };
       } catch (err) {
         return { branch: '', error: (err as Error).message };
@@ -906,10 +968,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:branches', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const env = getResolvedProcessEnv();
+        const env = getGitSafeEnv();
         // Get local branches with format
         const { stdout } = await exec('git', ['branch', '--format=%(refname:short)\t%(objectname:short)\t%(upstream:short)\t%(HEAD)\t%(committerdate:relative)'], { cwd: projectPath, env });
         const branches: Array<{ name: string; shortHash: string; upstream: string; isCurrent: boolean; isDefault: boolean; lastActivity: string }> = [];
@@ -956,10 +1018,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:checkout', async (_event, projectPath: string, branchName: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['checkout', branchName], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['checkout', branchName], { cwd: projectPath, env: getGitSafeEnv() });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -970,10 +1032,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:create-branch', async (_event, projectPath: string, branchName: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['checkout', '-b', branchName], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['checkout', '-b', branchName], { cwd: projectPath, env: getGitSafeEnv() });
         return { success: true, branch: branchName };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -984,10 +1046,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:stage', async (_event, projectPath: string, filePaths: string[]) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['add', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['add', '--', ...filePaths], { cwd: projectPath, env: getGitSafeEnv() });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -998,10 +1060,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:unstage', async (_event, projectPath: string, filePaths: string[]) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['reset', 'HEAD', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['reset', 'HEAD', '--', ...filePaths], { cwd: projectPath, env: getGitSafeEnv() });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -1012,15 +1074,44 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:commit', async (_event, projectPath: string, summary: string, description?: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
+      const env = getGitSafeEnv();
       try {
         const args = ['commit', '-m', summary];
         if (description) args.push('-m', description);
-        const { stdout } = await exec('git', args, { cwd: projectPath, env: getResolvedProcessEnv() });
+        const { stdout } = await exec('git', args, { cwd: projectPath, env });
         // Extract commit hash from output
         const hashMatch = stdout.match(/\[[\w/]+ ([a-f0-9]+)\]/);
         return { success: true, hash: hashMatch?.[1] ?? '' };
+      } catch (err) {
+        return { success: false, error: (err as Error).message };
+      }
+    });
+
+    // Git stage-all-and-commit — atomic stage + commit for worktree auto-commit
+    ipcMain.handle('git:stage-all-and-commit', async (_event, worktreePath: string, message: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      const env = getGitSafeEnv();
+      try {
+        console.info(`[git:stage-all-and-commit] Checking ${worktreePath}`);
+        // Check for changes
+        const { stdout: statusOut } = await exec('git', ['status', '--porcelain'], { cwd: worktreePath, env });
+        if (!statusOut.trim()) {
+          console.info(`[git:stage-all-and-commit] No changes to commit`);
+          return { success: true, skipped: true, reason: 'no changes' };
+        }
+        console.info(`[git:stage-all-and-commit] Changes found: ${statusOut.trim()}`);
+        // Stage all
+        await exec('git', ['add', '-A'], { cwd: worktreePath, env });
+        // Commit
+        const { stdout } = await exec('git', ['commit', '-m', message], { cwd: worktreePath, env });
+        const hashMatch = stdout.match(/\[[\w/]+ ([a-f0-9]+)\]/);
+        console.info(`[git:stage-all-and-commit] Committed: ${hashMatch?.[1] ?? 'unknown'}`);
+        return { success: true, hash: hashMatch?.[1] ?? '', skipped: false };
       } catch (err) {
         return { success: false, error: (err as Error).message };
       }
@@ -1030,11 +1121,11 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:log', async (_event, projectPath: string, limit?: number) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
         const n = limit ?? 50;
-        const { stdout } = await exec('git', ['log', `--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s%x00%D`, `-${n}`], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 2 * 1024 * 1024 });
+        const { stdout } = await exec('git', ['log', `--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s%x00%D`, `-${n}`], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 2 * 1024 * 1024 });
         const commits: Array<{ hash: string; shortHash: string; author: string; email: string; timestamp: number; message: string; refs: string }> = [];
         for (const line of stdout.split('\n')) {
           if (!line.trim()) continue;
@@ -1060,9 +1151,9 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:show', async (_event, projectPath: string, commitHash: string, filePath?: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
-      const env = getResolvedProcessEnv();
+      const env = getGitSafeEnv();
       try {
         if (filePath) {
           // Return diff for a specific file in the commit
@@ -1089,10 +1180,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:fetch', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['fetch', '--all'], { cwd: projectPath, env: getResolvedProcessEnv(), timeout: 30000 });
+        await exec('git', ['fetch', '--all'], { cwd: projectPath, env: getGitSafeEnv(), timeout: 30000 });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -1103,10 +1194,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:pull', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['pull'], { cwd: projectPath, env: getResolvedProcessEnv(), timeout: 60000 });
+        const { stdout } = await exec('git', ['pull'], { cwd: projectPath, env: getGitSafeEnv(), timeout: 60000 });
         return { success: true, summary: stdout.trim() };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -1117,9 +1208,9 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:push', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
-      const env = getResolvedProcessEnv();
+      const env = getGitSafeEnv();
       try {
         await exec('git', ['push'], { cwd: projectPath, env, timeout: 60000 });
         return { success: true };
@@ -1143,9 +1234,9 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:remote-status', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
-      const env = getResolvedProcessEnv();
+      const env = getGitSafeEnv();
       try {
         let behind = 0;
         let ahead = 0;
@@ -1167,10 +1258,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:staged-status', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 1024 * 1024 });
+        const { stdout } = await exec('git', ['status', '--porcelain', '-uall'], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 1024 * 1024 });
         const files: Array<{ path: string; indexStatus: string; worktreeStatus: string; staged: boolean }> = [];
         for (const line of stdout.split('\n')) {
           if (!line || line.length < 3) continue;
@@ -1192,15 +1283,15 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:discard', async (_event, projectPath: string, filePaths: string[]) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
         // Checkout tracked files to discard changes
-        await exec('git', ['checkout', '--', ...filePaths], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['checkout', '--', ...filePaths], { cwd: projectPath, env: getGitSafeEnv() });
         // Clean untracked files
         for (const fp of filePaths) {
           try {
-            await exec('git', ['clean', '-fd', '--', fp], { cwd: projectPath, env: getResolvedProcessEnv() });
+            await exec('git', ['clean', '-fd', '--', fp], { cwd: projectPath, env: getGitSafeEnv() });
           } catch { /* file might be tracked, ignore */ }
         }
         return { success: true };
@@ -1220,10 +1311,10 @@ if (gotSingleInstanceLock) {
     // Open a specific file in VS Code
     ipcMain.handle('git:open-file-in-editor', async (_event, projectPath: string, filePath: string) => {
       const { execFile } = await import('node:child_process');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const path = await import('node:path');
       try {
-        execFile('code', [path.join(projectPath, filePath)], { env: getResolvedProcessEnv() });
+        execFile('code', [path.join(projectPath, filePath)], { env: getGitSafeEnv() });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -1234,10 +1325,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:clone', async (_event, url: string, destPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        await exec('git', ['clone', url, destPath], { env: getResolvedProcessEnv(), timeout: 120000, maxBuffer: 5 * 1024 * 1024 });
+        await exec('git', ['clone', url, destPath], { env: getGitSafeEnv(), timeout: 120000, maxBuffer: 5 * 1024 * 1024 });
         // Extract repo name from path
         const path = await import('node:path');
         const name = path.basename(destPath);
@@ -1296,9 +1387,9 @@ if (gotSingleInstanceLock) {
     // Open project in VS Code
     ipcMain.handle('git:open-in-editor', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       try {
-        execFile('code', [projectPath], { env: getResolvedProcessEnv() });
+        execFile('code', [projectPath], { env: getGitSafeEnv() });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };
@@ -1316,10 +1407,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:remote-url', async (_event, projectPath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['remote', 'get-url', 'origin'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        const { stdout } = await exec('git', ['remote', 'get-url', 'origin'], { cwd: projectPath, env: getGitSafeEnv() });
         let url = stdout.trim();
         // Convert SSH URL to HTTPS
         if (url.startsWith('git@')) {
@@ -1344,12 +1435,15 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:diff-branch', async (_event, projectPath: string, baseBranch: string, taskBranch: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['diff', `${baseBranch}...${taskBranch}`], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 5 * 1024 * 1024 });
+        console.info(`[git:diff-branch] ${baseBranch}...${taskBranch} in ${projectPath}`);
+        const { stdout } = await exec('git', ['diff', `${baseBranch}...${taskBranch}`], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 5 * 1024 * 1024 });
+        console.info(`[git:diff-branch] Result: ${stdout.length} chars`);
         return { diff: stdout };
       } catch (err) {
+        console.error(`[git:diff-branch] Error:`, (err as Error).message);
         return { diff: '', error: (err as Error).message };
       }
     });
@@ -1358,10 +1452,10 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:diff-branch-stat', async (_event, projectPath: string, baseBranch: string, taskBranch: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['diff', '--name-status', `${baseBranch}...${taskBranch}`], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 1024 * 1024 });
+        const { stdout } = await exec('git', ['diff', '--name-status', `${baseBranch}...${taskBranch}`], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 1024 * 1024 });
         const files: Array<{ status: string; path: string }> = [];
         for (const line of stdout.split('\n')) {
           if (!line.trim()) continue;
@@ -1378,13 +1472,48 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:diff-branch-file', async (_event, projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
       try {
-        const { stdout } = await exec('git', ['diff', `${baseBranch}...${taskBranch}`, '--', filePath], { cwd: projectPath, env: getResolvedProcessEnv(), maxBuffer: 5 * 1024 * 1024 });
+        const { stdout } = await exec('git', ['diff', `${baseBranch}...${taskBranch}`, '--', filePath], { cwd: projectPath, env: getGitSafeEnv(), maxBuffer: 5 * 1024 * 1024 });
         return { diff: stdout };
       } catch (err) {
         return { diff: '', error: (err as Error).message };
+      }
+    });
+
+    // Git preview merge — check for conflicts before merging
+    ipcMain.handle('git:preview-merge', async (_event, projectPath: string, branchName: string) => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
+      const exec = promisify(execFile);
+      const env = getGitSafeEnv();
+      try {
+        // Attempt dry-run merge
+        await exec('git', ['merge', '--no-commit', '--no-ff', branchName], { cwd: projectPath, env });
+        // Check for conflicts
+        const { stdout } = await exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: projectPath, env });
+        const conflictFiles = stdout.split('\n').filter((l: string) => l.trim());
+        // Always abort the trial merge
+        try { await exec('git', ['merge', '--abort'], { cwd: projectPath, env }); } catch { /* may not need abort if clean */ }
+        if (conflictFiles.length > 0) {
+          return { hasConflicts: true, conflictFiles, canAutoMerge: false };
+        }
+        return { hasConflicts: false, conflictFiles: [], canAutoMerge: true };
+      } catch (err) {
+        // Merge command itself failed — likely conflicts
+        try {
+          const { stdout } = await exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: projectPath, env });
+          const conflictFiles = stdout.split('\n').filter((l: string) => l.trim());
+          try { await exec('git', ['merge', '--abort'], { cwd: projectPath, env }); } catch { /* */ }
+          if (conflictFiles.length > 0) {
+            return { hasConflicts: true, conflictFiles, canAutoMerge: false };
+          }
+        } catch {
+          try { await exec('git', ['merge', '--abort'], { cwd: projectPath, env }); } catch { /* */ }
+        }
+        return { hasConflicts: true, conflictFiles: [], canAutoMerge: false, error: (err as Error).message };
       }
     });
 
@@ -1392,24 +1521,32 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('git:merge-branch', async (_event, projectPath: string, branchName: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
+      const env = getGitSafeEnv();
       try {
-        const { stdout } = await exec('git', ['merge', branchName, '--no-edit'], { cwd: projectPath, env: getResolvedProcessEnv() });
+        const { stdout } = await exec('git', ['merge', branchName, '--no-edit'], { cwd: projectPath, env });
         return { success: true, summary: stdout.trim() };
       } catch (err) {
+        // Abort if merge left us in a bad state
+        try { await exec('git', ['merge', '--abort'], { cwd: projectPath, env }); } catch { /* */ }
         return { success: false, error: (err as Error).message };
       }
     });
 
-    // Git delete branch
+    // Git delete branch — with safety validation
     ipcMain.handle('git:delete-branch', async (_event, projectPath: string, branchName: string) => {
       const { execFile } = await import('node:child_process');
       const { promisify } = await import('node:util');
-      const { getResolvedProcessEnv } = await import('./utils/shell-env.js');
+      const { getGitSafeEnv } = await import('./utils/shell-env.js');
       const exec = promisify(execFile);
+      const env = getGitSafeEnv();
+      // Safety: only delete task branches
+      if (!branchName.startsWith('task/')) {
+        return { success: false, error: `Refusing to delete non-task branch: ${branchName}` };
+      }
       try {
-        await exec('git', ['branch', '-D', branchName], { cwd: projectPath, env: getResolvedProcessEnv() });
+        await exec('git', ['branch', '-D', branchName], { cwd: projectPath, env });
         return { success: true };
       } catch (err) {
         return { success: false, error: (err as Error).message };

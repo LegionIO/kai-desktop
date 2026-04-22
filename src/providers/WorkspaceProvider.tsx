@@ -85,7 +85,7 @@ interface WorkspaceContextValue {
   // Feature #11: Autonomous Task Execution
   executeTask: (taskId: string) => Promise<void>;
   reviewTask: (taskId: string, approved: boolean) => Promise<void>;
-  mergeTask: (taskId: string) => Promise<{ success: boolean; error?: string }>;
+  mergeTask: (taskId: string) => Promise<{ success: boolean; error?: string; hasConflicts?: boolean; conflictFiles?: string[] }>;
 
   // Task execution state (for task cards to consume)
   taskExecutions: Map<string, TaskExecutionState>;
@@ -773,6 +773,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     appendExecutionOutput(taskId, `Execution path: ${executionPath}`);
     appendExecutionOutput(taskId, `Plan steps: ${task.plan?.steps?.length ?? 0}`);
 
+    // Track accumulated text for step detection and current step for tool-based advancement
+    let executionAccumulated = '';
+    let lastDetectedStep = 0;
+
+    const advanceToStep = (stepNum: number) => {
+      if (stepNum <= lastDetectedStep) return;
+      lastDetectedStep = stepNum;
+      setTasks((prev) =>
+        prev.map((t) => {
+          if (t.id !== taskId || !t.plan) return t;
+          const steps = t.plan.steps.map((s, i) =>
+            i + 1 <= stepNum ? { ...s, status: 'done' as const } : i + 1 === stepNum + 1 ? { ...s, status: 'in_progress' as const } : s,
+          );
+          return { ...t, plan: { ...t.plan, steps }, updatedAt: Date.now() };
+        }),
+      );
+    };
+
+    // Track write tool calls to advance steps
+    let writeToolCount = 0;
+    const totalSteps = task.plan?.steps?.length ?? 0;
+
     // Stream using the existing workspace agent
     const cancel = streamWorkspaceEngine({
       workspaceId: project.path,
@@ -783,19 +805,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       executionMode: 'auto',
       onTextDelta: (text) => {
         appendStreamText(taskId, text);
+        executionAccumulated += text;
         // Detect step completion markers: [STEP_COMPLETE:N]
-        const stepMatch = text.match(/\[STEP_COMPLETE:(\d+)\]/);
-        if (stepMatch) {
-          const stepNum = parseInt(stepMatch[1], 10);
-          setTasks((prev) =>
-            prev.map((t) => {
-              if (t.id !== taskId || !t.plan) return t;
-              const steps = t.plan.steps.map((s, i) =>
-                i + 1 === stepNum ? { ...s, status: 'done' as const } : i + 1 === stepNum + 1 ? { ...s, status: 'in_progress' as const } : s,
-              );
-              return { ...t, plan: { ...t.plan, steps }, updatedAt: Date.now() };
-            }),
-          );
+        const allMatches = executionAccumulated.matchAll(/\[STEP_COMPLETE:(\d+)\]/g);
+        for (const m of allMatches) {
+          advanceToStep(parseInt(m[1], 10));
         }
       },
       onToolCall: (_id, name) => {
@@ -806,6 +820,21 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         updateExecution(taskId, { activeToolName: null });
         const summary = typeof result === 'string' ? result.slice(0, 200) : JSON.stringify(result).slice(0, 200);
         appendExecutionOutput(taskId, `[${name}] ${summary}`);
+
+        // Advance step on write tool completion (file_edit, file_write, sh)
+        if (name === 'file_edit' || name === 'file_write' || name === 'sh') {
+          writeToolCount++;
+          // Heuristic: distribute write tool calls across plan steps
+          if (totalSteps > 0) {
+            const estimatedStep = Math.min(
+              Math.ceil((writeToolCount / Math.max(totalSteps, 1)) * totalSteps),
+              totalSteps,
+            );
+            if (estimatedStep > lastDetectedStep) {
+              advanceToStep(estimatedStep);
+            }
+          }
+        }
       },
       onDone: () => {
         const remaining = partialLines.current.get(taskId);
@@ -814,31 +843,81 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }
         partialLines.current.delete(taskId);
 
-        updateExecution(taskId, { status: 'done', activeToolName: null, cancel: null });
-        executionCancels.current.delete(taskId);
+        // Capture tool count before async work
+        const currentExec = taskExecutions.get(taskId);
+        const currentOutput = currentExec?.output ?? [];
+        const toolCallCount = currentOutput.filter((l) => l.startsWith('> [tool:')).length;
 
-        // Mark all plan steps as done on completion + generate review summary
-        setTasks((prev) =>
-          prev.map((t) => {
-            if (t.id !== taskId) return t;
-            const plan = t.plan ? { ...t.plan, steps: t.plan.steps.map((s) => ({ ...s, status: 'done' as const })) } : t.plan;
-            // Build a brief summary from the execution output
-            const execState = taskExecutions.get(taskId);
-            const outputLines = execState?.output ?? [];
-            const toolCalls = outputLines.filter((l) => l.startsWith('[')).length;
-            const summary = `Executed ${plan?.steps?.length ?? 0} plan steps with ${toolCalls} tool operations. ${t.worktreeBranch ? `Changes on branch ${t.worktreeBranch}.` : ''}`;
-            const updated = { ...t, plan, status: 'review' as TaskStatus, reviewSummary: summary, executionCompletedAt: Date.now(), updatedAt: Date.now() };
-            persistTask(updated);
-            return updated;
-          }),
-        );
+        // Auto-commit changes in worktree, then transition to review
+        (async () => {
+          console.info(`[execution] onDone: executionPath=${executionPath}, project.path=${project.path}, isWorktree=${executionPath !== project.path}`);
+          if (executionPath !== project.path) {
+            try {
+              const taskTitle = task.title;
+              const commitMsg = `feat: ${taskTitle}\n\nAutomated commit from Kai workspace task execution`;
+              const commitResult = await app.git.stageAllAndCommit(executionPath, commitMsg);
+              if (commitResult.success && !commitResult.skipped) {
+                appendExecutionOutput(taskId, `Committed changes: ${commitResult.hash}`);
+              } else if (commitResult.skipped) {
+                appendExecutionOutput(taskId, 'No file changes to commit');
+              } else if (commitResult.error) {
+                appendExecutionOutput(taskId, `Commit warning: ${commitResult.error}`);
+              }
+            } catch (err) {
+              appendExecutionOutput(taskId, `Commit error: ${(err as Error).message}`);
+            }
+          }
 
-        // Force flush pending persistence
-        const pending = pendingPersist.current.get(taskId);
-        if (pending) {
-          clearTimeout(pending);
-          pendingPersist.current.delete(taskId);
-        }
+          updateExecution(taskId, { status: 'done', activeToolName: null, cancel: null });
+          executionCancels.current.delete(taskId);
+
+          // Mark all plan steps as done on completion + generate review summary
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId) return t;
+              const plan = t.plan ? { ...t.plan, steps: t.plan.steps.map((s) => ({ ...s, status: 'done' as const })) } : t.plan;
+              const summary = `Executed ${plan?.steps?.length ?? 0} plan steps with ${toolCallCount} tool operations. ${t.worktreeBranch ? `Changes on branch ${t.worktreeBranch}.` : ''}`;
+              const updated = { ...t, plan, status: 'review' as TaskStatus, reviewSummary: summary, executionCompletedAt: Date.now(), updatedAt: Date.now() };
+              persistTask(updated);
+              return updated;
+            }),
+          );
+
+          // Force flush pending persistence
+          const pending = pendingPersist.current.get(taskId);
+          if (pending) {
+            clearTimeout(pending);
+            pendingPersist.current.delete(taskId);
+          }
+        })();
+      },
+      onCancelled: () => {
+        partialLines.current.delete(taskId);
+        appendExecutionOutput(taskId, 'Execution stopped by user');
+
+        // Auto-commit any partial work
+        (async () => {
+          if (executionPath !== project.path) {
+            try {
+              const result = await app.git.stageAllAndCommit(executionPath, `wip: ${task.title} (stopped)`);
+              if (result.success && !result.skipped) {
+                appendExecutionOutput(taskId, `Committed partial work: ${result.hash}`);
+              }
+            } catch { /* ignore commit errors on cancel */ }
+          }
+
+          updateExecution(taskId, { status: 'done', activeToolName: null, cancel: null });
+          executionCancels.current.delete(taskId);
+
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId) return t;
+              const updated = { ...t, status: 'review' as TaskStatus, reviewSummary: 'Execution stopped by user. Partial changes may exist.', executionCompletedAt: Date.now(), updatedAt: Date.now() };
+              persistTask(updated);
+              return updated;
+            }),
+          );
+        })();
       },
       onError: (error) => {
         appendExecutionOutput(taskId, `[Error] ${error}`);
@@ -846,17 +925,19 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         updateExecution(taskId, { status: 'error', activeToolName: null, cancel: null });
         executionCancels.current.delete(taskId);
 
-        // Clean up worktree on error
-        if (executionPath !== project.path && project) {
-          app.git.removeWorktree(project.path, executionPath).catch(() => {});
-          app.git.deleteBranch(project.path, branchName).catch(() => {});
-        }
-
-        // Transition back to planning in a single setTasks call
+        // Move to review so the user can see what happened (don't delete worktree — it may have partial changes)
         setTasks((prev) =>
           prev.map((t) => {
             if (t.id !== taskId) return t;
-            const updated = { ...t, status: 'planning' as TaskStatus, worktreePath: undefined, worktreeBranch: undefined, updatedAt: Date.now() };
+            const plan = t.plan ? { ...t.plan, steps: t.plan.steps.map((s) => s.status === 'in_progress' ? { ...s, status: 'pending' as const } : s) } : t.plan;
+            const updated = {
+              ...t,
+              plan,
+              status: 'review' as TaskStatus,
+              reviewSummary: `Execution ended with error: ${error}`,
+              executionCompletedAt: Date.now(),
+              updatedAt: Date.now(),
+            };
             persistTask(updated);
             return updated;
           }),
@@ -898,11 +979,22 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, [tasks, project, persistTask]);
 
-  const mergeTask = useCallback(async (taskId: string): Promise<{ success: boolean; error?: string }> => {
+  const mergeTask = useCallback(async (taskId: string): Promise<{ success: boolean; error?: string; hasConflicts?: boolean; conflictFiles?: string[] }> => {
     const task = tasks.find((t) => t.id === taskId);
     if (!task?.worktreeBranch || !project) return { success: false, error: 'No branch to merge' };
 
-    // Merge the task branch into the current branch
+    // Preview merge for conflicts first
+    const preview = await app.git.previewMerge(project.path, task.worktreeBranch);
+    if (preview.hasConflicts) {
+      return {
+        success: false,
+        hasConflicts: true,
+        conflictFiles: preview.conflictFiles,
+        error: `Merge conflicts in ${preview.conflictFiles.length} file(s): ${preview.conflictFiles.join(', ')}`,
+      };
+    }
+
+    // Safe to merge
     const result = await app.git.mergeBranch(project.path, task.worktreeBranch);
     if (result.success) {
       // Clean up worktree and branch
@@ -929,19 +1021,25 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const reviewTaskWithAI = useCallback(async (task: WorkspaceTask) => {
     if (!project) return;
 
+    console.warn(`[review] Starting review for task=${task.id} branch=${task.worktreeBranch ?? 'NONE'} path=${task.worktreePath ?? 'NONE'}`);
+
     // Fetch actual git diff — use branch diff if worktree exists
     let diffText = '';
     try {
       if (task.worktreeBranch) {
         const currentBranch = await app.git.currentBranch(project.path);
         const baseBranch = currentBranch.branch || 'main';
+        console.warn(`[review] Diffing ${baseBranch}...${task.worktreeBranch} in ${project.path}`);
         const result = await app.git.diffBranch(project.path, baseBranch, task.worktreeBranch);
         diffText = result.diff || '(no changes detected)';
+        console.warn(`[review] Diff length=${diffText.length} error=${result.error ?? 'none'} first100=${diffText.slice(0, 100)}`);
       } else {
+        console.info(`[review] No worktreeBranch on task ${task.id}, falling back to working dir diff`);
         const result = await app.git.diff(project.path);
         diffText = result.diff || '(no changes detected)';
       }
-    } catch {
+    } catch (err) {
+      console.error('[review] Diff failed:', err);
       diffText = '(failed to fetch diff)';
     }
 
@@ -995,40 +1093,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           });
         }
 
-        // Move task based on review result
-        if (approved) {
-          setTasks((prev) =>
-            prev.map((t) =>
-              t.id === task.id && t.status === 'review'
-                ? { ...t, status: 'review' as TaskStatus, reviewResult: 'approved', updatedAt: Date.now() }
-                : t,
-            ),
-          );
-        } else {
-          setTasks((prev) =>
-            prev.map((t) =>
-              t.id === task.id && t.status === 'review'
-                ? { ...t, status: 'planning' as TaskStatus, reviewResult: 'changes_requested', updatedAt: Date.now() }
-                : t,
-            ),
-          );
-        }
+        // Move task based on review result — stay in review either way, let user decide
+        setTasks((prev) =>
+          prev.map((t) => {
+            if (t.id !== task.id || t.status !== 'review') return t;
+            const updated = {
+              ...t,
+              reviewResult: approved ? 'approved' as const : 'changes_requested' as const,
+              updatedAt: Date.now(),
+            };
+            persistTask(updated);
+            return updated;
+          }),
+        );
         reviewTimers.current.delete(`review-${task.id}`);
       },
       onError: (error) => {
-        // On error, add the error as a comment and send back to planning
+        // On error, add the error as a comment but stay in review
         addReviewComment(task.id, {
           author: 'Kai AI Reviewer',
           content: `Review failed: ${error}`,
           timestamp: Date.now(),
         });
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === task.id && t.status === 'review'
-              ? { ...t, status: 'planning' as TaskStatus, updatedAt: Date.now() }
-              : t,
-          ),
-        );
         reviewTimers.current.delete(`review-${task.id}`);
       },
     });
@@ -1037,7 +1123,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!autoReviewEnabled || !project) return;
 
-    const tasksInReview = tasks.filter((t) => t.status === 'review');
+    const tasksInReview = tasks.filter((t) => t.status === 'review' && !t.reviewResult);
     for (const task of tasksInReview) {
       if (reviewTimers.current.has(`review-${task.id}`)) continue;
       // Mark as in-review immediately so we don't double-trigger

@@ -231,8 +231,10 @@ const appAPI = {
     diffBranch: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch', projectPath, baseBranch, taskBranch) as Promise<{ diff: string; error?: string }>,
     diffBranchStat: (projectPath: string, baseBranch: string, taskBranch: string) => ipcRenderer.invoke('git:diff-branch-stat', projectPath, baseBranch, taskBranch) as Promise<{ files: Array<{ status: string; path: string }>; error?: string }>,
     diffBranchFile: (projectPath: string, baseBranch: string, taskBranch: string, filePath: string) => ipcRenderer.invoke('git:diff-branch-file', projectPath, baseBranch, taskBranch, filePath) as Promise<{ diff: string; error?: string }>,
+    previewMerge: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:preview-merge', projectPath, branchName) as Promise<{ hasConflicts: boolean; conflictFiles: string[]; canAutoMerge: boolean; error?: string }>,
     mergeBranch: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:merge-branch', projectPath, branchName) as Promise<{ success: boolean; summary?: string; error?: string }>,
     deleteBranch: (projectPath: string, branchName: string) => ipcRenderer.invoke('git:delete-branch', projectPath, branchName) as Promise<{ success: boolean; error?: string }>,
+    stageAllAndCommit: (worktreePath: string, message: string) => ipcRenderer.invoke('git:stage-all-and-commit', worktreePath, message) as Promise<{ success: boolean; hash?: string; skipped?: boolean; reason?: string; error?: string }>,
   },
 
   workspaceTasks: {
@@ -244,6 +246,20 @@ const appAPI = {
       const handler = (_event: unknown, data: { projectPath: string }) => callback(data);
       ipcRenderer.on('workspace-tasks:changed', handler);
       return () => { ipcRenderer.removeListener('workspace-tasks:changed', handler); };
+    },
+  },
+
+  workspaceStream: {
+    stream: (streamId: string, historyKey: string, messages: Array<{ role: string; content: string }>, modelKey?: string, freshConversation?: boolean, enableTools?: boolean) =>
+      ipcRenderer.invoke('workspace:stream', streamId, historyKey, messages, modelKey, freshConversation, enableTools) as Promise<{ streamId: string }>,
+    cancelStream: (streamId: string) =>
+      ipcRenderer.invoke('workspace:cancel-stream', streamId) as Promise<{ ok: boolean }>,
+    resetHistory: (historyKey: string) =>
+      ipcRenderer.invoke('workspace:reset-history', historyKey) as Promise<{ ok: boolean }>,
+    onStreamEvent: (callback: (event: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('workspace:stream-event', handler);
+      return () => ipcRenderer.removeListener('workspace:stream-event', handler);
     },
   },
 
