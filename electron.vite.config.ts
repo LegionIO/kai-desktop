@@ -29,6 +29,28 @@ brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 export default defineConfig({
   main: {
     define: brandDefines,
+    plugins: [
+      // @mastra/core dynamically imports execa with /* @vite-ignore */ which
+      // prevents Vite from bundling it. This plugin strips the ignore
+      // directives and rewrites the indirect `import(mod)` to a direct
+      // `import("execa")` so Rollup resolves and bundles it normally.
+      {
+        name: 'bundle-execa',
+        transform(code, id) {
+          if (!code.includes('getExeca')) return null;
+          const pattern =
+            /const mod = "execa";\s*const execa = \(await import\(\s*\/\*\s*@vite-ignore\s*\*\/\s*\/\*\s*webpackIgnore:\s*true\s*\*\/\s*mod\s*\)\)\.execa;/s;
+          if (!pattern.test(code)) return null;
+          return {
+            code: code.replace(
+              pattern,
+              `const execa = (await import("execa")).execa;`,
+            ),
+            map: null,
+          };
+        },
+      },
+    ],
     build: {
       // electron-builder + pnpm doesn't reliably include transitive
       // dependencies in the asar. Disable automatic externalization so
