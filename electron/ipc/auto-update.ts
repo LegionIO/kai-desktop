@@ -49,24 +49,25 @@ function broadcast(status: UpdateStatus): void {
 }
 
 /**
- * Quit-and-install with a fallback for macOS where Squirrel can silently fail.
- * If the app hasn't exited within a few seconds, force relaunch.
+ * Quit-and-install.
+ *
+ * On macOS the updater (Squirrel.Mac / ShipIt) may need to prompt for an
+ * admin password when the app lives in /Applications.  The previous approach
+ * called `autoUpdater.quitAndInstall()` and then force-killed the process
+ * after 3 s — but that kills the app *before* the user can finish typing
+ * their password, so the install silently fails and loops.
+ *
+ * Instead we rely on `autoInstallOnAppQuit = true` (set in
+ * registerAutoUpdateHandlers) and simply quit the app.  electron-updater
+ * hooks into the quit lifecycle and runs the installer itself, which keeps
+ * the authorization dialog alive until the user completes it.
  */
 export function performQuitAndInstall(): void {
   broadcast({ state: 'restarting' });
-  // Give the renderer a moment to show "Restarting..." UI
+  // Give the renderer a moment to show "Restarting..." UI, then quit.
+  // autoInstallOnAppQuit + autoRunAppAfterInstall handle the rest.
   setTimeout(() => {
-    try {
-      autoUpdater.quitAndInstall();
-    } catch (err) {
-      console.error('[auto-update] quitAndInstall threw:', err);
-    }
-    // Fallback: if the app is still running after 3s, force relaunch
-    setTimeout(() => {
-      console.warn('[auto-update] quitAndInstall did not exit — forcing relaunch');
-      app.relaunch();
-      app.exit(0);
-    }, 3000);
+    app.quit();
   }, 300);
 }
 

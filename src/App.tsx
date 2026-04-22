@@ -22,11 +22,11 @@ import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, SettingsIcon, Trash2Icon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarDock, type DockItem } from '@/components/SidebarDock';
 import { UpdateCard } from '@/components/UpdateCard';
-import { TooltipProvider } from '@/components/ui/Tooltip';
+import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import type { ExecutionMode } from '@/components/thread/ModelSettingsButton';
 import { app } from '@/lib/ipc-client';
@@ -865,13 +865,6 @@ function AppShell() {
   }, [handleOpenSettings, handlePluginNavigationItem, pluginCommands]);
 
   const dockItems: DockItem[] = useMemo(() => [
-    {
-      id: 'settings',
-      label: 'Settings',
-      icon: <SettingsIcon className="h-[18px] w-[18px]" />,
-      onClick: () => { void handleSettingsToggle(); },
-      active: activeView === SETTINGS_VIEW,
-    },
     ...pluginNavigationItems.map((item) => ({
       id: `plugin-nav:${item.pluginName}:${item.id}`,
       label: item.label,
@@ -884,7 +877,7 @@ function AppShell() {
         </span>
       ) : undefined,
     })),
-  ], [activeView, handlePluginNavigationItem, handleSettingsToggle, pluginNavigationItems]);
+  ], [activeView, handlePluginNavigationItem, pluginNavigationItems]);
 
   return (
     <AttachmentProvider>
@@ -911,6 +904,34 @@ function AppShell() {
         <PluginToastHost />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
+        {activeView === SETTINGS_VIEW && createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center"
+            onClick={() => setActiveView(CHAT_VIEW)}
+            onKeyDown={(e) => { if (e.key === 'Escape') setActiveView(CHAT_VIEW); }}
+          >
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative flex h-[min(85vh,800px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
+                <h2 className="text-sm font-semibold text-foreground">Settings</h2>
+                <button
+                  type="button"
+                  onClick={() => setActiveView(CHAT_VIEW)}
+                  className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
+                >
+                  <XIcon className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1">
+                <SettingsPanel onClose={() => setActiveView(CHAT_VIEW)} />
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
         {renamingTitle && activeConversationId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
@@ -993,14 +1014,26 @@ function AppShell() {
               <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
-              <button
-                type="button"
-                onClick={toggleTheme}
-                className="titlebar-no-drag absolute right-3 rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
-                title={themeTitle}
-              >
-                <ThemeIcon className="h-4 w-4" />
-              </button>
+              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
+                <Tooltip content="Settings" side="bottom" sideOffset={6}>
+                  <button
+                    type="button"
+                    onClick={() => { void handleSettingsToggle(); }}
+                    className={`rounded-lg p-1.5 transition-colors hover:bg-sidebar-accent/80 ${activeView === SETTINGS_VIEW ? 'bg-primary/15 text-primary' : 'text-muted-foreground'}`}
+                  >
+                    <SettingsIcon className="h-4 w-4" />
+                  </button>
+                </Tooltip>
+                <Tooltip content={themeTitle} side="bottom" sideOffset={6}>
+                  <button
+                    type="button"
+                    onClick={toggleTheme}
+                    className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
+                  >
+                    <ThemeIcon className="h-4 w-4" />
+                  </button>
+                </Tooltip>
+              </div>
             </div>
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1016,6 +1049,7 @@ function AppShell() {
                 <SubAgentSidebarSection />
               </div>
               <UpdateCard />
+              <PluginBannerSlot />
               <SidebarDock items={dockItems} />
             </div>
             </div>
@@ -1129,21 +1163,16 @@ function AppShell() {
               </div>
               </div>
             </div>
-            {/* Spacer for the absolutely-positioned title bar */}
-            <div className="h-12 shrink-0 md:h-14" />
-            <PluginBannerSlot />
-            <div className="min-h-0 flex-1 overflow-hidden">
-              {activeView === SETTINGS_VIEW ? (
-                <SettingsPanel onClose={() => setActiveView(CHAT_VIEW)} />
-              ) : activePluginPanel ? (
-                <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
+            <div className="min-h-0 flex-1">
+              {activePluginPanel ? (
+                <div className="pt-12 md:pt-14">
+                  <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
+                </div>
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                   <div className="flex h-full min-h-0">
                     {/* Chat column */}
-                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                      {/* Top fade — thread view only */}
-                      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
+                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                       <ThreadOrSubAgent
                         mode={threadMode}
                         onChangeMode={setThreadMode}
