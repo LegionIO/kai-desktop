@@ -379,7 +379,10 @@ export const ConversationList: FC<ConversationListProps> = ({
 
   const handleClearUnread = async (id: string) => {
     const conv = await app.conversations.get(id) as ConversationRecord | null;
-    if (conv?.hasUnread) {
+    // Don't clear hasUnread when the conversation is awaiting approval —
+    // the user hasn't actually addressed the pending prompt yet, so the
+    // indicator should reappear when they navigate away.
+    if (conv?.hasUnread && conv.runStatus !== 'awaiting-approval') {
       await app.conversations.put({ ...conv, hasUnread: false });
     }
     onSwitchConversation(id);
@@ -497,8 +500,9 @@ export const ConversationList: FC<ConversationListProps> = ({
               )}
               {section.items.map((conv) => {
                 const isActive = conv.id === activeConversationId || conv.id === fadingActiveId;
-                const isRunning = conv.runStatus === 'running';
-                const hasUnread = conv.hasUnread && !isActive;
+                const isAwaitingApproval = conv.runStatus === 'awaiting-approval';
+                const isRunning = conv.runStatus === 'running' && !isAwaitingApproval;
+                const hasUnread = (conv.hasUnread && !isActive) || (isAwaitingApproval && !isActive);
                 const isRemoving = removingIds.has(conv.id);
                 const computerStatus = getComputerStatus(conv.id);
                 const isPinned = pinnedIds.has(conv.id);
@@ -570,7 +574,8 @@ export const ConversationList: FC<ConversationListProps> = ({
                       </span>
                     </div>
                     <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
-                      {hasUnread && <div className="h-2 w-2 rounded-full bg-primary app-unread-glow" />}
+                      {isAwaitingApproval && !isActive && <div className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_10px_var(--color-amber-400)]" />}
+                      {hasUnread && !isAwaitingApproval && <div className="h-2 w-2 rounded-full bg-primary app-unread-glow" />}
                       {computerStatus === 'running' && <ComputerActiveIndicator />}
                       {computerStatus === 'completed' && !(isActive && activeThreadMode === 'computer') && <ComputerCompletedIndicator />}
                       {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}

@@ -45,6 +45,89 @@ export function shouldUseOpenAIResponsesApi(
   return modelConfig.useResponsesApi === true;
 }
 
+/**
+ * Fetch wrapper for OpenAI-compatible endpoints that patches Responses API
+ * requests to ensure every function_call has a matching function_call_output.
+ *
+ * Some gateways translate the Responses API to Anthropic Messages API format
+ * but fail when the input array has function_call items without matching
+ * function_call_output items during multi-step agentic turns.
+ */
+function createResponsesApiPatchingFetch(): typeof fetch {
+  return async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+
+    if (!url.endsWith('/responses') || typeof init?.body !== 'string') {
+      return fetch(input, init);
+    }
+
+    try {
+      const parsed = JSON.parse(init.body) as Record<string, unknown>;
+      const inputItems = parsed.input;
+      if (!Array.isArray(inputItems)) {
+        return fetch(input, init);
+      }
+
+      // Collect all function_call call_ids and all function_call_output call_ids
+      const callIds = new Set<string>();
+      const outputIds = new Set<string>();
+      for (const item of inputItems) {
+        if (item && typeof item === 'object') {
+          if (item.type === 'function_call' && item.call_id) callIds.add(item.call_id as string);
+          if (item.type === 'function_call_output' && item.call_id) outputIds.add(item.call_id as string);
+        }
+      }
+
+      // Find function_calls without matching outputs
+      const orphanedIds = [...callIds].filter(id => !outputIds.has(id));
+
+      let patched = [...inputItems];
+      let patchApplied = false;
+
+      // Inject synthetic function_call_output for each orphaned call
+      if (orphanedIds.length > 0) {
+        patchApplied = true;
+        for (const callId of orphanedIds) {
+          const callIndex = patched.findIndex(
+            (item) => item && typeof item === 'object' && item.type === 'function_call' && item.call_id === callId,
+          );
+          const insertAt = callIndex >= 0 ? callIndex + 1 : patched.length;
+          patched.splice(insertAt, 0, {
+            type: 'function_call_output',
+            call_id: callId,
+            output: 'Tool execution did not return a result.',
+          });
+        }
+      }
+
+      // Remove trailing assistant messages — Mastra's MessageMerger can produce
+      // duplicate/redundant assistant items for each agentic loop step.  The
+      // gateway rejects these because Anthropic requires the conversation to end
+      // with a user (or tool-result) turn, not an assistant turn.
+      while (patched.length > 0) {
+        const last = patched[patched.length - 1] as Record<string, unknown>;
+        if (last.role === 'assistant') {
+          patched.pop();
+          patchApplied = true;
+        } else {
+          break;
+        }
+      }
+
+      if (!patchApplied) {
+        return fetch(input, init);
+      }
+
+      return fetch(input, {
+        ...init,
+        body: JSON.stringify({ ...parsed, input: patched }),
+      });
+    } catch {
+      return fetch(input, init);
+    }
+  };
+}
+
 function createTemperatureOmissionFetch(): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(withBrandUserAgent(init?.headers));
@@ -164,6 +247,7 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
       ...(modelConfig.apiVersion ? { 'api-version': modelConfig.apiVersion } : {}),
       ...(modelConfig.extraHeaders ?? {}),
     }),
+    fetch: createResponsesApiPatchingFetch(),
   });
 
   const modelId = modelConfig.deploymentName || modelConfig.modelName;

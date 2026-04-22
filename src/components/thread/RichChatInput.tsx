@@ -593,6 +593,12 @@ export const RichChatInput: FC<RichChatInputProps> = ({
     }
   }, [autoFocus, focusAtRawOffset, focusKey, value.length]);
 
+  const handleSubmit = useCallback(() => {
+    if (!onSubmit) return;
+    pendingFocusRawOffsetRef.current = 0;
+    onSubmit();
+  }, [onSubmit]);
+
   const handleRunChange = useCallback((segment: UserTextSegment | UserInlineCodeSegment | GapTextSegment, nextText: string, localOffset: number) => {
     if (segment.type === 'inlineCode') {
       const serialized = serializeInlineCode(nextText, segment.delimiterLength);
@@ -715,7 +721,7 @@ export const RichChatInput: FC<RichChatInputProps> = ({
             segment={segment}
             registerHandle={registerHandle}
             onChangeText={(nextText, localOffset) => handleRunChange(segment, nextText, localOffset)}
-            onSubmit={onSubmit}
+            onSubmit={handleSubmit}
             onCancel={onCancel}
             onArrowNavigate={onArrowNavigate}
             onPaste={onPaste}

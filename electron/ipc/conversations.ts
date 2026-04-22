@@ -102,6 +102,30 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
   ipcMain.handle('conversations:put', (_event, conversation: ConversationRecord) => {
     const store = readConversationStore(appHome);
+    const tree = Array.isArray(conversation.messageTree) ? conversation.messageTree : [];
+    const prev = store.conversations[conversation.id];
+    const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
+
+    // Guard: never allow a write that would lose messages compared to what's on disk.
+    // If the incoming tree is shorter than the stored tree, preserve the stored message data
+    // and only apply non-message field updates. This protects against stale-closure races
+    // where title generation, settings persistence, or debounced persists write back
+    // an older snapshot of the conversation.
+    if (prev && prevTreeLen > 0 && tree.length < prevTreeLen) {
+      const guarded = {
+        ...conversation,
+        messages: prev.messages,
+        messageTree: prev.messageTree,
+        headId: prev.headId,
+        messageCount: prev.messageCount,
+        userMessageCount: prev.userMessageCount,
+      };
+      store.conversations[conversation.id] = guarded;
+      writeConversationStore(appHome, store);
+      broadcastConversationChange(store);
+      return { ok: true };
+    }
+
     store.conversations[conversation.id] = conversation;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);

@@ -117,14 +117,47 @@ Config schema: `models.providers` (keyed by name) + `models.catalog` (array of m
 
 ## Gotchas
 
-- **macOS only** for now - `electron-builder.yml` only targets `mac` with `dir` output (no DMG/installer)
+- **macOS only** for now - `electron-builder.yml` only targets `mac` with `dmg` output
 - **contextIsolation is ON** - never try to use `require()` or Node APIs in renderer code
 - **Tailwind v4** - uses `@tailwindcss/postcss` plugin, not the v3 `tailwind.config.js` pattern
 - **No test suite** - no specs or test framework currently configured
 - **`sandbox: false`** in webPreferences - needed for preload script to work with full Node access
-- **Conversation cleanup** - the app auto-deletes empty/abandoned conversations on switch
+- **No conversation auto-cleanup** - conversations are never auto-deleted; users manage their own threads
 - **Tool registry is async** - tools build after window creation; MCP connections happen at startup
+- **Config persistence allowlist** - `desktopConfigPayload()` in `electron/ipc/config.ts` is an explicit allowlist; new config sections MUST be added there or they won't persist
+
+## Debug Logging
+
+When debugging issues that span process boundaries (renderer <-> main) or involve async race conditions, use the project-local debug log directory instead of `console.warn`:
+
+| Item | Value |
+|------|-------|
+| **Directory** | `debug-logs/` (project root, gitignored) |
+| **Convention** | One file per topic, e.g. `debug-logs/persist.log`, `debug-logs/stream.log` |
+| **Format** | `[ISO-timestamp] [TAG] key=value key=value ...` — structured, grep-friendly |
+
+### How to use
+
+**Main process** (Node / Electron main) — write directly with `fs.appendFileSync`:
+```typescript
+import { appendFileSync } from 'fs';
+import { join } from 'path';
+const DEBUG_LOG = join(__dirname, '../../debug-logs/persist.log');
+function debugLog(msg: string) {
+  try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+}
+```
+
+**Renderer process** — use `console.warn` with a `[TAG]` prefix (renderer cannot write to disk). The user will relay console output, or you can read it from DevTools.
+
+### When the user says "enable debug mode" or "add debug logs"
+
+1. Create the log file(s) in `debug-logs/`.
+2. Add `appendFileSync`-based logging in the main process code at the points of interest.
+3. Add `console.warn`-based logging in the renderer at the points of interest.
+4. Ask the user to reproduce, then read `debug-logs/*.log` to diagnose.
+5. **Clean up**: remove the debug logging code once the issue is resolved. Debug logs are for investigation, not permanent instrumentation.
 
 ---
 
-**Last Updated**: 2026-03-20
+**Last Updated**: 2026-04-22

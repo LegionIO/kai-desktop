@@ -19,8 +19,8 @@ export const PlanPanel: FC<{
 
   return (
     <div className="flex h-full min-w-[280px] flex-col border-l border-border/70 bg-background">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border/70 px-4 py-3">
+      {/* Header — titlebar-no-drag so the close button isn't blocked by the Electron drag region */}
+      <div className="titlebar-no-drag relative z-40 flex items-center justify-between border-b border-border/70 px-4 py-3">
         <div className="flex items-center gap-2 min-w-0">
           <ScrollTextIcon className="h-4 w-4 shrink-0 text-primary" />
           <span className="text-sm font-semibold text-foreground">Plan</span>
@@ -102,10 +102,16 @@ export const PlanPanelDivider: FC<{
       onPointerDown={handleDragStart}
       className="group relative h-full w-0 shrink-0 cursor-col-resize z-10"
     >
-      {/* Invisible hit area */}
-      <div className="absolute inset-y-0 -left-3 w-6" />
+      {/* Invisible hit area — only extends left so it doesn't overlap the plan panel close button */}
+      <div className="absolute inset-y-0 -left-3 w-3" />
       {/* Handle pill */}
       <div className="absolute -left-0.5 top-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
+      {/* Tooltip — positioned to the left of the handle, matching the left nav resize handle */}
+      <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 -translate-x-full opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
+        <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
+          Drag to resize
+        </div>
+      </div>
     </div>
   );
 };

@@ -202,6 +202,12 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
     app.conversations.get(conversationId).then((conv: unknown) => {
       const record = conv as ConversationRecord | null;
       if (!record) return;
+      // Skip if values haven't actually changed to avoid unnecessary writes
+      // that could race with concurrent stream persistence.
+      if (record.selectedModelKey === selectedModelKey
+        && record.selectedProfileKey === selectedProfileKey
+        && record.fallbackEnabled === fallbackEnabled
+        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
       app.conversations.put({
         ...record,
         selectedModelKey,
@@ -305,53 +311,10 @@ function getComputerSessionForConversation(
   return sessionsByConversation.get(conversationId)?.[0];
 }
 
-function isDisposableNewConversation(conversation: ConversationRecord | null, hasComputerSessions = false): boolean {
-  if (!conversation) return false;
-  if (hasComputerSessions) return false; // Never auto-delete conversations with computer-use history
-
-  const hasMessages = Array.isArray(conversation.messages) && conversation.messages.length > 0;
-  const hasTreeMessages = Array.isArray(conversation.messageTree) && conversation.messageTree.length > 0;
-  const hasTitle = Boolean(conversation.title?.trim() || conversation.fallbackTitle?.trim());
-
-  return !hasTitle
-    && !hasMessages
-    && !hasTreeMessages
-    && (conversation.messageCount ?? 0) === 0
-    && (conversation.userMessageCount ?? 0) === 0
-    && conversation.runStatus === 'idle';
-}
-
 type ConversationsStore = {
   conversations?: Record<string, ConversationRecord>;
   activeConversationId?: string | null;
 };
-
-/**
- * Delete all empty "Untitled Thread" entries except the currently active one.
- * If a conversation list is provided, uses it directly; otherwise fetches from IPC.
- * Returns the IDs of deleted conversations (for animation).
- */
-async function cleanupEmptyConversations(
-  activeId?: string | null,
-  existingList?: ConversationRecord[],
-  sessionsByConversation?: Map<string, ComputerSession[]>,
-): Promise<string[]> {
-  try {
-    const list = existingList ?? (await app.conversations.list()) as ConversationRecord[];
-    const disposableIds = list
-      .filter((conv) => conv.id !== activeId && isDisposableNewConversation(conv, Boolean(sessionsByConversation?.has(conv.id))))
-      .map((conv) => conv.id);
-
-    if (disposableIds.length === 0) return [];
-
-    console.info(`[Conversations] Cleaning up ${disposableIds.length} empty conversations`);
-    await Promise.all(disposableIds.map((id) => app.conversations.delete(id)));
-    return disposableIds;
-  } catch (err) {
-    console.warn('[Conversations] Cleanup failed:', err);
-    return [];
-  }
-}
 
 type AppView = string;
 
@@ -406,6 +369,13 @@ function AppShell() {
   const [exportOpen, setExportOpen] = useState(false);
   const [renamingTitle, setRenamingTitle] = useState(false);
   const [renameValue, setRenameValue] = useState('');
+  const renameInputRef = useCallback((el: HTMLInputElement | null) => {
+    if (el) {
+      // Radix dropdown restores focus to the trigger button asynchronously
+      // after the menu closes, so we need a longer delay to beat that.
+      setTimeout(() => { el.focus(); el.select(); }, 50);
+    }
+  }, []);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
   const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
@@ -465,8 +435,6 @@ function AppShell() {
         );
         applyStore({ activeConversationId: id, conversations });
 
-        // Clean up historical empty conversations on load
-        void cleanupEmptyConversations(id, list as ConversationRecord[], cuSessionsByConversation);
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
@@ -597,26 +565,9 @@ function AppShell() {
     };
   }, [dragState, sidebarWidth, updateConfig]);
 
-  const cleanupAbandonedConversation = useCallback(async (nextConversationId?: string | null) => {
-    if (!activeConversationId || activeConversationId === nextConversationId) return;
-
-    try {
-      const conversation = await app.conversations.get(activeConversationId) as ConversationRecord | null;
-      const hasComputerSessions = cuSessionsByConversation.has(activeConversationId);
-      if (!isDisposableNewConversation(conversation, hasComputerSessions)) return;
-
-      await app.conversations.delete(activeConversationId);
-      setActiveConversationId(null);
-      setActiveConversationTitle('Untitled Thread');
-    } catch {
-      // Leave the current conversation intact if cleanup fails.
-    }
-  }, [activeConversationId, cuSessionsByConversation]);
-
   const handleSwitchConversation = useCallback(async (id: string) => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
-    await cleanupAbandonedConversation(id);
     await app.conversations.setActiveId(id);
     setActiveView(CHAT_VIEW);
     setActiveConversationId(id);
@@ -626,24 +577,13 @@ function AppShell() {
       conv,
       cuSessionsByConversation.get(id),
     ));
-    // Clean up any other empty conversations in the background
-    void cleanupEmptyConversations(id, undefined, cuSessionsByConversation);
-  }, [cleanupAbandonedConversation, cuSessionsByConversation, isMobile]);
+  }, [cuSessionsByConversation, isMobile]);
 
   const handleNewConversation = useCallback(async () => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
     suppressStoreSync.current = true;
     try {
-      if (activeConversationId) {
-        try {
-          const conversation = await app.conversations.get(activeConversationId) as ConversationRecord | null;
-          const hasComputerSessions = cuSessionsByConversation.has(activeConversationId);
-          if (isDisposableNewConversation(conversation, hasComputerSessions)) {
-            await app.conversations.delete(activeConversationId);
-          }
-        } catch { /* ignore */ }
-      }
       const newId = generateId();
       const now = new Date().toISOString();
       await app.conversations.put({
@@ -671,21 +611,17 @@ function AppShell() {
     } finally {
       suppressStoreSync.current = false;
     }
-  }, [activeConversationId, cuSessionsByConversation, isMobile]);
+  }, [isMobile]);
 
   const handleSettingsToggle = useCallback(async () => {
-    if (activeView !== 'settings') {
-      await cleanupAbandonedConversation();
-    }
     setActiveView((v) => v === SETTINGS_VIEW ? CHAT_VIEW : SETTINGS_VIEW);
     if (isMobile) setSidebarOpen(false);
-  }, [cleanupAbandonedConversation, activeView, isMobile]);
+  }, [activeView, isMobile]);
 
   const handleOpenSettings = useCallback(async () => {
-    await cleanupAbandonedConversation();
     setActiveView(SETTINGS_VIEW);
     if (isMobile) setSidebarOpen(false);
-  }, [cleanupAbandonedConversation, isMobile]);
+  }, [isMobile]);
 
   // Listen for Cmd+, / menu Settings
   useEffect(() => {
@@ -755,6 +691,12 @@ function AppShell() {
     app.conversations.get(activeConversationId).then((conv: unknown) => {
       const record = conv as ConversationRecord | null;
       if (!record) return;
+      // Skip if values haven't actually changed to avoid unnecessary writes
+      // that could race with concurrent stream persistence.
+      if (record.selectedModelKey === selectedModelKey
+        && record.selectedProfileKey === selectedProfileKey
+        && record.fallbackEnabled === fallbackEnabled
+        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
       app.conversations.put({
         ...record,
         selectedModelKey,
@@ -936,12 +878,11 @@ function AppShell() {
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
+              <h2 className="text-lg font-semibold text-foreground">Rename thread</h2>
               <input
-                autoFocus
+                ref={renameInputRef}
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
-                onFocus={(e) => e.target.select()}
                 onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeConversationId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
                 className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
               />

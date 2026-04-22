@@ -151,6 +151,8 @@ type MessageAccumulator = {
   /** Deferred tool approvals keyed by toolName — handles race where
    *  tool-approval-required arrives before the stream-side tool-call event. */
   deferredApprovals?: Map<string, { toolCallId: string }>;
+  /** True while a tool is awaiting user approval — suppresses the running indicator */
+  awaitingApproval?: boolean;
 };
 
 function nowIso(): string {
@@ -398,11 +400,11 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
 
   const content = acc.messages[idx].content;
   if (Array.isArray(content)) {
-    type ToolCallPart = { type: string; result?: unknown; finishedAt?: string; isError?: boolean; isHung?: boolean };
+    type ToolCallPart = { type: string; result?: unknown; finishedAt?: string; isError?: boolean; isHung?: boolean; approvalStatus?: string };
     let mutated = false;
     for (const part of content) {
       const tc = part as ToolCallPart;
-      if (tc.type === 'tool-call' && tc.result === undefined) {
+      if (tc.type === 'tool-call' && tc.result === undefined && tc.approvalStatus !== 'pending') {
         tc.result = { isHung: true, error: 'Stream ended before tool result was received.' };
         tc.isHung = true;
         tc.finishedAt = finishedAt;
@@ -892,6 +894,14 @@ async function getTitleSettings(): Promise<TitleSettings> {
   }
 }
 
+/** Update only specific fields on a conversation without overwriting message data.
+ *  Reads the latest record from disk immediately before writing to minimize race windows. */
+async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
+  const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+  if (!latest) return;
+  await app.conversations.put({ ...latest, ...patch });
+}
+
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[]): Promise<void> {
   try {
     const settings = await getTitleSettings();
@@ -920,8 +930,8 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     titleGenInFlight.add(conversationId);
 
     try {
-      // Mark as generating
-      await app.conversations.put({ ...conv, titleStatus: 'generating' });
+      // Mark as generating — use patchConversation to avoid overwriting message data
+      await patchConversation(conversationId, { titleStatus: 'generating' });
 
       // Stagger the title request slightly so Bedrock is less likely to reject
       // it when the main response request starts at the exact same moment.
@@ -929,22 +939,18 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
 
       const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined);
       if (result.title) {
-        const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
-        if (latest) {
-          await app.conversations.put({
-            ...latest,
-            title: result.title,
-            fallbackTitle: result.title,
-            titleStatus: 'ready',
-            titleUpdatedAt: nowIso(),
-          });
-        }
+        await patchConversation(conversationId, {
+          title: result.title,
+          fallbackTitle: result.title,
+          titleStatus: 'ready',
+          titleUpdatedAt: nowIso(),
+        });
       } else {
         // Title gen returned nothing — keep the UI moving with a simple fallback.
         const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
         if (latest && latest.titleStatus === 'generating') {
           const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
-          await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
+          await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
           // If we still have no title at all, clear the dedup counter so the
           // next user message can retry title generation.
           if (!latest.title?.trim() && !fallbackTitle?.trim()) {
@@ -959,7 +965,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (latest && latest.titleStatus === 'generating') {
       const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
-      await app.conversations.put({ ...latest, fallbackTitle, titleStatus: 'idle' });
+      await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
     }
     // Clear the dedup counter on error so subsequent messages can retry
     lastRetitleCount.delete(conversationId);
@@ -976,7 +982,8 @@ function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: 
       ...m,
       createdAt: m.createdAt ? new Date(m.createdAt as unknown as string) : undefined,
     }));
-    return { tree, headId: conv.headId ?? tree[tree.length - 1]?.id ?? null };
+    const headId = conv.headId ?? tree[tree.length - 1]?.id ?? null;
+    return { tree, headId };
   }
   // Convert flat messages to tree
   let parentId: string | null = null;
@@ -1048,7 +1055,7 @@ export function RuntimeProvider({
   const treeRef = useRef<StoredMessage[]>([]);
   const headIdRef = useRef<string | null>(null);
   const currentWorkingDirectoryRef = useRef<string | null>(null);
-  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const onModelFallbackRef = useRef(onModelFallback);
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
@@ -1168,22 +1175,28 @@ export function RuntimeProvider({
 
     const { tree: t, headId: h } = ensureTree(conv);
 
-    for (const msg of t) {
-      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-      type PersistedToolPart = { type: string; result?: unknown; isHung?: boolean; finishedAt?: string };
-      let repaired = false;
-      for (const part of msg.content) {
-        const tc = part as PersistedToolPart;
-        if (tc.type === 'tool-call' && tc.result === undefined) {
-          tc.result = { isHung: true, error: 'Stream ended before tool result was received.' };
-          tc.isHung = true;
-          tc.finishedAt = tc.finishedAt ?? new Date().toISOString();
-          repaired = true;
+    // Only mark orphaned tool-calls as hung if there's no active stream —
+    // an active stream or a tool awaiting user approval means the missing
+    // result is expected, not an error.
+    const hasActiveStream = streamAccumulators.has(id);
+    if (!hasActiveStream) {
+      for (const msg of t) {
+        if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+        type PersistedToolPart = { type: string; result?: unknown; isHung?: boolean; finishedAt?: string; approvalStatus?: string };
+        let repaired = false;
+        for (const part of msg.content) {
+          const tc = part as PersistedToolPart;
+          if (tc.type === 'tool-call' && tc.result === undefined && tc.approvalStatus !== 'pending') {
+            tc.result = { isHung: true, error: 'Stream ended before tool result was received.' };
+            tc.isHung = true;
+            tc.finishedAt = tc.finishedAt ?? new Date().toISOString();
+            repaired = true;
+          }
         }
-      }
-      if (repaired) {
-        const idx = t.indexOf(msg);
-        if (idx >= 0) t[idx] = { ...msg, content: [...msg.content] };
+        if (repaired) {
+          const idx = t.indexOf(msg);
+          if (idx >= 0) t[idx] = { ...msg, content: [...msg.content] };
+        }
       }
     }
 
@@ -1193,8 +1206,11 @@ export function RuntimeProvider({
     currentWorkingDirectoryRef.current = conv.currentWorkingDirectory ?? null;
     setCurrentWorkingDirectoryState(conv.currentWorkingDirectory ?? null);
 
-    const hasActiveStream = streamAccumulators.has(id);
-    setIsRunning(hasActiveStream);
+    // Don't show the running indicator for conversations awaiting user approval —
+    // the accumulator is still alive (so hasActiveStream is true) but the model
+    // has stopped generating; only user interaction can resume it.
+    const accAwait = hasActiveStream && streamAccumulators.get(id)?.awaitingApproval;
+    setIsRunning(hasActiveStream && !accAwait);
     if (conv.runStatus === 'running' && !hasActiveStream) {
       void persistConversation(id, t, h, { runStatus: 'idle' });
     }
@@ -1251,8 +1267,10 @@ export function RuntimeProvider({
   }, [conversationId, activeConversationId, loadConversationState]);
 
   const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
-    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-    persistTimerRef.current = setTimeout(() => { persistConversation(conversationId, t, h, extra); }, 300);
+    const timers = persistTimersRef.current;
+    const existing = timers.get(conversationId);
+    if (existing) clearTimeout(existing);
+    timers.set(conversationId, setTimeout(() => { timers.delete(conversationId); persistConversation(conversationId, t, h, extra); }, 300));
   }, []);
 
   const setCurrentWorkingDirectory = useCallback(async (cwd: string | null) => {
@@ -1406,7 +1424,9 @@ export function RuntimeProvider({
           const { tree: curTree, headId: curHead } = streamHandlerRef.current;
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
         } else {
-          streamAccumulators.set(convId, { messages: [], headId: null });
+          // No accumulator for a non-active conversation — the stream already
+          // completed and was persisted by the done/error handler.  Drop stale events.
+          return;
         }
       }
 
@@ -1493,7 +1513,7 @@ export function RuntimeProvider({
         // from merging into the previous call's last assistant message.
         if (rtStatus === 'connected' && acc.messages.length > 0) {
           finalizeAssistantResponse(acc);
-          if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+          const _pt1 = persistTimersRef.current.get(convId); if (_pt1) { clearTimeout(_pt1); persistTimersRef.current.delete(convId); }
           streamAccumulators.delete(convId);
           forceNewAssistant.add(convId);
           persistConversation(convId, acc.messages, acc.headId, {
@@ -1531,6 +1551,7 @@ export function RuntimeProvider({
         }
       } else if (e.type === 'tool-approval-required') {
         // Mark the tool call as needing approval
+        acc.awaitingApproval = true;
         if (!e.toolCallId) return;
         const { msg, idx } = getOrCreateAssistantInAcc(acc);
         const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
@@ -1549,7 +1570,7 @@ export function RuntimeProvider({
         }
         if (tcIdx >= 0) {
           const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-          content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: e.toolCallId as string };
+          content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: e.toolCallId as string, finishedAt: nowIso() };
           acc.messages[idx] = { ...msg, content: toStoredContent(content) };
         } else if (e.toolName) {
           // tool-call event hasn't arrived yet — defer the approval so it can
@@ -1558,6 +1579,7 @@ export function RuntimeProvider({
           acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string });
         }
       } else if (e.type === 'tool-result') {
+        acc.awaitingApproval = false;
         applyToolResult(acc, {
           toolCallId: e.toolCallId,
           toolName: e.toolName,
@@ -1665,7 +1687,7 @@ export function RuntimeProvider({
       } else if (e.type === 'error') {
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         finalizeAssistantResponse(acc);
-        if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+        const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
@@ -1677,8 +1699,26 @@ export function RuntimeProvider({
         }
         return;
       } else if (e.type === 'done') {
+        // If a tool is awaiting user approval, the stream "done" just means the
+        // model finished generating — tool execution is still blocked.  Keep the
+        // accumulator alive and stay in awaiting-approval state so the UI doesn't
+        // reset or restart the stream.
+        if (acc.awaitingApproval) {
+          finalizeAssistantResponse(acc);
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
+          // Persist with awaiting-approval so the sidebar stays correct
+          const _ptAwait = persistTimersRef.current.get(convId);
+          if (_ptAwait) { clearTimeout(_ptAwait); persistTimersRef.current.delete(convId); }
+          persistConversation(convId, acc.messages, acc.headId, {
+            runStatus: 'awaiting-approval', hasUnread: true,
+          });
+          return;
+        }
         finalizeAssistantResponse(acc);
-        if (persistTimerRef.current) { clearTimeout(persistTimerRef.current); persistTimerRef.current = null; }
+        const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
@@ -1757,7 +1797,29 @@ export function RuntimeProvider({
         setTree([...acc.messages]);
         setHeadId(acc.headId);
       }
-      streamHandlerRef.current.schedulePersist(convId, acc.messages, acc.headId, { runStatus: 'running' });
+      const persistStatus = e.type === 'tool-approval-required' ? 'awaiting-approval'
+        : acc.awaitingApproval ? 'awaiting-approval'
+        : 'running';
+      const persistExtra: Partial<ConversationRecord> = { runStatus: persistStatus };
+      if (e.type === 'tool-approval-required') {
+        persistExtra.hasUnread = true;
+        // Mark as not running so the typing indicator / sidebar bubble stops
+        if (isActiveConv) {
+          setIsRunning(false);
+        }
+        // Persist immediately — no debounce — so the sidebar picks up the
+        // awaiting-approval state even if the user switches threads quickly.
+        const _pt = persistTimersRef.current.get(convId);
+        if (_pt) { clearTimeout(_pt); persistTimersRef.current.delete(convId); }
+        persistConversation(convId, acc.messages, acc.headId, persistExtra);
+      } else {
+        // Resume running indicator only if not awaiting approval — stale
+        // text-delta events may arrive after tool-approval-required.
+        if (isActiveConv && !acc.awaitingApproval) {
+          setIsRunning(true);
+        }
+        streamHandlerRef.current.schedulePersist(convId, acc.messages, acc.headId, persistExtra);
+      }
     });
     return unsubscribe;
   }, [bumpSubAgentVersion]);

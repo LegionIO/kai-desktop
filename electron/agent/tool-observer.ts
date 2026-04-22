@@ -53,6 +53,7 @@ type ObservedToolState = {
   startedAt: string;
   finishedAt?: string;
   running: boolean;
+  awaitingApproval?: boolean;
   observerInitiated: boolean;
   stdout: string;
   stderr: string;
@@ -446,6 +447,12 @@ export class ToolObserverManager {
     state.finishedAt = new Date().toISOString();
   }
 
+  /** Mark a tool as awaiting user approval — hides it from the observer so it won't be cancelled. */
+  onToolAwaitingApproval(toolCallId: string): void {
+    const state = this.tools.get(toolCallId);
+    if (state) state.awaitingApproval = true;
+  }
+
   getToolAugmentation(toolCallId: string): Record<string, unknown> | undefined {
     const state = this.perToolAugmentation.get(toolCallId);
     if (!state) return undefined;
@@ -486,7 +493,7 @@ export class ToolObserverManager {
   }
 
   private getRunningTools(): ObservedToolState[] {
-    return Array.from(this.tools.values()).filter((t) => t.running);
+    return Array.from(this.tools.values()).filter((t) => t.running && !t.awaitingApproval);
   }
 
   private addLinkedLaunchedTool(parentToolCallId: string, launchedToolCallId: string): void {
