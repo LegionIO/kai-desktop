@@ -36,7 +36,7 @@ export default defineConfig({
       // `import("execa")` so Rollup resolves and bundles it normally.
       {
         name: 'bundle-execa',
-        transform(code, id) {
+        transform(code, _id) {
           if (!code.includes('getExeca')) return null;
           const pattern =
             /const mod = "execa";\s*const execa = \(await import\(\s*\/\*\s*@vite-ignore\s*\*\/\s*\/\*\s*webpackIgnore:\s*true\s*\*\/\s*mod\s*\)\)\.execa;/s;
