@@ -219,7 +219,7 @@ function getDefaultConfig() {
     imageGeneration: {
       enabled: false,
       provider: 'azure' as const,
-      model: 'gpt-image-1.5',
+      model: 'gpt-image-2',
     },
     videoGeneration: {
       enabled: false,

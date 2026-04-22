@@ -9,7 +9,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
   return {
     name: 'generate_image',
     description:
-      'Generate an image from a text prompt using an AI image generation model (e.g. gpt-image-1.5). ' +
+      'Generate an image from a text prompt using an AI image generation model (e.g. gpt-image-2). ' +
       'Returns a local file URL that can be embedded in markdown. ' +
       'The image is saved to disk automatically.',
     inputSchema: z.object({
@@ -36,6 +36,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
 
         const outputFormat = config.outputFormat || 'png';
         const body: Record<string, unknown> = {
+          model: config.model || 'gpt-image-2',
           prompt,
           size: size || config.size || '1024x1024',
           quality: quality || config.quality || 'high',
@@ -115,7 +116,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
           imageCount: images.length,
           size: (size || config.size || '1024x1024') as string,
           quality: (quality || config.quality || 'high') as string,
-          modelKey: config.model || 'gpt-image-1.5',
+          modelKey: config.model || 'gpt-image-2',
         });
 
         const markdownPreview = images
@@ -127,7 +128,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
           images,
           markdownPreview,
           prompt,
-          model: config.model || 'gpt-image-1.5',
+          model: config.model || 'gpt-image-2',
         };
       } catch (err) {
         return {

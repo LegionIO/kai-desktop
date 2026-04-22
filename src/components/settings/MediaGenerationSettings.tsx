@@ -130,7 +130,7 @@ const ProviderConfigSection: FC<{
               className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
               value={config?.azure?.deploymentName ?? ''}
               onChange={(e) => updateConfig(`${prefix}.azure.deploymentName`, e.target.value)}
-              placeholder={prefix.includes('image') ? 'gpt-image-1.5' : 'sora-2'}
+              placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
             />
           </div>
 
@@ -183,7 +183,7 @@ const ProviderConfigSection: FC<{
           className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
           value={config?.model ?? ''}
           onChange={(e) => updateConfig(`${prefix}.model`, e.target.value)}
-          placeholder={prefix.includes('image') ? 'gpt-image-1.5' : 'sora-2'}
+          placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
         />
       </div>
     </>
@@ -287,7 +287,7 @@ const VideoOptions: FC<{
 // ─── Main Component ──────────────────────────────────────────────────────────
 
 const tabs: Array<{ key: MediaTab; label: string; description: string }> = [
-  { key: 'image', label: 'Image', description: 'Generate images using models like gpt-image-1.5.' },
+  { key: 'image', label: 'Image', description: 'Generate images using models like gpt-image-2.' },
   { key: 'video', label: 'Video', description: 'Generate videos using models like Sora 2.' },
 ];
 
