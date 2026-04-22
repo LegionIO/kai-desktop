@@ -1766,22 +1766,6 @@ export function RuntimeProvider({
                 let treeForStream = [...latestTree];
                 let headForStream = latestHeadId;
 
-                // For plan rejection, inject a synthetic user message so the agent
-                // understands the plan was not accepted and it should keep planning.
-                if (planModeRejectRestart) {
-                  const rejectMsg: StoredMessage = {
-                    id: msgId(),
-                    parentId: latestHeadId,
-                    role: 'user',
-                    content: [{ type: 'text', text: 'I rejected that plan. Please keep planning — ask me questions or refine your approach before presenting a new plan.' }],
-                    createdAt: new Date(),
-                  };
-                  treeForStream = [...treeForStream, rejectMsg];
-                  headForStream = rejectMsg.id;
-                  setTree(treeForStream);
-                  setHeadId(headForStream);
-                }
-
                 const branch = getActiveBranch(treeForStream, headForStream);
                 streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
