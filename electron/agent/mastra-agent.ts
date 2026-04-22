@@ -259,27 +259,14 @@ function buildProviderOptions(
     modelConfig.provider === 'anthropic' ||
     (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName));
 
-  if (isAnthropic) {
-    const anthropicOptions: Record<string, unknown> = {
-      // Anthropic is strict about immediate tool_result pairing. In practice,
-      // parallel top-level tool calls can still destabilize multi-step loops
-      // when hidden tools like updateWorkingMemory join the same turn.
-      // Keep Anthropic on single top-level tool calls and rely on wrapper
-      // tools (for example multi_tool_use) for intentional fan-out.
-      disableParallelToolUse: true,
+  if (isAnthropic && reasoningEffort) {
+    const thinkingByEffort: Record<ReasoningEffort, Record<string, unknown>> = {
+      low: { type: 'disabled' },
+      medium: { type: 'adaptive' },
+      high: { type: 'enabled', budgetTokens: 10_000 },
+      xhigh: { type: 'enabled', budgetTokens: 32_000 },
     };
-
-    if (reasoningEffort) {
-      const thinkingByEffort: Record<ReasoningEffort, Record<string, unknown>> = {
-        low: { type: 'disabled' },
-        medium: { type: 'adaptive' },
-        high: { type: 'enabled', budgetTokens: 10_000 },
-        xhigh: { type: 'enabled', budgetTokens: 32_000 },
-      };
-      anthropicOptions.thinking = thinkingByEffort[reasoningEffort];
-    }
-
-    return { anthropic: anthropicOptions };
+    return { anthropic: { thinking: thinkingByEffort[reasoningEffort] } };
   }
 
   return undefined;
