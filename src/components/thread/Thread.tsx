@@ -123,8 +123,8 @@ export const Thread: FC<{
         className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
         style={{
           opacity: hasMessages ? 1 : 0,
-          transitionDuration: hasMessages ? '0ms' : '800ms',
-          transitionDelay: hasMessages ? '0ms' : '500ms',
+          transitionDuration: hasMessages ? '0ms' : '50ms',
+          transitionDelay: hasMessages ? '0ms' : '0ms',
         }}
       />
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
@@ -500,7 +500,6 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
   } | null>(null);
   const [visible, setVisible] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const observerRef = useRef<IntersectionObserver | null>(null);
 
   // Subscribe to thread messages and extract last user message content
   useEffect(() => {
@@ -536,10 +535,14 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
     if (!visible) setExpanded(false);
   }, [visible]);
 
-  // IntersectionObserver + content-height gate: only show the indicator when
-  // the user message has scrolled out of view AND the response chain after it
-  // is at least one viewport tall (so it doesn't flash for short replies).
-  // A MutationObserver re-evaluates the height gate as content streams in.
+  // Only show the indicator when the user's last message has scrolled far
+  // enough out of view that finding it again is non-trivial (at least 0.75x
+  // viewport height above the visible area).
+  // Uses scroll listener + rAF polling (not MutationObserver — that causes
+  // infinite loops because the indicator itself changing visibility mutates
+  // the DOM). The rAF polling is needed because Electron's programmatic
+  // scrollTo() (used by assistant-ui auto-scroll) may not fire DOM scroll
+  // events reliably.
   useEffect(() => {
     if (!lastUserMessage) {
       setVisible(false);
@@ -548,51 +551,43 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
     const viewport = viewportRef.current;
     if (!viewport) return;
 
-    // Clean up previous observer
-    observerRef.current?.disconnect();
-
-    const sentinels = viewport.querySelectorAll(`[data-pinned-sentinel]`);
-    const sentinel = sentinels[sentinels.length - 1] as HTMLElement | undefined;
-    if (!sentinel) {
-      setVisible(false);
-      return;
-    }
-
-    // Track whether the sentinel is currently off-screen
-    let sentinelHidden = false;
-
     const recompute = () => {
-      if (!sentinelHidden) {
+      const currentSentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
+      const currentSentinel = currentSentinels[currentSentinels.length - 1] as HTMLElement | undefined;
+      if (!currentSentinel) {
         setVisible(false);
         return;
       }
-      // Only show if there's enough scrollable content that finding the
-      // original message is non-trivial. We measure the distance between
-      // the current scroll position and the sentinel — if you'd have to
-      // scroll at least a full viewport height to reach it, show the pill.
-      const distanceToSentinel =
-        viewport.scrollTop - (sentinel.offsetTop + sentinel.offsetHeight);
-      setVisible(distanceToSentinel >= viewport.clientHeight);
+      const viewportRect = viewport.getBoundingClientRect();
+      const sentinelRect = currentSentinel.getBoundingClientRect();
+      // How far the bottom of the sentinel is above the top of the viewport.
+      // Positive means the sentinel is above the visible area (scrolled past).
+      const distanceAboveViewport = viewportRect.top - sentinelRect.bottom;
+      // Show when the sentinel is scrolled well out of view — at least 200px
+      // above the viewport top. This is a fixed threshold rather than
+      // viewport-relative to work consistently across different window sizes.
+      setVisible(distanceAboveViewport >= 200);
     };
 
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        sentinelHidden = !entry.isIntersecting;
-        recompute();
-      },
-      { root: viewport, threshold: 0 },
-    );
-    observer.observe(sentinel);
-    observerRef.current = observer;
+    // Poll via rAF for 1.5s after mount to catch auto-scroll settling.
+    // This is needed because Electron's programmatic scrollTo() may not
+    // fire DOM scroll events.
+    let rafId = 0;
+    const startTime = Date.now();
+    const poll = () => {
+      recompute();
+      if (Date.now() - startTime < 1500) {
+        rafId = requestAnimationFrame(poll);
+      }
+    };
+    rafId = requestAnimationFrame(poll);
 
-    // Re-evaluate height gate as the DOM grows (streaming responses) or as the user scrolls
-    const mo = new MutationObserver(recompute);
-    mo.observe(viewport, { childList: true, subtree: true });
+    // Re-evaluate on scroll (works in browser, may not fire in Electron
+    // for programmatic scrolls)
     viewport.addEventListener('scroll', recompute, { passive: true });
 
     return () => {
-      observer.disconnect();
-      mo.disconnect();
+      cancelAnimationFrame(rafId);
       viewport.removeEventListener('scroll', recompute);
     };
   }, [lastUserMessage, viewportRef]);
@@ -734,7 +729,12 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
         transitionDuration: fadingOut ? '300ms' : '2000ms',
       }}
     >
-      <div className="relative h-full w-full">{children}</div>
+      <div
+        className="relative h-full w-full"
+        style={{ maskImage: 'linear-gradient(to right, transparent, black 8%)' }}
+      >
+        {children}
+      </div>
     </div>
   );
 };
