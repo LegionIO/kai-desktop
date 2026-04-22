@@ -971,6 +971,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   toolName: state.toolName,
                   args: state.args,
                 });
+                observer?.onToolAwaitingApproval(state.toolCallId);
                 const approved = await new Promise<boolean>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });
@@ -989,6 +990,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   toolName: state.toolName,
                   args: state.args,
                 });
+                observer?.onToolAwaitingApproval(state.toolCallId);
                 const approved = await new Promise<boolean>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });
@@ -1019,6 +1021,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   toolName: state.toolName,
                   args: state.args,
                 });
+                observer?.onToolAwaitingApproval(state.toolCallId);
                 const approved = await new Promise<boolean>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });

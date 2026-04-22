@@ -369,6 +369,13 @@ function AppShell() {
   const [exportOpen, setExportOpen] = useState(false);
   const [renamingTitle, setRenamingTitle] = useState(false);
   const [renameValue, setRenameValue] = useState('');
+  const renameInputRef = useCallback((el: HTMLInputElement | null) => {
+    if (el) {
+      // Radix dropdown restores focus to the trigger button asynchronously
+      // after the menu closes, so we need a longer delay to beat that.
+      setTimeout(() => { el.focus(); el.select(); }, 50);
+    }
+  }, []);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
   const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
@@ -871,12 +878,11 @@ function AppShell() {
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
+              <h2 className="text-lg font-semibold text-foreground">Rename thread</h2>
               <input
-                autoFocus
+                ref={renameInputRef}
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
-                onFocus={(e) => e.target.select()}
                 onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeConversationId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
                 className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
               />

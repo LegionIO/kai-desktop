@@ -38,6 +38,7 @@ import {
   ArrowUpIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
 import { useAssistantResponseTiming, useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
@@ -551,10 +552,12 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
     const viewport = viewportRef.current;
     if (!viewport) return;
 
+    let currentlyVisible = false;
     const recompute = () => {
       const currentSentinels = viewport.querySelectorAll('[data-pinned-sentinel]');
       const currentSentinel = currentSentinels[currentSentinels.length - 1] as HTMLElement | undefined;
       if (!currentSentinel) {
+        currentlyVisible = false;
         setVisible(false);
         return;
       }
@@ -563,10 +566,16 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
       // How far the bottom of the sentinel is above the top of the viewport.
       // Positive means the sentinel is above the visible area (scrolled past).
       const distanceAboveViewport = viewportRect.top - sentinelRect.bottom;
-      // Show when the sentinel is scrolled well out of view — at least 200px
-      // above the viewport top. This is a fixed threshold rather than
-      // viewport-relative to work consistently across different window sizes.
-      setVisible(distanceAboveViewport >= 200);
+      // Hysteresis: show sooner (20px) when scrolling down, but only hide
+      // when the sentinel is back in view (-40px) when scrolling up.
+      if (currentlyVisible) {
+        // Already showing — only hide when sentinel is back in view
+        currentlyVisible = distanceAboveViewport >= -40;
+      } else {
+        // Not showing — show once sentinel is out of view
+        currentlyVisible = distanceAboveViewport >= 20;
+      }
+      setVisible(currentlyVisible);
     };
 
     // Poll via rAF for 1.5s after mount to catch auto-scroll settling.
@@ -604,16 +613,16 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
 
   return (
     <div
-      className={`sticky top-0 z-[35] transition-all duration-200 ${
+      className={`pointer-events-none sticky top-0 z-[35] transition-all duration-200 ${
         visible
           ? 'pt-14 md:pt-16 translate-y-0 opacity-100'
-          : 'h-0 overflow-hidden pointer-events-none opacity-0'
+          : 'h-0 overflow-hidden opacity-0'
       }`}
     >
       <div className="mx-auto flex w-full max-w-5xl justify-end px-3 pr-5 md:px-6 md:pr-8">
         <div className="max-w-[88%] md:max-w-[72%]">
           <div
-            className="ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
+            className="pointer-events-auto ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
             style={{
               backgroundColor: 'var(--app-user-bubble)',
               borderColor: 'var(--app-user-bubble-border)',
@@ -903,15 +912,18 @@ const ToolFallback: FC<{
   approvalId?: string;
 }> = (props) => {
   const hasResult = props.result !== undefined;
+  const isPendingApproval = props.approvalStatus === 'pending' && !hasResult;
   const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
     (props.result as Record<string, unknown>).error || (props.result as Record<string, unknown>).isError === true
   ));
-  const isRunning = !hasResult;
-  const dotColor = isRunning
-    ? 'bg-blue-500 animate-pulse'
-    : isError
-      ? 'bg-red-500'
-      : 'bg-emerald-500';
+  const isRunning = !hasResult && !isPendingApproval;
+  const dotColor = isPendingApproval
+    ? 'bg-amber-400 animate-pulse'
+    : isRunning
+      ? 'bg-blue-500 animate-pulse'
+      : isError
+        ? 'bg-red-500'
+        : 'bg-emerald-500';
 
   const threadRuntime = useThreadRuntime();
   const handleSendFeedback = useCallback((text: string) => {
@@ -994,7 +1006,8 @@ const AssistantTextPart: FC<{ text: string }> = ({ text }) => {
   );
 };
 
-const ThinkingSpinner: FC = () => {
+/** Animated verb text shared by both the timeline spinner and the between-tools spinner */
+const ThinkingSpinnerText: FC = () => {
   const [currentVerb, setCurrentVerb] = useState<string>(
     () => SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)],
   );
@@ -1046,13 +1059,19 @@ const ThinkingSpinner: FC = () => {
   }, [cursorPos]);
 
   return (
+    <span className="text-xs font-mono text-muted-foreground/60 whitespace-pre">
+      {displayText}
+    </span>
+  );
+};
+
+const ThinkingSpinner: FC = () => {
+  return (
     <div className="timeline-item py-0.5">
       <span className="timeline-dot-icon">
         <span className="thinking-spinner text-muted-foreground/50 select-none" aria-hidden="true" />
       </span>
-      <span className="text-xs font-mono text-muted-foreground/60 whitespace-pre">
-        {displayText}
-      </span>
+      <ThinkingSpinnerText />
     </div>
   );
 };
@@ -1097,6 +1116,12 @@ const AssistantMessage: FC = () => {
   );
   const isEmpty = !isRunning && !hasContent;
 
+  // Detect "thinking between tool calls" — model is running, content exists,
+  // but there's no actively-executing tool (all tool calls have results).
+  const allToolsDone = isRunning && hasContent && content.every(
+    (p: { type: string; result?: unknown }) => p.type !== 'tool-call' || p.result !== undefined,
+  );
+
   // Check if this message has an interrupt (source: 'interrupt' or 'unspoken')
   const hasInterrupt = content.some((p: { type: string; source?: string }) =>
     p.type === 'text' && (p.source === 'interrupt' || p.source === 'unspoken'),
@@ -1120,8 +1145,12 @@ const AssistantMessage: FC = () => {
     if (!el) return;
     const allItems = Array.from(el.querySelectorAll('.timeline-item'));
     const items = allItems.filter((item) => {
+      // Exclude the initial typing-dots spinner (hidden by CSS once content renders)
       const parent = item.closest('.aui-typing-dots');
-      return !parent || getComputedStyle(parent).display !== 'none';
+      if (parent && getComputedStyle(parent).display === 'none') return false;
+      // Exclude the between-tools spinner
+      if (item.closest('.timeline-detached')) return false;
+      return true;
     });
     if (items.length >= 2) {
       const containerRect = el.getBoundingClientRect();
@@ -1169,12 +1198,18 @@ const AssistantMessage: FC = () => {
               <div className="aui-typing-dots">
                 <ThinkingSpinner />
               </div>
+              {/* Between-tool-calls spinner: all tools finished but model is still running */}
+              {allToolsDone && (
+                <div className="mt-4 timeline-detached">
+                  <ThinkingSpinner />
+                </div>
+              )}
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
           {tokenUsage && !isRunning && <TokenUsage usage={tokenUsage} />}
         </div>
-        <div className={`flex items-center gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        <div className={`flex items-center gap-1 mt-3 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
           <MessageTimestamp date={message.createdAt} align="left" />
           {badgeStartedAt && (
@@ -1202,9 +1237,11 @@ const AssistantActionBar: FC = () => {
       <CopyButton />
       {ttsEnabled && <SpeakButton />}
       <ActionBarPrimitive.Reload asChild>
-        <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors" title="Regenerate">
-          <RefreshCwIcon className="h-3.5 w-3.5 text-muted-foreground" />
-        </button>
+        <Tooltip content="Regenerate">
+          <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
+            <RefreshCwIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </Tooltip>
       </ActionBarPrimitive.Reload>
 
       <BranchPicker />
@@ -1268,9 +1305,11 @@ const CopyButton: FC = () => {
   if (!hasCopyableContent) return null;
 
   return (
-    <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors" title="Copy" onClick={() => { void handleCopy(); }}>
-      {copied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />}
-    </button>
+    <Tooltip content="Copy">
+      <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors" onClick={() => { void handleCopy(); }}>
+        {copied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+      </button>
+    </Tooltip>
   );
 };
 
@@ -1283,26 +1322,28 @@ const SpeakButton: FC = () => {
   if (isSpeaking) {
     return (
       <ActionBarPrimitive.StopSpeaking asChild>
-        <button
-          type="button"
-          className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-          title="Stop speaking"
-        >
-          <SquareIcon className="h-3 w-3 text-primary" />
-        </button>
+        <Tooltip content="Stop speaking">
+          <button
+            type="button"
+            className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+          >
+            <SquareIcon className="h-3 w-3 text-primary" />
+          </button>
+        </Tooltip>
       </ActionBarPrimitive.StopSpeaking>
     );
   }
 
   return (
     <ActionBarPrimitive.Speak asChild>
-      <button
-        type="button"
-        className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-        title="Read aloud"
-      >
-        <Volume2Icon className="h-3.5 w-3.5 text-muted-foreground" />
-      </button>
+      <Tooltip content="Read">
+        <button
+          type="button"
+          className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+        >
+          <Volume2Icon className="h-3.5 w-3.5 text-muted-foreground" />
+        </button>
+      </Tooltip>
     </ActionBarPrimitive.Speak>
   );
 };
@@ -1960,6 +2001,8 @@ const Composer: FC<{
     } catch (err) {
       console.error('Attach directory failed:', err);
     }
+    // Refocus the composer after the native dialog closes.
+    refocusComposer();
   };
 
   const handleSend = useCallback(() => {

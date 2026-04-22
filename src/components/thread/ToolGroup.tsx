@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FC } from 'react';
+import { useState, useCallback, useEffect, type FC } from 'react';
 import { CodeBlock } from './CodeBlock';
 import { MarkdownText } from './MarkdownText';
 import { ElapsedBadge } from './ElapsedBadge';
@@ -7,6 +7,7 @@ import {
   ChevronRightIcon,
   CheckIcon,
   SquareIcon,
+  CircleIcon,
   AsteriskIcon,
   LoaderIcon,
   ScissorsIcon,
@@ -26,6 +27,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
+import { refocusComposer } from '@/lib/utils';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -82,7 +84,10 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
-  const isRunning = !hasResult && !isHung;
+  const approvalStatus = localApproval ?? part.approvalStatus;
+  const isPendingApproval = approvalStatus === 'pending' && !hasResult;
+  const isAskUser = part.toolName === 'ask_user';
+  const isRunning = !hasResult && !isHung && !isPendingApproval;
   const hasLiveOutput = Boolean(part.liveOutput?.stdout || part.liveOutput?.stderr);
   const wasCompacted = Boolean(part.compactionMeta?.wasCompacted);
   const canShowOriginal = wasCompacted && part.originalResult !== undefined;
@@ -90,12 +95,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const mediaResult = hasResult && !isError ? detectMediaResult(part.result) : null;
   const todoItems = detectTodoItems(part);
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
-  const approvalStatus = localApproval ?? part.approvalStatus;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
-  const isPendingApproval = approvalStatus === 'pending' && !hasResult;
   const isPlanApproval = part.toolName === 'exit_plan_mode';
-  const isAskUser = part.toolName === 'ask_user';
 
   // Extract plan content and filename from exit_plan_mode args
   const planArgs = isPlanApproval && part.args && typeof part.args === 'object' ? part.args as Record<string, unknown> : null;
@@ -109,11 +111,13 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const handleApprove = useCallback(() => {
     setLocalApproval('approved');
     void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
+    refocusComposer();
   }, [part.toolCallId, part.approvalId]);
 
   const handleReject = useCallback(() => {
     setLocalApproval('rejected');
     void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+    refocusComposer();
   }, [part.toolCallId, part.approvalId]);
 
   const handleFeedbackSubmit = useCallback(() => {
@@ -122,6 +126,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
     void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
     onSendFeedback?.(feedbackText.trim());
     setFeedbackText('');
+    refocusComposer();
   }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback]);
 
   const summary = getToolSummary(part);
@@ -359,8 +364,12 @@ const QuestionnaireView: FC<{
     // Clear "other" text when a predefined option is selected
     if (value !== '__other__') {
       setOtherTexts((prev) => { const next = { ...prev }; delete next[qIdx]; return next; });
+      // Auto-advance to the next tab after a brief delay
+      if (qIdx < questions.length - 1) {
+        setTimeout(() => setActiveTab(qIdx + 1), 180);
+      }
     }
-  }, []);
+  }, [questions.length]);
 
   const handleOtherText = useCallback((qIdx: number, text: string) => {
     setOtherTexts((prev) => ({ ...prev, [qIdx]: text }));
@@ -379,6 +388,7 @@ const QuestionnaireView: FC<{
     });
     void app.agent.answerToolQuestion(toolCallId, result);
     onSubmit();
+    refocusComposer();
   }, [toolCallId, questions, answers, otherTexts, onSubmit]);
 
   if (questions.length === 0) return null;
@@ -419,7 +429,7 @@ const QuestionnaireView: FC<{
         <button
           type="button"
           onClick={onCancel}
-          className="shrink-0 p-2 text-muted-foreground hover:text-foreground transition-colors"
+          className="shrink-0 p-2 mr-1 text-muted-foreground hover:text-foreground transition-colors"
           aria-label="Cancel"
         >
           <XIcon className="h-3.5 w-3.5" />
@@ -495,18 +505,15 @@ const QuestionnaireView: FC<{
           )}
         </div>
 
-        {/* Submit button + Esc hint */}
-        <div className="flex items-center justify-between">
-          <span className="text-[11px] text-muted-foreground/60">Esc to cancel</span>
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={!hasAllAnswers}
-            className="rounded-lg bg-primary px-4 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            Submit answers
-          </button>
-        </div>
+        {/* Submit button */}
+        <button
+          type="button"
+          onClick={handleSubmit}
+          disabled={!hasAllAnswers}
+          className="w-full rounded-lg bg-primary px-4 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          Submit answers
+        </button>
       </div>
     </div>
   );
@@ -527,23 +534,26 @@ const PlanApprovalCard: FC<{
   onOpenPlan?: (content: string, filePath?: string) => void;
   showFeedback: boolean;
 }> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onFeedbackSubmit, onOpenPlan, showFeedback }) => {
-  const autoOpenedRef = useRef(false);
-
-  // Auto-open the plan panel when this card first appears
-  useEffect(() => {
-    if (planContent && onOpenPlan && !autoOpenedRef.current) {
-      autoOpenedRef.current = true;
-      onOpenPlan(planContent, planFileName ?? undefined);
-    }
-  }, [planContent, planFileName, onOpenPlan]);
 
   const handleOpenPlan = useCallback(() => {
     onOpenPlan?.(planContent, planFileName ?? undefined);
   }, [planContent, planFileName, onOpenPlan]);
 
+  useEffect(() => {
+    if (!isPendingApproval) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onReject();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [isPendingApproval, onReject]);
+
   return (
     <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-3">
-      {/* Header: "Kai's Plan" + filename link */}
+      {/* Header: "Kai's Plan" + filename link + close */}
       <div className="flex items-center gap-2">
         <ScrollTextIcon className="h-4 w-4 shrink-0 text-primary" />
         <span className="text-xs font-semibold text-foreground">Kai&apos;s Plan</span>
@@ -555,6 +565,16 @@ const PlanApprovalCard: FC<{
           >
             <FileTextIcon className="h-3 w-3" />
             <span className="underline underline-offset-2">{planFileName}</span>
+          </button>
+        )}
+        {isPendingApproval && (
+          <button
+            type="button"
+            onClick={onReject}
+            className="ml-auto shrink-0 p-1 mr-1 text-muted-foreground hover:text-foreground transition-colors"
+            aria-label="Dismiss plan"
+          >
+            <XIcon className="h-3.5 w-3.5" />
           </button>
         )}
       </div>
@@ -613,8 +633,8 @@ const PlanApprovalCard: FC<{
       )}
       {approvalStatus === 'rejected' && (
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <SquareIcon className="h-3 w-3" />
-          <span>Continuing to plan</span>
+          <CircleIcon className="h-2.5 w-2.5 fill-orange-400 text-orange-400" />
+          <span>Stayed in plan mode</span>
         </div>
       )}
     </div>
@@ -1226,7 +1246,13 @@ const toolLabels: Record<string, string> = {
 };
 
 function getToolLabel(toolName: string): string {
-  return toolLabels[toolName] ?? toolName.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  if (toolLabels[toolName]) return toolLabels[toolName];
+  // Split PascalCase (e.g. UpdateWorkingMemory → Update Working Memory),
+  // then handle snake_case, and title-case any remaining words.
+  return toolName
+    .replace(/([a-z])([A-Z])/g, '$1 $2')  // camelCase/PascalCase split
+    .replace(/_/g, ' ')                     // snake_case split
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function getToolSummary(part: ToolCallPart): string {
@@ -1245,8 +1271,8 @@ function getToolSummary(part: ToolCallPart): string {
     const count = (args.questions as unknown[]).length;
     return `${count} question${count !== 1 ? 's' : ''}`;
   }
-  if (part.toolName === 'enter_plan_mode') return (args as Record<string, unknown>).reason ? String((args as Record<string, unknown>).reason).slice(0, 60) : '';
-  if (part.toolName === 'exit_plan_mode') return (args as Record<string, unknown>).summary ? String((args as Record<string, unknown>).summary).slice(0, 60) : '';
+  if (part.toolName === 'enter_plan_mode') return (args as Record<string, unknown>).reason ? String((args as Record<string, unknown>).reason) : '';
+  if (part.toolName === 'exit_plan_mode') return (args as Record<string, unknown>).summary ? String((args as Record<string, unknown>).summary) : '';
   return '';
 }
 
