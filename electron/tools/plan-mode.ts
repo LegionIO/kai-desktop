@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import { BrowserWindow } from 'electron';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { broadcastToWebClients } from '../web-server/web-clients.js';
 import type { ToolDefinition } from './types.js';
 
 const ADJECTIVES = ['bright', 'calm', 'cheerful', 'cosmic', 'drifting', 'elegant', 'floating', 'gentle', 'happy', 'luminous', 'merry', 'noble', 'quiet', 'radiant', 'serene', 'tender', 'vivid', 'warm', 'bold', 'crisp'];
@@ -11,6 +13,13 @@ const NOUNS = ['star', 'tiger', 'sparrow', 'duckling', 'raccoon', 'pretzel', 'pu
 function generatePlanName(): string {
   const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
   return `${pick(ADJECTIVES)}-${pick(VERBS)}-${pick(NOUNS)}`;
+}
+
+function broadcastModeChange(mode: string): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('agent:execution-mode-changed', mode);
+  }
+  broadcastToWebClients('agent:execution-mode-changed', mode);
 }
 
 export function createEnterPlanModeTool(): ToolDefinition {
@@ -27,8 +36,7 @@ export function createEnterPlanModeTool(): ToolDefinition {
     }),
     execute: async (input, context) => {
       const { reason } = input as { reason?: string };
-      // Mode change is broadcast by the IPC layer (agent.ts) when the tool-result
-      // event is processed, avoiding races with approval/rejection handlers.
+      broadcastModeChange('plan-first');
       const cwd = context.cwd;
       return {
         success: true,
@@ -66,7 +74,7 @@ export function createExitPlanModeTool(): ToolDefinition {
     execute: async (input, context) => {
       const { planContent, planTitle, summary } = input as { planContent: string; planTitle?: string; summary?: string };
 
-      // If the tool was cancelled (user rejected the plan), don't broadcast mode change.
+      // If the tool was cancelled (user rejected the plan), bail out early.
       if (context.abortSignal?.aborted) {
         return { success: false, message: 'Plan was not accepted.' };
       }
@@ -80,8 +88,7 @@ export function createExitPlanModeTool(): ToolDefinition {
       const planFilePath = join(plansDir, `${planName}.md`);
       writeFileSync(planFilePath, planContent, 'utf-8');
 
-      // Mode change is broadcast by the IPC layer (agent.ts) when the tool-result
-      // event is processed, avoiding races with approval/rejection handlers.
+      broadcastModeChange('auto');
       return {
         success: true,
         mode: 'auto',

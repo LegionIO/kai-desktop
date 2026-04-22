@@ -1135,10 +1135,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             // Plan mode was entered mid-stream. Abort this stream so the renderer
             // can re-send with executionMode='plan-first' (correct system prompt + tool set).
             console.info(`[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`);
-            for (const win of BrowserWindow.getAllWindows()) {
-              win.webContents.send('agent:execution-mode-changed', 'plan-first');
-            }
-            broadcastToWebClients('agent:execution-mode-changed', 'plan-first');
             broadcastStreamEvent(event);
             planDoneSent = true;
             broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
@@ -1149,10 +1145,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             // Plan was accepted. Abort this stream so the renderer can restart
             // with executionMode='auto' (full tool set, no plan-mode restrictions).
             console.info(`[Agent:stream] exit_plan_mode detected mid-stream, aborting to restart with auto mode`);
-            for (const win of BrowserWindow.getAllWindows()) {
-              win.webContents.send('agent:execution-mode-changed', 'auto');
-            }
-            broadcastToWebClients('agent:execution-mode-changed', 'auto');
             broadcastStreamEvent(event);
             planDoneSent = true;
             broadcastStreamEvent({ conversationId, type: 'done', data: { exitPlanModeRestart: true } });

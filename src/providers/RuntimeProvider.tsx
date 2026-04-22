@@ -1782,22 +1782,6 @@ export function RuntimeProvider({
                   setHeadId(headForStream);
                 }
 
-                // For plan acceptance, inject a synthetic user message so the agent
-                // knows the plan was approved and it should proceed with implementation.
-                if (exitPlanModeRestart) {
-                  const acceptMsg: StoredMessage = {
-                    id: msgId(),
-                    parentId: latestHeadId,
-                    role: 'user',
-                    content: [{ type: 'text', text: 'Plan accepted — go ahead and implement it. All tools are now available.' }],
-                    createdAt: new Date(),
-                  };
-                  treeForStream = [...treeForStream, acceptMsg];
-                  headForStream = acceptMsg.id;
-                  setTree(treeForStream);
-                  setHeadId(headForStream);
-                }
-
                 const branch = getActiveBranch(treeForStream, headForStream);
                 streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
