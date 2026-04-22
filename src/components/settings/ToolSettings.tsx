@@ -7,6 +7,8 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const tools = config.tools as {
     shell: { enabled: boolean; timeout: number; allowPatterns: string[]; denyPatterns: string[] };
     fileAccess: { enabled: boolean; allowPaths: string[]; denyPaths: string[] };
+    webFetch?: { enabled?: boolean; timeout?: number };
+    webSearch?: { enabled?: boolean; timeout?: number };
     processStreaming: {
       enabled: boolean;
       updateIntervalMs: number;
@@ -42,6 +44,18 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         <Toggle label="Enabled" checked={tools.fileAccess.enabled} onChange={(v) => updateConfig('tools.fileAccess.enabled', v)} />
         <PatternList label="Allow Paths" patterns={tools.fileAccess.allowPaths} onChange={(patterns) => updateConfig('tools.fileAccess.allowPaths', patterns)} />
         <PatternList label="Deny Paths" patterns={tools.fileAccess.denyPaths} onChange={(patterns) => updateConfig('tools.fileAccess.denyPaths', patterns)} />
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Web Fetch</legend>
+        <Toggle label="Enabled" checked={tools.webFetch?.enabled !== false} onChange={(v) => updateConfig('tools.webFetch.enabled', v)} />
+        <NumberField label="Timeout (ms)" value={tools.webFetch?.timeout ?? 30000} onChange={(v) => updateConfig('tools.webFetch.timeout', v)} min={1000} />
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Web Search</legend>
+        <Toggle label="Enabled" checked={tools.webSearch?.enabled !== false} onChange={(v) => updateConfig('tools.webSearch.enabled', v)} />
+        <NumberField label="Timeout (ms)" value={tools.webSearch?.timeout ?? 60000} onChange={(v) => updateConfig('tools.webSearch.timeout', v)} min={1000} />
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">

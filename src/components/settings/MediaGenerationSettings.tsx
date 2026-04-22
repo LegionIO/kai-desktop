@@ -1,7 +1,7 @@
 import { useState, type FC } from 'react';
 import { EyeIcon, EyeOffIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
-import { Toggle, settingsSelectClass } from './shared';
+import { Toggle, NumberField, settingsSelectClass } from './shared';
 
 type MediaProvider = 'openai' | 'azure' | 'custom';
 
@@ -23,6 +23,8 @@ type MediaGenConfig = {
   duration?: string;
   // Audio-specific (reserved for future use)
   voice?: string;
+  // Timeout
+  timeout?: number;
 };
 
 // ─── Password Field ──────────────────────────────────────────────────────────
@@ -240,6 +242,13 @@ const ImageOptions: FC<{
           <option value="webp">WebP</option>
         </select>
       </div>
+
+      <NumberField
+        label="Timeout (ms)"
+        value={config?.timeout ?? 300000}
+        onChange={(v) => updateConfig('imageGeneration.timeout', v)}
+        min={5000}
+      />
     </div>
   </div>
 );
@@ -280,6 +289,13 @@ const VideoOptions: FC<{
           <option value="12">12 seconds</option>
         </select>
       </div>
+
+      <NumberField
+        label="Timeout (ms)"
+        value={config?.timeout ?? 300000}
+        onChange={(v) => updateConfig('videoGeneration.timeout', v)}
+        min={5000}
+      />
     </div>
   </div>
 );

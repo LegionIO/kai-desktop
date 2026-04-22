@@ -49,7 +49,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
           method: 'POST',
           headers,
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(120000), // 2 min timeout for image generation
+          signal: AbortSignal.timeout(config.timeout || 300000),
         });
 
         if (!response.ok) {

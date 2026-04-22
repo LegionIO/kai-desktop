@@ -333,11 +333,13 @@ const imageGenerationConfigSchema = mediaGenProviderConfigSchema.extend({
   quality: z.string().optional(),
   style: z.string().optional(),
   outputFormat: z.string().optional(),
+  timeout: z.number().positive().optional(),
 });
 
 const videoGenerationConfigSchema = mediaGenProviderConfigSchema.extend({
   size: z.string().optional(),
   duration: z.string().optional(),
+  timeout: z.number().positive().optional(),
 });
 
 const pluginApprovalSchema = z.object({
@@ -387,9 +389,11 @@ export const appConfigSchema = z.object({
     executionMode: executionModeSchema.default('auto'),
     webFetch: z.object({
       enabled: z.boolean().default(true),
+      timeout: z.number().positive().optional(),
     }).optional(),
     webSearch: z.object({
       enabled: z.boolean().default(true),
+      timeout: z.number().positive().optional(),
     }).optional(),
   }),
   mcpServers: z.array(mcpServerSchema),

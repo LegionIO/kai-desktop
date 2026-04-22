@@ -19,8 +19,8 @@ import { createSubAgentTool } from './sub-agent.js';
 import { loadSkillsAsTools } from './skill-loader.js';
 import { createSkillManageTool } from './skill-manage.js';
 import { createCliToolManageTool } from './cli-tool-manage.js';
-import { webFetchTool } from './web-fetch.js';
-import { webSearchTool } from './web-search.js';
+import { createWebFetchTool } from './web-fetch.js';
+import { createWebSearchTool } from './web-search.js';
 import { createImageGenTool } from './image-gen.js';
 import { createVideoGenTool } from './video-gen.js';
 import { buildCliTools } from './cli-tools.js';
@@ -179,10 +179,10 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
 
   // Web tools
   if (config?.tools?.webFetch?.enabled !== false) {
-    tools.push(webFetchTool);
+    tools.push(createWebFetchTool(getConfig));
   }
   if (config?.tools?.webSearch?.enabled !== false) {
-    tools.push(webSearchTool);
+    tools.push(createWebSearchTool(getConfig));
   }
 
   // Media generation tools

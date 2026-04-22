@@ -33,6 +33,7 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
       try {
         const model = config.model || 'sora-2';
         const deploymentName = config.azure?.deploymentName || model;
+        const timeoutMs = config.timeout || 300000;
 
         // Create OpenAI client with video deployment header
         const client = createMediaGenClient(config, {
@@ -73,11 +74,16 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
         // Poll for completion
         let videoStatus = await client.videos.retrieve(jobId);
         let pollCount = 0;
+        const pollStart = Date.now();
 
         while (!['succeeded', 'failed', 'completed', 'cancelled'].includes(videoStatus.status)) {
           // Check for abort
           if (context.abortSignal?.aborted) {
             return { error: 'Video generation was cancelled.', jobId };
+          }
+
+          if (Date.now() - pollStart > timeoutMs) {
+            return { error: `Video generation timed out after ${Math.round(timeoutMs / 1000)}s.`, jobId };
           }
 
           await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));

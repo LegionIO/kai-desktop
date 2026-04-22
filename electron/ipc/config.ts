@@ -220,11 +220,13 @@ function getDefaultConfig() {
       enabled: false,
       provider: 'azure' as const,
       model: 'gpt-image-2',
+      timeout: 300000,
     },
     videoGeneration: {
       enabled: false,
       provider: 'azure' as const,
       model: 'sora-2',
+      timeout: 300000,
     },
     cliTools: [
       { name: 'github', binary: 'gh', extraBinaries: ['git'], description: 'Run GitHub CLI (gh) and git commands. Use for:\n- GitHub: gh pr list, gh issue create, gh repo clone, gh api, gh run list\n- Git: git status, git log, git diff, git commit, git push, git pull, git branch\n- Worktrees: git worktree add, git worktree list, git worktree remove\nPass the full command string including the binary name (gh or git).', prefix: 'gh pr list', enabled: true, builtIn: true },
