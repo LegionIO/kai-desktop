@@ -19,6 +19,10 @@ type RendererContentPart = {
   [key: string]: unknown;
 };
 
+function hasOwn(obj: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 export function normalizeMessagesForApi(
   messages: unknown[],
 ): Array<{ role: string; content: unknown }> {
@@ -85,22 +89,29 @@ export function normalizeMessagesForApi(
         }
 
         if (part.type === 'tool-call') {
-          // Emit clean tool-call in the assistant message
+          const toolCallId = typeof part.toolCallId === 'string' ? part.toolCallId : '';
+          const toolName = typeof part.toolName === 'string' ? part.toolName : 'unknown';
+          const hasResult = hasOwn(part, 'result');
+
+          // Only replay completed tool calls. Pending/hung UI cards from an
+          // interrupted turn should not be sent back as unresolved tool_use
+          // blocks because Anthropic-compatible APIs require matching results.
+          if (!toolCallId || !hasResult) {
+            continue;
+          }
+
           assistantParts.push({
             type: 'tool-call',
-            toolCallId: part.toolCallId as string,
-            toolName: part.toolName as string,
+            toolCallId,
+            toolName,
             args: part.args ?? {},
           });
 
-          // Collect matching tool-result for the follow-up tool message
           toolResults.push({
             type: 'tool-result',
-            toolCallId: part.toolCallId as string,
-            toolName: part.toolName as string,
-            result: part.result !== undefined
-              ? part.result
-              : 'Tool execution did not complete.',
+            toolCallId,
+            toolName,
+            result: part.result,
           });
           continue;
         }

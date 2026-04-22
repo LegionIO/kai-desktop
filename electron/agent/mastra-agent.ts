@@ -12,6 +12,7 @@ import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
+import { normalizeMessagesForApi } from './normalize-messages.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -476,7 +477,8 @@ export async function* streamAgentResponse(
   const useGenerate = isReasoningGatewayModel(modelConfig);
 
   const targetModelId = `${modelConfig.provider}:${modelConfig.modelName}`;
-  const sanitizedMessages = sanitizeMessagesForModel(messages, targetModelId);
+  const normalizedMessages = normalizeMessagesForApi(messages);
+  const sanitizedMessages = sanitizeMessagesForModel(normalizedMessages, targetModelId);
 
   if (useGenerate) {
     yield* generateWithSyntheticEvents(buildAgent, conversationId, sanitizedMessages, modelConfig, config, memory, modelSettings, providerOptions, options);
