@@ -77,7 +77,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: stri
 export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void }> = ({ part, onSendFeedback }) => {
   const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
-  const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | null>(null);
+  const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
   const planPanelCtx = usePlanPanel();
   const onOpenPlan = planPanelCtx?.openPlan;
@@ -117,6 +117,12 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const handleReject = useCallback(() => {
     setLocalApproval('rejected');
     void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+    refocusComposer();
+  }, [part.toolCallId, part.approvalId]);
+
+  const handleDismiss = useCallback(() => {
+    setLocalApproval('dismissed');
+    void app.agent.dismissToolCall(part.approvalId ?? part.toolCallId);
     refocusComposer();
   }, [part.toolCallId, part.approvalId]);
 
@@ -167,13 +173,19 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           toolCallId={part.approvalId ?? part.toolCallId}
           args={part.args}
           onSubmit={() => setLocalApproval('approved')}
-          onCancel={handleReject}
+          onCancel={handleDismiss}
         />
       )}
-      {!isPendingApproval && isAskUser && (approvalStatus === 'approved' || hasResult) && (
+      {!isPendingApproval && isAskUser && approvalStatus !== 'dismissed' && (approvalStatus === 'approved' || hasResult) && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
           <span>Answered</span>
+        </div>
+      )}
+      {!isPendingApproval && isAskUser && approvalStatus === 'dismissed' && (
+        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-red-500 dark:text-red-400">
+          <XIcon className="h-3 w-3" />
+          <span>Dismissed</span>
         </div>
       )}
       {/* Tool approval — plan mode exit: "Kai's Plan" card */}
@@ -187,6 +199,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           onFeedbackChange={setFeedbackText}
           onApprove={handleApprove}
           onReject={handleReject}
+          onDismiss={handleDismiss}
           onFeedbackSubmit={handleFeedbackSubmit}
           onOpenPlan={onOpenPlan}
           showFeedback={Boolean(onSendFeedback)}
@@ -525,15 +538,16 @@ const PlanApprovalCard: FC<{
   planContent: string;
   planFileName: string | null;
   isPendingApproval: boolean;
-  approvalStatus: 'pending' | 'approved' | 'rejected' | undefined;
+  approvalStatus: 'pending' | 'approved' | 'rejected' | 'dismissed' | undefined;
   feedbackText: string;
   onFeedbackChange: (text: string) => void;
   onApprove: () => void;
   onReject: () => void;
+  onDismiss: () => void;
   onFeedbackSubmit: () => void;
   onOpenPlan?: (content: string, filePath?: string) => void;
   showFeedback: boolean;
-}> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onFeedbackSubmit, onOpenPlan, showFeedback }) => {
+}> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onDismiss, onFeedbackSubmit, onOpenPlan, showFeedback }) => {
 
   const handleOpenPlan = useCallback(() => {
     onOpenPlan?.(planContent, planFileName ?? undefined);
@@ -544,12 +558,12 @@ const PlanApprovalCard: FC<{
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        onReject();
+        onDismiss();
       }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [isPendingApproval, onReject]);
+  }, [isPendingApproval, onDismiss]);
 
   return (
     <div className="ml-1 mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-3">
@@ -570,7 +584,7 @@ const PlanApprovalCard: FC<{
         {isPendingApproval && (
           <button
             type="button"
-            onClick={onReject}
+            onClick={onDismiss}
             className="ml-auto shrink-0 p-1 mr-1 text-muted-foreground hover:text-foreground transition-colors"
             aria-label="Dismiss plan"
           >
@@ -633,8 +647,14 @@ const PlanApprovalCard: FC<{
       )}
       {approvalStatus === 'rejected' && (
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <CircleIcon className="h-2.5 w-2.5 fill-orange-400 text-orange-400" />
-          <span>Stayed in plan mode</span>
+          <CircleIcon className="h-2.5 w-2.5 fill-yellow-400 text-yellow-400" />
+          <span>Planning resumed</span>
+        </div>
+      )}
+      {approvalStatus === 'dismissed' && (
+        <div className="flex items-center gap-1.5 text-xs text-red-500 dark:text-red-400">
+          <XIcon className="h-3 w-3" />
+          <span>Plan dismissed</span>
         </div>
       )}
     </div>

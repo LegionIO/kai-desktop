@@ -761,7 +761,7 @@ export class ToolObserverManager {
     const launch = await this.launchToolCall(toolName, args);
     if (!launch.ok) {
       const details = launch.details ? oneLine(launch.details) : `Failed launching ${toolName}.`;
-      this.emitMidToolMessage(`Failed launching ${toolName}: ${details}`);
+      this.appendJournal(`[observer-action] launch_tool failed for ${toolName}: ${details}`);
       this.recordEvent(
         targetIds.length > 0 ? targetIds : this.getRunningTools().map((t) => t.toolCallId),
         {

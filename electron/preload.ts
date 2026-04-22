@@ -32,6 +32,7 @@ const appAPI = {
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
+    dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
     generateTitle: (messages: unknown[], modelKey?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey),
     onStreamEvent: (callback: (event: unknown) => void) => {
