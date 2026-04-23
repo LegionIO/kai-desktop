@@ -104,6 +104,9 @@ function getDefaultConfig() {
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; approvedAt: string }>,
+    marketplace: {
+      installedPlugins: {} as Record<string, { name: string; repo: string; ref: string; version: string; installedAt: string; marketplaceUrl: string }>,
+    },
     launchAtLogin: false,
     ui: {
       theme: 'system' as const,
@@ -635,6 +638,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     systemPrompt: config.systemPrompt,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
+    marketplace: config.marketplace,
     launchAtLogin: config.launchAtLogin,
     ui: config.ui,
     webServer: config.webServer,

@@ -347,6 +347,19 @@ const pluginApprovalSchema = z.object({
   approvedAt: z.string(),
 });
 
+const marketplaceInstalledPluginSchema = z.object({
+  name: z.string(),
+  repo: z.string(),
+  ref: z.string(),
+  version: z.string(),
+  installedAt: z.string(),
+  marketplaceUrl: z.string(),
+});
+
+const marketplaceConfigSchema = z.object({
+  installedPlugins: z.record(z.string(), marketplaceInstalledPluginSchema),
+});
+
 const cliToolSchema = z.object({
   name: z.string(),
   binary: z.string(),
@@ -404,6 +417,7 @@ export const appConfigSchema = z.object({
   systemPrompt: z.string(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
+  marketplace: marketplaceConfigSchema.optional(),
   launchAtLogin: z.boolean(),
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),

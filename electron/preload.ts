@@ -108,6 +108,7 @@ const appAPI = {
       description: string;
       state: string;
       required: boolean;
+      brandRequired: boolean;
       error?: string;
     }>>,
     getConfig: (pluginName: string) => ipcRenderer.invoke('plugin:get-config', pluginName) as Promise<Record<string, unknown>>,
@@ -119,6 +120,39 @@ const appAPI = {
       ipcRenderer.invoke('plugin:banner-action', pluginName, bannerId, action, data),
     action: (pluginName: string, targetId: string, action: string, data?: unknown) =>
       ipcRenderer.invoke('plugin:action', pluginName, targetId, action, data),
+    marketplaceCatalog: () => ipcRenderer.invoke('plugin:marketplace-catalog') as Promise<Array<{
+      name: string;
+      displayName: string;
+      description: string;
+      repo: string;
+      ref: string;
+      version: string;
+      author?: string;
+      tags?: string[];
+      icon?: string;
+      installed: boolean;
+      installedVersion?: string;
+      marketplaceUrl: string;
+    }>>,
+    marketplaceInstall: (pluginName: string) =>
+      ipcRenderer.invoke('plugin:marketplace-install', pluginName) as Promise<{ success: boolean }>,
+    marketplaceUninstall: (pluginName: string) =>
+      ipcRenderer.invoke('plugin:marketplace-uninstall', pluginName) as Promise<{ success: boolean }>,
+    marketplaceRefresh: () =>
+      ipcRenderer.invoke('plugin:marketplace-refresh') as Promise<Array<{
+        name: string;
+        displayName: string;
+        description: string;
+        repo: string;
+        ref: string;
+        version: string;
+        author?: string;
+        tags?: string[];
+        icon?: string;
+        installed: boolean;
+        installedVersion?: string;
+        marketplaceUrl: string;
+      }>>,
     onUIStateChanged: (callback: (state: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, state: unknown) => callback(state);
       ipcRenderer.on('plugin:ui-state-changed', handler);

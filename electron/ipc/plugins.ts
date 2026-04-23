@@ -46,4 +46,25 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
       data,
     });
   });
+
+  // ── Marketplace ──
+
+  ipcMain.handle('plugin:marketplace-catalog', () => {
+    return pluginManager.getMarketplaceCatalog();
+  });
+
+  ipcMain.handle('plugin:marketplace-install', async (_event, pluginName: string) => {
+    await pluginManager.installFromMarketplace(pluginName);
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:marketplace-uninstall', async (_event, pluginName: string) => {
+    await pluginManager.uninstallFromMarketplace(pluginName);
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:marketplace-refresh', async () => {
+    const catalog = await pluginManager.refreshMarketplace();
+    return catalog;
+  });
 }
