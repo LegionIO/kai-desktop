@@ -1252,13 +1252,11 @@ const AssistantActionBar: FC = () => {
     <ActionBarPrimitive.Root className="flex items-center gap-1">
       <CopyButton />
       {ttsEnabled && <SpeakButton />}
-      <ActionBarPrimitive.Reload asChild>
-        <Tooltip content="Regenerate">
-          <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
-            <RefreshCwIcon className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        </Tooltip>
-      </ActionBarPrimitive.Reload>
+      <Tooltip content="Regenerate">
+        <ActionBarPrimitive.Reload className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
+          <RefreshCwIcon className="h-3.5 w-3.5 text-muted-foreground" />
+        </ActionBarPrimitive.Reload>
+      </Tooltip>
 
       <BranchPicker />
     </ActionBarPrimitive.Root>
@@ -1337,30 +1335,24 @@ const SpeakButton: FC = () => {
 
   if (isSpeaking) {
     return (
-      <ActionBarPrimitive.StopSpeaking asChild>
-        <Tooltip content="Stop speaking">
-          <button
-            type="button"
-            className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-          >
-            <SquareIcon className="h-3 w-3 text-primary" />
-          </button>
-        </Tooltip>
-      </ActionBarPrimitive.StopSpeaking>
+      <Tooltip content="Stop speaking">
+        <ActionBarPrimitive.StopSpeaking
+          className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+        >
+          <SquareIcon className="h-3 w-3 text-primary" />
+        </ActionBarPrimitive.StopSpeaking>
+      </Tooltip>
     );
   }
 
   return (
-    <ActionBarPrimitive.Speak asChild>
-      <Tooltip content="Read">
-        <button
-          type="button"
-          className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-        >
-          <Volume2Icon className="h-3.5 w-3.5 text-muted-foreground" />
-        </button>
-      </Tooltip>
-    </ActionBarPrimitive.Speak>
+    <Tooltip content="Read">
+      <ActionBarPrimitive.Speak
+        className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+      >
+        <Volume2Icon className="h-3.5 w-3.5 text-muted-foreground" />
+      </ActionBarPrimitive.Speak>
+    </Tooltip>
   );
 };
 
