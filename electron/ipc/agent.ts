@@ -27,7 +27,7 @@ const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
 
 // Pending tool approval promises for confirm-writes execution mode
-const pendingToolApprovals = new Map<string, { resolve: (approved: boolean) => void }>();
+const pendingToolApprovals = new Map<string, { resolve: (approved: boolean | 'dismiss') => void }>();
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
 import { pendingQuestionAnswers } from '../tools/ask-user.js';
@@ -931,6 +931,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
           });
         }
 
+        // Track whether exit_plan_mode was rejected so we can ignore the
+        // stale tool-result event that may still arrive after cancellation.
+        let exitPlanModeRejected = false;
+        // Track whether we already sent a plan-related done event so we skip
+        // any trailing plain done events from the generator after abort.
+        let planDoneSent = false;
+
         const streamOptions = {
             reasoningEffort,
             abortSignal: controller.signal,
@@ -972,10 +979,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   args: state.args,
                 });
                 observer?.onToolAwaitingApproval(state.toolCallId);
-                const approved = await new Promise<boolean>((resolve) => {
+                const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });
-                if (!approved) {
+                if (approved !== true) {
                   state.cancel();
                 }
               }
@@ -991,11 +998,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   args: state.args,
                 });
                 observer?.onToolAwaitingApproval(state.toolCallId);
-                const approved = await new Promise<boolean>((resolve) => {
+                const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });
-                if (!approved) {
+                if (approved !== true) {
+                  exitPlanModeRejected = true;
                   state.cancel();
+                  if (approved === 'dismiss') {
+                    // User clicked X — exit plan mode entirely and stop the stream.
+                    console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
+                    for (const win of BrowserWindow.getAllWindows()) {
+                      win.webContents.send('agent:execution-mode-changed', 'auto');
+                    }
+                    broadcastToWebClients('agent:execution-mode-changed', 'auto');
+                    planDoneSent = true;
+                    broadcastStreamEvent({ conversationId, type: 'done', data: { planDismissed: true } });
+                    controller.abort();
+                    return;
+                  }
+                  // User clicked "No, keep planning" — stay in plan-first mode.
                   // Re-broadcast plan-first mode so the UI toggle stays in plan mode
                   // even if a race with the tool's execute() emitted 'auto'.
                   for (const win of BrowserWindow.getAllWindows()) {
@@ -1005,6 +1026,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   // Abort the stream and signal the renderer to restart in plan-first
                   // mode so the agent can continue planning with the user.
                   console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
+                  planDoneSent = true;
                   broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
                   controller.abort();
                   return;
@@ -1022,10 +1044,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
                   args: state.args,
                 });
                 observer?.onToolAwaitingApproval(state.toolCallId);
-                const approved = await new Promise<boolean>((resolve) => {
+                const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
                   pendingToolApprovals.set(streamId, { resolve });
                 });
-                if (!approved) {
+                if (approved !== true) {
                   state.cancel();
                 } else {
                   // Copy answers from stream-side ID to execute-side ID so the tool's execute() can find them
@@ -1090,6 +1112,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
         });
 
         for await (const event of stream) {
+          // After a plan-related done event has been sent and the stream aborted,
+          // ignore any trailing events (especially the generator's final plain done).
+          if (planDoneSent) continue;
           if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
             logToolCompactionDebug('stream-event', {
               conversationId,
@@ -1111,7 +1136,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
             // can re-send with executionMode='plan-first' (correct system prompt + tool set).
             console.info(`[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`);
             broadcastStreamEvent(event);
+            planDoneSent = true;
             broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
+            controller.abort();
+            return { conversationId };
+          }
+          if (event.type === 'tool-result' && event.toolName === 'exit_plan_mode' && !exitPlanModeRejected) {
+            // Plan was accepted. Abort this stream so the renderer can restart
+            // with executionMode='auto' (full tool set, no plan-mode restrictions).
+            console.info(`[Agent:stream] exit_plan_mode detected mid-stream, aborting to restart with auto mode`);
+            broadcastStreamEvent(event);
+            planDoneSent = true;
+            broadcastStreamEvent({ conversationId, type: 'done', data: { exitPlanModeRestart: true } });
             controller.abort();
             return { conversationId };
           }
@@ -1214,6 +1250,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     const pending = pendingToolApprovals.get(toolCallId);
     if (pending) {
       pending.resolve(false);
+      pendingToolApprovals.delete(toolCallId);
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('agent:dismiss-tool', (_event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    if (pending) {
+      pending.resolve('dismiss');
       pendingToolApprovals.delete(toolCallId);
     }
     return { ok: true };

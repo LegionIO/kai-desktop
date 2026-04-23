@@ -1069,7 +1069,7 @@ const ThinkingSpinner: FC = () => {
   return (
     <div className="timeline-item py-0.5">
       <span className="timeline-dot-icon">
-        <span className="thinking-spinner text-muted-foreground/50 select-none" aria-hidden="true" />
+        <span className="thinking-spinner text-primary select-none" aria-hidden="true" />
       </span>
       <ThinkingSpinnerText />
     </div>
@@ -1122,6 +1122,12 @@ const AssistantMessage: FC = () => {
     (p: { type: string; result?: unknown }) => p.type !== 'tool-call' || p.result !== undefined,
   );
 
+  // Detect paused-for-input — a tool is awaiting user approval/answer
+  const isAwaitingInput = isRunning && content.some(
+    (p: { type: string; approvalStatus?: string; result?: unknown }) =>
+      p.type === 'tool-call' && p.approvalStatus === 'pending' && p.result === undefined,
+  );
+
   // Check if this message has an interrupt (source: 'interrupt' or 'unspoken')
   const hasInterrupt = content.some((p: { type: string; source?: string }) =>
     p.type === 'text' && (p.source === 'interrupt' || p.source === 'unspoken'),
@@ -1143,33 +1149,43 @@ const AssistantMessage: FC = () => {
   useEffect(() => {
     const el = contentRef.current;
     if (!el) return;
-    const allItems = Array.from(el.querySelectorAll('.timeline-item'));
-    const items = allItems.filter((item) => {
-      // Exclude the initial typing-dots spinner (hidden by CSS once content renders)
-      const parent = item.closest('.aui-typing-dots');
-      if (parent && getComputedStyle(parent).display === 'none') return false;
-      // Exclude the between-tools spinner
-      if (item.closest('.timeline-detached')) return false;
-      return true;
-    });
-    if (items.length >= 2) {
-      const containerRect = el.getBoundingClientRect();
-      const firstDot = items[0].querySelector('.timeline-dot, .timeline-dot-icon');
-      const lastDot = items[items.length - 1].querySelector('.timeline-dot, .timeline-dot-icon');
-      if (firstDot && lastDot) {
-        const firstRect = firstDot.getBoundingClientRect();
-        const lastRect = lastDot.getBoundingClientRect();
-        const top = firstRect.top + firstRect.height / 2 - containerRect.top;
-        const bottom = containerRect.bottom - (lastRect.top + lastRect.height / 2);
-        el.style.setProperty('--timeline-top', `${top}px`);
-        el.style.setProperty('--timeline-bottom', `${bottom}px`);
-        el.classList.add('has-timeline');
+
+    const recalcTimeline = () => {
+      const allItems = Array.from(el.querySelectorAll('.timeline-item'));
+      const items = allItems.filter((item) => {
+        // Exclude the initial typing-dots spinner (hidden by CSS once content renders)
+        const parent = item.closest('.aui-typing-dots');
+        if (parent && getComputedStyle(parent).display === 'none') return false;
+        // Exclude the between-tools spinner
+        if (item.closest('.timeline-detached')) return false;
+        return true;
+      });
+      if (items.length >= 2) {
+        const containerRect = el.getBoundingClientRect();
+        const firstDot = items[0].querySelector('.timeline-dot, .timeline-dot-icon');
+        const lastDot = items[items.length - 1].querySelector('.timeline-dot, .timeline-dot-icon');
+        if (firstDot && lastDot) {
+          const firstRect = firstDot.getBoundingClientRect();
+          const lastRect = lastDot.getBoundingClientRect();
+          const top = firstRect.top + firstRect.height / 2 - containerRect.top;
+          const bottom = containerRect.bottom - (lastRect.top + lastRect.height / 2);
+          el.style.setProperty('--timeline-top', `${top}px`);
+          el.style.setProperty('--timeline-bottom', `${bottom}px`);
+          el.classList.add('has-timeline');
+        } else {
+          el.classList.remove('has-timeline');
+        }
       } else {
         el.classList.remove('has-timeline');
       }
-    } else {
-      el.classList.remove('has-timeline');
-    }
+    };
+
+    recalcTimeline();
+
+    // Recalculate when the container resizes (e.g. plan card expanding)
+    const ro = new ResizeObserver(recalcTimeline);
+    ro.observe(el);
+    return () => ro.disconnect();
   });
 
   return (
@@ -1200,7 +1216,7 @@ const AssistantMessage: FC = () => {
               </div>
               {/* Between-tool-calls spinner: all tools finished but model is still running */}
               {allToolsDone && (
-                <div className="mt-4 timeline-detached">
+                <div className="mt-5 mb-2 timeline-detached">
                   <ThinkingSpinner />
                 </div>
               )}
@@ -1209,7 +1225,7 @@ const AssistantMessage: FC = () => {
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
           {tokenUsage && !isRunning && <TokenUsage usage={tokenUsage} />}
         </div>
-        <div className={`flex items-center gap-1 mt-3 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        <div className={`flex items-center gap-1 mt-3 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
           <MessageTimestamp date={message.createdAt} align="left" />
           {badgeStartedAt && (
