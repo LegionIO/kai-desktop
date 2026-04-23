@@ -234,7 +234,7 @@
 
 /* Content part dividers for multi-part assistant messages.
    With the timeline layout, we use lighter spacing between parts. */
-.aui-assistant-content > :not(.aui-assistant-badge) + :not(.aui-assistant-badge) {
+.aui-assistant-content > :not(.aui-assistant-badge):not(.timeline-detached) + :not(.aui-assistant-badge):not(.timeline-detached) {
   margin-top: 0.125rem;
 }
 

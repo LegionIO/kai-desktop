@@ -1699,6 +1699,16 @@ export function RuntimeProvider({
         }
         return;
       } else if (e.type === 'done') {
+        // Plan-mode transitions (accept, reject, dismiss) send a done event while
+        // a tool is still awaiting approval.  Clear the flag so the normal done
+        // path can clean up or restart the stream correctly.
+        const doneData = e.data as Record<string, unknown> | undefined;
+        if (acc.awaitingApproval && doneData && (
+          doneData.planModeRestart || doneData.planModeRejectRestart ||
+          doneData.exitPlanModeRestart || doneData.planDismissed
+        )) {
+          acc.awaitingApproval = false;
+        }
         // If a tool is awaiting user approval, the stream "done" just means the
         // model finished generating — tool execution is still blocked.  Keep the
         // accumulator alive and stay in awaiting-approval state so the UI doesn't
@@ -1740,9 +1750,13 @@ export function RuntimeProvider({
           // so we restart in plan-first mode with a synthetic user message telling the
           // agent to continue refining the plan.
           const planModeRejectRestart = (e.data as Record<string, unknown> | undefined)?.planModeRejectRestart;
-          if (planModeRestart || planModeRejectRestart) {
-            const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
-            console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
+          // Auto-continue after plan acceptance: the user approved the plan, so we
+          // restart with executionMode='auto' (full tool set, no plan-mode restrictions).
+          const exitPlanModeRestart = (e.data as Record<string, unknown> | undefined)?.exitPlanModeRestart;
+          if (planModeRestart || planModeRejectRestart || exitPlanModeRestart) {
+            const label = exitPlanModeRestart ? 'exit-plan-restart' : planModeRestart ? 'plan-restart' : 'plan-reject-restart';
+            const restartMode = exitPlanModeRestart ? 'auto' : 'plan-first';
+            console.info(`[UI:stream] ${label} — auto-continuing with ${restartMode} mode`);
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
@@ -1752,28 +1766,12 @@ export function RuntimeProvider({
                 let treeForStream = [...latestTree];
                 let headForStream = latestHeadId;
 
-                // For plan rejection, inject a synthetic user message so the agent
-                // understands the plan was not accepted and it should keep planning.
-                if (planModeRejectRestart) {
-                  const rejectMsg: StoredMessage = {
-                    id: msgId(),
-                    parentId: latestHeadId,
-                    role: 'user',
-                    content: [{ type: 'text', text: 'I rejected that plan. Please keep planning — ask me questions or refine your approach before presenting a new plan.' }],
-                    createdAt: new Date(),
-                  };
-                  treeForStream = [...treeForStream, rejectMsg];
-                  headForStream = rejectMsg.id;
-                  setTree(treeForStream);
-                  setHeadId(headForStream);
-                }
-
                 const branch = getActiveBranch(treeForStream, headForStream);
                 streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
                 persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
                 const cfg = streamHandlerRef.current;
-                console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
+                console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=${restartMode}`);
                 app.agent.stream(
                   convId,
                   branch,
@@ -1782,7 +1780,7 @@ export function RuntimeProvider({
                   cfg.selectedProfileKey ?? undefined,
                   cfg.fallbackEnabled ?? false,
                   currentWorkingDirectoryRef.current ?? undefined,
-                  'plan-first',
+                  restartMode,
                 );
               }
             }, 100);
