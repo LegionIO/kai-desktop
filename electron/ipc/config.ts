@@ -8,7 +8,6 @@ import { binaryExists } from '../tools/cli-tools.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
 import { getLanAddresses } from '../web-server/network.js';
 import { createLoginToken } from '../web-server/web-server.js';
-
 export type { AppConfig } from '../config/schema.js';
 
 export const APP_LLM_CONFIG_PATH = join(homedir(), '.' + __BRAND_APP_SLUG, 'settings', 'llm.json');
@@ -18,6 +17,7 @@ const DEFAULT_SYSTEM_PROMPT = `You are ${__BRAND_ASSISTANT_NAME}, a powerful loc
 export function getDesktopSettingsPath(appHome: string): string {
   return join(appHome, 'settings', DESKTOP_SETTINGS_FILENAME);
 }
+
 
 function getDefaultConfig() {
   return {
@@ -262,6 +262,12 @@ type AppProviderConfig = {
   use_responses_api?: boolean | null;
   region?: string | null;
   bearer_token?: string | null;
+  access_key_id?: string | null;
+  secret_access_key?: string | null;
+  session_token?: string | null;
+  aws_profile?: string | null;
+  role_arn?: string | null;
+  use_default_credentials?: boolean | null;
   default_model?: string | null;
   small_model?: string | null;
   medium_model?: string | null;
@@ -283,6 +289,14 @@ const OPENAI_FALLBACK_MODELS = [
   'gpt-4.1',
   'gpt-4.1-mini',
 ] as const;
+
+const BEDROCK_FALLBACK_CATALOG: ReadonlyArray<{ key: string; displayName: string; modelName: string; maxInputTokens?: number }> = [
+  { key: 'us.anthropic.claude-sonnet-4-6', displayName: 'Sonnet 4.6', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 200000 },
+  { key: 'us.anthropic.claude-sonnet-4-6-1m', displayName: 'Sonnet 4.6 [1M]', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 1000000 },
+  { key: 'us.anthropic.claude-opus-4-6-v1', displayName: 'Opus 4.6', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 200000 },
+  { key: 'us.anthropic.claude-opus-4-6-v1-1m', displayName: 'Opus 4.6 [1M]', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 1000000 },
+  { key: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', displayName: 'Haiku 4.5', modelName: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', maxInputTokens: 200000 },
+];
 
 function toTitleCase(value: string): string {
   return value
@@ -382,6 +396,12 @@ function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig
       enabled,
       region: provider?.region ?? '',
       apiKey: provider?.bearer_token ?? '',
+      accessKeyId: provider?.access_key_id ?? '',
+      secretAccessKey: provider?.secret_access_key ?? '',
+      sessionToken: provider?.session_token ?? '',
+      awsProfile: provider?.aws_profile ?? '',
+      roleArn: provider?.role_arn ?? '',
+      useDefaultCredentials: provider?.use_default_credentials ?? true,
     };
   }
 
@@ -430,7 +450,13 @@ function collectProviderModelNames(provider: AppProviderConfig | undefined): str
 function hasProviderCredentials(providerKey: AppProviderType, provider: AppProviderConfig | undefined): boolean {
   if (!provider?.enabled) return false;
   if (providerKey === 'bedrock') {
-    return Boolean(provider.bearer_token?.trim() || provider.region?.trim());
+    return Boolean(
+      provider.bearer_token?.trim()
+      || provider.region?.trim()
+      || (provider.access_key_id?.trim() && provider.secret_access_key?.trim())
+      || provider.aws_profile?.trim()
+      || provider.role_arn?.trim()
+    );
   }
   return Boolean(provider.api_key?.trim() || provider.openai_api_key?.trim());
 }
@@ -448,12 +474,25 @@ function resolveProviderModelNames(
 }
 
 function toCatalogEntries(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Array<Record<string, unknown>> {
-  return resolveProviderModelNames(providerKey, provider).map((modelName) => ({
-    key: modelName,
-    displayName: inferDisplayName(modelName),
-    provider: providerKey,
-    modelName,
-  }));
+  const explicit = resolveProviderModelNames(providerKey, provider);
+  if (explicit.length > 0) {
+    return explicit.map((modelName) => ({
+      key: modelName,
+      displayName: inferDisplayName(modelName),
+      provider: providerKey,
+      modelName,
+    }));
+  }
+  if (providerKey === 'bedrock' && hasProviderCredentials(providerKey, provider)) {
+    return BEDROCK_FALLBACK_CATALOG.map((m) => ({
+      key: m.key,
+      displayName: m.displayName,
+      provider: providerKey,
+      modelName: m.modelName,
+      ...(m.maxInputTokens ? { maxInputTokens: m.maxInputTokens } : {}),
+    }));
+  }
+  return [];
 }
 
 function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models'] {
@@ -580,6 +619,18 @@ export function persistAppModels(
       provider.use_responses_api = Boolean(value);
     } else if (field === 'region' && providerKey === 'bedrock') {
       provider.region = stringValue || null;
+    } else if (field === 'accessKeyId' && providerKey === 'bedrock') {
+      provider.access_key_id = stringValue || null;
+    } else if (field === 'secretAccessKey' && providerKey === 'bedrock') {
+      provider.secret_access_key = stringValue || null;
+    } else if (field === 'sessionToken' && providerKey === 'bedrock') {
+      provider.session_token = stringValue || null;
+    } else if (field === 'awsProfile' && providerKey === 'bedrock') {
+      provider.aws_profile = stringValue || null;
+    } else if (field === 'roleArn' && providerKey === 'bedrock') {
+      provider.role_arn = stringValue || null;
+    } else if (field === 'useDefaultCredentials' && providerKey === 'bedrock') {
+      provider.use_default_credentials = Boolean(value);
     }
 
     providers[providerKey as AppProviderType] = provider;
@@ -835,6 +886,7 @@ export function registerConfigHandlers(
     }
     return results;
   });
+
 
   return { setConfig: setConfigImpl };
 }
