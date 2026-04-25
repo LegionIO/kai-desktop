@@ -10,7 +10,7 @@ export type MarketplacePluginEntry = {
   name: string;
   displayName: string;
   description: string;
-  repo: string;
+  repository: string;
   version: string;
   author?: string;
   tags?: string[];
@@ -136,8 +136,8 @@ export class MarketplaceService {
       // Download pre-built tarball from GitHub release assets
       const tag = `v${entry.version}`;
       const assetName = `${entry.name}-v${entry.version}.tar.gz`;
-      const tarballUrl = `https://github.com/${entry.repo}/releases/download/${tag}/${assetName}`;
-      const token = await this.resolveGitHubToken(entry.repo);
+      const tarballUrl = `https://github.com/${entry.repository}/releases/download/${tag}/${assetName}`;
+      const token = await this.resolveGitHubToken(entry.repository);
       const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
       if (token) {
         headers['Authorization'] = `Bearer ${token}`;
@@ -182,7 +182,7 @@ export class MarketplaceService {
         ...(this.getConfig().marketplace?.installedPlugins ?? {}),
         [entry.name]: {
           name: entry.name,
-          repo: entry.repo,
+          repository: entry.repository,
           version: entry.version,
           installedAt: new Date().toISOString(),
           marketplaceUrl: entry.marketplaceUrl,
@@ -190,7 +190,7 @@ export class MarketplaceService {
       };
       this.setConfig('marketplace.installedPlugins', installedPlugins);
 
-      console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repo}@v${entry.version}`);
+      console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repository}@v${entry.version}`);
     } catch (err) {
       // Clean up temp directory on failure
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
