@@ -26,7 +26,7 @@ import { registerUsageHandlers } from './ipc/usage.js';
 import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
-import { bootstrapBundledPlugins, getBrandRequiredPluginNames } from './plugins/plugin-bootstrap.js';
+import { bootstrapBundledPlugins, getBrandRequiredPluginNames, getBrandMarketplaceUrls } from './plugins/plugin-bootstrap.js';
 import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
@@ -941,6 +941,16 @@ if (gotSingleInstanceLock) {
       mainWindow.show();
 
       try {
+        // Initialize marketplace and auto-install required plugins before loading
+        const marketplaceUrls = getBrandMarketplaceUrls();
+        if (marketplaceUrls.length > 0) {
+          try {
+            await pluginManager.initMarketplace(marketplaceUrls);
+          } catch (err) {
+            console.warn(`[${__BRAND_PRODUCT_NAME}] Marketplace init failed (non-fatal):`, err);
+          }
+        }
+
         await pluginManager.loadAll();
         console.info(`[${__BRAND_PRODUCT_NAME}] ${pluginManager.getPluginCount()} plugins loaded`);
       } catch (err) {

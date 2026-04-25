@@ -35,6 +35,8 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { buildPluginRendererBundle, resolvePluginRendererRequest } from './renderer-build.js';
+import { MarketplaceService } from './marketplace-service.js';
+import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 
 const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
   'config:read': 'Read app configuration',
@@ -103,6 +105,7 @@ export class PluginManager {
   private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> = new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
+  private marketplaceService: MarketplaceService | null = null;
 
   constructor(
     private pluginsDir: string,
@@ -831,6 +834,114 @@ export class PluginManager {
     };
     this.clearNotificationTimer(pluginName, id);
     this.broadcastUIState();
+  }
+
+  /* ── Marketplace ── */
+
+  async initMarketplace(marketplaceUrls: string[]): Promise<void> {
+    if (marketplaceUrls.length === 0) return;
+
+    this.marketplaceService = new MarketplaceService(
+      this.pluginsDir,
+      this.appHome,
+      this.getConfig,
+      this.setConfig,
+    );
+
+    try {
+      const catalog = await this.marketplaceService.fetchCatalog(marketplaceUrls);
+      console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
+
+      // Auto-install brand-required plugins that are not yet present
+      if (this.brandRequiredPluginNames.size > 0) {
+        await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNames, catalog);
+      }
+    } catch (err) {
+      console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
+    }
+  }
+
+  getMarketplaceCatalog(): MarketplaceCatalogEntry[] {
+    if (!this.marketplaceService) return [];
+
+    const catalog = this.marketplaceService.getCachedCatalog() ?? [];
+
+    // Annotate with current load status from PluginManager
+    return catalog.map((entry) => ({
+      ...entry,
+      installed: this.plugins.has(entry.name) || this.marketplaceService!.getInstalledPluginNames().includes(entry.name),
+    }));
+  }
+
+  async installFromMarketplace(pluginName: string): Promise<void> {
+    if (!this.marketplaceService) {
+      throw new Error('Marketplace is not initialized');
+    }
+
+    const catalog = this.marketplaceService.getCachedCatalog();
+    const entry = catalog?.find((p) => p.name === pluginName);
+    if (!entry) {
+      throw new Error(`Plugin "${pluginName}" not found in marketplace catalog`);
+    }
+
+    await this.marketplaceService.installPlugin(entry);
+
+    // Discover and load the newly installed plugin
+    const discovered = this.discoverPlugins();
+    const newPlugin = discovered.find((d) => d.manifest.name === pluginName);
+    if (newPlugin) {
+      await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
+    }
+  }
+
+  async uninstallFromMarketplace(pluginName: string): Promise<void> {
+    if (!this.marketplaceService) {
+      throw new Error('Marketplace is not initialized');
+    }
+
+    if (this.brandRequiredPluginNames.has(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
+    }
+
+    // Deactivate plugin first if loaded
+    const instance = this.plugins.get(pluginName);
+    if (instance) {
+      try {
+        if (instance.module?.deactivate) {
+          await instance.module.deactivate();
+        }
+        const api = this.pluginAPIs.get(pluginName);
+        if (api) {
+          await cleanupPluginAPI(api);
+        }
+      } catch (err) {
+        console.error(`[PluginManager] Error deactivating plugin "${pluginName}" during uninstall:`, err);
+      }
+      this.plugins.delete(pluginName);
+      this.pluginAPIs.delete(pluginName);
+    }
+
+    this.marketplaceService.uninstallPlugin(pluginName);
+
+    this.broadcastUIState();
+    this.notifyToolsChanged();
+  }
+
+  async refreshMarketplace(marketplaceUrls?: string[]): Promise<MarketplaceCatalogEntry[]> {
+    if (!this.marketplaceService) return [];
+
+    const urls = marketplaceUrls ?? this.getMarketplaceUrls();
+    if (urls.length === 0) return [];
+
+    return this.marketplaceService.fetchCatalog(urls);
+  }
+
+  private getMarketplaceUrls(): string[] {
+    try {
+      return [...__BRAND_MARKETPLACE_URLS];
+    } catch {
+      return [];
+    }
   }
 
   /* ── Conversation Helpers ── */

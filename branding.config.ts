@@ -91,6 +91,12 @@ export const branding = {
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */
   requiredPlugins: [] as ReadonlyArray<string>,
+
+  // ── Marketplace ───────────────────────────────────────────────────────
+  /** Raw JSON URLs for plugin marketplace catalogs. Enterprise URLs listed first win on name collisions. */
+  marketplaceUrls: [
+    'https://raw.githubusercontent.com/LegionIO/kai-plugin-marketplace/refs/heads/main/marketplace.json',
+  ] as ReadonlyArray<string>,
 } as const;
 
 export type Branding = typeof branding;

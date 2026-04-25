@@ -46,5 +46,8 @@ declare const __BRAND_SCREEN_CAPTURE_USAGE: string;
 // ── Required Plugins ─────────────────────────────────────────────────────
 declare const __BRAND_REQUIRED_PLUGINS: ReadonlyArray<string>;
 
+// ── Marketplace ──────────────────────────────────────────────────────────
+declare const __BRAND_MARKETPLACE_URLS: ReadonlyArray<string>;
+
 // ── CSS side-effect imports ──────────────────────────────────────────────
 declare module '*.css';

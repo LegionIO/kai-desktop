@@ -75,6 +75,7 @@ type AppAPI = {
       description: string;
       state: string;
       required: boolean;
+      brandRequired: boolean;
       error?: string;
     }>>;
     getConfig: (pluginName: string) => Promise<Record<string, unknown>>;
@@ -82,6 +83,36 @@ type AppAPI = {
     modalAction: (pluginName: string, modalId: string, action: string, data?: unknown) => Promise<unknown>;
     bannerAction: (pluginName: string, bannerId: string, action: string, data?: unknown) => Promise<unknown>;
     action: (pluginName: string, targetId: string, action: string, data?: unknown) => Promise<unknown>;
+    marketplaceCatalog: () => Promise<Array<{
+      name: string;
+      displayName: string;
+      description: string;
+      repo: string;
+      ref: string;
+      version: string;
+      author?: string;
+      tags?: string[];
+      icon?: string;
+      installed: boolean;
+      installedVersion?: string;
+      marketplaceUrl: string;
+    }>>;
+    marketplaceInstall: (pluginName: string) => Promise<{ success: boolean }>;
+    marketplaceUninstall: (pluginName: string) => Promise<{ success: boolean }>;
+    marketplaceRefresh: () => Promise<Array<{
+      name: string;
+      displayName: string;
+      description: string;
+      repo: string;
+      ref: string;
+      version: string;
+      author?: string;
+      tags?: string[];
+      icon?: string;
+      installed: boolean;
+      installedVersion?: string;
+      marketplaceUrl: string;
+    }>>;
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;

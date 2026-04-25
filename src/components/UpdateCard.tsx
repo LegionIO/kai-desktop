@@ -46,47 +46,49 @@ export const UpdateCard: FC = () => {
 
   return (
     <div
-      className={`shrink-0 border-t border-sidebar-border/80 px-3 py-2.5 transition-all duration-300 ${
-        visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-1'
+      className={`fixed bottom-24 right-6 z-50 w-[min(90vw,400px)] rounded-2xl border border-border/70 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl transition-all duration-300 ${
+        visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'
       }`}
     >
-      <div className="flex items-start gap-2">
-        {status.state === 'restarting' ? (
-          <LoaderIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
-        ) : (
-          <DownloadIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-        )}
+      <div className="flex items-start gap-4">
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-border/50 bg-muted/40">
+          {status.state === 'restarting' ? (
+            <LoaderIcon className="h-5 w-5 animate-spin text-primary" />
+          ) : (
+            <DownloadIcon className="h-5 w-5 text-primary" />
+          )}
+        </div>
         <div className="min-w-0 flex-1">
-          <p className="text-[11px] font-medium text-sidebar-foreground">
+          <h3 className="text-base font-semibold text-foreground">
             {status.state === 'downloading'
               ? 'Downloading update'
               : status.state === 'restarting'
                 ? 'Restarting…'
-                : 'Update ready'}
-          </p>
-          <p className="text-[10px] text-muted-foreground">
+                : 'Update available'}
+          </h3>
+          <p className="mt-1 text-sm text-muted-foreground">
             {status.state === 'downloading'
-              ? `v${status.version ?? '…'} · ${percent}%`
+              ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? '…'}) is being downloaded.`
               : status.state === 'restarting'
-                ? `Installing v${status.version ?? 'new'}`
-                : `v${status.version ?? 'new'} · Restart to apply`}
+                ? `Installing version ${status.version ?? 'new'}, please wait...`
+                : `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) is now available to install.`}
           </p>
         </div>
         {status.state !== 'restarting' && (
           <button
             type="button"
             onClick={() => setDismissed(true)}
-            className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
+            className="shrink-0 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
             title="Dismiss"
           >
-            <XIcon className="h-3 w-3" />
+            <XIcon className="h-4 w-4" />
           </button>
         )}
       </div>
 
       {/* Progress bar for downloading state */}
       {status.state === 'downloading' && (
-        <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-muted">
+        <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-muted">
           <div
             className="h-full rounded-full bg-primary transition-[width] duration-300"
             style={{ width: `${percent}%` }}
@@ -94,15 +96,24 @@ export const UpdateCard: FC = () => {
         </div>
       )}
 
-      {/* Install button for downloaded state */}
+      {/* Action buttons for downloaded state */}
       {status.state === 'downloaded' && (
-        <button
-          type="button"
-          onClick={() => app.autoUpdate.install()}
-          className="mt-2 w-full rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-        >
-          Restart to update
-        </button>
+        <div className="mt-4 flex gap-3">
+          <button
+            type="button"
+            onClick={() => app.autoUpdate.install()}
+            className="flex-1 rounded-lg bg-foreground px-4 py-2.5 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+          >
+            Install and restart
+          </button>
+          <button
+            type="button"
+            onClick={() => setDismissed(true)}
+            className="rounded-lg px-4 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/50"
+          >
+            Not yet
+          </button>
+        </div>
       )}
     </div>
   );

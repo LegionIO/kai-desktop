@@ -57,8 +57,20 @@ function hashPluginDirectory(dir: string): string {
  *
  * Skips any plugin whose target directory already exists (idempotent).
  * This runs synchronously during startup, before plugin discovery.
+ *
+ * When marketplace URLs are configured, this function is a no-op — the
+ * marketplace service handles required plugin installation instead.
  */
 export function bootstrapBundledPlugins(pluginsDir: string): void {
+  // Skip bundled-plugin copy when marketplace is configured
+  try {
+    if (Array.isArray(__BRAND_MARKETPLACE_URLS) && __BRAND_MARKETPLACE_URLS.length > 0) {
+      return;
+    }
+  } catch {
+    // __BRAND_MARKETPLACE_URLS not defined — continue with bundled bootstrap
+  }
+
   const bundledDir = getBundledPluginsDir();
   if (!existsSync(bundledDir)) return;
 
@@ -101,5 +113,16 @@ export function getBrandRequiredPluginNames(): Set<string> {
     return new Set(__BRAND_REQUIRED_PLUGINS);
   } catch {
     return new Set();
+  }
+}
+
+/**
+ * Returns the marketplace catalog URLs configured for the current brand.
+ */
+export function getBrandMarketplaceUrls(): string[] {
+  try {
+    return [...__BRAND_MARKETPLACE_URLS];
+  } catch {
+    return [];
   }
 }
