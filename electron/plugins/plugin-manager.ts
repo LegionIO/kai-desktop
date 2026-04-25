@@ -149,9 +149,6 @@ export class PluginManager {
           version: typeof raw.version === 'string' ? raw.version : '0.0.0',
           description: typeof raw.description === 'string' ? raw.description : '',
           author: typeof raw.author === 'string' ? raw.author : undefined,
-          rendererStyles: Array.isArray(raw.rendererStyles)
-            ? raw.rendererStyles.filter((value): value is string => typeof value === 'string')
-            : undefined,
           permissions: Array.isArray(raw.permissions)
             ? raw.permissions.filter((value): value is PluginPermission => typeof value === 'string')
             : [],
@@ -651,22 +648,6 @@ export class PluginManager {
       if (instance.rendererBuild) {
         rendererScripts.push(...instance.rendererBuild.scripts);
         rendererStyles.push(...instance.rendererBuild.styles);
-      }
-
-      for (const styleRelPath of instance.manifest.rendererStyles ?? []) {
-        const stylePath = join(instance.dir, styleRelPath);
-        if (!existsSync(stylePath)) continue;
-        try {
-          const styleContent = readFileSync(stylePath, 'utf-8');
-          rendererStyles.push({
-            pluginName: instance.manifest.name,
-            stylePath,
-            styleHash: hashContent(styleContent),
-            styleContent,
-          });
-        } catch (err) {
-          console.warn(`[PluginManager] Failed to read renderer style for "${instance.manifest.name}":`, err);
-        }
       }
 
       if (instance.manifest.required) {

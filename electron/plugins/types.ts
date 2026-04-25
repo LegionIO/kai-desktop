@@ -36,7 +36,6 @@ export type PluginManifest = {
   version: string;
   description: string;
   author?: string;
-  rendererStyles?: string[];
   permissions: PluginPermission[];
   priority: number;
   required: boolean;
