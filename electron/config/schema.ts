@@ -350,8 +350,7 @@ const pluginApprovalSchema = z.object({
 
 const marketplaceInstalledPluginSchema = z.object({
   name: z.string(),
-  repo: z.string(),
-  ref: z.string(),
+  repository: z.string(),
   version: z.string(),
   installedAt: z.string(),
   marketplaceUrl: z.string(),

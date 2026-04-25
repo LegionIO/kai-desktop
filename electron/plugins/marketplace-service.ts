@@ -51,7 +51,7 @@ export class MarketplaceService {
 
     for (const url of urls) {
       try {
-        const catalog = await this.fetchSingleCatalog(url);
+        const catalog = await this.fetchSingleCatalog(url, true);
         for (const plugin of catalog.plugins) {
           // First URL wins on name collisions (enterprise URLs should be listed first)
           if (!allPlugins.has(plugin.name)) {
@@ -75,9 +75,14 @@ export class MarketplaceService {
     return entries;
   }
 
-  private async fetchSingleCatalog(url: string): Promise<MarketplaceCatalog> {
-    const response = await net.fetch(url, {
-      headers: { 'Accept': 'application/json' },
+  private async fetchSingleCatalog(url: string, bustCache = false): Promise<MarketplaceCatalog> {
+    const fetchUrl = bustCache ? `${url}?_=${Date.now()}` : url;
+    const response = await net.fetch(fetchUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
     });
 
     if (!response.ok) {
