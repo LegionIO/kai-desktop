@@ -72,7 +72,7 @@ export type PluginInstance = {
   rendererBuild: PluginRendererBuild | null;
 };
 
-/* ── Plugin Module (what main.js must export) ── */
+/* ── Plugin Module (what backend.js must export) ── */
 
 export type PluginModule = {
   activate: (api: PluginAPI) => Promise<void> | void;

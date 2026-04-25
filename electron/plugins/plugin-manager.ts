@@ -142,12 +142,23 @@ export class PluginManager {
 
       try {
         const raw = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Record<string, unknown>;
+
+        // Determine main entry point with new naming preference
+        let mainEntry: string;
+        if (typeof raw.main === 'string') {
+          mainEntry = raw.main;
+        } else if (existsSync(join(pluginDir, 'backend.js'))) {
+          mainEntry = 'backend.js';
+        } else {
+          mainEntry = 'main.js'; // Backward compatibility fallback
+        }
+
         const manifest: PluginManifest = {
           name: typeof raw.name === 'string' ? raw.name : entry,
           displayName: typeof raw.displayName === 'string' ? raw.displayName : typeof raw.name === 'string' ? raw.name : entry,
           version: typeof raw.version === 'string' ? raw.version : '0.0.0',
           description: typeof raw.description === 'string' ? raw.description : '',
-          main: typeof raw.main === 'string' ? raw.main : 'main.js',
+          main: mainEntry,
           renderer: typeof raw.renderer === 'string' ? raw.renderer : undefined,
           rendererStyles: Array.isArray(raw.rendererStyles)
             ? raw.rendererStyles.filter((value): value is string => typeof value === 'string')
@@ -161,6 +172,15 @@ export class PluginManager {
             ? raw.configSchema as Record<string, unknown>
             : undefined,
         };
+
+        // Log deprecation warning for legacy naming
+        if (manifest.main === 'main.js' || manifest.renderer === 'renderer.js') {
+          console.warn(
+            `[PluginManager] Plugin "${manifest.name}" uses legacy naming (main.js/renderer.js). ` +
+            `Consider migrating to backend.js/frontend.js for clarity.`
+          );
+        }
+
         results.push({ manifest, dir: pluginDir });
       } catch (err) {
         console.warn(`[PluginManager] Failed to read plugin manifest at ${manifestPath}:`, err);
