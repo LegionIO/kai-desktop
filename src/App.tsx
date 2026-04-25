@@ -989,7 +989,6 @@ function AppShell() {
               <div className="shrink-0">
                 <SubAgentSidebarSection />
               </div>
-              <UpdateCard />
               <PluginBannerSlot />
               <SidebarDock items={dockItems} />
             </div>
@@ -1024,6 +1023,7 @@ function AppShell() {
 
           {/* Main content area */}
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            <UpdateCard />
             {/* Interactive title bar */}
             <div className={`${titleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
