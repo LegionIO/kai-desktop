@@ -11,7 +11,6 @@ export type MarketplacePluginEntry = {
   displayName: string;
   description: string;
   repo: string;
-  ref: string;
   version: string;
   author?: string;
   tags?: string[];
@@ -134,8 +133,10 @@ export class MarketplaceService {
       mkdirSync(this.pluginsDir, { recursive: true });
       mkdirSync(tmpDir, { recursive: true });
 
-      // Download tarball from GitHub
-      const tarballUrl = `https://github.com/${entry.repo}/archive/refs/heads/${entry.ref}.tar.gz`;
+      // Download pre-built tarball from GitHub release assets
+      const tag = `v${entry.version}`;
+      const assetName = `${entry.name}-v${entry.version}.tar.gz`;
+      const tarballUrl = `https://github.com/${entry.repo}/releases/download/${tag}/${assetName}`;
       const token = await this.resolveGitHubToken(entry.repo);
       const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
       if (token) {
@@ -168,44 +169,7 @@ export class MarketplaceService {
         throw new Error(`Plugin "${entry.name}" archive does not contain a plugin.json`);
       }
 
-      // If a build step is needed (package.json with build script), run it
-      const packageJsonPath = join(tmpDir, 'package.json');
-      if (existsSync(packageJsonPath)) {
-        try {
-          const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-          if (pkg.dependencies || pkg.devDependencies) {
-            await new Promise<void>((resolve, reject) => {
-              // Try pnpm first, fall back to npm
-              execFile('pnpm', ['install', '--frozen-lockfile'], { cwd: tmpDir, timeout: 120000 }, (err) => {
-                if (err) {
-                  execFile('npm', ['install'], { cwd: tmpDir, timeout: 120000 }, (npmErr) => {
-                    if (npmErr) return reject(new Error(`Failed to install dependencies for "${entry.name}": ${npmErr.message}`));
-                    resolve();
-                  });
-                } else {
-                  resolve();
-                }
-              });
-            });
-          }
-          if (pkg.scripts?.build) {
-            await new Promise<void>((resolve, reject) => {
-              execFile('pnpm', ['run', 'build'], { cwd: tmpDir, timeout: 120000 }, (err) => {
-                if (err) {
-                  execFile('npm', ['run', 'build'], { cwd: tmpDir, timeout: 120000 }, (npmErr) => {
-                    if (npmErr) return reject(new Error(`Failed to build plugin "${entry.name}": ${npmErr.message}`));
-                    resolve();
-                  });
-                } else {
-                  resolve();
-                }
-              });
-            });
-          }
-        } catch (buildErr) {
-          console.warn(`[Marketplace] Build step failed for "${entry.name}" (non-fatal):`, buildErr);
-        }
-      }
+      // No build step needed - plugins are pre-built in release assets
 
       // Swap in the new plugin directory
       if (existsSync(destDir)) {
@@ -219,7 +183,6 @@ export class MarketplaceService {
         [entry.name]: {
           name: entry.name,
           repo: entry.repo,
-          ref: entry.ref,
           version: entry.version,
           installedAt: new Date().toISOString(),
           marketplaceUrl: entry.marketplaceUrl,
@@ -227,7 +190,7 @@ export class MarketplaceService {
       };
       this.setConfig('marketplace.installedPlugins', installedPlugins);
 
-      console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repo}@${entry.ref}`);
+      console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repo}@v${entry.version}`);
     } catch (err) {
       // Clean up temp directory on failure
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
