@@ -32,6 +32,7 @@ const providerSchema = z.object({
   sessionToken: z.string().optional(),
   awsProfile: z.string().optional(),
   roleArn: z.string().optional(),
+  useDefaultCredentials: z.boolean().optional(),
   extraHeaders: z.record(z.string(), z.string()).optional(),
 });
 
