@@ -143,23 +143,11 @@ export class PluginManager {
       try {
         const raw = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Record<string, unknown>;
 
-        // Determine main entry point with new naming preference
-        let mainEntry: string;
-        if (typeof raw.main === 'string') {
-          mainEntry = raw.main;
-        } else if (existsSync(join(pluginDir, 'backend.js'))) {
-          mainEntry = 'backend.js';
-        } else {
-          mainEntry = 'main.js'; // Backward compatibility fallback
-        }
-
         const manifest: PluginManifest = {
           name: typeof raw.name === 'string' ? raw.name : entry,
           displayName: typeof raw.displayName === 'string' ? raw.displayName : typeof raw.name === 'string' ? raw.name : entry,
           version: typeof raw.version === 'string' ? raw.version : '0.0.0',
           description: typeof raw.description === 'string' ? raw.description : '',
-          main: mainEntry,
-          renderer: typeof raw.renderer === 'string' ? raw.renderer : undefined,
           rendererStyles: Array.isArray(raw.rendererStyles)
             ? raw.rendererStyles.filter((value): value is string => typeof value === 'string')
             : undefined,
@@ -172,14 +160,6 @@ export class PluginManager {
             ? raw.configSchema as Record<string, unknown>
             : undefined,
         };
-
-        // Log deprecation warning for legacy naming
-        if (manifest.main === 'main.js' || manifest.renderer === 'renderer.js') {
-          console.warn(
-            `[PluginManager] Plugin "${manifest.name}" uses legacy naming (main.js/renderer.js). ` +
-            `Consider migrating to backend.js/frontend.js for clarity.`
-          );
-        }
 
         results.push({ manifest, dir: pluginDir });
       } catch (err) {
@@ -384,12 +364,13 @@ export class PluginManager {
 
       this.ensurePluginConfigNormalized(manifest.name);
 
-      const mainPath = join(dir, manifest.main);
-      if (!existsSync(mainPath)) {
-        throw new Error(`Plugin entry point not found: ${mainPath}`);
+      // Load backend entry point from dist/backend.js
+      const backendPath = join(dir, 'dist', 'backend.js');
+      if (!existsSync(backendPath)) {
+        throw new Error(`Plugin backend not found: ${backendPath}`);
       }
 
-      const moduleUrl = pathToFileURL(mainPath).href;
+      const moduleUrl = pathToFileURL(backendPath).href;
       const mod = await import(moduleUrl) as PluginModule;
       instance.module = mod;
 
@@ -428,14 +409,16 @@ export class PluginManager {
         await mod.activate(api);
       }
 
-      if (manifest.renderer) {
+      // Check for frontend entry point at dist/frontend.js
+      const frontendPath = join(dir, 'dist', 'frontend.js');
+      if (existsSync(frontendPath)) {
         instance.rendererBuild = await buildPluginRendererBundle({
           appHome: this.appHome,
           pluginName: manifest.name,
           pluginDir: dir,
           fileHash: instance.fileHash,
-          rendererPath: manifest.renderer,
-          mainPath: manifest.main,
+          rendererPath: 'dist/frontend.js',
+          mainPath: 'dist/backend.js',
         });
       }
 

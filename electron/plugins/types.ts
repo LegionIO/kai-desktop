@@ -35,8 +35,6 @@ export type PluginManifest = {
   displayName: string;
   version: string;
   description: string;
-  main: string;
-  renderer?: string;
   rendererStyles?: string[];
   permissions: PluginPermission[];
   priority: number;
@@ -72,7 +70,7 @@ export type PluginInstance = {
   rendererBuild: PluginRendererBuild | null;
 };
 
-/* ── Plugin Module (what backend.js must export) ── */
+/* ── Plugin Module (what dist/backend.js must export) ── */
 
 export type PluginModule = {
   activate: (api: PluginAPI) => Promise<void> | void;
