@@ -123,18 +123,18 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
   return (
     <div className="space-y-3">
       {/* Header: goal + status + controls */}
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+        <div className="min-w-0 overflow-hidden">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getBadgeClass(session.status)}`}>
               {session.status}
             </span>
             {session.createdAt && (
               <span className="text-[10px] tabular-nums text-muted-foreground">{formatElapsed(session.createdAt)}</span>
             )}
-            <span className="text-[10px] text-muted-foreground">{session.target} · {session.approvalMode}</span>
+            <span className="min-w-0 break-words text-[10px] text-muted-foreground [overflow-wrap:anywhere]">{session.target} · {session.approvalMode}</span>
           </div>
-          <p className="mt-1 text-sm font-medium leading-snug">{session.goal}</p>
+          <p className="mt-1 min-w-0 break-words text-sm font-medium leading-snug [overflow-wrap:anywhere]">{session.goal}</p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {canPause && (
@@ -259,13 +259,13 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
       )}
 
       {session.status === 'failed' && session.lastError && (
-        <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <div className="break-words rounded-xl border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive [overflow-wrap:anywhere]">
           {session.lastError}
         </div>
       )}
 
       {session.statusMessage && !takeoverLikely && session.status !== 'failed' && (
-        <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
+        <div className="break-words rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground [overflow-wrap:anywhere]">
           {session.statusMessage}
         </div>
       )}
@@ -283,8 +283,8 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
                       <ShieldAlertIcon className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
                       <span className="text-xs font-medium">Approval needed</span>
                     </div>
-                    <p className="mt-1 text-xs">{approval.prompt}</p>
-                    {approval.rationale && <p className="mt-0.5 text-[11px] text-muted-foreground">{approval.rationale}</p>}
+                    <p className="mt-1 break-words text-xs [overflow-wrap:anywhere]">{approval.prompt}</p>
+                    {approval.rationale && <p className="mt-0.5 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{approval.rationale}</p>}
                     {action && (
                       <p className="mt-0.5 text-[11px] text-muted-foreground">
                         {action.kind}{isPointerAction(action) ? ` · ${formatMovementPath(action.movementPath)}` : ''}
@@ -369,8 +369,8 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
       {session.currentSubgoal && (
         <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2.5">
           <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Current subgoal</div>
-          <div className="mt-0.5 text-sm font-medium">{session.currentSubgoal}</div>
-          {session.planSummary && <p className="mt-0.5 text-xs text-muted-foreground">{session.planSummary}</p>}
+          <div className="mt-0.5 break-words text-sm font-medium [overflow-wrap:anywhere]">{session.currentSubgoal}</div>
+          {session.planSummary && <p className="mt-0.5 break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">{session.planSummary}</p>}
         </div>
       )}
 
@@ -403,7 +403,7 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
                   <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${action.status === 'completed' ? 'bg-green-500/10 text-green-600 dark:text-green-400' : action.status === 'awaiting-approval' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : action.status === 'failed' ? 'bg-destructive/10 text-destructive' : 'bg-muted text-muted-foreground'}`}>
                     {action.kind}
                   </span>
-                  <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">{action.rationale}</span>
+                  <span className="min-w-0 flex-1 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{action.rationale}</span>
                   {action.error && <span className="shrink-0 text-[10px] text-destructive">failed</span>}
                 </div>
               ))}
@@ -421,7 +421,7 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
           </div>
           {latestCheckpoint && (
             <div className="mt-1">
-              <p className="text-xs font-medium">{latestCheckpoint.summary}</p>
+              <p className="break-words text-xs font-medium [overflow-wrap:anywhere]">{latestCheckpoint.summary}</p>
               {latestCheckpoint.successCriteria.length > 0 && (
                 <div className="mt-1 flex flex-wrap gap-1">
                   {latestCheckpoint.successCriteria.slice(0, 3).map((criterion) => (

@@ -88,10 +88,10 @@ const OperatorSessionShell: FC<{ sessionId: string }> = ({ sessionId }) => {
   return (
     <div className="h-screen overflow-hidden bg-background px-6 py-6 text-foreground">
       <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-4">
-        <div className="flex items-center justify-between gap-3 rounded-2xl border border-border/70 bg-card/60 px-4 py-3">
-          <div>
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl border border-border/70 bg-card/60 px-4 py-3">
+          <div className="min-w-0 overflow-hidden">
             <div className="text-sm font-semibold">Live Operator</div>
-            <div className="text-xs text-muted-foreground">{session?.goal ? `Goal: ${session.goal}` : 'Waiting for session...'}</div>
+            <div className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">{session?.goal ? `Goal: ${session.goal}` : 'Waiting for session...'}</div>
           </div>
           <button
             type="button"
