@@ -299,6 +299,7 @@ const OPENAI_FALLBACK_MODELS = [
 const BEDROCK_FALLBACK_CATALOG: ReadonlyArray<{ key: string; displayName: string; modelName: string; maxInputTokens?: number }> = [
   { key: 'us.anthropic.claude-sonnet-4-6', displayName: 'Sonnet 4.6', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 200000 },
   { key: 'us.anthropic.claude-sonnet-4-6-1m', displayName: 'Sonnet 4.6 [1M]', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 1000000 },
+  { key: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', displayName: 'Sonnet 4.5', modelName: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', maxInputTokens: 200000 },
   { key: 'us.anthropic.claude-opus-4-6-v1', displayName: 'Opus 4.6', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 200000 },
   { key: 'us.anthropic.claude-opus-4-6-v1-1m', displayName: 'Opus 4.6 [1M]', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 1000000 },
   { key: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', displayName: 'Haiku 4.5', modelName: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', maxInputTokens: 200000 },
