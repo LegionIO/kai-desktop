@@ -148,6 +148,7 @@ export class PluginManager {
           displayName: typeof raw.displayName === 'string' ? raw.displayName : typeof raw.name === 'string' ? raw.name : entry,
           version: typeof raw.version === 'string' ? raw.version : '0.0.0',
           description: typeof raw.description === 'string' ? raw.description : '',
+          author: typeof raw.author === 'string' ? raw.author : undefined,
           rendererStyles: Array.isArray(raw.rendererStyles)
             ? raw.rendererStyles.filter((value): value is string => typeof value === 'string')
             : undefined,
