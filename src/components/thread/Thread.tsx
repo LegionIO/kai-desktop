@@ -265,7 +265,7 @@ const ComputerTabSurface: FC = () => {
   if (!activeComputerSession) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="px-3 py-4 md:px-6">
+        <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
           <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
@@ -286,9 +286,9 @@ const ComputerTabSurface: FC = () => {
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="px-3 py-4 md:px-6">
+      <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
         <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
-          <ComputerSessionPanel session={activeComputerSession} />
+          <ComputerSessionPanel session={activeComputerSession} stickyTopClassName="top-12 md:top-14" />
         </div>
       </div>
     </div>

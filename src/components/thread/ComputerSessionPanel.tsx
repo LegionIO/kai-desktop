@@ -12,6 +12,7 @@ import type { ComputerActionProposal, ComputerSession } from '../../../shared/co
 
 type PanelProps = {
   session: ComputerSession;
+  stickyTopClassName?: string;
 };
 
 function getBadgeClass(status: ComputerSession['status']): string {
@@ -58,7 +59,7 @@ function formatElapsed(startedAt: string): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
+export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassName = 'top-0' }) => {
   const {
     pauseSession,
     resumeSession,
@@ -123,8 +124,8 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
   return (
     <div className="space-y-3">
       {/* Header: goal + status + controls */}
-      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
-        <div className="min-w-0 overflow-hidden">
+      <div className={`sticky ${stickyTopClassName} z-20 -mx-1 min-w-0 rounded-xl bg-background/90 px-1 py-1 backdrop-blur-sm`}>
+        <div className="min-w-0 overflow-hidden pr-32 sm:pr-36">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getBadgeClass(session.status)}`}>
               {session.status}
@@ -134,9 +135,14 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session }) => {
             )}
             <span className="min-w-0 break-words text-[10px] text-muted-foreground [overflow-wrap:anywhere]">{session.target} · {session.approvalMode}</span>
           </div>
-          <p className="mt-1 min-w-0 break-words text-sm font-medium leading-snug [overflow-wrap:anywhere]">{session.goal}</p>
+          <p
+            className="mt-1 min-w-0 overflow-hidden break-words text-sm font-medium leading-snug [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] [overflow-wrap:anywhere]"
+            title={session.goal}
+          >
+            {session.goal}
+          </p>
         </div>
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="absolute right-0 top-0 z-10 flex shrink-0 items-center gap-1 bg-background/80 pl-2 backdrop-blur-sm">
           {canPause && (
             <button type="button" onClick={() => { void pauseSession(session.id); }} className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Pause">
               <PauseIcon className="h-3.5 w-3.5 text-muted-foreground" />
