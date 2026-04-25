@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
-import { Notification, app, dialog, BrowserWindow } from 'electron';
-import { readdirSync, readFileSync, existsSync, statSync } from 'fs';
+import { Notification, BrowserWindow } from 'electron';
+import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import { pathToFileURL } from 'url';
 import type {
@@ -222,54 +222,10 @@ export class PluginManager {
     });
   }
 
-  private async ensurePluginApproved(manifest: PluginManifest, fileHash: string): Promise<boolean> {
-    if (this.isPluginApproved(manifest.name, fileHash)) {
-      return true;
-    }
-
-    if (this.brandRequiredPluginNames.has(manifest.name)) {
+  private ensurePluginApproved(manifest: PluginManifest, fileHash: string): boolean {
+    if (!this.isPluginApproved(manifest.name, fileHash)) {
       this.persistPluginApproval(manifest.name, fileHash);
-      return true;
     }
-
-    const declaredPermissions = manifest.permissions.length > 0
-      ? manifest.permissions.map((permission) => `• ${PLUGIN_PERMISSION_LABELS[permission] ?? permission}`).join('\n')
-      : '• This plugin did not declare any permissions in plugin.json.';
-    const detail = [
-      `Plugin: ${manifest.displayName} (${manifest.name})`,
-      `Version: ${manifest.version}`,
-      '',
-      manifest.description || 'No description provided.',
-      '',
-      'Declared permissions:',
-      declaredPermissions,
-      '',
-      `Approval fingerprint: ${fileHash.slice(0, 16)}`,
-      'This approval is tied to the current plugin files. If the plugin changes, ' + __BRAND_PRODUCT_NAME + ' will ask again before loading it.',
-    ].join('\n');
-
-    const messageBoxOptions: Electron.MessageBoxOptions = {
-      type: 'warning',
-      buttons: ['Allow Plugin', 'Not Now'],
-      defaultId: 0,
-      cancelId: 1,
-      noLink: true,
-      message: `Allow "${manifest.displayName}" to load?`,
-      detail,
-    };
-    // Bring the app to the foreground on macOS so the dialog is visible
-    app.focus({ steal: true });
-    // Show the dialog without a parent window — the main window may not be
-    // visible yet (plugin approval runs before the first show) and attaching
-    // to a hidden parent would either force-show a partially-rendered window
-    // or leave the dialog hidden behind other apps.
-    const result = await dialog.showMessageBox(messageBoxOptions);
-
-    if (result.response !== 0) {
-      return false;
-    }
-
-    this.persistPluginApproval(manifest.name, fileHash);
     return true;
   }
 
@@ -352,7 +308,7 @@ export class PluginManager {
 
     try {
       instance.fileHash = this.computePluginFileHash(dir);
-      if (!(await this.ensurePluginApproved(manifest, instance.fileHash))) {
+      if (!this.ensurePluginApproved(manifest, instance.fileHash)) {
         instance.state = 'disabled';
         instance.error = 'Plugin permission approval is required before it can be loaded.';
         this.broadcastUIState();
@@ -362,10 +318,15 @@ export class PluginManager {
 
       this.ensurePluginConfigNormalized(manifest.name);
 
-      // Load backend entry point from dist/backend.js
-      const backendPath = join(dir, 'dist', 'backend.js');
+      // Load backend entry point from backend.js
+      const backendPath = join(dir, 'backend.js');
       if (!existsSync(backendPath)) {
-        throw new Error(`Plugin backend not found: ${backendPath}`);
+        console.warn(`[PluginManager] Plugin "${manifest.name}" missing backend.js - skipping`);
+        instance.state = 'error';
+        instance.error = `Plugin backend not found: ${backendPath}. Please rebuild the plugin with 'npm run build'.`;
+        this.broadcastUIState();
+        this.notifyToolsChanged();
+        return;
       }
 
       const moduleUrl = pathToFileURL(backendPath).href;
@@ -407,16 +368,13 @@ export class PluginManager {
         await mod.activate(api);
       }
 
-      // Check for frontend entry point at dist/frontend.js
-      const frontendPath = join(dir, 'dist', 'frontend.js');
+      // Check for frontend entry point at frontend.js
+      const frontendPath = join(dir, 'frontend.js');
       if (existsSync(frontendPath)) {
-        instance.rendererBuild = await buildPluginRendererBundle({
-          appHome: this.appHome,
+        instance.rendererBuild = buildPluginRendererBundle({
           pluginName: manifest.name,
           pluginDir: dir,
-          fileHash: instance.fileHash,
-          rendererPath: 'dist/frontend.js',
-          mainPath: 'dist/backend.js',
+          rendererPath: 'frontend.js',
         });
       }
 
@@ -490,20 +448,32 @@ export class PluginManager {
   getPluginConfig(pluginName: string): Record<string, unknown> {
     const instance = this.plugins.get(pluginName);
     if (!instance) return {};
-    return this.validatePluginConfig(instance.manifest, this.getConfig().plugins?.[pluginName]);
+    const settingsPath = join(instance.dir, 'settings.json');
+    try {
+      if (existsSync(settingsPath)) {
+        const raw = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        return this.validatePluginConfig(instance.manifest, raw);
+      }
+    } catch {
+      // ignore malformed settings
+    }
+    return this.validatePluginConfig(instance.manifest, {});
   }
 
-  resolveRendererAssetRequest(pluginName: string, fileHash: string, assetPath: string): { filePath: string; contentType: string } | null {
+  resolveRendererAssetRequest(pluginName: string, assetPath: string): { filePath: string; contentType: string } | null {
     const instance = this.plugins.get(pluginName);
-    if (!instance || instance.state !== 'active') return null;
+    if (!instance || instance.state !== 'active' || !instance.rendererBuild) return null;
 
-    return resolvePluginRendererRequest({
-      appHome: this.appHome,
-      pluginName,
-      fileHash,
-      assetPath,
-      build: instance.rendererBuild,
-    });
+    const filePath = join(instance.dir, assetPath);
+    if (!existsSync(filePath)) return null;
+
+    const ext = assetPath.split('.').pop()?.toLowerCase() ?? '';
+    const mimeTypes: Record<string, string> = {
+      js: 'text/javascript; charset=utf-8',
+      css: 'text/css; charset=utf-8',
+      json: 'application/json; charset=utf-8',
+    };
+    return { filePath, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
   }
 
   setPluginConfig(pluginName: string, path: string, value: unknown): void {
@@ -515,7 +485,9 @@ export class PluginManager {
     const next = this.getPluginConfig(pluginName);
     setNestedValue(next, path, value);
     const validated = this.validatePluginConfig(instance.manifest, next);
-    this.setConfig(`plugins.${pluginName}`, validated);
+    const settingsPath = join(instance.dir, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify(validated, null, 2), 'utf-8');
+    this.broadcastUIState();
   }
 
   /* ── Config Change Forwarding ── */

@@ -65,8 +65,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'usage', label: 'Usage' },
 ];
 
-export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
-  const [activeSection, setActiveSection] = useState<string>('models');
+export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string | null; onSectionHandled?: () => void }> = ({ onClose, requestedPlugin, onSectionHandled }) => {
   const { config, updateConfig } = useConfig();
   const pluginSections = usePluginSettingsSections();
   const {
@@ -82,6 +81,26 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   } = usePlugins();
   const sortedPluginSections = [...pluginSections].sort((a, b) => a.priority - b.priority);
   const hasPluginSections = sortedPluginSections.length > 0;
+
+  // Compute initial section synchronously to avoid flicker
+  const initialSection = requestedPlugin
+    ? (sortedPluginSections.find((s) => s.pluginName === requestedPlugin)?.key ?? 'models')
+    : 'models';
+  const [activeSection, setActiveSection] = useState<string>(initialSection);
+
+  const navRef = useRef<HTMLDivElement>(null);
+
+  // Scroll active nav item into view whenever activeSection changes
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const active = nav.querySelector('[data-active="true"]') as HTMLElement | null;
+    active?.scrollIntoView({ block: 'nearest' });
+  }, [activeSection]);
+
+  useEffect(() => {
+    onSectionHandled?.();
+  }, [onSectionHandled]);
 
   useEffect(() => {
     const handler = () => onClose();
@@ -100,11 +119,12 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   return (
     <div className="flex h-full flex-col bg-background md:flex-row">
       <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
-        <div className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
+        <div ref={navRef} className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
           {sections.map((section) => (
             <button
               key={section.key}
               type="button"
+              data-active={activeSection === section.key}
               onClick={() => setActiveSection(section.key)}
               className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
                 activeSection === section.key
@@ -130,6 +150,7 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
                 <button
                   key={section.key}
                   type="button"
+                  data-active={activeSection === section.key}
                   onClick={() => setActiveSection(section.key)}
                   className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
                     activeSection === section.key

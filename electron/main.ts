@@ -908,16 +908,15 @@ if (gotSingleInstanceLock) {
         return new Response('Bad Request', { status: 400 });
       }
 
+      // URL format: plugin-renderer://pluginName/assetPath
       const pluginName = decodeURIComponent(parsed.hostname);
-      const pathSegments = parsed.pathname.split('/').filter(Boolean).map((segment) => decodeURIComponent(segment));
-      const [fileHash, ...assetParts] = pathSegments;
-      const assetPath = assetParts.join('/');
+      const assetPath = parsed.pathname.split('/').filter(Boolean).map(decodeURIComponent).join('/');
 
-      if (!pluginName || !fileHash || !assetPath) {
+      if (!pluginName || !assetPath) {
         return new Response('Bad Request', { status: 400 });
       }
 
-      const resolved = pluginManagerRef.resolveRendererAssetRequest(pluginName, fileHash, assetPath);
+      const resolved = pluginManagerRef.resolveRendererAssetRequest(pluginName, assetPath);
       if (!resolved) {
         return new Response('Not Found', { status: 404 });
       }

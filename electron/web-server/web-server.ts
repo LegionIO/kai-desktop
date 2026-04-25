@@ -147,7 +147,7 @@ const MIME_TYPES: Record<string, string> = {
 const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
 
 /** Base directory where compiled plugin renderer bundles are cached. */
-const PLUGIN_RENDERERS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins', '.cache');
+const PLUGINS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins');
 
 /**
  * Client-side bridge script injected into the HTML served to web clients.
@@ -649,24 +649,24 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       return;
     }
 
-    // --- Serve plugin renderer bundles (compiled JS, CSS, assets) ---
+    // --- Serve plugin frontend files directly from plugin directory ---
     if (urlPath.startsWith('/plugin-renderer/')) {
-      // URL format: /plugin-renderer/<pluginName>/<fileHash>/<assetPath>
+      // URL format: /plugin-renderer/<pluginName>/<assetPath>
       const segments = urlPath.slice('/plugin-renderer/'.length).split('/').map(decodeURIComponent);
-      const [pluginName, fileHash, ...assetParts] = segments;
+      const [pluginName, ...assetParts] = segments;
       const assetPath = assetParts.join('/');
 
-      if (!pluginName || !fileHash || !assetPath) {
+      if (!pluginName || !assetPath) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Bad Request');
         return;
       }
 
-      const expectedRoot = join(PLUGIN_RENDERERS_DIR, pluginName, fileHash);
-      const filePath = join(expectedRoot, assetPath);
+      const pluginDir = join(PLUGINS_DIR, pluginName);
+      const filePath = join(pluginDir, assetPath);
 
-      // Security: ensure the resolved path is under the expected plugin cache root
-      if (!filePath.startsWith(expectedRoot + '/') && filePath !== expectedRoot) {
+      // Security: ensure the resolved path is within the plugin directory
+      if (!filePath.startsWith(pluginDir + '/') && filePath !== pluginDir) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
         return;

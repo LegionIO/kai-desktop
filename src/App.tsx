@@ -613,13 +613,26 @@ function AppShell() {
     }
   }, [isMobile]);
 
+  const [preSettingsView, setPreSettingsView] = useState<string>(CHAT_VIEW);
+
+  const handleCloseSettings = useCallback(() => {
+    setActiveView(preSettingsView);
+  }, [preSettingsView]);
+
   const handleSettingsToggle = useCallback(async () => {
-    setActiveView((v) => v === SETTINGS_VIEW ? CHAT_VIEW : SETTINGS_VIEW);
+    setActiveView((v) => {
+      if (v === SETTINGS_VIEW) return preSettingsView;
+      setPreSettingsView(v);
+      return SETTINGS_VIEW;
+    });
     if (isMobile) setSidebarOpen(false);
-  }, [activeView, isMobile]);
+  }, [isMobile, preSettingsView]);
 
   const handleOpenSettings = useCallback(async () => {
-    setActiveView(SETTINGS_VIEW);
+    setActiveView((v) => {
+      if (v !== SETTINGS_VIEW) setPreSettingsView(v);
+      return SETTINGS_VIEW;
+    });
     if (isMobile) setSidebarOpen(false);
   }, [isMobile]);
 
@@ -629,6 +642,19 @@ function AppShell() {
       void handleOpenSettings();
     });
     return cleanup;
+  }, [handleOpenSettings]);
+
+  // Allow plugins to open settings via a custom DOM event
+  // Optionally accepts a plugin name: new CustomEvent('kai:open-settings', { detail: { plugin: 'example' } })
+  const [requestedSettingsPlugin, setRequestedSettingsPlugin] = useState<string | null>(null);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const plugin = (e as CustomEvent<{ plugin?: string }>).detail?.plugin ?? null;
+      setRequestedSettingsPlugin(plugin);
+      void handleOpenSettings();
+    };
+    window.addEventListener('kai:open-settings', handler);
+    return () => window.removeEventListener('kai:open-settings', handler);
   }, [handleOpenSettings]);
 
   // Listen for AI-initiated model switches
@@ -849,8 +875,8 @@ function AppShell() {
         {activeView === SETTINGS_VIEW && createPortal(
           <div
             className="fixed inset-0 z-50 flex items-center justify-center"
-            onClick={() => setActiveView(CHAT_VIEW)}
-            onKeyDown={(e) => { if (e.key === 'Escape') setActiveView(CHAT_VIEW); }}
+            onClick={handleCloseSettings}
+            onKeyDown={(e) => { if (e.key === 'Escape') handleCloseSettings(); }}
           >
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div
@@ -861,14 +887,14 @@ function AppShell() {
                 <h2 className="text-sm font-semibold text-foreground">Settings</h2>
                 <button
                   type="button"
-                  onClick={() => setActiveView(CHAT_VIEW)}
+                  onClick={handleCloseSettings}
                   className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
                 >
                   <XIcon className="h-4 w-4" />
                 </button>
               </div>
               <div className="min-h-0 flex-1">
-                <SettingsPanel onClose={() => setActiveView(CHAT_VIEW)} />
+                <SettingsPanel onClose={handleCloseSettings} requestedPlugin={requestedSettingsPlugin} onSectionHandled={() => setRequestedSettingsPlugin(null)} />
               </div>
             </div>
           </div>,
@@ -952,7 +978,7 @@ function AppShell() {
             <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
-              <span className="titlebar-no-drag inline-flex items-center text-sm font-medium text-sidebar-foreground">
+              <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
               <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
@@ -1104,9 +1130,9 @@ function AppShell() {
               </div>
               </div>
             </div>
-            <div className="min-h-0 flex-1">
+            <div className="min-h-0 flex-1 flex flex-col">
               {activePluginPanel ? (
-                <div className="pt-12 md:pt-14">
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
                 </div>
               ) : (

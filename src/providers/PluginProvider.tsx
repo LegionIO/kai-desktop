@@ -15,7 +15,7 @@ function rewritePluginUrl(url: string): string {
   if (!isWebBridge) return url;
   const prefix = 'plugin-renderer://';
   if (!url.startsWith(prefix)) return url;
-  // plugin-renderer://pluginName/fileHash/path → /plugin-renderer/pluginName/fileHash/path
+  // plugin-renderer://pluginName/path → /plugin-renderer/pluginName/path
   return '/plugin-renderer/' + url.slice(prefix.length);
 }
 

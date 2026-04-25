@@ -40,7 +40,7 @@ export class MarketplaceService {
     private getConfig: () => AppConfig,
     private setConfig: (path: string, value: unknown) => void,
   ) {
-    this.cacheDir = join(appHome, 'marketplace-cache');
+    this.cacheDir = join(appHome, 'data');
   }
 
   /* ── Catalog fetch & merge ── */
@@ -266,7 +266,7 @@ export class MarketplaceService {
 
     // Try loading from disk cache
     try {
-      const cachePath = join(this.cacheDir, 'catalog.json');
+      const cachePath = join(this.cacheDir, 'marketplace.json');
       if (existsSync(cachePath)) {
         const raw = JSON.parse(readFileSync(cachePath, 'utf-8')) as MarketplaceCatalogEntry[];
         // Re-check installed status
@@ -288,7 +288,7 @@ export class MarketplaceService {
   private writeCatalogCache(entries: MarketplaceCatalogEntry[]): void {
     try {
       mkdirSync(this.cacheDir, { recursive: true });
-      writeFileSync(join(this.cacheDir, 'catalog.json'), JSON.stringify(entries, null, 2));
+      writeFileSync(join(this.cacheDir, 'marketplace.json'), JSON.stringify(entries, null, 2));
     } catch (err) {
       console.warn('[Marketplace] Failed to write catalog cache:', err);
     }
