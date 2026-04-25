@@ -29,7 +29,7 @@ export const PluginPanelHost: FC<{
 
   void rendererLoadCount;
 
-  const Component = getPluginComponent(panel.pluginName, panel.component);
+  const Component = getPluginComponent(panel.pluginName, 'PanelView');
   const pluginStatus = getPluginStatus(panel.pluginName);
   const pluginError = getPluginError(panel.pluginName);
   const rendererStatus = getPluginRendererStatus(panel.pluginName);

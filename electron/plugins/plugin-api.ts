@@ -368,14 +368,14 @@ export function createPluginAPI(
         }
       },
 
-      registerSettingsSection: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName'>) => {
+      registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => {
         requirePermission('ui:settings');
-        registerOrReplace(instance.uiSettingsSections, { ...descriptor, pluginName: manifest.name });
+        registerOrReplace(instance.uiSettingsSections, { ...descriptor, component: 'SettingsView', pluginName: manifest.name });
       },
 
-      registerPanel: (descriptor: Omit<PluginPanelDescriptor, 'pluginName'>) => {
+      registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => {
         requirePermission('ui:panel');
-        registerOrReplace(instance.uiPanels, { ...descriptor, pluginName: manifest.name });
+        registerOrReplace(instance.uiPanels, { ...descriptor, component: 'PanelView', pluginName: manifest.name });
       },
 
       registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => {

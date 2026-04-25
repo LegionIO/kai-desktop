@@ -189,7 +189,7 @@ export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string |
 
         {pluginSections.map((pluginSection) => {
           if (activeSection !== pluginSection.key) return null;
-          const Component = getPluginComponent(pluginSection.pluginName, pluginSection.component);
+          const Component = getPluginComponent(pluginSection.pluginName, 'SettingsView');
           const pluginStatus = getPluginStatus(pluginSection.pluginName);
           const pluginError = getPluginError(pluginSection.pluginName);
           const rendererStatus = getPluginRendererStatus(pluginSection.pluginName);

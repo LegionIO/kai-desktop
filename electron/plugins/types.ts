@@ -145,14 +145,14 @@ export type PluginSettingsSectionDescriptor = {
   id: string;
   pluginName: string;
   label: string;
-  component: string;
+  component: 'SettingsView';
   priority?: number;
 };
 
 export type PluginPanelDescriptor = {
   id: string;
   pluginName: string;
-  component: string;
+  component: 'PanelView';
   title: string;
   visible: boolean;
   width?: 'default' | 'wide' | 'full';
@@ -341,8 +341,8 @@ export type PluginAPI = {
     showModal: (descriptor: Omit<PluginModalDescriptor, 'pluginName'>) => void;
     hideModal: (id: string) => void;
     updateModal: (id: string, updates: Partial<Omit<PluginModalDescriptor, 'id' | 'pluginName'>>) => void;
-    registerSettingsSection: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName'>) => void;
-    registerPanel: (descriptor: Omit<PluginPanelDescriptor, 'pluginName'>) => void;
+    registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => void;
+    registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => void;
     registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => void;
     registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => void;
     showConversationDecoration: (descriptor: Omit<PluginConversationDecorationDescriptor, 'pluginName'>) => void;
