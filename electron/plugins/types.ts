@@ -168,7 +168,7 @@ export type PluginNavigationItemDescriptor = {
   id: string;
   pluginName: string;
   label: string;
-  icon?: string | { svg: string };
+  icon?: { lucide: string } | { svg: string };
   visible: boolean;
   priority?: number;
   badge?: string | number;
