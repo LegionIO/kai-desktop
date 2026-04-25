@@ -22,7 +22,7 @@ import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarDock, type DockItem } from '@/components/SidebarDock';
 import { UpdateCard } from '@/components/UpdateCard';
@@ -1062,7 +1062,8 @@ function AppShell() {
                   <MenuIcon className="h-5 w-5" />
                 </button>
               )}
-              <div className="titlebar-no-drag min-w-0">
+              <div className="titlebar-no-drag min-w-0 flex-1 flex items-center justify-between">
+              <div className="min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Settings</span>
                 ) : activePluginPanel ? (
@@ -1127,6 +1128,17 @@ function AppShell() {
                     {activeConversationTitle}
                   </span>
                 ) : null}
+              </div>
+              {activePluginPanel && pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName) && (
+                <button
+                  type="button"
+                  onClick={() => window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: activePluginPanel.pluginName } }))}
+                  className="titlebar-no-drag flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors"
+                >
+                  <Settings2Icon className="h-3.5 w-3.5" />
+                  Settings
+                </button>
+              )}
               </div>
               </div>
             </div>

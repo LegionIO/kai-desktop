@@ -1,5 +1,4 @@
 import type { FC } from 'react';
-import { Settings2Icon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { usePlugins, type PluginPanelDescriptor } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
@@ -26,7 +25,6 @@ export const PluginPanelHost: FC<{
     hasRendererScript,
     getPluginRendererStatus,
     getPluginRendererError,
-    uiState,
   } = usePlugins();
 
   void rendererLoadCount;
@@ -42,28 +40,8 @@ export const PluginPanelHost: FC<{
   );
   const widthClass = widthClassMap[panel.width ?? 'default'];
 
-  const hasSettings = uiState?.settingsSections.some((s) => s.pluginName === panel.pluginName);
-
-  const openSettings = () => {
-    window.dispatchEvent(new CustomEvent('kai:open-settings', {
-      detail: { plugin: panel.pluginName },
-    }));
-  };
-
   return (
     <div className="flex h-full flex-col">
-      {hasSettings && (
-        <div className="flex items-center justify-end border-b border-border/50 px-4 py-2 shrink-0">
-          <button
-            type="button"
-            onClick={openSettings}
-            className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors"
-          >
-            <Settings2Icon className="h-3.5 w-3.5" />
-            Settings
-          </button>
-        </div>
-      )}
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
         <div className={`mx-auto w-full ${widthClass}`}>
           {Component ? (
