@@ -353,19 +353,18 @@ export const PluginMarketplace: FC = () => {
                       if (!parsedAuthor) return null;
                       return (
                         <span className="text-[10px] text-muted-foreground">
-                          by {parsedAuthor.name}
-                          {parsedAuthor.url && (
-                            <>
-                              {' '}
-                              <a
-                                href={parsedAuthor.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-primary hover:underline"
-                              >
-                                [link]
-                              </a>
-                            </>
+                          by{' '}
+                          {parsedAuthor.url ? (
+                            <a
+                              href={parsedAuthor.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-primary hover:underline"
+                            >
+                              {parsedAuthor.name}
+                            </a>
+                          ) : (
+                            parsedAuthor.name
                           )}
                         </span>
                       );
