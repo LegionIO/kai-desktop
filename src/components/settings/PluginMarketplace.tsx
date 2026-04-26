@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon, ArrowUpCircleIcon, SearchIcon } from 'lucide-react';
+import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon, ArrowUpCircleIcon, SearchIcon, CheckIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 type MarketplaceEntry = {
@@ -44,6 +44,7 @@ export const PluginMarketplace: FC = () => {
   const [uninstallingPlugins, setUninstallingPlugins] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [justRefreshed, setJustRefreshed] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -67,12 +68,15 @@ export const PluginMarketplace: FC = () => {
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    setJustRefreshed(false);
     try {
       const refreshed = await app.plugins.marketplaceRefresh();
       setCatalog(refreshed);
       const pluginList = await app.plugins.list();
       setInstalledPlugins(pluginList);
       setError(null);
+      setJustRefreshed(true);
+      setTimeout(() => setJustRefreshed(false), 2000);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to refresh marketplace');
     } finally {
@@ -169,11 +173,21 @@ export const PluginMarketplace: FC = () => {
           <button
             type="button"
             onClick={handleRefresh}
-            disabled={refreshing}
-            className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/80 disabled:opacity-50"
+            disabled={refreshing || justRefreshed}
+            className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
+              justRefreshed
+                ? 'border-green-500/30 bg-green-500/10 text-green-400'
+                : 'border-border/70 bg-card text-foreground hover:bg-muted/80'
+            }`}
           >
-            <RefreshCwIcon className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-            Refresh
+            {refreshing ? (
+              <RefreshCwIcon className="h-3.5 w-3.5 animate-spin" />
+            ) : justRefreshed ? (
+              <CheckIcon className="h-3.5 w-3.5" />
+            ) : (
+              <RefreshCwIcon className="h-3.5 w-3.5" />
+            )}
+            {justRefreshed ? 'Refreshed' : 'Refresh'}
           </button>
         </div>
       </div>
