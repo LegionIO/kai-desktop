@@ -1,13 +1,11 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon } from 'lucide-react';
+import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon, ArrowUpCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 type MarketplaceEntry = {
   name: string;
   displayName: string;
   description: string;
-  repo: string;
-  ref: string;
   version: string;
   author?: string;
   tags?: string[];
@@ -16,6 +14,15 @@ type MarketplaceEntry = {
   installedVersion?: string;
   marketplaceUrl: string;
 };
+
+function isNewerVersion(catalogVersion: string, installedVersion: string): boolean {
+  const toNum = (v: string) => v.split('.').map(Number);
+  const [cMajor, cMinor, cPatch] = toNum(catalogVersion);
+  const [iMajor, iMinor, iPatch] = toNum(installedVersion);
+  if (cMajor !== iMajor) return cMajor > iMajor;
+  if (cMinor !== iMinor) return cMinor > iMinor;
+  return cPatch > iPatch;
+}
 
 type InstalledPlugin = {
   name: string;
