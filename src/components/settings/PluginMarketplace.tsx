@@ -124,6 +124,9 @@ export const PluginMarketplace: FC = () => {
   const availableCatalog = catalog.filter((entry) => !entry.installed && !installedNames.has(entry.name));
   const hasCatalog = catalog.length > 0;
 
+  // Build a map of plugin name -> catalog entry for update checking
+  const catalogMap = new Map(catalog.map((entry) => [entry.name, entry]));
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -169,56 +172,84 @@ export const PluginMarketplace: FC = () => {
             Installed ({installedPlugins.length})
           </h4>
           <div className="space-y-2">
-            {installedPlugins.map((plugin) => (
-              <div
-                key={plugin.name}
-                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
-              >
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
-                  <PackageIcon className="h-4 w-4 text-primary" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-semibold">{plugin.displayName}</span>
-                    <span className="text-[10px] text-muted-foreground">v{plugin.version}</span>
-                    {plugin.brandRequired && (
-                      <span className="flex items-center gap-1 rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-semibold text-primary">
-                        <ShieldIcon className="h-2.5 w-2.5" />
-                        Required
-                      </span>
-                    )}
-                    {plugin.state === 'active' && (
-                      <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
-                    )}
-                    {plugin.state === 'error' && (
-                      <span className="h-1.5 w-1.5 rounded-full bg-red-500" title="Error" />
-                    )}
-                    {plugin.state === 'disabled' && (
-                      <span className="h-1.5 w-1.5 rounded-full bg-yellow-500" title="Disabled" />
+            {installedPlugins.map((plugin) => {
+              const catalogEntry = catalogMap.get(plugin.name);
+              const hasUpdate = catalogEntry && catalogEntry.version && isNewerVersion(catalogEntry.version, plugin.version);
+
+              return (
+                <div
+                  key={plugin.name}
+                  className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
+                >
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
+                    <PackageIcon className="h-4 w-4 text-primary" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold">{plugin.displayName}</span>
+                      <span className="text-[10px] text-muted-foreground">v{plugin.version}</span>
+                      {hasUpdate && (
+                        <span className="flex items-center gap-1 rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold text-blue-400">
+                          <ArrowUpCircleIcon className="h-2.5 w-2.5" />
+                          v{catalogEntry.version} available
+                        </span>
+                      )}
+                      {plugin.brandRequired && (
+                        <span className="flex items-center gap-1 rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                          <ShieldIcon className="h-2.5 w-2.5" />
+                          Required
+                        </span>
+                      )}
+                      {plugin.state === 'active' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
+                      )}
+                      {plugin.state === 'error' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-red-500" title="Error" />
+                      )}
+                      {plugin.state === 'disabled' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-yellow-500" title="Disabled" />
+                      )}
+                    </div>
+                    <p className="truncate text-[11px] text-muted-foreground">{plugin.description}</p>
+                    {plugin.error && (
+                      <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
                     )}
                   </div>
-                  <p className="truncate text-[11px] text-muted-foreground">{plugin.description}</p>
-                  {plugin.error && (
-                    <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
-                  )}
-                </div>
-                {!plugin.brandRequired && !plugin.required && (
-                  <button
-                    type="button"
-                    onClick={() => handleUninstall(plugin.name)}
-                    disabled={uninstallingPlugins.has(plugin.name)}
-                    className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                  >
-                    {uninstallingPlugins.has(plugin.name) ? (
-                      <LoaderIcon className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <TrashIcon className="h-3 w-3" />
+                  <div className="flex shrink-0 gap-2">
+                    {hasUpdate && (
+                      <button
+                        type="button"
+                        onClick={() => handleInstall(plugin.name)}
+                        disabled={installingPlugins.has(plugin.name)}
+                        className="flex items-center gap-1.5 rounded-lg bg-blue-500/20 border border-blue-500/30 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
+                      >
+                        {installingPlugins.has(plugin.name) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <ArrowUpCircleIcon className="h-3 w-3" />
+                        )}
+                        {installingPlugins.has(plugin.name) ? 'Updating...' : 'Update'}
+                      </button>
                     )}
-                    {uninstallingPlugins.has(plugin.name) ? 'Removing...' : 'Uninstall'}
-                  </button>
-                )}
-              </div>
-            ))}
+                    {!plugin.brandRequired && !plugin.required && (
+                      <button
+                        type="button"
+                        onClick={() => handleUninstall(plugin.name)}
+                        disabled={uninstallingPlugins.has(plugin.name)}
+                        className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                      >
+                        {uninstallingPlugins.has(plugin.name) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <TrashIcon className="h-3 w-3" />
+                        )}
+                        {uninstallingPlugins.has(plugin.name) ? 'Removing...' : 'Uninstall'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
