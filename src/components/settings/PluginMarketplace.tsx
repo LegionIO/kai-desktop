@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon, ArrowUpCircleIcon } from 'lucide-react';
+import { RefreshCwIcon, DownloadIcon, TrashIcon, ShieldIcon, PackageIcon, LoaderIcon, AlertCircleIcon, ArrowUpCircleIcon, SearchIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 type MarketplaceEntry = {
@@ -43,6 +43,7 @@ export const PluginMarketplace: FC = () => {
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
   const [uninstallingPlugins, setUninstallingPlugins] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const loadData = useCallback(async () => {
     try {
@@ -121,11 +122,28 @@ export const PluginMarketplace: FC = () => {
   }
 
   const installedNames = new Set(installedPlugins.map((p) => p.name));
-  const availableCatalog = catalog.filter((entry) => !entry.installed && !installedNames.has(entry.name));
-  const hasCatalog = catalog.length > 0;
 
   // Build a map of plugin name -> catalog entry for update checking
   const catalogMap = new Map(catalog.map((entry) => [entry.name, entry]));
+
+  // Filter plugins based on search query
+  const searchLower = searchQuery.toLowerCase();
+  const filteredInstalledPlugins = installedPlugins.filter((plugin) =>
+    plugin.displayName.toLowerCase().includes(searchLower) ||
+    plugin.name.toLowerCase().includes(searchLower) ||
+    plugin.description.toLowerCase().includes(searchLower)
+  );
+
+  const availableCatalog = catalog
+    .filter((entry) => !entry.installed && !installedNames.has(entry.name))
+    .filter((entry) =>
+      entry.displayName.toLowerCase().includes(searchLower) ||
+      entry.name.toLowerCase().includes(searchLower) ||
+      entry.description.toLowerCase().includes(searchLower) ||
+      entry.tags?.some((tag) => tag.toLowerCase().includes(searchLower))
+    );
+
+  const hasCatalog = catalog.length > 0;
 
   return (
     <div className="space-y-6">
@@ -137,15 +155,27 @@ export const PluginMarketplace: FC = () => {
             Browse, install, and manage plugins
           </p>
         </div>
-        <button
-          type="button"
-          onClick={handleRefresh}
-          disabled={refreshing}
-          className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/80 disabled:opacity-50"
-        >
-          <RefreshCwIcon className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search plugins..."
+              className="h-8 w-48 rounded-lg border border-border/70 bg-card pl-8 pr-3 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/80 disabled:opacity-50"
+          >
+            <RefreshCwIcon className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Error banner */}
@@ -166,13 +196,13 @@ export const PluginMarketplace: FC = () => {
       )}
 
       {/* Installed plugins */}
-      {installedPlugins.length > 0 && (
+      {filteredInstalledPlugins.length > 0 && (
         <div className="space-y-3">
           <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Installed ({installedPlugins.length})
+            Installed ({filteredInstalledPlugins.length})
           </h4>
           <div className="space-y-2">
-            {installedPlugins.map((plugin) => {
+            {filteredInstalledPlugins.map((plugin) => {
               const catalogEntry = catalogMap.get(plugin.name);
               const hasUpdate = catalogEntry && catalogEntry.version && isNewerVersion(catalogEntry.version, plugin.version);
 
@@ -310,8 +340,21 @@ export const PluginMarketplace: FC = () => {
         </div>
       )}
 
+      {/* No results state */}
+      {searchQuery && filteredInstalledPlugins.length === 0 && availableCatalog.length === 0 && (
+        <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
+          <SearchIcon className="mx-auto h-8 w-8 text-muted-foreground/50" />
+          <p className="mt-3 text-sm text-muted-foreground">
+            No plugins found matching "{searchQuery}"
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            Try a different search term
+          </p>
+        </div>
+      )}
+
       {/* Empty state */}
-      {!hasCatalog && installedPlugins.length === 0 && (
+      {!hasCatalog && filteredInstalledPlugins.length === 0 && !searchQuery && (
         <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
           <PackageIcon className="mx-auto h-8 w-8 text-muted-foreground/50" />
           <p className="mt-3 text-sm text-muted-foreground">
