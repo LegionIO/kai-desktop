@@ -170,26 +170,25 @@ export const PluginMarketplace: FC = () => {
               className="h-8 w-48 rounded-lg border border-border/70 bg-card pl-8 pr-3 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
             />
           </div>
-          <div className="relative">
-            <button
-              type="button"
-              onClick={handleRefresh}
-              disabled={refreshing}
-              className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/80 disabled:opacity-50"
-            >
-              <RefreshCwIcon className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-              Refresh
-            </button>
-            {justRefreshed && (
-              <div className="absolute left-1/2 top-full mt-2 -translate-x-1/2 animate-in fade-in slide-in-from-top-2 duration-200">
-                <div className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-1.5 text-xs font-medium text-green-400 shadow-lg">
-                  <CheckIcon className="h-3.5 w-3.5" />
-                  Refreshed!
-                </div>
-                <div className="absolute bottom-full left-1/2 -translate-x-1/2 translate-y-px border-4 border-transparent border-b-green-500/30" />
-              </div>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing || justRefreshed}
+            title="Refresh Plugins"
+            className={`flex items-center justify-center rounded-lg border px-2.5 py-1.5 transition-colors disabled:opacity-50 ${
+              justRefreshed
+                ? 'border-green-500/30 bg-green-500/10 text-green-400'
+                : 'border-border/70 bg-card text-foreground hover:bg-muted/80'
+            }`}
+          >
+            {refreshing ? (
+              <RefreshCwIcon className="h-3.5 w-3.5 animate-spin" />
+            ) : justRefreshed ? (
+              <CheckIcon className="h-3.5 w-3.5" />
+            ) : (
+              <RefreshCwIcon className="h-3.5 w-3.5" />
             )}
-          </div>
+          </button>
         </div>
       </div>
 
