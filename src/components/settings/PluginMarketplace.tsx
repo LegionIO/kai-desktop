@@ -8,13 +8,22 @@ type MarketplaceEntry = {
   description: string;
   version: string;
   author?: string;
-  authorGithub?: string;
   tags?: string[];
   icon?: string;
   installed: boolean;
   installedVersion?: string;
   marketplaceUrl: string;
 };
+
+// Parse author string like "Name <https://example.com>" into {name, url}
+function parseAuthor(author?: string): { name: string; url?: string } | null {
+  if (!author) return null;
+  const match = author.match(/^(.+?)\s*<(.+?)>$/);
+  if (match) {
+    return { name: match[1].trim(), url: match[2].trim() };
+  }
+  return { name: author.trim() };
+}
 
 function isNewerVersion(catalogVersion: string, installedVersion: string): boolean {
   const toNum = (v: string) => v.split('.').map(Number);
@@ -339,23 +348,28 @@ export const PluginMarketplace: FC = () => {
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-semibold">{entry.displayName}</span>
                     <span className="text-[10px] text-muted-foreground">v{entry.version}</span>
-                    {entry.author && (
-                      <span className="text-[10px] text-muted-foreground">
-                        by{' '}
-                        {entry.authorGithub ? (
-                          <a
-                            href={`https://github.com/${entry.authorGithub}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-primary hover:underline"
-                          >
-                            {entry.author}
-                          </a>
-                        ) : (
-                          entry.author
-                        )}
-                      </span>
-                    )}
+                    {(() => {
+                      const parsedAuthor = parseAuthor(entry.author);
+                      if (!parsedAuthor) return null;
+                      return (
+                        <span className="text-[10px] text-muted-foreground">
+                          by {parsedAuthor.name}
+                          {parsedAuthor.url && (
+                            <>
+                              {' '}
+                              <a
+                                href={parsedAuthor.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-primary hover:underline"
+                              >
+                                [link]
+                              </a>
+                            </>
+                          )}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <p className="truncate text-[11px] text-muted-foreground">{entry.description}</p>
                   {entry.tags && entry.tags.length > 0 && (
