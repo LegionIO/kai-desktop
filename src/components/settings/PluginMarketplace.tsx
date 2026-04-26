@@ -45,6 +45,7 @@ export const PluginMarketplace: FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [justRefreshed, setJustRefreshed] = useState(false);
+  const [showRefreshTooltip, setShowRefreshTooltip] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -69,12 +70,21 @@ export const PluginMarketplace: FC = () => {
   const handleRefresh = async () => {
     setRefreshing(true);
     setJustRefreshed(false);
+    const startTime = Date.now();
     try {
       const refreshed = await app.plugins.marketplaceRefresh();
       setCatalog(refreshed);
       const pluginList = await app.plugins.list();
       setInstalledPlugins(pluginList);
       setError(null);
+
+      // Ensure spinner shows for at least 1 second (2 full rotations at 0.5s per rotation)
+      const elapsed = Date.now() - startTime;
+      const minSpinTime = 1000;
+      if (elapsed < minSpinTime) {
+        await new Promise((resolve) => setTimeout(resolve, minSpinTime - elapsed));
+      }
+
       setJustRefreshed(true);
       setTimeout(() => setJustRefreshed(false), 2000);
     } catch (err) {
@@ -170,25 +180,36 @@ export const PluginMarketplace: FC = () => {
               className="h-8 w-48 rounded-lg border border-border/70 bg-card pl-8 pr-3 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
             />
           </div>
-          <button
-            type="button"
-            onClick={handleRefresh}
-            disabled={refreshing || justRefreshed}
-            title="Refresh Plugins"
-            className={`flex items-center justify-center rounded-lg border px-2.5 py-1.5 transition-colors disabled:opacity-50 ${
-              justRefreshed
-                ? 'border-green-500/30 bg-green-500/10 text-green-400'
-                : 'border-border/70 bg-card text-foreground hover:bg-muted/80'
-            }`}
-          >
-            {refreshing ? (
-              <RefreshCwIcon className="h-3.5 w-3.5 animate-spin" />
-            ) : justRefreshed ? (
-              <CheckIcon className="h-3.5 w-3.5" />
-            ) : (
-              <RefreshCwIcon className="h-3.5 w-3.5" />
+          <div className="relative">
+            <button
+              type="button"
+              onClick={handleRefresh}
+              onMouseEnter={() => setShowRefreshTooltip(true)}
+              onMouseLeave={() => setShowRefreshTooltip(false)}
+              disabled={refreshing || justRefreshed}
+              className={`flex items-center justify-center rounded-lg border px-2.5 py-1.5 transition-colors disabled:opacity-50 ${
+                justRefreshed
+                  ? 'border-green-500/30 bg-green-500/10 text-green-400'
+                  : 'border-border/70 bg-card text-foreground hover:bg-muted/80'
+              }`}
+            >
+              {refreshing ? (
+                <RefreshCwIcon className="h-3.5 w-3.5 animate-spin" />
+              ) : justRefreshed ? (
+                <CheckIcon className="h-3.5 w-3.5" />
+              ) : (
+                <RefreshCwIcon className="h-3.5 w-3.5" />
+              )}
+            </button>
+            {showRefreshTooltip && !refreshing && !justRefreshed && (
+              <div className="pointer-events-none absolute right-0 top-full mt-2 animate-in fade-in duration-150">
+                <div className="whitespace-nowrap rounded-md bg-popover px-2 py-1 text-[10px] text-popover-foreground shadow-md">
+                  Refresh Plugins
+                </div>
+                <div className="absolute bottom-full right-2 translate-y-px border-4 border-transparent border-b-popover" />
+              </div>
             )}
-          </button>
+          </div>
         </div>
       </div>
 
