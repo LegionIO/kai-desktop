@@ -187,6 +187,15 @@ export const PluginMarketplace: FC = () => {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-semibold">{plugin.displayName}</span>
+                      {plugin.state === 'active' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
+                      )}
+                      {plugin.state === 'error' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-red-500" title="Error" />
+                      )}
+                      {plugin.state === 'disabled' && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-yellow-500" title="Disabled" />
+                      )}
                       <span className="text-[10px] text-muted-foreground">v{plugin.version}</span>
                       {hasUpdate && (
                         <span className="flex items-center gap-1 rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold text-blue-400">
@@ -199,15 +208,6 @@ export const PluginMarketplace: FC = () => {
                           <ShieldIcon className="h-2.5 w-2.5" />
                           Required
                         </span>
-                      )}
-                      {plugin.state === 'active' && (
-                        <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
-                      )}
-                      {plugin.state === 'error' && (
-                        <span className="h-1.5 w-1.5 rounded-full bg-red-500" title="Error" />
-                      )}
-                      {plugin.state === 'disabled' && (
-                        <span className="h-1.5 w-1.5 rounded-full bg-yellow-500" title="Disabled" />
                       )}
                     </div>
                     <p className="truncate text-[11px] text-muted-foreground">{plugin.description}</p>
