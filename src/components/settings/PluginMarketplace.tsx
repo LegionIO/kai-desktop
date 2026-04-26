@@ -8,6 +8,7 @@ type MarketplaceEntry = {
   description: string;
   version: string;
   author?: string;
+  authorGithub?: string;
   tags?: string[];
   icon?: string;
   installed: boolean;
@@ -339,7 +340,21 @@ export const PluginMarketplace: FC = () => {
                     <span className="text-xs font-semibold">{entry.displayName}</span>
                     <span className="text-[10px] text-muted-foreground">v{entry.version}</span>
                     {entry.author && (
-                      <span className="text-[10px] text-muted-foreground">by {entry.author}</span>
+                      <span className="text-[10px] text-muted-foreground">
+                        by{' '}
+                        {entry.authorGithub ? (
+                          <a
+                            href={`https://github.com/${entry.authorGithub}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-primary hover:underline"
+                          >
+                            {entry.author}
+                          </a>
+                        ) : (
+                          entry.author
+                        )}
+                      </span>
                     )}
                   </div>
                   <p className="truncate text-[11px] text-muted-foreground">{entry.description}</p>

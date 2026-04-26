@@ -13,6 +13,7 @@ export type MarketplacePluginEntry = {
   repository: string;
   version: string;
   author?: string;
+  authorGithub?: string;
   tags?: string[];
   icon?: string;
 };
