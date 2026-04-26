@@ -181,12 +181,12 @@ export const PluginMarketplace: FC = () => {
               Refresh
             </button>
             {justRefreshed && (
-              <div className="absolute -top-10 left-1/2 -translate-x-1/2 animate-in fade-in slide-in-from-bottom-2 duration-200">
+              <div className="absolute left-1/2 top-full mt-2 -translate-x-1/2 animate-in fade-in slide-in-from-top-2 duration-200">
                 <div className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-1.5 text-xs font-medium text-green-400 shadow-lg">
                   <CheckIcon className="h-3.5 w-3.5" />
                   Refreshed!
                 </div>
-                <div className="absolute left-1/2 top-full -translate-x-1/2 -translate-y-px border-4 border-transparent border-t-green-500/30" />
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 translate-y-px border-4 border-transparent border-b-green-500/30" />
               </div>
             )}
           </div>
