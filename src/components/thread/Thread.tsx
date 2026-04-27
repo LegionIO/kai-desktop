@@ -1116,6 +1116,7 @@ const AssistantMessage: FC = () => {
   const responseTiming = getResponseTiming(message);
   const badgeStartedAt = responseTiming?.startedAt ?? (isRunning ? activeRunStartedAt ?? undefined : undefined);
   const badgeFinishedAt = responseTiming?.finishedAt;
+  const badgeDurationMs = responseTiming?.durationMs;
 
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1206,6 +1207,7 @@ const AssistantMessage: FC = () => {
               <ElapsedBadge
                 startedAt={badgeStartedAt}
                 finishedAt={badgeFinishedAt}
+                durationMs={badgeDurationMs}
                 isRunning={isRunning}
               />
             </span>

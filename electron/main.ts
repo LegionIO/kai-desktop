@@ -966,7 +966,7 @@ if (gotSingleInstanceLock) {
     });
 
     // Initialize tools asynchronously
-    shellPathReady.then(() => buildToolRegistry(getConfig, APP_HOME)).then((tools) => {
+    shellPathReady.then(() => buildToolRegistry(getConfig, APP_HOME, pluginManager)).then((tools) => {
       const pluginTools = pluginManager.getAllPluginTools();
       const allTools = [...tools, ...pluginTools];
       registerTools(allTools);
