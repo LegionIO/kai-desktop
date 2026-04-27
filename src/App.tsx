@@ -25,7 +25,7 @@ import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarSectionSwitcher, type SidebarSection } from '@/components/SidebarSectionSwitcher';
-import { PluginsList } from '@/components/plugins/PluginsList';
+import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
@@ -1011,10 +1011,7 @@ function AppShell() {
                 <>
                   <PluginBannerSlot />
                   <div className="min-h-0 flex-1 overflow-y-auto">
-                    <PluginsList
-                      activeView={activeView}
-                      onNavigate={handlePluginNavigationItem}
-                    />
+                    <PluginMarketplace />
                   </div>
                 </>
               )}

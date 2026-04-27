@@ -18,7 +18,6 @@ import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { UsageDashboard } from './UsageDashboard';
 import { WebServerSettings } from './WebServerSettings';
-import { PluginMarketplace } from './PluginMarketplace';
 import type { SettingsProps } from './shared';
 import { usePluginSettingsSections } from '@/components/plugins/PluginSettingsSections';
 import { getPluginComponent } from '@/components/plugins/PluginComponentRegistry';
@@ -40,7 +39,6 @@ type SettingsSection =
   | 'media-generation'
   | 'computer-use'
   | 'web-server'
-  | 'plugins-marketplace'
   | 'advanced'
   | 'usage';
 
@@ -60,7 +58,6 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'web-server', label: 'Web UI' },
-  { key: 'plugins-marketplace', label: 'Plugins' },
   { key: 'advanced', label: 'Advanced' },
   { key: 'usage', label: 'Usage' },
 ];
@@ -183,7 +180,6 @@ export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string |
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'plugins-marketplace' && <PluginMarketplace />}
         {activeSection === 'advanced' && <AdvancedSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
 
