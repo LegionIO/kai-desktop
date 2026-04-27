@@ -1059,7 +1059,7 @@ const ThinkingSpinnerText: FC = () => {
   }, [cursorPos]);
 
   return (
-    <span className="text-xs font-mono text-muted-foreground/60 whitespace-pre">
+    <span className="text-xs font-mono whitespace-pre thinking-verb-shimmer">
       {displayText}
     </span>
   );

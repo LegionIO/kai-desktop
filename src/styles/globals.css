@@ -543,3 +543,13 @@ html:not(.dark) .app-gradient-text {
   content: '⠋';
   animation: thinking-spin 0.8s steps(1) infinite;
 }
+
+/* Glow pulse for the thinking-verb text */
+@keyframes verb-glow {
+  0%, 100% { color: var(--primary); }
+  50%      { color: color-mix(in oklch, var(--primary) 25%, white); }
+}
+
+.thinking-verb-shimmer {
+  animation: verb-glow 3s ease-in-out infinite;
+}
