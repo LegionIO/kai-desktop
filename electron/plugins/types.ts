@@ -36,6 +36,7 @@ export type PluginManifest = {
   version: string;
   description: string;
   author?: string;
+  icon?: { lucide: string } | { svg: string };
   permissions: PluginPermission[];
   priority: number;
   required: boolean;
@@ -343,7 +344,7 @@ export type PluginAPI = {
     updateModal: (id: string, updates: Partial<Omit<PluginModalDescriptor, 'id' | 'pluginName'>>) => void;
     registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => void;
     registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => void;
-    registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => void;
+    registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName' | 'label' | 'icon'> & { label?: string; icon?: PluginNavigationItemDescriptor['icon'] }) => void;
     registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => void;
     showConversationDecoration: (descriptor: Omit<PluginConversationDecorationDescriptor, 'pluginName'>) => void;
     hideConversationDecoration: (id: string) => void;

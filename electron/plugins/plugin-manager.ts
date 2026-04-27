@@ -149,6 +149,9 @@ export class PluginManager {
           version: typeof raw.version === 'string' ? raw.version : '0.0.0',
           description: typeof raw.description === 'string' ? raw.description : '',
           author: typeof raw.author === 'string' ? raw.author : undefined,
+          icon: raw.icon && typeof raw.icon === 'object' && !Array.isArray(raw.icon)
+            ? raw.icon as { lucide: string } | { svg: string }
+            : undefined,
           permissions: Array.isArray(raw.permissions)
             ? raw.permissions.filter((value): value is PluginPermission => typeof value === 'string')
             : [],

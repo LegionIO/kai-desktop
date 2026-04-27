@@ -378,9 +378,14 @@ export function createPluginAPI(
         registerOrReplace(instance.uiPanels, { ...descriptor, component: 'PanelView', pluginName: manifest.name });
       },
 
-      registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => {
+      registerNavigationItem: (descriptor) => {
         requirePermission('ui:navigation');
-        registerOrReplace(instance.uiNavigationItems, { ...descriptor, pluginName: manifest.name });
+        registerOrReplace(instance.uiNavigationItems, {
+          ...descriptor,
+          pluginName: manifest.name,
+          label: manifest.displayName,
+          ...(manifest.icon ? { icon: manifest.icon } : {}),
+        });
       },
 
       registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => {
