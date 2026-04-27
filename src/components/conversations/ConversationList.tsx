@@ -51,7 +51,7 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
     if (goal) return goal.length > 50 ? goal.slice(0, 47).trimEnd() + '...' : goal;
   }
 
-  return 'Untitled Thread';
+  return 'Untitled Chat';
 }
 
 const TypingBubble: FC = () => (
@@ -79,36 +79,6 @@ const ComputerCompletedIndicator: FC = () => (
     <div className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
   </div>
 );
-
-/**
- * Double-click-confirm hook: first click arms, second click within timeout executes.
- * Returns { armed, onClick, reset }.
- */
-function useDoubleClickConfirm(onConfirm: () => void, timeoutMs = 2500) {
-  const [armed, setArmed] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const reset = useCallback(() => {
-    setArmed(false);
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-  }, []);
-
-  const onClick = useCallback((e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    if (armed) {
-      reset();
-      onConfirm();
-    } else {
-      setArmed(true);
-      timerRef.current = setTimeout(reset, timeoutMs);
-    }
-  }, [armed, onConfirm, reset, timeoutMs]);
-
-  // Cleanup on unmount
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
-
-  return { armed, onClick, reset };
-}
 
 export const ConversationList: FC<ConversationListProps> = ({
   activeConversationId,
@@ -388,6 +358,16 @@ export const ConversationList: FC<ConversationListProps> = ({
     onSwitchConversation(id);
   };
 
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+
+  const confirmBulkDelete = async () => {
+    setIsBulkDeleting(true);
+    await handleDeleteBulk();
+    setIsBulkDeleting(false);
+    setBulkDeleteOpen(false);
+  };
+
   return (
     <div className="flex flex-col h-full">
       <div className="border-b border-sidebar-border/70 px-4 py-3">
@@ -399,32 +379,32 @@ export const ConversationList: FC<ConversationListProps> = ({
           className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80"
         >
           <PlusIcon className="h-4 w-4 text-primary" />
-          New thread
+          New Chat
         </button>
       </div>
 
       <div className="flex items-center justify-between px-4 pb-2 pt-4">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Threads</span>
+        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Chats</span>
         <div className="flex items-center gap-1 text-muted-foreground">
-          <Tooltip content="Sort threads" side="bottom" sideOffset={6}>
+          <Tooltip content="Sort chats" side="bottom" sideOffset={6}>
             <button
               ref={sortButtonRef}
               type="button"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={() => { setSortOpen((p) => !p); setFilterOpen(false); }}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${!isDefaultSort ? 'text-primary' : ''}`}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${!isDefaultSort ? 'text-primary' : ''}`}
             >
               <PanelTopOpenIcon className="h-4 w-4" />
             </button>
           </Tooltip>
           <div className="relative">
-            <Tooltip content="Filter threads" side="bottom" sideOffset={6}>
+            <Tooltip content="Filter chats" side="bottom" sideOffset={6}>
               <button
                 ref={filterButtonRef}
                 type="button"
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={() => { setFilterOpen((p) => !p); setSortOpen(false); }}
-                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80"
+                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary"
               >
                 <SlidersHorizontalIcon className="h-4 w-4" />
               </button>
@@ -435,16 +415,28 @@ export const ConversationList: FC<ConversationListProps> = ({
               </span>
             )}
           </div>
-          <Tooltip content={showArchived ? 'Show active threads' : 'Show archived threads'} side="bottom" sideOffset={6}>
+          <Tooltip content={showArchived ? 'Show active chats' : 'Show archived chats'} side="bottom" sideOffset={6}>
             <button
               type="button"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={() => setShowArchived((p) => !p)}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${showArchived ? 'text-primary' : ''}`}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${showArchived ? 'text-primary' : ''}`}
             >
               <ArchiveIcon className="h-4 w-4" />
             </button>
           </Tooltip>
+          {processedConversations.length > 0 && (
+            <Tooltip content={isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats'} side="bottom" sideOffset={6}>
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => setBulkDeleteOpen(true)}
+                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-destructive"
+              >
+                <Trash2Icon className="h-4 w-4" />
+              </button>
+            </Tooltip>
+          )}
           {sortOpen && (
             <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortButtonRef} />
           )}
@@ -600,19 +592,56 @@ export const ConversationList: FC<ConversationListProps> = ({
 
         {processedConversations.length === 0 && (
           <p className="text-xs text-muted-foreground p-3 text-center">
-            {searchQuery || hasActiveFilters ? 'No matching conversations' : 'No conversations yet'}
+            {searchQuery || hasActiveFilters ? 'No matching chats' : 'No chats yet'}
           </p>
         )}
       </div>
 
-      {/* Delete all / delete searched — bottom of sidebar */}
-      {processedConversations.length > 0 && (
-        <div className="border-t border-sidebar-border/70 p-3">
-          <BulkDeleteButton
-            label={isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats'}
-            onConfirm={handleDeleteBulk}
-          />
-        </div>
+      {/* Bulk delete confirmation modal */}
+      {bulkDeleteOpen && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-semibold text-foreground">Delete chats</h2>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {isSearchActive || hasActiveFilters
+                ? `This will permanently delete ${processedConversations.length} shown chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`
+                : `This will permanently delete all ${processedConversations.length} chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`}
+            </p>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkDeleteOpen(false)}
+                disabled={isBulkDeleting}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => { void confirmBulkDelete(); }}
+                disabled={isBulkDeleting}
+                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+              >
+                {isBulkDeleting ? (
+                  <>
+                    <LoaderIcon className="h-3 w-3 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  <>
+                    <Trash2Icon className="h-3 w-3" />
+                    Delete
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {contextMenu && createPortal(
@@ -667,39 +696,5 @@ export const ConversationList: FC<ConversationListProps> = ({
         conversationId={exportConvId}
       />
     </div>
-  );
-};
-
-/** Bulk delete button with double-click confirm */
-const BulkDeleteButton: FC<{ label: string; onConfirm: () => Promise<void> }> = ({ label, onConfirm }) => {
-  const [isDeleting, setIsDeleting] = useState(false);
-  const { armed, onClick } = useDoubleClickConfirm(async () => {
-    setIsDeleting(true);
-    await onConfirm();
-    setIsDeleting(false);
-  });
-
-  if (isDeleting) {
-    return (
-      <div className="flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs text-muted-foreground">
-        <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
-        Deleting...
-      </div>
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs transition-all ${
-        armed
-          ? 'bg-destructive text-destructive-foreground font-medium'
-          : 'text-muted-foreground hover:bg-sidebar-accent hover:text-foreground'
-      }`}
-    >
-      <Trash2Icon className="h-3.5 w-3.5" />
-      {armed ? 'Click again to confirm' : label}
-    </button>
   );
 };

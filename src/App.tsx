@@ -24,7 +24,8 @@ import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
-import { SidebarDock, type DockItem } from '@/components/SidebarDock';
+import { SidebarSectionSwitcher, type SidebarSection } from '@/components/SidebarSectionSwitcher';
+import { PluginsList } from '@/components/plugins/PluginsList';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
@@ -34,7 +35,6 @@ import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
-import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { PlanPanel, PlanPanelDivider } from '@/components/thread/PlanPanel';
@@ -385,6 +385,7 @@ function AppShell() {
   });
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('threads');
   const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
@@ -781,7 +782,6 @@ function AppShell() {
   }, [handleSwitchConversation]);
 
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
-  const pluginNavigationItems = pluginUIState?.navigationItems?.filter((item) => item.visible) ?? [];
   const activePluginPanel = useMemo(() => (
     pluginPanels.find((panel) => activeView === getPluginPanelViewKey(panel.pluginName, panel.id)) ?? null
   ), [activeView, pluginPanels]);
@@ -831,21 +831,6 @@ function AppShell() {
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
   }, [handleOpenSettings, handlePluginNavigationItem, pluginCommands]);
-
-  const dockItems: DockItem[] = useMemo(() => [
-    ...pluginNavigationItems.map((item) => ({
-      id: `plugin-nav:${item.pluginName}:${item.id}`,
-      label: item.label,
-      icon: getPluginNavigationIcon(item.icon),
-      onClick: () => handlePluginNavigationItem(item.pluginName, item.target as { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown }),
-      active: item.target.type === 'panel' && activeView === getPluginPanelViewKey(item.pluginName, item.target.panelId),
-      badge: item.badge != null ? (
-        <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-primary px-1 text-[8px] font-bold text-primary-foreground">
-          {String(item.badge)}
-        </span>
-      ) : undefined,
-    })),
-  ], [activeView, handlePluginNavigationItem, pluginNavigationItems]);
 
   return (
     <AttachmentProvider>
@@ -1003,20 +988,38 @@ function AppShell() {
               </div>
             </div>
             <div className="flex min-h-0 flex-1 flex-col">
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                <ConversationList
-                  activeConversationId={activeConversationId}
-                  activeThreadMode={threadMode}
-                  onSwitchConversation={handleSwitchConversation}
-                  onNewConversation={handleNewConversation}
-                  onDeleteConversation={handleDeleteConversation}
-                />
-              </div>
-              <div className="shrink-0">
-                <SubAgentSidebarSection />
-              </div>
-              <PluginBannerSlot />
-              <SidebarDock items={dockItems} />
+              <SidebarSectionSwitcher value={sidebarSection} onValueChange={setSidebarSection} />
+
+              {sidebarSection === 'threads' && (
+                <>
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    <ConversationList
+                      activeConversationId={activeConversationId}
+                      activeThreadMode={threadMode}
+                      onSwitchConversation={handleSwitchConversation}
+                      onNewConversation={handleNewConversation}
+                      onDeleteConversation={handleDeleteConversation}
+                    />
+                  </div>
+                  <div className="shrink-0">
+                    <SubAgentSidebarSection />
+                  </div>
+                </>
+              )}
+
+              {sidebarSection === 'extensions' && (
+                <>
+                  <PluginBannerSlot />
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    <PluginsList
+                      activeView={activeView}
+                      onNavigate={handlePluginNavigationItem}
+                    />
+                  </div>
+                </>
+              )}
+
+              <UpdateCard />
             </div>
             </div>
           </aside>
