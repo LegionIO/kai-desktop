@@ -502,6 +502,10 @@ export class PluginManager {
     }));
   }
 
+  getPluginInstance(pluginName: string): PluginInstance | null {
+    return this.plugins.get(pluginName) ?? null;
+  }
+
   getPluginConfig(pluginName: string): Record<string, unknown> {
     const instance = this.plugins.get(pluginName);
     if (!instance) return {};
