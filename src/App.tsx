@@ -26,6 +26,8 @@ import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIc
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { SidebarSectionSwitcher, type SidebarSection } from '@/components/SidebarSectionSwitcher';
 import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
+import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
+import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
@@ -320,6 +322,8 @@ type AppView = string;
 
 const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
+const MARKETPLACE_VIEW = 'marketplace';
+const PLUGINS_VIEW = 'plugins';
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
@@ -1011,7 +1015,12 @@ function AppShell() {
                 <>
                   <PluginBannerSlot />
                   <div className="min-h-0 flex-1 overflow-y-auto">
-                    <PluginMarketplace />
+                    <InstalledPluginsList
+                      activeView={activeView}
+                      onNavigate={handlePluginNavigationItem}
+                      onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                      onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                    />
                   </div>
                 </>
               )}
@@ -1066,6 +1075,10 @@ function AppShell() {
               <div className="min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Settings</span>
+                ) : activeView === MARKETPLACE_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
+                ) : activeView === PLUGINS_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Installed Plugins</span>
                 ) : activePluginPanel ? (
                   <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
                 ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
@@ -1143,7 +1156,23 @@ function AppShell() {
               </div>
             </div>
             <div className="min-h-0 flex-1 flex flex-col">
-              {activePluginPanel ? (
+              {activeView === MARKETPLACE_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <PluginMarketplace />
+                    </div>
+                  </div>
+                </div>
+              ) : activeView === PLUGINS_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <InstalledPluginsView onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)} />
+                    </div>
+                  </div>
+                </div>
+              ) : activePluginPanel ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
                 </div>
