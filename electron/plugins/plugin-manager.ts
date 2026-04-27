@@ -329,7 +329,7 @@ export class PluginManager {
         return;
       }
 
-      const moduleUrl = pathToFileURL(backendPath).href;
+      const moduleUrl = `${pathToFileURL(backendPath).href}?v=${instance.fileHash}`;
       const mod = await import(moduleUrl) as PluginModule;
       instance.module = mod;
 
@@ -420,6 +420,35 @@ export class PluginManager {
     this.actionHandlers.clear();
     this.notificationTimers.clear();
     this.notifyToolsChanged();
+  }
+
+  private async unloadPlugin(pluginName: string): Promise<void> {
+    const instance = this.plugins.get(pluginName);
+    if (!instance) return;
+
+    try {
+      if (instance.module?.deactivate) {
+        await instance.module.deactivate();
+      }
+      const api = this.pluginAPIs.get(pluginName);
+      if (api) {
+        await cleanupPluginAPI(api);
+      }
+    } catch (err) {
+      console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
+    }
+
+    this.actionHandlers.delete(pluginName);
+
+    for (const [key, timer] of this.notificationTimers.entries()) {
+      if (key.startsWith(`${pluginName}:`)) {
+        clearTimeout(timer);
+        this.notificationTimers.delete(key);
+      }
+    }
+
+    this.plugins.delete(pluginName);
+    this.pluginAPIs.delete(pluginName);
   }
 
   /* ── Permissions / Queries ── */
@@ -841,6 +870,9 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" not found in marketplace catalog`);
     }
 
+    // Unload existing instance if present (handles broken or active plugins)
+    await this.unloadPlugin(pluginName);
+
     await this.marketplaceService.installPlugin(entry);
 
     // Discover and load the newly installed plugin
@@ -860,23 +892,7 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
     }
 
-    // Deactivate plugin first if loaded
-    const instance = this.plugins.get(pluginName);
-    if (instance) {
-      try {
-        if (instance.module?.deactivate) {
-          await instance.module.deactivate();
-        }
-        const api = this.pluginAPIs.get(pluginName);
-        if (api) {
-          await cleanupPluginAPI(api);
-        }
-      } catch (err) {
-        console.error(`[PluginManager] Error deactivating plugin "${pluginName}" during uninstall:`, err);
-      }
-      this.plugins.delete(pluginName);
-      this.pluginAPIs.delete(pluginName);
-    }
+    await this.unloadPlugin(pluginName);
 
     this.marketplaceService.uninstallPlugin(pluginName);
 
