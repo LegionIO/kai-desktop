@@ -102,6 +102,12 @@ function getDefaultConfig() {
       enabled: [] as string[],
     },
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    systemPrompts: {
+      chat: '',
+      plan: '',
+      implement: '',
+      computerUse: '',
+    },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; approvedAt: string }>,
     marketplace: {
@@ -693,6 +699,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     mcpServers: config.mcpServers,
     skills: config.skills,
     systemPrompt: config.systemPrompt,
+    systemPrompts: config.systemPrompts,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
     marketplace: config.marketplace,
@@ -884,7 +891,7 @@ export function registerConfigHandlers(
     return currentConfig;
   });
 
-  ipcMain.handle('platform:homedir', () => appHome);
+  ipcMain.handle('platform:homedir', () => homedir());
 
   ipcMain.handle('webServer:lan-addresses', () => {
     return getLanAddresses();

@@ -90,14 +90,28 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
       setProfilePrimaryModelKey(null);
       return;
     }
+    let cancelled = false;
     app.profileCatalog()
       .then((catalog) => {
+        if (cancelled) return;
         const profile = (catalog as { profiles: Array<{ key: string; primaryModelKey: string }> }).profiles
           .find((p) => p.key === profileKey);
-        setProfilePrimaryModelKey(profile?.primaryModelKey ?? null);
+        const nextPrimaryModelKey = profile?.primaryModelKey ?? null;
+        setProfilePrimaryModelKey(nextPrimaryModelKey);
+        if (nextPrimaryModelKey && session.fallbackEnabled && session.selectedModelKey !== nextPrimaryModelKey) {
+          void updateSessionSettings(session.id, { modelKey: nextPrimaryModelKey });
+        }
+        if (!nextPrimaryModelKey) {
+          void updateSessionSettings(session.id, { profileKey: null, fallbackEnabled: false });
+        }
       })
-      .catch(() => setProfilePrimaryModelKey(null));
-  }, [session.selectedProfileKey]);
+      .catch(() => {
+        if (!cancelled) setProfilePrimaryModelKey(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [config, session.fallbackEnabled, session.id, session.selectedModelKey, session.selectedProfileKey, updateSessionSettings]);
   const pendingApprovals = session.approvals.filter((approval) => approval.status === 'pending');
   const latestFrame = session.latestFrame;
   const canResume = session.status === 'paused' || session.status === 'failed';

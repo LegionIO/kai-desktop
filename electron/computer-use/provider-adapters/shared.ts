@@ -354,9 +354,11 @@ export async function createPlannerState(
   modelChain: ModelChainEntry[],
   maxRetries: number,
   conversationContext?: string,
+  customInstructions?: string,
   callbacks?: FallbackCallbacks,
 ): Promise<{ state: ComputerPlannerState; modelIndex: number }> {
   const prompt = [
+    customInstructions?.trim() ? `Computer-use instructions:\n${customInstructions.trim()}` : undefined,
     'You are planning a computer-use session. Create a short task graph for the goal below.',
     '',
     `Goal:\n${goal}`,
@@ -412,10 +414,11 @@ export async function generateNextActions(params: {
   modelChain: ModelChainEntry[];
   maxRetries: number;
   role: ComputerUseRole;
+  customInstructions?: string;
   captureExcludedApps?: string[];
   callbacks?: FallbackCallbacks;
 }): Promise<PlannedActions> {
-  const { session, modelChain, maxRetries, role, captureExcludedApps, callbacks } = params;
+  const { session, modelChain, maxRetries, role, customInstructions, captureExcludedApps, callbacks } = params;
   const plannerState = session.plannerState ?? {
     summary: session.goal,
     subgoals: [session.goal],
@@ -495,6 +498,7 @@ export async function generateNextActions(params: {
   const promptParts = [
     // Hidden-focus hard-stop goes first so it is the very first thing the model reads
     hiddenFocusWarning,
+    customInstructions?.trim() ? `Computer-use instructions:\n${customInstructions.trim()}` : undefined,
     `Role: ${role}`,
     `Overall goal: ${session.goal}`,
     session.conversationContext ? `Conversation context:\n${session.conversationContext}` : undefined,

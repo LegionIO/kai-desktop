@@ -5,6 +5,7 @@ import type { BackgroundProcessConfig } from '@mastra/core/workspace';
 import { toStandardSchema as toJsonStandardSchema } from '@mastra/schema-compat/adapters/json-schema';
 import { z } from 'zod';
 import { homedir } from 'os';
+import { isAbsolute, resolve as resolvePath } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
@@ -339,6 +340,77 @@ export const WORKSPACE_MUTATING_TOOLS: Set<string> = new Set([
   WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND,
 ]);
 
+const WORKSPACE_PATH_TOOLS: Set<string> = new Set([
+  WORKSPACE_TOOLS.FILESYSTEM.READ_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.DELETE,
+  WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES,
+  WORKSPACE_TOOLS.FILESYSTEM.GREP,
+]);
+
+export function normalizeAgentCwd(cwd?: string | null): string {
+  const trimmed = cwd?.trim() || homedir();
+  if (trimmed === '~') return homedir();
+  if (trimmed.startsWith('~/')) return resolvePath(homedir(), trimmed.slice(2));
+  if (isAbsolute(trimmed)) return trimmed;
+  return resolvePath(homedir(), trimmed);
+}
+
+function normalizeWorkspacePath(basePath: string, value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '.') return basePath;
+  if (trimmed === '~') return homedir();
+  if (trimmed.startsWith('~/')) return resolvePath(homedir(), trimmed.slice(2));
+  if (isAbsolute(trimmed)) return trimmed;
+  return resolvePath(basePath, trimmed);
+}
+
+function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: string): unknown {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+
+  const normalized = { ...(input as Record<string, unknown>) };
+
+  if (toolName === WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES) {
+    if (Array.isArray(normalized.pattern) && normalized.pattern.length === 0) {
+      delete normalized.pattern;
+    } else if (typeof normalized.pattern === 'string' && normalized.pattern.trim() === '') {
+      delete normalized.pattern;
+    }
+    if (typeof normalized.extension === 'string' && normalized.extension.trim() === '') {
+      delete normalized.extension;
+    }
+    if (typeof normalized.exclude === 'string' && normalized.exclude.trim() === '') {
+      delete normalized.exclude;
+    }
+  }
+
+  if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof normalized.path === 'string') {
+    normalized.path = normalizeWorkspacePath(cwd, normalized.path);
+  } else if (
+    (toolName === WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES || toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP)
+    && (normalized.path === undefined || normalized.path === null)
+  ) {
+    normalized.path = cwd;
+  }
+
+  if (toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND && typeof normalized.cwd === 'string') {
+    normalized.cwd = normalizeWorkspacePath(cwd, normalized.cwd);
+  }
+
+  return normalized;
+}
+
+function normalizeWorkspaceToolPaths(tools: Record<string, unknown>, cwd: string): void {
+  for (const [toolName, tool] of Object.entries(tools)) {
+    if (!tool || typeof tool !== 'object') continue;
+    const candidate = tool as { execute?: (input: unknown, context: unknown) => Promise<unknown> };
+    if (typeof candidate.execute !== 'function') continue;
+    const originalExecute = candidate.execute.bind(tool);
+    candidate.execute = (input, context) => originalExecute(normalizeWorkspaceToolInput(toolName, input, cwd), context);
+  }
+}
+
 /**
  * Create a Mastra Workspace with LocalFilesystem and LocalSandbox
  * and return the workspace tools for the agent.
@@ -385,6 +457,7 @@ async function createWorkspaceForAgent(
   await workspace.init();
 
   const tools = await createWorkspaceTools(workspace);
+  normalizeWorkspaceToolPaths(tools as Record<string, unknown>, cwd);
 
   // If in plan-first mode, remove mutating workspace tools
   if (executionMode === 'plan-first') {
@@ -425,7 +498,7 @@ export async function* streamAgentResponse(
   const memory = getSharedMemory(config, dbPath);
 
   // Create Mastra workspace tools (file read/write/edit, grep, list, shell)
-  const effectiveCwd = options?.cwd || homedir();
+  const effectiveCwd = normalizeAgentCwd(options?.cwd);
   const executionMode = config.tools?.executionMode;
   const { workspace, tools: workspaceTools } = await createWorkspaceForAgent(
     effectiveCwd,
@@ -449,7 +522,7 @@ export async function* streamAgentResponse(
     onToolExecutionStart: options?.onToolExecutionStart,
     onToolExecutionEnd: options?.onToolExecutionEnd,
     augmentToolResult: options?.augmentToolResult,
-  }, { cwd: options?.cwd });
+  }, { cwd: effectiveCwd });
 
   // Merge: workspace tools (native Mastra) + custom tools (bridged)
   const allTools = { ...mastraCustomTools, ...workspaceTools };
@@ -459,7 +532,7 @@ export async function* streamAgentResponse(
     return new Agent({
       id: `${__BRAND_APP_SLUG}-${conversationId}`,
       name: __BRAND_APP_SLUG,
-      instructions: buildAgentInstructions(config.systemPrompt, executionMode),
+      instructions: buildAgentInstructions(config, executionMode),
       model: model as AgentConfig['model'],
       tools: allTools as AgentConfig['tools'],
       workspace: workspace as unknown as AgentConfig['workspace'],
@@ -991,7 +1064,7 @@ export async function* streamWithFallback(
     const entry = modelChain[attempt];
     const configOverride: AppConfig = {
       ...config,
-      systemPrompt: streamConfig.systemPrompt,
+      systemPrompt: config.systemPrompt || streamConfig.systemPrompt,
       advanced: {
         ...config.advanced,
         temperature: streamConfig.temperature,
@@ -1130,7 +1203,23 @@ export async function* streamWithFallback(
   yield { conversationId, type: 'done' };
 }
 
-function buildAgentInstructions(basePrompt: string, executionMode?: string): string {
+function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): string {
+  const prompts = config.systemPrompts;
+  const chatPrompt = prompts?.chat?.trim() || config.systemPrompt;
+
+  if (executionMode === 'plan-first') {
+    return prompts?.plan?.trim() || chatPrompt;
+  }
+
+  if (executionMode === 'implement') {
+    return prompts?.implement?.trim() || chatPrompt;
+  }
+
+  return chatPrompt;
+}
+
+function buildAgentInstructions(config: AppConfig, executionMode?: string): string {
+  const basePrompt = resolveModeSystemPrompt(config, executionMode);
   const lines = [
     basePrompt,
     '',
@@ -1139,8 +1228,6 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
     '- The runtime may emit mid-tool progress updates to the user.',
     '- A tool run may be cancelled if output indicates failure, risk, or mismatch with intent.',
     '- Do not claim that mid-tool progress updates are impossible in this environment.',
-    '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
-    '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
   ];
 
   if (executionMode === 'plan-first') {
@@ -1163,9 +1250,24 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
       '- Do NOT write the plan as regular text in the conversation. Instead, pass the entire plan as the planContent argument to exit_plan_mode. The user will see it in a dedicated side panel.',
       '- Your turn should ONLY end by either using ask_user (to clarify requirements) or calling exit_plan_mode (to present the plan for approval). Do not stop for any other reason.',
       '- Use exit_plan_mode to request plan approval. Do NOT ask about plan approval via text — phrases like "Is this plan okay?" or "Should I proceed?" MUST use exit_plan_mode instead.',
-      '- IMPORTANT: If exit_plan_mode has been called and its result indicates plan mode was deactivated, these restrictions no longer apply. You may proceed with edits and tool use on the next turn.',
+      '- IMPORTANT: If exit_plan_mode has been approved and its result indicates implementation mode is active, these restrictions no longer apply on the next turn.',
+    );
+  } else if (executionMode === 'implement') {
+    lines.push(
+      '',
+      'IMPLEMENTATION MODE ACTIVE:',
+      '- The user approved the plan. Implement it now; do not re-enter planning mode or restate the plan instead of acting.',
+      '- The ask_user, enter_plan_mode, and exit_plan_mode tools are not available in this mode. Do not ask clarification questions unless you are blocked by missing external information, credentials, or user-only access; in that case, report the concrete blocker and what you already tried.',
+      '- Reuse the context, approved plan, and tool results already present in the conversation. Do not begin implementation by listing the workspace, running pwd, or re-reading files solely to rediscover state that was already inspected during planning.',
+      '- Do targeted reads only when needed because information may be stale, incomplete, or directly relevant to the next edit. If the plan already identifies a new file to create, start by creating it.',
+      '- Prefer making the planned code changes, then run focused verification. If verification fails, diagnose and fix when practical before stopping.',
+      '- Continue until the requested implementation is complete or a concrete blocker prevents further progress. End with a concise summary of changed files and verification results.',
     );
   } else if (executionMode === 'confirm-writes') {
+    lines.push(
+      '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
+      '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
+    );
     lines.push(
       '',
       'CONFIRMATION MODE:',
@@ -1173,6 +1275,11 @@ function buildAgentInstructions(basePrompt: string, executionMode?: string): str
       '- The user will see your intended action and can approve or reject it.',
       '- Before invoking a write tool, briefly explain what the tool call will do and why.',
       '- Read-only tools execute normally without requiring approval.',
+    );
+  } else {
+    lines.push(
+      '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
+      '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
     );
   }
 

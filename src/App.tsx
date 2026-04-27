@@ -154,6 +154,7 @@ function useOperatorConversationId(preferredConversationId?: string | null): str
 const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ preferredConversationId }) => {
   const conversationId = useOperatorConversationId(preferredConversationId);
   const { sessionsByConversation } = useComputerUse();
+  const { config } = useConfig();
   const activeComputerSession = getComputerSessionForConversation(conversationId, sessionsByConversation);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
@@ -239,6 +240,27 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
       setSelectedModelKey(profilePrimaryModelKey);
     }
   }, [profilePrimaryModelKey, selectedProfileKey]);
+
+  useEffect(() => {
+    if (!selectedProfileKey || !config) return;
+
+    const nextPrimaryModelKey = getProfilePrimaryModelKey(config, selectedProfileKey);
+    if (!nextPrimaryModelKey) {
+      setSelectedProfileKey(null);
+      setProfilePrimaryModelKey(null);
+      setFallbackEnabled(false);
+      setSelectedModelKey(null);
+      return;
+    }
+
+    if (nextPrimaryModelKey === profilePrimaryModelKey) return;
+
+    const previousPrimaryModelKey = profilePrimaryModelKey;
+    setProfilePrimaryModelKey(nextPrimaryModelKey);
+    if (fallbackEnabled && (!selectedModelKey || selectedModelKey === previousPrimaryModelKey)) {
+      setSelectedModelKey(nextPrimaryModelKey);
+    }
+  }, [config, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
 
   return (
     <div className="h-screen overflow-hidden bg-background px-6 py-6 text-foreground">
@@ -335,6 +357,22 @@ function isPluginView(view: string): boolean {
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
+}
+
+function getProfilePrimaryModelKey(config: Record<string, unknown> | null, profileKey: string): string | undefined {
+  const profiles = config?.profiles;
+  if (!Array.isArray(profiles)) return undefined;
+
+  const profile = profiles.find((entry) => {
+    return Boolean(
+      entry
+      && typeof entry === 'object'
+      && 'key' in entry
+      && (entry as { key?: unknown }).key === profileKey,
+    );
+  }) as { primaryModelKey?: unknown } | undefined;
+
+  return typeof profile?.primaryModelKey === 'string' ? profile.primaryModelKey : undefined;
 }
 
 function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean {
@@ -750,7 +788,7 @@ function AppShell() {
   useEffect(() => {
     if (!window.app?.onExecutionModeChanged) return;
     const cleanup = window.app.onExecutionModeChanged((mode) => {
-      if (mode === 'plan-first' || mode === 'auto' || mode === 'confirm-writes') {
+      if (mode === 'plan-first' || mode === 'implement' || mode === 'auto' || mode === 'confirm-writes') {
         setExecutionMode(mode as ExecutionMode);
       }
     });
@@ -779,6 +817,27 @@ function AppShell() {
       setSelectedModelKey(profilePrimaryModelKey);
     }
   }, [selectedProfileKey, profilePrimaryModelKey]);
+
+  useEffect(() => {
+    if (!selectedProfileKey || !config) return;
+
+    const nextPrimaryModelKey = getProfilePrimaryModelKey(config, selectedProfileKey);
+    if (!nextPrimaryModelKey) {
+      setSelectedProfileKey(null);
+      setProfilePrimaryModelKey(null);
+      setFallbackEnabled(false);
+      setSelectedModelKey(null);
+      return;
+    }
+
+    if (nextPrimaryModelKey === profilePrimaryModelKey) return;
+
+    const previousPrimaryModelKey = profilePrimaryModelKey;
+    setProfilePrimaryModelKey(nextPrimaryModelKey);
+    if (fallbackEnabled && (!selectedModelKey || selectedModelKey === previousPrimaryModelKey)) {
+      setSelectedModelKey(nextPrimaryModelKey);
+    }
+  }, [config, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
 
   // Restore per-conversation settings when switching conversations
   const handleConversationSettingsLoaded = useCallback((settings: {

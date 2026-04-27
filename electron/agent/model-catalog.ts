@@ -150,7 +150,8 @@ export function resolveStreamConfig(
   const maxRetries = profile?.maxRetries ?? config.advanced.maxRetries;
   const profileUseResponsesApi = profile?.useResponsesApi;
   const useResponsesApi = profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
-  const systemPrompt = profile?.systemPrompt?.trim() || config.systemPrompt;
+  const globalSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
+  const systemPrompt = profile?.systemPrompt?.trim() || globalSystemPrompt;
   const reasoningEffort = opts.reasoningEffort ?? profile?.reasoningEffort as ReasoningEffort | undefined;
 
   // 5. Apply merged parameters to model configs (cloned so we don't mutate catalog)

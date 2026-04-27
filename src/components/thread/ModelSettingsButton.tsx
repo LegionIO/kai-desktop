@@ -5,6 +5,7 @@ import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useConfig } from '@/providers/ConfigProvider';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
 
 type ModelInfo = {
@@ -39,11 +40,13 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'xhigh', label: 'Max' },
 ];
 
-export type ExecutionMode = 'auto' | 'plan-first';
+export type ExecutionMode = 'auto' | 'plan-first' | 'implement' | 'confirm-writes';
 
 const MODE_ICONS: Record<ExecutionMode, typeof PenLineIcon> = {
   'auto': PenLineIcon,
   'plan-first': ScrollTextIcon,
+  'implement': DumbbellIcon,
+  'confirm-writes': CheckIcon,
 };
 
 export const ModelSettingsButton: FC<{
@@ -65,19 +68,32 @@ export const ModelSettingsButton: FC<{
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [profileCatalog, setProfileCatalog] = useState<ProfileCatalog | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const { config } = useConfig();
 
   useEffect(() => {
+    let cancelled = false;
     app.modelCatalog()
-      .then((data) => setCatalog(data as ModelCatalog))
+      .then((data) => {
+        if (!cancelled) setCatalog(data as ModelCatalog);
+      })
       .catch(() => {});
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [config]);
 
   useEffect(() => {
     if (!onSelectProfile) return;
+    let cancelled = false;
     app.profileCatalog()
-      .then((data) => setProfileCatalog(data as ProfileCatalog))
+      .then((data) => {
+        if (!cancelled) setProfileCatalog(data as ProfileCatalog);
+      })
       .catch(() => {});
-  }, [onSelectProfile]);
+    return () => {
+      cancelled = true;
+    };
+  }, [config, onSelectProfile]);
 
   // Close on outside click
   useEffect(() => {
@@ -137,7 +153,11 @@ export const ModelSettingsButton: FC<{
     ? currentLabel
     : executionMode === 'plan-first'
       ? 'Plan mode'
-      : 'Edit mode';
+      : executionMode === 'implement'
+        ? 'Implementation mode'
+        : executionMode === 'confirm-writes'
+          ? 'Confirm writes mode'
+          : 'Edit mode';
 
   const ModeIcon = hasExecutionMode
     ? MODE_ICONS[executionMode ?? 'auto']

@@ -326,12 +326,13 @@ export class ComputerUseOrchestrator {
 
         const freshSession = this.readSession(sessionId) ?? planningSession;
         const excludedApps = config.computerUse.localMacos.captureExcludedApps;
+        const computerUseInstructions = config.systemPrompts?.computerUse?.trim() || undefined;
 
         const plan = support === 'anthropic-client-tool'
-          ? await anthropicPlanSession(freshSession, modelChain, maxRetries, planningRole, excludedApps, fallbackCallbacks)
+          ? await anthropicPlanSession(freshSession, modelChain, maxRetries, planningRole, computerUseInstructions, excludedApps, fallbackCallbacks)
           : support === 'gemini-computer-use'
-            ? await geminiPlanSession(freshSession, modelChain, maxRetries, fallbackCallbacks)
-            : await openaiPlanSession(freshSession, modelChain, maxRetries, planningRole, excludedApps, fallbackCallbacks);
+            ? await geminiPlanSession(freshSession, modelChain, maxRetries, computerUseInstructions, fallbackCallbacks)
+            : await openaiPlanSession(freshSession, modelChain, maxRetries, planningRole, computerUseInstructions, excludedApps, fallbackCallbacks);
 
         this.mutateSession(sessionId, (existing) => ({
           ...existing,

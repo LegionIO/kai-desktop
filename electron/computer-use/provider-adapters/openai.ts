@@ -6,13 +6,14 @@ export async function openaiPlanSession(
   modelChain: ModelChainEntry[],
   maxRetries: number,
   role: 'driver' | 'recovery' = 'driver',
+  customInstructions?: string,
   captureExcludedApps?: string[],
   callbacks?: FallbackCallbacks,
 ): Promise<PlannedActions> {
   let effectiveChain = modelChain;
   let plannerState = session.plannerState;
   if (!plannerState) {
-    const plannerResult = await createPlannerState(session.goal, modelChain, maxRetries, session.conversationContext, callbacks);
+    const plannerResult = await createPlannerState(session.goal, modelChain, maxRetries, session.conversationContext, customInstructions, callbacks);
     plannerState = plannerResult.state;
     // If the planner fell back to a different model, reorder the chain so
     // generateNextActions starts with the model that actually worked.
@@ -23,6 +24,7 @@ export async function openaiPlanSession(
     modelChain: effectiveChain,
     maxRetries,
     role,
+    customInstructions,
     captureExcludedApps,
     callbacks,
   });

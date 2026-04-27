@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const executionModeSchema = z.enum(['auto', 'plan-first', 'confirm-writes']);
+export const executionModeSchema = z.enum(['auto', 'plan-first', 'implement', 'confirm-writes']);
 export type ExecutionMode = z.infer<typeof executionModeSchema>;
 
 const computerUseSupportSchema = z.enum([
@@ -180,6 +180,13 @@ const profileConfigSchema = z.object({
   maxRetries: z.number().nonnegative().optional(),
   useResponsesApi: z.boolean().optional(),
   reasoningEffort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+});
+
+const systemPromptsConfigSchema = z.object({
+  chat: z.string().optional(),
+  plan: z.string().optional(),
+  implement: z.string().optional(),
+  computerUse: z.string().optional(),
 });
 
 const fallbackConfigSchema = z.object({
@@ -420,6 +427,7 @@ export const appConfigSchema = z.object({
     enabled: z.array(z.string()),
   }),
   systemPrompt: z.string(),
+  systemPrompts: systemPromptsConfigSchema.optional(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
   marketplace: marketplaceConfigSchema.optional(),

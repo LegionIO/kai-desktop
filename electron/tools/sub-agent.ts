@@ -101,7 +101,7 @@ async function resumeSubAgent(
   try {
     const stream = streamAgentResponse(
       subAgentConversationId, messages, modelConfig,
-      { ...config, systemPrompt: config.systemPrompt },
+      { ...config, systemPrompt: config.systemPrompts?.chat?.trim() || config.systemPrompt },
       tools, dbPath,
       {
         abortSignal: localController.signal,

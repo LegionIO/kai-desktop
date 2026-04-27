@@ -27,7 +27,7 @@ const appAPI = {
       profileKey?: string,
       fallbackEnabled?: boolean,
       cwd?: string,
-      executionMode?: 'auto' | 'plan-first' | 'confirm-writes',
+      executionMode?: 'auto' | 'plan-first' | 'implement' | 'confirm-writes',
     ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd, executionMode),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),

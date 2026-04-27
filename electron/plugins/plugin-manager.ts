@@ -35,7 +35,7 @@ import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
-import { buildPluginRendererBundle, resolvePluginRendererRequest } from './renderer-build.js';
+import { buildPluginRendererBundle } from './renderer-build.js';
 import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 

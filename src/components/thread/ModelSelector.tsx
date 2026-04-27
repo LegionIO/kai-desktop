@@ -3,6 +3,7 @@ import { CheckIcon, ChevronDownIcon, CpuIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
+import { useConfig } from '@/providers/ConfigProvider';
 
 type ModelInfo = {
   key: string;
@@ -32,12 +33,19 @@ export const ModelSelector: FC<ModelSelectorProps> = ({ selectedModelKey, onSele
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const popover = usePopoverAlign();
+  const { config } = useConfig();
 
   useEffect(() => {
+    let cancelled = false;
     app.modelCatalog()
-      .then((data) => setCatalog(data as ModelCatalog))
+      .then((data) => {
+        if (!cancelled) setCatalog(data as ModelCatalog);
+      })
       .catch(() => {});
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [config]);
 
   useEffect(() => {
     if (!isOpen) return;

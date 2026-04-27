@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FC } from 'react';
 import { CheckIcon, ChevronDownIcon, UserCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
+import { useConfig } from '@/providers/ConfigProvider';
 
 type ProfileInfo = {
   key: string;
@@ -24,12 +25,19 @@ export const ProfileSelector: FC<{
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const popover = usePopoverAlign();
+  const { config } = useConfig();
 
   useEffect(() => {
+    let cancelled = false;
     app.profileCatalog()
-      .then((data) => setCatalog(data as ProfileCatalog))
+      .then((data) => {
+        if (!cancelled) setCatalog(data as ProfileCatalog);
+      })
       .catch(() => {});
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [config]);
 
   useEffect(() => {
     if (!isOpen) return;

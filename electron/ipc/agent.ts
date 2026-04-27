@@ -2,9 +2,8 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { join } from 'path';
-import { homedir } from 'os';
 import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry, type ResolvedStreamConfig } from '../agent/model-catalog.js';
-import { streamAgentResponse, streamWithFallback, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
+import { normalizeAgentCwd, streamAgentResponse, streamWithFallback, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -26,6 +25,18 @@ import type { PluginManager } from '../plugins/plugin-manager.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
+const PLAN_MODE_CUSTOM_TOOLS = new Set([
+  'ask_user',
+  'enter_plan_mode',
+  'exit_plan_mode',
+  'web_fetch',
+  'web_search',
+]);
+const IMPLEMENT_MODE_EXCLUDED_TOOLS = new Set([
+  'ask_user',
+  'enter_plan_mode',
+  'exit_plan_mode',
+]);
 
 // Pending tool approval promises for confirm-writes execution mode
 const pendingToolApprovals = new Map<string, { resolve: (approved: boolean | 'dismiss') => void }>();
@@ -81,6 +92,25 @@ function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): Abor
   primary.addEventListener('abort', abort, { once: true });
   secondary.addEventListener('abort', abort, { once: true });
   return controller.signal;
+}
+
+function toolsForExecutionMode(tools: ToolDefinition[], executionMode: ExecutionMode): ToolDefinition[] {
+  if (executionMode === 'plan-first') {
+    return tools.filter((tool) => PLAN_MODE_CUSTOM_TOOLS.has(tool.name));
+  }
+
+  if (executionMode === 'implement') {
+    return tools.filter((tool) => !IMPLEMENT_MODE_EXCLUDED_TOOLS.has(tool.name));
+  }
+
+  return tools;
+}
+
+function broadcastExecutionMode(mode: ExecutionMode): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('agent:execution-mode-changed', mode);
+  }
+  broadcastToWebClients('agent:execution-mode-changed', mode);
 }
 
 function withObserverAugmentation(result: unknown, augmentation: Record<string, unknown> | undefined): unknown {
@@ -339,7 +369,7 @@ function streamMastra(options: {
         options.conversationId,
         options.messages,
         options.streamConfig,
-        options.config,
+        configForStream,
         options.tools,
         dbPath,
         {
@@ -390,7 +420,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       cwd?: string,
       executionMode?: ExecutionMode,
     ) => {
-    const effectiveCwd = cwd || homedir();
+    const effectiveCwd = normalizeAgentCwd(cwd);
+    const effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
 
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
@@ -425,7 +456,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const modelEntry = streamConfig?.primaryModel ?? null;
 
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
-    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length} cwd=${effectiveCwd} executionMode=${executionMode ?? 'auto'}`);
+    console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length} cwd=${effectiveCwd} executionMode=${effectiveExecutionMode}`);
 
     // Track the model key for usage attribution
     activeStreamModelKeys.set(
@@ -750,6 +781,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       };
 
+      const activeTools = toolsForExecutionMode(registeredTools, effectiveExecutionMode);
+
       const launchObserverToolCall = async (toolName: string, args: unknown): Promise<LaunchToolCallResult> => {
         if (!observer) {
           return { ok: false, details: 'Observer runtime not initialized.' };
@@ -764,7 +797,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           return { ok: false, details: 'Thread run is already cancelled.' };
         }
 
-        const tool = findToolByName(registeredTools, toolName);
+        const tool = findToolByName(activeTools, toolName);
         if (!tool) {
           return { ok: false, details: `Tool "${toolName}" is not registered.` };
         }
@@ -804,6 +837,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const context: ToolExecutionContext = {
               toolCallId,
               conversationId,
+              cwd: effectiveCwd,
               abortSignal: mergedAbortSignal,
               onProgress: (progress) => {
                 if (activeObserverSessions.get(conversationId) !== observerSessionId) return;
@@ -1017,7 +1051,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               observer?.onToolExecutionStart(state);
 
               // In confirm-writes mode, block mutating tools until user approves
-              if (executionMode === 'confirm-writes' && WORKSPACE_MUTATING_TOOLS.has(state.toolName)) {
+              if (effectiveExecutionMode === 'confirm-writes' && WORKSPACE_MUTATING_TOOLS.has(state.toolName)) {
                 const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
                 broadcastStreamEvent({
                   conversationId,
@@ -1055,10 +1089,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   if (approved === 'dismiss') {
                     // User clicked X — exit plan mode entirely and stop the stream.
                     console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
-                    for (const win of BrowserWindow.getAllWindows()) {
-                      win.webContents.send('agent:execution-mode-changed', 'auto');
-                    }
-                    broadcastToWebClients('agent:execution-mode-changed', 'auto');
+                    broadcastExecutionMode('auto');
                     planDoneSent = true;
                     broadcastStreamEvent({ conversationId, type: 'done', data: { planDismissed: true } });
                     controller.abort();
@@ -1067,10 +1098,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // User clicked "No, keep planning" — stay in plan-first mode.
                   // Re-broadcast plan-first mode so the UI toggle stays in plan mode
                   // even if a race with the tool's execute() emitted 'auto'.
-                  for (const win of BrowserWindow.getAllWindows()) {
-                    win.webContents.send('agent:execution-mode-changed', 'plan-first');
-                  }
-                  broadcastToWebClients('agent:execution-mode-changed', 'plan-first');
+                  broadcastExecutionMode('plan-first');
                   // Abort the stream and signal the renderer to restart in plan-first
                   // mode so the agent can continue planning with the user.
                   console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
@@ -1128,17 +1156,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             },
           };
 
-        // NOTE: Plan-first mode filtering for workspace tools (file write/edit, shell)
-        // is now handled in createWorkspaceForAgent() in mastra-agent.ts.
-        // The registeredTools array only contains custom (non-workspace) tools.
-        const activeTools = registeredTools;
+        // NOTE: Workspace tool filtering is handled in createWorkspaceForAgent().
+        // Custom tools are filtered here so planning cannot mutate app state and
+        // implementation cannot fall back to asking more questions or re-planning.
 
         // Inject execution mode into config so system prompt can be augmented
         const configWithExecutionMode: AppConfig = {
           ...config,
           tools: {
             ...config.tools,
-            executionMode: executionMode ?? 'auto',
+            executionMode: effectiveExecutionMode,
+          },
+          advanced: {
+            ...config.advanced,
+            maxSteps: effectiveExecutionMode === 'implement'
+              ? Math.max(config.advanced.maxSteps, 30)
+              : config.advanced.maxSteps,
           },
         };
 
@@ -1191,8 +1224,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
           if (event.type === 'tool-result' && event.toolName === 'exit_plan_mode' && !exitPlanModeRejected) {
             // Plan was accepted. Abort this stream so the renderer can restart
-            // with executionMode='auto' (full tool set, no plan-mode restrictions).
-            console.info(`[Agent:stream] exit_plan_mode detected mid-stream, aborting to restart with auto mode`);
+            // with executionMode='implement' (write tools available, question/planning tools removed).
+            console.info(`[Agent:stream] exit_plan_mode detected mid-stream, aborting to restart with implement mode`);
             broadcastStreamEvent(event);
             planDoneSent = true;
             broadcastStreamEvent({ conversationId, type: 'done', data: { exitPlanModeRestart: true } });
@@ -1248,6 +1281,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             continue;
           }
           broadcastStreamEvent(event);
+          if (event.type === 'done' && effectiveExecutionMode === 'implement') {
+            broadcastExecutionMode('auto');
+          }
         }
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -1257,6 +1293,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             error: error instanceof Error ? error.message : String(error),
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
+          if (effectiveExecutionMode === 'implement') {
+            broadcastExecutionMode('auto');
+          }
         }
       } finally {
         observerLaunchesEnabled = false;

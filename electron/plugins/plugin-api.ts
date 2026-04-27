@@ -13,7 +13,6 @@ import type {
   PluginBrowserWindowOptions,
   PluginSettingsSectionDescriptor,
   PluginPanelDescriptor,
-  PluginNavigationItemDescriptor,
   PluginCommandDescriptor,
   PluginConversationDecorationDescriptor,
   PluginThreadDecorationDescriptor,

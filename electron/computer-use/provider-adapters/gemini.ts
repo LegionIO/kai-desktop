@@ -5,6 +5,7 @@ export async function geminiPlanSession(
   _session: ComputerSession,
   _modelChain: ModelChainEntry[],
   _maxRetries?: number,
+  _customInstructions?: string,
   _callbacks?: FallbackCallbacks,
 ): Promise<PlannedActions> {
   throw new Error('Gemini computer use is not available in the current runtime yet. Add Google model runtime support first.');

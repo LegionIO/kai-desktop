@@ -159,7 +159,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
   activeSubAgentCount++;
 
   try {
-    const systemPrompt = buildSubAgentSystemPrompt(config.systemPrompt, task, context, depth);
+    const basePrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
+    const systemPrompt = buildSubAgentSystemPrompt(basePrompt, task, context, depth);
     const messages: Array<{ role: string; content: unknown }> = [
       { role: 'user', content: task },
     ];

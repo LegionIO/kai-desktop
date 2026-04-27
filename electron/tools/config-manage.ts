@@ -232,20 +232,25 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
 export function createSystemPromptTool(appHome: string): ToolDefinition {
   return {
     name: 'system_prompt',
-    description: 'View or update the ' + __BRAND_PRODUCT_NAME + ' system prompt. Use "get" to read, "set" to replace it.',
+    description: 'View or update ' + __BRAND_PRODUCT_NAME + ' system prompts. Use "get" to read, "set" to replace a prompt for chat, plan, implement, or computer-use mode.',
     inputSchema: z.object({
       action: z.enum(['get', 'set']).describe('Read or write the system prompt'),
+      mode: z.enum(['chat', 'plan', 'implement', 'computerUse']).optional().describe('Prompt mode. Defaults to chat.'),
       prompt: z.string().optional().describe('The new system prompt text (required for "set")'),
     }),
     execute: async (input) => {
-      const { action, prompt } = input as { action: string; prompt?: string };
+      const { action, mode = 'chat', prompt } = input as { action: string; mode?: 'chat' | 'plan' | 'implement' | 'computerUse'; prompt?: string };
       const config = readConfig(appHome);
-      if (action === 'get') return { systemPrompt: config.systemPrompt };
+      if (action === 'get') return { systemPrompt: config.systemPrompt, systemPrompts: config.systemPrompts };
       if (prompt === undefined) return { error: 'Prompt text required for "set".' };
-      const previous = config.systemPrompt;
-      config.systemPrompt = prompt;
+      const previous = mode === 'chat' ? config.systemPrompt : config.systemPrompts?.[mode];
+      config.systemPrompts = {
+        ...(config.systemPrompts ?? {}),
+        [mode]: prompt,
+      };
+      if (mode === 'chat') config.systemPrompt = prompt;
       writeDesktopConfig(appHome, config);
-      return { success: true, changed: { previous, new: prompt } };
+      return { success: true, mode, changed: { previous, new: prompt } };
     },
   };
 }

@@ -134,20 +134,37 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
 };
 
 const SystemPromptSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  type PromptKey = 'chat' | 'plan' | 'implement' | 'computerUse';
+  const promptTabs: Array<{ key: PromptKey; label: string }> = [
+    { key: 'chat', label: 'Chat' },
+    { key: 'plan', label: 'Plan' },
+    { key: 'implement', label: 'Implement' },
+    { key: 'computerUse', label: 'Computer Use' },
+  ];
   const configPrompt = (config as { systemPrompt?: string }).systemPrompt ?? '';
-  const [draft, setDraft] = useState(configPrompt);
+  const configPrompts = (config as { systemPrompts?: Partial<Record<PromptKey, string>> }).systemPrompts ?? {};
+  const [activePrompt, setActivePrompt] = useState<PromptKey>('chat');
+  const promptValue = activePrompt === 'chat'
+    ? (configPrompts.chat?.trim() ? configPrompts.chat : configPrompt)
+    : (configPrompts[activePrompt] ?? '');
+  const [draft, setDraft] = useState(promptValue);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFocusedRef = useRef(false);
 
   useEffect(() => {
-    if (!isFocusedRef.current) setDraft(configPrompt);
-  }, [configPrompt]);
+    if (!isFocusedRef.current) setDraft(promptValue);
+  }, [promptValue]);
 
   const flushToConfig = useCallback((value: string) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = null;
-    updateConfig('systemPrompt', value);
-  }, [updateConfig]);
+    if (activePrompt === 'chat') {
+      void updateConfig('systemPrompt', value);
+      void updateConfig('systemPrompts.chat', value);
+    } else {
+      void updateConfig(`systemPrompts.${activePrompt}`, value);
+    }
+  }, [activePrompt, updateConfig]);
 
   const handleChange = (value: string) => {
     setDraft(value);
@@ -157,14 +174,41 @@ const SystemPromptSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-4">
-      <h3 className="text-sm font-semibold">System Prompt</h3>
+      <div>
+        <h3 className="text-sm font-semibold">System Prompts</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Plan, implement, and computer-use prompts inherit the chat prompt when left blank.
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-1 rounded-xl border border-border/70 bg-card/60 p-1">
+        {promptTabs.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => {
+              if (timerRef.current) flushToConfig(draft);
+              isFocusedRef.current = false;
+              setActivePrompt(tab.key);
+            }}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+              activePrompt === tab.key
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
       <EditableTextarea
         className="h-[300px] w-full overflow-y-auto rounded-lg border bg-card p-3 text-xs font-mono outline-none focus:ring-1 focus:ring-ring"
         value={draft}
         onFocus={() => { isFocusedRef.current = true; }}
         onBlur={() => { isFocusedRef.current = false; }}
         onChange={(value) => handleChange(value)}
-        placeholder={`Enter the system prompt for ${__BRAND_PRODUCT_NAME}...`}
+        placeholder={activePrompt === 'chat'
+          ? `Enter the system prompt for ${__BRAND_PRODUCT_NAME}...`
+          : 'Leave blank to inherit the chat prompt.'}
       />
     </div>
   );

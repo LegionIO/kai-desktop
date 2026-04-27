@@ -62,7 +62,7 @@ export function createExitPlanModeTool(): ToolDefinition {
   return {
     name: 'exit_plan_mode',
     description: [
-      'Exit plan-first mode and return to normal auto mode where all tools are available.',
+      'Exit plan-first mode and enter implementation mode where write tools are available.',
       'Call this when you have finished producing your plan and the user is ready to proceed with implementation.',
       'Pass the full plan as markdown in planContent. This tool requires user approval before executing — the user will see the plan in a side panel and an approve/reject prompt.',
     ].join(' '),
@@ -83,13 +83,13 @@ export function createExitPlanModeTool(): ToolDefinition {
       const planFilePath = join(plansDir, `${planName}.md`);
       writeFileSync(planFilePath, planContent, 'utf-8');
 
-      broadcastModeChange('auto');
+      broadcastModeChange('implement');
       return {
         success: true,
-        mode: 'auto',
+        mode: 'implement',
         planFilePath,
         planName: `${planName}.md`,
-        message: 'Plan mode has been deactivated. All tools including file_write, file_edit, and sh are now available. The PLAN MODE ACTIVE restriction from the system prompt no longer applies. You may now proceed with implementation using any tools.',
+        message: 'Plan mode has been deactivated and implementation mode is active. Write and command tools are available, while ask_user and plan-mode tools are unavailable. Proceed with the approved implementation now.',
         ...(summary ? { summary } : {}),
       };
     },

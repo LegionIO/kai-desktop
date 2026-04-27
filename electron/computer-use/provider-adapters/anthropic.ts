@@ -6,13 +6,14 @@ export async function anthropicPlanSession(
   modelChain: ModelChainEntry[],
   maxRetries: number,
   role: 'driver' | 'recovery' = 'driver',
+  customInstructions?: string,
   captureExcludedApps?: string[],
   callbacks?: FallbackCallbacks,
 ): Promise<PlannedActions> {
   let effectiveChain = modelChain;
   let plannerState = session.plannerState;
   if (!plannerState) {
-    const plannerResult = await createPlannerState(session.goal, modelChain, maxRetries, session.conversationContext, callbacks);
+    const plannerResult = await createPlannerState(session.goal, modelChain, maxRetries, session.conversationContext, customInstructions, callbacks);
     plannerState = plannerResult.state;
     effectiveChain = reorderChain(modelChain, plannerResult.modelIndex);
   }
@@ -21,6 +22,7 @@ export async function anthropicPlanSession(
     modelChain: effectiveChain,
     maxRetries,
     role,
+    customInstructions,
     captureExcludedApps,
     callbacks,
   });
