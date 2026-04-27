@@ -340,7 +340,7 @@ function getBridgeScript(): string {
       overlayMouseLeave: noop,
       onEvent: function(cb) { return on('computer-use:event', cb); },
       onOverlayState: function(cb) { return on('computer-use:overlay-state', cb); },
-      onFocusThread: function(cb) { return on('computer-use:focus-thread', cb); }
+      onFocusChat: function(cb) { return on('computer-use:focus-chat', cb); }
     },
     mic: {
       listDevices: function() { return Promise.resolve([]); },

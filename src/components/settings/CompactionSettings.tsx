@@ -23,7 +23,7 @@ export const CompactionSettings: FC<SettingsProps> = ({ config, updateConfig }) 
         <SliderField label={headTailLabel('Head ratio', compaction.tool.truncateHeadRatio)} value={compaction.tool.truncateHeadRatio} min={0.1} max={0.9} step={0.05} onChange={(v) => updateConfig('compaction.tool.truncateHeadRatio', v)} />
       </fieldset>
 
-      {/* Conversation compaction */}
+      {/* Chat compaction */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Chat Compaction</legend>
         <Toggle label="Enabled" checked={compaction.conversation.enabled} onChange={(v) => updateConfig('compaction.conversation.enabled', v)} />

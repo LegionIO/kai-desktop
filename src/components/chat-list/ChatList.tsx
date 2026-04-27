@@ -5,16 +5,16 @@ import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
-import type { ConversationRecord } from '@/providers/RuntimeProvider';
+import type { ChatRecord } from '@/providers/RuntimeProvider';
 import type { ComputerSession } from '../../../shared/computer-use';
-import { useConversationPreferences } from './useConversationPreferences';
+import { useChatPreferences } from './useChatPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
 import { Tooltip } from '@/components/ui/Tooltip';
 
-type ConversationSummary = Pick<
-  ConversationRecord,
+type ChatSummary = Pick<
+  ChatRecord,
   'id' | 'title' | 'fallbackTitle' | 'createdAt' | 'updatedAt' | 'lastMessageAt' |
   'messageCount' | 'userMessageCount' | 'runStatus' | 'hasUnread' | 'lastAssistantUpdateAt' | 'archived'
 > & {
@@ -22,12 +22,12 @@ type ConversationSummary = Pick<
   hasToolCalls?: boolean;
 };
 
-type ConversationListProps = {
-  activeConversationId: string | null;
-  activeThreadMode?: 'chat' | 'computer';
-  onSwitchConversation: (id: string) => void;
-  onNewConversation: () => Promise<void> | void;
-  onDeleteConversation?: (id: string) => Promise<void> | void;
+type ChatListProps = {
+  activeChatId: string | null;
+  activeChatMode?: 'chat' | 'computer';
+  onSwitchChat: (id: string) => void;
+  onNewChat: () => Promise<void> | void;
+  onDeleteChat?: (id: string) => Promise<void> | void;
 };
 
 function formatRelativeTime(timestamp: string | null): string {
@@ -40,7 +40,7 @@ function formatRelativeTime(timestamp: string | null): string {
   return `${Math.floor(diffMs / 604_800_000)}w ago`;
 }
 
-function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerSession[]): string {
+function getDisplayTitle(conv: ChatSummary, computerSessions?: ComputerSession[]): string {
   // Prefer chat-based titles
   const chatTitle = conv.title?.trim() || conv.fallbackTitle?.trim();
   if (chatTitle) return chatTitle;
@@ -80,14 +80,14 @@ const ComputerCompletedIndicator: FC = () => (
   </div>
 );
 
-export const ConversationList: FC<ConversationListProps> = ({
-  activeConversationId,
-  activeThreadMode,
-  onSwitchConversation,
-  onNewConversation,
-  onDeleteConversation: _onDeleteConversation,
+export const ChatList: FC<ChatListProps> = ({
+  activeChatId,
+  activeChatMode,
+  onSwitchChat,
+  onNewChat,
+  onDeleteChat: _onDeleteChat,
 }) => {
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [conversations, setConversations] = useState<ChatSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [, setDeletingId] = useState<string | null>(null);
@@ -96,12 +96,12 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
-  const { sessionsByConversation } = useComputerUse();
+  const { sessionsByChat } = useComputerUse();
   const [sortOpen, setSortOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
   const sortButtonRef = useRef<HTMLButtonElement>(null);
   const filterButtonRef = useRef<HTMLButtonElement>(null);
-  const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters, isDefaultSort } = useConversationPreferences();
+  const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters, isDefaultSort } = useChatPreferences();
   const [showArchived, setShowArchived] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -131,27 +131,27 @@ export const ConversationList: FC<ConversationListProps> = ({
 
   /** Get the computer-use session status for a conversation */
   const getComputerStatus = useCallback((conversationId: string): 'running' | 'completed' | null => {
-    const sessions = sessionsByConversation.get(conversationId);
+    const sessions = sessionsByChat.get(conversationId);
     if (!sessions?.length) return null;
     const latest = sessions[0]; // sorted by updatedAt desc
     if (latest.status === 'running' || latest.status === 'starting' || latest.status === 'awaiting-approval') return 'running';
     if (latest.status === 'completed' && !latest.completionSeen) return 'completed';
     return null;
-  }, [sessionsByConversation]);
+  }, [sessionsByChat]);
 
   // Mark computer-use sessions as seen when the user is viewing the Computer tab
   useEffect(() => {
-    if (!activeConversationId || activeThreadMode !== 'computer') return;
-    const sessions = sessionsByConversation.get(activeConversationId);
+    if (!activeChatId || activeChatMode !== 'computer') return;
+    const sessions = sessionsByChat.get(activeChatId);
     const hasUnseen = sessions?.some((s) => s.status === 'completed' && !s.completionSeen);
     if (hasUnseen) {
-      void app.computerUse.markSessionsSeen(activeConversationId);
+      void app.computerUse.markSessionsSeen(activeChatId);
     }
-  }, [activeConversationId, activeThreadMode, sessionsByConversation]);
+  }, [activeChatId, activeChatMode, sessionsByChat]);
 
   const loadConversations = useCallback(async () => {
     try {
-      const list = await app.conversations.list() as ConversationSummary[];
+      const list = await app.conversations.list() as ChatSummary[];
 
       setConversations((prev) => {
         const newIds = new Set(list.map((c) => c.id));
@@ -202,14 +202,14 @@ export const ConversationList: FC<ConversationListProps> = ({
 
     result = result.filter((conv) => showArchived ? Boolean(conv.archived) : !conv.archived);
 
-    // Hide empty threads (no messages, no title) — they only appear after the user sends a message
+    // Hide empty chats (no messages, no title) — they only appear after the user sends a message
     result = result.filter((conv) => conv.messageCount > 0 || Boolean(conv.title?.trim() || conv.fallbackTitle?.trim()));
 
     // Stage 1: Apply filters
     if (hasActiveFilters) {
       result = result.filter((conv) => {
         if (filter.hasToolCalls === true && !conv.hasToolCalls) return false;
-        if (filter.hasComputerUse === true && !sessionsByConversation.has(conv.id)) return false;
+        if (filter.hasComputerUse === true && !sessionsByChat.has(conv.id)) return false;
         if (filter.messageCountMin != null && conv.messageCount < filter.messageCountMin) return false;
         if (filter.messageCountMax != null && conv.messageCount > filter.messageCountMax) return false;
         if (filter.createdAfter && conv.createdAt.slice(0, 10) < filter.createdAfter) return false;
@@ -225,7 +225,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     if (isSearchActive) {
       const q = searchQuery.toLowerCase();
       result = result.filter((c) =>
-        getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q),
+        getDisplayTitle(c, sessionsByChat.get(c.id)).toLowerCase().includes(q),
       );
     }
 
@@ -243,8 +243,8 @@ export const ConversationList: FC<ConversationListProps> = ({
           cmp = a.createdAt.localeCompare(b.createdAt);
           break;
         case 'alphabetical': {
-          const aTitle = getDisplayTitle(a, sessionsByConversation.get(a.id)).toLowerCase();
-          const bTitle = getDisplayTitle(b, sessionsByConversation.get(b.id)).toLowerCase();
+          const aTitle = getDisplayTitle(a, sessionsByChat.get(a.id)).toLowerCase();
+          const bTitle = getDisplayTitle(b, sessionsByChat.get(b.id)).toLowerCase();
           cmp = aTitle.localeCompare(bTitle);
           break;
         }
@@ -253,7 +253,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived]);
+  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByChat, showArchived]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
@@ -262,8 +262,8 @@ export const ConversationList: FC<ConversationListProps> = ({
   const handleDelete = async (id: string) => {
     setDeletingId(id);
     try {
-      const wasDeletingActive = id === activeConversationId;
-      let next: ConversationSummary | undefined;
+      const wasDeletingActive = id === activeChatId;
+      let next: ChatSummary | undefined;
 
       if (wasDeletingActive) {
         const idx = processedConversations.findIndex((c) => c.id === id);
@@ -281,9 +281,9 @@ export const ConversationList: FC<ConversationListProps> = ({
           setFadingActiveId(null);
           if (next) {
             await app.conversations.setActiveId(next.id);
-            onSwitchConversation(next.id);
+            onSwitchChat(next.id);
           } else {
-            await onNewConversation();
+            await onNewChat();
           }
         }, 300);
       }
@@ -293,12 +293,12 @@ export const ConversationList: FC<ConversationListProps> = ({
   };
 
   const handleArchive = async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     if (!conv) return;
     const isArchived = !conv.archived;
     await app.conversations.put({ ...conv, archived: isArchived });
-    if (isArchived && id === activeConversationId) {
-      await onNewConversation();
+    if (isArchived && id === activeChatId) {
+      await onNewChat();
     }
     await loadConversations();
   };
@@ -306,7 +306,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   const handleRename = async (id: string, newTitle: string) => {
     const trimmed = newTitle.trim();
     if (!trimmed) { setRenamingId(null); return; }
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     if (!conv) { setRenamingId(null); return; }
     await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
     setRenamingId(null);
@@ -340,22 +340,22 @@ export const ConversationList: FC<ConversationListProps> = ({
       await app.conversations.delete(id);
     }
 
-    if (activeConversationId && idsToDelete.includes(activeConversationId)) {
-      await onNewConversation();
+    if (activeChatId && idsToDelete.includes(activeChatId)) {
+      await onNewChat();
     }
 
     await loadConversations();
   };
 
   const handleClearUnread = async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     // Don't clear hasUnread when the conversation is awaiting approval —
     // the user hasn't actually addressed the pending prompt yet, so the
     // indicator should reappear when they navigate away.
     if (conv?.hasUnread && conv.runStatus !== 'awaiting-approval') {
       await app.conversations.put({ ...conv, hasUnread: false });
     }
-    onSwitchConversation(id);
+    onSwitchChat(id);
   };
 
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
@@ -368,7 +368,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     setBulkDeleteOpen(false);
   };
 
-  const isNewChat = hasLoaded && !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
+  const isNewChat = hasLoaded && !!activeChatId && !processedConversations.some((c) => c.id === activeChatId);
 
   return (
     <div className="flex flex-col h-full">
@@ -376,7 +376,7 @@ export const ConversationList: FC<ConversationListProps> = ({
         <button
           type="button"
           onClick={() => {
-            void onNewConversation();
+            void onNewChat();
           }}
           className={cn(
             'flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80',
@@ -482,7 +482,7 @@ export const ConversationList: FC<ConversationListProps> = ({
         {(() => {
           const pinned = processedConversations.filter((c) => pinnedIds.has(c.id));
           const unpinned = processedConversations.filter((c) => !pinnedIds.has(c.id));
-          const sections: Array<{ label?: string; items: ConversationSummary[] }> = [];
+          const sections: Array<{ label?: string; items: ChatSummary[] }> = [];
           if (pinned.length > 0) sections.push({ label: 'Pinned', items: pinned });
           sections.push({ items: unpinned });
 
@@ -495,7 +495,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                 </div>
               )}
               {section.items.map((conv) => {
-                const isActive = conv.id === activeConversationId || conv.id === fadingActiveId;
+                const isActive = conv.id === activeChatId || conv.id === fadingActiveId;
                 const isAwaitingApproval = conv.runStatus === 'awaiting-approval';
                 const isRunning = conv.runStatus === 'running' && !isAwaitingApproval;
                 const hasUnread = (conv.hasUnread && !isActive) || (isAwaitingApproval && !isActive);
@@ -540,7 +540,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                         />
                       ) : (
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
-                        {getDisplayTitle(conv, sessionsByConversation.get(conv.id))}
+                        {getDisplayTitle(conv, sessionsByChat.get(conv.id))}
                       </span>
                       )}
                       <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
@@ -552,7 +552,7 @@ export const ConversationList: FC<ConversationListProps> = ({
                       {isAwaitingApproval && !isActive && <div className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_10px_var(--color-amber-400)]" />}
                       {hasUnread && !isAwaitingApproval && <div className="h-2 w-2 rounded-full bg-primary app-unread-glow" />}
                       {computerStatus === 'running' && <ComputerActiveIndicator />}
-                      {computerStatus === 'completed' && !(isActive && activeThreadMode === 'computer') && <ComputerCompletedIndicator />}
+                      {computerStatus === 'completed' && !(isActive && activeChatMode === 'computer') && <ComputerCompletedIndicator />}
                       {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}
                       {conv.archived && <ArchiveIcon className="h-3 w-3 text-muted-foreground" />}
                       <button
@@ -676,7 +676,7 @@ export const ConversationList: FC<ConversationListProps> = ({
       <ExportDialog
         open={exportConvId !== null}
         onClose={() => setExportConvId(null)}
-        conversationId={exportConvId}
+        chatId={exportConvId}
       />
     </div>
   );

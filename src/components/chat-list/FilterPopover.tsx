@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckIcon, XIcon } from 'lucide-react';
-import type { FilterPreference } from './useConversationPreferences';
+import type { FilterPreference } from './useChatPreferences';
 
 type FilterPopoverProps = {
   filter: FilterPreference;

@@ -92,7 +92,7 @@ type StoredMessage = ThreadMessageLike & {
   messageMeta?: Record<string, unknown>;
 };
 
-export type ConversationRecord = {
+export type ChatRecord = {
   id: string;
   title: string | null;
   fallbackTitle: string | null;
@@ -849,10 +849,10 @@ async function persistConversation(
   conversationId: string,
   tree: StoredMessage[],
   headId: string | null,
-  updates: Partial<ConversationRecord> = {},
+  updates: Partial<ChatRecord> = {},
 ): Promise<void> {
   try {
-    const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const conv = await app.conversations.get(conversationId) as ChatRecord | null;
     if (!conv) return;
     const branch = getActiveBranch(tree, headId);
     const now = nowIso();
@@ -896,8 +896,8 @@ async function getTitleSettings(): Promise<TitleSettings> {
 
 /** Update only specific fields on a conversation without overwriting message data.
  *  Reads the latest record from disk immediately before writing to minimize race windows. */
-async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
-  const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+async function patchConversation(conversationId: string, patch: Partial<ChatRecord>): Promise<void> {
+  const latest = await app.conversations.get(conversationId) as ChatRecord | null;
   if (!latest) return;
   await app.conversations.put({ ...latest, ...patch });
 }
@@ -907,7 +907,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     const settings = await getTitleSettings();
     if (!settings.enabled) return;
 
-    const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const conv = await app.conversations.get(conversationId) as ChatRecord | null;
     if (!conv) return;
 
     const userMessageCount = messages.filter((m) => m.role === 'user').length;
@@ -947,7 +947,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
         });
       } else {
         // Title gen returned nothing — keep the UI moving with a simple fallback.
-        const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+        const latest = await app.conversations.get(conversationId) as ChatRecord | null;
         if (latest && latest.titleStatus === 'generating') {
           const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
           await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
@@ -962,7 +962,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       titleGenInFlight.delete(conversationId);
     }
   } catch {
-    const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const latest = await app.conversations.get(conversationId) as ChatRecord | null;
     if (latest && latest.titleStatus === 'generating') {
       const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
       await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
@@ -975,7 +975,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
 
 // --- Helpers to convert flat messages to tree ---
 
-function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: string | null } {
+function ensureTree(conv: ChatRecord): { tree: StoredMessage[]; headId: string | null } {
   if (conv.messageTree && conv.messageTree.length > 0) {
     // Rehydrate createdAt from ISO string to Date
     const tree = conv.messageTree.map((m) => ({
@@ -1032,7 +1032,7 @@ export function RuntimeProvider({
   selectedProfileKey,
   fallbackEnabled,
   onModelFallback,
-  onConversationSettingsLoaded,
+  onChatSettingsLoaded,
 }: {
   children: ReactNode;
   conversationId?: string | null;
@@ -1042,7 +1042,7 @@ export function RuntimeProvider({
   selectedProfileKey?: string | null;
   fallbackEnabled?: boolean;
   onModelFallback?: (toModelKey: string) => void;
-  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null }) => void;
+  onChatSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null }) => void;
 }) {
   const [tree, setTree] = useState<StoredMessage[]>([]);
   const [headId, setHeadId] = useState<string | null>(null);
@@ -1058,8 +1058,8 @@ export function RuntimeProvider({
   const persistTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const onModelFallbackRef = useRef(onModelFallback);
   onModelFallbackRef.current = onModelFallback;
-  const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
-  onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
+  const onChatSettingsLoadedRef = useRef(onChatSettingsLoaded);
+  onChatSettingsLoadedRef.current = onChatSettingsLoaded;
   const { consumeAttachments } = useAttachments();
 
   // --- Audio adapters (TTS & Dictation) ---
@@ -1136,7 +1136,7 @@ export function RuntimeProvider({
   // Sub-agent state — backed by module-level globals so it survives remounts
   const [subAgentVersion, setSubAgentVersion] = useState(globalSubAgentVersion);
   const [activeSubAgentView, setActiveSubAgentView] = useState<string | null>(null);
-  // Snapshot of global threads for rendering (updated when version changes)
+  // Snapshot of global sub-agent chats for rendering (updated when version changes)
   const subAgentThreads = useMemo(() => new Map(globalSubAgentThreads), [subAgentVersion]);
 
   const bumpSubAgentVersion = useCallback(() => {
@@ -1170,7 +1170,7 @@ export function RuntimeProvider({
   }, [tree, headId, isRunning]);
 
   const loadConversationState = useCallback(async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     if (!conv) return false;
 
     const { tree: t, headId: h } = ensureTree(conv);
@@ -1215,8 +1215,8 @@ export function RuntimeProvider({
       void persistConversation(id, t, h, { runStatus: 'idle' });
     }
 
-    // Restore per-conversation settings (model, profile, fallback)
-    onConversationSettingsLoadedRef.current?.({
+    // Restore per-chat settings (model, profile, fallback)
+    onChatSettingsLoadedRef.current?.({
       selectedModelKey: conv.selectedModelKey ?? null,
       selectedProfileKey: conv.selectedProfileKey ?? null,
       fallbackEnabled: conv.fallbackEnabled ?? false,
@@ -1247,7 +1247,7 @@ export function RuntimeProvider({
           runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
           selectedModelKey: null,
           currentWorkingDirectory: defaultCwd,
-        } as ConversationRecord);
+        } as ChatRecord);
         await app.conversations.setActiveId(newId);
         setActiveConversationId(newId);
         setTree([]);
@@ -1266,7 +1266,7 @@ export function RuntimeProvider({
     void loadConversationState(conversationId);
   }, [conversationId, activeConversationId, loadConversationState]);
 
-  const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
+  const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ChatRecord> = {}) => {
     const timers = persistTimersRef.current;
     const existing = timers.get(conversationId);
     if (existing) clearTimeout(existing);
@@ -1348,7 +1348,7 @@ export function RuntimeProvider({
 
         // Accumulate sub-agent messages
         if (!globalSubAgentAccumulators.has(saId)) {
-          // Initialize from existing thread messages (survives remount)
+          // Initialize from existing chat messages (survives remount)
           const existingThread = globalSubAgentThreads.get(saId);
           globalSubAgentAccumulators.set(saId, {
             messages: existingThread?.messages ? [...existingThread.messages] : [],
@@ -1398,7 +1398,7 @@ export function RuntimeProvider({
           globalSubAgentAccumulators.delete(saId);
         }
 
-        // Update global thread state
+        // Update global sub-agent chat state
         const existing = globalSubAgentThreads.get(saId);
         const msgs = finalMessages.length > 0 ? finalMessages : (existing?.messages ?? []);
         const head = finalMessages.length > 0 ? finalHeadId : (existing?.headId ?? null);
@@ -1798,7 +1798,7 @@ export function RuntimeProvider({
       const persistStatus = e.type === 'tool-approval-required' ? 'awaiting-approval'
         : acc.awaitingApproval ? 'awaiting-approval'
         : 'running';
-      const persistExtra: Partial<ConversationRecord> = { runStatus: persistStatus };
+      const persistExtra: Partial<ChatRecord> = { runStatus: persistStatus };
       if (e.type === 'tool-approval-required') {
         persistExtra.hasUnread = true;
         // Mark as not running so the typing indicator / sidebar bubble stops
@@ -1806,7 +1806,7 @@ export function RuntimeProvider({
           setIsRunning(false);
         }
         // Persist immediately — no debounce — so the sidebar picks up the
-        // awaiting-approval state even if the user switches threads quickly.
+        // awaiting-approval state even if the user switches chats quickly.
         const _pt = persistTimersRef.current.get(convId);
         if (_pt) { clearTimeout(_pt); persistTimersRef.current.delete(convId); }
         persistConversation(convId, acc.messages, acc.headId, persistExtra);

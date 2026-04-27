@@ -3,7 +3,7 @@ import { ChevronUpIcon, ChevronDownIcon, SearchIcon } from 'lucide-react';
 import { formatTokenCount, formatDateShort } from './chart-utils';
 import { app } from '@/lib/ipc-client';
 
-type ConversationRow = {
+type ChatRow = {
   id: string;
   title: string | null;
   modelKey: string | null;
@@ -19,8 +19,8 @@ type SortKey = 'title' | 'modelKey' | 'totalTokens' | 'inputTokens' | 'outputTok
 
 const PAGE_SIZE = 25;
 
-export const UsageConversationTable: FC<{
-  conversations: ConversationRow[];
+export const UsageChatTable: FC<{
+  conversations: ChatRow[];
   total: number;
   offset: number;
   onPageChange: (offset: number) => void;
@@ -93,7 +93,7 @@ export const UsageConversationTable: FC<{
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="text-xs font-medium text-muted-foreground">By Conversation</h4>
+        <h4 className="text-xs font-medium text-muted-foreground">By Chat</h4>
         {/* Search */}
         <div className="flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/80 px-2.5 py-1.5">
           <SearchIcon className="h-3 w-3 text-muted-foreground" />

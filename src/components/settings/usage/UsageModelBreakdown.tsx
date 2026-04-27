@@ -140,7 +140,7 @@ const DonutChart: FC<{ data: ModelData[] }> = ({ data }) => {
           <div className="text-[10px] text-muted-foreground space-y-0.5">
             <p>{formatTokenCount(hovered.inputTokens)} in · {formatTokenCount(hovered.outputTokens)} out</p>
             <p>{hovered.requestCount} messages</p>
-            <p>{hovered.conversationCount} conversations</p>
+            <p>{hovered.conversationCount} chats</p>
           </div>
         </div>
       )}
@@ -175,7 +175,7 @@ const ModelBarRow: FC<{ model: ModelData; maxTokens: number; index: number }> = 
         <span>{formatTokenCount(model.outputTokens)} out</span>
         {model.cacheReadTokens > 0 && <span>{formatTokenCount(model.cacheReadTokens)} cached</span>}
         <span>{model.requestCount} msg</span>
-        <span>{model.conversationCount} conv</span>
+        <span>{model.conversationCount} chats</span>
       </div>
     </div>
   );

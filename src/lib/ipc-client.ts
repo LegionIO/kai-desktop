@@ -180,7 +180,7 @@ type AppAPI = {
     overlayMouseLeave: () => void;
     onEvent: (callback: (event: ComputerUseEvent) => void) => () => void;
     onOverlayState: (callback: (state: unknown) => void) => () => void;
-    onFocusThread: (callback: () => void) => () => void;
+    onFocusChat: (callback: () => void) => () => void;
   };
   mic: {
     listDevices: () => Promise<Array<{ deviceId: string; label: string }>>;

@@ -3,7 +3,7 @@
  *
  * Handles mic capture, audio playback, call lifecycle, and auto-end-call on silence.
  * Events are broadcast on both realtime:event (for this provider) and
- * agent:stream-event (for RuntimeProvider/thread integration).
+ * agent:stream-event (for RuntimeProvider/chat integration).
  */
 
 import {

@@ -51,7 +51,7 @@ export const ProfileSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
       <h3 className="text-sm font-semibold">Profiles</h3>
       <p className="text-xs text-muted-foreground">
         Profiles bundle a primary model, fallback chain, system prompt, and LLM parameters into named presets.
-        Select a profile per-conversation in the composer area.
+        Select a profile per-chat in the composer area.
       </p>
 
       {/* Default profile selector */}

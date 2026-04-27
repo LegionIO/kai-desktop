@@ -23,14 +23,14 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
   const viewportRef = useRef<HTMLDivElement>(null);
   const { threads, sendMessage, stop } = useSubAgents();
 
-  const thread = threads.get(subAgentConversationId);
-  const isRunning = thread?.status === 'running' || thread?.status === 'awaiting-input';
+  const subThread = threads.get(subAgentConversationId);
+  const isRunning = subThread?.status === 'running' || subThread?.status === 'awaiting-input';
 
   useEffect(() => {
     if (viewportRef.current) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-  }, [thread?.messages.length]);
+  }, [subThread?.messages.length]);
 
   const handleSend = useCallback(async () => {
     if (!messageInput.trim()) return;
@@ -42,7 +42,7 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
     await stop(subAgentConversationId);
   }, [subAgentConversationId, stop]);
 
-  if (!thread) {
+  if (!subThread) {
     return (
       <div className="flex h-full flex-col">
         <Header task="Sub-agent thread not found" status="error" onBack={onBack} />
@@ -56,16 +56,16 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
   return (
     <div className="flex h-full flex-col">
       <Header
-        task={thread.task}
-        status={thread.status}
-        depth={thread.depth}
+        task={subThread.task}
+        status={subThread.status}
+        depth={subThread.depth}
         onBack={onBack}
         onStop={isRunning ? handleStop : undefined}
       />
 
       {/* Messages */}
       <div ref={viewportRef} className="flex-1 overflow-y-auto px-4 pt-4">
-        {thread.messages.map((msg, i) => {
+        {subThread.messages.map((msg, i) => {
           const content = Array.isArray(msg.content) ? msg.content : [];
           const role = msg.role as string;
           return (
@@ -134,7 +134,7 @@ const Header: FC<{
 
   return (
     <div className="border-b px-4 py-3 flex items-center gap-3">
-      <button type="button" onClick={onBack} className="p-1.5 rounded-md hover:bg-muted transition-colors shrink-0" title="Back to parent thread">
+      <button type="button" onClick={onBack} className="p-1.5 rounded-md hover:bg-muted transition-colors shrink-0" title="Back to parent chat">
         <ArrowLeftIcon className="h-4 w-4" />
       </button>
       <BotIcon className="h-4 w-4 text-blue-400 shrink-0" />
@@ -156,7 +156,7 @@ const Header: FC<{
   );
 };
 
-// --- Chat bubble (full-size version for the thread view) ---
+// --- Chat bubble (full-size version for the chat view) ---
 
 type ContentPart = {
   type: string;

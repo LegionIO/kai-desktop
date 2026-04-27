@@ -39,7 +39,7 @@ function load<T>(key: string, fallback: T): T {
   }
 }
 
-export function useConversationPreferences() {
+export function useChatPreferences() {
   const [sort, setSort] = useState<SortPreference>(() => load(SORT_KEY, DEFAULT_SORT));
   const [filter, setFilter] = useState<FilterPreference>(() => load(FILTER_KEY, DEFAULT_FILTER));
 

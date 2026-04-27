@@ -19,18 +19,18 @@ export type ComputerUseFallbackBanner = {
   error: string;
 };
 
-type ConversationMessageLike = {
+type ChatMessageLike = {
   id?: string;
   parentId?: string | null;
   role?: string;
   content?: unknown;
 };
 
-type ConversationRecordLike = {
+type ChatRecordLike = {
   title?: string | null;
   fallbackTitle?: string | null;
   messages?: unknown[];
-  messageTree?: ConversationMessageLike[];
+  messageTree?: ChatMessageLike[];
   headId?: string | null;
 };
 
@@ -40,7 +40,7 @@ type OpenPrivacySettingsResult = {
 
 type ComputerUseContextValue = {
   sessions: ComputerSession[];
-  sessionsByConversation: Map<string, ComputerSession[]>;
+  sessionsByChat: Map<string, ComputerSession[]>;
   /** Map of sessionId -> ordered list of captured frames (for step log traceability). */
   frameHistory: Map<string, ComputerFrame[]>;
   startSession: (goal: string, options: {
@@ -73,7 +73,7 @@ type ComputerUseContextValue = {
 
 const ComputerUseContext = createContext<ComputerUseContextValue>({
   sessions: [],
-  sessionsByConversation: new Map(),
+  sessionsByChat: new Map(),
   frameHistory: new Map(),
   startSession: async () => { throw new Error('ComputerUseProvider not ready'); },
   pauseSession: async () => {},
@@ -142,14 +142,14 @@ function extractMessageText(message: unknown): string {
   }).join(' '));
 }
 
-function resolveConversationMessages(conversation: ConversationRecordLike | null): unknown[] {
-  if (Array.isArray(conversation?.messageTree) && conversation.messageTree.length > 0) {
-    const byId = new Map(conversation.messageTree
+function resolveChatMessages(chat: ChatRecordLike | null): unknown[] {
+  if (Array.isArray(chat?.messageTree) && chat.messageTree.length > 0) {
+    const byId = new Map(chat.messageTree
       .filter((message) => typeof message.id === 'string')
       .map((message) => [message.id as string, message]));
-    const ordered: ConversationMessageLike[] = [];
+    const ordered: ChatMessageLike[] = [];
     const seen = new Set<string>();
-    let cursor = conversation.headId ?? conversation.messageTree[conversation.messageTree.length - 1]?.id ?? null;
+    let cursor = chat.headId ?? chat.messageTree[chat.messageTree.length - 1]?.id ?? null;
 
     while (cursor && !seen.has(cursor)) {
       seen.add(cursor);
@@ -164,11 +164,11 @@ function resolveConversationMessages(conversation: ConversationRecordLike | null
     }
   }
 
-  return Array.isArray(conversation?.messages) ? conversation.messages : [];
+  return Array.isArray(chat?.messages) ? chat.messages : [];
 }
 
-function buildConversationContextSummary(conversation: ConversationRecordLike | null): string | undefined {
-  const messages = resolveConversationMessages(conversation);
+function buildChatContextSummary(chat: ChatRecordLike | null): string | undefined {
+  const messages = resolveChatMessages(chat);
   const excerpts = messages
     .map((message) => {
       const role = typeof (message as { role?: unknown })?.role === 'string'
@@ -183,9 +183,9 @@ function buildConversationContextSummary(conversation: ConversationRecordLike | 
 
   if (excerpts.length === 0) return undefined;
 
-  const title = normalizeSnippet(conversation?.title ?? conversation?.fallbackTitle ?? '', 120);
+  const title = normalizeSnippet(chat?.title ?? chat?.fallbackTitle ?? '', 120);
   const summary = title
-    ? ['Conversation title: ' + title, ...excerpts].join('\n')
+    ? ['Chat title: ' + title, ...excerpts].join('\n')
     : excerpts.join('\n');
 
   return summary.length <= 1800
@@ -288,7 +288,7 @@ export function ComputerUseProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<ComputerUseContextValue>(() => ({
     sessions,
-    sessionsByConversation: new Map(
+    sessionsByChat: new Map(
       sessions.reduce<Array<[string, ComputerSession[]]>>((acc, session) => {
         const existing = acc.find(([conversationId]) => conversationId === session.conversationId);
         if (existing) {
@@ -304,8 +304,8 @@ export function ComputerUseProvider({ children }: { children: ReactNode }) {
       let contextSummary: string | undefined;
 
       try {
-        const conversation = await app.conversations.get(options.conversationId) as ConversationRecordLike | null;
-        contextSummary = buildConversationContextSummary(conversation);
+        const chatRecord = await app.conversations.get(options.conversationId) as ChatRecordLike | null;
+        contextSummary = buildChatContextSummary(chatRecord);
       } catch {
         contextSummary = undefined;
       }

@@ -274,10 +274,10 @@ const appAPI = {
       ipcRenderer.on('computer-use:overlay-state', handler);
       return () => ipcRenderer.removeListener('computer-use:overlay-state', handler);
     },
-    onFocusThread: (callback: () => void) => {
+    onFocusChat: (callback: () => void) => {
       const handler = () => callback();
-      ipcRenderer.on('computer-use:focus-thread', handler);
-      return () => ipcRenderer.removeListener('computer-use:focus-thread', handler);
+      ipcRenderer.on('computer-use:focus-chat', handler);
+      return () => ipcRenderer.removeListener('computer-use:focus-chat', handler);
     },
   },
 

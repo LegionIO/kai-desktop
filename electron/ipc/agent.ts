@@ -12,6 +12,7 @@ import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
+import type { PluginManager } from '../plugins/plugin-manager.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
 import {
   ToolObserverManager,
@@ -238,7 +239,7 @@ function resolveTitleModel(
   threadModelKey: string | null,
 ): ModelCatalogEntry | null {
   const catalog = resolveModelCatalog(config);
-  const threadEntry = resolveModelForThread(config, threadModelKey);
+  const chatEntry = resolveModelForThread(config, threadModelKey);
 
   const matchingHaiku = catalog.entries.find((entry) => {
     const modelName = entry.modelConfig.modelName.toLowerCase();
@@ -246,7 +247,7 @@ function resolveTitleModel(
   });
 
   if (matchingHaiku) return matchingHaiku;
-  return threadEntry;
+  return chatEntry;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -374,7 +375,7 @@ function streamMastra(options: {
   })();
 }
 
-export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: import('../plugins/plugin-manager.js').PluginManager): void {
+export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
 
   ipcMain.handle(
     'agent:stream',
@@ -757,10 +758,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           return { ok: false, details: 'Observer launches are disabled for this run phase.' };
         }
         if (activeObserverSessions.get(conversationId) !== observerSessionId) {
-          return { ok: false, details: 'Observer session is not active for this thread.' };
+          return { ok: false, details: 'Observer session is not active for this chat.' };
         }
         if (controller.signal.aborted) {
-          return { ok: false, details: 'Thread run is already cancelled.' };
+          return { ok: false, details: 'Chat run is already cancelled.' };
         }
 
         const tool = findToolByName(registeredTools, toolName);

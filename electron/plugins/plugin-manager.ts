@@ -34,7 +34,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { readChatStore, writeChatStore, broadcastChatChange } from '../ipc/conversations.js';
 import { buildPluginRendererBundle, resolvePluginRendererRequest } from './renderer-build.js';
 import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
@@ -960,31 +960,31 @@ export class PluginManager {
   /* ── Conversation Helpers ── */
 
   listConversations(): Array<Record<string, unknown>> {
-    const store = readConversationStore(this.appHome);
+    const store = readChatStore(this.appHome);
     return Object.values(store.conversations);
   }
 
   getConversation(conversationId: string): Record<string, unknown> | null {
-    return readConversationStore(this.appHome).conversations[conversationId] ?? null;
+    return readChatStore(this.appHome).conversations[conversationId] ?? null;
   }
 
   upsertConversation(conversation: Record<string, unknown>): void {
-    const store = readConversationStore(this.appHome);
+    const store = readChatStore(this.appHome);
     const conversationId = typeof conversation.id === 'string' ? conversation.id : '';
     if (!conversationId) {
       throw new Error('Conversation id is required');
     }
 
     store.conversations[conversationId] = conversation as typeof store.conversations[string];
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(this.appHome, store);
+    broadcastChatChange(store);
   }
 
   setActiveConversation(conversationId: string): void {
-    const store = readConversationStore(this.appHome);
+    const store = readChatStore(this.appHome);
     store.activeConversationId = conversationId;
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(this.appHome, store);
+    broadcastChatChange(store);
   }
 
   appendConversationMessage(
@@ -997,7 +997,7 @@ export class PluginManager {
       createdAt?: string;
     },
   ): Record<string, unknown> | null {
-    const store = readConversationStore(this.appHome);
+    const store = readChatStore(this.appHome);
     const conversation = store.conversations[conversationId];
     if (!conversation) return null;
 
@@ -1041,13 +1041,13 @@ export class PluginManager {
     };
 
     store.conversations[conversationId] = nextConversation;
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(this.appHome, store);
+    broadcastChatChange(store);
     return nextConversation;
   }
 
   markConversationUnread(conversationId: string, unread: boolean): void {
-    const store = readConversationStore(this.appHome);
+    const store = readChatStore(this.appHome);
     const conversation = store.conversations[conversationId];
     if (!conversation) return;
     store.conversations[conversationId] = {
@@ -1055,7 +1055,7 @@ export class PluginManager {
       hasUnread: unread,
       updatedAt: new Date().toISOString(),
     };
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(this.appHome, store);
+    broadcastChatChange(store);
   }
 }

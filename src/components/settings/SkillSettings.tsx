@@ -109,7 +109,7 @@ export const SkillSettings: FC<SettingsProps> = ({ config, updateConfig: _update
       <h3 className="text-sm font-semibold">Skills</h3>
       <p className="text-xs text-muted-foreground">
         Skills are reusable tools stored in <code className="bg-muted rounded px-1">~/.{__BRAND_APP_SLUG}/skills/</code>.
-        The AI can create new skills during conversations, or you can add them manually.
+        The AI can create new skills during chats, or you can add them manually.
       </p>
 
       {skills.length === 0 ? (

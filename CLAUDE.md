@@ -52,7 +52,7 @@ Three Electron process layers with strict isolation:
 ```
 electron/main.ts          <- Main process: window, menus, IPC registration, tool init
 electron/preload.ts       <- Preload: exposes `window.app` API via contextBridge
-src/App.tsx               <- Renderer: React shell, sidebar, conversations, settings
+src/App.tsx               <- Renderer: React shell, sidebar, chats, settings
 ```
 
 ### Main Process (`electron/`)
@@ -69,9 +69,9 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 | Directory | Purpose |
 |-----------|---------|
-| `src/components/thread/` | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
+| `src/components/chat/` | Chat view, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
 | `src/components/settings/` | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage) |
-| `src/components/conversations/` | Sidebar conversation list and sub-agent section |
+| `src/components/chat-list/` | Sidebar chat list and sub-agent section |
 | `src/components/plugins/` | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections |
 | `src/providers/` | React context providers (Config, Runtime, Attachments) |
 | `src/lib/` | IPC client wrapper, utilities |
@@ -82,7 +82,7 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 - `electron/tools/registry.ts` - Builds active tool set from config, skills, MCP servers
 - `electron/preload.ts` - The `window.app` IPC bridge (renderer's only way to talk to main)
 - `electron/agent/mastra-agent.ts` - Mastra agent setup and streaming
-- `src/providers/RuntimeProvider.tsx` - Manages conversation streaming state in renderer
+- `src/providers/RuntimeProvider.tsx` - Manages chat streaming state in renderer
 - `src/providers/ConfigProvider.tsx` - Reads/writes config via IPC
 - `electron-builder.yml` - macOS packaging config
 - `electron.vite.config.ts` - Vite config for main, preload, and renderer builds
@@ -94,12 +94,29 @@ All app state lives under `~/.kai/`:
 | Path | Contents |
 |------|----------|
 | `~/.kai/config.json` | Primary config (models, tools, MCP, memory, compaction, etc.) |
-| `~/.kai/data/` | Conversation persistence |
+| `~/.kai/data/` | Chat persistence |
 | `~/.kai/skills/` | Installed skill directories |
 | `~/.kai/certs/` | TLS certificates for integrations |
 | `~/.kai/settings/llm.json` | Imported provider/model settings |
 
 Config changes trigger hot-reload for MCP servers and skills (fingerprint diffing in `main.ts`).
+
+## Naming Convention
+
+The codebase uses a **layered terminology** that respects different domains:
+
+| Layer | Term | Examples |
+|-------|------|----------|
+| **User-facing UI** | **Chat** | "Untitled Chat", sidebar tab "Chats", `ChatThread`, `ChatList`, `ChatMode` |
+| **Renderer state** | **Chat** | `activeChatId`, `activeChatTitle`, `chatMode`, `handleSwitchChat`, `getChatDisplayTitle` |
+| **IPC / Storage** | **conversation** | `conversations:list`, `conversations.json`, `activeConversationId` (store field) |
+| **assistant-ui / Mastra** | **thread** | `ThreadPrimitive`, `useThreadRuntime`, `ThreadMessageLike`, `thread: { id }` |
+| **Sub-agents** | **thread** | `SubAgentThread`, `SubAgentThreadState`, `globalSubAgentThreads` |
+| **Plugins** | **thread** | `PluginThreadDecorationDescriptor`, `threadDecorations`, `showThreadDecoration` |
+| **Config schema** | **thread** | `scope: 'thread' \| 'resource'` (Mastra runtime requirement) |
+| **Internal electron/ functions** | **thread** | `resolveModelForThread`, `summarizeThreadContext`, `baseThreadContext` |
+
+**Key rule:** Use **"Chat"** in UI components and renderer state. Use **"thread"** when interfacing with assistant-ui, Mastra, sub-agents, or plugins. Use **"conversation"** only for IPC channels and on-disk storage fields.
 
 ## Code Style
 
@@ -121,7 +138,7 @@ Renderer code **never** accesses Node APIs directly. All communication goes thro
 
 - `window.app.agent.*` - streaming, title generation, sub-agents
 - `window.app.config.*` - get/set config, change listeners
-- `window.app.conversations.*` - CRUD, active conversation tracking
+- `window.app.conversations.*` - CRUD, active chat tracking
 - `window.app.mcp.*` - test MCP connections
 - `window.app.memory.*` - clear memory stores
 - `window.app.skills.*` - list/get/delete/toggle skills
@@ -190,4 +207,4 @@ function debugLog(msg: string) {
 
 ---
 
-**Last Updated**: 2026-04-22
+**Last Updated**: 2026-04-27

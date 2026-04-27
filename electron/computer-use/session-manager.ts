@@ -42,16 +42,15 @@ const SESSION_ALERT_SOUND_BY_KIND: Record<SessionAlertKind, string> = {
   takeover: 'Ping',
 };
 
-function readActiveConversationId(appHome: string): string | null {
+function readActiveChatId(appHome: string): string | null {
   const storePath = join(appHome, 'data', 'conversations.json');
   if (!existsSync(storePath)) return null;
   try {
     const store = JSON.parse(readFileSync(storePath, 'utf-8')) as {
       activeConversationId?: string | null;
     };
-    return typeof store.activeConversationId === 'string' && store.activeConversationId.trim()
-      ? store.activeConversationId
-      : null;
+    const id = store.activeConversationId;
+    return typeof id === 'string' && id.trim() ? id : null;
   } catch {
     return null;
   }
@@ -553,7 +552,7 @@ export class ComputerUseSessionManager extends EventEmitter {
     const config = this.getConfig();
     const sessionId = makeComputerUseId('cs');
     const conversationId = options.conversationId.trim().toLowerCase() === 'current'
-      ? readActiveConversationId(this.appHome) ?? options.conversationId
+      ? readActiveChatId(this.appHome) ?? options.conversationId
       : options.conversationId;
     const target = options.target ?? config.computerUse.defaultTarget;
     const surface = options.surface ?? config.computerUse.defaultSurface;
@@ -850,8 +849,8 @@ export class ComputerUseSessionManager extends EventEmitter {
     this.refreshTakeoverMonitor();
   }
 
-  /** Remove all sessions associated with a conversation (used when deleting a conversation). */
-  removeSessionsByConversation(conversationId: string): void {
+  /** Remove all sessions associated with a chat (used when deleting a chat). */
+  removeSessionsByChat(conversationId: string): void {
     const toRemove: string[] = [];
     for (const session of this.sessions.values()) {
       if (session.conversationId === conversationId) {

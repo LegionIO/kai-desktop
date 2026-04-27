@@ -4,16 +4,16 @@ import { ConfigProvider, useConfig } from '@/providers/ConfigProvider';
 import { AttachmentProvider } from '@/providers/AttachmentContext';
 import { RuntimeProvider, useSubAgents } from '@/providers/RuntimeProvider';
 import { RealtimeProvider } from '@/providers/RealtimeProvider';
-import { Thread, type ThreadMode } from '@/components/thread/Thread';
-import { ComputerSessionPanel } from '@/components/thread/ComputerSessionPanel';
-import { ComputerSetupPanel } from '@/components/thread/ComputerSetupPanel';
-import { SubAgentThread } from '@/components/thread/SubAgentThread';
-import { DropZone } from '@/components/thread/DropZone';
-import { ConversationList } from '@/components/conversations/ConversationList';
-import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSidebarSection';
+import { ChatThread, type ChatMode } from '@/components/chat/ChatThread';
+import { ComputerSessionPanel } from '@/components/chat/ComputerSessionPanel';
+import { ComputerSetupPanel } from '@/components/chat/ComputerSetupPanel';
+import { SubAgentThread } from '@/components/chat/SubAgentThread';
+import { DropZone } from '@/components/chat/DropZone';
+import { ChatList } from '@/components/chat-list/ChatList';
+import { SubAgentSidebarSection } from '@/components/chat-list/SubAgentSidebarSection';
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
-import { ExportDialog } from '@/components/conversations/ExportDialog';
+import { ExportDialog } from '@/components/chat-list/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
@@ -30,16 +30,16 @@ import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView'
 import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
-import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
-import type { ExecutionMode } from '@/components/thread/ModelSettingsButton';
+import type { ReasoningEffort } from '@/components/chat/ReasoningEffortSelector';
+import type { ExecutionMode } from '@/components/chat/ModelSettingsButton';
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
-import type { ConversationRecord } from '@/providers/RuntimeProvider';
+import type { ChatRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
-import { PlanPanel, PlanPanelDivider } from '@/components/thread/PlanPanel';
+import { PlanPanel, PlanPanelDivider } from '@/components/chat/PlanPanel';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -118,7 +118,7 @@ const OperatorSessionShell: FC<{ sessionId: string }> = ({ sessionId }) => {
   );
 };
 
-function useOperatorConversationId(preferredConversationId?: string | null): string | null {
+function useOperatorChatId(preferredConversationId?: string | null): string | null {
   const [conversationId, setConversationId] = useState<string | null>(preferredConversationId ?? null);
 
   useEffect(() => {
@@ -152,9 +152,9 @@ function useOperatorConversationId(preferredConversationId?: string | null): str
 }
 
 const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ preferredConversationId }) => {
-  const conversationId = useOperatorConversationId(preferredConversationId);
-  const { sessionsByConversation } = useComputerUse();
-  const activeComputerSession = getComputerSessionForConversation(conversationId, sessionsByConversation);
+  const conversationId = useOperatorChatId(preferredConversationId);
+  const { sessionsByChat } = useComputerUse();
+  const activeComputerSession = getComputerSessionForChat(conversationId, sessionsByChat);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
@@ -202,7 +202,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   useEffect(() => {
     if (!conversationId) return;
     app.conversations.get(conversationId).then((conv: unknown) => {
-      const record = conv as ConversationRecord | null;
+      const record = conv as ChatRecord | null;
       if (!record) return;
       // Skip if values haven't actually changed to avoid unnecessary writes
       // that could race with concurrent stream persistence.
@@ -285,8 +285,8 @@ function clampSidebarWidth(width: number) {
   return Math.min(Math.max(width, SIDEBAR_MIN_WIDTH), SIDEBAR_MAX_WIDTH);
 }
 
-function getConversationDisplayTitle(
-  conversation: Pick<ConversationRecord, 'title' | 'fallbackTitle'> | null,
+function getChatDisplayTitle(
+  conversation: Pick<ChatRecord, 'title' | 'fallbackTitle'> | null,
   computerSessions?: ComputerSession[],
 ) {
   // Prefer chat-based titles
@@ -305,16 +305,16 @@ function getConversationDisplayTitle(
   return 'Untitled Chat';
 }
 
-function getComputerSessionForConversation(
+function getComputerSessionForChat(
   conversationId: string | null | undefined,
-  sessionsByConversation: Map<string, ComputerSession[]>,
+  sessionsByChat: Map<string, ComputerSession[]>,
 ): ComputerSession | undefined {
   if (!conversationId) return undefined;
-  return sessionsByConversation.get(conversationId)?.[0];
+  return sessionsByChat.get(conversationId)?.[0];
 }
 
-type ConversationsStore = {
-  conversations?: Record<string, ConversationRecord>;
+type ChatsStore = {
+  conversations?: Record<string, ChatRecord>;
   activeConversationId?: string | null;
 };
 
@@ -364,16 +364,16 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 }
 
 function AppShell() {
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
-  const [activeConversationTitle, setActiveConversationTitle] = useState('Untitled Thread');
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [activeChatTitle, setActiveChatTitle] = useState('Untitled Chat');
   const [activeView, setActiveView] = useState<AppView>('chat');
-  const [threadMode, setThreadMode] = useState<ThreadMode>('chat');
+  const [chatMode, setChatMode] = useState<ChatMode>('chat');
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
-  const { sessionsByConversation: cuSessionsByConversation } = useComputerUse();
+  const { sessionsByChat: cuSessionsByChat } = useComputerUse();
   // Track the primary model key of the currently selected profile so we can
   // restore it when auto-routing is re-enabled.
   const [profilePrimaryModelKey, setProfilePrimaryModelKey] = useState<string | null>(null);
@@ -403,7 +403,7 @@ function AppShell() {
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('threads');
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('chats');
   const lastPluginViewRef = useRef<string>(MARKETPLACE_VIEW);
   const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
   const isMobile = useIsMobile();
@@ -449,7 +449,7 @@ function AppShell() {
   useEffect(() => {
     let cancelled = false;
 
-    const applyStore = (store: ConversationsStore | null) => {
+    const applyStore = (store: ChatsStore | null) => {
       if (cancelled) return;
       if (suppressStoreSync.current) return;
       const resolvedActiveId = store?.activeConversationId ?? null;
@@ -457,10 +457,10 @@ function AppShell() {
         ? store.conversations[resolvedActiveId] ?? null
         : null;
 
-      setActiveConversationId(resolvedActiveId);
-      setActiveConversationTitle(getConversationDisplayTitle(
+      setActiveChatId(resolvedActiveId);
+      setActiveChatTitle(getChatDisplayTitle(
         conversation,
-        resolvedActiveId ? cuSessionsByConversation.get(resolvedActiveId) : undefined,
+        resolvedActiveId ? cuSessionsByChat.get(resolvedActiveId) : undefined,
       ));
     };
 
@@ -473,21 +473,21 @@ function AppShell() {
         if (cancelled) return;
 
         const conversations = Object.fromEntries(
-          (list as ConversationRecord[]).map((conversation) => [conversation.id, conversation]),
+          (list as ChatRecord[]).map((conversation) => [conversation.id, conversation]),
         );
         applyStore({ activeConversationId: id, conversations });
 
       } catch {
         if (!cancelled) {
-          setActiveConversationId(null);
-          setActiveConversationTitle('Untitled Thread');
+          setActiveChatId(null);
+          setActiveChatTitle('Untitled Chat');
         }
       }
     };
 
     void loadActiveConversation();
     const unsubscribe = app.conversations.onChanged((store) => {
-      applyStore(store as ConversationsStore);
+      applyStore(store as ChatsStore);
     });
 
     return () => {
@@ -497,17 +497,17 @@ function AppShell() {
   }, []);
 
   // Update conversation title when computer-use sessions become available
-  // (sessions load async, so the title may initially be "Untitled Thread")
+  // (sessions load async, so the title may initially be "Untitled Chat")
   useEffect(() => {
-    if (!activeConversationId || activeConversationTitle !== 'Untitled Thread') return;
-    const sessions = cuSessionsByConversation.get(activeConversationId);
+    if (!activeChatId || activeChatTitle !== 'Untitled Chat') return;
+    const sessions = cuSessionsByChat.get(activeChatId);
     if (sessions?.length) {
       const goal = sessions[0].goal;
       if (goal) {
-        setActiveConversationTitle(goal.length > 60 ? goal.slice(0, 57).trimEnd() + '...' : goal);
+        setActiveChatTitle(goal.length > 60 ? goal.slice(0, 57).trimEnd() + '...' : goal);
       }
     }
-  }, [activeConversationId, activeConversationTitle, cuSessionsByConversation]);
+  }, [activeChatId, activeChatTitle, cuSessionsByChat]);
 
   const togglePin = useCallback((id: string) => {
     const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]';
@@ -573,13 +573,13 @@ function AppShell() {
     const trimmed = newTitle.trim();
     setRenamingTitle(false);
     if (!trimmed) return;
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     if (!conv) return;
-    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' } as ConversationRecord);
+    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' } as ChatRecord);
   }, []);
 
-  const handleDeleteConversation = useCallback(async (id: string) => {
-    const allConversations = await app.conversations.list() as ConversationRecord[];
+  const handleDeleteChat = useCallback(async (id: string) => {
+    const allConversations = await app.conversations.list() as ChatRecord[];
     const remaining = allConversations
       .filter((c) => c.id !== id)
       .sort((a, b) => {
@@ -594,21 +594,21 @@ function AppShell() {
     }
     await app.conversations.delete(id);
     if (remaining.length > 0) {
-      setActiveConversationId(remaining[0].id);
-      setActiveConversationTitle(getConversationDisplayTitle(
+      setActiveChatId(remaining[0].id);
+      setActiveChatTitle(getChatDisplayTitle(
         remaining[0],
-        cuSessionsByConversation.get(remaining[0].id),
+        cuSessionsByChat.get(remaining[0].id),
       ));
     } else {
-      setActiveConversationId(null);
-      setActiveConversationTitle('Untitled Thread');
+      setActiveChatId(null);
+      setActiveChatTitle('Untitled Chat');
     }
-  }, [cuSessionsByConversation]);
+  }, [cuSessionsByChat]);
 
-  const handleArchiveConversation = useCallback(async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+  const handleArchiveChat = useCallback(async (id: string) => {
+    const conv = await app.conversations.get(id) as ChatRecord | null;
     if (!conv) return;
-    await app.conversations.put({ ...conv, archived: !conv.archived } as ConversationRecord);
+    await app.conversations.put({ ...conv, archived: !conv.archived } as ChatRecord);
   }, []);
 
   useEffect(() => {
@@ -642,21 +642,21 @@ function AppShell() {
     };
   }, [dragState, sidebarWidth, updateConfig]);
 
-  const handleSwitchConversation = useCallback(async (id: string) => {
+  const handleSwitchChat = useCallback(async (id: string) => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
     await app.conversations.setActiveId(id);
     setActiveView(CHAT_VIEW);
-    setActiveConversationId(id);
+    setActiveChatId(id);
     // Load the title for the switched-to conversation
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
-    setActiveConversationTitle(getConversationDisplayTitle(
+    const conv = await app.conversations.get(id) as ChatRecord | null;
+    setActiveChatTitle(getChatDisplayTitle(
       conv,
-      cuSessionsByConversation.get(id),
+      cuSessionsByChat.get(id),
     ));
-  }, [cuSessionsByConversation, isMobile]);
+  }, [cuSessionsByChat, isMobile]);
 
-  const handleNewConversation = useCallback(async () => {
+  const handleNewChat = useCallback(async () => {
     if (isMobile) setSidebarOpen(false);
     setPlanPanel(null);
     suppressStoreSync.current = true;
@@ -676,15 +676,15 @@ function AppShell() {
       });
       await app.conversations.setActiveId(newId);
       setActiveView(CHAT_VIEW);
-      setActiveConversationId(newId);
-      setActiveConversationTitle('Untitled Thread');
+      setActiveChatId(newId);
+      setActiveChatTitle('Untitled Chat');
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
       setProfilePrimaryModelKey(null);
       setExecutionMode('auto');
     } catch (err) {
-      console.error('[AppShell] handleNewConversation failed:', err);
+      console.error('[AppShell] handleNewChat failed:', err);
     } finally {
       suppressStoreSync.current = false;
     }
@@ -780,8 +780,8 @@ function AppShell() {
     }
   }, [selectedProfileKey, profilePrimaryModelKey]);
 
-  // Restore per-conversation settings when switching conversations
-  const handleConversationSettingsLoaded = useCallback((settings: {
+  // Restore per-chat settings when switching chats
+  const handleChatSettingsLoaded = useCallback((settings: {
     selectedModelKey: string | null;
     selectedProfileKey: string | null;
     fallbackEnabled: boolean;
@@ -793,11 +793,11 @@ function AppShell() {
     setProfilePrimaryModelKey(settings.profilePrimaryModelKey);
   }, []);
 
-  // Persist per-conversation settings whenever they change
+  // Persist per-chat settings whenever they change
   useEffect(() => {
-    if (!activeConversationId) return;
-    app.conversations.get(activeConversationId).then((conv: unknown) => {
-      const record = conv as ConversationRecord | null;
+    if (!activeChatId) return;
+    app.conversations.get(activeChatId).then((conv: unknown) => {
+      const record = conv as ChatRecord | null;
       if (!record) return;
       // Skip if values haven't actually changed to avoid unnecessary writes
       // that could race with concurrent stream persistence.
@@ -814,15 +814,15 @@ function AppShell() {
         updatedAt: new Date().toISOString(),
       });
     }).catch(() => {});
-  }, [activeConversationId, selectedModelKey, selectedProfileKey, fallbackEnabled, profilePrimaryModelKey]);
+  }, [activeChatId, selectedModelKey, selectedProfileKey, fallbackEnabled, profilePrimaryModelKey]);
 
   // When the overlay banner is clicked (paused session), the main process
   // sends this event after switching the active conversation and focusing
   // the window. Switch to the computer-use tab so the user sees the session.
   useEffect(() => {
-    return app.computerUse.onFocusThread(() => {
+    return app.computerUse.onFocusChat(() => {
       setActiveView(CHAT_VIEW);
-      setThreadMode('computer');
+      setChatMode('computer');
     });
   }, []);
 
@@ -834,7 +834,7 @@ function AppShell() {
     console.info('[App] Processing navigation request:', request.pluginName, request.target);
 
     if (request.target.type === 'conversation') {
-      void handleSwitchConversation(request.target.conversationId);
+      void handleSwitchChat(request.target.conversationId);
       return;
     }
 
@@ -846,7 +846,7 @@ function AppShell() {
     if (request.target.type === 'action') {
       void sendPluginAction(request.pluginName, request.target.targetId, request.target.action, request.target.data);
     }
-  }, [consumeNavigationRequest, handleSwitchConversation, navigationRequests.length, sendPluginAction]);
+  }, [consumeNavigationRequest, handleSwitchChat, navigationRequests.length, sendPluginAction]);
 
   // Handle plugin navigation from in-app toast clicks (via DOM custom event to bypass React state batching)
   useEffect(() => {
@@ -855,12 +855,12 @@ function AppShell() {
       if (target?.type === 'panel' && target.panelId) {
         setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
       } else if (target?.type === 'conversation' && target.conversationId) {
-        void handleSwitchConversation(target.conversationId);
+        void handleSwitchChat(target.conversationId);
       }
     };
     window.addEventListener('plugin-navigate', handler);
     return () => window.removeEventListener('plugin-navigate', handler);
-  }, [handleSwitchConversation]);
+  }, [handleSwitchChat]);
 
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
   const activePluginPanel = useMemo(() => {
@@ -908,14 +908,14 @@ function AppShell() {
     }
 
     if (target.type === 'conversation' && target.conversationId) {
-      void handleSwitchConversation(target.conversationId);
+      void handleSwitchChat(target.conversationId);
       return;
     }
 
     if (target.type === 'action' && target.targetId && target.action) {
       void sendPluginAction(pluginName, target.targetId, target.action, target.data);
     }
-  }, [handleSwitchConversation, sendPluginAction]);
+  }, [handleSwitchChat, sendPluginAction]);
 
   const pluginCommands = pluginUIState?.commands?.filter((command) => command.visible) ?? [];
 
@@ -948,26 +948,26 @@ function AppShell() {
     <AttachmentProvider>
       <DropZone>
       <RuntimeProvider
-        conversationId={activeConversationId}
+        conversationId={activeChatId}
         selectedModelKey={selectedModelKey}
         reasoningEffort={reasoningEffort}
         executionMode={executionMode}
         selectedProfileKey={selectedProfileKey}
         fallbackEnabled={fallbackEnabled}
         onModelFallback={setSelectedModelKey}
-        onConversationSettingsLoaded={handleConversationSettingsLoaded}
+        onChatSettingsLoaded={handleChatSettingsLoaded}
       >
       <ComputerUseAutoNavigator
-        activeConversationId={activeConversationId}
+        activeChatId={activeChatId}
         onRevealComputerSurface={() => {
           setActiveView('chat');
-          setThreadMode('computer');
+          setChatMode('computer');
         }}
       />
       <RealtimeProvider>
         <PluginToastHost />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
-        <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
+        <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} chatId={activeChatId} />
         {activeView === SETTINGS_VIEW && createPortal(
           <div
             className="fixed inset-0 z-50 flex items-center justify-center"
@@ -1003,7 +1003,7 @@ function AppShell() {
             onClose={() => setPluginSettingsOpen(null)}
           />
         )}
-        {renamingTitle && activeConversationId && createPortal(
+        {renamingTitle && activeChatId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
@@ -1012,7 +1012,7 @@ function AppShell() {
                 ref={renameInputRef}
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeConversationId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeChatId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
                 className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
               />
               <div className="mt-5 flex justify-end gap-2">
@@ -1025,7 +1025,7 @@ function AppShell() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void handleRename(activeConversationId, renameValue)}
+                  onClick={() => void handleRename(activeChatId, renameValue)}
                   className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
                 >
                   Save
@@ -1035,7 +1035,7 @@ function AppShell() {
           </div>,
           document.body,
         )}
-        {confirmingDelete && activeConversationId && createPortal(
+        {confirmingDelete && activeChatId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingDelete(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
@@ -1051,7 +1051,7 @@ function AppShell() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => { setConfirmingDelete(false); void handleDeleteConversation(activeConversationId); }}
+                  onClick={() => { setConfirmingDelete(false); void handleDeleteChat(activeChatId); }}
                   className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
                 >
                   Delete
@@ -1154,21 +1154,21 @@ function AppShell() {
                   setSidebarSection(section);
                   if (section === 'extensions') {
                     setActiveView(lastPluginViewRef.current);
-                  } else if (section === 'threads') {
+                  } else if (section === 'chats') {
                     setActiveView(CHAT_VIEW);
                   }
                 }}
               />
 
-              {sidebarSection === 'threads' && (
+              {sidebarSection === 'chats' && (
                 <>
                   <div className="min-h-0 flex-1 overflow-y-auto">
-                    <ConversationList
-                      activeConversationId={activeConversationId}
-                      activeThreadMode={threadMode}
-                      onSwitchConversation={handleSwitchConversation}
-                      onNewConversation={handleNewConversation}
-                      onDeleteConversation={handleDeleteConversation}
+                    <ChatList
+                      activeChatId={activeChatId}
+                      activeChatMode={chatMode}
+                      onSwitchChat={handleSwitchChat}
+                      onNewChat={handleNewChat}
+                      onDeleteChat={handleDeleteChat}
                     />
                   </div>
                   <div className="shrink-0">
@@ -1331,12 +1331,12 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
-                ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
+                ) : activeChatId && activeChatTitle !== 'Untitled Chat' ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
                       <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
                         <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                          {activeConversationTitle}
+                          {activeChatTitle}
                         </span>
                         <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
                       </button>
@@ -1349,21 +1349,21 @@ function AppShell() {
                       >
                         <DropdownMenu.Item
                           className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => togglePin(activeConversationId)}
+                          onSelect={() => togglePin(activeChatId)}
                         >
                           <PinIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
+                          <span>{pinnedIds.has(activeChatId) ? 'Unpin' : 'Pin'}</span>
                         </DropdownMenu.Item>
                         <DropdownMenu.Item
                           className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => { setRenameValue(activeConversationTitle); setRenamingTitle(true); }}
+                          onSelect={() => { setRenameValue(activeChatTitle); setRenamingTitle(true); }}
                         >
                           <PencilIcon className="h-4 w-4 text-muted-foreground" />
                           <span>Rename</span>
                         </DropdownMenu.Item>
                         <DropdownMenu.Item
                           className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => void handleArchiveConversation(activeConversationId)}
+                          onSelect={() => void handleArchiveChat(activeChatId)}
                         >
                           <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
                           <span>Archive</span>
@@ -1386,9 +1386,9 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
-                ) : activeConversationTitle !== 'Untitled Thread' ? (
+                ) : activeChatTitle !== 'Untitled Chat' ? (
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
-                    {activeConversationTitle}
+                    {activeChatTitle}
                   </span>
                 ) : null}
               </div>
@@ -1442,9 +1442,9 @@ function AppShell() {
                   <div className="flex h-full min-h-0">
                     {/* Chat column */}
                     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                      <ThreadOrSubAgent
-                        mode={threadMode}
-                        onChangeMode={setThreadMode}
+                      <ChatOrSubAgent
+                        mode={chatMode}
+                        onChangeMode={setChatMode}
                         selectedModelKey={selectedModelKey}
                         onSelectModel={setSelectedModelKey}
                         reasoningEffort={reasoningEffort}
@@ -1487,18 +1487,18 @@ function AppShell() {
 }
 
 const ComputerUseAutoNavigator: FC<{
-  activeConversationId: string | null;
+  activeChatId: string | null;
   onRevealComputerSurface: () => void;
-}> = ({ activeConversationId, onRevealComputerSurface }) => {
-  const { sessionsByConversation } = useComputerUse();
+}> = ({ activeChatId, onRevealComputerSurface }) => {
+  const { sessionsByChat } = useComputerUse();
   const { setActiveSubAgentView } = useSubAgents();
   const hydratedRef = useRef(false);
   const knownSessionsRef = useRef(new Map<string, { surface: ComputerUseSurface }>());
-  const activeSession = getComputerSessionForConversation(activeConversationId, sessionsByConversation) ?? null;
+  const activeSession = getComputerSessionForChat(activeChatId, sessionsByChat) ?? null;
 
   useEffect(() => {
     const nextKnown = new Map<string, { surface: ComputerUseSurface }>();
-    for (const sessionList of sessionsByConversation.values()) {
+    for (const sessionList of sessionsByChat.values()) {
       for (const session of sessionList) {
         nextKnown.set(session.id, { surface: session.surface });
       }
@@ -1528,15 +1528,15 @@ const ComputerUseAutoNavigator: FC<{
 
     setActiveSubAgentView(null);
     onRevealComputerSurface();
-  }, [activeSession, onRevealComputerSurface, sessionsByConversation, setActiveSubAgentView]);
+  }, [activeSession, onRevealComputerSurface, sessionsByChat, setActiveSubAgentView]);
 
   return null;
 };
 
-/** Switches between the main Thread and a SubAgentThread view */
-const ThreadOrSubAgent: FC<{
-  mode: ThreadMode;
-  onChangeMode: (mode: ThreadMode) => void;
+/** Switches between the main ChatThread and a SubAgentThread view */
+const ChatOrSubAgent: FC<{
+  mode: ChatMode;
+  onChangeMode: (mode: ChatMode) => void;
   selectedModelKey: string | null;
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -1560,7 +1560,7 @@ const ThreadOrSubAgent: FC<{
   }
 
   return (
-    <Thread
+    <ChatThread
       mode={mode}
       onChangeMode={onChangeMode}
       selectedModelKey={selectedModelKey}

@@ -2,13 +2,13 @@ import type { FC } from 'react';
 import * as Tabs from '@radix-ui/react-tabs';
 import { cn } from '@/lib/utils';
 
-export type SidebarSection = 'threads' | 'extensions';
+export type SidebarSection = 'chats' | 'extensions';
 
 interface SidebarSectionSwitcherProps {
   value: SidebarSection;
   onValueChange: (v: SidebarSection) => void;
-  /** Called when user clicks the already-active "threads" tab (no-op when switching TO it) */
-  onThreadsReselect?: () => void;
+  /** Called when user clicks the already-active "chats" tab (no-op when switching TO it) */
+  onChatsReselect?: () => void;
   /** Called when user clicks the already-active "extensions" tab (no-op when switching TO it) */
   onExtensionsReselect?: () => void;
 }
@@ -16,7 +16,7 @@ interface SidebarSectionSwitcherProps {
 export const SidebarSectionSwitcher: FC<SidebarSectionSwitcherProps> = ({
   value,
   onValueChange,
-  onThreadsReselect,
+  onChatsReselect,
   onExtensionsReselect,
 }) => {
   const handleValueChange = (v: string) => {
@@ -32,15 +32,15 @@ export const SidebarSectionSwitcher: FC<SidebarSectionSwitcherProps> = ({
     >
       <Tabs.List className="titlebar-no-drag flex gap-1 border-b border-sidebar-border/80 px-3 py-1.5">
         <Tabs.Trigger
-          value="threads"
-          onClick={() => { if (value === 'threads') onThreadsReselect?.(); }}
+          value="chats"
+          onClick={() => { if (value === 'chats') onChatsReselect?.(); }}
           className={cn(
             'rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
             'data-[state=active]:bg-sidebar-accent/80 data-[state=active]:text-sidebar-foreground',
             'data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:text-sidebar-foreground/70',
           )}
         >
-          {__BRAND_SIDEBAR_SECTION_THREADS}
+          {__BRAND_SIDEBAR_SECTION_CHATS}
         </Tabs.Trigger>
         <Tabs.Trigger
           value="extensions"

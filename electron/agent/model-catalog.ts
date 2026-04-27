@@ -122,7 +122,7 @@ export function resolveStreamConfig(
 ): ResolvedStreamConfig | null {
   const catalog = resolveModelCatalog(config);
 
-  // 1. Find active profile: conversation → global default → none
+  // 1. Find active profile: chat → global default → none
   const profileKey = opts.threadProfileKey ?? config.defaultProfileKey ?? null;
   const profile = profileKey
     ? (config.profiles ?? []).find((p) => p.key === profileKey)

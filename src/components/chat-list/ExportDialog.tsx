@@ -10,7 +10,7 @@ interface Message {
   createdAt?: string;
 }
 
-interface Conversation {
+interface ChatData {
   id: string;
   title?: string | null;
   fallbackTitle?: string | null;
@@ -22,10 +22,10 @@ interface Conversation {
 interface Props {
   open: boolean;
   onClose: () => void;
-  conversationId: string | null;
+  chatId: string | null;
 }
 
-function messagesToMarkdown(conv: Conversation): string {
+function messagesToMarkdown(conv: ChatData): string {
   const title = conv.title || conv.fallbackTitle || 'Chat';
   const lines: string[] = [`# ${title}`, ''];
   if (conv.createdAt) lines.push(`_Created: ${new Date(conv.createdAt).toLocaleString()}_`, '');
@@ -43,7 +43,7 @@ function messagesToMarkdown(conv: Conversation): string {
   return lines.join('\n');
 }
 
-function messagesToJson(conv: Conversation): string {
+function messagesToJson(conv: ChatData): string {
   return JSON.stringify({
     id: conv.id,
     title: conv.title || conv.fallbackTitle || null,
@@ -58,7 +58,7 @@ function messagesToJson(conv: Conversation): string {
   }, null, 2);
 }
 
-function messagesToText(conv: Conversation): string {
+function messagesToText(conv: ChatData): string {
   const title = conv.title || conv.fallbackTitle || 'Chat';
   const lines: string[] = [title, '='.repeat(title.length), ''];
 
@@ -76,18 +76,18 @@ function messagesToText(conv: Conversation): string {
 
 type ExportFormat = 'markdown' | 'json' | 'text';
 
-export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
+export const ExportDialog: FC<Props> = ({ open, onClose, chatId }) => {
   const [format, setFormat] = useState<ExportFormat>('markdown');
   const [preview, setPreview] = useState('');
   const [copied, setCopied] = useState(false);
-  const [conv, setConv] = useState<Conversation | null>(null);
+  const [conv, setConv] = useState<ChatData | null>(null);
 
   useEffect(() => {
-    if (!open || !conversationId) return;
-    void app.conversations.get(conversationId).then((c) => {
-      setConv(c as Conversation);
+    if (!open || !chatId) return;
+    void app.conversations.get(chatId).then((c) => {
+      setConv(c as ChatData);
     });
-  }, [open, conversationId]);
+  }, [open, chatId]);
 
   useEffect(() => {
     if (!conv) { setPreview(''); return; }

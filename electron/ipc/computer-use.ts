@@ -11,7 +11,7 @@ import type {
 import { getComputerUseManager } from '../computer-use/service.js';
 import { getLocalMacDisplayLayout, probeInputMonitoring } from '../computer-use/permissions.js';
 import type { AppConfig } from '../config/schema.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from './conversations.js';
+import { readChatStore, writeChatStore, broadcastChatChange } from './conversations.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 
 const execFileAsync = promisify(execFile);
@@ -204,11 +204,11 @@ export function registerComputerUseHandlers(
     if (!session) return { ok: false, error: 'Session not found' };
 
     // Switch active conversation to the one owning this computer-use session
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
     if (store.conversations[session.conversationId]) {
       store.activeConversationId = session.conversationId;
-      writeConversationStore(appHome, store);
-      broadcastConversationChange(store);
+      writeChatStore(appHome, store);
+      broadcastChatChange(store);
     }
 
     // Focus the main window and tell its renderer to switch to the computer tab
@@ -217,8 +217,8 @@ export function registerComputerUseHandlers(
       if (mainWin.isMinimized()) mainWin.restore();
       if (!mainWin.isVisible()) mainWin.show();
       mainWin.focus();
-      mainWin.webContents.send('computer-use:focus-thread');
-      broadcastToWebClients('computer-use:focus-thread', undefined);
+      mainWin.webContents.send('computer-use:focus-chat');
+      broadcastToWebClients('computer-use:focus-chat', undefined);
     }
 
     return { ok: true };

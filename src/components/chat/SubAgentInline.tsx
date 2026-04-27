@@ -49,19 +49,19 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
   const subAgentId = resultData?.subAgentConversationId
     ?? liveOutput?.subAgentConversationId
     ?? findSubAgentByToolCall(threads, toolCallId);
-  const thread = subAgentId ? threads.get(subAgentId) : null;
+  const subThread = subAgentId ? threads.get(subAgentId) : null;
 
   const hasResult = result !== undefined;
-  const isRunning = !hasResult && (thread?.status === 'running' || thread?.status === 'awaiting-input');
-  const isStopped = resultData?.status === 'stopped' || thread?.status === 'stopped';
-  const hasError = isError || resultData?.status === 'error' || thread?.status === 'error';
+  const isRunning = !hasResult && (subThread?.status === 'running' || subThread?.status === 'awaiting-input');
+  const isStopped = resultData?.status === 'stopped' || subThread?.status === 'stopped';
+  const hasError = isError || resultData?.status === 'error' || subThread?.status === 'error';
 
-  // Auto-scroll to bottom of inline thread
+  // Auto-scroll to bottom of inline sub-agent chat
   useEffect(() => {
     if (expanded && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [expanded, thread?.messages.length]);
+  }, [expanded, subThread?.messages.length]);
 
   const handleSendMessage = useCallback(async () => {
     if (!subAgentId || !messageInput.trim()) return;
@@ -82,7 +82,7 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
   // Status display
   const StatusIcon = hasError ? AlertCircleIcon : isStopped ? StopCircleIcon : hasResult ? CheckCircle2Icon : LoaderIcon;
   const statusColor = hasError ? 'text-destructive' : isStopped ? 'text-orange-400' : hasResult ? 'text-green-500' : 'text-blue-400';
-  const statusLabel = hasError ? 'Error' : isStopped ? 'Stopped' : hasResult ? 'Completed' : thread?.status === 'awaiting-input' ? 'Awaiting input' : 'Running';
+  const statusLabel = hasError ? 'Error' : isStopped ? 'Stopped' : hasResult ? 'Completed' : subThread?.status === 'awaiting-input' ? 'Awaiting input' : 'Running';
 
   return (
     <div className="rounded-lg border-l-4 border-l-blue-500/60 border border-border bg-card text-sm overflow-hidden">
@@ -147,17 +147,17 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
       {/* Collapsed: compact single-line preview */}
       {!expanded && (
         <div className="border-t px-3 py-1.5">
-          <CompactPreview thread={thread} liveOutput={liveOutput} isRunning={isRunning} />
+          <CompactPreview subThread={subThread} liveOutput={liveOutput} isRunning={isRunning} />
         </div>
       )}
 
-      {/* Expanded: full nested thread display */}
+      {/* Expanded: full nested sub-agent chat display */}
       {expanded && (
         <div className="border-t">
-          {/* Mini chat thread */}
+          {/* Mini sub-agent chat */}
           <div ref={scrollRef} className="overflow-y-auto px-3 py-2 space-y-2 max-h-[450px]">
-            {thread && thread.messages.length > 0 ? (
-              thread.messages.map((msg, i) => {
+            {subThread && subThread.messages.length > 0 ? (
+              subThread.messages.map((msg, i) => {
                 const content = Array.isArray(msg.content) ? msg.content : [];
                 const role = msg.role as string;
                 return <MiniChatBubble key={(msg as { id?: string }).id ?? i} role={role} content={content} />;
@@ -169,7 +169,7 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
             ) : null}
 
             {/* Typing indicator */}
-            {isRunning && thread && thread.messages.length > 0 && (
+            {isRunning && subThread && subThread.messages.length > 0 && (
               <div className="flex items-center gap-2 pl-6 py-1">
                 <BotIcon className="h-3 w-3 text-blue-400" />
                 <div className="flex items-center gap-1">
@@ -182,7 +182,7 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
           </div>
 
           {/* Inline composer — visible when running or awaiting input */}
-          {(isRunning || thread?.status === 'awaiting-input') && subAgentId && (
+          {(isRunning || subThread?.status === 'awaiting-input') && subAgentId && (
             <div className="border-t px-3 py-2">
               <div className="flex items-center gap-1.5 rounded-lg border bg-background px-2 py-1.5">
                 <RichChatInput
@@ -219,7 +219,7 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
   );
 };
 
-// --- Mini chat bubble for inline thread ---
+// --- Mini chat bubble for inline sub-agent chat ---
 
 type ContentPart = {
   type: string;
@@ -329,13 +329,13 @@ const MiniChatBubble: FC<{ role: string; content: ContentPart[] }> = ({ role, co
 // --- Compact preview for collapsed state ---
 
 const CompactPreview: FC<{
-  thread: SubAgentThreadState | null | undefined;
+  subThread: SubAgentThreadState | null | undefined;
   liveOutput: SubAgentInlineProps['liveOutput'];
   isRunning: boolean;
-}> = ({ thread, liveOutput, isRunning }) => {
+}> = ({ subThread, liveOutput, isRunning }) => {
   // Show last assistant message snippet
-  if (thread?.messages.length) {
-    const lastAssistant = [...thread.messages].reverse().find((m) => m.role === 'assistant');
+  if (subThread?.messages.length) {
+    const lastAssistant = [...subThread.messages].reverse().find((m) => m.role === 'assistant');
     if (lastAssistant) {
       const content = Array.isArray(lastAssistant.content) ? lastAssistant.content : [];
       const text = content
