@@ -22,6 +22,11 @@ type ComputerUseConfig = {
   capture: {
     maxDimension: number;
     jpegQuality: number;
+    modelFrame?: {
+      mode: 'native' | 'canonical';
+      width: number;
+      height: number;
+    };
   };
   safety: {
     pauseOnTerminal: boolean;
@@ -546,6 +551,21 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         <div className="grid grid-cols-2 gap-3">
           <NumberField label="Max Dimension (px)" value={computerUse.capture.maxDimension} onChange={(value) => updateConfig('computerUse.capture.maxDimension', value)} min={512} />
           <NumberField label="JPEG Quality (%)" value={Math.round(computerUse.capture.jpegQuality * 100)} onChange={(value) => updateConfig('computerUse.capture.jpegQuality', Math.max(0.1, Math.min(value / 100, 1)))} min={10} max={100} />
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <label className="space-y-1">
+            <span className="text-[11px] font-medium text-muted-foreground">Model Frame</span>
+            <select
+              className={settingsSelectClass}
+              value={computerUse.capture.modelFrame?.mode ?? 'canonical'}
+              onChange={(e) => updateConfig('computerUse.capture.modelFrame.mode', e.target.value)}
+            >
+              <option value="canonical">Canonical</option>
+              <option value="native">Native</option>
+            </select>
+          </label>
+          <NumberField label="Model Width" value={computerUse.capture.modelFrame?.width ?? 1366} onChange={(value) => updateConfig('computerUse.capture.modelFrame.width', value)} min={512} />
+          <NumberField label="Model Height" value={computerUse.capture.modelFrame?.height ?? 768} onChange={(value) => updateConfig('computerUse.capture.modelFrame.height', value)} min={384} />
         </div>
       </CollapsibleSection>
     </div>

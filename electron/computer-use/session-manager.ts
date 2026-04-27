@@ -181,6 +181,7 @@ export class ComputerUseSessionManager extends EventEmitter {
   private readonly sessionsDir: string;
   private readonly orchestrator: ComputerUseOrchestrator;
   private takeoverMonitorActive = false;
+  private takeoverSuppressedUntil = 0;
 
   constructor(
     private readonly appHome: string,
@@ -480,10 +481,14 @@ export class ComputerUseSessionManager extends EventEmitter {
     if (!this.getConfig().computerUse.safety.manualTakeoverPauses) return false;
     for (const session of this.sessions.values()) {
       if (session.target !== 'local-macos') continue;
-      if (session.status === 'stopped' || session.status === 'completed' || session.status === 'failed') continue;
+      if (session.status !== 'running') continue;
       return true;
     }
     return false;
+  }
+
+  private suppressTakeoverMonitor(durationMs = 1000): void {
+    this.takeoverSuppressedUntil = Math.max(this.takeoverSuppressedUntil, Date.now() + durationMs);
   }
 
   private refreshTakeoverMonitor(): void {
@@ -506,6 +511,7 @@ export class ComputerUseSessionManager extends EventEmitter {
 
   private handleTakeoverEvent(event: LocalMacosTakeoverEvent): void {
     if (!this.getConfig().computerUse.safety.manualTakeoverPauses) return;
+    if (Date.now() < this.takeoverSuppressedUntil) return;
     const timestamp = nowIso();
     const message = event.eventType.startsWith('key')
       ? 'Human in control. Session paused after keyboard activity.'
@@ -606,6 +612,9 @@ export class ComputerUseSessionManager extends EventEmitter {
       lastError: blocker ?? undefined,
     };
 
+    if (!blocker) {
+      this.suppressTakeoverMonitor();
+    }
     this.upsertSession(session);
     if (!blocker && surface === 'window') {
       openOperatorWindow(session.id, () => this.handleOperatorWindowClosed(session.id), {
@@ -651,6 +660,7 @@ export class ComputerUseSessionManager extends EventEmitter {
       });
     }
 
+    this.suppressTakeoverMonitor();
     const next = this.upsertSession({
       ...session,
       status: 'running',
@@ -773,6 +783,7 @@ export class ComputerUseSessionManager extends EventEmitter {
       createdAt: nowIso(),
     };
 
+    this.suppressTakeoverMonitor();
     const next = this.upsertSession({
       ...session,
       goal: continuedGoal,
@@ -794,6 +805,7 @@ export class ComputerUseSessionManager extends EventEmitter {
   async approveAction(sessionId: string, actionId: string): Promise<ComputerSession | null> {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
+    this.suppressTakeoverMonitor();
     const next: ComputerSession = {
       ...session,
       approvals: session.approvals.map((approval) => approval.actionId === actionId ? { ...approval, status: 'approved' as const } : approval),

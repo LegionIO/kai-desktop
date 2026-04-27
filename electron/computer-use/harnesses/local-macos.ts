@@ -200,6 +200,8 @@ type LocalMacCoordinateSpace = {
   desktopHeight: number;
 };
 
+type LocalMacModelFrameConfig = AppConfig['computerUse']['capture']['modelFrame'];
+
 async function resolveCoordinateSpace(session: ComputerSession): Promise<LocalMacCoordinateSpace> {
   const frameWidth = Math.max(1, Math.round(session.latestFrame?.width ?? 1440));
   const frameHeight = Math.max(1, Math.round(session.latestFrame?.height ?? 900));
@@ -227,23 +229,53 @@ function toFramePoint(point: { x: number; y: number }, space: LocalMacCoordinate
 }
 
 /**
- * Downscale a screenshot so its longest side fits within MAX_FRAME_DIMENSION.
- * If the image already fits, it is returned unchanged.
+ * Resize a native screenshot into the model-facing coordinate space.
+ *
+ * The model emits pointer coordinates in this resized image space. The action
+ * executor maps those coordinates back across the native display's logical
+ * bounds before posting macOS events.
  */
-function downscaleFrame(
+function resizeFrameForModel(
   data: Buffer,
   originalSize: { width: number; height: number },
+  modelFrame: LocalMacModelFrameConfig | undefined,
   maxFrameDimension?: number,
-): { data: Buffer; width: number; height: number } {
-  const maxDim = maxFrameDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
-  const longest = Math.max(originalSize.width, originalSize.height);
-  if (longest <= maxDim) {
-    return { data, width: originalSize.width, height: originalSize.height };
+): { data: Buffer; width: number; height: number; nativeWidth: number; nativeHeight: number } {
+  const nativeWidth = originalSize.width;
+  const nativeHeight = originalSize.height;
+  let targetWidth = nativeWidth;
+  let targetHeight = nativeHeight;
+
+  if (modelFrame?.mode === 'canonical') {
+    const canonicalWidth = Math.max(1, Math.round(modelFrame.width || 1366));
+    const canonicalHeight = Math.max(1, Math.round(modelFrame.height || 768));
+    const originalAspect = nativeWidth / Math.max(nativeHeight, 1);
+    const canonicalAspect = canonicalWidth / Math.max(canonicalHeight, 1);
+    const canUseExactCanonical = nativeWidth >= canonicalWidth
+      && nativeHeight >= canonicalHeight
+      && Math.abs(originalAspect - canonicalAspect) / Math.max(canonicalAspect, 0.0001) < 0.01;
+
+    if (canUseExactCanonical) {
+      targetWidth = canonicalWidth;
+      targetHeight = canonicalHeight;
+    } else {
+      const scale = Math.min(1, canonicalWidth / Math.max(nativeWidth, 1), canonicalHeight / Math.max(nativeHeight, 1));
+      targetWidth = Math.max(1, Math.round(nativeWidth * scale));
+      targetHeight = Math.max(1, Math.round(nativeHeight * scale));
+    }
+  } else {
+    const maxDim = maxFrameDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const longest = Math.max(nativeWidth, nativeHeight);
+    if (longest > maxDim) {
+      const scale = maxDim / longest;
+      targetWidth = Math.max(1, Math.round(nativeWidth * scale));
+      targetHeight = Math.max(1, Math.round(nativeHeight * scale));
+    }
   }
 
-  const scale = maxDim / longest;
-  const targetWidth = Math.round(originalSize.width * scale);
-  const targetHeight = Math.round(originalSize.height * scale);
+  if (targetWidth === nativeWidth && targetHeight === nativeHeight) {
+    return { data, width: nativeWidth, height: nativeHeight, nativeWidth, nativeHeight };
+  }
 
   const image = nativeImage.createFromBuffer(data);
   const resized = image.resize({ width: targetWidth, height: targetHeight, quality: 'better' });
@@ -253,6 +285,8 @@ function downscaleFrame(
     data: Buffer.from(jpegBuffer),
     width: targetWidth,
     height: targetHeight,
+    nativeWidth,
+    nativeHeight,
   };
 }
 
@@ -311,6 +345,7 @@ export class LocalMacosHarness implements ComputerHarness {
     const excludeApps = config.computerUse.localMacos.captureExcludedApps ?? ['Electron'];
     const jpegQuality = config.computerUse.capture.jpegQuality ?? 0.8;
     const maxDimension = config.computerUse.capture.maxDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const modelFrame = config.computerUse.capture.modelFrame;
     const allowedDisplays = config.computerUse.localMacos.allowedDisplays;
 
     const excludeArg = Buffer.from(JSON.stringify(excludeApps)).toString('base64');
@@ -329,7 +364,7 @@ export class LocalMacosHarness implements ComputerHarness {
 
     const rawData = Buffer.from(primaryResult.imageBase64, 'base64');
     const rawSize = { width: primaryResult.width, height: primaryResult.height };
-    const frame = downscaleFrame(rawData, rawSize, maxDimension);
+    const frame = resizeFrameForModel(rawData, rawSize, modelFrame, maxDimension);
 
     // Build display layout from the helper response
     const displayLayout = buildDisplayLayout(
@@ -344,6 +379,8 @@ export class LocalMacosHarness implements ComputerHarness {
       dataUrl: `data:image/jpeg;base64,${frame.data.toString('base64')}`,
       width: frame.width,
       height: frame.height,
+      nativeWidth: frame.nativeWidth,
+      nativeHeight: frame.nativeHeight,
     }];
 
     if (displayLayout && displayLayout.displays.length > 1) {
@@ -354,13 +391,15 @@ export class LocalMacosHarness implements ComputerHarness {
           );
           if (extraResult.imageBase64 && extraResult.width && extraResult.height) {
             const extraRaw = Buffer.from(extraResult.imageBase64, 'base64');
-            const extraFrame = downscaleFrame(extraRaw, { width: extraResult.width, height: extraResult.height }, maxDimension);
+            const extraFrame = resizeFrameForModel(extraRaw, { width: extraResult.width, height: extraResult.height }, modelFrame, maxDimension);
             displayFrames.push({
               displayIndex: i,
               displayName: displayLayout.displays[i]?.name ?? `Display ${i + 1}`,
               dataUrl: `data:image/jpeg;base64,${extraFrame.data.toString('base64')}`,
               width: extraFrame.width,
               height: extraFrame.height,
+              nativeWidth: extraFrame.nativeWidth,
+              nativeHeight: extraFrame.nativeHeight,
             });
           }
         } catch {
@@ -377,6 +416,8 @@ export class LocalMacosHarness implements ComputerHarness {
       dataUrl: `data:image/jpeg;base64,${frame.data.toString('base64')}`,
       width: frame.width,
       height: frame.height,
+      nativeWidth: frame.nativeWidth,
+      nativeHeight: frame.nativeHeight,
       source: 'local-macos',
       displayLayout,
       displayFrames: displayFrames.length > 1 ? displayFrames : undefined,

@@ -427,8 +427,16 @@ export async function getLocalMacPointerPosition(): Promise<{ x: number; y: numb
 export async function getLocalMacDesktopSize(): Promise<{ width: number; height: number } | null> {
   const result = await runLocalMacHelper(['permissions']);
   if (!result.ok) return null;
-  const width = typeof result.desktopWidth === 'number' ? Math.max(1, Math.round(result.desktopWidth)) : null;
-  const height = typeof result.desktopHeight === 'number' ? Math.max(1, Math.round(result.desktopHeight)) : null;
+  const width = typeof result.desktopCoordinateWidth === 'number'
+    ? Math.max(1, Math.round(result.desktopCoordinateWidth))
+    : typeof result.desktopWidth === 'number'
+      ? Math.max(1, Math.round(result.desktopWidth))
+      : null;
+  const height = typeof result.desktopCoordinateHeight === 'number'
+    ? Math.max(1, Math.round(result.desktopCoordinateHeight))
+    : typeof result.desktopHeight === 'number'
+      ? Math.max(1, Math.round(result.desktopHeight))
+      : null;
   if (!width || !height) return null;
   return { width, height };
 }

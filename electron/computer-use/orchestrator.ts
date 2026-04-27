@@ -343,7 +343,7 @@ export class ComputerUseOrchestrator {
           updatedAt: nowIso(),
         }));
 
-        if (plan.actions.length === 0 || plan.complete) {
+        if (plan.actions.length === 0) {
           const checkpoint = {
             id: makeComputerUseId('checkpoint'),
             sessionId,

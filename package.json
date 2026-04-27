@@ -13,6 +13,7 @@
     "start": "electron-vite preview",
     "rebuild": "electron-builder install-app-deps",
     "compile:swift": "bash scripts/compile-swift-helper.sh",
+    "coordinate-test": "tsx scripts/coordinate-test.ts",
     "generate:builder": "tsx scripts/generate-builder-config.ts",
     "generate:dmg-bg": "tsx scripts/generate-dmg-background.ts",
     "build:mac": "pnpm compile:swift && pnpm generate:dmg-bg && pnpm build && pnpm generate:builder && electron-builder --mac --config",

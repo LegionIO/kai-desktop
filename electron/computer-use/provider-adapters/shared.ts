@@ -485,6 +485,12 @@ export async function generateNextActions(params: {
         'Do NOT click, type, scroll, or press keys until the focused application matches the window you intend to interact with.',
       ].join(' ')
     : undefined;
+  const displayFrames = session.latestFrame?.displayFrames;
+  const coordinateSpaceInstruction = displayFrames && displayFrames.length > 1
+    ? 'Screenshot coordinate space: each labeled display image has its own top-left origin; x increases right; y increases downward; use coordinates relative to the display image named by displayIndex.'
+    : frame
+      ? `Screenshot coordinate space: origin is the top-left corner; x increases right; y increases downward; valid coordinates are x=0..${frame.width} and y=0..${frame.height}.`
+      : undefined;
 
   const promptParts = [
     // Hidden-focus hard-stop goes first so it is the very first thing the model reads
@@ -512,9 +518,16 @@ export async function generateNextActions(params: {
       : undefined,
     'Resolve references such as "that", "that fix", or "the change we discussed" against the conversation context before acting.',
     'Return the next 0-3 actions. Prefer navigate when a URL is obvious. Use click/scroll/type only when grounded in the current UI. Mark complete=true only when the user goal is clearly done.',
+    'Never mark complete=true merely because the previous action should have produced the result. Mark complete=true only when the current screenshot or environment metadata already shows the requested final state.',
     'If the last approach appears stuck, do not repeat the same action sequence. Change strategy and gather new evidence from the current UI first.',
     'When interactive elements are listed and the intended control is clearly one of them, prefer returning its elementId and leave x/y null so the runtime can resolve the exact target location.',
-    'If you use x/y for a pointer action, use the screenshot coordinates for the visible point you want.',
+    coordinateSpaceInstruction,
+    'If you use x/y for a pointer action, use the screenshot coordinates for the visible point you want. Aim for the center of the intended clickable target both horizontally and vertically, not the edge of the target and not the top/bottom of its text glyphs.',
+    'For text-labeled controls, horizontal and vertical targeting are different: x may be near the center of the visible label, but y must be the vertical center of the whole clickable control or row. Do not use the top edge of the label, the text baseline, or the top padding as the y coordinate.',
+    'For compact menu-bar items, toolbar icons, status icons, and small icon buttons, click the visual center of the icon or menu heading. Avoid edge/corner coordinates; keep the click comfortably inside the visible target.',
+    'For menu items, dropdown rows, buttons, list rows, tabs, and similar rectangular controls, estimate the row/control top and bottom first, then set y=(top+bottom)/2. The row center is usually below the top of the text glyphs and below the top edge of the menu background.',
+    'If a recent click had the correct x but missed above the target or left the UI unchanged, keep the x roughly the same and choose a lower y at the center of the intended row/control instead of repeating the same high y.',
+    'When using menus, first verify the opened menu is the intended one by checking its visible items. If the dropdown contents do not match the intended menu, do not click inside it; dismiss or reopen the correct menu from the center of the correct menu-bar target.',
     'Always set movementPath to teleport, direct, horizontal-first, or vertical-first. For pointer-moving actions (movePointer, click, doubleClick, drag), default to teleport unless you intentionally need the pointer to travel through a visible route.',
 
     // ── Cursor travel direction & moving targets ──
@@ -535,7 +548,6 @@ export async function generateNextActions(params: {
   ].filter(Boolean).join('\n\n');
 
   // Build message content with per-display images
-  const displayFrames = session.latestFrame?.displayFrames;
   const contentParts: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer | URL; mediaType?: string }> = [
     { type: 'text' as const, text: promptParts },
   ];
@@ -543,7 +555,11 @@ export async function generateNextActions(params: {
   if (displayFrames && displayFrames.length > 1) {
     // Multi-display: send labeled images for each display
     for (const df of displayFrames) {
-      contentParts.push({ type: 'text' as const, text: `[Display ${df.displayIndex}: "${df.displayName}" — ${df.width}x${df.height}]` });
+      const nativeSuffix = df.nativeWidth && df.nativeHeight ? `; native ${df.nativeWidth}x${df.nativeHeight}` : '';
+      contentParts.push({
+        type: 'text' as const,
+        text: `[Display ${df.displayIndex}: "${df.displayName}" — model frame ${df.width}x${df.height}${nativeSuffix}; origin top-left; x increases right; y increases downward; use coordinates relative to this display image]`,
+      });
       const img = toImageInput({ dataUrl: df.dataUrl, mimeType: 'image/jpeg' } as typeof frame);
       if (img) {
         contentParts.push({ type: 'image' as const, image: img.image, mediaType: img.mediaType });
@@ -551,6 +567,10 @@ export async function generateNextActions(params: {
     }
   } else if (imageInput) {
     // Single display: send one image (original behavior)
+    contentParts.push({
+      type: 'text' as const,
+      text: `[Display 0 — model frame ${frame?.width ?? 'unknown'}x${frame?.height ?? 'unknown'}${frame?.nativeWidth && frame.nativeHeight ? `; native ${frame.nativeWidth}x${frame.nativeHeight}` : ''}; origin top-left; y increases downward]`,
+    });
     contentParts.push({ type: 'image' as const, image: imageInput.image, mediaType: imageInput.mediaType });
   }
 

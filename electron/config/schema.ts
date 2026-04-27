@@ -206,6 +206,11 @@ const computerUseConfigSchema = z.object({
   capture: z.object({
     maxDimension: z.number().positive(),
     jpegQuality: z.number().min(0.1).max(1),
+    modelFrame: z.object({
+      mode: z.enum(['native', 'canonical']),
+      width: z.number().positive(),
+      height: z.number().positive(),
+    }),
   }),
   safety: z.object({
     pauseOnTerminal: z.boolean(),

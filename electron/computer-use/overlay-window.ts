@@ -1,8 +1,8 @@
-import { app, BrowserWindow, ipcMain, nativeImage, screen } from 'electron';
-import { existsSync } from 'node:fs';
+import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
 import type { ComputerDisplayLayout, ComputerOverlayState } from '../../shared/computer-use.js';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
+import { createPaddedDockIcon } from '../utils/dock-icon.js';
 
 // Resolve the app icon once — same path as electron/main.ts
 const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
@@ -13,7 +13,7 @@ function ensureDockVisible(): void {
     const dock = process.platform === 'darwin' ? app.dock : undefined;
     if (!dock) return;
 
-    const icon = existsSync(APP_ICON) ? nativeImage.createFromPath(APP_ICON) : null;
+    const icon = createPaddedDockIcon(APP_ICON);
 
     // Set icon before show() in case show() reads the current icon
     if (icon) dock.setIcon(icon);

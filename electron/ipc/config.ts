@@ -173,6 +173,11 @@ function getDefaultConfig() {
       capture: {
         maxDimension: 1920,
         jpegQuality: 0.8,
+        modelFrame: {
+          mode: 'canonical' as const,
+          width: 1366,
+          height: 768,
+        },
       },
       safety: {
         pauseOnTerminal: true,

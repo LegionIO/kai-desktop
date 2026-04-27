@@ -22,6 +22,7 @@ import {
 } from '../agent/tool-observer.js';
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
 import { recordUsageEvent } from './usage.js';
+import type { PluginManager } from '../plugins/plugin-manager.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
@@ -374,7 +375,7 @@ function streamMastra(options: {
   })();
 }
 
-export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: import('../plugins/plugin-manager.js').PluginManager): void {
+export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
 
   ipcMain.handle(
     'agent:stream',

@@ -18,7 +18,17 @@ func primaryDisplayID() -> CGDirectDisplayID {
   CGMainDisplayID()
 }
 
-/// Get all active displays sorted left-to-right by their global X position.
+func displaySortPrecedes(_ lhsFrame: CGRect, _ rhsFrame: CGRect, lhsID: CGDirectDisplayID, rhsID: CGDirectDisplayID) -> Bool {
+  if lhsFrame.origin.x != rhsFrame.origin.x {
+    return lhsFrame.origin.x < rhsFrame.origin.x
+  }
+  if lhsFrame.origin.y != rhsFrame.origin.y {
+    return lhsFrame.origin.y < rhsFrame.origin.y
+  }
+  return lhsID < rhsID
+}
+
+/// Get all active displays sorted by global position in a stable order.
 func allDisplaysSorted() -> [CGDirectDisplayID] {
   var displayCount: UInt32 = 0
   CGGetActiveDisplayList(0, nil, &displayCount)
@@ -26,7 +36,9 @@ func allDisplaysSorted() -> [CGDirectDisplayID] {
   var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
   CGGetActiveDisplayList(displayCount, &displays, &displayCount)
   displays = Array(displays.prefix(Int(displayCount)))
-  displays.sort { CGDisplayBounds($0).origin.x < CGDisplayBounds($1).origin.x }
+  displays.sort {
+    displaySortPrecedes(CGDisplayBounds($0), CGDisplayBounds($1), lhsID: $0, rhsID: $1)
+  }
   return displays
 }
 
@@ -64,8 +76,49 @@ func displayInfoDict(_ displayId: CGDirectDisplayID) -> [String: Any] {
   ]
 }
 
+@available(macOS 12.3, *)
+func displayInfoDict(_ display: SCDisplay) -> [String: Any] {
+  let displayId = display.displayID
+  let frame = display.frame
+  let pixelWidth = max(1, Int(CGDisplayPixelsWide(displayId)))
+  let pixelHeight = max(1, Int(CGDisplayPixelsHigh(displayId)))
+  let fallbackBounds = CGDisplayBounds(displayId)
+  let logicalWidth = Int((frame.width > 0 ? frame.width : fallbackBounds.width).rounded())
+  let logicalHeight = Int((frame.height > 0 ? frame.height : fallbackBounds.height).rounded())
+  let globalX = Int((frame.width > 0 ? frame.origin.x : fallbackBounds.origin.x).rounded())
+  let globalY = Int((frame.height > 0 ? frame.origin.y : fallbackBounds.origin.y).rounded())
+  let scaleFactor = pixelWidth > 0 && logicalWidth > 0 ? Double(pixelWidth) / Double(logicalWidth) : 1.0
+
+  var name = "Display \(displayId)"
+  for screen in NSScreen.screens {
+    if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+       screenNumber == displayId {
+      name = screen.localizedName
+      break
+    }
+  }
+
+  return [
+    "displayId": String(displayId),
+    "name": name,
+    "pixelWidth": pixelWidth,
+    "pixelHeight": pixelHeight,
+    "logicalWidth": logicalWidth,
+    "logicalHeight": logicalHeight,
+    "globalX": globalX,
+    "globalY": globalY,
+    "scaleFactor": scaleFactor,
+    "isPrimary": displayId == CGMainDisplayID(),
+  ]
+}
+
 func buildDisplayLayoutArray() -> [[String: Any]] {
   return allDisplaysSorted().map { displayInfoDict($0) }
+}
+
+@available(macOS 12.3, *)
+func buildDisplayLayoutArray(_ displays: [SCDisplay]) -> [[String: Any]] {
+  return displays.map { displayInfoDict($0) }
 }
 
 func desktopBounds() -> CGRect {
@@ -703,7 +756,9 @@ case "screenshot":
     Task {
       do {
         let content = try await SCShareableContent.current
-        let allDisplays = content.displays.sorted { $0.frame.origin.x < $1.frame.origin.x }
+        let allDisplays = content.displays.sorted {
+          displaySortPrecedes($0.frame, $1.frame, lhsID: $0.displayID, rhsID: $1.displayID)
+        }
         guard !allDisplays.isEmpty else {
           captureResult = ["ok": false, "error": "No displays found"]
           sem.signal()
@@ -744,9 +799,12 @@ case "screenshot":
 
         let filter = SCContentFilter(display: targetDisplay, excludingWindows: excludedWindows)
 
+        let captureWidth = max(1, Int(CGDisplayPixelsWide(targetDisplay.displayID)))
+        let captureHeight = max(1, Int(CGDisplayPixelsHigh(targetDisplay.displayID)))
+
         let config = SCStreamConfiguration()
-        config.width = targetDisplay.width
-        config.height = targetDisplay.height
+        config.width = captureWidth
+        config.height = captureHeight
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = false
 
@@ -762,14 +820,14 @@ case "screenshot":
         let base64 = jpegData.base64EncodedString()
         // Find which index this display is in our sorted list
         let actualIndex = allDisplays.firstIndex(where: { $0.displayID == targetDisplay.displayID }) ?? 0
-        let displayInfo = buildDisplayLayoutArray()
+        let displayInfo = buildDisplayLayoutArray(allDisplays)
         let thisDisplayInfo = actualIndex < displayInfo.count ? displayInfo[actualIndex] : [:]
 
         captureResult = [
           "ok": true,
           "imageBase64": base64,
-          "width": targetDisplay.width,
-          "height": targetDisplay.height,
+          "width": captureWidth,
+          "height": captureHeight,
           "displayIndex": actualIndex,
           "displayInfo": thisDisplayInfo,
           "displays": displayInfo,

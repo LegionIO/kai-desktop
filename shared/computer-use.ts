@@ -106,8 +106,12 @@ export type ComputerFrame = {
   createdAt: string;
   mimeType: string;
   dataUrl: string;
+  /** Dimensions of the image sent to the model. Pointer action coordinates are in this space. */
   width: number;
   height: number;
+  /** Native captured display dimensions before model-frame resizing. */
+  nativeWidth?: number;
+  nativeHeight?: number;
   source: ComputerUseTarget;
   summary?: string;
   diffScore?: number;
@@ -118,8 +122,12 @@ export type ComputerFrame = {
     displayIndex: number;
     displayName: string;
     dataUrl: string;
+    /** Dimensions of the image sent to the model for this display. */
     width: number;
     height: number;
+    /** Native captured display dimensions before model-frame resizing. */
+    nativeWidth?: number;
+    nativeHeight?: number;
   }>;
 };
 
