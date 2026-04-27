@@ -28,6 +28,7 @@ import { SidebarSectionSwitcher, type SidebarSection } from '@/components/Sideba
 import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
 import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
 import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
+import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
@@ -324,6 +325,7 @@ const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
 const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
+const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
@@ -1020,6 +1022,7 @@ function AppShell() {
                       onNavigate={handlePluginNavigationItem}
                       onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
                       onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                      onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
                     />
                   </div>
                 </>
@@ -1079,6 +1082,10 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
                 ) : activeView === PLUGINS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
+                  <span className="text-sm font-medium text-foreground">
+                    {activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
+                  </span>
                 ) : activePluginPanel ? (
                   <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
                 ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
@@ -1169,6 +1176,17 @@ function AppShell() {
                   <div className="flex-1 overflow-y-auto px-6 py-6">
                     <div className="mx-auto max-w-3xl">
                       <InstalledPluginsView onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)} />
+                    </div>
+                  </div>
+                </div>
+              ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <BrokenPluginView
+                        pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
+                        onUninstalled={() => setActiveView(PLUGINS_VIEW)}
+                      />
                     </div>
                   </div>
                 </div>

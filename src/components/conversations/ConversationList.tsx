@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'reac
 import { createPortal } from 'react-dom';
 import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { cn } from '@/lib/utils';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
@@ -368,6 +369,8 @@ export const ConversationList: FC<ConversationListProps> = ({
     setBulkDeleteOpen(false);
   };
 
+  const isNewChat = !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
+
   return (
     <div className="flex flex-col h-full">
       <div className="border-b border-sidebar-border/70 px-4 py-3">
@@ -376,7 +379,10 @@ export const ConversationList: FC<ConversationListProps> = ({
           onClick={() => {
             void onNewConversation();
           }}
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80"
+          className={cn(
+            'flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80',
+            isNewChat && 'bg-primary/10 text-primary',
+          )}
         >
           <PlusIcon className="h-4 w-4 text-primary" />
           New Chat

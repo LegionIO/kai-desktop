@@ -239,7 +239,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                         : 'Update'}
                     </button>
                   )}
-                  {!plugin.brandRequired && !plugin.required && (
+                  {!plugin.brandRequired && (
                     <button
                       type="button"
                       onClick={() => handleUninstall(plugin.name)}

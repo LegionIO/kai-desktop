@@ -27,6 +27,7 @@ interface InstalledPluginsListProps {
   ) => void;
   onOpenMarketplace: () => void;
   onOpenPlugins: () => void;
+  onOpenPluginError: (pluginName: string) => void;
 }
 
 /* ── Status dot color map ────────────────────────────── */
@@ -45,6 +46,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onNavigate,
   onOpenMarketplace,
   onOpenPlugins,
+  onOpenPluginError,
 }) => {
   const { uiState, getPluginStatus } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
@@ -73,7 +75,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* + New Plugin button */}
+      {/* + Install Plugin button */}
       <div className="border-b border-sidebar-border/70 px-4 py-3">
         <button
           type="button"
@@ -142,24 +144,26 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
           filteredPlugins.map((plugin) => {
             const status = getPluginStatus(plugin.name);
             const navItem = navigationItems.find((n) => n.pluginName === plugin.name);
-            const isClickable = !!navItem;
+            const isErrored = plugin.state === 'error';
 
-            const isActive =
-              navItem?.target.type === 'panel' &&
-              activeView === `plugin-panel:${plugin.name}:${navItem.target.panelId}`;
+            const isActive = navItem?.target.type === 'panel'
+              ? activeView === `plugin-panel:${plugin.name}:${navItem.target.panelId}`
+              : isErrored && activeView === `plugin-error:${plugin.name}`;
 
             return (
               <button
                 key={plugin.name}
                 type="button"
-                disabled={!isClickable}
                 onClick={() => {
-                  if (navItem) onNavigate(navItem.pluginName, navItem.target);
+                  if (navItem) {
+                    onNavigate(navItem.pluginName, navItem.target);
+                  } else if (isErrored) {
+                    onOpenPluginError(plugin.name);
+                  }
                 }}
                 className={cn(
                   'group flex w-full items-start gap-2.5 rounded-lg px-3 py-2 text-left transition-colors',
-                  isClickable && 'hover:bg-sidebar-accent/60 cursor-pointer',
-                  !isClickable && 'cursor-default',
+                  'hover:bg-sidebar-accent/60 cursor-pointer',
                   isActive && 'bg-primary/10',
                 )}
               >

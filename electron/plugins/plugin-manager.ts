@@ -323,7 +323,7 @@ export class PluginManager {
       if (!existsSync(backendPath)) {
         console.warn(`[PluginManager] Plugin "${manifest.name}" missing backend.js - skipping`);
         instance.state = 'error';
-        instance.error = `Plugin backend not found: ${backendPath}. Please rebuild the plugin with 'npm run build'.`;
+        instance.error = `Plugin backend not found: ${backendPath}`;
         this.broadcastUIState();
         this.notifyToolsChanged();
         return;
