@@ -149,15 +149,15 @@ function extractMessageText(content: unknown): string {
 }
 
 function buildTitleGenerationInput(messages: unknown[]): string {
+  // Only include user messages — prevents weaker models from parroting assistant responses
   const normalized = messages
     .map((message) => {
       if (!message || typeof message !== 'object') return null;
       const typedMessage = message as { role?: string; content?: unknown };
-      const role = typedMessage.role === 'assistant' ? 'assistant' : typedMessage.role === 'user' ? 'user' : null;
-      if (!role) return null;
+      if (typedMessage.role !== 'user') return null;
       const text = extractMessageText(typedMessage.content);
       if (!text) return null;
-      return `${role}: ${text}`;
+      return `user: ${text}`;
     })
     .filter((line): line is string => Boolean(line))
     .slice(-8);

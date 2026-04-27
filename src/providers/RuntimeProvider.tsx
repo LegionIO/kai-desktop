@@ -933,9 +933,8 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       // Mark as generating — use patchConversation to avoid overwriting message data
       await patchConversation(conversationId, { titleStatus: 'generating' });
 
-      // Stagger the title request slightly so Bedrock is less likely to reject
-      // it when the main response request starts at the exact same moment.
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      // Brief stagger to avoid simultaneous requests hitting rate limits
+      await new Promise((resolve) => setTimeout(resolve, 100));
 
       const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined);
       if (result.title) {
@@ -1226,6 +1225,22 @@ export function RuntimeProvider({
     return true;
   }, []);
 
+  // On mount, clear stale runStatus for ALL conversations.
+  // If the app was closed while a stream was in progress, the persisted
+  // runStatus may still be 'running' even though no stream is active.
+  useEffect(() => {
+    (async () => {
+      try {
+        const allConvs = await app.conversations.list() as ConversationRecord[];
+        for (const conv of allConvs) {
+          if ((conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') && !streamAccumulators.has(conv.id)) {
+            await patchConversation(conv.id, { runStatus: 'idle' });
+          }
+        }
+      } catch { /* best-effort cleanup */ }
+    })();
+  }, []);
+
   // Load active conversation on mount
   useEffect(() => {
     (async () => {
@@ -1270,7 +1285,17 @@ export function RuntimeProvider({
     const timers = persistTimersRef.current;
     const existing = timers.get(conversationId);
     if (existing) clearTimeout(existing);
-    timers.set(conversationId, setTimeout(() => { timers.delete(conversationId); persistConversation(conversationId, t, h, extra); }, 300));
+    timers.set(conversationId, setTimeout(() => {
+      timers.delete(conversationId);
+      // Guard: if the stream has already ended (accumulator deleted), don't
+      // overwrite the terminal runStatus that the done/error handler persisted.
+      // This prevents a stale debounced persist (runStatus:'running') from
+      // racing with the immediate done-persist (runStatus:'idle').
+      if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
+        return;
+      }
+      persistConversation(conversationId, t, h, extra);
+    }, 300));
   }, []);
 
   const setCurrentWorkingDirectory = useCallback(async (cwd: string | null) => {

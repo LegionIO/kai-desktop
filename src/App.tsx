@@ -288,7 +288,7 @@ function clampSidebarWidth(width: number) {
 function getConversationDisplayTitle(
   conversation: Pick<ConversationRecord, 'title' | 'fallbackTitle'> | null,
   computerSessions?: ComputerSession[],
-) {
+): string | null {
   // Prefer chat-based titles
   const chatTitle = conversation?.title?.trim() || conversation?.fallbackTitle?.trim();
   if (chatTitle) return chatTitle;
@@ -302,7 +302,7 @@ function getConversationDisplayTitle(
     }
   }
 
-  return 'Untitled Chat';
+  return null;
 }
 
 function getComputerSessionForConversation(
@@ -365,7 +365,7 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 
 function AppShell() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
-  const [activeConversationTitle, setActiveConversationTitle] = useState('Untitled Thread');
+  const [activeConversationTitle, setActiveConversationTitle] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<AppView>('chat');
   const [threadMode, setThreadMode] = useState<ThreadMode>('chat');
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
@@ -480,7 +480,7 @@ function AppShell() {
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
-          setActiveConversationTitle('Untitled Thread');
+          setActiveConversationTitle(null);
         }
       }
     };
@@ -497,9 +497,9 @@ function AppShell() {
   }, []);
 
   // Update conversation title when computer-use sessions become available
-  // (sessions load async, so the title may initially be "Untitled Thread")
+  // (sessions load async, so the title may initially be null)
   useEffect(() => {
-    if (!activeConversationId || activeConversationTitle !== 'Untitled Thread') return;
+    if (!activeConversationId || activeConversationTitle !== null) return;
     const sessions = cuSessionsByConversation.get(activeConversationId);
     if (sessions?.length) {
       const goal = sessions[0].goal;
@@ -601,7 +601,7 @@ function AppShell() {
       ));
     } else {
       setActiveConversationId(null);
-      setActiveConversationTitle('Untitled Thread');
+      setActiveConversationTitle(null);
     }
   }, [cuSessionsByConversation]);
 
@@ -677,7 +677,7 @@ function AppShell() {
       await app.conversations.setActiveId(newId);
       setActiveView(CHAT_VIEW);
       setActiveConversationId(newId);
-      setActiveConversationTitle('Untitled Thread');
+      setActiveConversationTitle(null);
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
@@ -1331,7 +1331,7 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
-                ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
+                ) : activeConversationId && activeConversationTitle ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
                       <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
@@ -1356,7 +1356,7 @@ function AppShell() {
                         </DropdownMenu.Item>
                         <DropdownMenu.Item
                           className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => { setRenameValue(activeConversationTitle); setRenamingTitle(true); }}
+                          onSelect={() => { setRenameValue(activeConversationTitle ?? ''); setRenamingTitle(true); }}
                         >
                           <PencilIcon className="h-4 w-4 text-muted-foreground" />
                           <span>Rename</span>
@@ -1386,7 +1386,7 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
-                ) : activeConversationTitle !== 'Untitled Thread' ? (
+                ) : activeConversationTitle ? (
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>

@@ -51,7 +51,7 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
     if (goal) return goal.length > 50 ? goal.slice(0, 47).trimEnd() + '...' : goal;
   }
 
-  return 'Untitled Chat';
+  return '';
 }
 
 const TypingBubble: FC = () => (
@@ -540,7 +540,9 @@ export const ConversationList: FC<ConversationListProps> = ({
                         />
                       ) : (
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
-                        {getDisplayTitle(conv, sessionsByConversation.get(conv.id))}
+                        {getDisplayTitle(conv, sessionsByConversation.get(conv.id)) || (
+                          <span className="italic text-muted-foreground">New Chat</span>
+                        )}
                       </span>
                       )}
                       <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
