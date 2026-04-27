@@ -246,7 +246,7 @@ export const PluginMarketplace: FC = () => {
               return (
                 <div
                   key={plugin.name}
-                  className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
+                  className="flex items-start gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
                 >
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                     <PackageIcon className="h-4 w-4 text-primary" />
@@ -277,10 +277,7 @@ export const PluginMarketplace: FC = () => {
                         </span>
                       )}
                     </div>
-                    <p className="truncate text-[11px] text-muted-foreground">{plugin.description}</p>
-                    {plugin.error && (
-                      <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
-                    )}
+                    <p className="line-clamp-2 text-[11px] text-muted-foreground">{plugin.description}</p>
                   </div>
                   <div className="flex shrink-0 gap-2">
                     {hasUpdate && (
@@ -331,7 +328,7 @@ export const PluginMarketplace: FC = () => {
             {availableCatalog.map((entry) => (
               <div
                 key={entry.name}
-                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
+                className="flex items-start gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/50">
                   <PackageIcon className="h-4 w-4 text-muted-foreground" />
@@ -362,7 +359,7 @@ export const PluginMarketplace: FC = () => {
                       );
                     })()}
                   </div>
-                  <p className="truncate text-[11px] text-muted-foreground">{entry.description}</p>
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
                   {entry.tags && entry.tags.length > 0 && (
                     <div className="mt-1 flex gap-1">
                       {entry.tags.map((tag) => (

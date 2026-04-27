@@ -16,6 +16,9 @@ pnpm-lock.yaml
 # Debug logs written during development (see CLAUDE.md § Debug Logging)
 debug-logs/
 
+# Local branding overrides (developer-specific, not committed)
+branding.config.local.ts
+
 # Auto-generated from electron-builder.template.yml by scripts/generate-builder-config.ts
 electron-builder.yml
 

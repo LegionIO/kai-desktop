@@ -38,6 +38,32 @@ export function getPluginComponent(
   return registry.get(pluginName)?.get(componentName) ?? null;
 }
 
+export function getPluginComponentByHint(
+  pluginName: string,
+  preferred: string,
+  hints: string[],
+  fuzzyKeyword?: string,
+): PluginComponent | null {
+  const pluginMap = registry.get(pluginName);
+  if (!pluginMap || pluginMap.size === 0) return null;
+  // 1. Exact match on preferred name
+  const exact = pluginMap.get(preferred);
+  if (exact) return exact;
+  // 2. Try hint names (case-insensitive)
+  for (const hint of hints) {
+    const lower = hint.toLowerCase();
+    for (const [key, component] of pluginMap) {
+      if (key.toLowerCase() === lower) return component;
+    }
+  }
+  // 3. Fuzzy: find any component whose name contains the keyword (case-insensitive)
+  const keyword = (fuzzyKeyword ?? preferred).toLowerCase();
+  for (const [key, component] of pluginMap) {
+    if (key.toLowerCase().includes(keyword)) return component;
+  }
+  return null;
+}
+
 export function hasPluginComponents(pluginName: string): boolean {
   return registry.has(pluginName) && (registry.get(pluginName)?.size ?? 0) > 0;
 }

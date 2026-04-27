@@ -168,7 +168,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             return (
               <div
                 key={plugin.name}
-                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
+                className="flex items-start gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                   <PackageIcon className="h-4 w-4 text-primary" />
@@ -212,7 +212,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                       </span>
                     )}
                   </div>
-                  <p className="truncate text-[11px] text-muted-foreground">
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">
                     {plugin.description}
                   </p>
                   {plugin.error && (

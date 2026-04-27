@@ -11,7 +11,6 @@ import { useConversationPreferences } from './useConversationPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
-import { usePlugins } from '@/providers/PluginProvider';
 import { Tooltip } from '@/components/ui/Tooltip';
 
 type ConversationSummary = Pick<
@@ -89,6 +88,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   onDeleteConversation: _onDeleteConversation,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [, setDeletingId] = useState<string | null>(null);
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
@@ -107,8 +107,6 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [exportConvId, setExportConvId] = useState<string | null>(null);
-  const { uiState: pluginUIState } = usePlugins();
-  const conversationDecorations = pluginUIState?.conversationDecorations ?? [];
 
   const togglePin = useCallback((id: string) => {
     setPinnedIds((prev) => {
@@ -182,6 +180,7 @@ export const ConversationList: FC<ConversationListProps> = ({
 
         return list;
       });
+      setHasLoaded(true);
     } catch {
       // IPC not ready
     }
@@ -369,7 +368,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     setBulkDeleteOpen(false);
   };
 
-  const isNewChat = !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
+  const isNewChat = hasLoaded && !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
 
   return (
     <div className="flex flex-col h-full">
@@ -431,18 +430,17 @@ export const ConversationList: FC<ConversationListProps> = ({
               <ArchiveIcon className="h-4 w-4" />
             </button>
           </Tooltip>
-          {processedConversations.length > 0 && (
-            <Tooltip content={isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats'} side="bottom" sideOffset={6}>
-              <button
-                type="button"
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={() => setBulkDeleteOpen(true)}
-                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-destructive"
-              >
-                <Trash2Icon className="h-4 w-4" />
-              </button>
-            </Tooltip>
-          )}
+          <Tooltip content={processedConversations.length > 0 ? (isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats') : 'No chats to delete'} side="bottom" sideOffset={6}>
+            <button
+              type="button"
+              disabled={processedConversations.length === 0}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setBulkDeleteOpen(true)}
+              className={`rounded-md p-1.5 transition-colors ${processedConversations.length > 0 ? 'hover:bg-sidebar-accent/80 hover:text-destructive' : 'opacity-30 cursor-default'}`}
+            >
+              <Trash2Icon className="h-4 w-4" />
+            </button>
+          </Tooltip>
           {sortOpen && (
             <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortButtonRef} />
           )}
@@ -504,7 +502,6 @@ export const ConversationList: FC<ConversationListProps> = ({
                 const isRemoving = removingIds.has(conv.id);
                 const computerStatus = getComputerStatus(conv.id);
                 const isPinned = pinnedIds.has(conv.id);
-                const decorations = conversationDecorations.filter((decoration) => decoration.visible && decoration.conversationId === conv.id);
 
                 return (
                   <div
@@ -545,26 +542,6 @@ export const ConversationList: FC<ConversationListProps> = ({
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
                         {getDisplayTitle(conv, sessionsByConversation.get(conv.id))}
                       </span>
-                      )}
-                      {decorations.length > 0 && (
-                        <div className="mt-1 flex flex-wrap gap-1">
-                          {decorations.slice(0, 3).map((decoration) => (
-                            <span
-                              key={`${decoration.pluginName}-${decoration.id}`}
-                              className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                                decoration.variant === 'error'
-                                  ? 'bg-red-500/10 text-red-600 dark:text-red-300'
-                                  : decoration.variant === 'warning'
-                                    ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                                    : decoration.variant === 'success'
-                                      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                                      : 'bg-blue-500/10 text-blue-700 dark:text-blue-300'
-                              }`}
-                            >
-                              {decoration.label}
-                            </span>
-                          ))}
-                        </div>
                       )}
                       <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
                         {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
