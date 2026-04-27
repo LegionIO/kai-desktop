@@ -99,6 +99,7 @@ export const branding = {
   // ── Marketplace ───────────────────────────────────────────────────────
   /** Raw JSON URLs for plugin marketplace catalogs. Enterprise URLs listed first win on name collisions. */
   marketplaceUrls: [
+    'https://kai.s3api-core.optum.com/marketplace.json',
     'https://raw.githubusercontent.com/LegionIO/kai-plugin-marketplace/refs/heads/main/marketplace.json',
   ] as ReadonlyArray<string>,
 } as const;
