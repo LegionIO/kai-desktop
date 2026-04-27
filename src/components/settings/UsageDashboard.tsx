@@ -5,7 +5,7 @@ import { app } from '@/lib/ipc-client';
 import { UsageSummaryCards } from './usage/UsageSummaryCards';
 import { UsageTimeSeriesChart } from './usage/UsageTimeSeriesChart';
 import { UsageModelBreakdown } from './usage/UsageModelBreakdown';
-import { UsageConversationTable } from './usage/UsageConversationTable';
+import { UsageChatTable } from './usage/UsageChatTable';
 import { UsageModalityBreakdown } from './usage/UsageModalityBreakdown';
 
 type Period = 'daily' | 'weekly' | 'monthly';
@@ -168,8 +168,8 @@ export const UsageDashboard: FC<SettingsProps> = () => {
           {/* Model Breakdown */}
           <UsageModelBreakdown data={modelData as never[]} />
 
-          {/* Conversation Table */}
-          <UsageConversationTable
+          {/* Chat Table */}
+          <UsageChatTable
             conversations={conversations as never[]}
             total={convTotal}
             offset={convOffset}

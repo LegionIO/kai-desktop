@@ -75,11 +75,11 @@ import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSessio
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
 
-export type ThreadMode = 'chat' | 'computer';
+export type ChatMode = 'chat' | 'computer';
 
-export const Thread: FC<{
-  mode: ThreadMode;
-  onChangeMode: (mode: ThreadMode) => void;
+export const ChatThread: FC<{
+  mode: ChatMode;
+  onChangeMode: (mode: ChatMode) => void;
   selectedModelKey: string | null;
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -94,7 +94,7 @@ export const Thread: FC<{
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
-  const activeConversationId = useActiveConversationId();
+  const _activeChatId = useActiveChatId();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
   useEffect(() => {
@@ -192,24 +192,24 @@ export const Thread: FC<{
   );
 };
 
-function useActiveConversationId(): string | null {
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+function useActiveChatId(): string | null {
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     app.conversations.getActiveId()
       .then((id) => {
-        if (!cancelled) setActiveConversationId(id as string | null);
+        if (!cancelled) setActiveChatId(id as string | null);
       })
       .catch(() => {
-        if (!cancelled) setActiveConversationId(null);
+        if (!cancelled) setActiveChatId(null);
       });
 
     const unsubscribe = app.conversations.onChanged((store) => {
       const payload = store as { activeConversationId?: string | null } | null;
       if (!cancelled) {
-        setActiveConversationId(payload?.activeConversationId ?? null);
+        setActiveChatId(payload?.activeConversationId ?? null);
       }
     });
 
@@ -219,21 +219,21 @@ function useActiveConversationId(): string | null {
     };
   }, []);
 
-  return activeConversationId;
+  return activeChatId;
 }
 
 function getActiveComputerSession(
-  conversationId: string | null,
-  sessionsByConversation: Map<string, ComputerSession[]>,
+  chatId: string | null,
+  sessionsByChat: Map<string, ComputerSession[]>,
 ): ComputerSession | undefined {
-  if (!conversationId) return undefined;
-  return sessionsByConversation.get(conversationId)?.[0];
+  if (!chatId) return undefined;
+  return sessionsByChat.get(chatId)?.[0];
 }
 
 const ComputerTabSurface: FC = () => {
-  const activeConversationId = useActiveConversationId();
-  const { sessionsByConversation } = useComputerUse();
-  const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
+  const activeChatId = useActiveChatId();
+  const { sessionsByChat } = useComputerUse();
+  const activeComputerSession = getActiveComputerSession(activeChatId, sessionsByChat);
 
   if (!activeComputerSession) {
     return (
@@ -243,9 +243,9 @@ const ComputerTabSurface: FC = () => {
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
-                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Chat'}</div>
+                <div className="mt-3 text-sm font-medium">{activeChatId ? 'No Active Session' : 'Select a Chat'}</div>
                 <p className="mt-1.5 text-xs text-muted-foreground">
-                  {activeConversationId
+                  {activeChatId
                     ? 'Configure a goal and start a session using the controls below.'
                     : 'Choose or create a chat from the sidebar first.'}
                 </p>
@@ -433,12 +433,12 @@ function pickBackground(): FC {
 }
 
 /**
- * Randomly selected background for the empty thread state.
+ * Randomly selected background for the empty chat state.
  * Never repeats the same background consecutively.
  *
  * Background is selected once on mount via useState initializer.
  * FadingSplash unmounts children when fading out (visible=false),
- * so each new empty thread triggers a fresh mount and a new pick.
+ * so each new empty chat triggers a fresh mount and a new pick.
  *
  * The last-shown index is persisted in sessionStorage so it survives
  * HMR and component remounts. The write happens in a useEffect (not during
@@ -475,7 +475,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
   const [visible, setVisible] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
-  // Subscribe to thread messages and extract last user message content
+  // Subscribe to chat messages and extract last user message content
   useEffect(() => {
     const update = () => {
       const msgs = threadRuntime.getState().messages;
@@ -635,11 +635,11 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
 };
 
 /**
- * Wrapper that fades the splash IN (500ms) when the thread is empty,
+ * Wrapper that fades the splash IN (500ms) when the chat is empty,
  * then fades it OUT (300ms) when the first message is sent.
  *
  * When `visible` is false, children are unmounted (returned null).
- * This means EmptyThreadBackground remounts on each new empty thread,
+ * This means EmptyThreadBackground remounts on each new empty chat,
  * triggering a fresh pickBackground() via its useState initializer.
  */
 const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
@@ -649,7 +649,7 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
   const [fadedIn, setFadedIn] = useState(false);
   const fadingOutRef = useRef(false);
 
-  // Reset visibility when threadRuntime identity changes (thread switch)
+  // Reset visibility when threadRuntime identity changes (chat switch)
   useEffect(() => {
     const msgs = threadRuntime.getState().messages;
     if (msgs.length === 0) {
@@ -672,7 +672,7 @@ const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
     return threadRuntime.subscribe(() => {
       const msgs = threadRuntime.getState().messages;
       if (msgs.length > 0 && !fadingOutRef.current) {
-        // When loading an existing thread (many messages appear at once),
+        // When loading an existing chat (many messages appear at once),
         // hide the splash instantly to avoid a visible overlay during the
         // scroll-to-bottom positioning. Only use the gradual fade when a
         // single message is sent in a new conversation.
@@ -1821,8 +1821,8 @@ const CallButton: FC = () => {
 };
 
 const Composer: FC<{
-  mode: ThreadMode;
-  onChangeMode: (mode: ThreadMode) => void;
+  mode: ChatMode;
+  onChangeMode: (mode: ChatMode) => void;
   selectedModelKey: string | null;
   onSelectModel: (key: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -1838,8 +1838,8 @@ const Composer: FC<{
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
-  const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
-  const activeConversationId = useActiveConversationId();
+  const { sessionsByChat, startSession, continueSession, sendGuidance } = useComputerUse();
+  const activeChatId = useActiveChatId();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
 
   // Computer-use inline toggle state
@@ -1916,7 +1916,7 @@ const Composer: FC<{
     return () => window.removeEventListener('pointerdown', handler);
   }, [cwdPopoverOpen]);
 
-  const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
+  const activeComputerSession = getActiveComputerSession(activeChatId, sessionsByChat);
   const showComputerSetup = shouldShowComputerSetup(activeComputerSession);
 
   useEffect(() => {
@@ -1990,7 +1990,7 @@ const Composer: FC<{
     if (!composerText.trim() && attachments.length === 0) return;
 
     if (computerUseToggled && mode === 'chat' && composerText.trim()) {
-      if (!activeConversationId) return;
+      if (!activeChatId) return;
       setIsStartingComputerSession(true);
 
       // Active non-terminal session → send guidance
@@ -2008,7 +2008,7 @@ const Composer: FC<{
       const promise = canContinue
         ? continueSession(activeComputerSession.id, composerText.trim())
         : startSession(composerText.trim(), {
-            conversationId: activeConversationId,
+            conversationId: activeChatId,
             target: computerTarget,
             surface: 'docked',
             approvalMode: computerApprovalMode,
@@ -2029,7 +2029,7 @@ const Composer: FC<{
     composerRuntime.send();
   }, [
     attachments.length, composerRuntime, composerText, computerUseToggled, mode,
-    activeConversationId, activeComputerSession, startSession, continueSession, sendGuidance,
+    activeChatId, activeComputerSession, startSession, continueSession, sendGuidance,
     computerTarget, computerApprovalMode, selectedModelKey, selectedProfileKey,
     fallbackEnabled, reasoningEffort,
   ]);
@@ -2101,7 +2101,7 @@ const Composer: FC<{
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel
-                  conversationId={activeConversationId}
+                  conversationId={activeChatId}
                   selectedModelKey={selectedModelKey}
                   onSelectModel={onSelectModel}
                   reasoningEffort={reasoningEffort}
@@ -2111,7 +2111,7 @@ const Composer: FC<{
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={onToggleFallback}
                   activeComputerSession={activeComputerSession}
-                  onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
+                  onOpenPopout={() => { void app.computerUse.openSetupWindow(activeChatId ?? undefined); }}
                   renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
                     <DictationButton
                       onListeningChange={onDictatingChange}

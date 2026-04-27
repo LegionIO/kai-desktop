@@ -6,7 +6,7 @@ import { join } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 
-type ConversationRecord = {
+type ChatRecord = {
   id: string;
   title: string | null;
   fallbackTitle: string | null;
@@ -33,8 +33,8 @@ type ConversationRecord = {
   metadata?: Record<string, unknown>;
 };
 
-type ConversationsStore = {
-  conversations: Record<string, ConversationRecord>;
+type ChatsStore = {
+  conversations: Record<string, ChatRecord>;
   activeConversationId: string | null;
   settings: Record<string, unknown>;
 };
@@ -43,19 +43,20 @@ function getStorePath(appHome: string): string {
   return join(appHome, 'data', 'conversations.json');
 }
 
-export function readConversationStore(appHome: string): ConversationsStore {
+export function readChatStore(appHome: string): ChatsStore {
   const storePath = getStorePath(appHome);
   if (!existsSync(storePath)) {
     return { conversations: {}, activeConversationId: null, settings: {} };
   }
   try {
-    return JSON.parse(readFileSync(storePath, 'utf-8'));
+    const raw = JSON.parse(readFileSync(storePath, 'utf-8'));
+    return raw;
   } catch {
     return { conversations: {}, activeConversationId: null, settings: {} };
   }
 }
 
-export function writeConversationStore(appHome: string, store: ConversationsStore): void {
+export function writeChatStore(appHome: string, store: ChatsStore): void {
   const storePath = getStorePath(appHome);
   const dir = join(appHome, 'data');
   if (!existsSync(dir)) {
@@ -64,7 +65,7 @@ export function writeConversationStore(appHome: string, store: ConversationsStor
   writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf-8');
 }
 
-export function broadcastConversationChange(store: ConversationsStore): void {
+export function broadcastChatChange(store: ChatsStore): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('conversations:changed', store);
   }
@@ -73,18 +74,18 @@ export function broadcastConversationChange(store: ConversationsStore): void {
 
 export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, getConfig?: () => AppConfig): void {
   ipcMain.handle('conversations:list', () => {
-    const store = readConversationStore(appHome);
-    const conversations = Object.values(store.conversations);
+    const store = readChatStore(appHome);
+    const chats = Object.values(store.conversations);
     // Sort by most recent activity
-    conversations.sort((a, b) => {
+    chats.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
       return bAt.localeCompare(aAt);
     });
     // Add computed metadata for client-side filtering
-    return conversations.map((conv) => ({
-      ...conv,
-      hasToolCalls: Array.isArray(conv.messages) && conv.messages.some(
+    return chats.map((chat) => ({
+      ...chat,
+      hasToolCalls: Array.isArray(chat.messages) && chat.messages.some(
         (msg: unknown) => {
           const m = msg as Record<string, unknown>;
           return Array.isArray(m.content) && (m.content as Array<Record<string, unknown>>).some(
@@ -96,56 +97,56 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   });
 
   ipcMain.handle('conversations:get', (_event, id: string) => {
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
     return store.conversations[id] ?? null;
   });
 
-  ipcMain.handle('conversations:put', (_event, conversation: ConversationRecord) => {
-    const store = readConversationStore(appHome);
-    const tree = Array.isArray(conversation.messageTree) ? conversation.messageTree : [];
-    const prev = store.conversations[conversation.id];
+  ipcMain.handle('conversations:put', (_event, chat: ChatRecord) => {
+    const store = readChatStore(appHome);
+    const tree = Array.isArray(chat.messageTree) ? chat.messageTree : [];
+    const prev = store.conversations[chat.id];
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
     // Guard: never allow a write that would lose messages compared to what's on disk.
     // If the incoming tree is shorter than the stored tree, preserve the stored message data
     // and only apply non-message field updates. This protects against stale-closure races
     // where title generation, settings persistence, or debounced persists write back
-    // an older snapshot of the conversation.
+    // an older snapshot of the chat.
     if (prev && prevTreeLen > 0 && tree.length < prevTreeLen) {
       const guarded = {
-        ...conversation,
+        ...chat,
         messages: prev.messages,
         messageTree: prev.messageTree,
         headId: prev.headId,
         messageCount: prev.messageCount,
         userMessageCount: prev.userMessageCount,
       };
-      store.conversations[conversation.id] = guarded;
-      writeConversationStore(appHome, store);
-      broadcastConversationChange(store);
+      store.conversations[chat.id] = guarded;
+      writeChatStore(appHome, store);
+      broadcastChatChange(store);
       return { ok: true };
     }
 
-    store.conversations[conversation.id] = conversation;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    store.conversations[chat.id] = chat;
+    writeChatStore(appHome, store);
+    broadcastChatChange(store);
     return { ok: true };
   });
 
   ipcMain.handle('conversations:delete', (_event, id: string) => {
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
     delete store.conversations[id];
     if (store.activeConversationId === id) {
       store.activeConversationId = null;
     }
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(appHome, store);
+    broadcastChatChange(store);
 
     // Clean up associated computer-use sessions
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
-        manager.removeSessionsByConversation(id);
+        manager.removeSessionsByChat(id);
       } catch {
         // Computer-use module may not be initialized yet — safe to ignore
       }
@@ -155,14 +156,14 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   });
 
   ipcMain.handle('conversations:clear', () => {
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
 
     // Clean up all computer-use sessions
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
-        for (const conversationId of Object.keys(store.conversations)) {
-          manager.removeSessionsByConversation(conversationId);
+        for (const chatId of Object.keys(store.conversations)) {
+          manager.removeSessionsByChat(chatId);
         }
       } catch {
         // Safe to ignore
@@ -171,21 +172,21 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
     store.conversations = {};
     store.activeConversationId = null;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(appHome, store);
+    broadcastChatChange(store);
     return { ok: true };
   });
 
   ipcMain.handle('conversations:get-active-id', () => {
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
     return store.activeConversationId;
   });
 
   ipcMain.handle('conversations:set-active-id', (_event, id: string) => {
-    const store = readConversationStore(appHome);
+    const store = readChatStore(appHome);
     store.activeConversationId = id;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(appHome, store);
+    broadcastChatChange(store);
     return { ok: true };
   });
 }

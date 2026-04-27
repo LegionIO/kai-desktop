@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useLayoutEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckIcon, ArrowUpIcon, ArrowDownIcon } from 'lucide-react';
-import type { SortPreference, SortField, SortDirection } from './useConversationPreferences';
+import type { SortPreference, SortField, SortDirection } from './useChatPreferences';
 
 type SortPopoverProps = {
   sort: SortPreference;

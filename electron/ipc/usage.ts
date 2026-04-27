@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { dialog } from 'electron';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { readConversationStore } from './conversations.js';
+import { readChatStore } from './conversations.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ type ConvRecord = {
 };
 
 function getConversationMeta(appHome: string): Map<string, ConversationMeta> {
-  const store = readConversationStore(appHome);
+  const store = readChatStore(appHome);
   const meta = new Map<string, ConversationMeta>();
 
   for (const conv of Object.values(store.conversations) as ConvRecord[]) {

@@ -18,7 +18,7 @@ declare const __BRAND_ASSISTANT_NAME: string;
 declare const __BRAND_COMPOSER_PLACEHOLDER: string;
 declare const __BRAND_DROP_ZONE_TEXT: string;
 declare const __BRAND_ERROR_BOUNDARY_TEXT: string;
-declare const __BRAND_SIDEBAR_SECTION_THREADS: string;
+declare const __BRAND_SIDEBAR_SECTION_CHATS: string;
 declare const __BRAND_SIDEBAR_SECTION_PLUGINS: string;
 
 // ── Protocol & machine IDs ────────────────────────────────────────────────

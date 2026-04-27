@@ -174,7 +174,7 @@ export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
           <select className={settingsSelectClass} value={memory.workingMemory.scope} onChange={(e) => updateConfig('memory.workingMemory.scope', e.target.value)}>
             <option value="resource">Resource (cross-chat)</option>
-            <option value="thread">Thread (per-chat)</option>
+            <option value="thread">Per-chat</option>
           </select>
         </div>
         <p className="text-[10px] text-muted-foreground">Working memory stores user preferences and key facts. "Resource" scope shares across all chats.</p>
@@ -187,7 +187,7 @@ export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
           <select className={settingsSelectClass} value={memory.observationalMemory.scope} onChange={(e) => updateConfig('memory.observationalMemory.scope', e.target.value)}>
             <option value="resource">Resource (cross-chat)</option>
-            <option value="thread">Thread (per-chat)</option>
+            <option value="thread">Per-chat</option>
           </select>
         </div>
         <p className="text-[10px] text-muted-foreground">AI-generated observations about patterns and preferences. Best with "resource" scope for cross-chat learning.</p>

@@ -34,7 +34,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { readChatStore, writeChatStore, broadcastChatChange } from '../ipc/conversations.js';
 
 type PluginAPICallbacks = {
   appHome: string;
@@ -1073,36 +1073,36 @@ export function createPluginAPI(
 
   api.conversations.list = () => {
     requirePermission('conversations:read');
-    const store = readConversationStore(callbacks.appHome);
+    const store = readChatStore(callbacks.appHome);
     return Object.values(store.conversations) as PluginConversationRecord[];
   };
 
   api.conversations.get = (conversationId: string) => {
     requirePermission('conversations:read');
-    const store = readConversationStore(callbacks.appHome);
+    const store = readChatStore(callbacks.appHome);
     return (store.conversations[conversationId] as PluginConversationRecord | undefined) ?? null;
   };
 
   api.conversations.upsert = (conversation: PluginConversationRecord) => {
     requirePermission('conversations:write');
-    const store = readConversationStore(callbacks.appHome);
+    const store = readChatStore(callbacks.appHome);
     const normalizedConversation = normalizeConversationRecord(conversation);
     store.conversations[conversation.id] = normalizedConversation as unknown as typeof store.conversations[string];
-    writeConversationStore(callbacks.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(callbacks.appHome, store);
+    broadcastChatChange(store);
   };
 
   api.conversations.getActiveId = () => {
     requirePermission('conversations:read');
-    return readConversationStore(callbacks.appHome).activeConversationId;
+    return readChatStore(callbacks.appHome).activeConversationId;
   };
 
   api.conversations.setActive = (conversationId: string) => {
     requirePermission('conversations:write');
-    const store = readConversationStore(callbacks.appHome);
+    const store = readChatStore(callbacks.appHome);
     store.activeConversationId = conversationId;
-    writeConversationStore(callbacks.appHome, store);
-    broadcastConversationChange(store);
+    writeChatStore(callbacks.appHome, store);
+    broadcastChatChange(store);
     callbacks.openNavigationTarget({ type: 'conversation', conversationId });
   };
 

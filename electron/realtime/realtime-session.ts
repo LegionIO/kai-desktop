@@ -1051,7 +1051,7 @@ export class RealtimeSession {
     broadcastToWebClients('realtime:event', event);
   }
 
-  /** Broadcast on the agent:stream-event channel (for RuntimeProvider/thread integration) */
+  /** Broadcast on the agent:stream-event channel (for RuntimeProvider/chat integration) */
   private broadcastStreamEvent(event: RealtimeStreamEvent): void {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send('agent:stream-event', event);

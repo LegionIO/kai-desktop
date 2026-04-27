@@ -143,9 +143,9 @@ export async function buildRealtimeMemoryContext(
       const maxMessages = memoryConfig.conversationHistory.maxMessages || 20;
       console.info(`[RealtimeContext] Fetching conversation history (max ${maxMessages} messages)...`);
 
-      // First try to get the thread to verify it exists in Mastra storage
+      // First try to verify the chat exists in Mastra storage
       const thread = await memory.getThreadById({ threadId: conversationId });
-      console.info(`[RealtimeContext] Thread lookup: ${thread ? `found (title="${thread.title}")` : 'NOT FOUND'}`);
+      console.info(`[RealtimeContext] Chat lookup: ${thread ? `found (title="${thread.title}")` : 'NOT FOUND'}`);
 
       if (thread) {
         const result = await memory.recall({
@@ -182,8 +182,8 @@ export async function buildRealtimeMemoryContext(
           }
         }
       } else {
-        // Thread not in Mastra storage — try reading from conversations.json directly
-        console.info('[RealtimeContext] Thread not found in Mastra storage — falling back to conversations store');
+        // Chat not in Mastra storage — try reading from conversations.json directly
+        console.info('[RealtimeContext] Chat not found in Mastra storage — falling back to conversations store');
         try {
           const { readFileSync, existsSync } = await import('fs');
           const { join, dirname } = await import('path');
