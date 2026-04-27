@@ -41,6 +41,10 @@ export const branding = {
   dropZoneText: 'Drop files for {{productName}}',
   /** Heading shown in the error boundary fallback UI. */
   errorBoundaryText: '{{productName}} encountered an error',
+  /** Sidebar section label for the chats/conversations tab. */
+  sidebarSectionThreads: 'Chats',
+  /** Sidebar section label for the plugins/extensions tab. */
+  sidebarSectionPlugins: 'Plugins',
 
   // ── Protocol & machine IDs ────────────────────────────────────────────
   /** Custom Electron protocol scheme for serving generated media (e.g. "kai-media://"). */

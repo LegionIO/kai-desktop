@@ -360,12 +360,12 @@ export const RealtimeSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
       <div className="space-y-3 border-t border-border/50 pt-4">
         <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Memory Context</h4>
         <p className="text-[10px] text-muted-foreground/60">
-          Include conversation memory in the call context so the AI has awareness of prior messages,
+          Include chat memory in the call context so the AI has awareness of prior messages,
           user preferences, and relevant history. Uses part of the 32k context budget.
         </p>
 
         <Toggle
-          label="Include conversation memory in call context"
+          label="Include chat memory in call context"
           checked={memoryCtx?.enabled ?? true}
           onChange={(v) => updateConfig('realtime.memoryContext.enabled', v)}
         />
@@ -385,7 +385,7 @@ export const RealtimeSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
               <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Memory Types</h4>
 
               <Toggle
-                label="Recent conversation history"
+                label="Recent chat history"
                 checked={memoryCtx?.conversationHistory?.enabled ?? true}
                 onChange={(v) => updateConfig('realtime.memoryContext.conversationHistory.enabled', v)}
               />

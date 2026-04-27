@@ -18,11 +18,7 @@ import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { UsageDashboard } from './UsageDashboard';
 import { WebServerSettings } from './WebServerSettings';
-import { PluginMarketplace } from './PluginMarketplace';
 import type { SettingsProps } from './shared';
-import { usePluginSettingsSections } from '@/components/plugins/PluginSettingsSections';
-import { getPluginComponent } from '@/components/plugins/PluginComponentRegistry';
-import { usePlugins } from '@/providers/PluginProvider';
 
 type SettingsSection =
   | 'models'
@@ -40,7 +36,6 @@ type SettingsSection =
   | 'media-generation'
   | 'computer-use'
   | 'web-server'
-  | 'plugins-marketplace'
   | 'advanced'
   | 'usage';
 
@@ -60,33 +55,13 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'web-server', label: 'Web UI' },
-  { key: 'plugins-marketplace', label: 'Plugins' },
   { key: 'advanced', label: 'Advanced' },
   { key: 'usage', label: 'Usage' },
 ];
 
-export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string | null; onSectionHandled?: () => void }> = ({ onClose, requestedPlugin, onSectionHandled }) => {
+export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   const { config, updateConfig } = useConfig();
-  const pluginSections = usePluginSettingsSections();
-  const {
-    setPluginConfig,
-    sendAction,
-    getResolvedPluginConfig,
-    getPluginState,
-    getPluginStatus,
-    getPluginError,
-    hasRendererScript,
-    getPluginRendererStatus,
-    getPluginRendererError,
-  } = usePlugins();
-  const sortedPluginSections = [...pluginSections].sort((a, b) => a.priority - b.priority);
-  const hasPluginSections = sortedPluginSections.length > 0;
-
-  // Compute initial section synchronously to avoid flicker
-  const initialSection = requestedPlugin
-    ? (sortedPluginSections.find((s) => s.pluginName === requestedPlugin)?.key ?? 'models')
-    : 'models';
-  const [activeSection, setActiveSection] = useState<string>(initialSection);
+  const [activeSection, setActiveSection] = useState<SettingsSection>('models');
 
   const navRef = useRef<HTMLDivElement>(null);
 
@@ -97,10 +72,6 @@ export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string |
     const active = nav.querySelector('[data-active="true"]') as HTMLElement | null;
     active?.scrollIntoView({ block: 'nearest' });
   }, [activeSection]);
-
-  useEffect(() => {
-    onSectionHandled?.();
-  }, [onSectionHandled]);
 
   useEffect(() => {
     const handler = () => onClose();
@@ -136,34 +107,6 @@ export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string |
               <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
             </button>
           ))}
-
-          {hasPluginSections && (
-            <>
-              <div className="hidden items-center gap-2 px-1 pb-1 pt-3 md:flex">
-                <div className="h-px flex-1 bg-border" />
-                <span className="whitespace-nowrap text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                  Plugin Settings
-                </span>
-                <div className="h-px flex-1 bg-border" />
-              </div>
-              {sortedPluginSections.map((section) => (
-                <button
-                  key={section.key}
-                  type="button"
-                  data-active={activeSection === section.key}
-                  onClick={() => setActiveSection(section.key)}
-                  className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-2xl px-3 py-2 text-xs font-medium transition-all md:w-full ${
-                    activeSection === section.key
-                      ? 'bg-primary text-primary-foreground shadow-[0_12px_28px_var(--brand-accent-glow)]'
-                      : 'text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-                  }`}
-                >
-                  {section.label}
-                  <ChevronRightIcon className="ml-auto hidden h-3 w-3 opacity-50 md:block" />
-                </button>
-              ))}
-            </>
-          )}
         </div>
       </div>
 
@@ -183,57 +126,8 @@ export const SettingsPanel: FC<{ onClose: () => void; requestedPlugin?: string |
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'plugins-marketplace' && <PluginMarketplace />}
         {activeSection === 'advanced' && <AdvancedSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
-
-        {pluginSections.map((pluginSection) => {
-          if (activeSection !== pluginSection.key) return null;
-          const Component = getPluginComponent(pluginSection.pluginName, 'SettingsView');
-          const pluginStatus = getPluginStatus(pluginSection.pluginName);
-          const pluginError = getPluginError(pluginSection.pluginName);
-          const rendererStatus = getPluginRendererStatus(pluginSection.pluginName);
-          const rendererError = getPluginRendererError(pluginSection.pluginName);
-          const waitingForRenderer = !Component && (
-            pluginStatus === 'loading'
-            || (hasRendererScript(pluginSection.pluginName) && rendererStatus !== 'error')
-          );
-
-          if (!Component) {
-            if (waitingForRenderer) {
-              return (
-                <div key={pluginSection.key} className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
-                  Loading plugin settings for "{pluginSection.pluginName}"...
-                </div>
-              );
-            }
-            if (pluginError || rendererError) {
-              return (
-                <div key={pluginSection.key} className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
-                  Failed to load the plugin UI for "{pluginSection.pluginName}": {pluginError || rendererError}
-                </div>
-              );
-            }
-            return null;
-          }
-
-          return (
-            <Component
-              key={pluginSection.key}
-              pluginName={pluginSection.pluginName}
-              config={config}
-              updateConfig={updateConfig}
-              pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
-              pluginState={getPluginState(pluginSection.pluginName)}
-              onAction={(action: string, data?: unknown) => {
-                sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
-              }}
-              setPluginConfig={async (path, value) => {
-                await setPluginConfig(pluginSection.pluginName, path, value);
-              }}
-            />
-          );
-        })}
       </div>
     </div>
   );

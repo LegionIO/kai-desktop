@@ -320,7 +320,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
         value={computerGoal}
         onChange={(event) => setComputerGoal(event.target.value)}
         onKeyDown={handleGoalKeyDown}
-        placeholder={!conversationId ? 'Select a conversation first...' : isDictating ? 'Listening...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
+        placeholder={!conversationId ? 'Select a chat first...' : isDictating ? 'Listening...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
         disabled={!conversationId}
         rows={2}
         className="w-full resize-none bg-transparent px-1 py-0.5 text-base md:text-[15px] outline-none placeholder:text-muted-foreground/50 disabled:cursor-not-allowed disabled:opacity-50"
@@ -360,7 +360,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           type="button"
           onClick={handleStart}
           disabled={!canStart}
-          title={!conversationId ? 'Select a conversation first' : !computerGoal.trim() ? 'Enter a goal first' : isStartingComputerSession ? (canContinue ? 'Resuming...' : 'Starting...') : canContinue ? 'Continue session' : 'Start computer session'}
+          title={!conversationId ? 'Select a chat first' : !computerGoal.trim() ? 'Enter a goal first' : isStartingComputerSession ? (canContinue ? 'Resuming...' : 'Starting...') : canContinue ? 'Continue session' : 'Start computer session'}
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
         >
           {isStartingComputerSession ? (

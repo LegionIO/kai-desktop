@@ -9,12 +9,12 @@ function lucideIconByName(name: string): ReactNode {
     .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
     .join('') + 'Icon';
   const Icon = (LucideIcons as Record<string, unknown>)[componentName] as React.ComponentType<{ className?: string }> | undefined;
-  if (Icon) return <Icon className="h-[18px] w-[18px]" />;
-  return <PuzzleIcon className="h-[18px] w-[18px]" />;
+  if (Icon) return <Icon className="h-4 w-4" />;
+  return <PuzzleIcon className="h-4 w-4" />;
 }
 
 export function getPluginNavigationIcon(icon?: { lucide: string } | { svg: string }): ReactNode {
-  if (!icon) return <PuzzleIcon className="h-[18px] w-[18px]" />;
+  if (!icon) return <PuzzleIcon className="h-4 w-4" />;
 
   if ('lucide' in icon) {
     return lucideIconByName(icon.lucide);
@@ -23,11 +23,11 @@ export function getPluginNavigationIcon(icon?: { lucide: string } | { svg: strin
   if ('svg' in icon) {
     return (
       <span
-        className="inline-flex h-[18px] w-[18px] items-center justify-center [&>svg]:h-full [&>svg]:w-full"
+        className="inline-flex h-4 w-4 items-center justify-center [&>svg]:h-full [&>svg]:w-full"
         dangerouslySetInnerHTML={{ __html: icon.svg }}
       />
     );
   }
 
-  return <PuzzleIcon className="h-[18px] w-[18px]" />;
+  return <PuzzleIcon className="h-4 w-4" />;
 }

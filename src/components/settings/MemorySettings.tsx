@@ -173,11 +173,11 @@ export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
           <select className={settingsSelectClass} value={memory.workingMemory.scope} onChange={(e) => updateConfig('memory.workingMemory.scope', e.target.value)}>
-            <option value="resource">Resource (cross-thread)</option>
-            <option value="thread">Thread (per-conversation)</option>
+            <option value="resource">Resource (cross-chat)</option>
+            <option value="thread">Thread (per-chat)</option>
           </select>
         </div>
-        <p className="text-[10px] text-muted-foreground">Working memory stores user preferences and key facts. "Resource" scope shares across all threads.</p>
+        <p className="text-[10px] text-muted-foreground">Working memory stores user preferences and key facts. "Resource" scope shares across all chats.</p>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-2">
@@ -186,18 +186,18 @@ export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
           <select className={settingsSelectClass} value={memory.observationalMemory.scope} onChange={(e) => updateConfig('memory.observationalMemory.scope', e.target.value)}>
-            <option value="resource">Resource (cross-thread)</option>
-            <option value="thread">Thread (per-conversation)</option>
+            <option value="resource">Resource (cross-chat)</option>
+            <option value="thread">Thread (per-chat)</option>
           </select>
         </div>
-        <p className="text-[10px] text-muted-foreground">AI-generated observations about patterns and preferences. Best with "resource" scope for cross-thread learning.</p>
+        <p className="text-[10px] text-muted-foreground">AI-generated observations about patterns and preferences. Best with "resource" scope for cross-chat learning.</p>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Semantic Recall (RAG)</legend>
         <Toggle label="Enabled" checked={memory.semanticRecall.enabled} onChange={(v) => updateConfig('memory.semanticRecall.enabled', v)} />
         <NumberField label="Top-K results" value={memory.semanticRecall.topK} onChange={(v) => updateConfig('memory.semanticRecall.topK', v)} min={1} max={20} />
-        <p className="text-[10px] text-muted-foreground">Vector similarity search across conversation history. Enables cross-thread reference (&quot;that thing from yesterday&quot;).</p>
+        <p className="text-[10px] text-muted-foreground">Vector similarity search across chat history. Enables cross-chat reference (&quot;that thing from yesterday&quot;).</p>
 
         {memory.semanticRecall.enabled && (
           <div className="space-y-3 border-t border-border/50 pt-3">

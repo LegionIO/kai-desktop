@@ -62,7 +62,7 @@ export const UsageSummaryCards: FC<{ data: SummaryData }> = ({ data }) => {
         icon={ArrowDownIcon}
         label="Input Tokens"
         value={formatTokenCount(data.totalInputTokens)}
-        sub={`${data.totalConversations} conversations`}
+        sub={`${data.totalConversations} chats`}
       />
       <StatCard
         icon={ArrowUpIcon}

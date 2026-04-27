@@ -71,7 +71,6 @@ import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
 import type { ExecutionMode } from './ModelSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
-import { usePlugins } from '@/providers/PluginProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
@@ -104,10 +103,6 @@ export const Thread: FC<{
     });
   }, [threadRuntime]);
 
-  const { uiState: pluginUIState } = usePlugins();
-  const threadDecorations = (pluginUIState?.threadDecorations ?? []).filter((decoration) => (
-    decoration.visible && (!decoration.conversationId || decoration.conversationId === activeConversationId)
-  ));
 
   useEffect(() => {
     if (!window.app?.onFind) return;
@@ -131,28 +126,6 @@ export const Thread: FC<{
       <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
       <FallbackBanner />
       <ComputerUseFallbackBanner />
-      {threadDecorations.length > 0 && (
-        <div className="border-b border-border/60 bg-background/65 px-3 py-2 backdrop-blur-sm md:px-6">
-          <div className="mx-auto flex w-full max-w-5xl flex-wrap gap-2">
-            {threadDecorations.map((decoration) => (
-              <span
-                key={`${decoration.pluginName}-${decoration.id}`}
-                className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
-                  decoration.variant === 'error'
-                    ? 'bg-red-500/10 text-red-700 dark:text-red-300'
-                    : decoration.variant === 'warning'
-                      ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                      : decoration.variant === 'success'
-                        ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                        : 'bg-blue-500/10 text-blue-700 dark:text-blue-300'
-                }`}
-              >
-                {decoration.label}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
       {mode === 'chat' ? (
         <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
           <PinnedUserMessage viewportRef={viewportRef} />
@@ -270,11 +243,11 @@ const ComputerTabSurface: FC = () => {
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
-                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Conversation'}</div>
+                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Chat'}</div>
                 <p className="mt-1.5 text-xs text-muted-foreground">
                   {activeConversationId
                     ? 'Configure a goal and start a session using the controls below.'
-                    : 'Choose or create a conversation from the sidebar first.'}
+                    : 'Choose or create a chat from the sidebar first.'}
                 </p>
               </div>
             </div>

@@ -15,16 +15,19 @@ import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
 import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
-import { PluginBannerSlot } from '@/components/plugins/PluginBannerSlot';
-import { PluginModalHost } from '@/components/plugins/PluginModalHost';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
+import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, DownloadIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
-import { SidebarDock, type DockItem } from '@/components/SidebarDock';
+import { SidebarSectionSwitcher, type SidebarSection } from '@/components/SidebarSectionSwitcher';
+import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
+import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
+import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
+import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
@@ -34,7 +37,6 @@ import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
-import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { PlanPanel, PlanPanelDivider } from '@/components/thread/PlanPanel';
@@ -300,7 +302,7 @@ function getConversationDisplayTitle(
     }
   }
 
-  return 'Untitled Thread';
+  return 'Untitled Chat';
 }
 
 function getComputerSessionForConversation(
@@ -320,6 +322,16 @@ type AppView = string;
 
 const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
+const MARKETPLACE_VIEW = 'marketplace';
+const PLUGINS_VIEW = 'plugins';
+const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
+
+function isPluginView(view: string): boolean {
+  return view === MARKETPLACE_VIEW
+    || view === PLUGINS_VIEW
+    || view.startsWith(PLUGIN_ERROR_VIEW_PREFIX)
+    || view.startsWith('plugin-panel:');
+}
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
@@ -383,8 +395,17 @@ function AppShell() {
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
+  const [pinnedPlugins, setPinnedPlugins] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-plugins') || '[]')); } catch { return new Set(); }
+  });
+  const [pluginTitleMenuOpen, setPluginTitleMenuOpen] = useState(false);
+  const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
+  const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('threads');
+  const lastPluginViewRef = useRef<string>(MARKETPLACE_VIEW);
+  const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
   const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
@@ -403,6 +424,27 @@ function AppShell() {
       setSidebarWidth(clampSidebarWidth(ui.sidebarWidth));
     }
   }, [config]);
+
+  // Track the last plugin-related view so we can restore it when switching back
+  useEffect(() => {
+    if (isPluginView(activeView)) {
+      lastPluginViewRef.current = activeView;
+    }
+  }, [activeView]);
+
+  // Build a name→displayName map from the plugin list (refreshed when pluginUIState changes)
+  useEffect(() => {
+    let cancelled = false;
+    app.plugins.list().then((list: Array<{ name: string; displayName: string }>) => {
+      if (cancelled) return;
+      const map = new Map<string, string>();
+      for (const p of list) {
+        if (p.displayName) map.set(p.name, p.displayName);
+      }
+      setPluginDisplayNames(map);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [pluginUIState]);
 
   useEffect(() => {
     let cancelled = false;
@@ -490,6 +532,41 @@ function AppShell() {
     };
     window.addEventListener('pinned-conversations-changed', handler);
     return () => window.removeEventListener('pinned-conversations-changed', handler);
+  }, []);
+
+  const togglePluginPin = useCallback((name: string) => {
+    const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-plugins') || '[]';
+    let names: string[];
+    try { names = JSON.parse(raw); } catch { names = []; }
+    const set = new Set(names);
+    if (set.has(name)) set.delete(name); else set.add(name);
+    const serialized = JSON.stringify([...set]);
+    localStorage.setItem(__BRAND_APP_SLUG + ':pinned-plugins', serialized);
+    setPinnedPlugins(set);
+    window.dispatchEvent(new CustomEvent('pinned-plugins-changed', { detail: serialized }));
+  }, []);
+
+  // Sync plugin pin state when changed from the sidebar
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      try { setPinnedPlugins(new Set(JSON.parse(detail) as string[])); } catch { /* ignore */ }
+    };
+    window.addEventListener('pinned-plugins-changed', handler);
+    return () => window.removeEventListener('pinned-plugins-changed', handler);
+  }, []);
+
+  const handlePluginUninstall = useCallback(async (pluginName: string) => {
+    setIsPluginUninstalling(true);
+    try {
+      await app.plugins.marketplaceUninstall(pluginName);
+      setActiveView(MARKETPLACE_VIEW);
+    } catch (err) {
+      console.error('[AppShell] Plugin uninstall failed:', err);
+    } finally {
+      setIsPluginUninstalling(false);
+      setConfirmPluginUninstall(null);
+    }
   }, []);
 
   const handleRename = useCallback(async (id: string, newTitle: string) => {
@@ -644,14 +721,19 @@ function AppShell() {
     return cleanup;
   }, [handleOpenSettings]);
 
+  // Plugin settings modal — opens a standalone modal for a single plugin's settings
+  const [pluginSettingsOpen, setPluginSettingsOpen] = useState<string | null>(null);
+
   // Allow plugins to open settings via a custom DOM event
   // Optionally accepts a plugin name: new CustomEvent('kai:open-settings', { detail: { plugin: 'example' } })
-  const [requestedSettingsPlugin, setRequestedSettingsPlugin] = useState<string | null>(null);
   useEffect(() => {
     const handler = (e: Event) => {
       const plugin = (e as CustomEvent<{ plugin?: string }>).detail?.plugin ?? null;
-      setRequestedSettingsPlugin(plugin);
-      void handleOpenSettings();
+      if (plugin) {
+        setPluginSettingsOpen(plugin);
+      } else {
+        void handleOpenSettings();
+      }
     };
     window.addEventListener('kai:open-settings', handler);
     return () => window.removeEventListener('kai:open-settings', handler);
@@ -781,10 +863,40 @@ function AppShell() {
   }, [handleSwitchConversation]);
 
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
-  const pluginNavigationItems = pluginUIState?.navigationItems?.filter((item) => item.visible) ?? [];
-  const activePluginPanel = useMemo(() => (
-    pluginPanels.find((panel) => activeView === getPluginPanelViewKey(panel.pluginName, panel.id)) ?? null
-  ), [activeView, pluginPanels]);
+  const activePluginPanel = useMemo(() => {
+    // First try to match a real panel descriptor
+    const real = pluginPanels.find((panel) => activeView === getPluginPanelViewKey(panel.pluginName, panel.id));
+    if (real) return real;
+    // Synthesize a placeholder panel for plugins that don't register one
+    // (e.g. plugin-panel:skynet:default)
+    const match = activeView.match(/^plugin-panel:([^:]+):default$/);
+    if (match) {
+      const pluginName = match[1];
+      return {
+        id: 'default',
+        pluginName,
+        component: 'PanelView',
+        title: pluginName,
+        visible: true,
+        width: 'default' as const,
+      };
+    }
+    return null;
+  }, [activeView, pluginPanels]);
+
+  const activeErrorPluginName = activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX)
+    ? activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)
+    : null;
+
+  /** Resolve a raw plugin name to its display label */
+  const pluginDisplayName = useCallback((rawName: string): string => {
+    // First try navigation items (active plugins)
+    const navItems = pluginUIState?.navigationItems ?? [];
+    const match = navItems.find((n) => n.pluginName === rawName && n.visible);
+    if (match?.label) return match.label;
+    // Fall back to the plugin list's displayName (works for errored plugins too)
+    return pluginDisplayNames.get(rawName) || rawName;
+  }, [pluginUIState?.navigationItems, pluginDisplayNames]);
 
   const handlePluginNavigationItem = useCallback((pluginName: string, target: { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown }) => {
     if (target.type === 'panel' && target.panelId) {
@@ -832,21 +944,6 @@ function AppShell() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [handleOpenSettings, handlePluginNavigationItem, pluginCommands]);
 
-  const dockItems: DockItem[] = useMemo(() => [
-    ...pluginNavigationItems.map((item) => ({
-      id: `plugin-nav:${item.pluginName}:${item.id}`,
-      label: item.label,
-      icon: getPluginNavigationIcon(item.icon),
-      onClick: () => handlePluginNavigationItem(item.pluginName, item.target as { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown }),
-      active: item.target.type === 'panel' && activeView === getPluginPanelViewKey(item.pluginName, item.target.panelId),
-      badge: item.badge != null ? (
-        <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-primary px-1 text-[8px] font-bold text-primary-foreground">
-          {String(item.badge)}
-        </span>
-      ) : undefined,
-    })),
-  ], [activeView, handlePluginNavigationItem, pluginNavigationItems]);
-
   return (
     <AttachmentProvider>
       <DropZone>
@@ -868,7 +965,6 @@ function AppShell() {
         }}
       />
       <RealtimeProvider>
-        <PluginModalHost />
         <PluginToastHost />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
@@ -894,17 +990,24 @@ function AppShell() {
                 </button>
               </div>
               <div className="min-h-0 flex-1">
-                <SettingsPanel onClose={handleCloseSettings} requestedPlugin={requestedSettingsPlugin} onSectionHandled={() => setRequestedSettingsPlugin(null)} />
+                <SettingsPanel onClose={handleCloseSettings} />
               </div>
             </div>
           </div>,
           document.body,
         )}
+        {pluginSettingsOpen && (
+          <PluginSettingsModal
+            pluginName={pluginSettingsOpen}
+            displayName={pluginDisplayName(pluginSettingsOpen)}
+            onClose={() => setPluginSettingsOpen(null)}
+          />
+        )}
         {renamingTitle && activeConversationId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename thread</h2>
+              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
               <input
                 ref={renameInputRef}
                 value={renameValue}
@@ -958,6 +1061,48 @@ function AppShell() {
           </div>,
           document.body,
         )}
+        {confirmPluginUninstall && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmPluginUninstall(null)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                This will uninstall{' '}
+                <span className="font-medium text-foreground">{pluginDisplayName(confirmPluginUninstall)}</span>.
+                This cannot be undone.
+              </p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmPluginUninstall(null)}
+                  disabled={isPluginUninstalling}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void handlePluginUninstall(confirmPluginUninstall); }}
+                  disabled={isPluginUninstalling}
+                  className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+                >
+                  {isPluginUninstalling ? (
+                    <>
+                      <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                      Uninstalling...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2Icon className="h-3.5 w-3.5" />
+                      Uninstall
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
         <div className="relative flex h-screen overflow-hidden text-foreground">
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
@@ -1003,20 +1148,50 @@ function AppShell() {
               </div>
             </div>
             <div className="flex min-h-0 flex-1 flex-col">
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                <ConversationList
-                  activeConversationId={activeConversationId}
-                  activeThreadMode={threadMode}
-                  onSwitchConversation={handleSwitchConversation}
-                  onNewConversation={handleNewConversation}
-                  onDeleteConversation={handleDeleteConversation}
-                />
-              </div>
-              <div className="shrink-0">
-                <SubAgentSidebarSection />
-              </div>
-              <PluginBannerSlot />
-              <SidebarDock items={dockItems} />
+              <SidebarSectionSwitcher
+                value={sidebarSection}
+                onValueChange={(section) => {
+                  setSidebarSection(section);
+                  if (section === 'extensions') {
+                    setActiveView(lastPluginViewRef.current);
+                  } else if (section === 'threads') {
+                    setActiveView(CHAT_VIEW);
+                  }
+                }}
+              />
+
+              {sidebarSection === 'threads' && (
+                <>
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    <ConversationList
+                      activeConversationId={activeConversationId}
+                      activeThreadMode={threadMode}
+                      onSwitchConversation={handleSwitchConversation}
+                      onNewConversation={handleNewConversation}
+                      onDeleteConversation={handleDeleteConversation}
+                    />
+                  </div>
+                  <div className="shrink-0">
+                    <SubAgentSidebarSection />
+                  </div>
+                </>
+              )}
+
+              {sidebarSection === 'extensions' && (
+                <>
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    <InstalledPluginsList
+                      activeView={activeView}
+                      onNavigate={handlePluginNavigationItem}
+                      onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                      onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                      onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                    />
+                  </div>
+                </>
+              )}
+
+              <UpdateCard />
             </div>
             </div>
           </aside>
@@ -1051,7 +1226,7 @@ function AppShell() {
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <UpdateCard />
             {/* Interactive title bar */}
-            <div className={`${titleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+            <div className={`${titleMenuOpen || pluginTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
@@ -1066,8 +1241,96 @@ function AppShell() {
               <div className="min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Settings</span>
+                ) : activeView === MARKETPLACE_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
+                ) : activeView === PLUGINS_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                ) : activeErrorPluginName ? (
+                  <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                    <DropdownMenu.Trigger asChild>
+                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                          {pluginDisplayName(activeErrorPluginName)}
+                        </span>
+                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      </button>
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Portal>
+                      <DropdownMenu.Content
+                        align="start"
+                        sideOffset={4}
+                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                      >
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => togglePluginPin(activeErrorPluginName)}
+                        >
+                          <PinIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>{pinnedPlugins.has(activeErrorPluginName) ? 'Unpin' : 'Pin'}</span>
+                        </DropdownMenu.Item>
+                        {pluginUIState?.settingsSections.some((s) => s.pluginName === activeErrorPluginName) && (
+                          <DropdownMenu.Item
+                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                            onSelect={() => setPluginSettingsOpen(activeErrorPluginName)}
+                          >
+                            <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                            <span>Settings</span>
+                          </DropdownMenu.Item>
+                        )}
+                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                          onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
+                        >
+                          <Trash2Icon className="h-4 w-4" />
+                          <span>Uninstall</span>
+                        </DropdownMenu.Item>
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Portal>
+                  </DropdownMenu.Root>
                 ) : activePluginPanel ? (
-                  <span className="text-sm font-medium text-foreground">{activePluginPanel.title}</span>
+                  <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                    <DropdownMenu.Trigger asChild>
+                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                          {pluginDisplayName(activePluginPanel.pluginName)}
+                        </span>
+                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      </button>
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Portal>
+                      <DropdownMenu.Content
+                        align="start"
+                        sideOffset={4}
+                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                      >
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => togglePluginPin(activePluginPanel.pluginName)}
+                        >
+                          <PinIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>{pinnedPlugins.has(activePluginPanel.pluginName) ? 'Unpin' : 'Pin'}</span>
+                        </DropdownMenu.Item>
+                        {pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName) && (
+                          <DropdownMenu.Item
+                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                            onSelect={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
+                          >
+                            <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                            <span>Settings</span>
+                          </DropdownMenu.Item>
+                        )}
+                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                          onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
+                        >
+                          <Trash2Icon className="h-4 w-4" />
+                          <span>Uninstall</span>
+                        </DropdownMenu.Item>
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Portal>
+                  </DropdownMenu.Root>
                 ) : activeConversationId && activeConversationTitle !== 'Untitled Thread' ? (
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
@@ -1132,7 +1395,7 @@ function AppShell() {
               {activePluginPanel && pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName) && (
                 <button
                   type="button"
-                  onClick={() => window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: activePluginPanel.pluginName } }))}
+                  onClick={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
                   className="titlebar-no-drag flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors"
                 >
                   <Settings2Icon className="h-3.5 w-3.5" />
@@ -1143,7 +1406,34 @@ function AppShell() {
               </div>
             </div>
             <div className="min-h-0 flex-1 flex flex-col">
-              {activePluginPanel ? (
+              {activeView === MARKETPLACE_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <PluginMarketplace />
+                    </div>
+                  </div>
+                </div>
+              ) : activeView === PLUGINS_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <InstalledPluginsView onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)} />
+                    </div>
+                  </div>
+                </div>
+              ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex-1 overflow-y-auto px-6 py-6">
+                    <div className="mx-auto max-w-3xl">
+                      <BrokenPluginView
+                        pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
+                        onUninstalled={() => setActiveView(PLUGINS_VIEW)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : activePluginPanel ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
                 </div>

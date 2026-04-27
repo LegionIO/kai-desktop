@@ -100,7 +100,7 @@ export const UsageConversationTable: FC<{
           <input
             type="text"
             className="bg-transparent text-xs outline-none w-[160px] placeholder:text-muted-foreground/50"
-            placeholder="Search conversations..."
+            placeholder="Search chats..."
             value={searchInput}
             onChange={(e) => handleSearchInput(e.target.value)}
           />
@@ -110,7 +110,7 @@ export const UsageConversationTable: FC<{
       <div className="rounded-xl border border-border/40 bg-card/40 overflow-hidden">
         {/* Header row */}
         <div className="grid grid-cols-[1fr_120px_80px_80px_80px_60px_80px] gap-2 px-3 py-2 border-b border-border/30 bg-muted/20">
-          <SortHeader label="Conversation" field="title" />
+          <SortHeader label="Chat" field="title" />
           <SortHeader label="Model" field="modelKey" />
           <SortHeader label="Total" field="totalTokens" />
           <SortHeader label="In" field="inputTokens" />
@@ -122,7 +122,7 @@ export const UsageConversationTable: FC<{
         {/* Rows */}
         {conversations.length === 0 ? (
           <p className="text-xs text-muted-foreground py-6 text-center">
-            {searchInput ? 'No matching conversations.' : 'No conversations with usage data.'}
+            {searchInput ? 'No matching chats.' : 'No chats with usage data.'}
           </p>
         ) : (
           conversations.map((conv, i) => (

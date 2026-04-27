@@ -22,6 +22,7 @@ export type PluginPermission =
   | 'navigation:open'
   | 'state:publish'
   | 'agent:generate'
+  | 'agent:inference-provider'
   | 'safe-storage'
   | 'browser:window';
 
@@ -36,9 +37,8 @@ export type PluginManifest = {
   version: string;
   description: string;
   author?: string;
+  icon?: { lucide: string } | { svg: string };
   permissions: PluginPermission[];
-  priority: number;
-  required: boolean;
   configSchema?: Record<string, unknown>;
 };
 
@@ -68,6 +68,7 @@ export type PluginInstance = {
   notifications: PluginNotificationDescriptor[];
   configChangeListeners: Array<(config: AppConfig) => void>;
   rendererBuild: PluginRendererBuild | null;
+  inferenceProvider: PluginInferenceProvider | null;
 };
 
 /* ── Plugin Module (what dist/backend.js must export) ── */
@@ -343,7 +344,7 @@ export type PluginAPI = {
     updateModal: (id: string, updates: Partial<Omit<PluginModalDescriptor, 'id' | 'pluginName'>>) => void;
     registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => void;
     registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => void;
-    registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => void;
+    registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName' | 'label' | 'icon'> & { label?: string; icon?: PluginNavigationItemDescriptor['icon'] }) => void;
     registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => void;
     showConversationDecoration: (descriptor: Omit<PluginConversationDecorationDescriptor, 'pluginName'>) => void;
     hideConversationDecoration: (id: string) => void;
@@ -405,6 +406,8 @@ export type PluginAPI = {
 
   agent: {
     generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
+    registerInferenceProvider: (provider: PluginInferenceProvider) => void;
+    unregisterInferenceProvider: () => void;
   };
 
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
@@ -455,6 +458,41 @@ export type PluginAgentGenerateResult = {
     error?: string;
     durationMs?: number;
   }>;
+};
+
+/* ── Plugin Inference Provider ── */
+
+export type PluginInferenceStreamEvent = {
+  conversationId: string;
+  type: 'text-delta' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'error' | 'done' | 'context-usage' | 'enrichment' | 'compaction' | 'model-fallback';
+  text?: string;
+  toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+  error?: string;
+  data?: unknown;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+};
+
+export type PluginInferenceStreamOptions = {
+  conversationId: string;
+  messages: Array<{ role: string; content: unknown }>;
+  modelKey: string;
+  systemPrompt: string;
+  reasoningEffort?: string;
+  abortSignal?: AbortSignal;
+};
+
+export type PluginInferenceProvider = {
+  /** Human-readable name for logging. */
+  name: string;
+  /** Return true when this provider can handle inference right now. */
+  isAvailable: () => boolean;
+  /** Stream inference. Yield PluginInferenceStreamEvent objects. */
+  stream: (options: PluginInferenceStreamOptions) => AsyncGenerator<PluginInferenceStreamEvent>;
 };
 
 /* ── Modal/Banner Actions (renderer → main via IPC) ── */

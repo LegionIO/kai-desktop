@@ -138,14 +138,28 @@ export class MarketplaceService {
       mkdirSync(this.pluginsDir, { recursive: true });
       mkdirSync(tmpDir, { recursive: true });
 
-      // Download pre-built tarball from GitHub release assets
+      // Download pre-built tarball
       const tag = `v${entry.version}`;
       const assetName = `${entry.name}-v${entry.version}.tar.gz`;
-      const tarballUrl = `https://github.com/${entry.repository}/releases/download/${tag}/${assetName}`;
-      const token = await this.resolveGitHubToken(entry.repository);
-      const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
+      const isGitHub = entry.marketplaceUrl.includes('github.com') || entry.marketplaceUrl.includes('raw.githubusercontent.com');
+
+      let tarballUrl: string;
+      if (isGitHub) {
+        // GitHub-hosted: use releases URL pattern
+        tarballUrl = `https://github.com/${entry.repository}/releases/download/${tag}/${assetName}`;
+      } else {
+        // Self-hosted (S3, etc): tarballs are siblings of marketplace.json
+        const baseUrl = entry.marketplaceUrl.replace(/\/[^/]*$/, '');
+        tarballUrl = `${baseUrl}/${entry.name}/${tag}/${assetName}`;
+      }
+
+      const headers: Record<string, string> = {};
+      if (isGitHub) {
+        headers['Accept'] = 'application/vnd.github+json';
+        const token = await this.resolveGitHubToken(entry.repository);
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
       }
 
       const response = await net.fetch(tarballUrl, { headers });

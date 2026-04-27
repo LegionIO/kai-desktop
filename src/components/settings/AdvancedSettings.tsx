@@ -76,12 +76,12 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
-        <legend className="text-xs font-semibold px-1">AI Conversation Titles</legend>
+        <legend className="text-xs font-semibold px-1">AI Chat Titles</legend>
 
         <div className="flex items-start justify-between gap-3 rounded-md border p-3">
           <div>
             <span className="text-xs font-medium">Auto-generate titles</span>
-            <p className="mt-0.5 text-[10px] text-muted-foreground">Automatically generate and refresh conversation titles using AI.</p>
+            <p className="mt-0.5 text-[10px] text-muted-foreground">Automatically generate and refresh chat titles using AI.</p>
           </div>
           <input type="checkbox" checked={titleGen.enabled} onChange={(e) => updateConfig('titleGeneration.enabled', e.target.checked)} className="mt-0.5 h-4 w-4 rounded" />
         </div>

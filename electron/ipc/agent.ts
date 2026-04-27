@@ -374,7 +374,7 @@ function streamMastra(options: {
   })();
 }
 
-export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
+export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: import('../plugins/plugin-manager.js').PluginManager): void {
 
   ipcMain.handle(
     'agent:stream',
@@ -442,6 +442,53 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
 
     // Run streaming in background
     (async () => {
+      // Check for plugin inference provider before starting the standard pipeline
+      const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
+      if (inferenceProvider) {
+        console.info(`[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`);
+        let emittedTextDelta = false;
+        try {
+          const providerStream = inferenceProvider.stream({
+            conversationId,
+            messages: messages as Array<{ role: string; content: unknown }>,
+            modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+            systemPrompt: streamConfig?.systemPrompt ?? config.systemPrompt ?? '',
+            reasoningEffort,
+            abortSignal: controller.signal,
+          });
+
+          for await (const event of providerStream) {
+            if (controller.signal.aborted && event.type !== 'done') continue;
+            if (event.type === 'text-delta') emittedTextDelta = true;
+            broadcastStreamEvent({ ...event, conversationId });
+            if (event.type === 'done') break;
+          }
+
+          // Provider handled the request — clean up and exit
+          activeStreams.delete(conversationId);
+          activeStreamModelKeys.delete(conversationId);
+          activeObserverSessions.delete(conversationId);
+          return;
+        } catch (providerError) {
+          if (emittedTextDelta) {
+            // Already started streaming text — can't fall back mid-response
+            console.error(`[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed after emitting text:`, providerError);
+            broadcastStreamEvent({
+              conversationId,
+              type: 'error',
+              error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
+            });
+            broadcastStreamEvent({ conversationId, type: 'done' });
+            activeStreams.delete(conversationId);
+            activeStreamModelKeys.delete(conversationId);
+            activeObserverSessions.delete(conversationId);
+            return;
+          }
+          // No text emitted yet — fall through to standard Mastra pipeline
+          console.warn(`[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text, falling back to standard pipeline:`, providerError);
+        }
+      }
+
       const toolCancels = new Map<string, () => void>();
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
@@ -1286,6 +1333,45 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string): void {
     const modelEntry = resolveTitleModel(config, modelKey ?? null);
     if (!modelEntry) return { title: null };
 
+    // Check if a plugin inference provider is available
+    const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
+    if (inferenceProvider) {
+      try {
+        const titleInput = buildTitleGenerationInput(messages);
+        if (!titleInput) return { title: null };
+
+        const systemPrompt = [
+          'Generate a concise conversation title using at most 4 words.',
+          'Summarize the user\'s main topic or task, not the assistant\'s answer.',
+          'Use a neutral noun phrase, not a sentence.',
+          'Avoid apologies, disclaimers, or copied response text.',
+          'Return only the title text with no quotes or formatting.',
+        ].join(' ');
+
+        let titleText = '';
+        const providerStream = inferenceProvider.stream({
+          conversationId: `title-gen-${Date.now()}`,
+          messages: [{ role: 'user', content: titleInput }],
+          modelKey: modelEntry.key,
+          systemPrompt,
+          abortSignal: undefined,
+        });
+
+        for await (const event of providerStream) {
+          if (event.type === 'text-delta' && event.text) {
+            titleText += event.text;
+          }
+          if (event.type === 'done' || event.type === 'error') break;
+        }
+
+        const title = normalizeGeneratedTitle(titleText);
+        if (title) return { title };
+      } catch (error) {
+        console.warn('[Agent] Title generation via plugin inference provider failed, falling back to Mastra:', error);
+      }
+    }
+
+    // Fallback to standard Mastra title generation
     try {
       const { Agent } = await import('@mastra/core/agent');
       const model = await createLanguageModelFromConfig(modelEntry.modelConfig);

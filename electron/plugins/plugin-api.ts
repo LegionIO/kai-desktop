@@ -28,6 +28,7 @@ import type {
   PostReceiveHook,
   PluginNavigationTarget,
   MessageContent,
+  PluginInferenceProvider,
 } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
@@ -378,9 +379,14 @@ export function createPluginAPI(
         registerOrReplace(instance.uiPanels, { ...descriptor, component: 'PanelView', pluginName: manifest.name });
       },
 
-      registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName'>) => {
+      registerNavigationItem: (descriptor) => {
         requirePermission('ui:navigation');
-        registerOrReplace(instance.uiNavigationItems, { ...descriptor, pluginName: manifest.name });
+        registerOrReplace(instance.uiNavigationItems, {
+          ...descriptor,
+          pluginName: manifest.name,
+          label: manifest.displayName,
+          ...(manifest.icon ? { icon: manifest.icon } : {}),
+        });
       },
 
       registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => {
@@ -1035,6 +1041,23 @@ export function createPluginAPI(
           tools: allTools,
           abortSignal: options.abortSignal,
         });
+      },
+
+      registerInferenceProvider: (provider: PluginInferenceProvider) => {
+        requirePermission('agent:inference-provider');
+        if (!provider || typeof provider.stream !== 'function' || typeof provider.isAvailable !== 'function') {
+          throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
+        }
+        instance.inferenceProvider = provider;
+        console.info(`[PluginAPI:${manifest.name}] Registered inference provider: ${provider.name}`);
+      },
+
+      unregisterInferenceProvider: () => {
+        requirePermission('agent:inference-provider');
+        if (instance.inferenceProvider) {
+          console.info(`[PluginAPI:${manifest.name}] Unregistered inference provider: ${instance.inferenceProvider.name}`);
+          instance.inferenceProvider = null;
+        }
       },
     },
 

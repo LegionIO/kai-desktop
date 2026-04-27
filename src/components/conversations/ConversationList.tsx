@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'reac
 import { createPortal } from 'react-dom';
 import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { cn } from '@/lib/utils';
 import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
@@ -10,7 +11,6 @@ import { useConversationPreferences } from './useConversationPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
-import { usePlugins } from '@/providers/PluginProvider';
 import { Tooltip } from '@/components/ui/Tooltip';
 
 type ConversationSummary = Pick<
@@ -51,7 +51,7 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
     if (goal) return goal.length > 50 ? goal.slice(0, 47).trimEnd() + '...' : goal;
   }
 
-  return 'Untitled Thread';
+  return 'Untitled Chat';
 }
 
 const TypingBubble: FC = () => (
@@ -80,36 +80,6 @@ const ComputerCompletedIndicator: FC = () => (
   </div>
 );
 
-/**
- * Double-click-confirm hook: first click arms, second click within timeout executes.
- * Returns { armed, onClick, reset }.
- */
-function useDoubleClickConfirm(onConfirm: () => void, timeoutMs = 2500) {
-  const [armed, setArmed] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const reset = useCallback(() => {
-    setArmed(false);
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-  }, []);
-
-  const onClick = useCallback((e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    if (armed) {
-      reset();
-      onConfirm();
-    } else {
-      setArmed(true);
-      timerRef.current = setTimeout(reset, timeoutMs);
-    }
-  }, [armed, onConfirm, reset, timeoutMs]);
-
-  // Cleanup on unmount
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
-
-  return { armed, onClick, reset };
-}
-
 export const ConversationList: FC<ConversationListProps> = ({
   activeConversationId,
   activeThreadMode,
@@ -118,6 +88,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   onDeleteConversation: _onDeleteConversation,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [, setDeletingId] = useState<string | null>(null);
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
@@ -136,8 +107,6 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [exportConvId, setExportConvId] = useState<string | null>(null);
-  const { uiState: pluginUIState } = usePlugins();
-  const conversationDecorations = pluginUIState?.conversationDecorations ?? [];
 
   const togglePin = useCallback((id: string) => {
     setPinnedIds((prev) => {
@@ -211,6 +180,7 @@ export const ConversationList: FC<ConversationListProps> = ({
 
         return list;
       });
+      setHasLoaded(true);
     } catch {
       // IPC not ready
     }
@@ -388,6 +358,18 @@ export const ConversationList: FC<ConversationListProps> = ({
     onSwitchConversation(id);
   };
 
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+
+  const confirmBulkDelete = async () => {
+    setIsBulkDeleting(true);
+    await handleDeleteBulk();
+    setIsBulkDeleting(false);
+    setBulkDeleteOpen(false);
+  };
+
+  const isNewChat = hasLoaded && !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
+
   return (
     <div className="flex flex-col h-full">
       <div className="border-b border-sidebar-border/70 px-4 py-3">
@@ -396,35 +378,38 @@ export const ConversationList: FC<ConversationListProps> = ({
           onClick={() => {
             void onNewConversation();
           }}
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80"
+          className={cn(
+            'flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80',
+            isNewChat && 'bg-primary/10 text-primary',
+          )}
         >
           <PlusIcon className="h-4 w-4 text-primary" />
-          New thread
+          New Chat
         </button>
       </div>
 
       <div className="flex items-center justify-between px-4 pb-2 pt-4">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Threads</span>
+        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Chats</span>
         <div className="flex items-center gap-1 text-muted-foreground">
-          <Tooltip content="Sort threads" side="bottom" sideOffset={6}>
+          <Tooltip content="Sort chats" side="bottom" sideOffset={6}>
             <button
               ref={sortButtonRef}
               type="button"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={() => { setSortOpen((p) => !p); setFilterOpen(false); }}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${!isDefaultSort ? 'text-primary' : ''}`}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${!isDefaultSort ? 'text-primary' : ''}`}
             >
               <PanelTopOpenIcon className="h-4 w-4" />
             </button>
           </Tooltip>
           <div className="relative">
-            <Tooltip content="Filter threads" side="bottom" sideOffset={6}>
+            <Tooltip content="Filter chats" side="bottom" sideOffset={6}>
               <button
                 ref={filterButtonRef}
                 type="button"
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={() => { setFilterOpen((p) => !p); setSortOpen(false); }}
-                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80"
+                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary"
               >
                 <SlidersHorizontalIcon className="h-4 w-4" />
               </button>
@@ -435,14 +420,25 @@ export const ConversationList: FC<ConversationListProps> = ({
               </span>
             )}
           </div>
-          <Tooltip content={showArchived ? 'Show active threads' : 'Show archived threads'} side="bottom" sideOffset={6}>
+          <Tooltip content={showArchived ? 'Show active chats' : 'Show archived chats'} side="bottom" sideOffset={6}>
             <button
               type="button"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={() => setShowArchived((p) => !p)}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 ${showArchived ? 'text-primary' : ''}`}
+              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${showArchived ? 'text-primary' : ''}`}
             >
               <ArchiveIcon className="h-4 w-4" />
+            </button>
+          </Tooltip>
+          <Tooltip content={processedConversations.length > 0 ? (isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats') : 'No chats to delete'} side="bottom" sideOffset={6}>
+            <button
+              type="button"
+              disabled={processedConversations.length === 0}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setBulkDeleteOpen(true)}
+              className={`rounded-md p-1.5 transition-colors ${processedConversations.length > 0 ? 'hover:bg-sidebar-accent/80 hover:text-destructive' : 'opacity-30 cursor-default'}`}
+            >
+              <Trash2Icon className="h-4 w-4" />
             </button>
           </Tooltip>
           {sortOpen && (
@@ -506,7 +502,6 @@ export const ConversationList: FC<ConversationListProps> = ({
                 const isRemoving = removingIds.has(conv.id);
                 const computerStatus = getComputerStatus(conv.id);
                 const isPinned = pinnedIds.has(conv.id);
-                const decorations = conversationDecorations.filter((decoration) => decoration.visible && decoration.conversationId === conv.id);
 
                 return (
                   <div
@@ -548,26 +543,6 @@ export const ConversationList: FC<ConversationListProps> = ({
                         {getDisplayTitle(conv, sessionsByConversation.get(conv.id))}
                       </span>
                       )}
-                      {decorations.length > 0 && (
-                        <div className="mt-1 flex flex-wrap gap-1">
-                          {decorations.slice(0, 3).map((decoration) => (
-                            <span
-                              key={`${decoration.pluginName}-${decoration.id}`}
-                              className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                                decoration.variant === 'error'
-                                  ? 'bg-red-500/10 text-red-600 dark:text-red-300'
-                                  : decoration.variant === 'warning'
-                                    ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                                    : decoration.variant === 'success'
-                                      ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                                      : 'bg-blue-500/10 text-blue-700 dark:text-blue-300'
-                              }`}
-                            >
-                              {decoration.label}
-                            </span>
-                          ))}
-                        </div>
-                      )}
                       <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
                         {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
                         {conv.messageCount > 0 && ` · ${conv.messageCount} msgs`}
@@ -600,19 +575,56 @@ export const ConversationList: FC<ConversationListProps> = ({
 
         {processedConversations.length === 0 && (
           <p className="text-xs text-muted-foreground p-3 text-center">
-            {searchQuery || hasActiveFilters ? 'No matching conversations' : 'No conversations yet'}
+            {searchQuery || hasActiveFilters ? 'No matching chats' : 'No chats yet'}
           </p>
         )}
       </div>
 
-      {/* Delete all / delete searched — bottom of sidebar */}
-      {processedConversations.length > 0 && (
-        <div className="border-t border-sidebar-border/70 p-3">
-          <BulkDeleteButton
-            label={isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats'}
-            onConfirm={handleDeleteBulk}
-          />
-        </div>
+      {/* Bulk delete confirmation modal */}
+      {bulkDeleteOpen && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-semibold text-foreground">Delete chats</h2>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {isSearchActive || hasActiveFilters
+                ? `This will permanently delete ${processedConversations.length} shown chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`
+                : `This will permanently delete all ${processedConversations.length} chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`}
+            </p>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkDeleteOpen(false)}
+                disabled={isBulkDeleting}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => { void confirmBulkDelete(); }}
+                disabled={isBulkDeleting}
+                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+              >
+                {isBulkDeleting ? (
+                  <>
+                    <LoaderIcon className="h-3 w-3 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  <>
+                    <Trash2Icon className="h-3 w-3" />
+                    Delete
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {contextMenu && createPortal(
@@ -667,39 +679,5 @@ export const ConversationList: FC<ConversationListProps> = ({
         conversationId={exportConvId}
       />
     </div>
-  );
-};
-
-/** Bulk delete button with double-click confirm */
-const BulkDeleteButton: FC<{ label: string; onConfirm: () => Promise<void> }> = ({ label, onConfirm }) => {
-  const [isDeleting, setIsDeleting] = useState(false);
-  const { armed, onClick } = useDoubleClickConfirm(async () => {
-    setIsDeleting(true);
-    await onConfirm();
-    setIsDeleting(false);
-  });
-
-  if (isDeleting) {
-    return (
-      <div className="flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs text-muted-foreground">
-        <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
-        Deleting...
-      </div>
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs transition-all ${
-        armed
-          ? 'bg-destructive text-destructive-foreground font-medium'
-          : 'text-muted-foreground hover:bg-sidebar-accent hover:text-foreground'
-      }`}
-    >
-      <Trash2Icon className="h-3.5 w-3.5" />
-      {armed ? 'Click again to confirm' : label}
-    </button>
   );
 };

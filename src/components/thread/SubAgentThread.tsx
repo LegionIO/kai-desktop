@@ -97,7 +97,7 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
             value={messageInput}
             onChange={setMessageInput}
             onSubmit={handleSend}
-            placeholder={isRunning ? 'Message sub-agent...' : 'Resume conversation with sub-agent...'}
+            placeholder={isRunning ? 'Message sub-agent...' : 'Resume chat with sub-agent...'}
             className="min-h-[36px] max-h-[180px] flex-1 py-1.5 text-sm bg-transparent outline-none"
             autoFocus
           />

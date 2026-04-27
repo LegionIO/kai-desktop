@@ -615,7 +615,6 @@ if (gotSingleInstanceLock) {
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
     const { setConfig } = registerConfigHandlers(ipcMain, APP_HOME, handleConfigChanged);
-    registerAgentHandlers(ipcMain, APP_HOME);
     registerConversationHandlers(ipcMain, APP_HOME, getConfig);
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
@@ -670,6 +669,9 @@ if (gotSingleInstanceLock) {
     );
     registerPluginHandlers(ipcMain, pluginManager);
     pluginManagerRef = pluginManager;
+
+    // Register agent handlers after pluginManager so inference providers are available
+    registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
 
     // Listen for plugin tool changes before plugin activation so early registrations are not missed
     pluginManager.onToolsChanged((pluginTools) => {

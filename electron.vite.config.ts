@@ -1,4 +1,5 @@
 import { resolve } from 'path';
+import { existsSync } from 'fs';
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/postcss';
@@ -14,12 +15,32 @@ import pkg from './package.json';
 //   branding.productName  →  __BRAND_PRODUCT_NAME  (string literal at build time)
 //   branding.appSlug      →  __BRAND_APP_SLUG
 //   …etc.
+//
+// If `branding.config.local.ts` exists, its exports are shallow-merged on
+// top of the base config.  That file is gitignored so developers can add
+// local overrides (e.g. an enterprise marketplace URL) without touching
+// committed code.
 // ---------------------------------------------------------------------------
 function camelToScreamingSnake(s: string): string {
   return s.replace(/([A-Z])/g, '_$1').toUpperCase();
 }
 
-const resolved = resolveBranding(branding);
+// Merge optional local overrides (gitignored)
+let mergedBranding: Record<string, unknown> = { ...branding };
+const localPath = resolve(__dirname, 'branding.config.local.ts');
+if (existsSync(localPath)) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const local = require('./branding.config.local');
+    const overrides = local.brandingLocal ?? local.default ?? {};
+    mergedBranding = { ...mergedBranding, ...overrides };
+    console.info('[branding] Merged local overrides from branding.config.local.ts');
+  } catch (err) {
+    console.warn('[branding] Failed to load branding.config.local.ts:', err);
+  }
+}
+
+const resolved = resolveBranding(mergedBranding);
 const brandDefines: Record<string, string> = {};
 for (const [key, value] of Object.entries(resolved)) {
   brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
