@@ -1,7 +1,6 @@
-import { createHash } from 'crypto';
 import { Notification, BrowserWindow } from 'electron';
 import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs';
-import { join, relative } from 'path';
+import { join } from 'path';
 import { pathToFileURL } from 'url';
 import type {
   PluginManifest,
@@ -38,30 +37,8 @@ import { readConversationStore, writeConversationStore, broadcastConversationCha
 import { buildPluginRendererBundle } from './renderer-build.js';
 import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
-
-const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
-  'config:read': 'Read app configuration',
-  'config:write': 'Write app configuration',
-  'tools:register': 'Register tools the assistant can call',
-  'ui:banner': 'Show inline banner UI in the app',
-  'ui:modal': 'Show modal UI in the app',
-  'ui:settings': 'Add plugin settings screens',
-  'ui:panel': 'Register full-page plugin panels',
-  'ui:navigation': 'Register navigation items and conversation decorations',
-  'messages:hook': 'Inspect or modify model messages',
-  'network:fetch': 'Make network requests from the plugin runtime',
-  'auth:window': 'Open authentication browser windows',
-  'http:listen': 'Listen on a local HTTP callback port',
-  'notifications:send': 'Send in-app and native notifications',
-  'conversations:read': 'Read conversation data',
-  'conversations:write': 'Create or update conversation data',
-  'navigation:open': 'Request in-app navigation actions',
-  'state:publish': 'Publish plugin state and live events to the renderer',
-  'agent:generate': 'Generate AI responses via the agent',
-  'agent:inference-provider': 'Route LLM inference through plugin backend',
-  'safe-storage': 'Access encrypted safe storage',
-  'browser:window': 'Open browser windows',
-};
+import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
+import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
@@ -83,10 +60,6 @@ function normalizePluginObject(value: unknown): Record<string, unknown> {
     return {};
   }
   return { ...(value as Record<string, unknown>) };
-}
-
-function hashContent(content: string): string {
-  return createHash('sha256').update(content).digest('hex');
 }
 
 type PluginListEntry = {
@@ -146,25 +119,7 @@ export class PluginManager {
       if (!existsSync(manifestPath)) continue;
 
       try {
-        const raw = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Record<string, unknown>;
-
-        const manifest: PluginManifest = {
-          name: typeof raw.name === 'string' ? raw.name : entry,
-          displayName: typeof raw.displayName === 'string' ? raw.displayName : typeof raw.name === 'string' ? raw.name : entry,
-          version: typeof raw.version === 'string' ? raw.version : '0.0.0',
-          description: typeof raw.description === 'string' ? raw.description : '',
-          author: typeof raw.author === 'string' ? raw.author : undefined,
-          icon: raw.icon && typeof raw.icon === 'object' && !Array.isArray(raw.icon)
-            ? raw.icon as { lucide: string } | { svg: string }
-            : undefined,
-          permissions: Array.isArray(raw.permissions)
-            ? raw.permissions.filter((value): value is PluginPermission => typeof value === 'string')
-            : [],
-          configSchema: raw.configSchema && typeof raw.configSchema === 'object'
-            ? raw.configSchema as Record<string, unknown>
-            : undefined,
-        };
-
+        const manifest = readPluginManifest(pluginDir, entry);
         results.push({ manifest, dir: pluginDir });
       } catch (err) {
         console.warn(`[PluginManager] Failed to read plugin manifest at ${manifestPath}:`, err);
@@ -185,62 +140,68 @@ export class PluginManager {
 
   /* ── Loading ── */
 
-  private collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
-    const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    const files: string[] = [];
-
-    for (const entry of entries) {
-      const fullPath = join(currentDir, entry.name);
-      if (entry.isDirectory()) {
-        files.push(...this.collectPluginFiles(rootDir, fullPath));
-        continue;
-      }
-      if (entry.isFile()) {
-        files.push(fullPath);
-      }
-    }
-
-    return files;
-  }
-
-  private computePluginFileHash(dir: string): string {
-    const hash = createHash('sha256');
-    const files = this.collectPluginFiles(dir);
-
-    for (const filePath of files) {
-      const relativePath = relative(dir, filePath).replace(/\\/g, '/');
-      hash.update(relativePath);
-      hash.update('\0');
-      hash.update(readFileSync(filePath));
-      hash.update('\0');
-    }
-
-    return hash.digest('hex');
-  }
-
   private getPluginApprovals(): AppConfig['pluginApprovals'] {
     return this.getConfig().pluginApprovals ?? {};
   }
 
-  private isPluginApproved(pluginName: string, fileHash: string): boolean {
-    return this.getPluginApprovals()[pluginName]?.hash === fileHash;
+  private isPluginApproved(pluginName: string, fileHash: string, permissions: readonly string[]): boolean {
+    const approval = this.getPluginApprovals()[pluginName];
+    if (!approval || approval.hash !== fileHash) return false;
+    return !approval.permissions || arePermissionSetsEqual(approval.permissions, permissions);
   }
 
-  private persistPluginApproval(pluginName: string, fileHash: string): void {
+  private persistPluginApproval(pluginName: string, fileHash: string, permissions: readonly string[]): void {
     this.setConfig('pluginApprovals', {
       ...this.getPluginApprovals(),
       [pluginName]: {
         hash: fileHash,
+        permissions: [...permissions],
         approvedAt: new Date().toISOString(),
       },
     });
   }
 
   private ensurePluginApproved(manifest: PluginManifest, fileHash: string): boolean {
-    if (!this.isPluginApproved(manifest.name, fileHash)) {
-      this.persistPluginApproval(manifest.name, fileHash);
+    if (this.brandRequiredPluginNamesSet.has(manifest.name)) {
+      if (!this.isRequiredPluginIntegrityTrusted(manifest, fileHash)) {
+        console.error(`[PluginManager] Required plugin "${manifest.name}" failed integrity verification`);
+        return false;
+      }
+      if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
+        this.persistPluginApproval(manifest.name, fileHash, manifest.permissions);
+      }
+      return true;
+    }
+
+    if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
+      this.persistPluginApproval(manifest.name, fileHash, manifest.permissions);
     }
     return true;
+  }
+
+  private isRequiredPluginIntegrityTrusted(manifest: PluginManifest, fileHash: string): boolean {
+    if (this.marketplaceService) {
+      const installedInfo = this.getConfig().marketplace?.installedPlugins?.[manifest.name];
+      if (!installedInfo?.fileHash || installedInfo.fileHash !== fileHash) return false;
+      if (installedInfo.version !== manifest.version) return false;
+      if (!installedInfo.permissions || !arePermissionSetsEqual(installedInfo.permissions, manifest.permissions)) return false;
+
+      const entry = this.marketplaceService.getCachedCatalog()?.find((plugin) => plugin.name === manifest.name);
+      if (entry && entry.version !== manifest.version) return false;
+      const expectedFileHash = entry ? this.getMarketplaceExpectedFileHash(entry) : undefined;
+      if (expectedFileHash && expectedFileHash !== fileHash) return false;
+
+      return true;
+    }
+
+    const bundledIntegrity = getBundledPluginIntegrity(manifest.name);
+    return bundledIntegrity?.fileHash === fileHash
+      && bundledIntegrity.version === manifest.version
+      && arePermissionSetsEqual(bundledIntegrity.permissions, manifest.permissions);
+  }
+
+  private getMarketplaceExpectedFileHash(entry: MarketplaceCatalogEntry): string | undefined {
+    return entry.fileHash ?? entry.hash;
   }
 
   private validatePluginConfig(manifest: PluginManifest, input: unknown): Record<string, unknown> {
@@ -322,10 +283,12 @@ export class PluginManager {
     this.plugins.set(manifest.name, instance);
 
     try {
-      instance.fileHash = this.computePluginFileHash(dir);
+      instance.fileHash = hashPluginDirectory(dir);
       if (!this.ensurePluginApproved(manifest, instance.fileHash)) {
-        instance.state = 'disabled';
-        instance.error = 'Plugin permission approval is required before it can be loaded.';
+        instance.state = 'error';
+        instance.error = this.brandRequiredPluginNamesSet.has(manifest.name)
+          ? 'Required plugin integrity verification failed. Reinstall or update the plugin from a trusted source.'
+          : 'Plugin permission approval is required before it can be loaded.';
         this.broadcastUIState();
         this.notifyToolsChanged();
         return;
@@ -878,16 +841,17 @@ export class PluginManager {
       this.setConfig,
     );
 
+    let catalog: MarketplaceCatalogEntry[] = [];
     try {
-      const catalog = await this.marketplaceService.fetchCatalog(marketplaceUrls);
+      catalog = await this.marketplaceService.fetchCatalog(marketplaceUrls);
       console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
-
-      // Auto-install brand-required plugins that are not yet present
-      if (this.brandRequiredPluginNames.length > 0) {
-        await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
-      }
     } catch (err) {
       console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
+      catalog = this.marketplaceService.getCachedCatalog() ?? [];
+    }
+
+    if (this.brandRequiredPluginNames.length > 0) {
+      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
     }
   }
 
@@ -950,7 +914,12 @@ export class PluginManager {
     const urls = marketplaceUrls ?? this.getMarketplaceUrls();
     if (urls.length === 0) return [];
 
-    return this.marketplaceService.fetchCatalog(urls);
+    const catalog = await this.marketplaceService.fetchCatalog(urls);
+    if (this.brandRequiredPluginNames.length > 0) {
+      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
+      return this.marketplaceService.getCachedCatalog() ?? catalog;
+    }
+    return catalog;
   }
 
   private getMarketplaceUrls(): string[] {

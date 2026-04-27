@@ -109,9 +109,9 @@ function getDefaultConfig() {
       computerUse: '',
     },
     plugins: {} as Record<string, Record<string, unknown>>,
-    pluginApprovals: {} as Record<string, { hash: string; approvedAt: string }>,
+    pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
     marketplace: {
-      installedPlugins: {} as Record<string, { name: string; repo: string; ref: string; version: string; installedAt: string; marketplaceUrl: string }>,
+      installedPlugins: {} as Record<string, { name: string; repository: string; version: string; fileHash?: string; permissions?: string[]; installedAt: string; marketplaceUrl: string }>,
     },
     launchAtLogin: false,
     ui: {

@@ -3,6 +3,8 @@ import { join } from 'path';
 import { execFile } from 'child_process';
 import { net } from 'electron';
 import type { AppConfig } from '../config/schema.js';
+import { arePermissionSetsEqual, getPluginIntegrity, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
+import type { PluginIntegrity } from './plugin-integrity.js';
 
 /* ── Marketplace JSON types ── */
 
@@ -12,6 +14,8 @@ export type MarketplacePluginEntry = {
   description: string;
   repository: string;
   version: string;
+  fileHash?: string;
+  hash?: string;
   author?: string;
   tags?: string[];
   icon?: string;
@@ -130,7 +134,7 @@ export class MarketplaceService {
 
   /* ── Plugin install ── */
 
-  async installPlugin(entry: MarketplaceCatalogEntry): Promise<void> {
+  async installPlugin(entry: MarketplaceCatalogEntry): Promise<PluginIntegrity> {
     const destDir = join(this.pluginsDir, entry.name);
     const tmpDir = join(this.pluginsDir, `.tmp-${entry.name}-${Date.now()}`);
 
@@ -188,6 +192,17 @@ export class MarketplaceService {
         throw new Error(`Plugin "${entry.name}" archive does not contain a plugin.json`);
       }
 
+      const manifest = readPluginManifest(tmpDir, entry.name);
+      if (manifest.name !== entry.name) {
+        throw new Error(`Plugin archive name mismatch: expected "${entry.name}", got "${manifest.name}"`);
+      }
+
+      const fileHash = hashPluginDirectory(tmpDir);
+      const expectedFileHash = this.getExpectedFileHash(entry);
+      if (expectedFileHash && fileHash !== expectedFileHash) {
+        throw new Error(`Plugin "${entry.name}" failed integrity check: expected ${expectedFileHash}, got ${fileHash}`);
+      }
+
       // No build step needed - plugins are pre-built in release assets
 
       // Swap in the new plugin directory
@@ -203,13 +218,29 @@ export class MarketplaceService {
           name: entry.name,
           repository: entry.repository,
           version: entry.version,
+          fileHash,
+          permissions: manifest.permissions,
           installedAt: new Date().toISOString(),
           marketplaceUrl: entry.marketplaceUrl,
         },
       };
       this.setConfig('marketplace.installedPlugins', installedPlugins);
+      this.persistPluginApproval(entry.name, fileHash, manifest.permissions);
+      if (this.cachedCatalog) {
+        this.cachedCatalog = this.cachedCatalog.map((catalogEntry) =>
+          catalogEntry.name === entry.name
+            ? { ...catalogEntry, installed: true, installedVersion: entry.version }
+            : catalogEntry,
+        );
+        this.writeCatalogCache(this.cachedCatalog);
+      }
 
       console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repository}@v${entry.version}`);
+      return {
+        fileHash,
+        permissions: manifest.permissions,
+        version: manifest.version,
+      };
     } catch (err) {
       // Clean up temp directory on failure
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -256,8 +287,6 @@ export class MarketplaceService {
 
   async autoInstallRequired(requiredNames: Set<string>, catalog: MarketplaceCatalogEntry[]): Promise<void> {
     for (const name of requiredNames) {
-      if (this.isPluginInstalled(name)) continue;
-
       const entry = catalog.find((p) => p.name === name);
       if (!entry) {
         console.warn(`[Marketplace] Required plugin "${name}" not found in any marketplace catalog`);
@@ -265,7 +294,10 @@ export class MarketplaceService {
       }
 
       try {
-        console.info(`[Marketplace] Auto-installing required plugin "${name}"...`);
+        const reason = this.getRequiredInstallReason(entry);
+        if (!reason) continue;
+
+        console.info(`[Marketplace] Auto-installing required plugin "${name}" (${reason})...`);
         await this.installPlugin(entry);
       } catch (err) {
         console.error(`[Marketplace] Failed to auto-install required plugin "${name}":`, err);
@@ -278,6 +310,53 @@ export class MarketplaceService {
   private isPluginInstalled(name: string): boolean {
     const pluginDir = join(this.pluginsDir, name);
     return existsSync(join(pluginDir, 'plugin.json'));
+  }
+
+  private getExpectedFileHash(entry: MarketplacePluginEntry): string | undefined {
+    return entry.fileHash ?? entry.hash;
+  }
+
+  private getInstalledPluginIntegrity(name: string): PluginIntegrity | null {
+    const pluginDir = join(this.pluginsDir, name);
+    if (!existsSync(join(pluginDir, 'plugin.json'))) return null;
+
+    try {
+      return getPluginIntegrity(pluginDir, name);
+    } catch {
+      return null;
+    }
+  }
+
+  private getRequiredInstallReason(entry: MarketplaceCatalogEntry): string | null {
+    const installed = this.getInstalledPluginIntegrity(entry.name);
+    if (!installed) return 'missing';
+
+    const installedInfo = this.getConfig().marketplace?.installedPlugins?.[entry.name];
+    const expectedFileHash = this.getExpectedFileHash(entry);
+    if (expectedFileHash && installed.fileHash !== expectedFileHash) return 'integrity mismatch';
+    if (installedInfo?.fileHash && installed.fileHash !== installedInfo.fileHash) return 'local files changed';
+    if (!installedInfo?.fileHash) return 'untrusted install metadata';
+    if (!installedInfo.permissions) return 'untrusted permission metadata';
+    if (installedInfo.version !== entry.version || installed.version !== entry.version) return `update available ${installedInfo.version ?? installed.version} -> ${entry.version}`;
+    if (!arePermissionSetsEqual(installedInfo.permissions, installed.permissions)) return 'permissions changed';
+
+    const approval = this.getConfig().pluginApprovals?.[entry.name];
+    if (!approval || approval.hash !== installed.fileHash || !arePermissionSetsEqual(approval.permissions, installed.permissions)) {
+      this.persistPluginApproval(entry.name, installed.fileHash, installed.permissions);
+    }
+
+    return null;
+  }
+
+  private persistPluginApproval(pluginName: string, fileHash: string, permissions: readonly string[]): void {
+    this.setConfig('pluginApprovals', {
+      ...(this.getConfig().pluginApprovals ?? {}),
+      [pluginName]: {
+        hash: fileHash,
+        permissions: [...permissions],
+        approvedAt: new Date().toISOString(),
+      },
+    });
   }
 
   getCachedCatalog(): MarketplaceCatalogEntry[] | null {

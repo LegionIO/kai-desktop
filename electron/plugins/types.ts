@@ -28,6 +28,7 @@ export type PluginPermission =
 
 export type PluginApprovalRecord = {
   hash: string;
+  permissions?: string[];
   approvedAt: string;
 };
 

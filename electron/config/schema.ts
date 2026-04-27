@@ -357,6 +357,7 @@ const videoGenerationConfigSchema = mediaGenProviderConfigSchema.extend({
 
 const pluginApprovalSchema = z.object({
   hash: z.string(),
+  permissions: z.array(z.string()).optional(),
   approvedAt: z.string(),
 });
 
@@ -364,6 +365,8 @@ const marketplaceInstalledPluginSchema = z.object({
   name: z.string(),
   repository: z.string(),
   version: z.string(),
+  fileHash: z.string().optional(),
+  permissions: z.array(z.string()).optional(),
   installedAt: z.string(),
   marketplaceUrl: z.string(),
 });

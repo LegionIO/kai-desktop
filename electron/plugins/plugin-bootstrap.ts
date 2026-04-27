@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
-import { existsSync, cpSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import type { Dirent } from 'node:fs';
+import { existsSync, cpSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { app } from 'electron';
+import { getPluginIntegrity, hashPluginDirectory } from './plugin-integrity.js';
+import type { PluginIntegrity } from './plugin-integrity.js';
 
 /**
  * Resolve the path to the bundled-plugins directory.
@@ -16,39 +16,6 @@ function getBundledPluginsDir(): string {
   }
   // Dev mode — bundled-plugins/ lives at the project root
   return join(import.meta.dirname, '../../bundled-plugins');
-}
-
-function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
-  const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) => a.name.localeCompare(b.name));
-  const files: string[] = [];
-
-  for (const entry of entries) {
-    const fullPath = join(currentDir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...collectPluginFiles(rootDir, fullPath));
-      continue;
-    }
-    if (entry.isFile()) {
-      files.push(fullPath);
-    }
-  }
-
-  return files;
-}
-
-function hashPluginDirectory(dir: string): string {
-  const hash = createHash('sha256');
-  const files = collectPluginFiles(dir);
-
-  for (const filePath of files) {
-    const relativePath = filePath.slice(dir.length + 1).replace(/\\/g, '/');
-    hash.update(relativePath);
-    hash.update('\0');
-    hash.update(readFileSync(filePath));
-    hash.update('\0');
-  }
-
-  return hash.digest('hex');
 }
 
 /**
@@ -102,6 +69,22 @@ export function bootstrapBundledPlugins(pluginsDir: string): void {
     } catch (err) {
       console.warn(`[PluginBootstrap] Failed to install bundled plugin "${entry}":`, err);
     }
+  }
+}
+
+/**
+ * Returns integrity metadata for a bundled plugin when the current brand ships
+ * one. Used as a trusted source for required-plugin load checks in builds that
+ * do not use a marketplace.
+ */
+export function getBundledPluginIntegrity(pluginName: string): PluginIntegrity | null {
+  const pluginDir = join(getBundledPluginsDir(), pluginName);
+  if (!existsSync(pluginDir)) return null;
+
+  try {
+    return getPluginIntegrity(pluginDir, pluginName);
+  } catch {
+    return null;
   }
 }
 
