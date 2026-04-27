@@ -169,7 +169,7 @@ export const SearchBar: FC<SearchBarProps> = ({ visible, onClose, viewportRef })
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={handleKeyDown}
-        placeholder="Search in conversation..."
+        placeholder="Search in chat..."
         className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/50"
       />
       {query && (

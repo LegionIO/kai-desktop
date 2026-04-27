@@ -270,11 +270,11 @@ const ComputerTabSurface: FC = () => {
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
-                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Conversation'}</div>
+                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Chat'}</div>
                 <p className="mt-1.5 text-xs text-muted-foreground">
                   {activeConversationId
                     ? 'Configure a goal and start a session using the controls below.'
-                    : 'Choose or create a conversation from the sidebar first.'}
+                    : 'Choose or create a chat from the sidebar first.'}
                 </p>
               </div>
             </div>

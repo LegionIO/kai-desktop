@@ -92,7 +92,7 @@ const SubAgentSidebarEntry: FC<{
             type="button"
             onClick={(e) => { e.stopPropagation(); onDelete(); }}
             className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-destructive/10 transition-all"
-            title="Delete thread"
+            title="Delete sub-agent"
           >
             <Trash2Icon className="h-3 w-3 text-muted-foreground hover:text-destructive" />
           </button>

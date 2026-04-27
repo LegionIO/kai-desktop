@@ -110,7 +110,7 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
           </button>
         )}
         {subAgentId && (
-          <button type="button" onClick={(e) => { e.stopPropagation(); handleNavigate(); }} className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 hover:bg-blue-500/10 px-1.5 py-0.5 rounded transition-colors shrink-0" title="Open full thread">
+          <button type="button" onClick={(e) => { e.stopPropagation(); handleNavigate(); }} className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 hover:bg-blue-500/10 px-1.5 py-0.5 rounded transition-colors shrink-0" title="Open full chat">
             <ExternalLinkIcon className="h-3 w-3" />
             <span>Open</span>
           </button>

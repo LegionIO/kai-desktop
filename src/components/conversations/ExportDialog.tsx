@@ -26,7 +26,7 @@ interface Props {
 }
 
 function messagesToMarkdown(conv: Conversation): string {
-  const title = conv.title || conv.fallbackTitle || 'Conversation';
+  const title = conv.title || conv.fallbackTitle || 'Chat';
   const lines: string[] = [`# ${title}`, ''];
   if (conv.createdAt) lines.push(`_Created: ${new Date(conv.createdAt).toLocaleString()}_`, '');
   lines.push('---', '');
@@ -59,7 +59,7 @@ function messagesToJson(conv: Conversation): string {
 }
 
 function messagesToText(conv: Conversation): string {
-  const title = conv.title || conv.fallbackTitle || 'Conversation';
+  const title = conv.title || conv.fallbackTitle || 'Chat';
   const lines: string[] = [title, '='.repeat(title.length), ''];
 
   for (const msg of conv.messages || []) {
@@ -119,7 +119,7 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
   const handleDownload = () => {
     const ext = format === 'json' ? '.json' : format === 'markdown' ? '.md' : '.txt';
     const mime = format === 'json' ? 'application/json' : 'text/plain';
-    const name = (conv?.title || conv?.fallbackTitle || 'conversation').replace(/[^a-zA-Z0-9-_ ]/g, '').slice(0, 50).trim().replace(/\s+/g, '-');
+    const name = (conv?.title || conv?.fallbackTitle || 'chat').replace(/[^a-zA-Z0-9-_ ]/g, '').slice(0, 50).trim().replace(/\s+/g, '-');
     const blob = new Blob([preview], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -140,7 +140,7 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
         <div className="flex items-center justify-between border-b border-border/30 px-5 py-3">
           <div className="flex items-center gap-2">
             <DownloadIcon className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">Export Conversation</h2>
+            <h2 className="text-sm font-semibold">Export Chat</h2>
             <span className="text-[10px] text-muted-foreground">{msgCount} messages</span>
           </div>
           <button type="button" onClick={onClose} className="rounded p-1 hover:bg-muted/40 transition-colors">

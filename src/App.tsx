@@ -300,7 +300,7 @@ function getConversationDisplayTitle(
     }
   }
 
-  return 'Untitled Thread';
+  return 'Untitled Chat';
 }
 
 function getComputerSessionForConversation(
@@ -889,7 +889,7 @@ function AppShell() {
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename thread</h2>
+              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
               <input
                 ref={renameInputRef}
                 value={renameValue}

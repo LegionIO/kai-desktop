@@ -12,8 +12,8 @@ const GROUPS: Array<{ label: string; shortcuts: Array<{ keys: string[]; descript
     shortcuts: [
       { keys: ['⌘', '?'], description: 'Keyboard shortcuts' },
       { keys: ['⌘', ','], description: 'Open settings' },
-      { keys: ['⌘', 'N'], description: 'New conversation' },
-      { keys: ['⌘', 'F'], description: 'Find in conversation' },
+      { keys: ['⌘', 'N'], description: 'New chat' },
+      { keys: ['⌘', 'F'], description: 'Find in chat' },
     ],
   },
   {
