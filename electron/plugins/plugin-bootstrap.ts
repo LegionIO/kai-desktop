@@ -108,11 +108,11 @@ export function bootstrapBundledPlugins(pluginsDir: string): void {
 /**
  * Returns the set of plugin names that the current brand mandates.
  */
-export function getBrandRequiredPluginNames(): Set<string> {
+export function getBrandRequiredPluginNames(): string[] {
   try {
-    return new Set(__BRAND_REQUIRED_PLUGINS);
+    return [...__BRAND_REQUIRED_PLUGINS];
   } catch {
-    return new Set();
+    return [];
   }
 }
 

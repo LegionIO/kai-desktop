@@ -15,7 +15,6 @@ type InstalledPlugin = {
   version: string;
   description: string;
   state: string;
-  required: boolean;
   brandRequired: boolean;
   error?: string;
 };

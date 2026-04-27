@@ -27,6 +27,7 @@ import type {
   PostReceiveHookResult,
   PluginAPI,
   PluginPermission,
+  PluginInferenceProvider,
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
@@ -57,6 +58,7 @@ const PLUGIN_PERMISSION_LABELS: Record<PluginPermission, string> = {
   'navigation:open': 'Request in-app navigation actions',
   'state:publish': 'Publish plugin state and live events to the renderer',
   'agent:generate': 'Generate AI responses via the agent',
+  'agent:inference-provider': 'Route LLM inference through plugin backend',
   'safe-storage': 'Access encrypted safe storage',
   'browser:window': 'Open browser windows',
 };
@@ -93,7 +95,6 @@ type PluginListEntry = {
   version: string;
   description: string;
   state: string;
-  required: boolean;
   brandRequired: boolean;
   error?: string;
 };
@@ -107,13 +108,17 @@ export class PluginManager {
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
 
+  private brandRequiredPluginNamesSet: Set<string>;
+
   constructor(
     private pluginsDir: string,
     private appHome: string,
     private getConfig: () => AppConfig,
     private setConfig: (path: string, value: unknown) => void,
-    private brandRequiredPluginNames: Set<string> = new Set(),
-  ) {}
+    private brandRequiredPluginNames: string[] = [],
+  ) {
+    this.brandRequiredPluginNamesSet = new Set(brandRequiredPluginNames);
+  }
 
   /* ── Discovery ── */
 
@@ -155,8 +160,6 @@ export class PluginManager {
           permissions: Array.isArray(raw.permissions)
             ? raw.permissions.filter((value): value is PluginPermission => typeof value === 'string')
             : [],
-          priority: typeof raw.priority === 'number' ? raw.priority : 100,
-          required: raw.required === true || this.brandRequiredPluginNames.has(typeof raw.name === 'string' ? raw.name : entry),
           configSchema: raw.configSchema && typeof raw.configSchema === 'object'
             ? raw.configSchema as Record<string, unknown>
             : undefined,
@@ -168,7 +171,15 @@ export class PluginManager {
       }
     }
 
-    results.sort((a, b) => a.manifest.priority - b.manifest.priority);
+    // Sort: requiredPlugins first (in their configured order), then the rest alphabetically
+    results.sort((a, b) => {
+      const aIdx = this.brandRequiredPluginNames.indexOf(a.manifest.name);
+      const bIdx = this.brandRequiredPluginNames.indexOf(b.manifest.name);
+      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+      if (aIdx !== -1) return -1;
+      if (bIdx !== -1) return 1;
+      return a.manifest.name.localeCompare(b.manifest.name);
+    });
     return results;
   }
 
@@ -305,6 +316,7 @@ export class PluginManager {
       notifications: [],
       configChangeListeners: [],
       rendererBuild: null,
+      inferenceProvider: null,
     };
 
     this.plugins.set(manifest.name, instance);
@@ -385,7 +397,7 @@ export class PluginManager {
       instance.error = undefined;
       this.broadcastUIState();
       this.notifyToolsChanged();
-      console.info(`[PluginManager] Plugin "${manifest.name}" activated (priority=${manifest.priority}, required=${manifest.required})`);
+      console.info(`[PluginManager] Plugin "${manifest.name}" activated`);
     } catch (err) {
       instance.state = 'error';
       instance.error = err instanceof Error ? err.message : String(err);
@@ -398,7 +410,15 @@ export class PluginManager {
   /* ── Unloading ── */
 
   async unloadAll(): Promise<void> {
-    const sorted = [...this.plugins.entries()].sort(([, a], [, b]) => b.manifest.priority - a.manifest.priority);
+    // Unload in reverse of load order: non-required plugins first (reverse alpha), then required plugins in reverse order
+    const sorted = [...this.plugins.entries()].sort(([, a], [, b]) => {
+      const aIdx = this.brandRequiredPluginNames.indexOf(a.manifest.name);
+      const bIdx = this.brandRequiredPluginNames.indexOf(b.manifest.name);
+      if (aIdx !== -1 && bIdx !== -1) return bIdx - aIdx;
+      if (aIdx !== -1) return 1;
+      if (bIdx !== -1) return -1;
+      return b.manifest.name.localeCompare(a.manifest.name);
+    });
 
     for (const [name, instance] of sorted) {
       try {
@@ -443,6 +463,12 @@ export class PluginManager {
 
     this.actionHandlers.delete(pluginName);
 
+    // Clean up inference provider
+    if (instance.inferenceProvider) {
+      console.info(`[PluginManager] Clearing inference provider from "${pluginName}"`);
+      instance.inferenceProvider = null;
+    }
+
     for (const [key, timer] of this.notificationTimers.entries()) {
       if (key.startsWith(`${pluginName}:`)) {
         clearTimeout(timer);
@@ -471,8 +497,7 @@ export class PluginManager {
       version: instance.manifest.version,
       description: instance.manifest.description,
       state: instance.state,
-      required: instance.manifest.required,
-      brandRequired: this.brandRequiredPluginNames.has(instance.manifest.name),
+      brandRequired: this.brandRequiredPluginNamesSet.has(instance.manifest.name),
       error: instance.error,
     }));
   }
@@ -568,6 +593,18 @@ export class PluginManager {
 
   /* ── Message Hooks ── */
 
+  /* ── Inference Provider ── */
+
+  getInferenceProvider(): PluginInferenceProvider | null {
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      if (instance.inferenceProvider && instance.inferenceProvider.isAvailable()) {
+        return instance.inferenceProvider;
+      }
+    }
+    return null;
+  }
+
   async runPreSendHooks(args: PreSendHookArgs): Promise<PreSendHookResult> {
     let result: PreSendHookResult = { messages: args.messages };
 
@@ -631,7 +668,7 @@ export class PluginManager {
       const isActive = instance.state === 'active';
       const shouldExposeUi = instance.state === 'loading' || instance.state === 'active';
 
-      if (!isActive && instance.manifest.required) {
+      if (!isActive && this.brandRequiredPluginNamesSet.has(instance.manifest.name)) {
         requiredPluginsReady = false;
       }
 
@@ -654,7 +691,7 @@ export class PluginManager {
         rendererStyles.push(...instance.rendererBuild.styles);
       }
 
-      if (instance.manifest.required) {
+      if (this.brandRequiredPluginNamesSet.has(instance.manifest.name)) {
         const hasBlockingModal = instance.uiModals.some((modal) => modal.visible && !modal.closeable);
         if (hasBlockingModal) {
           requiredPluginsReady = false;
@@ -842,8 +879,8 @@ export class PluginManager {
       console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
 
       // Auto-install brand-required plugins that are not yet present
-      if (this.brandRequiredPluginNames.size > 0) {
-        await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNames, catalog);
+      if (this.brandRequiredPluginNames.length > 0) {
+        await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
       }
     } catch (err) {
       console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
@@ -891,7 +928,7 @@ export class PluginManager {
       throw new Error('Marketplace is not initialized');
     }
 
-    if (this.brandRequiredPluginNames.has(pluginName)) {
+    if (this.brandRequiredPluginNamesSet.has(pluginName)) {
       throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
     }
 
