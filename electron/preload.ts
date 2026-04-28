@@ -56,6 +56,7 @@ const appAPI = {
     clear: () => ipcRenderer.invoke('conversations:clear'),
     getActiveId: () => ipcRenderer.invoke('conversations:get-active-id'),
     setActiveId: (id: string) => ipcRenderer.invoke('conversations:set-active-id', id),
+    debugLog: (message: string) => ipcRenderer.invoke('conversations:debug-log', message),
     onChanged: (callback: (store: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, store: unknown) => callback(store);
       ipcRenderer.on('conversations:changed', handler);

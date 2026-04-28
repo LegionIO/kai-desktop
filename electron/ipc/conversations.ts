@@ -1,10 +1,20 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import { getComputerUseManager } from '../computer-use/service.js';
+
+// --- Debug logging (temporary) ---
+const DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/persist.log');
+function debugLog(msg: string): void {
+  try {
+    const dir = join(import.meta.dirname, '../../debug-logs');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* ignore */ }
+}
 
 type ConversationRecord = {
   id: string;
@@ -106,12 +116,29 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const prev = store.conversations[conversation.id];
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
+    // --- Debug: log what's being written ---
+    const lastAssistantMsg = Array.isArray(conversation.messages)
+      ? [...conversation.messages].reverse().find((m: unknown) => {
+          const msg = m as Record<string, unknown>;
+          return msg.role === 'assistant';
+        })
+      : null;
+    const assistantTiming = lastAssistantMsg
+      ? (() => {
+          const meta = (lastAssistantMsg as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
+          const custom = meta?.['custom'] as Record<string, unknown> | undefined;
+          return custom?.['responseTiming'] ?? null;
+        })()
+      : null;
+    debugLog(`[PUT] id=${conversation.id.slice(0, 8)} runStatus=${conversation.runStatus} treeLen=${tree.length} prevTreeLen=${prevTreeLen} assistantTiming=${JSON.stringify(assistantTiming)} caller=${(conversation.metadata?.['_debugCaller'] as string) ?? 'unknown'}`);
+
     // Guard: never allow a write that would lose messages compared to what's on disk.
     // If the incoming tree is shorter than the stored tree, preserve the stored message data
     // and only apply non-message field updates. This protects against stale-closure races
     // where title generation, settings persistence, or debounced persists write back
     // an older snapshot of the conversation.
     if (prev && prevTreeLen > 0 && tree.length < prevTreeLen) {
+      debugLog(`[PUT:GUARD] id=${conversation.id.slice(0, 8)} incoming tree shorter (${tree.length} < ${prevTreeLen}), preserving stored messages`);
       const guarded = {
         ...conversation,
         messages: prev.messages,
@@ -187,5 +214,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
     return { ok: true };
+  });
+
+  ipcMain.handle('conversations:debug-log', (_event, message: string) => {
+    debugLog(`[RENDERER] ${message}`);
   });
 }
