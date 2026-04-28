@@ -885,8 +885,21 @@ async function persistConversation(
     }
     const branch = getActiveBranch(tree, headId);
     const now = nowIso();
+    // Debug: check if assistant message has finishedAt in responseTiming
+    if (updates.runStatus === 'idle') {
+      const lastAssistant = [...branch].reverse().find((m) => m.role === 'assistant');
+      if (lastAssistant) {
+        const rt = getResponseTiming(lastAssistant);
+        console.warn(`[STREAM_DEBUG] persistConversation WRITING runStatus=idle branchLen=${branch.length} treeLen=${tree.length} assistantRT=${JSON.stringify(rt)}`);
+      }
+    }
+    // When this is a generation-tagged persist (from schedulePersist), strip volatile
+    // status fields from the base record so we don't accidentally overwrite a terminal
+    // runStatus that the done/error handler wrote between our get() and put().
+    const { runStatus: _diskRunStatus, hasUnread: _diskUnread, ...safeConv } = conv;
+    const baseConv = generation !== undefined ? safeConv : conv;
     await app.conversations.put({
-      ...conv,
+      ...baseConv,
       messages: branch, // linear view for backward compat
       messageTree: tree,
       headId,
@@ -897,6 +910,19 @@ async function persistConversation(
       userMessageCount: branch.filter((m) => m.role === 'user').length,
       ...updates,
     });
+    // Verify what was actually written
+    if (updates.runStatus === 'idle') {
+      const verify = await app.conversations.get(conversationId) as ConversationRecord | null;
+      if (verify) {
+        const vTree = verify.messageTree ?? [];
+        const vBranch = getActiveBranch(vTree as StoredMessage[], verify.headId ?? null);
+        const lastA = [...vBranch].reverse().find((m: StoredMessage) => m.role === 'assistant');
+        if (lastA) {
+          const vRt = getResponseTiming(lastA);
+          console.warn(`[STREAM_DEBUG] persistConversation VERIFY ON DISK runStatus=${verify.runStatus} assistantRT=${JSON.stringify(vRt)}`);
+        }
+      }
+    }
   } catch (err) {
     console.error('[Runtime] Failed to persist:', err);
   }

@@ -152,6 +152,9 @@ export const ConversationList: FC<ConversationListProps> = ({
   const loadConversations = useCallback(async () => {
     try {
       const list = await app.conversations.list() as ConversationSummary[];
+      // Debug: log runStatus of all conversations
+      const statusSummary = list.map((c) => `${(c.title || c.fallbackTitle || '?').slice(0, 15)}:${c.runStatus}`).join(', ');
+      console.warn(`[SIDEBAR_DEBUG] loadConversations: ${list.length} convs [${statusSummary}]`);
 
       setConversations((prev) => {
         const newIds = new Set(list.map((c) => c.id));
@@ -190,7 +193,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     let cancelled = false;
     const safeLoad = () => { if (!cancelled) void loadConversations(); };
     safeLoad();
-    const unsub = app.conversations.onChanged(() => { safeLoad(); });
+    const unsub = app.conversations.onChanged(() => { console.warn('[SIDEBAR_DEBUG] onChanged fired'); safeLoad(); });
     return () => { cancelled = true; unsub(); };
   }, [loadConversations]);
 
