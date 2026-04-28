@@ -46,6 +46,10 @@ const appAPI = {
       ipcRenderer.invoke('agent:sub-agent-stop', subAgentConversationId),
     listSubAgents: () =>
       ipcRenderer.invoke('agent:sub-agent-list'),
+    getAvailableRuntimes: () =>
+      ipcRenderer.invoke('agent:get-available-runtimes'),
+    getActiveRuntime: () =>
+      ipcRenderer.invoke('agent:get-active-runtime'),
   },
 
   conversations: {

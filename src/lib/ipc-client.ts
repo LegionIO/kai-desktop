@@ -24,6 +24,8 @@ type AppAPI = {
     sendSubAgentMessage: (subAgentConversationId: string, message: string) => Promise<{ ok: boolean }>;
     stopSubAgent: (subAgentConversationId: string) => Promise<{ ok: boolean }>;
     listSubAgents: () => Promise<{ ids: string[] }>;
+    getAvailableRuntimes: () => Promise<Array<{ id: string; name: string; available: boolean; reason?: string }>>;
+    getActiveRuntime: () => Promise<string>;
   };
   conversations: {
     list: () => Promise<unknown[]>;

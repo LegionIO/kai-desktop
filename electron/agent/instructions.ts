@@ -371,3 +371,54 @@ function getExtension(filePath: string): string {
   if (dotIdx <= 0) return '';
   return base.slice(dotIdx).toLowerCase();
 }
+
+// ---------------------------------------------------------------------------
+// Working directory prompt assembly (moved from ipc/agent.ts)
+// ---------------------------------------------------------------------------
+
+// Cache loaded instructions per cwd to avoid re-reading on every message
+const instructionsCache = new Map<string, { prompt: string; loadedAt: number }>();
+const INSTRUCTIONS_CACHE_TTL_MS = 30_000; // 30 seconds
+
+/**
+ * Augment a base system prompt with working-directory context and project
+ * instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.).
+ *
+ * If `cwd` is undefined the original prompt is returned unchanged.
+ */
+export async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Promise<string> {
+  if (!cwd) return basePrompt;
+
+  const parts = [
+    basePrompt,
+    `Current working directory for this conversation: ${cwd}`,
+    'IMPORTANT: Use this directory as the default base path for ALL tool calls (mastra_workspace_grep, mastra_workspace_list_files, mastra_workspace_execute_command, mastra_workspace_read_file, mastra_workspace_write_file, mastra_workspace_edit_file). When a tool accepts a `path` parameter, either omit it to use the working directory automatically, or pass this exact directory. NEVER navigate the filesystem from / or /Users to find the project — the working directory is already set.',
+  ];
+
+  // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
+  try {
+    const cached = instructionsCache.get(cwd);
+    const now = Date.now();
+    let instructionsPrompt: string;
+
+    if (cached && (now - cached.loadedAt) < INSTRUCTIONS_CACHE_TTL_MS) {
+      instructionsPrompt = cached.prompt;
+    } else {
+      const sources = await loadProjectInstructions(cwd);
+      instructionsPrompt = buildInstructionsPrompt(sources);
+      instructionsCache.set(cwd, { prompt: instructionsPrompt, loadedAt: now });
+
+      if (sources.length > 0) {
+        console.info(`[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`);
+      }
+    }
+
+    if (instructionsPrompt) {
+      parts.push(instructionsPrompt);
+    }
+  } catch (err) {
+    console.warn('[Instructions] Failed to load project instructions:', err);
+  }
+
+  return parts.filter(Boolean).join('\n\n');
+}

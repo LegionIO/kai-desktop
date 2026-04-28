@@ -385,6 +385,34 @@ const cliToolSchema = z.object({
   builtIn: z.boolean().optional(),
 });
 
+// ---------------------------------------------------------------------------
+// Agent runtime config
+// ---------------------------------------------------------------------------
+
+const runtimeIdSchema = z.enum(['mastra', 'claude-agent-sdk', 'codex-sdk']);
+export type RuntimeIdConfig = z.infer<typeof runtimeIdSchema>;
+
+const claudeAgentSdkConfigSchema = z.object({
+  permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),
+  maxTurns: z.number().positive().optional(),
+  thinking: z.discriminatedUnion('type', [
+    z.object({ type: z.literal('adaptive') }),
+    z.object({ type: z.literal('disabled') }),
+    z.object({ type: z.literal('enabled'), budgetTokens: z.number().positive() }),
+  ]).optional(),
+  persistSession: z.boolean().optional(),
+});
+
+const codexSdkConfigSchema = z.object({
+  approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
+});
+
+const agentConfigSchema = z.object({
+  runtime: z.enum(['auto', 'mastra', 'claude-agent-sdk', 'codex-sdk']),
+  claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
+  codexSdk: codexSdkConfigSchema.optional(),
+});
+
 const webServerConfigSchema = z.object({
   enabled: z.boolean(),
   port: z.number().positive(),
@@ -403,6 +431,7 @@ const webServerConfigSchema = z.object({
 });
 
 export const appConfigSchema = z.object({
+  agent: agentConfigSchema.optional(),
   models: modelsConfigSchema,
   memory: memoryConfigSchema,
   compaction: z.object({
