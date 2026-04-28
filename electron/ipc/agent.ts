@@ -38,8 +38,8 @@ const IMPLEMENT_MODE_EXCLUDED_TOOLS = new Set([
   'exit_plan_mode',
 ]);
 
-// Pending tool approval promises for confirm-writes execution mode
-const pendingToolApprovals = new Map<string, { resolve: (approved: boolean | 'dismiss') => void }>();
+// Pending tool approval promises — shared with the Claude Agent SDK MCP bridge
+import { pendingToolApprovals } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
 import { pendingQuestionAnswers } from '../tools/ask-user.js';

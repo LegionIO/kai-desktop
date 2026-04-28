@@ -1,15 +1,15 @@
 /**
- * Tool → MCP Bridge.
+ * Tool → MCP Bridge (DEPRECATED).
  *
- * Wraps Kai's internal tool definitions as an in-process MCP server so that
- * external SDK runtimes (Claude Agent SDK, Codex SDK) can discover and invoke
- * Kai's custom tools (skills, plugins, CLI tools) through the MCP protocol.
+ * This module is superseded by the direct `createSdkMcpServer()` integration
+ * in `claude-agent-runtime.ts`. The SDK's native `tool()` helper now handles
+ * schema conversion and handler registration inline — no separate bridge class
+ * is needed.
  *
- * Claude Agent SDK natively supports MCP connections via:
- *   mcpServers: { "kai-tools": { type: "sdk", instance: bridgeServer } }
+ * Kept for backward compatibility with tests and any code that references it.
+ * New code should use `createSdkMcpServer()` + SDK `tool()` directly.
  *
- * Schema conversion uses Zod 4's built-in `toJSONSchema()` — no external
- * dependency required.
+ * @deprecated Use createSdkMcpServer() from @anthropic-ai/claude-agent-sdk instead.
  */
 
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';

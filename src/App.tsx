@@ -39,7 +39,7 @@ import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface 
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
-import { PlanPanel, PlanPanelDivider } from '@/components/thread/PlanPanel';
+import { PlanPanel } from '@/components/thread/PlanPanel';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -429,7 +429,6 @@ function AppShell() {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
   const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
-  const [planPanelWidth, setPlanPanelWidth] = useState(420);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
@@ -1516,21 +1515,13 @@ function AppShell() {
                         onToggleFallback={handleToggleFallback}
                       />
                     </div>
-                    {/* Plan panel (side-by-side) */}
+                    {/* Plan modal */}
                     {planPanel && (
-                      <>
-                        <PlanPanelDivider
-                          panelWidth={planPanelWidth}
-                          onWidthChange={setPlanPanelWidth}
-                        />
-                        <div style={{ width: `${planPanelWidth}px` }} className="shrink-0">
-                          <PlanPanel
-                            content={planPanel.content}
-                            filePath={planPanel.filePath}
-                            onClose={() => setPlanPanel(null)}
-                          />
-                        </div>
-                      </>
+                      <PlanPanel
+                        content={planPanel.content}
+                        filePath={planPanel.filePath}
+                        onClose={() => setPlanPanel(null)}
+                      />
                     )}
                   </div>
                 </PlanPanelProvider>

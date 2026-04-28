@@ -2,368 +2,303 @@
 
 ## Context
 
-The Claude Code runtime currently only supports SDK built-in tools (Read, Write, Edit, Bash, Glob, Grep, LSP, WebFetch, WebSearch, Agent, Monitor). When Claude wants to use Kai-specific features like `ask_user`, `enter_plan_mode`, or `exit_plan_mode`, it either:
-1. Tries to use the SDK's built-in versions (which have incompatible APIs and break), OR
-2. Asks in plain text (which bypasses Kai's custom UI components)
+The Claude Code runtime currently only supports SDK built-in tools (Read, Write, Edit, Bash, Glob, Grep, LSP, WebFetch, WebSearch, Agent, Monitor). When Claude wants to use Kai-specific features like skills, CLI tools, settings management, or plan mode, they're unavailable — the user is told to switch to Mastra.
 
-**The Goal**: Enable the Claude Code runtime to call Kai's tools (ask_user, plan mode, task management, etc.) so users get the full Kai feature set regardless of which runtime they choose.
+**The Goal**: Expose Kai's custom tools to the Claude Code SDK so users get a fuller Kai experience regardless of which runtime they choose.
 
-**The Challenge**: The Claude Code SDK runs as a subprocess and can't directly access Kai's Electron IPC infrastructure. Kai tools require IPC to show dialogs, manage state, and communicate with the renderer.
+**Key Insight**: The Claude Agent SDK supports **in-process MCP servers** via `createSdkMcpServer()`. Tool handlers run in Kai's main process (the parent), not inside the Claude Code subprocess. The SDK marshals tool calls back across the process boundary transparently. This means most Kai tools can be bridged with minimal effort.
 
 ---
 
-## Architecture Options
+## Architecture: In-Process MCP Server
 
-### Option A: IPC-backed MCP Server (Recommended)
+```
+┌──────────────────────────────────────────────────────────┐
+│  Kai Main Process (Node/Electron)                        │
+│                                                          │
+│  ┌────────────────┐    ┌──────────────────────────────┐  │
+│  │  Claude SDK    │    │  createSdkMcpServer()        │  │
+│  │  query()       │───▶│  "kai-tools"                 │  │
+│  │  (spawns CLI   │    │                              │  │
+│  │   subprocess)  │    │  tool handlers execute here  │  │
+│  └────────────────┘    │  (full main-process access)  │  │
+│                        └──────────────────────────────┘  │
+│                                   │                      │
+│                                   ▼                      │
+│                        ┌──────────────────────────────┐  │
+│                        │  Kai Tool Registry            │  │
+│                        │  (skills, CLI tools, MCP,     │  │
+│                        │   plan mode, settings, etc.)  │  │
+│                        └──────────────────────────────┘  │
+│                                   │                      │
+│                                   ▼                      │
+│                        ┌──────────────────────────────┐  │
+│                        │  Electron IPC / BrowserWindow │  │
+│                        │  (UI broadcasts, file ops)    │  │
+│                        └──────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
 
-**How it works**:
-1. Create a stdio-based MCP server in Kai's main process that wraps registered tools
-2. Spawn the server as a child process alongside the Claude Code CLI
-3. Configure the SDK to connect to this MCP server via stdio transport
-4. When the SDK calls a tool, the MCP server executes it via Kai's IPC and returns the result
-
-**Pros**:
-- Clean separation: SDK subprocess ↔ MCP server ↔ Kai IPC
-- Standard MCP protocol (no custom hacks)
-- Works with any MCP-compatible client (not just Claude Code)
-- Tools execute in Kai's context with full IPC access
-
-**Cons**:
-- Requires building a stdio MCP server (not just in-process)
-- SDK must support stdio MCP connections (need to verify)
-- Additional process management complexity
-
-### Option B: HTTP-based MCP Server
-
-**How it works**:
-1. Start an HTTP server in Kai's main process that implements MCP over SSE
-2. Configure SDK to connect via HTTP transport
-3. MCP requests execute tools via Kai's IPC
-
-**Pros**:
-- HTTP/SSE is a standard MCP transport
-- No stdio process management
-- Easy to debug (can test with curl)
-
-**Cons**:
-- Need to allocate a port (localhost:random or fixed)
-- More overhead than stdio
-- Security consideration (localhost only)
-
-### Option C: In-Process Callback Bridge
-
-**How it works**:
-1. Use SDK's `createSdkMcpServer` to create an in-process MCP server
-2. Tool handlers call back to Kai via Node.js async calls (not subprocesses)
-3. SDK runs in same process, just uses MCP interface
-
-**Pros**:
-- Simplest — no separate processes or servers
-- Direct function calls (fast)
-
-**Cons**:
-- **Does not work**: SDK's `query()` spawns a subprocess (the Claude Code CLI), and the in-process MCP server can't be accessed from that subprocess
-- Already attempted and failed (see current code)
-
-### Option D: Accept Limited Tool Support
-
-**How it works**:
-- Document that Claude Code runtime has limited tool support
-- Users who need plan mode / ask_user / tasks use Mastra runtime
-- Claude Code is for fast, reliable file/code operations only
-
-**Pros**:
-- Zero implementation work
-- Clear separation of concerns
-- Mastra still has full features
-
-**Cons**:
-- Users lose Kai features when using Claude Code
-- Inconsistent experience across runtimes
+Because tool handlers run in the main process, they have full access to:
+- `BrowserWindow.getAllWindows()` (for UI broadcasts)
+- File system (`~/.kai/config.json`, `~/.kai/plans/`, etc.)
+- The tool registry and all registered tools
+- Electron IPC infrastructure
 
 ---
 
-## Recommended Approach: Option A (IPC-backed MCP Server)
+## Tool Categories & Bridging Feasibility
 
-### Phase 1: Build stdio MCP Server
+### Fully Bridgeable (execute in main process, no special flow needed)
 
-**File**: `electron/agent/runtime/kai-mcp-server.ts`
+| Tool | What it does | Why it works |
+|------|-------------|--------------|
+| `enter_plan_mode` | Broadcasts mode change to renderer, returns instructions | Pure broadcast + return |
+| `exit_plan_mode` | Writes plan to `~/.kai/plans/`, broadcasts mode change | File write + broadcast |
+| `mcp_manage` | Manages MCP server config in `~/.kai/config.json` | Config file I/O |
+| `memory_settings` | Configures memory settings | Config file I/O |
+| `compaction_settings` | Configures compaction | Config file I/O |
+| `tool_settings` | Configures tool availability | Config file I/O |
+| `advanced_settings` | Configures advanced behavior | Config file I/O |
+| `system_prompt` | Configures system prompt | Config file I/O |
+| `audio_settings` | Configures audio | Config file I/O |
+| `realtime_settings` | Configures realtime API | Config file I/O |
+| `model_switch` | Switches active model | Config file I/O |
+| `skill_manage` | Installs/removes/toggles skills | File I/O + config |
+| `cli_tool_manage` | Manages CLI tool bindings | Config file I/O |
+| `plugin_info` | Returns plugin metadata | Pure read |
+| CLI tools (gh, git, etc.) | Run shell commands | Subprocess execution |
+| Skill tools | Execute skill logic | Pure function calls |
+| MCP tools (external servers) | Forward to external MCP | Network/stdio calls |
+| `web_fetch` / `web_search` | HTTP requests | Network I/O |
+| `image_gen` / `video_gen` | Media generation APIs | Network I/O + file write |
 
-Create a Node.js script that:
-1. Receives MCP requests via stdin (JSONRPC format)
-2. Sends MCP responses via stdout
-3. Calls Kai tools via... **wait, how does it call back to main process?**
+### Requires Special Handling: `ask_user`
 
-**Problem**: A stdio MCP server runs as a separate process. It can't directly call Kai's IPC handlers because those are in the main process. We need IPC between the MCP server process and Kai's main process.
+**The challenge**: `ask_user` needs orchestration beyond just running `execute()`:
 
-**Solution**: Use Node.js IPC (child_process with IPC channel):
+1. Tool call arrives → broadcast `tool-approval-required` event to renderer
+2. Renderer shows question UI to user
+3. User submits answers via `agent:answer-tool-question` IPC
+4. Answers stored in `pendingQuestionAnswers` map
+5. Tool approval resolves → `execute()` retrieves answers from map
+
+In the Mastra runtime, `agent.ts` orchestrates steps 1-4 via `onToolExecutionStart` hooks. The Claude Code SDK manages its own tool execution loop, so we need a different approach.
+
+**Solution**: Implement the full orchestration inside the MCP tool handler itself:
+
 ```typescript
-// In main.ts
-const mcpServer = fork('electron/agent/runtime/kai-mcp-server.js', [], {
-  stdio: ['pipe', 'pipe', 'pipe', 'ipc'], // stdin, stdout, stderr, IPC channel
-});
+tool('ask_user', 'Ask the user a question...', schema, async (args) => {
+  const toolCallId = `mcp-ask-${Date.now()}`;
 
-// MCP server can call tools via IPC channel
-mcpServer.on('message', async (msg) => {
-  if (msg.type === 'tool-call') {
-    const result = await executeToolInMainProcess(msg.toolName, msg.args);
-    mcpServer.send({ type: 'tool-result', id: msg.id, result });
+  // 1. Broadcast to renderer (show question UI)
+  broadcastStreamEvent({
+    conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'ask_user',
+    args,
+  });
+
+  // 2. Wait for user response (blocks until IPC resolves)
+  const answers = await waitForUserAnswer(toolCallId);
+
+  // 3. Return answers to SDK
+  if (!answers) {
+    return { content: [{ type: 'text', text: 'User dismissed the question.' }], isError: true };
   }
+  return { content: [{ type: 'text', text: JSON.stringify({ success: true, answers }) }] };
 });
 ```
 
-### Phase 2: Wire MCP Server to Claude Code SDK
+The key insight: since the tool handler runs in the main process, it can directly broadcast events and await IPC responses, just like `agent.ts` does for Mastra. The tool call simply blocks (awaits a Promise) until the user responds.
+
+### Not Bridgeable: `sub_agent`
+
+The sub-agent tool creates new Mastra agent instances with their own streaming loops. It's deeply tied to the Mastra runtime's streaming architecture and would require essentially reimplementing a second runtime inside the bridge. Not worth the complexity — Claude Code SDK already has its own native `Agent` tool that does the same thing.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Core Bridge (~50-100 lines)
 
 **File**: `electron/agent/runtime/claude-agent-runtime.ts`
 
-In the SDK options:
+Wire the existing `ToolMcpBridge` into the SDK via `createSdkMcpServer()`:
+
 ```typescript
-mcpServers: {
-  'kai-tools': {
-    command: process.execPath, // Node.js
-    args: [path.join(__dirname, 'kai-mcp-server.js')],
-    env: { KAI_MAIN_PROCESS_IPC: 'some-channel-id' }, // How to pass IPC back-channel?
-  }
+import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+
+// In stream() method, before calling query():
+
+// Filter tools: exclude sub_agent (SDK has its own Agent tool) and
+// tools that duplicate SDK built-ins (web_fetch, web_search already in SDK)
+const EXCLUDED_TOOLS = new Set(['sub_agent']);
+const bridgeableTools = (options.tools ?? []).filter(t => !EXCLUDED_TOOLS.has(t.name));
+
+if (bridgeableTools.length > 0) {
+  const bridge = new ToolMcpBridge({
+    tools: bridgeableTools,
+    conversationId,
+    cwd,
+  });
+
+  const kaiMcpServer = createSdkMcpServer({
+    name: 'kai-tools',
+    version: '1.0.0',
+    tools: bridgeableTools.map(t => tool(
+      t.name,
+      t.description ?? '',
+      t.inputSchema,
+      async (args) => {
+        const result = await bridge.callTool(t.name, args, abortSignal);
+        return result;
+      }
+    )),
+  });
+
+  sdkOptions.mcpServers = {
+    'kai-tools': kaiMcpServer,
+  };
 }
 ```
 
-**Wait, another problem**: The SDK spawns the MCP server as a subprocess, but we need that subprocess to have an IPC channel back to Kai's main process. How do we establish that?
+### Phase 2: `ask_user` Bridge (~80 lines)
 
-**Possible solutions**:
-1. **Unix socket**: MCP server connects to a Unix socket that Kai's main process listens on
-2. **TCP localhost**: MCP server connects to localhost:PORT where main process has an IPC bridge
-3. **Shared memory / pipe**: More complex
+**File**: `electron/agent/runtime/claude-agent-runtime.ts` (or extracted to a helper)
 
-Actually, **this is getting too complex**. Let me reconsider...
-
----
-
-## Reconsidering: The Real Problem
-
-The fundamental issue: **Claude Code SDK runs as a subprocess and cannot access Kai's Electron IPC**. Any bridge we build requires:
-1. SDK subprocess → MCP server (stdio or HTTP)
-2. MCP server → Kai main process (some IPC mechanism)
-3. Kai main process → Tool execution (current IPC handlers)
-
-This is a lot of plumbing for what amounts to: "call a function in the parent process from a subprocess."
-
-### Alternative: Simpler HTTP Bridge
-
-**File**: `electron/agent/runtime/tool-ipc-bridge.ts`
+Create a self-contained `ask_user` handler that orchestrates the full approval flow within the MCP tool handler:
 
 ```typescript
-import { createServer } from 'http';
-import type { ToolDefinition } from '../../tools/types.js';
+// Helper: wait for user answer via IPC
+function createAskUserBridgeHandler(conversationId: string) {
+  return async (args: { questions: unknown[] }) => {
+    const toolCallId = `mcp-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-export class ToolIpcBridge {
-  private server: Server;
-  private port: number;
-
-  constructor(private tools: ToolDefinition[]) {
-    this.server = createServer(this.handleRequest.bind(this));
-  }
-
-  async start(): Promise<number> {
-    return new Promise((resolve) => {
-      this.server.listen(0, 'localhost', () => {
-        this.port = (this.server.address() as AddressInfo).port;
-        resolve(this.port);
-      });
-    });
-  }
-
-  private async handleRequest(req: IncomingMessage, res: ServerResponse) {
-    if (req.url === '/tools') {
-      // List tools (MCP list_tools format)
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ tools: this.tools.map(t => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema,
-      })) }));
-    } else if (req.url?.startsWith('/call/')) {
-      // Execute tool (MCP call_tool format)
-      const toolName = req.url.slice(6);
-      const tool = this.tools.find(t => t.name === toolName);
-      
-      let body = '';
-      req.on('data', chunk => body += chunk);
-      req.on('end', async () => {
-        try {
-          const args = JSON.parse(body);
-          const result = await tool.execute(args, {
-            toolCallId: `http-bridge-${Date.now()}`,
-            conversationId: args._conversationId, // Pass through
-            cwd: args._cwd,
-            abortSignal: null, // TODO: handle abort
-          });
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ result }));
-        } catch (err) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: err.message }));
-        }
+    // Broadcast to renderer — shows question UI
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('agent:stream-event', {
+        conversationId,
+        type: 'tool-approval-required',
+        toolCallId,
+        toolName: 'ask_user',
+        args,
       });
     }
-  }
 
-  stop() {
-    this.server.close();
-  }
+    // Block until user responds (or aborts)
+    const answers = await new Promise<Record<string, string> | null>((resolve) => {
+      const handler = (_event: unknown, id: string, userAnswers: Record<string, string>) => {
+        if (id === toolCallId) {
+          ipcMain.removeHandler(`ask-user-bridge:${toolCallId}`);
+          resolve(userAnswers);
+        }
+      };
+      // Register one-shot handler
+      pendingMcpAskUserResolvers.set(toolCallId, resolve);
+    });
+
+    if (!answers) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed' }) }], isError: true };
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({ success: true, answers }) }] };
+  };
 }
 ```
 
-Then in SDK options:
-```typescript
-// Start bridge
-const bridge = new ToolIpcBridge(tools);
-const port = await bridge.start();
+**Renderer-side**: The renderer already handles `tool-approval-required` events and calls `agent:answer-tool-question`. We just need to ensure the bridge handler listens for answers on the same channel (or a parallel one) so the existing UI flow works unchanged.
 
-// Configure SDK
-mcpServers: {
-  'kai-tools': {
-    url: `http://localhost:${port}/mcp`, // If SDK supports HTTP MCP
-    // OR use sse:
-    url: `http://localhost:${port}/sse`,
-  }
-}
-```
+### Phase 3: Plan Mode Integration (~20 lines)
 
-**But does the Claude Code SDK support HTTP MCP servers?** Need to verify this.
+Plan mode tools (`enter_plan_mode`, `exit_plan_mode`) already work as pure functions that broadcast + write files. They'll work through the standard bridge path (Phase 1) with zero modifications because:
+- `broadcastModeChange()` calls `BrowserWindow.getAllWindows()` — works from main process
+- `writeFileSync()` writes plans to disk — works from main process
+- No approval flow or IPC blocking needed
 
----
+The only consideration: when `enter_plan_mode` fires, the SDK won't actually restrict its own tools. The tool's return value tells Claude "only use read-only tools" as an instruction in the system context, which Claude typically respects. For stronger enforcement, we could filter the `tools` array mid-session, but that's a stretch goal.
 
-## Decision Point
-
-Before proceeding, we need to answer:
-
-1. **Does the Claude Code SDK support stdio-based MCP servers?**
-2. **Does the Claude Code SDK support HTTP/SSE-based MCP servers?**
-3. **What MCP transport options does `mcpServers` config accept?**
-
-Without knowing the SDK's MCP transport capabilities, we can't design the bridge properly.
-
----
-
-## Interim Recommendation: Option D + Documentation
-
-**For now**:
-1. Accept that Claude Code runtime has limited tool support
-2. Add clear documentation in RuntimeSettings UI:
-   - **Mastra**: Full Kai features (plan mode, user questions, task management, memory, compaction, sub-agents)
-   - **Claude Code**: Fast & reliable, best for file/code operations (Read, Write, Edit, Bash, Grep, LSP)
-   - **Codex**: Similar to Claude Code with OpenAI models
-3. Add a note: "Kai-specific tools (plan mode, user questions) require Mastra runtime"
-4. Update runtime descriptions to set clear expectations
-
-**Later**, when we have SDK documentation or can test MCP transports:
-- Implement Option A (stdio MCP) or Option B (HTTP MCP) based on what the SDK supports
-- This is a significant architectural addition and warrants its own focused implementation phase
-
----
-
-## Implementation Steps (Interim Approach)
-
-### Step 1: Update Runtime Descriptions
+### Phase 4: UI Updates (~30 lines)
 
 **File**: `src/components/settings/RuntimeSettings.tsx`
 
-Update `RUNTIME_DESCRIPTIONS`:
+Update capability table and descriptions to reflect the new bridge:
+
 ```typescript
-const RUNTIME_DESCRIPTIONS: Record<string, string> = {
-  mastra: 'Built-in runtime with full Kai feature support: memory, observer, compaction, multi-provider models, plan mode, user questions, task management, and sub-agents.',
-  'claude-agent-sdk': 'Anthropic\'s Claude Code. Production-tested tool execution, native MCP support, session resume. Best for file/code operations. Note: Kai-specific features (plan mode, user questions) are not available.',
-  'codex-sdk': 'OpenAI\'s Codex agent. Thread-based execution with session resume. Best for file/code operations with OpenAI models.',
-};
-```
-
-### Step 2: Add Feature Comparison Note
-
-Add a prominent note in the Runtime Settings UI:
-```tsx
-{selectedRuntime !== 'mastra' && (
-  <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 px-3 py-2 mt-4">
-    <p className="text-xs text-amber-600 dark:text-amber-400">
-      <strong>Note:</strong> Kai-specific features (plan mode, user questions, task management) require the Mastra runtime. The {runtimes.find(r => r.id === selectedRuntime)?.name} runtime provides file and code operations only.
-    </p>
-  </div>
-)}
-```
-
-### Step 3: Update Capability Table
-
-Update the capability comparison to clarify which features are Kai-specific:
-```typescript
+// Before (incorrect):
 ['Plan mode', true, false, false],
 ['User questions', true, false, false],
-['Task management', true, false, false],
+
+// After (accurate):
+['Plan mode', true, true, false],
+['User questions (ask_user)', true, true, false],
+['Skills & CLI tools', true, true, false],
+['Sub-agents', true, 'native', false],  // SDK has its own Agent tool
 ```
 
-### Step 4: Comment the Bridge Code
-
-Add detailed comments in `claude-agent-runtime.ts` explaining why the bridge doesn't exist and what would be needed:
+Update runtime description:
 ```typescript
-// -----------------------------------------------------------------------
-// NOTE: Kai Tool Bridging
-// -----------------------------------------------------------------------
-// Kai's custom tools (ask_user, enter_plan_mode, exit_plan_mode, task_*,
-// etc.) require Electron IPC to show dialogs and manage state. The Claude
-// Code SDK runs as a subprocess and cannot access IPC directly.
-//
-// To bridge these tools, we would need to:
-// 1. Create an MCP server (stdio or HTTP) in Kai's main process
-// 2. Have that server execute tools via IPC when the SDK calls them
-// 3. Configure the SDK to connect to this MCP server
-//
-// This is architecturally complex and requires:
-// - Understanding SDK's supported MCP transports (stdio/HTTP/SSE)
-// - Building a subprocess → main process IPC bridge
-// - Handling abort signals across process boundaries
-// - Managing server lifecycle (start/stop with runtime)
-//
-// For now, users needing these features should use the Mastra runtime.
-// Future work: Implement MCP bridge once SDK transport options are clear.
+'claude-agent-sdk': 'Anthropic\'s Claude Code. Production-tested tool execution with native MCP support and session resume. Kai tools (skills, plan mode, settings) are available via MCP bridge.',
 ```
 
 ---
 
-## Verification
+## Verification Plan
 
-1. **UI updates**: Open Settings → Agent Runtime, verify descriptions are clear
-2. **Note visible**: When Claude Code or Codex is selected, the amber warning appears
-3. **Capability table**: Shows plan mode / user questions as Mastra-only
-4. **User understanding**: A user reading the UI should understand which runtime to pick based on their needs
-
----
-
-## Future Work: MCP Bridge Implementation
-
-When ready to implement the bridge:
-
-1. **Research**: Determine SDK's supported MCP transports by reading SDK docs or testing
-2. **Choose transport**: stdio (if supported) or HTTP (fallback)
-3. **Build bridge**:
-   - `electron/agent/runtime/kai-mcp-server.ts` (stdio variant) OR
-   - `electron/agent/runtime/tool-http-bridge.ts` (HTTP variant)
-4. **Wire to SDK**: Configure `mcpServers` in claude-agent-runtime.ts
-5. **Test**: Verify tools work across the bridge (plan mode, ask_user, etc.)
-6. **Update UI**: Remove limitation warnings once bridge works
+1. **Basic bridge**: Select Claude Code runtime → start a conversation → ask Claude to use a skill → verify it executes via the MCP bridge
+2. **Plan mode**: Ask Claude to "plan this first" → verify `enter_plan_mode` broadcasts mode change → renderer shows plan mode UI → `exit_plan_mode` writes plan file
+3. **ask_user**: Give Claude a task that requires clarification → verify question UI appears → submit answer → verify Claude receives it
+4. **Settings tools**: Ask Claude to "switch the model" or "configure memory" → verify config changes persist
+5. **CLI tools**: Ask Claude to use `gh` → verify it routes through the bridge (not SDK's built-in Bash)
+6. **Abort**: Start a bridged tool call → cancel the stream → verify cleanup
 
 ---
 
-## Files to Modify (Interim Approach)
+## Files to Modify
 
 | File | Change |
 |------|--------|
-| `src/components/settings/RuntimeSettings.tsx` | Update descriptions, add note, update capability table |
-| `electron/agent/runtime/claude-agent-runtime.ts` | Add comment explaining bridge challenge |
+| `electron/agent/runtime/claude-agent-runtime.ts` | Wire `createSdkMcpServer()` with bridgeable tools, add `ask_user` orchestration |
+| `electron/agent/runtime/tool-mcp-bridge.ts` | Minor: ensure `callTool` return type matches SDK's `CallToolResult` |
+| `src/components/settings/RuntimeSettings.tsx` | Update capability table and descriptions |
 
----
-
-## Files to Create (Future MCP Bridge)
+## Files to Create (optional)
 
 | File | Purpose |
 |------|---------|
-| `electron/agent/runtime/kai-mcp-server.ts` | Stdio MCP server (if SDK supports) |
-| `electron/agent/runtime/tool-http-bridge.ts` | HTTP MCP bridge (if SDK supports) |
-| `electron/agent/runtime/mcp-transport-detect.ts` | Detect SDK's MCP capabilities |
+| `electron/agent/runtime/ask-user-bridge.ts` | Extract `ask_user` orchestration if it grows complex |
+
+---
+
+## Risks & Mitigations
+
+| Risk | Mitigation |
+|------|-----------|
+| `createSdkMcpServer()` API changes between SDK versions | Pin SDK version; add integration test |
+| Tool handler blocks forever if user never answers `ask_user` | Add timeout (configurable, default 5 min); abort cleans up |
+| SDK tool list conflicts (e.g. SDK's `WebFetch` vs Kai's `web_fetch`) | Use distinct names; Kai tools use snake_case, SDK uses PascalCase |
+| Plan mode "enforcement" is advisory only | Accept this — Claude respects instructions; add a note in plan mode tool response |
+| Too many tools in MCP server slows SDK startup | Lazy-load MCP server; only include tools relevant to execution mode |
+
+---
+
+## What This Does NOT Solve
+
+- **Mastra-specific features**: Memory layers, compaction, tool observer, and observer-launched tools remain Mastra-only. These are deeply integrated into Mastra's streaming pipeline.
+- **Sub-agents via Kai**: Claude Code SDK has its own `Agent` tool. Kai's sub-agent system (which uses Mastra internally) won't be bridged — it's redundant.
+- **Model override**: Claude Code uses its own model config. Kai's model switcher can update `~/.kai/config.json` but won't affect the SDK's active session.
+
+---
+
+## Estimated Effort
+
+| Phase | Lines of Code | Complexity |
+|-------|--------------|------------|
+| Phase 1: Core bridge | ~50 | Low — mostly wiring existing pieces |
+| Phase 2: ask_user | ~80 | Medium — IPC orchestration |
+| Phase 3: Plan mode | ~0 (works via Phase 1) | None |
+| Phase 4: UI updates | ~30 | Low |
+| **Total** | **~160** | **Low-Medium** |
+
+This is a focused integration task, not a multi-phase architecture project.

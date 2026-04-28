@@ -10,7 +10,7 @@ type AgentConfig = {
 
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   mastra: 'Built-in runtime with full Kai feature support (memory, observer, compaction, multi-provider models).',
-  'claude-agent-sdk': 'Anthropic\'s Claude Code agent. Production-tested tool execution, native MCP support, session resume.',
+  'claude-agent-sdk': 'Anthropic\'s Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.',
   'codex-sdk': 'OpenAI\'s Codex agent. Thread-based execution with session resume.',
 };
 
@@ -155,6 +155,9 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
                 ['Tool execution', true, true, true],
                 ['MCP support', true, true, false],
                 ['Custom tools', true, true, false],
+                ['Plan mode', true, true, false],
+                ['User questions (ask_user)', true, true, false],
+                ['Skills & CLI tools', true, true, false],
                 ['Memory layers', true, false, false],
                 ['Context compaction', true, false, false],
                 ['Tool observer', true, false, false],
