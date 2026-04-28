@@ -161,6 +161,20 @@ export class PluginManager {
     });
   }
 
+  /** Permissions that require explicit user consent via modal. */
+  private static readonly DANGEROUS_PERMISSIONS: Set<PluginPermission> = new Set([
+    'exec:whitelisted',
+    'fs:scoped-write',
+    'fs:scoped-read',
+  ]);
+
+  /** Plugins waiting for user consent. Maps pluginName → pending load info. */
+  private pendingConsent: Map<string, { manifest: PluginManifest; fileHash: string }> = new Map();
+
+  private hasDangerousPermissions(manifest: PluginManifest): boolean {
+    return manifest.permissions.some((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
+  }
+
   private ensurePluginApproved(manifest: PluginManifest, fileHash: string): boolean {
     if (this.brandRequiredPluginNamesSet.has(manifest.name)) {
       if (!this.isRequiredPluginIntegrityTrusted(manifest, fileHash)) {
@@ -173,10 +187,63 @@ export class PluginManager {
       return true;
     }
 
+    // All non-brand-required plugins require explicit user consent
     if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
-      this.persistPluginApproval(manifest.name, fileHash, manifest.permissions);
+      // Store pending consent and notify renderer
+      this.pendingConsent.set(manifest.name, { manifest, fileHash });
+      const dangerousPermissions = manifest.permissions.filter((p) =>
+        PluginManager.DANGEROUS_PERMISSIONS.has(p),
+      );
+      broadcastToAllWindows('plugin:consent-required', {
+        pluginName: manifest.name,
+        displayName: manifest.displayName,
+        permissions: manifest.permissions,
+        dangerousPermissions,
+        fsScope: manifest.fsScope,
+        execScope: manifest.execScope,
+        fileHash,
+      });
+      console.info(`[PluginManager] Plugin "${manifest.name}" requires user consent for: ${manifest.permissions.join(', ')}`);
+      return false; // Block loading until user consents
     }
     return true;
+  }
+
+  /** Called by IPC when user approves a dangerous plugin. */
+  async approveAndReload(pluginName: string): Promise<boolean> {
+    const pending = this.pendingConsent.get(pluginName);
+    if (!pending) return false;
+
+    this.persistPluginApproval(pluginName, pending.fileHash, pending.manifest.permissions);
+    this.pendingConsent.delete(pluginName);
+
+    // Re-discover the plugin directory
+    const discovered = this.discoverPlugins();
+    const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
+    if (!pluginInfo) return false;
+
+    // Load the plugin now that it's approved
+    await this.loadPlugin(pluginInfo.manifest, pluginInfo.dir);
+    return true;
+  }
+
+  /** Called by IPC when user denies a dangerous plugin. */
+  denyPlugin(pluginName: string): void {
+    this.pendingConsent.delete(pluginName);
+    const instance = this.plugins.get(pluginName);
+    if (instance) {
+      instance.state = 'error';
+      instance.error = 'Permission denied by user';
+      this.broadcastUIState();
+    }
+  }
+
+  /** Get list of plugins pending consent. */
+  getPendingConsent(): Array<{ pluginName: string; manifest: PluginManifest; fileHash: string }> {
+    return Array.from(this.pendingConsent.entries()).map(([pluginName, info]) => ({
+      pluginName,
+      ...info,
+    }));
   }
 
   private isRequiredPluginIntegrityTrusted(manifest: PluginManifest, fileHash: string): boolean {
