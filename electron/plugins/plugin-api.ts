@@ -5,6 +5,11 @@ import { URL } from 'url';
 import { z } from 'zod';
 import { generateForPlugin } from '../agent/plugin-generate.js';
 import { getRegisteredTools } from '../ipc/agent.js';
+import { readFile, writeFile, mkdir, readdir, rm, rename } from 'fs/promises';
+import { existsSync } from 'fs';
+import { resolve, normalize, join, dirname } from 'path';
+import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 import type {
   PluginAPI,
   PluginInstance,
@@ -28,7 +33,20 @@ import type {
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
+  ScopedDirectory,
+  AllowedBinary,
+  ExecRequest,
+  FsResult,
 } from './types.js';
+import {
+  resolveScopeDirectory,
+  isPathWithinScope,
+  executeCommand,
+  detectTool,
+  findBinary,
+  SAFE_ENV_VARS,
+} from './sandboxed-exec.js';
+import { writeAuditEntry } from './audit-log.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix } from '../tools/naming.js';
@@ -1073,6 +1091,226 @@ export function createPluginAPI(
         init as Parameters<typeof net.fetch>[1],
       ) as ReturnType<typeof globalThis.fetch>;
     }) as typeof globalThis.fetch,
+
+    // ─── Scoped Filesystem ──────────────────────────────────────────────
+
+    fs: {
+      resolveScopePath: (scope: ScopedDirectory, relativePath?: string): string => {
+        requirePermission('fs:scoped-read');
+        const base = resolveScopeDirectory(scope, instance.dir);
+        return relativePath ? join(base, relativePath) : base;
+      },
+
+      readFile: async (scopedPath: string): Promise<FsResult> => {
+        requirePermission('fs:scoped-read');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+          writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:read', target: scopedPath, approved: false });
+          return { success: false, path: scopedPath, error: 'Path outside declared scope' };
+        }
+        try {
+          const data = await readFile(scopedPath, 'utf-8');
+          writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:read', target: scopedPath, approved: true });
+          return { success: true, path: scopedPath, data };
+        } catch (err) {
+          return { success: false, path: scopedPath, error: String(err) };
+        }
+      },
+
+      writeFile: async (scopedPath: string, content: string): Promise<FsResult> => {
+        requirePermission('fs:scoped-write');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
+        if (!fsScope.operations.includes('write')) return { success: false, path: scopedPath, error: 'Write not in declared operations' };
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+          writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:write', target: scopedPath, approved: false });
+          return { success: false, path: scopedPath, error: 'Path outside declared scope' };
+        }
+        try {
+          await mkdir(dirname(scopedPath), { recursive: true });
+          await writeFile(scopedPath, content, 'utf-8');
+          writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:write', target: scopedPath, approved: true });
+          return { success: true, path: scopedPath };
+        } catch (err) {
+          return { success: false, path: scopedPath, error: String(err) };
+        }
+      },
+
+      exists: async (scopedPath: string): Promise<boolean> => {
+        requirePermission('fs:scoped-read');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return false;
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) return false;
+        return existsSync(scopedPath);
+      },
+
+      mkdir: async (scopedPath: string): Promise<FsResult> => {
+        requirePermission('fs:scoped-write');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+          return { success: false, path: scopedPath, error: 'Path outside declared scope' };
+        }
+        try {
+          await mkdir(scopedPath, { recursive: true });
+          writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:mkdir', target: scopedPath, approved: true });
+          return { success: true, path: scopedPath };
+        } catch (err) {
+          return { success: false, path: scopedPath, error: String(err) };
+        }
+      },
+
+      readdir: async (scopedPath: string) => {
+        requirePermission('fs:scoped-read');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return { success: false as const, error: 'No fsScope declared in plugin.json' };
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+          return { success: false as const, error: 'Path outside declared scope' };
+        }
+        try {
+          const entries = await readdir(scopedPath);
+          return { success: true as const, entries };
+        } catch (err) {
+          return { success: false as const, error: String(err) };
+        }
+      },
+
+      remove: async (scopedPath: string): Promise<FsResult> => {
+        requirePermission('fs:scoped-write');
+        const fsScope = manifest.fsScope;
+        if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
+        if (!fsScope.operations.includes('remove')) return { success: false, path: scopedPath, error: 'Remove not in declared operations' };
+        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+          return { success: false, path: scopedPath, error: 'Path outside declared scope' };
+        }
+        try {
+          await rm(scopedPath, { force: true });
+          return { success: true, path: scopedPath };
+        } catch (err) {
+          return { success: false, path: scopedPath, error: String(err) };
+        }
+      },
+
+      readJson: async <T = unknown>(scopedPath: string) => {
+        const result = await api.fs.readFile(scopedPath);
+        if (!result.success || !result.data) return { success: false as const, error: result.error };
+        try {
+          return { success: true as const, data: JSON.parse(result.data) as T };
+        } catch (err) {
+          return { success: false as const, error: `JSON parse error: ${err}` };
+        }
+      },
+
+      writeJson: async (scopedPath: string, data: unknown): Promise<FsResult> => {
+        const content = JSON.stringify(data, null, 2);
+        // Atomic write: write to temp file, then rename
+        const tmpPath = `${scopedPath}.${randomUUID().slice(0, 8)}.tmp`;
+        const writeResult = await api.fs.writeFile(tmpPath, content);
+        if (!writeResult.success) return writeResult;
+        try {
+          await rename(tmpPath, scopedPath);
+          return { success: true, path: scopedPath };
+        } catch (err) {
+          return { success: false, path: scopedPath, error: String(err) };
+        }
+      },
+    },
+
+    // ─── Whitelisted Command Execution ──────────────────────────────────
+
+    exec: {
+      run: async (request: ExecRequest) => {
+        requirePermission('exec:whitelisted');
+        const execScope = manifest.execScope;
+        if (!execScope) {
+          return { exitCode: -1, stdout: '', stderr: 'No execScope declared in plugin.json', command: request.binary, durationMs: 0, truncated: false };
+        }
+        return executeCommand(request, execScope, manifest.name, writeAuditEntry);
+      },
+
+      which: async (binary: AllowedBinary) => {
+        requirePermission('exec:whitelisted');
+        return findBinary(binary);
+      },
+    },
+
+    // ─── Tool Detection ─────────────────────────────────────────────────
+
+    detect: {
+      claudeCode: () => { requirePermission('tools:detect'); return detectTool('claude'); },
+      codex:      () => { requirePermission('tools:detect'); return detectTool('codex'); },
+      python:     () => { requirePermission('tools:detect'); return detectTool('python3'); },
+      node:       () => { requirePermission('tools:detect'); return detectTool('node'); },
+      git:        () => { requirePermission('tools:detect'); return detectTool('git'); },
+      pip:        () => { requirePermission('tools:detect'); return detectTool('pip3'); },
+      binary: (name: AllowedBinary) => { requirePermission('tools:detect'); return detectTool(name); },
+
+      claudePlugin: async (pluginName: string) => {
+        requirePermission('tools:detect');
+        const installedPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+        try {
+          if (!existsSync(installedPath)) return { installed: false };
+          const data = JSON.parse(await readFile(installedPath, 'utf-8'));
+          const plugins = data.plugins ?? data;
+          const found = Array.isArray(plugins)
+            ? plugins.find((p: { name?: string }) => p.name === pluginName)
+            : plugins[pluginName];
+          return found ? { installed: true, version: found.version, path: found.path } : { installed: false };
+        } catch {
+          return { installed: false };
+        }
+      },
+
+      codexSkill: async (skillId: string) => {
+        requirePermission('tools:detect');
+        const skillPath = join(homedir(), '.codex', 'skills', skillId, 'SKILL.md');
+        return { installed: existsSync(skillPath), path: existsSync(skillPath) ? skillPath : undefined };
+      },
+
+      dr0Package: async () => {
+        requirePermission('tools:detect');
+        try {
+          const { execSync } = await import('child_process');
+          const result = execSync('python3 -c "import dr0; print(dr0.__version__)"', {
+            encoding: 'utf-8',
+            timeout: 10_000,
+          }).trim();
+          return { installed: true, version: result };
+        } catch {
+          return { installed: false };
+        }
+      },
+
+      all: async () => {
+        requirePermission('tools:detect');
+        const [claude, codex, python, node, git, pip] = await Promise.all([
+          detectTool('claude'),
+          detectTool('codex'),
+          detectTool('python3'),
+          detectTool('node'),
+          detectTool('git'),
+          detectTool('pip3'),
+        ]);
+        return { claude, codex, python, node, git, pip };
+      },
+    },
+
+    // ─── Safe Environment Access ────────────────────────────────────────
+
+    env: {
+      home:     () => { requirePermission('system:env'); return homedir(); },
+      platform: () => { requirePermission('system:env'); return process.platform; },
+      get: (name: string) => {
+        requirePermission('system:env');
+        if (!SAFE_ENV_VARS.has(name)) return undefined;
+        return process.env[name];
+      },
+      paths: () => {
+        requirePermission('system:env');
+        return (process.env.PATH ?? '').split(':');
+      },
+    },
   };
 
   api.conversations.list = () => {

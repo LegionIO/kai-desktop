@@ -24,12 +24,94 @@ export type PluginPermission =
   | 'agent:generate'
   | 'agent:inference-provider'
   | 'safe-storage'
-  | 'browser:window';
+  | 'browser:window'
+  | 'fs:scoped-read'
+  | 'fs:scoped-write'
+  | 'exec:whitelisted'
+  | 'tools:detect'
+  | 'system:env'
+  | 'audit:log';
 
 export type PluginApprovalRecord = {
   hash: string;
   permissions?: string[];
   approvedAt: string;
+};
+
+/* ── Scoped Filesystem & Execution Declarations ── */
+
+export type ScopedDirectory =
+  | 'claude-home'   // ~/.claude/
+  | 'codex-home'    // ~/.codex/
+  | 'plugin-own'    // The plugin's own directory
+  | 'kai-home'      // ~/.kai/
+  | 'otc-repo';     // Configurable otc-awesome-llm checkout
+
+export type AllowedBinary =
+  | 'claude'       // Claude Code CLI
+  | 'codex'        // Codex CLI
+  | 'node'         // Node.js
+  | 'npm'          // npm
+  | 'pip'          // Python package manager
+  | 'pip3'         // Python 3 package manager
+  | 'python'       // Python interpreter
+  | 'python3'      // Python 3 interpreter
+  | 'git'          // Git CLI
+  | 'bash';        // Bash (only for whitelisted scripts)
+
+export type FsScopeDeclaration = {
+  directories: ScopedDirectory[];
+  operations: ('read' | 'write' | 'mkdir' | 'exists' | 'readdir' | 'remove')[];
+};
+
+export type ExecScopeDeclaration = {
+  binaries: AllowedBinary[];
+  argPatterns?: Record<string, string[]>;
+};
+
+export type ExecRequest = {
+  binary: AllowedBinary;
+  args: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;       // default 60_000, max 300_000
+  stdin?: string;
+};
+
+export type ExecResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  command: string;
+  durationMs: number;
+  truncated: boolean;
+};
+
+export type ToolDetectionResult = {
+  name: string;
+  installed: boolean;
+  path?: string;
+  version?: string;
+  error?: string;
+};
+
+export type FsResult = {
+  success: boolean;
+  path: string;
+  error?: string;
+  data?: string;
+};
+
+export type AuditEntry = {
+  timestamp: string;
+  pluginName: string;
+  action: 'fs:read' | 'fs:write' | 'fs:mkdir' | 'fs:exists' | 'exec:run' | 'tools:detect';
+  target: string;
+  args?: string[];
+  exitCode?: number;
+  durationMs?: number;
+  approved: boolean;
+  userConsentId?: string;
 };
 
 export type PluginManifest = {
@@ -41,6 +123,8 @@ export type PluginManifest = {
   icon?: { lucide: string } | { svg: string };
   permissions: PluginPermission[];
   configSchema?: Record<string, unknown>;
+  fsScope?: FsScopeDeclaration;
+  execScope?: ExecScopeDeclaration;
 };
 
 /* ── Plugin State ── */
@@ -414,6 +498,48 @@ export type PluginAPI = {
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
 
   fetch: typeof globalThis.fetch;
+
+  /* ── Scoped Filesystem ── */
+  fs: {
+    resolveScopePath: (scope: ScopedDirectory, relativePath?: string) => string;
+    readFile: (scopedPath: string) => Promise<FsResult>;
+    writeFile: (scopedPath: string, content: string) => Promise<FsResult>;
+    exists: (scopedPath: string) => Promise<boolean>;
+    mkdir: (scopedPath: string) => Promise<FsResult>;
+    readdir: (scopedPath: string) => Promise<{ success: boolean; entries?: string[]; error?: string }>;
+    remove: (scopedPath: string) => Promise<FsResult>;
+    readJson: <T = unknown>(scopedPath: string) => Promise<{ success: boolean; data?: T; error?: string }>;
+    writeJson: (scopedPath: string, data: unknown) => Promise<FsResult>;
+  };
+
+  /* ── Whitelisted Command Execution ── */
+  exec: {
+    run: (request: ExecRequest) => Promise<ExecResult>;
+    which: (binary: AllowedBinary) => Promise<string | null>;
+  };
+
+  /* ── Tool Detection (read-only) ── */
+  detect: {
+    claudeCode: () => Promise<ToolDetectionResult>;
+    codex: () => Promise<ToolDetectionResult>;
+    python: () => Promise<ToolDetectionResult>;
+    node: () => Promise<ToolDetectionResult>;
+    git: () => Promise<ToolDetectionResult>;
+    pip: () => Promise<ToolDetectionResult>;
+    binary: (name: AllowedBinary) => Promise<ToolDetectionResult>;
+    claudePlugin: (pluginName: string) => Promise<{ installed: boolean; version?: string; path?: string }>;
+    codexSkill: (skillId: string) => Promise<{ installed: boolean; path?: string }>;
+    dr0Package: () => Promise<{ installed: boolean; version?: string }>;
+    all: () => Promise<Record<string, ToolDetectionResult>>;
+  };
+
+  /* ── Safe Environment Access ── */
+  env: {
+    home: () => string;
+    platform: () => string;
+    get: (name: string) => string | undefined;
+    paths: () => string[];
+  };
 };
 
 export type PluginHttpRequest = {

@@ -181,6 +181,17 @@ const appAPI = {
       ipcRenderer.on('plugin:modal-callback', handler);
       return () => ipcRenderer.removeListener('plugin:modal-callback', handler);
     },
+    approveConsent: (pluginName: string) =>
+      ipcRenderer.invoke('plugin:approve-consent', pluginName) as Promise<{ success: boolean }>,
+    denyConsent: (pluginName: string) =>
+      ipcRenderer.invoke('plugin:deny-consent', pluginName) as Promise<{ success: boolean }>,
+    getPendingConsent: () =>
+      ipcRenderer.invoke('plugin:pending-consent') as Promise<Array<{ pluginName: string; manifest: unknown; fileHash: string }>>,
+    onConsentRequired: (callback: (data: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('plugin:consent-required', handler);
+      return () => ipcRenderer.removeListener('plugin:consent-required', handler);
+    },
   },
 
   modelCatalog: () => ipcRenderer.invoke('agent:model-catalog'),
