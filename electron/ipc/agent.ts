@@ -1,9 +1,8 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { join } from 'path';
-import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry, type ResolvedStreamConfig } from '../agent/model-catalog.js';
-import { normalizeAgentCwd, streamAgentResponse, streamWithFallback, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
+import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
+import { normalizeAgentCwd, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -12,6 +11,7 @@ import { shouldCompact, compactConversationPrefix, compactToolResult, estimateTo
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
+import { resolveRuntime } from '../agent/runtime/index.js';
 import {
   ToolObserverManager,
   resolveToolObserverConfig,
@@ -199,48 +199,7 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-import { loadProjectInstructions, buildInstructionsPrompt } from '../agent/instructions.js';
 
-// Cache loaded instructions per cwd to avoid re-reading on every message
-const instructionsCache = new Map<string, { prompt: string; loadedAt: number }>();
-const INSTRUCTIONS_CACHE_TTL_MS = 30_000; // 30 seconds
-
-async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: string): Promise<string> {
-  if (!cwd) return basePrompt;
-
-  const parts = [
-    basePrompt,
-    `Current working directory for this conversation: ${cwd}`,
-    'IMPORTANT: Use this directory as the default base path for ALL tool calls (mastra_workspace_grep, mastra_workspace_list_files, mastra_workspace_execute_command, mastra_workspace_read_file, mastra_workspace_write_file, mastra_workspace_edit_file). When a tool accepts a `path` parameter, either omit it to use the working directory automatically, or pass this exact directory. NEVER navigate the filesystem from / or /Users to find the project — the working directory is already set.',
-  ];
-
-  // Load project instructions (CLAUDE.md, AGENTS.md, .cursorrules, etc.)
-  try {
-    const cached = instructionsCache.get(cwd);
-    const now = Date.now();
-    let instructionsPrompt: string;
-
-    if (cached && (now - cached.loadedAt) < INSTRUCTIONS_CACHE_TTL_MS) {
-      instructionsPrompt = cached.prompt;
-    } else {
-      const sources = await loadProjectInstructions(cwd);
-      instructionsPrompt = buildInstructionsPrompt(sources);
-      instructionsCache.set(cwd, { prompt: instructionsPrompt, loadedAt: now });
-
-      if (sources.length > 0) {
-        console.info(`[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`);
-      }
-    }
-
-    if (instructionsPrompt) {
-      parts.push(instructionsPrompt);
-    }
-  } catch (err) {
-    console.warn('[Instructions] Failed to load project instructions:', err);
-  }
-
-  return parts.filter(Boolean).join('\n\n');
-}
 
 function logToolCompactionDebug(stage: string, details: Record<string, unknown>): void {
   console.info(`[ToolCompactionDebug] ${stage} ${JSON.stringify(details)}`);
@@ -325,86 +284,6 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
   registeredTools = [...nonCli, ...ensureSafeToolDefinitions(cliTools)];
 }
 
-function streamMastra(options: {
-  conversationId: string;
-  messages: unknown[];
-  appHome: string;
-  config: AppConfig;
-  cwd?: string;
-  primaryModel: ModelCatalogEntry | null;
-  streamConfig: ResolvedStreamConfig | null;
-  tools: ToolDefinition[];
-  reasoningEffort?: ReasoningEffort;
-  abortSignal?: AbortSignal;
-  emitEvent?: (event: StreamEvent) => void;
-  onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => Promise<void> | void;
-  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-  augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
-}): AsyncGenerator<StreamEvent> {
-  return (async function* (): AsyncGenerator<StreamEvent> {
-    if (!options.primaryModel || !options.streamConfig) {
-      yield {
-        conversationId: options.conversationId,
-        type: 'text-delta',
-        text: 'No model configured. Please add a model provider in Settings and ensure your API key is set.',
-      };
-      yield { conversationId: options.conversationId, type: 'done' };
-      return;
-    }
-
-    const dbPath = join(options.appHome, 'data', 'memory.db');
-    const configForStream: AppConfig = {
-      ...options.config,
-      systemPrompt: await withWorkingDirectoryPrompt(options.streamConfig.systemPrompt, options.cwd),
-      advanced: {
-        ...options.config.advanced,
-        temperature: options.streamConfig.temperature,
-        maxSteps: options.streamConfig.maxSteps,
-        maxRetries: options.streamConfig.maxRetries,
-      },
-    };
-
-    if (options.streamConfig.fallbackEnabled) {
-      yield* streamWithFallback(
-        options.conversationId,
-        options.messages,
-        options.streamConfig,
-        configForStream,
-        options.tools,
-        dbPath,
-        {
-          reasoningEffort: options.reasoningEffort,
-          abortSignal: options.abortSignal,
-          cwd: options.cwd,
-          emitEvent: options.emitEvent,
-          onToolExecutionStart: options.onToolExecutionStart,
-          onToolExecutionEnd: options.onToolExecutionEnd,
-          augmentToolResult: options.augmentToolResult,
-        },
-      );
-      return;
-    }
-
-    yield* streamAgentResponse(
-      options.conversationId,
-      options.messages,
-      options.primaryModel.modelConfig,
-      configForStream,
-      options.tools,
-      dbPath,
-      {
-        reasoningEffort: options.reasoningEffort,
-        abortSignal: options.abortSignal,
-        cwd: options.cwd,
-        emitEvent: options.emitEvent,
-        onToolExecutionStart: options.onToolExecutionStart,
-        onToolExecutionEnd: options.onToolExecutionEnd,
-        augmentToolResult: options.augmentToolResult,
-      },
-    );
-  })();
-}
-
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
 
   ipcMain.handle(
@@ -454,6 +333,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       fallbackEnabled: fallbackEnabled ?? false,
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
+
+    // Resolve runtime early to access capabilities for middleware gating
+    const runtime = await resolveRuntime(config);
+    const observerSupported = runtime.capabilities.toolObserver;
+    const compactionSupported = runtime.capabilities.compaction;
 
     const messageList = messages as Array<{ role?: string; content?: unknown }>;
     console.info(`[Agent:stream] conv=${conversationId} model=${modelKey ?? config.models.defaultModelKey} profile=${profileKey ?? 'none'} fallback=${fallbackEnabled ? 'on' : 'off'} fallbackModels=${streamConfig?.fallbackModels.length ?? 0} messageCount=${messageList.length} cwd=${effectiveCwd} executionMode=${effectiveExecutionMode}`);
@@ -695,7 +579,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         };
       }> => {
         const toolCompaction = config.compaction?.tool as ToolCompactionConfig | undefined;
-        if (!toolCompaction?.enabled || controller.signal.aborted) {
+        if (!compactionSupported || !toolCompaction?.enabled || controller.signal.aborted) {
           return { result };
         }
 
@@ -936,8 +820,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           broadcastStreamEvent({ conversationId, type: 'done' });
           return;
         }
-        // Check if compaction is needed
-        if (config.compaction.conversation.enabled && modelEntry) {
+        // Check if compaction is needed (only if runtime supports it)
+        if (compactionSupported && config.compaction.conversation.enabled && modelEntry) {
           const chatMessages = messages as Array<{ role: string; content: unknown; id?: string }>;
           const check = shouldCompact(
             chatMessages as Parameters<typeof shouldCompact>[0],
@@ -982,7 +866,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
         }
 
-        if (modelEntry) {
+        if (modelEntry && observerSupported) {
           observer = new ToolObserverManager({
             conversationId,
             modelConfig: modelEntry.modelConfig,
@@ -1175,17 +1059,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           },
         };
 
-        const stream = streamMastra({
+        const stream = runtime.stream({
           conversationId,
           messages,
-          cwd: effectiveCwd,
           config: configWithExecutionMode,
-          appHome,
-          primaryModel: modelEntry,
-          streamConfig,
           tools: activeTools,
+          appHome,
+          cwd: effectiveCwd,
           reasoningEffort,
           abortSignal: controller.signal,
+          streamConfig: streamConfig ?? undefined,
+          primaryModel: modelEntry,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
@@ -1513,6 +1397,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       };
     } catch {
       return { profiles: [], defaultKey: null };
+    }
+  });
+
+  // Runtime introspection endpoints
+  ipcMain.handle('agent:get-available-runtimes', async () => {
+    const { getAvailableRuntimes } = await import('../agent/runtime/index.js');
+    return getAvailableRuntimes();
+  });
+
+  ipcMain.handle('agent:get-active-runtime', async () => {
+    const { getActiveRuntimeId } = await import('../agent/runtime/index.js');
+    try {
+      const config = readEffectiveConfig(appHome);
+      return getActiveRuntimeId(config);
+    } catch {
+      return 'mastra';
     }
   });
 }

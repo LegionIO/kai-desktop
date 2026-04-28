@@ -21,6 +21,9 @@ export function getDesktopSettingsPath(appHome: string): string {
 
 function getDefaultConfig() {
   return {
+    agent: {
+      runtime: 'auto' as const,
+    },
     models: {
       defaultModelKey: 'placeholder',
       providers: {},
@@ -692,6 +695,7 @@ function applyExternalModelConfig(config: AppConfig, _appHome: string): AppConfi
 
 export function desktopConfigPayload(config: AppConfig): Record<string, unknown> {
   return {
+    agent: config.agent,
     models: config.models,
     memory: config.memory,
     compaction: config.compaction,
