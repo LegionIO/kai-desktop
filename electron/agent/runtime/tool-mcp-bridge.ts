@@ -1,5 +1,5 @@
 /**
- * Tool → MCP Bridge (skeleton).
+ * Tool → MCP Bridge.
  *
  * Wraps Kai's internal tool definitions as an in-process MCP server so that
  * external SDK runtimes (Claude Agent SDK, Codex SDK) can discover and invoke
@@ -8,8 +8,8 @@
  * Claude Agent SDK natively supports MCP connections via:
  *   mcpServers: { "kai-tools": { type: "sdk", instance: bridgeServer } }
  *
- * Implementation will be fleshed out when the Claude Agent SDK runtime is
- * fully integrated.
+ * Schema conversion uses Zod 4's built-in `toJSONSchema()` — no external
+ * dependency required.
  */
 
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
@@ -28,6 +28,52 @@ export type McpToolCallResult = {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
 };
+
+// ---------------------------------------------------------------------------
+// Schema conversion cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache for converted JSON Schemas keyed by tool name.
+ * Avoids re-converting on every listTools() call.
+ */
+const schemaCache = new WeakMap<object, Record<string, unknown>>();
+
+/**
+ * Convert a Zod schema to a plain JSON Schema object.
+ *
+ * Uses Zod 4's native `toJSONSchema()` method.  Falls back to a permissive
+ * `{ type: 'object' }` if conversion fails (e.g. for very exotic schemas).
+ */
+function zodToJsonSchemaObject(zodSchema: unknown): Record<string, unknown> {
+  if (!zodSchema || typeof zodSchema !== 'object') {
+    return { type: 'object' };
+  }
+
+  // Check cache first
+  const cached = schemaCache.get(zodSchema);
+  if (cached) return cached;
+
+  try {
+    // Zod 4 exposes .toJSONSchema() natively
+    const toJsonSchema = (zodSchema as { toJSONSchema?: () => Record<string, unknown> }).toJSONSchema;
+    if (typeof toJsonSchema === 'function') {
+      const jsonSchema = toJsonSchema.call(zodSchema);
+      // Strip $schema metadata — MCP consumers don't need it
+      const { $schema: _schema, ...rest } = jsonSchema;
+      const result = rest as Record<string, unknown>;
+      schemaCache.set(zodSchema, result);
+      return result;
+    }
+  } catch {
+    // Fall through to permissive fallback
+  }
+
+  // Fallback for non-Zod or incompatible schemas
+  const fallback: Record<string, unknown> = { type: 'object' };
+  schemaCache.set(zodSchema, fallback);
+  return fallback;
+}
 
 // ---------------------------------------------------------------------------
 // Bridge implementation
@@ -54,16 +100,18 @@ export class ToolMcpBridge {
     this.cwd = options.cwd;
   }
 
-  /** Returns tool definitions in MCP list_tools format. */
+  /** Returns tool definitions in MCP list_tools format with real JSON Schemas. */
   listTools(): McpToolListEntry[] {
     return Array.from(this.tools.values()).map((tool) => ({
       name: tool.name,
       description: tool.description ?? '',
-      // Convert Zod schema to a plain JSON Schema object.
-      // For a full implementation, use zod-to-json-schema or the SDK's
-      // jsonSchema() helper.  For now, expose a permissive object schema.
-      inputSchema: { type: 'object' } as Record<string, unknown>,
+      inputSchema: zodToJsonSchemaObject(tool.inputSchema),
     }));
+  }
+
+  /** Look up a single tool definition by name. */
+  getTool(name: string): ToolDefinition | undefined {
+    return this.tools.get(name);
   }
 
   /** Executes a tool call by name. */
@@ -77,6 +125,19 @@ export class ToolMcpBridge {
     }
 
     try {
+      // Validate args against Zod schema before execution
+      let validatedArgs = args;
+      try {
+        const parseResult = tool.inputSchema.safeParse(args);
+        if (parseResult.success) {
+          validatedArgs = parseResult.data;
+        }
+        // If validation fails we still pass args through — the tool's own
+        // execute() may handle partial/relaxed input gracefully.
+      } catch {
+        // Ignore validation errors for exotic schemas
+      }
+
       const context: ToolExecutionContext = {
         toolCallId: `mcp-bridge-${Date.now()}`,
         conversationId: this.conversationId,
@@ -84,7 +145,7 @@ export class ToolMcpBridge {
         abortSignal,
       };
 
-      const result = await tool.execute(args, context);
+      const result = await tool.execute(validatedArgs, context);
       const text = typeof result === 'string' ? result : JSON.stringify(result);
 
       return {
@@ -98,12 +159,22 @@ export class ToolMcpBridge {
     }
   }
 
+  /** Returns the number of registered tools. */
+  get size(): number {
+    return this.tools.size;
+  }
+
+  /** Returns true if a tool with the given name is registered. */
+  hasTool(name: string): boolean {
+    return this.tools.has(name);
+  }
+
   /** Update the set of available tools. */
   updateTools(tools: ToolDefinition[]): void {
     this.tools = new Map(tools.map((t) => [t.name, t]));
   }
 
-  /** Disposes the bridge (no-op for in-process bridge). */
+  /** Disposes the bridge. */
   dispose(): void {
     this.tools.clear();
   }
