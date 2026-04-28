@@ -26,6 +26,7 @@ type AppAPI = {
     listSubAgents: () => Promise<{ ids: string[] }>;
     getAvailableRuntimes: () => Promise<Array<{ id: string; name: string; available: boolean }>>;
     getActiveRuntime: () => Promise<string>;
+    installRuntime: (runtimeId: string) => Promise<{ ok: boolean; error?: string }>;
   };
   conversations: {
     list: () => Promise<unknown[]>;

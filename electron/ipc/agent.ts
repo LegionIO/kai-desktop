@@ -1415,4 +1415,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return 'mastra';
     }
   });
+
+  ipcMain.handle('agent:install-runtime', async (_event, runtimeId: string) => {
+    const packageMap: Record<string, string> = {
+      'claude-agent-sdk': '@anthropic-ai/claude-agent-sdk',
+      'codex-sdk': '@openai/codex-sdk',
+    };
+    const pkg = packageMap[runtimeId];
+    if (!pkg) return { ok: false, error: `Unknown runtime: ${runtimeId}` };
+
+    try {
+      const { execSync } = await import('child_process');
+      const { app } = await import('electron');
+      const { join } = await import('path');
+
+      // In dev mode, use the project root. In production, use app path.
+      const projectRoot = app.isPackaged
+        ? app.getAppPath()
+        : join(app.getAppPath(), '..', '..');
+
+      execSync(`pnpm add ${pkg}`, {
+        cwd: projectRoot,
+        timeout: 120_000,
+        stdio: 'pipe',
+      });
+
+      // Reset detection cache so the new package is picked up
+      const { resetDetectionCache } = await import('../agent/runtime/detect.js');
+      resetDetectionCache();
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
 }

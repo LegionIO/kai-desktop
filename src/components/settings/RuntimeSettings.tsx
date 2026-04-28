@@ -1,4 +1,4 @@
-import { useState, useEffect, type FC } from 'react';
+import { useState, useEffect, useCallback, type FC } from 'react';
 import { settingsSelectClass, NumberField, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
@@ -28,26 +28,53 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
   const [activeRuntime, setActiveRuntime] = useState<string>('mastra');
   const [loading, setLoading] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [installSuccess, setInstallSuccess] = useState<string | null>(null);
+
+  const fetchRuntimes = useCallback(async () => {
+    try {
+      const [available, active] = await Promise.all([
+        app.agent.getAvailableRuntimes(),
+        app.agent.getActiveRuntime(),
+      ]);
+      setRuntimes(available);
+      setActiveRuntime(active);
+      setLoading(false);
+    } catch {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try {
-        const [available, active] = await Promise.all([
-          app.agent.getAvailableRuntimes(),
-          app.agent.getActiveRuntime(),
-        ]);
-        if (!cancelled) {
-          setRuntimes(available);
-          setActiveRuntime(active);
-          setLoading(false);
-        }
-      } catch {
-        if (!cancelled) setLoading(false);
-      }
+      await fetchRuntimes();
+      if (cancelled) return;
     })();
     return () => { cancelled = true; };
-  }, [agentConfig.runtime]);
+  }, [agentConfig.runtime, fetchRuntimes]);
+
+  const handleInstall = useCallback(async (runtimeId: string) => {
+    setInstalling(runtimeId);
+    setInstallError(null);
+    setInstallSuccess(null);
+
+    try {
+      const result = await app.agent.installRuntime(runtimeId);
+      if (result.ok) {
+        setInstallSuccess(runtimeId);
+        // Refresh runtime list
+        await fetchRuntimes();
+      } else {
+        setInstallError(result.error ?? 'Installation failed');
+      }
+    } catch (err) {
+      setInstallError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(null);
+    }
+  }, [fetchRuntimes]);
 
   const selectedRuntime = agentConfig.runtime;
 
@@ -102,9 +129,38 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
                 <span className="text-[10px] text-muted-foreground">
                   {rt.available ? 'Available' : 'Not installed'}
                 </span>
+                {!rt.available && rt.id !== 'mastra' && (
+                  <button
+                    type="button"
+                    disabled={installing !== null}
+                    onClick={() => void handleInstall(rt.id)}
+                    className="ml-1 rounded-lg border border-border/60 bg-primary/10 px-2.5 py-1 text-[10px] font-medium text-primary hover:bg-primary/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {installing === rt.id ? (
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                        Installing...
+                      </span>
+                    ) : (
+                      'Install'
+                    )}
+                  </button>
+                )}
               </div>
             ))}
           </div>
+
+          {/* Install feedback */}
+          {installSuccess && (
+            <p className="mt-2 text-[10px] text-green-500 font-medium">
+              Successfully installed {runtimes.find((r) => r.id === installSuccess)?.name ?? installSuccess}. You may need to restart Kai for full effect.
+            </p>
+          )}
+          {installError && (
+            <p className="mt-2 text-[10px] text-red-400 font-medium">
+              Installation failed: {installError}
+            </p>
+          )}
         </div>
       )}
 
@@ -170,6 +226,19 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
               max={100000}
             />
           )}
+
+          <label className="flex items-center gap-2 mt-2">
+            <input
+              type="checkbox"
+              checked={agentConfig.claudeAgentSdk?.persistSession ?? false}
+              onChange={(e) => void updateConfig('agent.claudeAgentSdk.persistSession', e.target.checked)}
+              className="rounded"
+            />
+            <span className="text-xs">Persist sessions to disk</span>
+          </label>
+          <p className="text-[10px] text-muted-foreground -mt-1 ml-5">
+            When enabled, SDK sessions are saved and can be resumed later.
+          </p>
         </div>
       )}
 
