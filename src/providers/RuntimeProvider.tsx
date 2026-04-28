@@ -1783,7 +1783,7 @@ export function RuntimeProvider({
         finalizeAssistantResponse(acc);
         const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
-        await app.conversations.debugLog(`[FINALIZE] id=${convId.slice(0, 8)} before persist`);
+        void app.conversations.debugLog(`[FINALIZE] id=${convId.slice(0, 8)} before persist`);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
         }, 'done:idle');
