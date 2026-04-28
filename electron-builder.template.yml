@@ -8,6 +8,7 @@
 appId: "{{appId}}"
 productName: "{{productName}}"
 executableName: "{{executableName}}"
+afterPack: scripts/after-pack.cjs
 directories:
   buildResources: build
   output: dist

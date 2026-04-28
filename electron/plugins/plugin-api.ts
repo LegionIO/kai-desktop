@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, safeStorage, session } from 'electron';
+import { app, shell, BrowserWindow, safeStorage, session, net } from 'electron';
 import { getBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
@@ -1066,7 +1066,12 @@ export function createPluginAPI(
 
     fetch: ((...args: Parameters<typeof globalThis.fetch>) => {
       requirePermission('network:fetch');
-      return globalThis.fetch(...args);
+      const [input, init] = args;
+      const normalizedInput = input instanceof URL ? input.toString() : input;
+      return net.fetch(
+        normalizedInput as Parameters<typeof net.fetch>[0],
+        init as Parameters<typeof net.fetch>[1],
+      ) as ReturnType<typeof globalThis.fetch>;
     }) as typeof globalThis.fetch,
   };
 
