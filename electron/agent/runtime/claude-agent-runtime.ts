@@ -86,7 +86,7 @@ type SdkMessageAny = {
 
 export class ClaudeAgentRuntime implements AgentRuntime {
   readonly id = 'claude-agent-sdk' as const;
-  readonly name = 'Claude Agent SDK';
+  readonly name = 'Claude Code';
   readonly capabilities = CLAUDE_CAPABILITIES;
 
   async isAvailable(): Promise<boolean> {
@@ -111,16 +111,15 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     let sdkToolHelper: ((name: string, desc: string, schema: unknown, handler: unknown) => unknown) | undefined;
 
     try {
-      // @ts-expect-error — optional dependency, may not be installed
       const sdk = await import('@anthropic-ai/claude-agent-sdk');
-      sdkQuery = sdk.query;
-      sdkCreateSdkMcpServer = sdk.createSdkMcpServer;
-      sdkToolHelper = sdk.tool;
+      sdkQuery = sdk.query as unknown as typeof sdkQuery;
+      sdkCreateSdkMcpServer = sdk.createSdkMcpServer as unknown as typeof sdkCreateSdkMcpServer;
+      sdkToolHelper = sdk.tool as unknown as typeof sdkToolHelper;
     } catch {
       yield {
         conversationId,
         type: 'text-delta',
-        text: 'Claude Agent SDK is not installed. Install it with:\n```\npnpm add @anthropic-ai/claude-agent-sdk\n```\nThen restart Kai and select the Claude Agent SDK runtime in Settings → Runtime.',
+        text: 'Claude Agent SDK failed to load. Ensure the Claude Code CLI is installed and available on your PATH.',
       };
       yield { conversationId, type: 'done' };
       return;

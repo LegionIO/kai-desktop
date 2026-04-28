@@ -44,7 +44,7 @@ type SettingsSection =
 const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Models' },
   { key: 'profiles', label: 'Profiles' },
-  { key: 'runtime', label: 'Runtime' },
+  { key: 'runtime', label: 'Agent Runtime' },
   { key: 'memory', label: 'Memory' },
   { key: 'compaction', label: 'Compaction' },
   { key: 'tools', label: 'Tools' },

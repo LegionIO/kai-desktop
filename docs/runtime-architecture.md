@@ -34,7 +34,7 @@ Kai Desktop supports pluggable agent runtimes that power conversations. Each run
 | `electron/agent/runtime/mastra-runtime.ts` | Built-in Mastra adapter (always available) |
 | `electron/agent/runtime/claude-agent-runtime.ts` | Claude Agent SDK adapter (optional) |
 | `electron/agent/runtime/codex-runtime.ts` | Codex SDK adapter (optional) |
-| `electron/agent/runtime/detect.ts` | SDK availability detection via dynamic `import()` |
+| `electron/agent/runtime/detect.ts` | CLI availability detection (`which claude`, `which codex`) |
 | `electron/agent/runtime/tool-mcp-bridge.ts` | Exposes Kai's tools as MCP for external SDKs |
 | `src/components/settings/RuntimeSettings.tsx` | Settings UI for runtime selection |
 
@@ -130,9 +130,13 @@ const stream = runtime.stream(options);
 Resolution algorithm:
 
 1. Read `config.agent.runtime` (`'auto'` | `'mastra'` | `'claude-agent-sdk'` | `'codex-sdk'`)
-2. If explicitly set and available → use it
-3. If `'auto'`: try Claude Agent SDK (if installed) → fall back to Mastra
-4. If selected runtime unavailable → fall back to Mastra (always available)
+2. If explicitly set and available (CLI found on PATH) → use it
+3. If `'auto'`: try Claude Agent SDK (if `claude` CLI available) → fall back to Mastra
+4. If selected runtime unavailable (CLI not on PATH) → fall back to Mastra (always available)
+
+> **Note:** Both `@anthropic-ai/claude-agent-sdk` and `@openai/codex-sdk` are bundled
+> as regular dependencies. Availability depends on whether the corresponding CLI
+> binary (`claude` or `codex`) is found on the user's PATH, not on package installation.
 
 ## Tool MCP Bridge
 
@@ -224,16 +228,13 @@ import { MyRuntime } from './agent/runtime/my-runtime.js';
 registerRuntime(new MyRuntime());
 ```
 
-### 4. Add SDK detection (optional)
+### 4. Add CLI detection (optional)
 
 In `electron/agent/runtime/detect.ts`:
 
 ```typescript
 export async function detectMyRuntime(): Promise<boolean> {
-  try {
-    await import('my-runtime-sdk');
-    return true;
-  } catch { return false; }
+  return isCliAvailable('my-runtime-cli');
 }
 ```
 

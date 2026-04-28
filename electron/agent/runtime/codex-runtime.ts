@@ -109,7 +109,7 @@ type ThreadItemAny = {
 
 export class CodexRuntime implements AgentRuntime {
   readonly id = 'codex-sdk' as const;
-  readonly name = 'Codex SDK';
+  readonly name = 'Codex';
   readonly capabilities = CODEX_CAPABILITIES;
 
   async isAvailable(): Promise<boolean> {
@@ -131,14 +131,13 @@ export class CodexRuntime implements AgentRuntime {
     let CodexCtor: CodexClass;
 
     try {
-      // @ts-expect-error — optional dependency, may not be installed
       const sdk = await import('@openai/codex-sdk');
-      CodexCtor = sdk.Codex;
+      CodexCtor = sdk.Codex as unknown as CodexClass;
     } catch {
       yield {
         conversationId,
         type: 'text-delta',
-        text: 'Codex SDK is not installed. Install it with:\n```\npnpm add @openai/codex-sdk\n```\nThen restart Kai and select the Codex SDK runtime in Settings → Runtime.',
+        text: 'Codex SDK failed to load. Ensure the Codex CLI is installed and available on your PATH.',
       };
       yield { conversationId, type: 'done' };
       return;

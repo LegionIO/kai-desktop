@@ -88,14 +88,22 @@ function getMastraOrThrow(): AgentRuntime {
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: RuntimeId; name: string; available: boolean }>
+  Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }>
 > {
-  const results: Array<{ id: RuntimeId; name: string; available: boolean }> = [];
+  const results: Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }> = [];
   for (const [, runtime] of runtimes) {
+    const available = await runtime.isAvailable();
     results.push({
       id: runtime.id,
       name: runtime.name,
-      available: await runtime.isAvailable(),
+      available,
+      reason: available
+        ? undefined
+        : runtime.id === 'claude-agent-sdk'
+          ? 'Claude Code CLI not found on PATH'
+          : runtime.id === 'codex-sdk'
+            ? 'Codex CLI not found on PATH'
+            : undefined,
     });
   }
   return results;

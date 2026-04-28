@@ -1,36 +1,42 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { settingsSelectClass, NumberField, type SettingsProps } from './shared';
+import { settingsSelectClass, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
-type RuntimeInfo = { id: string; name: string; available: boolean };
+type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string };
 
 type AgentConfig = {
   runtime: 'auto' | 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
-  claudeAgentSdk?: {
-    permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions';
-    maxTurns?: number;
-    thinking?: { type: 'adaptive' } | { type: 'disabled' } | { type: 'enabled'; budgetTokens: number };
-    persistSession?: boolean;
-  };
-  codexSdk?: {
-    approval?: 'suggest' | 'auto-edit' | 'full-auto';
-  };
 };
 
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   mastra: 'Built-in runtime with full Kai feature support (memory, observer, compaction, multi-provider models).',
-  'claude-agent-sdk': 'Anthropic\'s official agent SDK. Production-tested tool execution, native MCP support, session resume.',
-  'codex-sdk': 'OpenAI\'s Codex CLI SDK. Thread-based execution with session resume.',
+  'claude-agent-sdk': 'Anthropic\'s Claude Code agent. Production-tested tool execution, native MCP support, session resume.',
+  'codex-sdk': 'OpenAI\'s Codex agent. Thread-based execution with session resume.',
 };
+
+/** Sort order: available first, then by priority (Claude > Codex > Mastra). */
+const RUNTIME_PRIORITY: Record<string, number> = {
+  'claude-agent-sdk': 0,
+  'codex-sdk': 1,
+  'mastra': 2,
+};
+
+function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
+  return [...list].sort((a, b) => {
+    // Available runtimes sort before inactive ones
+    if (a.available !== b.available) return a.available ? -1 : 1;
+    // Within the same availability group, sort by priority
+    const pa = RUNTIME_PRIORITY[a.id] ?? 99;
+    const pb = RUNTIME_PRIORITY[b.id] ?? 99;
+    return pa - pb;
+  });
+}
 
 export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const agentConfig = (config.agent as AgentConfig | undefined) ?? { runtime: 'auto' };
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
   const [activeRuntime, setActiveRuntime] = useState<string>('mastra');
   const [loading, setLoading] = useState(true);
-  const [installing, setInstalling] = useState<string | null>(null);
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [installSuccess, setInstallSuccess] = useState<string | null>(null);
 
   const fetchRuntimes = useCallback(async () => {
     try {
@@ -55,28 +61,8 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
     return () => { cancelled = true; };
   }, [agentConfig.runtime, fetchRuntimes]);
 
-  const handleInstall = useCallback(async (runtimeId: string) => {
-    setInstalling(runtimeId);
-    setInstallError(null);
-    setInstallSuccess(null);
-
-    try {
-      const result = await app.agent.installRuntime(runtimeId);
-      if (result.ok) {
-        setInstallSuccess(runtimeId);
-        // Refresh runtime list
-        await fetchRuntimes();
-      } else {
-        setInstallError(result.error ?? 'Installation failed');
-      }
-    } catch (err) {
-      setInstallError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInstalling(null);
-    }
-  }, [fetchRuntimes]);
-
   const selectedRuntime = agentConfig.runtime;
+  const sortedRuntimes = sortRuntimes(runtimes);
 
   return (
     <div className="space-y-6">
@@ -95,10 +81,10 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
           value={selectedRuntime}
           onChange={(e) => void updateConfig('agent.runtime', e.target.value)}
         >
-          <option value="auto">Auto (prefer external SDK if available)</option>
+          <option value="auto">Auto (prefer external runtime if available)</option>
           <option value="mastra">Mastra (built-in)</option>
-          <option value="claude-agent-sdk">Claude Agent SDK</option>
-          <option value="codex-sdk">Codex SDK</option>
+          <option value="claude-agent-sdk">Claude Code</option>
+          <option value="codex-sdk">Codex</option>
         </select>
       </div>
 
@@ -113,54 +99,31 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
       )}
 
       {/* Availability table */}
-      {!loading && runtimes.length > 0 && (
+      {!loading && sortedRuntimes.length > 0 && (
         <div>
-          <span className="text-[10px] text-muted-foreground block mb-2">Installed Runtimes</span>
+          <span className="text-[10px] text-muted-foreground block mb-2">Runtimes</span>
           <div className="space-y-1.5">
-            {runtimes.map((rt) => (
+            {sortedRuntimes.map((rt) => (
               <div
                 key={rt.id}
                 className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/60 px-3 py-2"
               >
                 <span
-                  className={`h-2 w-2 rounded-full ${rt.available ? 'bg-green-500' : 'bg-red-400'}`}
+                  className={`h-2 w-2 rounded-full ${
+                    rt.available ? 'bg-green-500' : 'bg-yellow-500'
+                  }`}
                 />
                 <span className="text-xs font-medium flex-1">{rt.name}</span>
                 <span className="text-[10px] text-muted-foreground">
-                  {rt.available ? 'Available' : 'Not installed'}
+                  {rt.available
+                    ? 'Available'
+                    : rt.reason
+                      ? `Inactive — ${rt.reason}`
+                      : 'Inactive'}
                 </span>
-                {!rt.available && rt.id !== 'mastra' && (
-                  <button
-                    type="button"
-                    disabled={installing !== null}
-                    onClick={() => void handleInstall(rt.id)}
-                    className="ml-1 rounded-lg border border-border/60 bg-primary/10 px-2.5 py-1 text-[10px] font-medium text-primary hover:bg-primary/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    {installing === rt.id ? (
-                      <span className="flex items-center gap-1">
-                        <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                        Installing...
-                      </span>
-                    ) : (
-                      'Install'
-                    )}
-                  </button>
-                )}
               </div>
             ))}
           </div>
-
-          {/* Install feedback */}
-          {installSuccess && (
-            <p className="mt-2 text-[10px] text-green-500 font-medium">
-              Successfully installed {runtimes.find((r) => r.id === installSuccess)?.name ?? installSuccess}. You may need to restart Kai for full effect.
-            </p>
-          )}
-          {installError && (
-            <p className="mt-2 text-[10px] text-red-400 font-medium">
-              Installation failed: {installError}
-            </p>
-          )}
         </div>
       )}
 
@@ -169,97 +132,6 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
         <p className="text-xs text-muted-foreground/80 italic">
           {RUNTIME_DESCRIPTIONS[selectedRuntime]}
         </p>
-      )}
-
-      {/* Claude Agent SDK options */}
-      {(selectedRuntime === 'claude-agent-sdk' || selectedRuntime === 'auto') && (
-        <div className="space-y-3 rounded-xl border border-border/60 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold">Claude Agent SDK Options</h4>
-
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-1">Permission Mode</label>
-            <select
-              className={settingsSelectClass}
-              value={agentConfig.claudeAgentSdk?.permissionMode ?? 'default'}
-              onChange={(e) => void updateConfig('agent.claudeAgentSdk.permissionMode', e.target.value)}
-            >
-              <option value="default">Default (ask for approval)</option>
-              <option value="acceptEdits">Accept Edits (auto-approve file writes)</option>
-              <option value="bypassPermissions">Bypass Permissions (full auto)</option>
-            </select>
-          </div>
-
-          <NumberField
-            label="Max Turns"
-            value={agentConfig.claudeAgentSdk?.maxTurns ?? 25}
-            onChange={(v) => void updateConfig('agent.claudeAgentSdk.maxTurns', v)}
-            min={1}
-            max={100}
-          />
-
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-1">Thinking Mode</label>
-            <select
-              className={settingsSelectClass}
-              value={agentConfig.claudeAgentSdk?.thinking?.type ?? 'adaptive'}
-              onChange={(e) => {
-                const type = e.target.value;
-                if (type === 'enabled') {
-                  void updateConfig('agent.claudeAgentSdk.thinking', { type: 'enabled', budgetTokens: 10000 });
-                } else {
-                  void updateConfig('agent.claudeAgentSdk.thinking', { type });
-                }
-              }}
-            >
-              <option value="adaptive">Adaptive</option>
-              <option value="enabled">Enabled (with budget)</option>
-              <option value="disabled">Disabled</option>
-            </select>
-          </div>
-
-          {agentConfig.claudeAgentSdk?.thinking?.type === 'enabled' && (
-            <NumberField
-              label="Thinking Budget (tokens)"
-              value={(agentConfig.claudeAgentSdk.thinking as { budgetTokens: number }).budgetTokens ?? 10000}
-              onChange={(v) => void updateConfig('agent.claudeAgentSdk.thinking', { type: 'enabled', budgetTokens: v })}
-              min={1000}
-              max={100000}
-            />
-          )}
-
-          <label className="flex items-center gap-2 mt-2">
-            <input
-              type="checkbox"
-              checked={agentConfig.claudeAgentSdk?.persistSession ?? false}
-              onChange={(e) => void updateConfig('agent.claudeAgentSdk.persistSession', e.target.checked)}
-              className="rounded"
-            />
-            <span className="text-xs">Persist sessions to disk</span>
-          </label>
-          <p className="text-[10px] text-muted-foreground -mt-1 ml-5">
-            When enabled, SDK sessions are saved and can be resumed later.
-          </p>
-        </div>
-      )}
-
-      {/* Codex SDK options */}
-      {selectedRuntime === 'codex-sdk' && (
-        <div className="space-y-3 rounded-xl border border-border/60 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold">Codex SDK Options</h4>
-
-          <div>
-            <label className="text-[10px] text-muted-foreground block mb-1">Approval Mode</label>
-            <select
-              className={settingsSelectClass}
-              value={agentConfig.codexSdk?.approval ?? 'suggest'}
-              onChange={(e) => void updateConfig('agent.codexSdk.approval', e.target.value)}
-            >
-              <option value="suggest">Suggest (ask before changes)</option>
-              <option value="auto-edit">Auto Edit (auto-approve edits)</option>
-              <option value="full-auto">Full Auto (no approvals)</option>
-            </select>
-          </div>
-        </div>
       )}
 
       {/* Capability comparison */}
@@ -273,8 +145,8 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
               <tr className="border-b border-border/40">
                 <th className="text-left py-1 pr-3 font-medium text-muted-foreground">Feature</th>
                 <th className="text-center py-1 px-2 font-medium">Mastra</th>
-                <th className="text-center py-1 px-2 font-medium">Claude SDK</th>
-                <th className="text-center py-1 px-2 font-medium">Codex SDK</th>
+                <th className="text-center py-1 px-2 font-medium">Claude Code</th>
+                <th className="text-center py-1 px-2 font-medium">Codex</th>
               </tr>
             </thead>
             <tbody className="text-muted-foreground">

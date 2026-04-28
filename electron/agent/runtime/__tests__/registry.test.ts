@@ -72,8 +72,8 @@ describe('Runtime Registry', () => {
     // Re-register a clean set of runtimes before each test.
     // The registry uses a global Map, so registering overwrites any previous.
     registerRuntime(createStubRuntime('mastra', 'Mastra', true));
-    registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Agent SDK', false));
-    registerRuntime(createStubRuntime('codex-sdk', 'Codex SDK', false));
+    registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Code', false));
+    registerRuntime(createStubRuntime('codex-sdk', 'Codex', false));
   });
 
   describe('registerRuntime / getRuntime', () => {
@@ -102,14 +102,14 @@ describe('Runtime Registry', () => {
       expect(rt.id).toBe('mastra');
     });
 
-    it('returns Claude Agent SDK when config is "auto" and SDK is available', async () => {
-      registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Agent SDK', true));
+    it('returns Claude Code when config is "auto" and CLI is available', async () => {
+      registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Code', true));
       const rt = await resolveRuntime(makeConfig('auto'));
       expect(rt.id).toBe('claude-agent-sdk');
     });
 
     it('returns explicitly selected runtime when available', async () => {
-      registerRuntime(createStubRuntime('codex-sdk', 'Codex SDK', true));
+      registerRuntime(createStubRuntime('codex-sdk', 'Codex', true));
       const rt = await resolveRuntime(makeConfig('codex-sdk'));
       expect(rt.id).toBe('codex-sdk');
     });
@@ -148,13 +148,13 @@ describe('Runtime Registry', () => {
     });
 
     it('returns claude-agent-sdk when available and set to auto', async () => {
-      registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Agent SDK', true));
+      registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Code', true));
       const id = await getActiveRuntimeId(makeConfig('auto'));
       expect(id).toBe('claude-agent-sdk');
     });
 
     it('returns explicitly selected runtime id', async () => {
-      registerRuntime(createStubRuntime('codex-sdk', 'Codex SDK', true));
+      registerRuntime(createStubRuntime('codex-sdk', 'Codex', true));
       const id = await getActiveRuntimeId(makeConfig('codex-sdk'));
       expect(id).toBe('codex-sdk');
     });

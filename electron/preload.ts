@@ -50,8 +50,6 @@ const appAPI = {
       ipcRenderer.invoke('agent:get-available-runtimes'),
     getActiveRuntime: () =>
       ipcRenderer.invoke('agent:get-active-runtime'),
-    installRuntime: (runtimeId: string) =>
-      ipcRenderer.invoke('agent:install-runtime', runtimeId),
   },
 
   conversations: {
