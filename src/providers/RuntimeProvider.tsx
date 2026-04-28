@@ -351,6 +351,9 @@ let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 const streamAccumulators = new Map<string, MessageAccumulator>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
+/** Per-conversation persist version counter — incremented before each persist, checked before writing.
+ *  Prevents stale async persists from overwriting newer data. */
+const persistVersions = new Map<string, number>();
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
   return { startedAt };
@@ -851,11 +854,23 @@ async function persistConversation(
   headId: string | null,
   updates: Partial<ConversationRecord> = {},
 ): Promise<void> {
+  // Bump version BEFORE the async boundary to claim this persist operation.
+  // This prevents stale debounced persists from overwriting newer data
+  // (e.g. done handler's runStatus:'idle' overwritten by a late schedulePersist's 'running').
+  const currentVersion = (persistVersions.get(conversationId) ?? 0) + 1;
+  persistVersions.set(conversationId, currentVersion);
+
   try {
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (!conv) return;
+
+    // After the async get(), check if a newer persist started while we were waiting
+    const latestVersion = persistVersions.get(conversationId) ?? 0;
+    if (currentVersion < latestVersion) return;
+
     const branch = getActiveBranch(tree, headId);
     const now = nowIso();
+
     await app.conversations.put({
       ...conv,
       messages: branch, // linear view for backward compat
