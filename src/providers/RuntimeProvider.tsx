@@ -351,6 +351,9 @@ let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 const streamAccumulators = new Map<string, MessageAccumulator>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
+/** Monotonically increasing generation counter per conversation — bumped when a stream
+ *  ends so that in-flight debounced persists from the previous generation are discarded. */
+const persistGenerations = new Map<string, number>();
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
   return { startedAt };
@@ -850,10 +853,36 @@ async function persistConversation(
   tree: StoredMessage[],
   headId: string | null,
   updates: Partial<ConversationRecord> = {},
+  /** If provided, the persist is skipped when the conversation's generation has
+   *  advanced past this value — meaning a done/error handler has already persisted
+   *  the terminal state and this call carries stale data. */
+  generation?: number,
 ): Promise<void> {
   try {
+    if (updates.runStatus) {
+      console.warn(`[STREAM_DEBUG] persistConversation convId=${conversationId} runStatus=${updates.runStatus} gen=${generation} currentGen=${persistGenerations.get(conversationId)}`);
+    }
+    // Check generation AFTER the async boundary — this is the key race-safety check.
+    // A done/error handler bumps the generation synchronously, so any in-flight
+    // debounced persist from before the bump will see a stale generation here.
+    if (generation !== undefined) {
+      const currentGen = persistGenerations.get(conversationId) ?? 0;
+      if (generation < currentGen) {
+        console.warn(`[STREAM_DEBUG] persistConversation SKIPPED stale gen=${generation} < currentGen=${currentGen} convId=${conversationId}`);
+        return;
+      }
+    }
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (!conv) return;
+    // Re-check generation after the async get — the done handler may have fired
+    // while we were awaiting.
+    if (generation !== undefined) {
+      const currentGen = persistGenerations.get(conversationId) ?? 0;
+      if (generation < currentGen) {
+        console.warn(`[STREAM_DEBUG] persistConversation SKIPPED (post-get) stale gen=${generation} < currentGen=${currentGen} convId=${conversationId}`);
+        return;
+      }
+    }
     const branch = getActiveBranch(tree, headId);
     const now = nowIso();
     await app.conversations.put({
@@ -1285,16 +1314,19 @@ export function RuntimeProvider({
     const timers = persistTimersRef.current;
     const existing = timers.get(conversationId);
     if (existing) clearTimeout(existing);
+    // Capture the current generation at schedule time.  The done/error handler
+    // bumps the generation synchronously, so a persist from an earlier generation
+    // will be discarded even if its timer fires or its async work is still in-flight.
+    const gen = persistGenerations.get(conversationId) ?? 0;
     timers.set(conversationId, setTimeout(() => {
       timers.delete(conversationId);
-      // Guard: if the stream has already ended (accumulator deleted), don't
-      // overwrite the terminal runStatus that the done/error handler persisted.
-      // This prevents a stale debounced persist (runStatus:'running') from
-      // racing with the immediate done-persist (runStatus:'idle').
-      if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
+      // Quick synchronous guard — avoids starting an async persist we know is stale.
+      if (!streamAccumulators.has(conversationId)) {
+        console.warn(`[STREAM_DEBUG] schedulePersist SKIPPED (stream ended) convId=${conversationId}`);
         return;
       }
-      persistConversation(conversationId, t, h, extra);
+      console.warn(`[STREAM_DEBUG] schedulePersist FIRING convId=${conversationId} gen=${gen}`);
+      persistConversation(conversationId, t, h, extra, gen);
     }, 300));
   }, []);
 
@@ -1540,6 +1572,7 @@ export function RuntimeProvider({
           finalizeAssistantResponse(acc);
           const _pt1 = persistTimersRef.current.get(convId); if (_pt1) { clearTimeout(_pt1); persistTimersRef.current.delete(convId); }
           streamAccumulators.delete(convId);
+          persistGenerations.set(convId, (persistGenerations.get(convId) ?? 0) + 1);
           forceNewAssistant.add(convId);
           persistConversation(convId, acc.messages, acc.headId, {
             lastAssistantUpdateAt: new Date().toISOString(),
@@ -1710,10 +1743,13 @@ export function RuntimeProvider({
           }
         }
       } else if (e.type === 'error') {
+        console.warn(`[STREAM_DEBUG] error convId=${convId} isActive=${isActiveConv}`);
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         finalizeAssistantResponse(acc);
         const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
+        // Bump generation so any in-flight debounced persist is discarded
+        persistGenerations.set(convId, (persistGenerations.get(convId) ?? 0) + 1);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
         });
@@ -1755,6 +1791,12 @@ export function RuntimeProvider({
         finalizeAssistantResponse(acc);
         const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
+        // Bump generation so any in-flight debounced persist is discarded
+        persistGenerations.set(convId, (persistGenerations.get(convId) ?? 0) + 1);
+        console.warn(`[STREAM_DEBUG] done convId=${convId} isActive=${isActiveConv} accumulatorDeleted=true gen=${persistGenerations.get(convId)}`);
+        const lastMsg = getActiveBranch(acc.messages, acc.headId).slice(-1)[0];
+        const rt = lastMsg ? getResponseTiming(lastMsg) : null;
+        console.warn(`[STREAM_DEBUG] done responseTiming startedAt=${rt?.startedAt} finishedAt=${rt?.finishedAt} durationMs=${rt?.durationMs}`);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
         });
@@ -1820,12 +1862,8 @@ export function RuntimeProvider({
         setTree([...acc.messages]);
         setHeadId(acc.headId);
       }
-      const persistStatus = e.type === 'tool-approval-required' ? 'awaiting-approval'
-        : acc.awaitingApproval ? 'awaiting-approval'
-        : 'running';
-      const persistExtra: Partial<ConversationRecord> = { runStatus: persistStatus };
       if (e.type === 'tool-approval-required') {
-        persistExtra.hasUnread = true;
+        const persistExtra: Partial<ConversationRecord> = { runStatus: 'awaiting-approval', hasUnread: true };
         // Mark as not running so the typing indicator / sidebar bubble stops
         if (isActiveConv) {
           setIsRunning(false);
@@ -1841,7 +1879,10 @@ export function RuntimeProvider({
         if (isActiveConv && !acc.awaitingApproval) {
           setIsRunning(true);
         }
-        streamHandlerRef.current.schedulePersist(convId, acc.messages, acc.headId, persistExtra);
+        // Don't persist runStatus here — it was already set to 'running' when the
+        // stream started.  Including it in debounced persists creates a race where
+        // a stale async persist can overwrite the done handler's 'idle' status.
+        streamHandlerRef.current.schedulePersist(convId, acc.messages, acc.headId);
       }
     });
     return unsubscribe;
