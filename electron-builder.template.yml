@@ -3,7 +3,7 @@
 #
 # This file is used by `scripts/generate-builder-config.ts` to produce the
 # final electron-builder.yml with values from `branding.config.ts`.
-# Placeholders use {{key}} where key matches a branding config property.
+# Placeholders use double-brace tokens where the name matches a branding config property.
 # ──────────────────────────────────────────────────────────────────────────────
 appId: "{{appId}}"
 productName: "{{productName}}"
@@ -37,6 +37,8 @@ mac:
     NSAppleEventsUsageDescription: "{{appleEventsUsage}}"
     NSScreenCaptureUsageDescription: "{{screenCaptureUsage}}"
     NSLocalNetworkUsageDescription: "{{localNetworkUsage}}"
+    NSAppTransportSecurity:
+      NSAllowsLocalNetworking: true
   target:
     - target: dmg
       arch:

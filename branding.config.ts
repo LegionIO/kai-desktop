@@ -90,7 +90,7 @@ export const branding = {
   screenCaptureUsage:
     '{{productName}} captures your screen to enable local Mac computer control and allow the AI to see what\'s on your display.',
   localNetworkUsage:
-    '{{productName}} connects to services on your local network (e.g. MCP servers, APIs, and plugins).',
+    '{{productName}} connects to services on your local network.',
 
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */
