@@ -1,5 +1,5 @@
 import { Notification, BrowserWindow } from 'electron';
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs';
+import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 import type {
@@ -469,10 +469,32 @@ export class PluginManager {
     return this.plugins.get(pluginName) ?? null;
   }
 
+  private pluginSettingsPath(pluginName: string): string {
+    return join(this.appHome, 'plugin-settings', pluginName, 'settings.json');
+  }
+
   getPluginConfig(pluginName: string): Record<string, unknown> {
     const instance = this.plugins.get(pluginName);
     if (!instance) return {};
-    const settingsPath = join(instance.dir, 'settings.json');
+    const settingsPath = this.pluginSettingsPath(pluginName);
+
+    // Migrate from legacy in-plugin-dir settings.json if the new location doesn't exist yet
+    if (!existsSync(settingsPath)) {
+      const legacyPath = join(instance.dir, 'settings.json');
+      if (existsSync(legacyPath)) {
+        try {
+          const legacyData = readFileSync(legacyPath, 'utf-8');
+          const dir = join(this.appHome, 'plugin-settings', pluginName);
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(settingsPath, legacyData, 'utf-8');
+          try { unlinkSync(legacyPath); } catch { /* best-effort cleanup */ }
+          console.info(`[PluginManager] Migrated settings for "${pluginName}" from plugin dir to ${settingsPath}`);
+        } catch (err) {
+          console.warn(`[PluginManager] Failed to migrate legacy settings for "${pluginName}":`, err);
+        }
+      }
+    }
+
     try {
       if (existsSync(settingsPath)) {
         const raw = JSON.parse(readFileSync(settingsPath, 'utf-8'));
@@ -509,7 +531,9 @@ export class PluginManager {
     const next = this.getPluginConfig(pluginName);
     setNestedValue(next, path, value);
     const validated = this.validatePluginConfig(instance.manifest, next);
-    const settingsPath = join(instance.dir, 'settings.json');
+    const settingsPath = this.pluginSettingsPath(pluginName);
+    const dir = join(this.appHome, 'plugin-settings', pluginName);
+    mkdirSync(dir, { recursive: true });
     writeFileSync(settingsPath, JSON.stringify(validated, null, 2), 'utf-8');
     this.broadcastUIState();
   }
