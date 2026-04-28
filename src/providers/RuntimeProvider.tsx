@@ -853,34 +853,23 @@ async function persistConversation(
   tree: StoredMessage[],
   headId: string | null,
   updates: Partial<ConversationRecord> = {},
-  debugCaller = 'unknown',
 ): Promise<void> {
-  // Bump version BEFORE the async boundary to claim this persist operation
+  // Bump version BEFORE the async boundary to claim this persist operation.
+  // This prevents stale debounced persists from overwriting newer data
+  // (e.g. done handler's runStatus:'idle' overwritten by a late schedulePersist's 'running').
   const currentVersion = (persistVersions.get(conversationId) ?? 0) + 1;
   persistVersions.set(conversationId, currentVersion);
 
   try {
-    await app.conversations.debugLog(`[PERSIST:START] id=${conversationId.slice(0, 8)} v=${currentVersion} caller=${debugCaller} runStatus=${updates.runStatus ?? 'unset'}`);
-
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
-    if (!conv) {
-      await app.conversations.debugLog(`[PERSIST:ABORT] id=${conversationId.slice(0, 8)} v=${currentVersion} reason=conversation-not-found`);
-      return;
-    }
+    if (!conv) return;
 
     // After the async get(), check if a newer persist started while we were waiting
     const latestVersion = persistVersions.get(conversationId) ?? 0;
-    if (currentVersion < latestVersion) {
-      await app.conversations.debugLog(`[PERSIST:ABORT] id=${conversationId.slice(0, 8)} v=${currentVersion} reason=stale (latest=${latestVersion})`);
-      return;
-    }
+    if (currentVersion < latestVersion) return;
 
     const branch = getActiveBranch(tree, headId);
     const now = nowIso();
-
-    const lastAssistantMsg = [...branch].reverse().find((m) => m.role === 'assistant');
-    const timing = lastAssistantMsg ? getResponseTiming(lastAssistantMsg) : null;
-    await app.conversations.debugLog(`[PERSIST:WRITE] id=${conversationId.slice(0, 8)} v=${currentVersion} runStatus=${updates.runStatus ?? conv.runStatus} timing=${JSON.stringify(timing)}`);
 
     await app.conversations.put({
       ...conv,
@@ -892,12 +881,10 @@ async function persistConversation(
       lastMessageAt: now,
       messageCount: branch.length,
       userMessageCount: branch.filter((m) => m.role === 'user').length,
-      metadata: { ...conv.metadata, _debugCaller: debugCaller },
       ...updates,
     });
   } catch (err) {
     console.error('[Runtime] Failed to persist:', err);
-    await app.conversations.debugLog(`[PERSIST:ERROR] id=${conversationId.slice(0, 8)} v=${currentVersion} err=${String(err)}`);
   }
 }
 
@@ -1239,7 +1226,7 @@ export function RuntimeProvider({
     const accAwait = hasActiveStream && streamAccumulators.get(id)?.awaitingApproval;
     setIsRunning(hasActiveStream && !accAwait);
     if (conv.runStatus === 'running' && !hasActiveStream) {
-      void persistConversation(id, t, h, { runStatus: 'idle' }, 'loadConversationState:stale-running');
+      void persistConversation(id, t, h, { runStatus: 'idle' });
     }
 
     // Restore per-conversation settings (model, profile, fallback)
@@ -1322,7 +1309,7 @@ export function RuntimeProvider({
       if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
         return;
       }
-      persistConversation(conversationId, t, h, extra, 'schedulePersist');
+      persistConversation(conversationId, t, h, extra);
     }, 300));
   }, []);
 
@@ -1336,7 +1323,7 @@ export function RuntimeProvider({
 
     await persistConversation(convId, treeRef.current, headIdRef.current, {
       currentWorkingDirectory: trimmed,
-    }, 'setCurrentWorkingDirectory');
+    });
   }, []);
 
   // Stable ref for values the stream handler needs without re-subscribing
@@ -1571,7 +1558,7 @@ export function RuntimeProvider({
           forceNewAssistant.add(convId);
           persistConversation(convId, acc.messages, acc.headId, {
             lastAssistantUpdateAt: new Date().toISOString(),
-          }, 'realtime-status:connected');
+          });
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
@@ -1744,7 +1731,7 @@ export function RuntimeProvider({
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
-        }, 'error:idle');
+        });
         if (isActiveConv) {
           setIsRunning(false);
           setTree([...acc.messages]);
@@ -1777,16 +1764,15 @@ export function RuntimeProvider({
           if (_ptAwait) { clearTimeout(_ptAwait); persistTimersRef.current.delete(convId); }
           persistConversation(convId, acc.messages, acc.headId, {
             runStatus: 'awaiting-approval', hasUnread: true,
-          }, 'done:awaiting-approval');
+          });
           return;
         }
         finalizeAssistantResponse(acc);
         const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
-        void app.conversations.debugLog(`[FINALIZE] id=${convId.slice(0, 8)} before persist`);
         persistConversation(convId, acc.messages, acc.headId, {
           runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
-        }, 'done:idle');
+        });
         if (isActiveConv) {
           setTree([...acc.messages]);
           setHeadId(acc.headId);
@@ -1833,7 +1819,7 @@ export function RuntimeProvider({
                   : branch;
                 streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
-                persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' }, `plan-restart:${label}`);
+                persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
                 const cfg = streamHandlerRef.current;
                 console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=${restartMode}`);
                 app.agent.stream(
@@ -1873,7 +1859,7 @@ export function RuntimeProvider({
         // awaiting-approval state even if the user switches threads quickly.
         const _pt = persistTimersRef.current.get(convId);
         if (_pt) { clearTimeout(_pt); persistTimersRef.current.delete(convId); }
-        persistConversation(convId, acc.messages, acc.headId, persistExtra, 'tool-approval-required');
+        persistConversation(convId, acc.messages, acc.headId, persistExtra);
       } else {
         // Resume running indicator only if not awaiting approval — stale
         // text-delta events may arrive after tool-approval-required.
@@ -1922,7 +1908,7 @@ export function RuntimeProvider({
 
     streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
     const branch = getActiveBranch(newTree, newHead);
-    await persistConversation(convId, newTree, newHead, { runStatus: 'running' }, 'onNew');
+    await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     void maybeGenerateTitle(convId, branch);
     console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`);    console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
     app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto');
@@ -1954,7 +1940,7 @@ export function RuntimeProvider({
       pendingAssistantTiming: createPendingAssistantTiming(),
     });
     const branch = getActiveBranch(newTree, actualParent);
-    persistConversation(convId, newTree, actualParent, { runStatus: 'running' }, 'onReload');
+    persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
     console.info(`[UI:stream:reload] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`);
     app.agent.stream(
       convId,
@@ -2005,7 +1991,7 @@ export function RuntimeProvider({
       setHeadId(newHead);
       setIsRunning(false);
       try { await app.agent.cancelStream(convId); } catch { /* ignore */ }
-      persistConversation(convId, newTree, newHead, { runStatus: 'idle' }, 'onCancel:new-message');
+      persistConversation(convId, newTree, newHead, { runStatus: 'idle' });
       return;
     }
 
@@ -2018,7 +2004,7 @@ export function RuntimeProvider({
     } catch (err) {
       console.error('[Runtime] Cancel failed:', err);
     }
-    persistConversation(convId, latestTree, latestHead, { runStatus: 'idle' }, 'onCancel:preserve');
+    persistConversation(convId, latestTree, latestHead, { runStatus: 'idle' });
   }, []);
 
   // Branch navigation
@@ -2037,7 +2023,7 @@ export function RuntimeProvider({
     setHeadId(newHead);
     // Persist
     const convId = activeIdRef.current;
-    if (convId) persistConversation(convId, tree, newHead, {}, 'goToBranch');
+    if (convId) persistConversation(convId, tree, newHead);
   }, [tree]);
 
   const goToPreviousBranch = useCallback(() => {
