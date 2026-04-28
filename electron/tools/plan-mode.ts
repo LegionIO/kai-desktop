@@ -83,13 +83,13 @@ export function createExitPlanModeTool(): ToolDefinition {
       const planFilePath = join(plansDir, `${planName}.md`);
       writeFileSync(planFilePath, planContent, 'utf-8');
 
-      broadcastModeChange('implement');
+      broadcastModeChange('auto');
       return {
         success: true,
-        mode: 'implement',
+        mode: 'auto',
         planFilePath,
         planName: `${planName}.md`,
-        message: 'Plan mode has been deactivated and implementation mode is active. Write and command tools are available, while ask_user and plan-mode tools are unavailable. Proceed with the approved implementation now.',
+        message: `Plan saved to ${planFilePath}. Reverting to auto mode.`,
         ...(summary ? { summary } : {}),
       };
     },

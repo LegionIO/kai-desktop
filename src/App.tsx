@@ -787,7 +787,7 @@ function AppShell() {
   useEffect(() => {
     if (!window.app?.onExecutionModeChanged) return;
     const cleanup = window.app.onExecutionModeChanged((mode) => {
-      if (mode === 'plan-first' || mode === 'implement' || mode === 'auto' || mode === 'confirm-writes') {
+      if (mode === 'plan-first' || mode === 'auto') {
         setExecutionMode(mode as ExecutionMode);
       }
     });

@@ -332,7 +332,7 @@ function isExpectedMastraStructuralEvent(type: string): boolean {
     || type === 'raw';
 }
 
-/** Mutating workspace tool names — used for confirm-writes gating and plan-mode filtering. */
+/** Mutating workspace tool names — used for plan-mode filtering. */
 export const WORKSPACE_MUTATING_TOOLS: Set<string> = new Set([
   WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE,
   WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE,
@@ -1211,10 +1211,6 @@ function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): str
     return prompts?.plan?.trim() || chatPrompt;
   }
 
-  if (executionMode === 'implement') {
-    return prompts?.implement?.trim() || chatPrompt;
-  }
-
   return chatPrompt;
 }
 
@@ -1250,31 +1246,7 @@ function buildAgentInstructions(config: AppConfig, executionMode?: string): stri
       '- Do NOT write the plan as regular text in the conversation. Instead, pass the entire plan as the planContent argument to exit_plan_mode. The user will see it in a dedicated side panel.',
       '- Your turn should ONLY end by either using ask_user (to clarify requirements) or calling exit_plan_mode (to present the plan for approval). Do not stop for any other reason.',
       '- Use exit_plan_mode to request plan approval. Do NOT ask about plan approval via text — phrases like "Is this plan okay?" or "Should I proceed?" MUST use exit_plan_mode instead.',
-      '- IMPORTANT: If exit_plan_mode has been approved and its result indicates implementation mode is active, these restrictions no longer apply on the next turn.',
-    );
-  } else if (executionMode === 'implement') {
-    lines.push(
-      '',
-      'IMPLEMENTATION MODE ACTIVE:',
-      '- The user approved the plan. Implement it now; do not re-enter planning mode or restate the plan instead of acting.',
-      '- The ask_user, enter_plan_mode, and exit_plan_mode tools are not available in this mode. Do not ask clarification questions unless you are blocked by missing external information, credentials, or user-only access; in that case, report the concrete blocker and what you already tried.',
-      '- Reuse the context, approved plan, and tool results already present in the conversation. Do not begin implementation by listing the workspace, running pwd, or re-reading files solely to rediscover state that was already inspected during planning.',
-      '- Do targeted reads only when needed because information may be stale, incomplete, or directly relevant to the next edit. If the plan already identifies a new file to create, start by creating it.',
-      '- Prefer making the planned code changes, then run focused verification. If verification fails, diagnose and fix when practical before stopping.',
-      '- Continue until the requested implementation is complete or a concrete blocker prevents further progress. End with a concise summary of changed files and verification results.',
-    );
-  } else if (executionMode === 'confirm-writes') {
-    lines.push(
-      '- You have enter_plan_mode and exit_plan_mode tools. When the user asks to plan, think first, or explore before coding, call enter_plan_mode to switch to plan-first mode.',
-      '- You have an ask_user tool for asking the user questions with multiple-choice options. Use it when you need clarification, preferences, or decisions. Provide 2-4 clear options per question and a short header for each question tab. The user can also type a custom response.',
-    );
-    lines.push(
-      '',
-      'CONFIRMATION MODE:',
-      '- Write operations (mastra_workspace_write_file, mastra_workspace_edit_file, mastra_workspace_execute_command) require explicit user approval before executing.',
-      '- The user will see your intended action and can approve or reject it.',
-      '- Before invoking a write tool, briefly explain what the tool call will do and why.',
-      '- Read-only tools execute normally without requiring approval.',
+      '- IMPORTANT: If exit_plan_mode has been approved and its result indicates auto mode is restored, these restrictions no longer apply on the next turn.',
     );
   } else {
     lines.push(

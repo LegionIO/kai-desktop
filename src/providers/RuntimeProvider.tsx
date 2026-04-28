@@ -77,7 +77,7 @@ type ContentPart =
       stopped?: boolean;
       subAgentConversationId?: string;
     };
-    /** Approval status for confirm-writes execution mode */
+    /** Approval status for tool execution */
     approvalStatus?: 'pending' | 'approved' | 'rejected';
     /** The ID the backend uses for the approval promise — may differ from
      *  toolCallId due to execute-side vs stream-side ID mismatch. */
@@ -1035,7 +1035,7 @@ export function useFallbackBanner(): FallbackBannerActions {
 
 // =============================================================================
 
-export type ExecutionMode = 'auto' | 'plan-first' | 'implement' | 'confirm-writes';
+export type ExecutionMode = 'auto' | 'plan-first';
 
 export function RuntimeProvider({
   children,
@@ -1745,7 +1745,7 @@ export function RuntimeProvider({
         const doneData = e.data as Record<string, unknown> | undefined;
         if (acc.awaitingApproval && doneData && (
           doneData.planModeRestart || doneData.planModeRejectRestart ||
-          doneData.exitPlanModeRestart || doneData.planDismissed
+          doneData.planDismissed
         )) {
           acc.awaitingApproval = false;
         }
@@ -1790,13 +1790,9 @@ export function RuntimeProvider({
           // so we restart in plan-first mode with a synthetic user message telling the
           // agent to continue refining the plan.
           const planModeRejectRestart = (e.data as Record<string, unknown> | undefined)?.planModeRejectRestart;
-          // Auto-continue after plan acceptance: the user approved the plan, so we
-          // restart with executionMode='implement' (write tools enabled, ask_user removed).
-          const exitPlanModeRestart = (e.data as Record<string, unknown> | undefined)?.exitPlanModeRestart;
-          if (planModeRestart || planModeRejectRestart || exitPlanModeRestart) {
-            const label = exitPlanModeRestart ? 'exit-plan-restart' : planModeRestart ? 'plan-restart' : 'plan-reject-restart';
-            const restartMode: ExecutionMode = exitPlanModeRestart ? 'implement' : 'plan-first';
-            console.info(`[UI:stream] ${label} — auto-continuing with ${restartMode} mode`);
+          if (planModeRestart || planModeRejectRestart) {
+            const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
+            console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
@@ -1805,32 +1801,20 @@ export function RuntimeProvider({
                 const treeForStream = [...acc.messages];
 
                 const branch = getActiveBranch(treeForStream, headForStream);
-                const branchForStream = exitPlanModeRestart
-                  ? [
-                      ...branch,
-                      {
-                        role: 'user',
-                        content: [{
-                          type: 'text',
-                          text: 'The plan was approved. Implement the approved plan now. Do not ask more questions or re-enter planning mode. Use the existing context and prior tool results; do not start by listing the workspace or re-reading files just to rediscover state. Make the changes and run focused verification.',
-                        }],
-                      },
-                    ]
-                  : branch;
                 streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
                 setIsRunning(true);
                 persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
                 const cfg = streamHandlerRef.current;
-                console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=${restartMode}`);
+                console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
                 app.agent.stream(
                   convId,
-                  branchForStream,
+                  branch,
                   cfg.selectedModelKey ?? undefined,
                   cfg.reasoningEffort ?? 'medium',
                   cfg.selectedProfileKey ?? undefined,
                   cfg.fallbackEnabled ?? false,
                   currentWorkingDirectoryRef.current ?? undefined,
-                  restartMode,
+                  'plan-first',
                 );
               }
             }, 100);

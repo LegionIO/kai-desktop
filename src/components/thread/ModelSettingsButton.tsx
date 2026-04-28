@@ -40,13 +40,11 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'xhigh', label: 'Max' },
 ];
 
-export type ExecutionMode = 'auto' | 'plan-first' | 'implement' | 'confirm-writes';
+export type ExecutionMode = 'auto' | 'plan-first';
 
 const MODE_ICONS: Record<ExecutionMode, typeof PenLineIcon> = {
   'auto': PenLineIcon,
   'plan-first': ScrollTextIcon,
-  'implement': DumbbellIcon,
-  'confirm-writes': CheckIcon,
 };
 
 export const ModelSettingsButton: FC<{
@@ -153,11 +151,7 @@ export const ModelSettingsButton: FC<{
     ? currentLabel
     : executionMode === 'plan-first'
       ? 'Plan mode'
-      : executionMode === 'implement'
-        ? 'Implementation mode'
-        : executionMode === 'confirm-writes'
-          ? 'Confirm writes mode'
-          : 'Edit mode';
+      : 'Edit mode';
 
   const ModeIcon = hasExecutionMode
     ? MODE_ICONS[executionMode ?? 'auto']

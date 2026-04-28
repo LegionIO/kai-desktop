@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
-import { normalizeAgentCwd, WORKSPACE_MUTATING_TOOLS } from '../agent/mastra-agent.js';
+import { normalizeAgentCwd } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -31,11 +31,6 @@ const PLAN_MODE_CUSTOM_TOOLS = new Set([
   'exit_plan_mode',
   'web_fetch',
   'web_search',
-]);
-const IMPLEMENT_MODE_EXCLUDED_TOOLS = new Set([
-  'ask_user',
-  'enter_plan_mode',
-  'exit_plan_mode',
 ]);
 
 // Pending tool approval promises — shared with the Claude Agent SDK MCP bridge
@@ -97,10 +92,6 @@ function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): Abor
 function toolsForExecutionMode(tools: ToolDefinition[], executionMode: ExecutionMode): ToolDefinition[] {
   if (executionMode === 'plan-first') {
     return tools.filter((tool) => PLAN_MODE_CUSTOM_TOOLS.has(tool.name));
-  }
-
-  if (executionMode === 'implement') {
-    return tools.filter((tool) => !IMPLEMENT_MODE_EXCLUDED_TOOLS.has(tool.name));
   }
 
   return tools;
@@ -897,9 +888,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
         }
 
-        // Track whether exit_plan_mode was rejected so we can ignore the
-        // stale tool-result event that may still arrive after cancellation.
-        let exitPlanModeRejected = false;
         // Track whether we already sent a plan-related done event so we skip
         // any trailing plain done events from the generator after abort.
         let planDoneSent = false;
@@ -934,25 +922,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               pairExecuteAndStreamToolCallIds(state.toolName);
               observer?.onToolExecutionStart(state);
 
-              // In confirm-writes mode, block mutating tools until user approves
-              if (effectiveExecutionMode === 'confirm-writes' && WORKSPACE_MUTATING_TOOLS.has(state.toolName)) {
-                const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-                broadcastStreamEvent({
-                  conversationId,
-                  type: 'tool-approval-required',
-                  toolCallId: streamId,
-                  toolName: state.toolName,
-                  args: state.args,
-                });
-                observer?.onToolAwaitingApproval(state.toolCallId);
-                const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
-                  pendingToolApprovals.set(streamId, { resolve });
-                });
-                if (approved !== true) {
-                  state.cancel();
-                }
-              }
-
               // Gate exit_plan_mode behind user approval regardless of execution mode
               if (state.toolName === 'exit_plan_mode') {
                 const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
@@ -968,7 +937,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   pendingToolApprovals.set(streamId, { resolve });
                 });
                 if (approved !== true) {
-                  exitPlanModeRejected = true;
                   state.cancel();
                   if (approved === 'dismiss') {
                     // User clicked X — exit plan mode entirely and stop the stream.
@@ -1051,12 +1019,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             ...config.tools,
             executionMode: effectiveExecutionMode,
           },
-          advanced: {
-            ...config.advanced,
-            maxSteps: effectiveExecutionMode === 'implement'
-              ? Math.max(config.advanced.maxSteps, 30)
-              : config.advanced.maxSteps,
-          },
         };
 
         const stream = runtime.stream({
@@ -1103,16 +1065,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             broadcastStreamEvent(event);
             planDoneSent = true;
             broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
-            controller.abort();
-            return { conversationId };
-          }
-          if (event.type === 'tool-result' && event.toolName === 'exit_plan_mode' && !exitPlanModeRejected) {
-            // Plan was accepted. Abort this stream so the renderer can restart
-            // with executionMode='implement' (write tools available, question/planning tools removed).
-            console.info(`[Agent:stream] exit_plan_mode detected mid-stream, aborting to restart with implement mode`);
-            broadcastStreamEvent(event);
-            planDoneSent = true;
-            broadcastStreamEvent({ conversationId, type: 'done', data: { exitPlanModeRestart: true } });
             controller.abort();
             return { conversationId };
           }
@@ -1165,9 +1117,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             continue;
           }
           broadcastStreamEvent(event);
-          if (event.type === 'done' && effectiveExecutionMode === 'implement') {
-            broadcastExecutionMode('auto');
-          }
         }
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -1177,9 +1126,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             error: error instanceof Error ? error.message : String(error),
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
-          if (effectiveExecutionMode === 'implement') {
-            broadcastExecutionMode('auto');
-          }
         }
       } finally {
         observerLaunchesEnabled = false;

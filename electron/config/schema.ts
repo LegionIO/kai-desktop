@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const executionModeSchema = z.enum(['auto', 'plan-first', 'implement', 'confirm-writes']);
+export const executionModeSchema = z.enum(['auto', 'plan-first']);
 export type ExecutionMode = z.infer<typeof executionModeSchema>;
 
 const computerUseSupportSchema = z.enum([
