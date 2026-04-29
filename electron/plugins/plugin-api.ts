@@ -1268,20 +1268,6 @@ export function createPluginAPI(
         return { installed: existsSync(skillPath), path: existsSync(skillPath) ? skillPath : undefined };
       },
 
-      dr0Package: async () => {
-        requirePermission('tools:detect');
-        try {
-          const { execSync } = await import('child_process');
-          const result = execSync('python3 -c "import dr0; print(dr0.__version__)"', {
-            encoding: 'utf-8',
-            timeout: 10_000,
-          }).trim();
-          return { installed: true, version: result };
-        } catch {
-          return { installed: false };
-        }
-      },
-
       all: async () => {
         requirePermission('tools:detect');
         const [claude, codex, python, node, git, pip] = await Promise.all([

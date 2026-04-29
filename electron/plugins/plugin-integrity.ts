@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { PluginManifest, PluginPermission, FsScopeDeclaration, ExecScopeDeclaration, ScopedDirectory, AllowedBinary } from './types.js';
+import type { PluginManifest, PluginPermission, FsScopeDeclaration, ExecScopeDeclaration, ScopedDirectory, AllowedBinary, AssetDeclaration, AssetMapping } from './types.js';
 
 export type PluginIntegrity = {
   fileHash: string;
@@ -71,6 +71,7 @@ export function readPluginManifest(pluginDir: string, fallbackName?: string): Pl
       : undefined,
     fsScope: parseFsScope(raw.fsScope),
     execScope: parseExecScope(raw.execScope),
+    assets: parseAssets(raw.assets),
   };
 }
 
@@ -152,4 +153,33 @@ function parseExecScope(raw: unknown): ExecScopeDeclaration | undefined {
   }
 
   return { binaries, argPatterns };
+}
+
+function parseAssets(raw: unknown): AssetDeclaration | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (!Array.isArray(obj.mappings)) return undefined;
+
+  const mappings: AssetMapping[] = [];
+  for (const m of obj.mappings) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) continue;
+    const entry = m as Record<string, unknown>;
+    if (typeof entry.src !== 'string') continue;
+    if (!entry.target || typeof entry.target !== 'object' || Array.isArray(entry.target)) continue;
+
+    const target = entry.target as Record<string, unknown>;
+    if (typeof target.scope !== 'string' || typeof target.path !== 'string') continue;
+    if (!VALID_SCOPED_DIRECTORIES.has(target.scope)) continue;
+
+    mappings.push({
+      src: entry.src,
+      target: { scope: target.scope as ScopedDirectory, path: target.path },
+      include: Array.isArray(entry.include)
+        ? entry.include.filter((p): p is string => typeof p === 'string')
+        : undefined,
+      overwrite: typeof entry.overwrite === 'boolean' ? entry.overwrite : undefined,
+    });
+  }
+
+  return mappings.length > 0 ? { mappings } : undefined;
 }

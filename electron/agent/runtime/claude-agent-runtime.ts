@@ -247,7 +247,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // The SDK takes a prompt string for the current turn.
     // Extract the last user message as the prompt.
-    const prompt = extractLastUserPrompt(options.messages);
+    let prompt = extractLastUserPrompt(options.messages);
     if (!prompt) {
       yield {
         conversationId,
@@ -256,6 +256,19 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       };
       yield { conversationId, type: 'done' };
       return;
+    }
+
+    // Claude Code's CLI intercepts prompts starting with "/" as built-in
+    // slash commands (e.g. /help, /clear).  If the prompt starts with "/"
+    // but is NOT a recognised CLI command, the subprocess returns
+    // "Unknown command" instantly and never reaches the LLM.
+    //
+    // Rewrite slash-prefixed prompts into natural language so the LLM
+    // receives them.  The system prompt already contains routing
+    // instructions telling Claude which tool to invoke for each command.
+    if (prompt.startsWith('/')) {
+      const withoutSlash = prompt.slice(1);
+      prompt = `[Slash command: /${withoutSlash.split(/\s/)[0]}] ${withoutSlash}`;
     }
 
     // -----------------------------------------------------------------------
