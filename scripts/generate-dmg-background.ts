@@ -4,8 +4,14 @@
  * Usage:  node --import tsx scripts/generate-dmg-background.ts
  *         (automatically called by `pnpm build:mac`)
  *
- * Renders an SVG to a Retina-resolution PNG using sharp.
- * The logical size is 660×400; the output is 1320×800 at 144 DPI.
+ * Renders an SVG to a PNG using sharp at the DMG window's native size
+ * (660×400). electron-builder uses the PNG's pixel dimensions to size the
+ * installer window, so this must match `dmg.window.{width,height}` in
+ * electron-builder.template.yml.
+ *
+ * Design: a rounded-corner amber arrow on a light background, with a warm
+ * radial halo behind it and a soft drop shadow. The light backdrop keeps
+ * the dark Kai icon legible when composited on top.
  */
 
 import { resolve, dirname } from 'path';
@@ -16,45 +22,34 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
 const outputPath = resolve(root, 'build', 'dmg-background.png');
 
-// Logical dimensions (what macOS displays)
-const WIDTH = 660;
-const HEIGHT = 400;
+// Render at the DMG window's native size — must match dmg.window in
+// electron-builder.template.yml.
+const PX_W = 660;
+const PX_H = 400;
 
-// Retina multiplier
-const SCALE = 2;
-const PX_W = WIDTH * SCALE;
-const PX_H = HEIGHT * SCALE;
+// Icon positions (must match electron-builder contents[].x/y in the
+// template; window is 660×400).
+const APP_X = 180;
+const APP_Y = 200;
+const LINK_X = 480;
 
-// Icon positions (must match electron-builder contents[].x/y × SCALE)
-const APP_X = 180 * SCALE;
-const APP_Y = 200 * SCALE;
-const LINK_X = 480 * SCALE;
-
-// ── Arrow geometry ──
+// ── Arrow geometry (rounded-corner block arrow) ──
 const CX = (APP_X + LINK_X) / 2;
-const CY = APP_Y - 10 * SCALE;
+const CY = APP_Y - 10;
 
-// Arrow dimensions
-const SHAFT_W = 28 * SCALE; // width of the shaft
-const SHAFT_H = 11 * SCALE; // half-height of the shaft
-const HEAD_W = 16 * SCALE; // how far the head extends beyond the shaft
-const HEAD_H = 20 * SCALE; // half-height of the arrowhead
-const R = 6 * SCALE; // corner radius for rounding
+const SHAFT_W = 58;
+const SHAFT_H = 22;
+const HEAD_W = 32;
+const HEAD_H = 42;
+const R = 11;
 
 const TOTAL_W = SHAFT_W + HEAD_W;
 
-// Build a rounded arrow as an SVG path.
-// The arrow points right, centered at (CX, CY).
-//
-// Key points (before rounding):
-//   A = left edge, top of shaft
-//   B = right edge of shaft, top of shaft
-//   C = right edge of shaft, top of arrowhead
-//   D = tip of arrow
-//   E = right edge of shaft, bottom of arrowhead
-//   F = right edge of shaft, bottom of shaft
+// Arrow corners (before rounding):
+//   A = left edge, top of shaft       B = right edge of shaft, top of shaft
+//   C = right edge of shaft, top of arrowhead    D = tip of arrow
+//   E = right edge of shaft, bottom of arrowhead F = right edge of shaft, bottom of shaft
 //   G = left edge, bottom of shaft
-//
 const LEFT = CX - TOTAL_W / 2;
 const RIGHT_SHAFT = LEFT + SHAFT_W;
 const RIGHT_TIP = CX + TOTAL_W / 2;
@@ -68,10 +63,9 @@ const F = { x: RIGHT_SHAFT, y: CY + SHAFT_H };
 const G = { x: LEFT, y: CY + SHAFT_H };
 
 // Build the path with rounded corners using quadratic bezier curves at corners.
-// For each corner, we pull back by R along the incoming edge and push forward by R
+// For each corner, pull back by R along the incoming edge and push forward by R
 // along the outgoing edge, with the actual corner point as the control point.
 function roundedArrowPath(): string {
-  // Helper: move along a direction from a point by distance d
   function towards(from: { x: number; y: number }, to: { x: number; y: number }, d: number) {
     const dx = to.x - from.x;
     const dy = to.y - from.y;
@@ -81,33 +75,20 @@ function roundedArrowPath(): string {
   }
 
   const r = R;
+  const tipR = r * 0.6;
 
-  // Corner A (top-left of shaft): rounded
-  const a1 = towards(A, G, r); // coming from G toward A
-  const a2 = towards(A, B, r); // going from A toward B
-
-  // Corner B (top-right of shaft, where shaft meets head going up): rounded
+  const a1 = towards(A, G, r);
+  const a2 = towards(A, B, r);
   const b1 = towards(B, A, r);
   const b2 = towards(B, C, r);
-
-  // Corner C (top of arrowhead): rounded
   const c1 = towards(C, B, r);
   const c2 = towards(C, D, r);
-
-  // Corner D (tip): rounded with a tighter radius
-  const tipR = r * 0.6;
   const d1 = towards(D, C, tipR);
   const d2 = towards(D, E, tipR);
-
-  // Corner E (bottom of arrowhead): rounded
   const e1 = towards(E, D, r);
   const e2 = towards(E, F, r);
-
-  // Corner F (bottom-right of shaft): rounded
   const f1 = towards(F, E, r);
   const f2 = towards(F, G, r);
-
-  // Corner G (bottom-left of shaft): rounded
   const g1 = towards(G, F, r);
   const g2 = towards(G, A, r);
 
@@ -133,49 +114,67 @@ function roundedArrowPath(): string {
 
 const arrowPath = roundedArrowPath();
 
-// Brand colors from Kai icon — warm amber/gold
-const ACCENT = '#d4a912';
-const ACCENT_DIM = '#8a6e0a';
+// ── Palette tuned to the Kai icon's gold spokes ──
+const GOLD_MID = '#d7aa2d';
+const GOLD_BRIGHT = '#f0cd55';
+const GOLD_HIGH = '#ffeb91';
+const HALO = '#ffd764';
+
+// Bright source for the radial wash inside the arrow — slightly behind the tip.
+const WASH_CX = CX + 6;
+const WASH_CY = CY;
+const WASH_R = TOTAL_W * 0.85;
+
+// Drop-shadow offset
+const SHADOW_DX = 3;
+const SHADOW_DY = 5;
+
+// Tight halo geometry — a single solid disc gets blurred for a smooth,
+// band-free glow (multi-stop radial gradients render as visible rings at
+// this resolution).
+const HALO_R = 70;
 
 const svg = `
 <svg xmlns="http://www.w3.org/2000/svg" width="${PX_W}" height="${PX_H}" viewBox="0 0 ${PX_W} ${PX_H}">
   <defs>
-    <!-- Dark background gradient -->
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#1c1c1c"/>
-      <stop offset="100%" stop-color="#111111"/>
-    </linearGradient>
-
-    <!-- Subtle radial glow behind center -->
-    <radialGradient id="glow" cx="50%" cy="48%" r="35%">
-      <stop offset="0%" stop-color="${ACCENT_DIM}" stop-opacity="0.08"/>
-      <stop offset="100%" stop-color="${ACCENT_DIM}" stop-opacity="0"/>
+    <!-- Radial wash inside the arrow body -->
+    <radialGradient id="arrowWash" cx="${WASH_CX}" cy="${WASH_CY}" r="${WASH_R}" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="${GOLD_HIGH}"/>
+      <stop offset="30%"  stop-color="${GOLD_BRIGHT}"/>
+      <stop offset="100%" stop-color="${GOLD_MID}"/>
     </radialGradient>
 
-    <!-- Left-to-right fade gradient for the arrow -->
-    <linearGradient id="arrowFade" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="${ACCENT}" stop-opacity="0.05"/>
-      <stop offset="50%" stop-color="${ACCENT}" stop-opacity="0.2"/>
-      <stop offset="100%" stop-color="${ACCENT}" stop-opacity="0.35"/>
-    </linearGradient>
+    <!-- Heavy blur for the halo — turns a solid disc into a smooth glow -->
+    <filter id="haloBlur" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+
+    <!-- Soft drop shadow -->
+    <filter id="dropShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
   </defs>
 
-  <!-- Background -->
-  <rect width="${PX_W}" height="${PX_H}" fill="url(#bg)"/>
+  <!-- Light background -->
+  <rect width="${PX_W}" height="${PX_H}" fill="#eeeeee"/>
 
-  <!-- Subtle warm glow in center -->
-  <rect width="${PX_W}" height="${PX_H}" fill="url(#glow)"/>
+  <!-- Smooth warm halo: a solid amber disc, heavily blurred -->
+  <g filter="url(#haloBlur)">
+    <circle cx="${CX + 4}" cy="${CY}" r="${HALO_R}" fill="${HALO}" fill-opacity="0.45"/>
+  </g>
 
-  <!-- Filled arrow with rounded corners and gradient fade -->
-  <path d="${arrowPath}" fill="url(#arrowFade)"/>
+  <!-- Drop shadow -->
+  <g filter="url(#dropShadow)" transform="translate(${SHADOW_DX} ${SHADOW_DY})">
+    <path d="${arrowPath}" fill="#2a1a00" fill-opacity="0.55"/>
+  </g>
+
+  <!-- Arrow body -->
+  <path d="${arrowPath}" fill="url(#arrowWash)"/>
 </svg>
 `;
 
 async function main() {
-  await sharp(Buffer.from(svg))
-    .png()
-    .toFile(outputPath);
-
+  await sharp(Buffer.from(svg)).png().toFile(outputPath);
   console.info(`[generate-dmg-background] Generated ${outputPath} (${PX_W}×${PX_H})`);
 }
 
