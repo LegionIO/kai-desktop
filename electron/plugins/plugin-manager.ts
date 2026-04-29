@@ -164,8 +164,6 @@ export class PluginManager {
   /** Permissions that require explicit user consent via modal. */
   private static readonly DANGEROUS_PERMISSIONS: Set<PluginPermission> = new Set([
     'exec:whitelisted',
-    'fs:scoped-write',
-    'fs:scoped-read',
   ]);
 
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */
@@ -199,7 +197,6 @@ export class PluginManager {
         displayName: manifest.displayName,
         permissions: manifest.permissions,
         dangerousPermissions,
-        fsScope: manifest.fsScope,
         execScope: manifest.execScope,
         fileHash,
       });
