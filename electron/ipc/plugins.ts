@@ -67,4 +67,20 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     const catalog = await pluginManager.refreshMarketplace();
     return catalog;
   });
+
+  // ── Permission Consent ──
+
+  ipcMain.handle('plugin:approve-consent', async (_event, pluginName: string) => {
+    const success = await pluginManager.approveAndReload(pluginName);
+    return { success };
+  });
+
+  ipcMain.handle('plugin:deny-consent', (_event, pluginName: string) => {
+    pluginManager.denyPlugin(pluginName);
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:pending-consent', () => {
+    return pluginManager.getPendingConsent();
+  });
 }

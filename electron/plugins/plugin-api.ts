@@ -5,6 +5,11 @@ import { URL } from 'url';
 import { z } from 'zod';
 import { generateForPlugin } from '../agent/plugin-generate.js';
 import { getRegisteredTools } from '../ipc/agent.js';
+import { readFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
 import type {
   PluginAPI,
   PluginInstance,
@@ -28,7 +33,16 @@ import type {
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
+  AllowedBinary,
+  ExecRequest,
 } from './types.js';
+import {
+  executeCommand,
+  detectTool,
+  findBinary,
+  SAFE_ENV_VARS,
+} from './sandboxed-exec.js';
+import { writeAuditEntry } from './audit-log.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix } from '../tools/naming.js';
@@ -1073,6 +1087,87 @@ export function createPluginAPI(
         init as Parameters<typeof net.fetch>[1],
       ) as ReturnType<typeof globalThis.fetch>;
     }) as typeof globalThis.fetch,
+
+    // ─── Whitelisted Command Execution ──────────────────────────────────
+
+    exec: {
+      run: async (request: ExecRequest) => {
+        requirePermission('exec:whitelisted');
+        const execScope = manifest.execScope;
+        if (!execScope) {
+          return { exitCode: -1, stdout: '', stderr: 'No execScope declared in plugin.json', command: request.binary, durationMs: 0, truncated: false };
+        }
+        return executeCommand(request, execScope, manifest.name, writeAuditEntry);
+      },
+
+      which: async (binary: AllowedBinary) => {
+        requirePermission('exec:whitelisted');
+        return findBinary(binary);
+      },
+    },
+
+    // ─── Tool Detection ─────────────────────────────────────────────────
+
+    detect: {
+      claudeCode: () => { requirePermission('tools:detect'); return detectTool('claude'); },
+      codex:      () => { requirePermission('tools:detect'); return detectTool('codex'); },
+      python:     () => { requirePermission('tools:detect'); return detectTool('python3'); },
+      node:       () => { requirePermission('tools:detect'); return detectTool('node'); },
+      git:        () => { requirePermission('tools:detect'); return detectTool('git'); },
+      pip:        () => { requirePermission('tools:detect'); return detectTool('pip3'); },
+      binary: (name: AllowedBinary) => { requirePermission('tools:detect'); return detectTool(name); },
+
+      claudePlugin: async (pluginName: string) => {
+        requirePermission('tools:detect');
+        const installedPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+        try {
+          if (!existsSync(installedPath)) return { installed: false };
+          const data = JSON.parse(await readFile(installedPath, 'utf-8'));
+          const plugins = data.plugins ?? data;
+          const found = Array.isArray(plugins)
+            ? plugins.find((p: { name?: string }) => p.name === pluginName)
+            : plugins[pluginName];
+          return found ? { installed: true, version: found.version, path: found.path } : { installed: false };
+        } catch {
+          return { installed: false };
+        }
+      },
+
+      codexSkill: async (skillId: string) => {
+        requirePermission('tools:detect');
+        const skillPath = join(homedir(), '.codex', 'skills', skillId, 'SKILL.md');
+        return { installed: existsSync(skillPath), path: existsSync(skillPath) ? skillPath : undefined };
+      },
+
+      all: async () => {
+        requirePermission('tools:detect');
+        const [claude, codex, python, node, git, pip] = await Promise.all([
+          detectTool('claude'),
+          detectTool('codex'),
+          detectTool('python3'),
+          detectTool('node'),
+          detectTool('git'),
+          detectTool('pip3'),
+        ]);
+        return { claude, codex, python, node, git, pip };
+      },
+    },
+
+    // ─── Safe Environment Access ────────────────────────────────────────
+
+    env: {
+      home:     () => { requirePermission('system:env'); return homedir(); },
+      platform: () => { requirePermission('system:env'); return process.platform; },
+      get: (name: string) => {
+        requirePermission('system:env');
+        if (!SAFE_ENV_VARS.has(name)) return undefined;
+        return process.env[name];
+      },
+      paths: () => {
+        requirePermission('system:env');
+        return (process.env.PATH ?? '').split(':');
+      },
+    },
   };
 
   api.conversations.list = () => {

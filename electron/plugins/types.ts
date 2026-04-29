@@ -24,12 +24,77 @@ export type PluginPermission =
   | 'agent:generate'
   | 'agent:inference-provider'
   | 'safe-storage'
-  | 'browser:window';
+  | 'browser:window'
+  | 'exec:whitelisted'
+  | 'tools:detect'
+  | 'system:env'
+  | 'audit:log';
 
 export type PluginApprovalRecord = {
   hash: string;
   permissions?: string[];
   approvedAt: string;
+};
+
+/* ── Scoped Filesystem & Execution Declarations ── */
+
+export type ScopedDirectory =
+  | 'claude-home'   // ~/.claude/
+  | 'codex-home';   // ~/.codex/
+
+export type AllowedBinary =
+  | 'claude'       // Claude Code CLI
+  | 'codex'        // Codex CLI
+  | 'node'         // Node.js
+  | 'npm'          // npm
+  | 'pip'          // Python package manager
+  | 'pip3'         // Python 3 package manager
+  | 'python'       // Python interpreter
+  | 'python3'      // Python 3 interpreter
+  | 'git'          // Git CLI
+  | 'bash';        // Bash (only for whitelisted scripts)
+
+export type ExecScopeDeclaration = {
+  binaries: AllowedBinary[];
+  argPatterns?: Record<string, string[]>;
+};
+
+export type ExecRequest = {
+  binary: AllowedBinary;
+  args: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;       // default 60_000, max 300_000
+  stdin?: string;
+};
+
+export type ExecResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  command: string;
+  durationMs: number;
+  truncated: boolean;
+};
+
+export type ToolDetectionResult = {
+  name: string;
+  installed: boolean;
+  path?: string;
+  version?: string;
+  error?: string;
+};
+
+export type AuditEntry = {
+  timestamp: string;
+  pluginName: string;
+  action: 'exec:run' | 'tools:detect';
+  target: string;
+  args?: string[];
+  exitCode?: number;
+  durationMs?: number;
+  approved: boolean;
+  userConsentId?: string;
 };
 
 export type PluginManifest = {
@@ -41,6 +106,7 @@ export type PluginManifest = {
   icon?: { lucide: string } | { svg: string };
   permissions: PluginPermission[];
   configSchema?: Record<string, unknown>;
+  execScope?: ExecScopeDeclaration;
 };
 
 /* ── Plugin State ── */
@@ -414,6 +480,34 @@ export type PluginAPI = {
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
 
   fetch: typeof globalThis.fetch;
+
+  /* ── Whitelisted Command Execution ── */
+  exec: {
+    run: (request: ExecRequest) => Promise<ExecResult>;
+    which: (binary: AllowedBinary) => Promise<string | null>;
+  };
+
+  /* ── Tool Detection (read-only) ── */
+  detect: {
+    claudeCode: () => Promise<ToolDetectionResult>;
+    codex: () => Promise<ToolDetectionResult>;
+    python: () => Promise<ToolDetectionResult>;
+    node: () => Promise<ToolDetectionResult>;
+    git: () => Promise<ToolDetectionResult>;
+    pip: () => Promise<ToolDetectionResult>;
+    binary: (name: AllowedBinary) => Promise<ToolDetectionResult>;
+    claudePlugin: (pluginName: string) => Promise<{ installed: boolean; version?: string; path?: string }>;
+    codexSkill: (skillId: string) => Promise<{ installed: boolean; path?: string }>;
+    all: () => Promise<Record<string, ToolDetectionResult>>;
+  };
+
+  /* ── Safe Environment Access ── */
+  env: {
+    home: () => string;
+    platform: () => string;
+    get: (name: string) => string | undefined;
+    paths: () => string[];
+  };
 };
 
 export type PluginHttpRequest = {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
-import { CheckIcon, ChevronUpIcon, CpuIcon, DumbbellIcon, PenLineIcon, ScrollTextIcon, ShuffleIcon, UserCircleIcon } from 'lucide-react';
+import { CheckIcon, ChevronUpIcon, CpuIcon, DumbbellIcon, MessageCircleIcon, ScrollTextIcon, ShuffleIcon, UserCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -42,8 +42,8 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
 
 export type ExecutionMode = 'auto' | 'plan-first';
 
-const MODE_ICONS: Record<ExecutionMode, typeof PenLineIcon> = {
-  'auto': PenLineIcon,
+const MODE_ICONS: Record<ExecutionMode, typeof MessageCircleIcon> = {
+  'auto': MessageCircleIcon,
   'plan-first': ScrollTextIcon,
 };
 
@@ -151,7 +151,7 @@ export const ModelSettingsButton: FC<{
     ? currentLabel
     : executionMode === 'plan-first'
       ? 'Plan mode'
-      : 'Edit mode';
+      : 'Ask mode';
 
   const ModeIcon = hasExecutionMode
     ? MODE_ICONS[executionMode ?? 'auto']

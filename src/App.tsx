@@ -17,6 +17,7 @@ import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
+import { PermissionConsentModal } from '@/components/plugins/PermissionConsentModal';
 import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
@@ -1024,6 +1025,7 @@ function AppShell() {
       />
       <RealtimeProvider>
         <PluginToastHost />
+        <PermissionConsentModal />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
         {activeView === SETTINGS_VIEW && createPortal(

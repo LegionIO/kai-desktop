@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { PluginManifest, PluginPermission } from './types.js';
+import type { PluginManifest, PluginPermission, ExecScopeDeclaration, AllowedBinary } from './types.js';
 
 export type PluginIntegrity = {
   fileHash: string;
@@ -69,6 +69,7 @@ export function readPluginManifest(pluginDir: string, fallbackName?: string): Pl
     configSchema: raw.configSchema && typeof raw.configSchema === 'object'
       ? raw.configSchema as Record<string, unknown>
       : undefined,
+    execScope: parseExecScope(raw.execScope),
   };
 }
 
@@ -92,4 +93,37 @@ export function arePermissionSetsEqual(left: readonly string[] = [], right: read
   }
 
   return true;
+}
+
+// ─── Scope Parsing Helpers ──────────────────────────────────────────────────
+
+const VALID_ALLOWED_BINARIES = new Set<string>([
+  'claude', 'codex', 'node', 'npm', 'pip', 'pip3', 'python', 'python3', 'git', 'bash',
+]);
+
+function parseExecScope(raw: unknown): ExecScopeDeclaration | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+
+  const binaries = Array.isArray(obj.binaries)
+    ? obj.binaries.filter((b): b is AllowedBinary => typeof b === 'string' && VALID_ALLOWED_BINARIES.has(b))
+    : [];
+
+  if (binaries.length === 0) return undefined;
+
+  let argPatterns: Record<string, string[]> | undefined;
+  if (obj.argPatterns && typeof obj.argPatterns === 'object' && !Array.isArray(obj.argPatterns)) {
+    argPatterns = {};
+    for (const [key, value] of Object.entries(obj.argPatterns as Record<string, unknown>)) {
+      if (Array.isArray(value)) {
+        const patterns = value.filter((v): v is string => typeof v === 'string');
+        if (patterns.length > 0) {
+          argPatterns[key] = patterns;
+        }
+      }
+    }
+    if (Object.keys(argPatterns).length === 0) argPatterns = undefined;
+  }
+
+  return { binaries, argPatterns };
 }
