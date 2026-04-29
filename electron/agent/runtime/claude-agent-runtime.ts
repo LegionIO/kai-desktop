@@ -248,7 +248,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // The SDK takes a prompt string for the current turn.
     // Extract the last user message as the prompt.
-    let prompt = extractLastUserPrompt(options.messages);
+    const prompt = extractLastUserPrompt(options.messages);
     if (!prompt) {
       yield {
         conversationId,
