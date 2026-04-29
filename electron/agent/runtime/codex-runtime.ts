@@ -52,6 +52,7 @@ type CodexClass = new (options?: {
     workingDirectory?: string;
     modelReasoningEffort?: string;
     approvalPolicy?: string;
+    skipGitRepoCheck?: boolean;
   }): ThreadInstance;
   resumeThread(id: string, options?: {
     model?: string;
@@ -59,6 +60,7 @@ type CodexClass = new (options?: {
     workingDirectory?: string;
     modelReasoningEffort?: string;
     approvalPolicy?: string;
+    skipGitRepoCheck?: boolean;
   }): ThreadInstance;
 };
 
@@ -194,6 +196,7 @@ export class CodexRuntime implements AgentRuntime {
       workingDirectory: cwd ?? process.cwd(),
       modelReasoningEffort: modelEffort,
       approvalPolicy,
+      skipGitRepoCheck: true,
     };
 
     // Resume or start new thread

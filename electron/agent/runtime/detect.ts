@@ -17,17 +17,29 @@
 
 import { execSync } from 'child_process';
 
-let _claudeCliAvailable: boolean | null = null;
-let _codexCliAvailable: boolean | null = null;
+let _claudeCliPath: string | false | null = null;
+let _codexCliPath: string | false | null = null;
 
 /**
  * Returns `true` when the `claude` CLI binary is found on PATH.
  * This is required for the Claude Agent SDK to function.
  */
 export async function detectClaudeAgentSdk(): Promise<boolean> {
-  if (_claudeCliAvailable !== null) return _claudeCliAvailable;
-  _claudeCliAvailable = isCliAvailable('claude');
-  return _claudeCliAvailable;
+  if (_claudeCliPath !== null) return _claudeCliPath !== false;
+  _claudeCliPath = resolveCliPath('claude');
+  return _claudeCliPath !== false;
+}
+
+/**
+ * Returns the absolute path to the `claude` CLI binary if found on PATH,
+ * or `undefined` if not found.  Used to pass `pathToClaudeCodeExecutable`
+ * to the SDK when its bundled binary is missing.
+ */
+export async function resolveClaudeCliPath(): Promise<string | undefined> {
+  if (_claudeCliPath === null) {
+    _claudeCliPath = resolveCliPath('claude');
+  }
+  return _claudeCliPath || undefined;
 }
 
 /**
@@ -35,9 +47,9 @@ export async function detectClaudeAgentSdk(): Promise<boolean> {
  * This is required for the Codex SDK to function.
  */
 export async function detectCodexSdk(): Promise<boolean> {
-  if (_codexCliAvailable !== null) return _codexCliAvailable;
-  _codexCliAvailable = isCliAvailable('codex');
-  return _codexCliAvailable;
+  if (_codexCliPath !== null) return _codexCliPath !== false;
+  _codexCliPath = resolveCliPath('codex');
+  return _codexCliPath !== false;
 }
 
 /**
@@ -45,8 +57,8 @@ export async function detectCodexSdk(): Promise<boolean> {
  * CLI binary while Kai is already running.
  */
 export function resetDetectionCache(): void {
-  _claudeCliAvailable = null;
-  _codexCliAvailable = null;
+  _claudeCliPath = null;
+  _codexCliPath = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,13 +66,14 @@ export function resetDetectionCache(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Check whether a CLI binary is available on PATH using `which` (macOS/Linux).
- * Returns `true` if found, `false` otherwise.
+ * Resolve the absolute path to a CLI binary on PATH using `which` (macOS/Linux).
+ * Returns the trimmed path string if found, or `false` if not found.
  */
-function isCliAvailable(binaryName: string): boolean {
+function resolveCliPath(binaryName: string): string | false {
   try {
-    execSync(`which ${binaryName}`, { stdio: 'pipe', timeout: 5_000 });
-    return true;
+    const result = execSync(`which ${binaryName}`, { stdio: 'pipe', timeout: 5_000 });
+    const resolved = result.toString().trim();
+    return resolved || false;
   } catch {
     return false;
   }

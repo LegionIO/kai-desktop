@@ -17,7 +17,7 @@
  */
 
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
-import { detectClaudeAgentSdk } from './detect.js';
+import { detectClaudeAgentSdk, resolveClaudeCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
 import { resolveStreamConfig } from '../model-catalog.js';
@@ -91,6 +91,7 @@ type SdkOptions = {
   persistSession?: boolean;
   env?: Record<string, string | undefined>;
   systemPrompt?: string | string[] | { type: 'preset'; preset: 'claude_code'; append?: string; excludeDynamicSections?: boolean };
+  pathToClaudeCodeExecutable?: string;
 };
 
 /**
@@ -264,6 +265,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // NOTE: Claude Code uses its own auth from ~/.claude/settings.json
     // (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.) so we don't pass env.
 
+    // Resolve the system-installed `claude` binary path as a fallback
+    // in case the SDK's bundled platform binary is missing (e.g. optional
+    // deps were omitted during install).
+    const claudeCliPath = await resolveClaudeCliPath();
+
     // Check if we have a prior SDK session for this conversation.
     // If so, pass `resume` so the SDK replays its stored history.
     const existingSessionId = this.sessionMap.get(conversationId);
@@ -310,6 +316,8 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         : { type: 'preset', preset: 'claude_code' },
       // Resume previous session for conversation continuity
       ...(existingSessionId ? { resume: existingSessionId } : {}),
+      // Fall back to system-installed CLI when bundled binary is missing
+      ...(claudeCliPath ? { pathToClaudeCodeExecutable: claudeCliPath } : {}),
     };
 
     // NOTE: fallbackModel is intentionally not passed — Claude Code manages
