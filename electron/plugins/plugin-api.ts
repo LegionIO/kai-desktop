@@ -1097,7 +1097,7 @@ export function createPluginAPI(
     fs: {
       resolveScopePath: (scope: ScopedDirectory, relativePath?: string): string => {
         requirePermission('fs:scoped-read');
-        const base = resolveScopeDirectory(scope, instance.dir);
+        const base = resolveScopeDirectory(scope);
         return relativePath ? join(base, relativePath) : base;
       },
 
@@ -1105,7 +1105,7 @@ export function createPluginAPI(
         requirePermission('fs:scoped-read');
         const fsScope = manifest.fsScope;
         if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) {
           writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:read', target: scopedPath, approved: false });
           return { success: false, path: scopedPath, error: 'Path outside declared scope' };
         }
@@ -1123,7 +1123,7 @@ export function createPluginAPI(
         const fsScope = manifest.fsScope;
         if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
         if (!fsScope.operations.includes('write')) return { success: false, path: scopedPath, error: 'Write not in declared operations' };
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) {
           writeAuditEntry({ timestamp: new Date().toISOString(), pluginName: manifest.name, action: 'fs:write', target: scopedPath, approved: false });
           return { success: false, path: scopedPath, error: 'Path outside declared scope' };
         }
@@ -1141,7 +1141,7 @@ export function createPluginAPI(
         requirePermission('fs:scoped-read');
         const fsScope = manifest.fsScope;
         if (!fsScope) return false;
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) return false;
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) return false;
         return existsSync(scopedPath);
       },
 
@@ -1149,7 +1149,7 @@ export function createPluginAPI(
         requirePermission('fs:scoped-write');
         const fsScope = manifest.fsScope;
         if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) {
           return { success: false, path: scopedPath, error: 'Path outside declared scope' };
         }
         try {
@@ -1165,7 +1165,7 @@ export function createPluginAPI(
         requirePermission('fs:scoped-read');
         const fsScope = manifest.fsScope;
         if (!fsScope) return { success: false as const, error: 'No fsScope declared in plugin.json' };
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) {
           return { success: false as const, error: 'Path outside declared scope' };
         }
         try {
@@ -1181,7 +1181,7 @@ export function createPluginAPI(
         const fsScope = manifest.fsScope;
         if (!fsScope) return { success: false, path: scopedPath, error: 'No fsScope declared in plugin.json' };
         if (!fsScope.operations.includes('remove')) return { success: false, path: scopedPath, error: 'Remove not in declared operations' };
-        if (!isPathWithinScope(scopedPath, fsScope.directories, instance.dir)) {
+        if (!isPathWithinScope(scopedPath, fsScope.directories)) {
           return { success: false, path: scopedPath, error: 'Path outside declared scope' };
         }
         try {

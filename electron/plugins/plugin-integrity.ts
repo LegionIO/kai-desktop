@@ -100,7 +100,7 @@ export function arePermissionSetsEqual(left: readonly string[] = [], right: read
 // ─── Scope Parsing Helpers ──────────────────────────────────────────────────
 
 const VALID_SCOPED_DIRECTORIES = new Set<string>([
-  'claude-home', 'codex-home', 'plugin-own', 'kai-home', 'otc-repo',
+  'claude-home', 'codex-home',
 ]);
 
 const VALID_FS_OPERATIONS = new Set<string>([

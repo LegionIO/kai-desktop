@@ -57,9 +57,6 @@ const PERMISSION_DESCRIPTIONS: Record<string, { label: string; icon: typeof Shie
 const SCOPE_LABELS: Record<string, string> = {
   'claude-home':  '~/.claude/',
   'codex-home':   '~/.codex/',
-  'plugin-own':   'Plugin directory',
-  'kai-home':     '~/.kai/',
-  'otc-repo':     'otc-awesome-llm repo',
 };
 
 const LEVEL_STYLES: Record<string, string> = {

@@ -110,7 +110,7 @@ export function installPluginAssets(
     const srcDir = join(pluginDir, mapping.src);
     if (!existsSync(srcDir)) continue;
 
-    const targetRoot = resolveScopeDirectory(mapping.target.scope, pluginDir);
+    const targetRoot = resolveScopeDirectory(mapping.target.scope);
     const targetDir = mapping.target.path
       ? join(targetRoot, mapping.target.path)
       : targetRoot;

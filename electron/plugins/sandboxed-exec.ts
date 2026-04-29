@@ -69,14 +69,11 @@ export const SAFE_ENV_VARS = new Set([
 /**
  * Resolve a ScopedDirectory token to an absolute path.
  */
-export function resolveScopeDirectory(scope: ScopedDirectory, pluginDir: string): string {
+export function resolveScopeDirectory(scope: ScopedDirectory): string {
   const home = homedir();
   switch (scope) {
     case 'claude-home': return join(home, '.claude');
     case 'codex-home':  return join(home, '.codex');
-    case 'plugin-own':  return pluginDir;
-    case 'kai-home':    return join(home, '.kai');
-    case 'otc-repo':    return join(home, 'Documents', 'kai', 'otc-awesome-llm');
     default:            throw new Error(`Unknown scope: ${scope}`);
   }
 }
@@ -88,7 +85,6 @@ export function resolveScopeDirectory(scope: ScopedDirectory, pluginDir: string)
 export function isPathWithinScope(
   targetPath: string,
   directories: ScopedDirectory[],
-  pluginDir: string,
 ): boolean {
   let resolvedTarget: string;
   try {
@@ -101,7 +97,7 @@ export function isPathWithinScope(
   }
 
   for (const scope of directories) {
-    const scopeRoot = resolveScopeDirectory(scope, pluginDir);
+    const scopeRoot = resolveScopeDirectory(scope);
     let resolvedRoot: string;
     try {
       resolvedRoot = existsSync(scopeRoot)

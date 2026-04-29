@@ -43,10 +43,7 @@ export type PluginApprovalRecord = {
 
 export type ScopedDirectory =
   | 'claude-home'   // ~/.claude/
-  | 'codex-home'    // ~/.codex/
-  | 'plugin-own'    // The plugin's own directory
-  | 'kai-home'      // ~/.kai/
-  | 'otc-repo';     // Configurable otc-awesome-llm checkout
+  | 'codex-home';   // ~/.codex/
 
 export type AllowedBinary =
   | 'claude'       // Claude Code CLI
