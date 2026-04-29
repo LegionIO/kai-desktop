@@ -25,13 +25,10 @@ export type PluginPermission =
   | 'agent:inference-provider'
   | 'safe-storage'
   | 'browser:window'
-  | 'fs:scoped-read'
-  | 'fs:scoped-write'
   | 'exec:whitelisted'
   | 'tools:detect'
   | 'system:env'
-  | 'audit:log'
-  | 'assets:install';
+  | 'audit:log';
 
 export type PluginApprovalRecord = {
   hash: string;
@@ -57,32 +54,9 @@ export type AllowedBinary =
   | 'git'          // Git CLI
   | 'bash';        // Bash (only for whitelisted scripts)
 
-export type FsScopeDeclaration = {
-  directories: ScopedDirectory[];
-  operations: ('read' | 'write' | 'mkdir' | 'exists' | 'readdir' | 'remove')[];
-};
-
 export type ExecScopeDeclaration = {
   binaries: AllowedBinary[];
   argPatterns?: Record<string, string[]>;
-};
-
-/* ── Asset Installation Declarations ── */
-
-export type AssetMapping = {
-  /** Source directory relative to the plugin's dist/output dir */
-  src: string;
-  /** Target scope + path — e.g. { scope: 'claude-home', path: 'commands' } */
-  target: { scope: ScopedDirectory; path: string };
-  /** Regex patterns for filenames to include (defaults to all files) */
-  include?: string[];
-  /** If true, overwrite existing files on install (default: false) */
-  overwrite?: boolean;
-};
-
-export type AssetDeclaration = {
-  /** Array of directory mappings from plugin source → external target */
-  mappings: AssetMapping[];
 };
 
 export type ExecRequest = {
@@ -111,17 +85,10 @@ export type ToolDetectionResult = {
   error?: string;
 };
 
-export type FsResult = {
-  success: boolean;
-  path: string;
-  error?: string;
-  data?: string;
-};
-
 export type AuditEntry = {
   timestamp: string;
   pluginName: string;
-  action: 'fs:read' | 'fs:write' | 'fs:mkdir' | 'fs:exists' | 'exec:run' | 'tools:detect';
+  action: 'exec:run' | 'tools:detect';
   target: string;
   args?: string[];
   exitCode?: number;
@@ -139,9 +106,7 @@ export type PluginManifest = {
   icon?: { lucide: string } | { svg: string };
   permissions: PluginPermission[];
   configSchema?: Record<string, unknown>;
-  fsScope?: FsScopeDeclaration;
   execScope?: ExecScopeDeclaration;
-  assets?: AssetDeclaration;
 };
 
 /* ── Plugin State ── */
@@ -179,7 +144,6 @@ export type PluginModule = {
   activate: (api: PluginAPI) => Promise<void> | void;
   deactivate?: () => Promise<void> | void;
   onConfigChanged?: (config: AppConfig) => void;
-  onUninstall?: () => Promise<void> | void;
 };
 
 /* ── Message Hooks ── */
@@ -516,19 +480,6 @@ export type PluginAPI = {
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
 
   fetch: typeof globalThis.fetch;
-
-  /* ── Scoped Filesystem ── */
-  fs: {
-    resolveScopePath: (scope: ScopedDirectory, relativePath?: string) => string;
-    readFile: (scopedPath: string) => Promise<FsResult>;
-    writeFile: (scopedPath: string, content: string) => Promise<FsResult>;
-    exists: (scopedPath: string) => Promise<boolean>;
-    mkdir: (scopedPath: string) => Promise<FsResult>;
-    readdir: (scopedPath: string) => Promise<{ success: boolean; entries?: string[]; error?: string }>;
-    remove: (scopedPath: string) => Promise<FsResult>;
-    readJson: <T = unknown>(scopedPath: string) => Promise<{ success: boolean; data?: T; error?: string }>;
-    writeJson: (scopedPath: string, data: unknown) => Promise<FsResult>;
-  };
 
   /* ── Whitelisted Command Execution ── */
   exec: {

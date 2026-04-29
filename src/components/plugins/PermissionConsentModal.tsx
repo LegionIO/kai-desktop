@@ -1,6 +1,6 @@
 import { type FC, useEffect, useState, useCallback } from 'react';
 import {
-  ShieldAlert, FileText, Terminal, Eye, FolderOpen, XIcon, CheckIcon,
+  ShieldAlert, FileText, Terminal, Eye, XIcon, CheckIcon,
   Settings, Wrench, Layout, Bell, Globe, Lock, MessageSquare, Bot,
   Compass, Database, MonitorSmartphone, Wifi, KeyRound, PanelLeft,
 } from 'lucide-react';
@@ -10,10 +10,6 @@ type ConsentRequest = {
   displayName: string;
   permissions: string[];
   dangerousPermissions: string[];
-  fsScope?: {
-    directories: string[];
-    operations: string[];
-  };
   execScope?: {
     binaries: string[];
     argPatterns?: Record<string, string[]>;
@@ -24,8 +20,6 @@ type ConsentRequest = {
 const PERMISSION_DESCRIPTIONS: Record<string, { label: string; icon: typeof ShieldAlert; level: 'low' | 'medium' | 'high' }> = {
   // ── Elevated (dangerous) ──
   'exec:whitelisted':        { label: 'Execute whitelisted CLI commands',        icon: Terminal,          level: 'high' },
-  'fs:scoped-write':         { label: 'Write files within declared directories', icon: FileText,          level: 'high' },
-  'fs:scoped-read':          { label: 'Read files within declared directories',  icon: Eye,               level: 'medium' },
   // ── Medium risk ──
   'messages:hook':           { label: 'Intercept messages before/after send',    icon: MessageSquare,     level: 'medium' },
   'network:fetch':           { label: 'Make network requests',                   icon: Globe,             level: 'medium' },
@@ -52,11 +46,6 @@ const PERMISSION_DESCRIPTIONS: Record<string, { label: string; icon: typeof Shie
   'navigation:open':         { label: 'Open navigation targets',                icon: Compass,           level: 'low' },
   'system:env':              { label: 'Read environment variables',              icon: Eye,               level: 'low' },
   'audit:log':               { label: 'Write to the audit log',                 icon: FileText,          level: 'low' },
-};
-
-const SCOPE_LABELS: Record<string, string> = {
-  'claude-home':  '~/.claude/',
-  'codex-home':   '~/.codex/',
 };
 
 const LEVEL_STYLES: Record<string, string> = {
@@ -205,26 +194,6 @@ export const PermissionConsentModal: FC = () => {
                   </div>
                 );
               })()}
-
-              {/* Filesystem Scope */}
-              {req.fsScope && (
-                <div className="space-y-1.5">
-                  <h3 className="text-xs font-semibold text-foreground flex items-center gap-1.5">
-                    <FolderOpen className="h-3.5 w-3.5" /> Directory Access
-                  </h3>
-                  <div className="rounded-md border p-2.5 space-y-1">
-                    {req.fsScope.directories.map((dir) => (
-                      <div key={dir} className="flex items-center gap-2 text-xs">
-                        <span className="text-muted-foreground">{SCOPE_LABELS[dir] ?? dir}</span>
-                        <span className="text-[10px] text-muted-foreground/60 font-mono">({dir})</span>
-                      </div>
-                    ))}
-                    <div className="mt-1 text-[10px] text-muted-foreground">
-                      Operations: {req.fsScope.operations.join(', ')}
-                    </div>
-                  </div>
-                </div>
-              )}
 
               {/* Exec Scope */}
               {req.execScope && (

@@ -14,7 +14,7 @@
  */
 
 import { spawn, execSync } from 'child_process';
-import { resolve, normalize, join, dirname } from 'path';
+import { resolve, normalize, join } from 'path';
 import { homedir } from 'os';
 import { existsSync, realpathSync } from 'fs';
 import type {
@@ -23,7 +23,6 @@ import type {
   ExecRequest,
   ExecResult,
   ExecScopeDeclaration,
-  FsScopeDeclaration,
   ToolDetectionResult,
   AuditEntry,
 } from './types.js';

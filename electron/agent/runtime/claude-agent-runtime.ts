@@ -258,19 +258,6 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       return;
     }
 
-    // Claude Code's CLI intercepts prompts starting with "/" as built-in
-    // slash commands (e.g. /help, /clear).  If the prompt starts with "/"
-    // but is NOT a recognised CLI command, the subprocess returns
-    // "Unknown command" instantly and never reaches the LLM.
-    //
-    // Rewrite slash-prefixed prompts into natural language so the LLM
-    // receives them.  The system prompt already contains routing
-    // instructions telling Claude which tool to invoke for each command.
-    if (prompt.startsWith('/')) {
-      const withoutSlash = prompt.slice(1);
-      prompt = `[Slash command: /${withoutSlash.split(/\s/)[0]}] ${withoutSlash}`;
-    }
-
     // -----------------------------------------------------------------------
     // 7. Start the query
     // -----------------------------------------------------------------------

@@ -39,7 +39,6 @@ import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
-import { installPluginAssets, uninstallPluginAssets } from './asset-manager.js';
 
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
@@ -165,8 +164,6 @@ export class PluginManager {
   /** Permissions that require explicit user consent via modal. */
   private static readonly DANGEROUS_PERMISSIONS: Set<PluginPermission> = new Set([
     'exec:whitelisted',
-    'fs:scoped-write',
-    'fs:scoped-read',
   ]);
 
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */
@@ -200,7 +197,6 @@ export class PluginManager {
         displayName: manifest.displayName,
         permissions: manifest.permissions,
         dangerousPermissions,
-        fsScope: manifest.fsScope,
         execScope: manifest.execScope,
         fileHash,
       });
@@ -412,18 +408,6 @@ export class PluginManager {
 
       if (typeof mod.activate === 'function') {
         await mod.activate(api);
-      }
-
-      // Install platform-managed assets declared in plugin.json
-      if (manifest.assets?.mappings?.length && manifest.permissions.includes('assets:install')) {
-        try {
-          const assetCount = installPluginAssets(manifest, dir);
-          if (assetCount > 0) {
-            console.info(`[PluginManager] Installed ${assetCount} asset(s) for "${manifest.name}"`);
-          }
-        } catch (err) {
-          console.warn(`[PluginManager] Asset install failed for "${manifest.name}":`, err);
-        }
       }
 
       // Check for frontend entry point at frontend.js
@@ -1002,29 +986,6 @@ export class PluginManager {
 
     if (this.brandRequiredPluginNamesSet.has(pluginName)) {
       throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
-    }
-
-    const instance = this.plugins.get(pluginName);
-
-    // Call onUninstall hook if the plugin provides one (before deactivation)
-    if (instance?.module?.onUninstall) {
-      try {
-        await instance.module.onUninstall();
-      } catch (err) {
-        console.warn(`[PluginManager] onUninstall hook failed for "${pluginName}":`, err);
-      }
-    }
-
-    // Remove platform-managed assets before the plugin directory is deleted
-    if (instance?.dir) {
-      try {
-        const removed = uninstallPluginAssets(instance.dir);
-        if (removed > 0) {
-          console.info(`[PluginManager] Removed ${removed} asset(s) for "${pluginName}"`);
-        }
-      } catch (err) {
-        console.warn(`[PluginManager] Asset cleanup failed for "${pluginName}":`, err);
-      }
     }
 
     await this.unloadPlugin(pluginName);

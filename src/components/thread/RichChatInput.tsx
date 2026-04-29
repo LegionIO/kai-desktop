@@ -42,8 +42,6 @@ type RichChatInputProps = {
   onCancel?: () => void;
   onArrowNavigate?: (direction: 'older' | 'newer', rawOffset: number) => boolean;
   onPaste?: (event: ClipboardEvent<HTMLElement>) => boolean | void;
-  /** Called before RichChatInput processes a keydown. Return true to suppress default handling. */
-  onKeyDownIntercept?: (event: KeyboardEvent<HTMLElement>) => boolean;
   placeholder?: string;
   className?: string;
   autoFocus?: boolean;
@@ -290,7 +288,6 @@ type EditableRunProps = {
   onCancel?: () => void;
   onArrowNavigate?: (direction: 'older' | 'newer', rawOffset: number) => boolean;
   onPaste?: (event: ClipboardEvent<HTMLElement>) => boolean | void;
-  onKeyDownIntercept?: (event: KeyboardEvent<HTMLElement>) => boolean;
   onBackspaceBeforeCode?: () => void;
   onDeleteAfterCode?: () => void;
   isBlockGap?: boolean;
@@ -341,7 +338,6 @@ const EditableRun: FC<EditableRunProps> = ({
   onCancel,
   onArrowNavigate,
   onPaste,
-  onKeyDownIntercept,
   onBackspaceBeforeCode,
   onDeleteAfterCode,
   isBlockGap,
@@ -407,8 +403,6 @@ const EditableRun: FC<EditableRunProps> = ({
   }, [onChangeText, syncDom]);
 
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLSpanElement>) => {
-    if (onKeyDownIntercept?.(event)) return;
-
     const el = editorRef.current;
     const localOffset = el ? saveCursorOffset(el) : 0;
     const rawOffset = segment.start + localOffset;
@@ -473,7 +467,7 @@ const EditableRun: FC<EditableRunProps> = ({
       event.preventDefault();
       document.execCommand('insertText', false, '  ');
     }
-  }, [currentText.length, handleInput, onArrowNavigate, onBackspaceBeforeCode, onCancel, onDeleteAfterCode, onKeyDownIntercept, onMoveIntoNextCode, onMoveIntoPreviousCode, onSubmit, segment.start]);
+  }, [currentText.length, handleInput, onArrowNavigate, onBackspaceBeforeCode, onCancel, onDeleteAfterCode, onMoveIntoNextCode, onMoveIntoPreviousCode, onSubmit, segment.start]);
 
   const handlePaste = useCallback((event: ClipboardEvent<HTMLSpanElement>) => {
     if (onPaste?.(event)) return;
@@ -518,7 +512,6 @@ export const RichChatInput: FC<RichChatInputProps> = ({
   onCancel,
   onArrowNavigate,
   onPaste,
-  onKeyDownIntercept,
   placeholder,
   className,
   autoFocus,
@@ -732,7 +725,6 @@ export const RichChatInput: FC<RichChatInputProps> = ({
             onCancel={onCancel}
             onArrowNavigate={onArrowNavigate}
             onPaste={onPaste}
-            onKeyDownIntercept={onKeyDownIntercept}
             onBackspaceBeforeCode={segment.type === 'text' && segment.start > 0 ? () => handleBackspaceBeforeCode(segment) : undefined}
             onDeleteAfterCode={segment.type === 'text' ? () => handleDeleteAfterCode(segment) : undefined}
             isBlockGap={
