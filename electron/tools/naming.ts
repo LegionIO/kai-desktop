@@ -2,6 +2,14 @@ import type { ToolDefinition, ToolSource } from './types.js';
 
 export const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
+/**
+ * Maximum length for tool names registered with the Claude Agent SDK.
+ * The SDK's MCP bridge prefixes tool names with `mcp__kai__` (10 chars),
+ * and APIs enforce a hard 64-char limit on tool names.
+ * 64 - 10 = 54 chars max for tool names we register.
+ */
+export const MAX_TOOL_NAME_LENGTH = 54;
+
 function sanitizeToolSegment(value: string, fallback = 'tool'): string {
   const normalized = value
     .normalize('NFKD')
@@ -29,10 +37,21 @@ export function buildScopedToolName(
 ): string {
   if (source === 'skill') return getScopedToolPrefix(source, scope);
 
-  return [
+  const full = [
     getScopedToolPrefix(source, scope).replace(/__$/, ''),
     sanitizeToolSegment(rawName ?? 'tool', 'tool'),
   ].join('__');
+
+  // Enforce the API tool name length limit.  Truncate and warn if exceeded.
+  if (full.length > MAX_TOOL_NAME_LENGTH) {
+    const truncated = full.slice(0, MAX_TOOL_NAME_LENGTH);
+    console.warn(
+      `[naming] Tool name exceeds ${MAX_TOOL_NAME_LENGTH}-char limit and was truncated: "${full}" → "${truncated}"`,
+    );
+    return truncated;
+  }
+
+  return full;
 }
 
 export function getScopedToolPrefix(

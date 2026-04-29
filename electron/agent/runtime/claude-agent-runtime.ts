@@ -20,6 +20,7 @@ import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } fr
 import { detectClaudeAgentSdk, resolveClaudeCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
+import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
@@ -192,10 +193,32 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     let mcpServers: Record<string, unknown> | undefined;
     if (bridgeableTools.length > 0) {
       try {
+        // The SDK wraps tool names with `mcp__<server>__` prefix.
+        // For the 'kai' server this adds `mcp__kai__` (10 chars).
+        // APIs enforce a hard 64-char limit on tool names.
+        // MAX_TOOL_NAME_LENGTH (54) already accounts for this prefix.
+        // Tool names should already be truncated at registration time
+        // (buildScopedToolName), but we enforce it here as a safety net.
+        const usedNames = new Set<string>();
+
         const sdkTools = bridgeableTools.map((t) => {
+          let safeName = t.name.length > MAX_TOOL_NAME_LENGTH
+            ? t.name.slice(0, MAX_TOOL_NAME_LENGTH)
+            : t.name;
+          // Resolve collisions from truncation by appending a counter
+          if (usedNames.has(safeName)) {
+            let counter = 2;
+            while (usedNames.has(`${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
+            safeName = `${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
+            debugLog(`[BRIDGE] Collision-resolved tool name: ${t.name} → ${safeName}`);
+          }
+          usedNames.add(safeName);
+          if (safeName !== t.name) {
+            debugLog(`[BRIDGE] Truncated tool name: ${t.name} → ${safeName}`);
+          }
           const rawShape = extractZodShape(t.inputSchema);
           return sdkTool(
-            t.name,
+            safeName,
             t.description ?? '',
             rawShape,
             createToolHandler(t, conversationId, cwd, abortSignal),
@@ -203,12 +226,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         });
 
         const kaiServer = sdkCreateMcpServer({
-          name: 'kai-tools',
+          name: 'kai',
           version: '1.0.0',
           tools: sdkTools,
         });
 
-        mcpServers = { 'kai-tools': kaiServer };
+        mcpServers = { 'kai': kaiServer };
         debugLog(`[BRIDGE] Created MCP bridge with ${sdkTools.length} tools: ${bridgeableTools.map((t) => t.name).join(', ')}`);
       } catch (bridgeErr) {
         debugLog(`[BRIDGE] Failed to create MCP bridge: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`);
@@ -507,7 +530,7 @@ function extractLastUserPrompt(messages: unknown[]): string | null {
  * Also strips MCP namespacing (mcp__server-name__tool → tool).
  */
 function normalizeToolName(name: string): string {
-  // Strip MCP prefix: mcp__kai-tools__enter_plan_mode → enter_plan_mode
+  // Strip MCP prefix: mcp__kai__enter_plan_mode → enter_plan_mode
   const withoutMcp = name.replace(/^mcp__[^_]+__/, '');
 
   // Convert PascalCase to snake_case

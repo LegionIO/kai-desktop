@@ -1354,6 +1354,22 @@ export function RuntimeProvider({
         summary?: string;
       };
 
+      // Debug: log every event received in renderer
+      const debugSummary = e.type === 'text-delta'
+        ? `text-delta len=${(e.text ?? '').length}`
+        : e.type === 'tool-call'
+          ? `tool-call id=${e.toolCallId} name=${e.toolName}`
+          : e.type === 'tool-result'
+            ? `tool-result id=${e.toolCallId}`
+            : e.type === 'done'
+              ? `done data=${JSON.stringify(e.data ?? null)}`
+              : e.type === 'error'
+                ? `error msg=${(e.error ?? '').slice(0, 100)}`
+                : e.type;
+      const isActive = e.conversationId === activeIdRef.current;
+      const hasAccumulator = streamAccumulators.has(e.conversationId);
+      console.warn(`[StreamEvent] conv=${e.conversationId.slice(0, 8)} ${debugSummary} isActive=${isActive} hasAccumulator=${hasAccumulator}`);
+
       // Route sub-agent events to global sub-agent state
       if (e.subAgentConversationId) {
         const saId = e.subAgentConversationId;
@@ -1462,10 +1478,12 @@ export function RuntimeProvider({
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
           const { tree: curTree, headId: curHead } = streamHandlerRef.current;
+          console.warn(`[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`);
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
         } else {
           // No accumulator for a non-active conversation — the stream already
           // completed and was persisted by the done/error handler.  Drop stale events.
+          console.warn(`[StreamEvent] DROPPING event for non-active conv=${convId.slice(0, 8)} type=${e.type} activeConv=${activeIdRef.current?.slice(0, 8) ?? 'none'}`);
           return;
         }
       }
@@ -1725,6 +1743,7 @@ export function RuntimeProvider({
           }
         }
       } else if (e.type === 'error') {
+        console.warn(`[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`);
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         finalizeAssistantResponse(acc);
         const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
@@ -1739,6 +1758,7 @@ export function RuntimeProvider({
         }
         return;
       } else if (e.type === 'done') {
+        console.warn(`[StreamEvent] DONE conv=${convId.slice(0, 8)} accMsgCount=${acc.messages.length} awaitingApproval=${acc.awaitingApproval ?? false} isActive=${isActiveConv} data=${JSON.stringify(e.data ?? null)}`);
         // Plan-mode transitions (accept, reject, dismiss) send a done event while
         // a tool is still awaiting approval.  Clear the flag so the normal done
         // path can clean up or restart the stream correctly.
@@ -1819,6 +1839,7 @@ export function RuntimeProvider({
               }
             }, 100);
           } else {
+            console.warn(`[StreamEvent] DONE setting isRunning=false for conv=${convId.slice(0, 8)}`);
             setIsRunning(false);
           }
         }

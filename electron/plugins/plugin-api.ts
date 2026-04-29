@@ -45,7 +45,7 @@ import {
 import { writeAuditEntry } from './audit-log.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
-import { buildScopedToolName, getScopedToolPrefix } from '../tools/naming.js';
+import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 
@@ -288,12 +288,24 @@ export function createPluginAPI(
     tools: {
       register: (tools: ToolDefinition[]) => {
         requirePermission('tools:register');
+        const seenNames = new Set<string>();
         const prefixed = tools.map((tool) => normalizePluginTool(tool)).map((tool) => {
           const originalName = resolvePluginToolOriginalName(manifest.name, tool);
+          let scopedName = buildScopedToolName('plugin', manifest.name, originalName);
+
+          // buildScopedToolName already truncates to MAX_TOOL_NAME_LENGTH, but
+          // truncation can cause collisions.  Append a counter to resolve.
+          if (seenNames.has(scopedName)) {
+            let counter = 2;
+            while (seenNames.has(`${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
+            scopedName = `${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
+            console.warn(`[plugin:${manifest.name}] Tool name collision after truncation, resolved: ${originalName} → ${scopedName}`);
+          }
+          seenNames.add(scopedName);
 
           return {
             ...tool,
-            name: buildScopedToolName('plugin', manifest.name, originalName),
+            name: scopedName,
             source: 'plugin' as const,
             sourceId: manifest.name,
             originalName,
