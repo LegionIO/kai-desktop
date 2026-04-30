@@ -73,7 +73,7 @@ export const ComputerSettingsButton: FC<{
         </div>
 
         {/* Right segment: monitor icon — toggles computer use on/off */}
-        <Tooltip content={toggled ? 'Disable autopilot' : 'Enable autopilot mode'} side="top" sideOffset={8}>
+        <Tooltip content={toggled ? 'Disable autopilot' : 'Autopilot mode'} side="top" sideOffset={8}>
           <button
             type="button"
             onClick={onToggle}

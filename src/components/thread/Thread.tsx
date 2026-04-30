@@ -609,7 +609,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
             )}
 
             {/* Action buttons — always anchored right, never move */}
-            <div className="flex shrink-0 items-start gap-0.5 px-2 py-1.5">
+            <div className="flex shrink-0 items-center gap-0.5 px-2 py-2">
               <button
                 type="button"
                 onClick={() => setExpanded((e) => !e)}
@@ -1686,7 +1686,7 @@ const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef
         <Tooltip
           content={
             <span className="flex items-center gap-2">
-              {holdToRecord ? 'Press and hold to record' : 'Click to start/stop dictation'}
+              {holdToRecord ? 'Press and hold to record' : 'Voice dictation'}
               <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
             </span>
           }
@@ -1810,7 +1810,7 @@ const CallButton: FC = () => {
   }, [startCall]);
 
   return (
-    <Tooltip content="Start voice call" side="top" sideOffset={8}>
+    <Tooltip content="Voice call" side="top" sideOffset={8}>
       <button
         type="button"
         onClick={handleClick}
@@ -2189,7 +2189,7 @@ const Composer: FC<{
                           : 'border-border/50 bg-muted/40'
                       }`}>
                         {/* Left segment: folder icon — opens picker */}
-                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Set working directory'} side="top" sideOffset={8}>
+                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Working directory'} side="top" sideOffset={8}>
                           <button
                             type="button"
                             onClick={() => { void handleAttachDirectory(); }}
@@ -2276,20 +2276,22 @@ const Composer: FC<{
                   {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
                   <CallButton />
                   <ThreadPrimitive.If running={false}>
-                    <button
-                      type="button"
-                      onClick={handleSend}
-                      disabled={!canSend || isStartingComputerSession}
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
-                    >
-                      {isStartingComputerSession ? (
-                        <LoaderIcon className="h-4 w-4 animate-spin" />
-                      ) : computerUseToggled ? (
-                        <MonitorIcon className="h-4 w-4" />
-                      ) : (
-                        <SendHorizontalIcon className="h-4 w-4" />
-                      )}
-                    </button>
+                    <Tooltip content="Send message" side="top" sideOffset={8}>
+                      <button
+                        type="button"
+                        onClick={handleSend}
+                        disabled={!canSend || isStartingComputerSession}
+                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                      >
+                        {isStartingComputerSession ? (
+                          <LoaderIcon className="h-4 w-4 animate-spin" />
+                        ) : computerUseToggled ? (
+                          <MonitorIcon className="h-4 w-4" />
+                        ) : (
+                          <SendHorizontalIcon className="h-4 w-4" />
+                        )}
+                      </button>
+                    </Tooltip>
                   </ThreadPrimitive.If>
                   <ThreadPrimitive.If running>
                     <StopButton />
