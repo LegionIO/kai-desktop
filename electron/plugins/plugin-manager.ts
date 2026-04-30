@@ -661,13 +661,26 @@ export class PluginManager {
   }
 
   async runPreSendHooks(args: PreSendHookArgs): Promise<PreSendHookResult> {
-    let result: PreSendHookResult = { messages: args.messages };
+    let result: PreSendHookResult = {
+      messages: args.messages,
+      systemPrompt: args.systemPrompt,
+    };
 
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
       for (const hook of instance.preSendHooks) {
         try {
-          result = await hook({ ...args, messages: result.messages });
+          const hookResult = await hook({
+            ...args,
+            messages: result.messages,
+            systemPrompt: result.systemPrompt,
+          });
+          result = {
+            messages: hookResult.messages ?? result.messages,
+            systemPrompt: hookResult.systemPrompt ?? result.systemPrompt,
+            abort: hookResult.abort,
+            abortReason: hookResult.abortReason,
+          };
           if (result.abort) return result;
         } catch (err) {
           console.error(`[PluginManager] Pre-send hook error in "${instance.manifest.name}":`, err);

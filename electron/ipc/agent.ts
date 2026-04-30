@@ -36,6 +36,7 @@ import {
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
 import { recordUsageEvent } from './usage.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
+import type { HookMessage } from '../plugins/types.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
@@ -346,13 +347,54 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { conversationId };
     }
 
-    const streamConfig = resolveStreamConfig(config, {
+    let streamConfig = resolveStreamConfig(config, {
       threadModelKey: modelKey ?? null,
       threadProfileKey: profileKey ?? null,
       reasoningEffort,
       fallbackEnabled: fallbackEnabled ?? false,
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
+    let effectiveSystemPrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
+
+    // Inject execution mode before plugin hooks so prompt/message middleware sees
+    // the same mode that the runtime will use.
+    const configWithExecutionMode: AppConfig = {
+      ...config,
+      tools: {
+        ...config.tools,
+        executionMode: effectiveExecutionMode,
+      },
+    };
+
+    if (pluginManager) {
+      const hookResult = await pluginManager.runPreSendHooks({
+        messages: messages as HookMessage[],
+        modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+        config: configWithExecutionMode,
+        systemPrompt: effectiveSystemPrompt,
+      });
+
+      if (hookResult.abort) {
+        broadcastStreamEvent({
+          conversationId,
+          type: 'error',
+          error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
+        });
+        broadcastStreamEvent({ conversationId, type: 'done' });
+        activeStreams.delete(conversationId);
+        activeStreamModelKeys.delete(conversationId);
+        activeObserverSessions.delete(conversationId);
+        return { conversationId };
+      }
+
+      messages = hookResult.messages;
+      if (typeof hookResult.systemPrompt === 'string') {
+        effectiveSystemPrompt = hookResult.systemPrompt;
+        if (streamConfig) {
+          streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
+        }
+      }
+    }
 
     // Resolve runtime early to access capabilities for middleware gating
     const runtime = await resolveRuntime(config);
@@ -389,7 +431,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             conversationId,
             messages: messages as Array<{ role: string; content: unknown }>,
             modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
-            systemPrompt: streamConfig?.systemPrompt ?? config.systemPrompt ?? '',
+            systemPrompt: effectiveSystemPrompt,
             reasoningEffort,
             abortSignal: controller.signal,
           });
@@ -1041,15 +1083,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // NOTE: Workspace tool filtering is handled in createWorkspaceForAgent().
         // Custom tools are filtered here so planning cannot mutate app state and
         // implementation cannot fall back to asking more questions or re-planning.
-
-        // Inject execution mode into config so system prompt can be augmented
-        const configWithExecutionMode: AppConfig = {
-          ...config,
-          tools: {
-            ...config.tools,
-            executionMode: effectiveExecutionMode,
-          },
-        };
 
         const stream = runtime.stream({
           conversationId,

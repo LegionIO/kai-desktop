@@ -34,6 +34,7 @@ const providerSchema = z.object({
   roleArn: z.string().optional(),
   useDefaultCredentials: z.boolean().optional(),
   extraHeaders: z.record(z.string(), z.string()).optional(),
+  providerTools: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 
 const modelEntrySchema = z.object({
@@ -44,6 +45,7 @@ const modelEntrySchema = z.object({
   deploymentName: z.string().optional(),
   maxInputTokens: z.number().positive().optional(),
   useResponsesApi: z.boolean().optional(),
+  providerTools: z.array(z.record(z.string(), z.unknown())).optional(),
   computerUseSupport: computerUseSupportSchema.optional(),
   visionCapable: z.boolean().optional(),
   preferredTarget: computerUseTargetSchema.optional(),

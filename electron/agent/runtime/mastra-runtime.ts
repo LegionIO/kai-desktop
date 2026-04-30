@@ -99,6 +99,10 @@ export class MastraRuntime implements AgentRuntime {
     const configForStream: AppConfig = {
       ...config,
       systemPrompt: assembledPrompt,
+      systemPrompts: {
+        ...config.systemPrompts,
+        chat: assembledPrompt,
+      },
       advanced: {
         ...config.advanced,
         temperature: streamConfig.temperature,

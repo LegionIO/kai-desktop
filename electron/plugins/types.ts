@@ -164,10 +164,12 @@ export type PreSendHookArgs = {
   messages: HookMessage[];
   modelKey: string;
   config: AppConfig;
+  systemPrompt?: string;
 };
 
 export type PreSendHookResult = {
   messages: HookMessage[];
+  systemPrompt?: string;
   abort?: boolean;
   abortReason?: string;
 };

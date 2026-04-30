@@ -2,6 +2,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { ComputerUseSupport, ComputerUseTarget } from '../../shared/computer-use.js';
 
 export type LLMProviderType = 'openai-compatible' | 'anthropic' | 'amazon-bedrock' | 'google';
+export type ProviderToolConfig = Record<string, unknown>;
 
 export type LLMModelConfig = {
   provider: LLMProviderType;
@@ -19,6 +20,7 @@ export type LLMModelConfig = {
   maxInputTokens?: number;
   useResponsesApi?: boolean;
   extraHeaders?: Record<string, string>;
+  providerTools?: ProviderToolConfig[];
   temperature: number;
   maxSteps?: number;
   maxRetries?: number;
@@ -32,6 +34,16 @@ export type ModelCatalogEntry = {
   visionCapable?: boolean;
   preferredTarget?: ComputerUseTarget;
 };
+
+function normalizeProviderTools(
+  ...toolSets: Array<ProviderToolConfig[] | undefined>
+): ProviderToolConfig[] | undefined {
+  const tools = toolSets
+    .flatMap((toolSet) => toolSet ?? [])
+    .filter((tool): tool is ProviderToolConfig => tool != null && typeof tool === 'object' && !Array.isArray(tool));
+
+  return tools.length > 0 ? tools : undefined;
+}
 
 export function resolveModelCatalog(config: AppConfig): {
   entries: ModelCatalogEntry[];
@@ -62,6 +74,7 @@ export function resolveModelCatalog(config: AppConfig): {
       deploymentName: model.deploymentName,
       modelName: model.modelName,
       maxInputTokens: model.maxInputTokens,
+      providerTools: normalizeProviderTools(providerConfig.providerTools, model.providerTools),
       temperature: config.advanced.temperature,
       maxSteps: config.advanced.maxSteps,
       maxRetries: config.advanced.maxRetries,

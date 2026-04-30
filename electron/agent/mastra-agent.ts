@@ -3,6 +3,8 @@ import { createTool } from '@mastra/core/tools';
 import { Workspace, LocalFilesystem, LocalSandbox, createWorkspaceTools, WORKSPACE_TOOLS } from '@mastra/core/workspace';
 import type { BackgroundProcessConfig } from '@mastra/core/workspace';
 import { toStandardSchema as toJsonStandardSchema } from '@mastra/schema-compat/adapters/json-schema';
+import { openai as openaiProvider } from '@ai-sdk/openai';
+import { anthropic as anthropicProvider } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import { homedir } from 'os';
 import { isAbsolute, resolve as resolvePath } from 'path';
@@ -255,9 +257,7 @@ function buildProviderOptions(
   }
 
   // Anthropic (direct or Bedrock with Claude models): map reasoning effort to thinking config
-  const isAnthropic =
-    modelConfig.provider === 'anthropic' ||
-    (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName));
+  const isAnthropic = isAnthropicProviderModel(modelConfig);
 
   if (isAnthropic && reasoningEffort) {
     const thinkingByEffort: Record<ReasoningEffort, Record<string, unknown>> = {
@@ -270,6 +270,187 @@ function buildProviderOptions(
   }
 
   return undefined;
+}
+
+function compactToolArgs<T extends Record<string, unknown>>(args: T): T {
+  return Object.fromEntries(
+    Object.entries(args).filter(([, value]) => value !== undefined),
+  ) as T;
+}
+
+function getStringOption(tool: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = tool[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
+function getNumberOption(tool: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = tool[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function getBooleanOption(tool: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = tool[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
+
+function getStringArrayOption(tool: Record<string, unknown>, ...keys: string[]): string[] | undefined {
+  for (const key of keys) {
+    const value = tool[key];
+    if (Array.isArray(value)) {
+      const strings = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+      if (strings.length > 0) return strings;
+    }
+  }
+  return undefined;
+}
+
+function getRecordOption(tool: Record<string, unknown>, ...keys: string[]): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const value = tool[key];
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+function normalizeSearchContextSize(value?: string): 'low' | 'medium' | 'high' | undefined {
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  return undefined;
+}
+
+function normalizeApproximateLocation(value?: Record<string, unknown>): {
+  type: 'approximate';
+  country?: string;
+  city?: string;
+  region?: string;
+  timezone?: string;
+} | undefined {
+  if (!value) return undefined;
+  const type = value.type === 'approximate' ? 'approximate' : undefined;
+  if (!type) return undefined;
+
+  const location: {
+    type: 'approximate';
+    country?: string;
+    city?: string;
+    region?: string;
+    timezone?: string;
+  } = { type };
+  const country = getStringOption(value, 'country');
+  const city = getStringOption(value, 'city');
+  const region = getStringOption(value, 'region');
+  const timezone = getStringOption(value, 'timezone');
+
+  if (country) location.country = country;
+  if (city) location.city = city;
+  if (region) location.region = region;
+  if (timezone) location.timezone = timezone;
+
+  return location;
+}
+
+function normalizeOpenAIWebSearchFilters(value?: Record<string, unknown>): { allowedDomains?: string[] } | undefined {
+  if (!value) return undefined;
+  const allowedDomains = getStringArrayOption(value, 'allowedDomains', 'allowed_domains');
+  return allowedDomains ? { allowedDomains } : undefined;
+}
+
+function normalizeProviderToolType(tool: Record<string, unknown>): string | undefined {
+  const rawType = getStringOption(tool, 'type');
+  if (!rawType) return undefined;
+  const normalized = rawType.toLowerCase();
+  return normalized.includes('.') ? normalized.split('.').pop() : normalized;
+}
+
+function providerToolName(tool: Record<string, unknown>, fallbackName: string): string {
+  return getStringOption(tool, 'name') ?? fallbackName;
+}
+
+function createOpenAIProviderTool(tool: Record<string, unknown>) {
+  const type = normalizeProviderToolType(tool);
+  if (type === 'web_search') {
+    const filters = normalizeOpenAIWebSearchFilters(getRecordOption(tool, 'filters'));
+    return {
+      name: providerToolName(tool, 'web_search'),
+      tool: openaiProvider.tools.webSearch(compactToolArgs({
+        externalWebAccess: getBooleanOption(tool, 'externalWebAccess', 'external_web_access'),
+        filters,
+        searchContextSize: normalizeSearchContextSize(getStringOption(tool, 'searchContextSize', 'search_context_size')),
+        userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
+      })),
+    };
+  }
+
+  if (type === 'web_search_preview') {
+    return {
+      name: providerToolName(tool, 'web_search_preview'),
+      tool: openaiProvider.tools.webSearchPreview(compactToolArgs({
+        searchContextSize: normalizeSearchContextSize(getStringOption(tool, 'searchContextSize', 'search_context_size')),
+        userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
+      })),
+    };
+  }
+
+  return null;
+}
+
+function createAnthropicProviderTool(tool: Record<string, unknown>) {
+  const type = normalizeProviderToolType(tool);
+  const args = compactToolArgs({
+    maxUses: getNumberOption(tool, 'maxUses', 'max_uses'),
+    allowedDomains: getStringArrayOption(tool, 'allowedDomains', 'allowed_domains'),
+    blockedDomains: getStringArrayOption(tool, 'blockedDomains', 'blocked_domains'),
+    userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
+  });
+
+  if (type === 'web_search' || type === 'web_search_20260209') {
+    return {
+      name: providerToolName(tool, 'web_search'),
+      tool: anthropicProvider.tools.webSearch_20260209(args),
+    };
+  }
+
+  if (type === 'web_search_20250305') {
+    return {
+      name: providerToolName(tool, 'web_search'),
+      tool: anthropicProvider.tools.webSearch_20250305(args),
+    };
+  }
+
+  return null;
+}
+
+function isAnthropicProviderModel(modelConfig: LLMModelConfig): boolean {
+  return modelConfig.provider === 'anthropic'
+    || (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName));
+}
+
+function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const configuredTool of modelConfig.providerTools ?? []) {
+    if (!configuredTool || typeof configuredTool !== 'object' || Array.isArray(configuredTool)) continue;
+
+    const providerTool = modelConfig.provider === 'openai-compatible' && shouldUseOpenAIResponsesApi(modelConfig)
+      ? createOpenAIProviderTool(configuredTool)
+      : isAnthropicProviderModel(modelConfig)
+        ? createAnthropicProviderTool(configuredTool)
+        : null;
+
+    if (providerTool) {
+      result[providerTool.name] = providerTool.tool;
+    }
+  }
+  return result;
 }
 
 function buildMastraMemoryOptions(
@@ -523,9 +704,10 @@ export async function* streamAgentResponse(
     onToolExecutionEnd: options?.onToolExecutionEnd,
     augmentToolResult: options?.augmentToolResult,
   }, { cwd: effectiveCwd });
+  const providerDefinedTools = buildProviderDefinedTools(modelConfig);
 
   // Merge: workspace tools (native Mastra) + custom tools (bridged)
-  const allTools = { ...mastraCustomTools, ...workspaceTools };
+  const allTools = { ...mastraCustomTools, ...providerDefinedTools, ...workspaceTools };
 
   const buildAgent = async (activeModelConfig: LLMModelConfig): Promise<Agent> => {
     const model = await createLanguageModelFromConfig(activeModelConfig);
