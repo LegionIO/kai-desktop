@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PuzzleIcon, XIcon, CompassIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon } from 'lucide-react';
+import { SearchIcon, PuzzleIcon, XIcon, PackageSearchIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
@@ -231,8 +231,8 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
             activeView === 'marketplace' && 'bg-primary/10 text-primary',
           )}
         >
-          <CompassIcon className="h-4 w-4 text-primary" />
-          Browse Plugins
+          <PackageSearchIcon className="h-4 w-4 text-primary" />
+          Explore Plugins
         </button>
       </div>
 

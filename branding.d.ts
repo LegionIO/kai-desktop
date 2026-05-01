@@ -20,6 +20,7 @@ declare const __BRAND_DROP_ZONE_TEXT: string;
 declare const __BRAND_ERROR_BOUNDARY_TEXT: string;
 declare const __BRAND_SIDEBAR_SECTION_THREADS: string;
 declare const __BRAND_SIDEBAR_SECTION_PLUGINS: string;
+declare const __BRAND_SIDEBAR_SECTION_TASKS: string;
 
 // ── Protocol & machine IDs ────────────────────────────────────────────────
 declare const __BRAND_MEDIA_PROTOCOL: string;

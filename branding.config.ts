@@ -45,6 +45,8 @@ export const branding = {
   sidebarSectionThreads: 'Chats',
   /** Sidebar section label for the plugins/extensions tab. */
   sidebarSectionPlugins: 'Plugins',
+  /** Sidebar section label for the tasks/kanban tab. */
+  sidebarSectionTasks: 'Tasks',
 
   // ── Protocol & machine IDs ────────────────────────────────────────────
   /** Custom Electron protocol scheme for serving generated media (e.g. "kai-media://"). */

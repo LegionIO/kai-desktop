@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
+import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, MessageSquarePlusIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { EditableInput } from '@/components/EditableInput';
@@ -383,7 +383,7 @@ export const ConversationList: FC<ConversationListProps> = ({
             isNewChat && 'bg-primary/10 text-primary',
           )}
         >
-          <PlusIcon className="h-4 w-4 text-primary" />
+          <MessageSquarePlusIcon className="h-4 w-4 text-primary" />
           New Chat
         </button>
       </div>

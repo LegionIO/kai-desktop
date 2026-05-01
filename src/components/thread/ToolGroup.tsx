@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, type FC } from 'react';
+import { useState, useCallback, useEffect, useMemo, type FC } from 'react';
 import { CodeBlock } from './CodeBlock';
 import { MarkdownText } from './MarkdownText';
 import { ElapsedBadge } from './ElapsedBadge';
@@ -27,6 +27,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
+import { useTasksOptional } from '@/providers/TaskProvider';
 import { refocusComposer } from '@/lib/utils';
 
 type ToolCallPart = {
@@ -62,23 +63,32 @@ type ToolCallPart = {
   approvalId?: string;
 };
 
-export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: string) => void }> = ({ parts, onSendFeedback }) => {
+export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ parts, onSendFeedback, onPlanApproved }) => {
   if (parts.length === 0) return null;
 
   return (
     <div className="my-2 space-y-1.5">
       {parts.map((part) => (
-        <ToolCallDisplay key={part.toolCallId} part={part} onSendFeedback={onSendFeedback} />
+        <ToolCallDisplay key={part.toolCallId} part={part} onSendFeedback={onSendFeedback} onPlanApproved={onPlanApproved} />
       ))}
     </div>
   );
 };
 
-export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void }> = ({ part, onSendFeedback }) => {
+export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ part, onSendFeedback, onPlanApproved }) => {
   const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
+  const [createdTaskIdLocal, setCreatedTaskIdLocal] = useState<string | null>(null);
+  const tasksCtx = useTasksOptional();
+  // Derive createdTaskId from the tasks list (survives remount) or fall back to local state
+  const createdTaskId = useMemo(() => {
+    if (createdTaskIdLocal) return createdTaskIdLocal;
+    if (!tasksCtx || part.toolName !== 'exit_plan_mode') return null;
+    const match = tasksCtx.state.tasks.find((t) => t.sourceToolCallId === part.toolCallId);
+    return match?.id ?? null;
+  }, [createdTaskIdLocal, tasksCtx, part.toolName, part.toolCallId]);
   const planPanelCtx = usePlanPanel();
   const onOpenPlan = planPanelCtx?.openPlan;
   const hasResult = part.result !== undefined;
@@ -108,11 +118,23 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       ? String((part.result as Record<string, unknown>).planName)
       : null;
 
-  const handleApprove = useCallback(() => {
+  const handleApprove = useCallback(async () => {
     setLocalApproval('approved');
     void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
+    // Bridge: create a kanban task from approved plan
+    if (isPlanApproval && planContent) {
+      const task = await onPlanApproved?.({
+        title: planArgs?.planTitle ? String(planArgs.planTitle) : 'Untitled Plan',
+        description: planContent,
+        planFileName: planFileName ?? undefined,
+        toolCallId: part.toolCallId,
+      });
+      if (task?.id) {
+        setCreatedTaskIdLocal(task.id);
+      }
+    }
     refocusComposer();
-  }, [part.toolCallId, part.approvalId]);
+  }, [part.toolCallId, part.approvalId, isPlanApproval, planContent, planArgs?.planTitle, planFileName, onPlanApproved]);
 
   const handleReject = useCallback(() => {
     setLocalApproval('rejected');
@@ -203,6 +225,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           onFeedbackSubmit={handleFeedbackSubmit}
           onOpenPlan={onOpenPlan}
           showFeedback={Boolean(onSendFeedback)}
+          createdTaskId={createdTaskId}
+          hasResult={hasResult}
+          isError={isError}
         />
       )}
       {/* Fallback: plan approval without planContent (legacy/edge case) */}
@@ -547,11 +572,20 @@ const PlanApprovalCard: FC<{
   onFeedbackSubmit: () => void;
   onOpenPlan?: (content: string, filePath?: string) => void;
   showFeedback: boolean;
-}> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onDismiss, onFeedbackSubmit, onOpenPlan, showFeedback }) => {
+  createdTaskId?: string | null;
+  hasResult: boolean;
+  isError: boolean;
+}> = ({ planContent, planFileName, isPendingApproval, approvalStatus, feedbackText, onFeedbackChange, onApprove, onReject, onDismiss, onFeedbackSubmit, onOpenPlan, showFeedback, createdTaskId, hasResult, isError }) => {
 
   const handleOpenPlan = useCallback(() => {
     onOpenPlan?.(planContent, planFileName ?? undefined);
   }, [planContent, planFileName, onOpenPlan]);
+
+  const handleViewTask = useCallback(() => {
+    if (createdTaskId) {
+      window.dispatchEvent(new CustomEvent('kai:open-task', { detail: { taskId: createdTaskId } }));
+    }
+  }, [createdTaskId]);
 
   useEffect(() => {
     if (!isPendingApproval) return;
@@ -638,11 +672,23 @@ const PlanApprovalCard: FC<{
         </>
       )}
 
-      {/* Post-approval states */}
-      {approvalStatus === 'approved' && (
+      {/* Post-approval states — show "accepted" when explicitly approved OR when the tool
+          completed successfully (has a result and no error), which means it was approved in a
+          prior session even if approvalStatus wasn't persisted as 'approved'. */}
+      {(approvalStatus === 'approved' || (hasResult && !isError)) && (
         <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
-          <span>Plan accepted — implementing</span>
+          <span>Plan accepted — added to Task Board</span>
+          {createdTaskId && (
+            <button
+              type="button"
+              onClick={handleViewTask}
+              className="ml-1 inline-flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors underline underline-offset-2"
+            >
+              View Task
+              <ExternalLinkIcon className="h-3 w-3" />
+            </button>
+          )}
         </div>
       )}
       {approvalStatus === 'rejected' && (

@@ -40,7 +40,10 @@ import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface 
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
+import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
+import { KanbanBoard } from '@/components/tasks/KanbanBoard';
+import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -49,7 +52,9 @@ export default function App() {
       <ConfigProvider>
         <PluginProvider>
           <ComputerUseProvider>
-            <AppRoot />
+            <TaskProvider>
+              <AppRoot />
+            </TaskProvider>
           </ComputerUseProvider>
         </PluginProvider>
       </ConfigProvider>
@@ -347,6 +352,7 @@ const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
 const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
+const TASKS_VIEW = 'tasks';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function isPluginView(view: string): boolean {
@@ -439,6 +445,13 @@ function AppShell() {
   const [pluginTitleMenuOpen, setPluginTitleMenuOpen] = useState(false);
   const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
+  const [taskTitleMenuOpen, setTaskTitleMenuOpen] = useState(false);
+  const [renamingTask, setRenamingTask] = useState(false);
+  const [taskRenameValue, setTaskRenameValue] = useState('');
+  const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
+  const [pinnedTaskIds, setPinnedTaskIds] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]')); } catch { return new Set(); }
+  });
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>('threads');
@@ -921,6 +934,56 @@ function AppShell() {
     return () => window.removeEventListener('plugin-navigate', handler);
   }, [handleSwitchConversation]);
 
+  // Handle "View Task" links from chat — navigate to task board and open the task modal
+  const tasksCtx = useTasksOptional();
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { taskId } = (e as CustomEvent<{ taskId: string }>).detail;
+      if (taskId) {
+        setSidebarSection('tasks');
+        setActiveView(TASKS_VIEW);
+        tasksCtx?.selectTask(taskId);
+      }
+    };
+    window.addEventListener('kai:open-task', handler);
+    return () => window.removeEventListener('kai:open-task', handler);
+  }, [tasksCtx]);
+
+  // Sync pinned-tasks from other components (sidebar context menu, etc.)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      try { setPinnedTaskIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+    };
+    window.addEventListener('pinned-tasks-changed', handler);
+    return () => window.removeEventListener('pinned-tasks-changed', handler);
+  }, []);
+
+  const toggleTaskPin = useCallback((id: string) => {
+    const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]';
+    let ids: string[];
+    try { ids = JSON.parse(raw); } catch { ids = []; }
+    const set = new Set(ids);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    const serialized = JSON.stringify([...set]);
+    localStorage.setItem(__BRAND_APP_SLUG + ':pinned-tasks', serialized);
+    setPinnedTaskIds(set);
+    window.dispatchEvent(new CustomEvent('pinned-tasks-changed', { detail: serialized }));
+  }, []);
+
+  const handleTaskRename = useCallback(async (taskId: string, newTitle: string) => {
+    if (!tasksCtx || !newTitle.trim()) return;
+    await tasksCtx.updateTask(taskId, { title: newTitle.trim() });
+    setRenamingTask(false);
+  }, [tasksCtx]);
+
+  const handleTaskDelete = useCallback(async (taskId: string) => {
+    if (!tasksCtx) return;
+    await tasksCtx.deleteTask(taskId);
+    tasksCtx.selectTask(null);
+    setConfirmingTaskDelete(false);
+  }, [tasksCtx]);
+
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
   const activePluginPanel = useMemo(() => {
     // First try to match a real panel descriptor
@@ -1163,6 +1226,64 @@ function AppShell() {
           </div>,
           document.body,
         )}
+        {renamingTask && tasksCtx?.state.selectedTaskId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTask(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
+              <input
+                ref={renameInputRef}
+                value={taskRenameValue}
+                onChange={(e) => setTaskRenameValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue); if (e.key === 'Escape') setRenamingTask(false); }}
+                className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRenamingTask(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
+                  className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+        {confirmingTaskDelete && tasksCtx?.state.selectedTaskId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingTaskDelete(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
+              <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this task? This cannot be undone.</p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmingTaskDelete(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void handleTaskDelete(tasksCtx.state.selectedTaskId!); }}
+                  className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
         <div className="relative flex h-screen overflow-hidden text-foreground">
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
@@ -1216,6 +1337,8 @@ function AppShell() {
                     setActiveView(lastPluginViewRef.current);
                   } else if (section === 'threads') {
                     setActiveView(CHAT_VIEW);
+                  } else if (section === 'tasks') {
+                    setActiveView(TASKS_VIEW);
                   }
                 }}
               />
@@ -1249,6 +1372,16 @@ function AppShell() {
                     />
                   </div>
                 </>
+              )}
+
+              {sidebarSection === 'tasks' && (
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  <TaskSidebarList
+                    onSelectTask={() => {
+                      setActiveView(TASKS_VIEW);
+                    }}
+                  />
+                </div>
               )}
 
               <UpdateCard />
@@ -1286,7 +1419,7 @@ function AppShell() {
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <UpdateCard />
             {/* Interactive title bar */}
-            <div className={`${titleMenuOpen || pluginTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+            <div className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
@@ -1305,6 +1438,56 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
                 ) : activeView === PLUGINS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                ) : activeView === TASKS_VIEW ? (
+                  (() => {
+                    const selectedTaskId = tasksCtx?.state.selectedTaskId;
+                    const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
+                    if (selectedTask) {
+                      return (
+                        <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
+                          <DropdownMenu.Trigger asChild>
+                            <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                              <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                {selectedTask.title}
+                              </span>
+                              <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                            </button>
+                          </DropdownMenu.Trigger>
+                          <DropdownMenu.Portal>
+                            <DropdownMenu.Content
+                              align="start"
+                              sideOffset={4}
+                              className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                            >
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                onSelect={() => toggleTaskPin(selectedTask.id)}
+                              >
+                                <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
+                              </DropdownMenu.Item>
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                onSelect={() => { setTaskRenameValue(selectedTask.title); setRenamingTask(true); }}
+                              >
+                                <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                <span>Rename</span>
+                              </DropdownMenu.Item>
+                              <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                onSelect={() => setConfirmingTaskDelete(true)}
+                              >
+                                <Trash2Icon className="h-4 w-4" />
+                                <span>Delete</span>
+                              </DropdownMenu.Item>
+                            </DropdownMenu.Content>
+                          </DropdownMenu.Portal>
+                        </DropdownMenu.Root>
+                      );
+                    }
+                    return <span className="text-sm font-medium text-foreground">Task Board</span>;
+                  })()
                 ) : activeErrorPluginName ? (
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
@@ -1496,6 +1679,10 @@ function AppShell() {
               ) : activePluginPanel ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
+                </div>
+              ) : activeView === TASKS_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <KanbanBoard />
                 </div>
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>

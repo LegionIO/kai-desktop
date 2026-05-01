@@ -25,6 +25,8 @@ import { CodexRuntime } from './agent/runtime/codex-runtime.js';
 import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
+import { registerTaskHandlers } from './ipc/tasks.js';
+import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
 import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
@@ -632,6 +634,9 @@ if (gotSingleInstanceLock) {
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
+    registerTaskHandlers(ipcMain, APP_HOME);
+    const taskTerminalManager = new TaskTerminalManager();
+    registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;

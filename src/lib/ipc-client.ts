@@ -150,6 +150,22 @@ type AppAPI = {
   plans: {
     readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
   };
+  tasks: {
+    list: () => Promise<unknown[]>;
+    get: (id: string) => Promise<unknown>;
+    create: (taskData: unknown) => Promise<unknown>;
+    update: (id: string, updates: unknown) => Promise<unknown>;
+    delete: (id: string) => Promise<{ ok: boolean }>;
+    getOrder: () => Promise<unknown>;
+    saveOrder: (order: unknown) => Promise<{ ok: boolean }>;
+    onChanged: (callback: (tasks: unknown[]) => void) => () => void;
+    terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => Promise<{ sessionId?: string; error?: string }>;
+    terminalWrite: (sessionId: string, data: string) => Promise<void>;
+    terminalResize: (sessionId: string, cols: number, rows: number) => Promise<void>;
+    terminalKill: (sessionId: string) => Promise<{ ok: boolean }>;
+    onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
+    onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
+  };
   platform: {
     homedir: () => Promise<string>;
   };

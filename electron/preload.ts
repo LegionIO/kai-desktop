@@ -252,6 +252,40 @@ const appAPI = {
     readFile: (filename: string) => ipcRenderer.invoke('plans:read-file', filename) as Promise<{ content?: string; error?: string }>,
   },
 
+  tasks: {
+    list: () => ipcRenderer.invoke('tasks:list'),
+    get: (id: string) => ipcRenderer.invoke('tasks:get', id),
+    create: (taskData: unknown) => ipcRenderer.invoke('tasks:create', taskData),
+    update: (id: string, updates: unknown) => ipcRenderer.invoke('tasks:update', id, updates),
+    delete: (id: string) => ipcRenderer.invoke('tasks:delete', id),
+    getOrder: () => ipcRenderer.invoke('tasks:get-order'),
+    saveOrder: (order: unknown) => ipcRenderer.invoke('tasks:save-order', order),
+    onChanged: (callback: (tasks: unknown[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, tasks: unknown[]) => callback(tasks);
+      ipcRenderer.on('tasks:changed', handler);
+      return () => ipcRenderer.removeListener('tasks:changed', handler);
+    },
+    // Terminal methods
+    terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) =>
+      ipcRenderer.invoke('tasks:terminal-create', taskId, options) as Promise<{ sessionId?: string; error?: string }>,
+    terminalWrite: (sessionId: string, data: string) =>
+      ipcRenderer.invoke('tasks:terminal-write', sessionId, data),
+    terminalResize: (sessionId: string, cols: number, rows: number) =>
+      ipcRenderer.invoke('tasks:terminal-resize', sessionId, cols, rows),
+    terminalKill: (sessionId: string) =>
+      ipcRenderer.invoke('tasks:terminal-kill', sessionId) as Promise<{ ok: boolean }>,
+    onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { sessionId: string; data: string }) => callback(data);
+      ipcRenderer.on('tasks:terminal-data', handler);
+      return () => ipcRenderer.removeListener('tasks:terminal-data', handler);
+    },
+    onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { sessionId: string; exitCode: number }) => callback(data);
+      ipcRenderer.on('tasks:terminal-exit', handler);
+      return () => ipcRenderer.removeListener('tasks:terminal-exit', handler);
+    },
+  },
+
   computerUse: {
     startSession: (goal: string, options: unknown) => ipcRenderer.invoke('computer-use:start-session', goal, options),
     pauseSession: (sessionId: string) => ipcRenderer.invoke('computer-use:pause-session', sessionId),

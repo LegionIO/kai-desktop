@@ -74,6 +74,7 @@ import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
+import { useTasksOptional } from '@/providers/TaskProvider';
 
 export type ThreadMode = 'chat' | 'computer';
 
@@ -898,6 +899,18 @@ const ToolFallback: FC<{
         ? 'bg-red-500'
         : 'bg-emerald-500';
 
+  // Bridge: create kanban task when a plan is approved
+  const taskCtx = useTasksOptional();
+  const handlePlanApproved = useCallback(async (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => {
+    const task = await taskCtx?.createTaskFromPlan({
+      title: data.title,
+      description: data.description,
+      planFileName: data.planFileName,
+      sourceToolCallId: data.toolCallId,
+    });
+    return task ?? null;
+  }, [taskCtx]);
+
   const threadRuntime = useThreadRuntime();
   const handleSendFeedback = useCallback((text: string) => {
     threadRuntime.append({
@@ -944,6 +957,7 @@ const ToolFallback: FC<{
           approvalId: props.approvalId,
         }}
         onSendFeedback={handleSendFeedback}
+        onPlanApproved={handlePlanApproved}
       />
     </div>
   );
@@ -1208,7 +1222,7 @@ const AssistantMessage: FC = () => {
                 startedAt={badgeStartedAt}
                 finishedAt={badgeFinishedAt}
                 durationMs={badgeDurationMs}
-                isRunning={isRunning}
+                isRunning={isRunning && !isAwaitingInput}
               />
             </span>
           )}
