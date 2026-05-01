@@ -3,7 +3,7 @@ import { ExternalLinkIcon, LoaderIcon, MonitorIcon, MaximizeIcon } from 'lucide-
 import { useConfig } from '@/providers/ConfigProvider';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { app } from '@/lib/ipc-client';
-import { ModelSettingsButton } from './ModelSettingsButton';
+import { ChatSettingsButton } from './ChatSettingsButton';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { PermissionChecklist } from './PermissionChecklist';
@@ -35,13 +35,13 @@ type ComputerSetupPanelProps = {
 export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   conversationId,
   selectedModelKey,
-  onSelectModel,
+  onSelectModel: _onSelectModel,
   reasoningEffort,
   onChangeReasoningEffort,
   selectedProfileKey,
-  onSelectProfile,
+  onSelectProfile: _onSelectProfile,
   fallbackEnabled,
-  onToggleFallback,
+  onToggleFallback: _onToggleFallback,
   startSurface = 'docked',
   activeComputerSession,
   onOpenPopout,
@@ -337,20 +337,9 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           onToggle={() => {}}
         />
 
-        <ModelSettingsButton
-          selectedModelKey={selectedModelKey}
-          onSelectModel={onSelectModel}
+        <ChatSettingsButton
           reasoningEffort={reasoningEffort}
           onChangeReasoningEffort={onChangeReasoningEffort}
-          fallbackEnabled={fallbackEnabled}
-          onToggleFallback={onToggleFallback}
-          selectedProfileKey={selectedProfileKey}
-          onSelectProfile={onSelectProfile}
-          filter={(model) => Boolean(
-            (model.computerUseSupport && model.computerUseSupport !== 'none')
-            || model.visionCapable,
-          )}
-          fallbackToUnfilteredWhenEmpty
         />
 
         {renderDictation?.({ getText: getGoalText, setText: setGoalText, isDictating, onDictatingChange: setIsDictating })}

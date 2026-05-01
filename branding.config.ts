@@ -35,8 +35,6 @@ export const branding = {
   // ── User-facing strings ───────────────────────────────────────────────
   /** Name used in the default system prompt: "You are {assistantName}, a powerful…" */
   assistantName: '{{productName}}',
-  /** Placeholder inside the message composer. */
-  composerPlaceholder: 'How can I help you today?',
   /** Text shown in the file drop zone overlay. */
   dropZoneText: 'Drop files for {{productName}}',
   /** Heading shown in the error boundary fallback UI. */

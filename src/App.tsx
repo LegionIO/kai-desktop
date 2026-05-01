@@ -32,7 +32,7 @@ import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
 import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
-import type { ExecutionMode } from '@/components/thread/ModelSettingsButton';
+import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
@@ -44,6 +44,7 @@ import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
 import { KanbanBoard } from '@/components/tasks/KanbanBoard';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
+import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -449,6 +450,7 @@ function AppShell() {
   const [renamingTask, setRenamingTask] = useState(false);
   const [taskRenameValue, setTaskRenameValue] = useState('');
   const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
   const [pinnedTaskIds, setPinnedTaskIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]')); } catch { return new Set(); }
   });
@@ -1378,6 +1380,12 @@ function AppShell() {
                 <div className="min-h-0 flex-1 overflow-y-auto">
                   <TaskSidebarList
                     onSelectTask={() => {
+                      setIsCreatingTask(false);
+                      setActiveView(TASKS_VIEW);
+                    }}
+                    onCreateTask={() => {
+                      tasksCtx?.selectTask(null);
+                      setIsCreatingTask(true);
                       setActiveView(TASKS_VIEW);
                     }}
                   />
@@ -1440,6 +1448,9 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Installed Plugins</span>
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
+                    if (isCreatingTask) {
+                      return null;
+                    }
                     const selectedTaskId = tasksCtx?.state.selectedTaskId;
                     const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
                     if (selectedTask) {
@@ -1681,9 +1692,21 @@ function AppShell() {
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
                 </div>
               ) : activeView === TASKS_VIEW ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <KanbanBoard />
-                </div>
+                isCreatingTask ? (
+                  <TaskCreationView
+                    onDone={(taskId) => {
+                      setIsCreatingTask(false);
+                      tasksCtx?.selectTask(taskId);
+                    }}
+                    onCancel={() => {
+                      setIsCreatingTask(false);
+                    }}
+                  />
+                ) : (
+                  <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                    <KanbanBoard />
+                  </div>
+                )
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                   <div className="flex h-full min-h-0">

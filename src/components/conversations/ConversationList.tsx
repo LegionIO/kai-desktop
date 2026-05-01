@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, MessageSquarePlusIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
-import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import type { ComputerSession } from '../../../shared/computer-use';
@@ -460,11 +459,12 @@ export const ConversationList: FC<ConversationListProps> = ({
       <div className="px-3 pb-3">
         <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/60 bg-sidebar-accent/50 px-3 py-2">
           <SearchIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-          <EditableInput
+          <input
+            type="text"
             placeholder="Search..."
             value={searchQuery}
-            onChange={setSearchQuery}
-            className="flex-1 bg-transparent text-xs"
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 bg-transparent text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none"
           />
           {searchQuery && (
             <button
@@ -576,9 +576,10 @@ export const ConversationList: FC<ConversationListProps> = ({
         })()}
 
         {processedConversations.length === 0 && (
-          <p className="text-xs text-muted-foreground p-3 text-center">
-            {searchQuery || hasActiveFilters ? 'No matching chats' : 'No chats yet'}
-          </p>
+          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
+            <MessageSquareIcon className="h-6 w-6 opacity-40" />
+            <span>{searchQuery || hasActiveFilters ? 'No chats match your search' : 'No chats yet'}</span>
+          </div>
         )}
       </div>
 

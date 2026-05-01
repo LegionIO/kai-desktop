@@ -3,7 +3,47 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import type { TaskFile, KaiTaskOrder } from '../../shared/task-types.js';
+import type { TaskFile, KaiTaskOrder, TaskConversationMessage } from '../../shared/task-types.js';
+import type { AppConfig } from '../config/schema.js';
+
+// ── Task plan streaming types ─────────────────────────────────────────────
+
+export type TaskStreamEvent = {
+  taskId: string;
+  type: 'text-delta' | 'done' | 'error';
+  text?: string;
+  error?: string;
+};
+
+const TASK_PLAN_SYSTEM_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
+
+Write the plan as clear, actionable markdown with this structure:
+
+## Objective
+One sentence summarizing the goal.
+
+## Steps
+1. First step — specific and actionable
+2. Second step — with enough detail to execute
+3. Continue as needed...
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Any additional context, risks, or dependencies.
+
+Rules:
+- Be specific and actionable, not vague
+- Include technical details where relevant
+- Use markdown checkboxes for criteria
+- Keep the plan concise but complete
+- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
+- Always output the complete updated plan, never just a diff or partial update`;
+
+/** Active plan generation streams, keyed by taskId. */
+const activeTaskStreams = new Map<string, { abort: () => void }>();
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -21,6 +61,12 @@ function broadcastTaskChange(appHome: string): void {
     }
   } catch (err) {
     console.error('[tasks] Failed to broadcast task change:', err);
+  }
+}
+
+function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('tasks:stream-event', event);
   }
 }
 
@@ -148,6 +194,177 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     } catch (err) {
       console.error('[tasks] Failed to save order:', err);
       return { error: String(err) };
+    }
+  });
+
+  // ── AI plan streaming ───────────────────────────────────────────────
+
+  ipcMain.handle(
+    'tasks:stream-plan',
+    async (
+      _e,
+      taskId: string,
+      userMessage: string,
+      existingHistory?: TaskConversationMessage[],
+    ) => {
+      // Cancel any existing stream for this task
+      const existing = activeTaskStreams.get(taskId);
+      if (existing) existing.abort();
+
+      const controller = new AbortController();
+      activeTaskStreams.set(taskId, { abort: () => controller.abort() });
+
+      // Resolve config and model
+      let config: AppConfig;
+      try {
+        const { readEffectiveConfig } = await import('./config.js');
+        config = readEffectiveConfig(appHome);
+      } catch {
+        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Failed to load config' });
+        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        activeTaskStreams.delete(taskId);
+        return { taskId };
+      }
+
+      const { resolveModelCatalog } = await import('../agent/model-catalog.js');
+      const catalog = resolveModelCatalog(config);
+      // Prefer a fast/cheap model (Haiku) for plan generation
+      const haikuModel = catalog.entries.find((e) =>
+        e.modelConfig.modelName.toLowerCase().includes('haiku'),
+      );
+      const modelEntry = haikuModel ?? catalog.defaultEntry;
+      if (!modelEntry) {
+        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No model configured' });
+        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        activeTaskStreams.delete(taskId);
+        return { taskId };
+      }
+
+      // Build conversation messages
+      const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      if (existingHistory) {
+        for (const msg of existingHistory) {
+          messages.push({ role: msg.role, content: msg.content });
+        }
+      }
+      messages.push({ role: 'user', content: userMessage });
+
+      // Stream in background (handler returns immediately)
+      void (async () => {
+        try {
+          const { streamText } = await import('ai');
+          const { createLanguageModelFromConfig } = await import('../agent/language-model.js');
+          const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
+
+          const result = streamText({
+            model,
+            system: TASK_PLAN_SYSTEM_PROMPT,
+            messages,
+            abortSignal: controller.signal,
+          });
+
+          let fullText = '';
+          for await (const textPart of (await result).textStream) {
+            if (controller.signal.aborted) break;
+            fullText += textPart;
+            broadcastTaskStreamEvent({ taskId, type: 'text-delta', text: textPart });
+          }
+
+          // Persist final description to task file
+          if (fullText && !controller.signal.aborted) {
+            const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+            if (existsSync(filePath)) {
+              const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+              const newHistory: TaskConversationMessage[] = [
+                ...(existingHistory ?? []),
+                { role: 'user', content: userMessage, timestamp: new Date().toISOString() },
+                { role: 'assistant', content: fullText, timestamp: new Date().toISOString() },
+              ];
+              const updated: TaskFile = {
+                ...task,
+                description: fullText,
+                conversationHistory: newHistory,
+                updatedAt: new Date().toISOString(),
+              };
+              writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+              broadcastTaskChange(appHome);
+            }
+          }
+
+          broadcastTaskStreamEvent({ taskId, type: 'done' });
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            broadcastTaskStreamEvent({
+              taskId,
+              type: 'error',
+              error: error instanceof Error ? error.message : String(error),
+            });
+            broadcastTaskStreamEvent({ taskId, type: 'done' });
+          }
+        } finally {
+          activeTaskStreams.delete(taskId);
+        }
+      })();
+
+      return { taskId };
+    },
+  );
+
+  ipcMain.handle('tasks:cancel-stream', (_e, taskId: string) => {
+    const stream = activeTaskStreams.get(taskId);
+    if (stream) {
+      stream.abort();
+      activeTaskStreams.delete(taskId);
+    }
+    return { ok: true };
+  });
+
+  // ── AI title generation ─────────────────────────────────────────────
+
+  ipcMain.handle('tasks:generate-title', async (_e, userMessage: string) => {
+    let config: AppConfig;
+    try {
+      const { readEffectiveConfig } = await import('./config.js');
+      config = readEffectiveConfig(appHome);
+    } catch {
+      return { title: null };
+    }
+
+    const { resolveModelCatalog } = await import('../agent/model-catalog.js');
+    const catalog = resolveModelCatalog(config);
+    const haikuModel = catalog.entries.find((e) =>
+      e.modelConfig.modelName.toLowerCase().includes('haiku'),
+    );
+    const modelEntry = haikuModel ?? catalog.defaultEntry;
+    if (!modelEntry) return { title: null };
+
+    try {
+      const { Agent } = await import('@mastra/core/agent');
+      const { createLanguageModelFromConfig } = await import('../agent/language-model.js');
+      const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
+      type AgentConfig = ConstructorParameters<typeof Agent>[0];
+
+      const agent = new Agent({
+        id: `task-title-gen-${Date.now()}`,
+        name: 'task-title-generator',
+        instructions: [
+          'Generate a concise task title using at most 6 words.',
+          'Summarize what needs to be done, not how.',
+          'Use imperative form (e.g. "Add user auth", "Fix sidebar overflow").',
+          'Return only the title text with no quotes or formatting.',
+        ].join(' '),
+        model: model as AgentConfig['model'],
+      });
+
+      const result = await agent.generate(userMessage, { maxSteps: 1 });
+      const rawTitle = typeof result.text === 'string' ? result.text : null;
+      if (!rawTitle) return { title: null };
+      const cleaned = rawTitle.trim().replace(/^["']|["']$/g, '').replace(/\s+/g, ' ');
+      const title = cleaned.split(/\s+/).slice(0, 6).join(' ').slice(0, 80);
+      return { title: title || null };
+    } catch (error) {
+      console.error('[tasks] Title generation failed:', error);
+      return { title: null };
     }
   });
 }

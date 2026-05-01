@@ -165,6 +165,11 @@ type AppAPI = {
     terminalKill: (sessionId: string) => Promise<{ ok: boolean }>;
     onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
     onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
+    // AI plan generation
+    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) => Promise<{ taskId: string }>;
+    cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
+    generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
+    onStreamEvent: (callback: (event: unknown) => void) => () => void;
   };
   platform: {
     homedir: () => Promise<string>;

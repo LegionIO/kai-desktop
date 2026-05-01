@@ -15,7 +15,6 @@ declare const __BRAND_DESCRIPTION: string;
 
 // ── User-facing strings ───────────────────────────────────────────────────
 declare const __BRAND_ASSISTANT_NAME: string;
-declare const __BRAND_COMPOSER_PLACEHOLDER: string;
 declare const __BRAND_DROP_ZONE_TEXT: string;
 declare const __BRAND_ERROR_BOUNDARY_TEXT: string;
 declare const __BRAND_SIDEBAR_SECTION_THREADS: string;

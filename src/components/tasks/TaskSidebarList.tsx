@@ -48,10 +48,13 @@ const PIN_EVENT = 'pinned-tasks-changed';
 
 interface TaskSidebarListProps {
   onSelectTask?: (taskId: string) => void;
+  /** When provided, "Create Task" opens the AI creation view instead of the dialog. */
+  onCreateTask?: () => void;
 }
 
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
+  onCreateTask,
 }) => {
   const { state, selectTask, deleteTask } = useTasks();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -179,7 +182,13 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
       <div className="border-b border-sidebar-border/70 px-4 py-3">
         <button
           type="button"
-          onClick={() => setCreateDialogOpen(true)}
+          onClick={() => {
+            if (onCreateTask) {
+              onCreateTask();
+            } else {
+              setCreateDialogOpen(true);
+            }
+          }}
           className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80"
         >
           <ClipboardPlusIcon className="h-4 w-4 text-primary" />
@@ -216,15 +225,15 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search..."
-            className="flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground outline-none"
+            className="flex-1 bg-transparent text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none"
           />
           {searchQuery && (
             <button
               type="button"
               onClick={() => setSearchQuery('')}
-              className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+              className="shrink-0 p-0.5 rounded hover:bg-sidebar-accent transition-colors"
             >
-              <XIcon className="h-3 w-3" />
+              <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           )}
         </div>
@@ -300,16 +309,9 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         ))}
 
         {sortedTasks.length === 0 && (
-          <div className="flex flex-col items-center py-8 text-muted-foreground/40">
-            {searchQuery ? (
-              <p className="text-xs text-muted-foreground text-center">No matching tasks</p>
-            ) : (
-              <>
-                <CircleDotIcon className="mb-2 h-6 w-6" />
-                <p className="text-xs">No tasks yet</p>
-                <p className="mt-0.5 text-[10px]">Accept a plan to create one</p>
-              </>
-            )}
+          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
+            <CircleDotIcon className="h-6 w-6 opacity-40" />
+            <span>{searchQuery ? 'No tasks match your search' : 'No tasks yet'}</span>
           </div>
         )}
       </div>

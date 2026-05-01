@@ -26,10 +26,7 @@ import {
 
   Volume2Icon,
   SquareIcon,
-  MicIcon,
-  PointerIcon,
   ChevronUpIcon,
-  PhoneIcon,
   MonitorIcon,
   FolderOpenIcon,
   ImageIcon,
@@ -44,12 +41,10 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useAssistantResponseTiming, useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
-import { isDictationSupportedForProvider, createUnifiedDictationAdapter, type DictationSession, type AudioProvider } from '@/lib/audio/speech-adapters';
-import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { ElapsedBadge } from './ElapsedBadge';
-import { backgrounds } from '@/components/backgrounds';
+import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
@@ -57,10 +52,11 @@ import type { PipelineEnrichments } from './PipelineInsights';
 import { TokenUsage } from './TokenUsage';
 import { ComposerInput } from './ComposerInput';
 import { RichChatInput } from './RichChatInput';
-import { DeviceRow } from './DeviceRow';
+import { DictationButton } from './DictationButton';
+import { CallButton } from './CallButton';
 import { SearchBar } from './SearchBar';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
-import { ModelSettingsButton } from './ModelSettingsButton';
+import { ChatSettingsButton } from './ChatSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
@@ -69,7 +65,7 @@ import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
-import type { ExecutionMode } from './ModelSettingsButton';
+import type { ExecutionMode } from './ChatSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
 import { getResponseTiming } from '@/lib/response-timing';
@@ -98,10 +94,20 @@ export const Thread: FC<{
   const activeConversationId = useActiveConversationId();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
+  // Track whether the splash should hide instantly (loading existing thread)
+  // vs fade out gradually (user just sent first message in new thread).
+  const [splashInstantHide, setSplashInstantHide] = useState(false);
   useEffect(() => {
     return threadRuntime.subscribe(() => {
-      setHasMessages(threadRuntime.getState().messages.length > 0);
+      const count = threadRuntime.getState().messages.length;
+      setHasMessages(count > 0);
+      if (count > 1) setSplashInstantHide(true);
     });
+  }, [threadRuntime]);
+  // Reset instant-hide flag when switching to an empty thread
+  useEffect(() => {
+    const count = threadRuntime.getState().messages.length;
+    if (count === 0) setSplashInstantHide(false);
   }, [threadRuntime]);
 
 
@@ -113,9 +119,7 @@ export const Thread: FC<{
 
   return (
     <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col">
-      <FadingSplash>
-        <EmptyThreadBackground />
-      </FadingSplash>
+      <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
       <div
         className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
         style={{
@@ -424,44 +428,6 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
   );
 };
 
-/** Pick a random background, never repeating the last one shown */
-function pickBackground(): FC {
-  const lastIndex = parseInt(sessionStorage.getItem('__bg_last_index') ?? '-1', 10);
-  const available = backgrounds.length > 1
-    ? backgrounds.filter((_, i) => i !== lastIndex)
-    : backgrounds;
-  return available[Math.floor(Math.random() * available.length)];
-}
-
-/**
- * Randomly selected background for the empty thread state.
- * Never repeats the same background consecutively.
- *
- * Background is selected once on mount via useState initializer.
- * FadingSplash unmounts children when fading out (visible=false),
- * so each new empty thread triggers a fresh mount and a new pick.
- *
- * The last-shown index is persisted in sessionStorage so it survives
- * HMR and component remounts. The write happens in a useEffect (not during
- * pick) to avoid React StrictMode double-invocation issues.
- */
-const EmptyThreadBackground: FC = () => {
-  const [Background] = useState<FC>(() => pickBackground());
-
-  // Persist which background is displayed — useEffect only commits once,
-  // unlike useState initializers which StrictMode may call twice.
-  useEffect(() => {
-    const idx = backgrounds.indexOf(Background);
-    if (idx !== -1) sessionStorage.setItem('__bg_last_index', String(idx));
-  }, [Background]);
-
-  return (
-    <div className="absolute inset-0">
-      <Background />
-    </div>
-  );
-};
-
 /**
  * Pinned user message — sticks to the top of the viewport when the user
  * scrolls past their last message, so they always know what they asked.
@@ -630,93 +596,6 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
             </div>
           </div>
         </div>
-      </div>
-    </div>
-  );
-};
-
-/**
- * Wrapper that fades the splash IN (500ms) when the thread is empty,
- * then fades it OUT (300ms) when the first message is sent.
- *
- * When `visible` is false, children are unmounted (returned null).
- * This means EmptyThreadBackground remounts on each new empty thread,
- * triggering a fresh pickBackground() via its useState initializer.
- */
-const FadingSplash: FC<PropsWithChildren> = ({ children }) => {
-  const threadRuntime = useThreadRuntime();
-  const [visible, setVisible] = useState(true);
-  const [fadingOut, setFadingOut] = useState(false);
-  const [fadedIn, setFadedIn] = useState(false);
-  const fadingOutRef = useRef(false);
-
-  // Reset visibility when threadRuntime identity changes (thread switch)
-  useEffect(() => {
-    const msgs = threadRuntime.getState().messages;
-    if (msgs.length === 0) {
-      setVisible(true);
-      setFadingOut(false);
-      fadingOutRef.current = false;
-      setFadedIn(false);
-      // Double RAF: first frame paints at opacity:0, second frame triggers the transition
-      requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
-    } else {
-      setVisible(false);
-      setFadingOut(true);
-      fadingOutRef.current = true;
-    }
-  }, [threadRuntime]);
-
-  // Subscribe to message changes — fade out when messages appear,
-  // fade in when messages go back to empty.
-  useEffect(() => {
-    return threadRuntime.subscribe(() => {
-      const msgs = threadRuntime.getState().messages;
-      if (msgs.length > 0 && !fadingOutRef.current) {
-        // When loading an existing thread (many messages appear at once),
-        // hide the splash instantly to avoid a visible overlay during the
-        // scroll-to-bottom positioning. Only use the gradual fade when a
-        // single message is sent in a new conversation.
-        if (msgs.length > 1) {
-          setVisible(false);
-          setFadingOut(false);
-          fadingOutRef.current = true;
-        } else {
-          setFadingOut(true);
-          fadingOutRef.current = true;
-        }
-      } else if (msgs.length === 0) {
-        setVisible(true);
-        setFadingOut(false);
-        fadingOutRef.current = false;
-        setFadedIn(false);
-        requestAnimationFrame(() => requestAnimationFrame(() => setFadedIn(true)));
-      }
-    });
-  }, [threadRuntime]);
-
-  // Unmount children after fade-out completes
-  useEffect(() => {
-    if (!fadingOut) return;
-    const timer = setTimeout(() => setVisible(false), 300);
-    return () => clearTimeout(timer);
-  }, [fadingOut]);
-
-  if (!visible) return null;
-
-  return (
-    <div
-      className="absolute inset-0 -top-28 z-10 transition-opacity ease-out md:-top-[8.5rem]"
-      style={{
-        opacity: fadingOut ? 0 : fadedIn ? 1 : 0,
-        transitionDuration: fadingOut ? '300ms' : '2000ms',
-      }}
-    >
-      <div
-        className="relative h-full w-full"
-        style={{ maskImage: 'linear-gradient(to right, transparent, black 8%)' }}
-      >
-        {children}
       </div>
     </div>
   );
@@ -1389,453 +1268,6 @@ const StopButton: FC = () => {
   );
 };
 
-interface DictationButtonProps {
-  onListeningChange?: (listening: boolean) => void;
-  startRef?: React.RefObject<(() => void) | null>;
-  stopRef?: React.RefObject<(() => void) | null>;
-  getText?: () => string;
-  setText?: (text: string) => void;
-}
-
-const DictationButton: FC<DictationButtonProps> = ({ onListeningChange, startRef, stopRef, getText: externalGetText, setText: externalSetText }) => {
-  const composerRuntime = useComposerRuntime();
-  const getTextFn = useCallback(() => externalGetText ? externalGetText() : (composerRuntime.getState().text ?? ''), [externalGetText, composerRuntime]);
-  const setTextFn = useCallback((text: string) => externalSetText ? externalSetText(text) : composerRuntime.setText(text), [externalSetText, composerRuntime]);
-  const { config, updateConfig } = useConfig();
-  const [isListening, _setIsListening] = useState(false);
-  const [isActivating, setIsActivating] = useState(false);
-  const setIsListening = useCallback((v: boolean) => {
-    _setIsListening(v);
-    if (v) setIsActivating(false); // transition from activating → listening
-    onListeningChange?.(v);
-  }, [onListeningChange]);
-
-  // Short audio feedback tones via Web Audio API
-  const playTone = useCallback((frequency: number, endFrequency: number, duration = 0.12) => {
-    try {
-      const ctx = new AudioContext();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(frequency, ctx.currentTime);
-      osc.frequency.linearRampToValueAtTime(endFrequency, ctx.currentTime + duration);
-      gain.gain.setValueAtTime(0.15, ctx.currentTime);
-      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + duration);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + duration);
-      setTimeout(() => ctx.close(), (duration + 0.1) * 1000);
-    } catch { /* audio not available */ }
-  }, []);
-  const [error, setError] = useState<string | null>(null);
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
-  const [levels, setLevels] = useState<Record<string, number>>({});
-  const sessionRef = useRef<DictationSession | null>(null);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const popover = usePopoverAlign();
-  const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const webMonitorUnsubRef = useRef<(() => void) | null>(null);
-
-  const audioConfig = (config as Record<string, unknown> | null)?.audio as {
-    provider?: AudioProvider;
-    azure?: { endpoint?: string; region?: string; subscriptionKey?: string; sttLanguage?: string };
-    dictation?: { enabled?: boolean; language?: string; continuous?: boolean; inputDeviceId?: string };
-  } | undefined;
-  const isWebBridgeDictation = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
-  // Azure STT relies on main-process mic capture which isn't available over
-  // the web bridge — fall back to native Web Speech API for browser users.
-  const audioProvider: AudioProvider = isWebBridgeDictation ? 'native' : (audioConfig?.provider ?? 'native');
-  const dictationConfig = audioConfig?.dictation;
-  const azureConfig = audioConfig?.azure;
-  const selectedDeviceId = dictationConfig?.inputDeviceId;
-
-  // Close picker on outside click
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const handler = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setPickerOpen(false);
-    };
-    window.addEventListener('pointerdown', handler);
-    return () => window.removeEventListener('pointerdown', handler);
-  }, [pickerOpen]);
-
-  // Load devices and start level monitoring when picker opens
-  useEffect(() => {
-    if (!pickerOpen) {
-      if (!isWebBridgeDictation) window.app?.mic?.stopMonitor();
-      if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-      webMonitorUnsubRef.current?.();
-      webMonitorUnsubRef.current = null;
-      setLevels({});
-      return;
-    }
-
-    if (isWebBridgeDictation) {
-      // Browser: use shared WebAudioMonitor for level monitoring
-      let cancelled = false;
-      const monitor = WebAudioMonitor.getInstance();
-      (async () => {
-        try {
-          const inputs = await monitor.listInputDevices();
-          if (cancelled) return;
-          setDevices(inputs);
-          const ids = inputs.map((d) => d.deviceId);
-          webMonitorUnsubRef.current = monitor.subscribeAll(ids);
-          // Poll levels from the shared monitor
-          levelTimerRef.current = setInterval(() => {
-            setLevels(monitor.getLevels());
-          }, 66);
-        } catch {
-          setDevices([]);
-        }
-      })();
-      return () => {
-        cancelled = true;
-        if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-        webMonitorUnsubRef.current?.();
-        webMonitorUnsubRef.current = null;
-      };
-    }
-
-    const mic = window.app?.mic;
-    if (!mic) return;
-
-    // Load device list, then start monitoring all devices
-    mic.listDevices().then((devs) => {
-      setDevices(devs);
-      // Get unique device IDs (include 'default' for system default)
-      const ids = ['default', ...devs.filter(d => d.deviceId !== 'default').map(d => d.deviceId)];
-      mic.startMonitor(ids).then(() => {
-        // Poll all levels ~15 fps
-        levelTimerRef.current = setInterval(() => {
-          mic.getLevel().then(setLevels).catch(() => setLevels({}));
-        }, 66);
-      });
-    }).catch(() => setDevices([]));
-
-    return () => {
-      if (!isWebBridgeDictation) mic.stopMonitor();
-      if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
-    };
-  }, [pickerOpen, isWebBridgeDictation]);
-
-  // Whether "Hold to record" mode is active (continuous defaults to true = hold mode)
-  const holdToRecord = dictationConfig?.continuous ?? true;
-
-  const selectDevice = useCallback((deviceId: string | undefined) => {
-    updateConfig('audio.dictation.inputDeviceId', deviceId);
-  }, [updateConfig]);
-
-  const handleStop = useCallback(() => {
-    if (!isListening && !isActivating) return;
-    console.log('[DictationButton] Stopping...');
-    sessionRef.current?.stop();
-    setIsListening(false);
-    setIsActivating(false);
-    sessionRef.current = null;
-    playTone(480, 320); // falling tone — stop
-  }, [isListening, isActivating, setIsListening, playTone]);
-
-  const handleStart = useCallback(() => {
-    setError(null);
-    if (isListening || isActivating) return;
-
-    // Enter activating state (light blue) before the SDK is ready
-    setIsActivating(true);
-
-    console.log('[DictationButton] Starting, provider=%s, deviceId=%s', audioProvider, selectedDeviceId ?? 'default');
-    if (!isDictationSupportedForProvider(audioProvider, Boolean(azureConfig?.subscriptionKey))) {
-      setIsActivating(false);
-      setError('Speech recognition is not supported');
-      return;
-    }
-
-    try {
-      const adapter = createUnifiedDictationAdapter({
-        provider: audioProvider,
-        enabled: true,
-        language: dictationConfig?.language ?? 'en-US',
-        continuous: dictationConfig?.continuous ?? true,
-        azure: audioProvider === 'azure' ? {
-          endpoint: azureConfig?.endpoint,
-          region: azureConfig?.region ?? 'eastus',
-          subscriptionKey: azureConfig?.subscriptionKey ?? '',
-          language: azureConfig?.sttLanguage ?? dictationConfig?.language ?? 'en-US',
-          continuous: dictationConfig?.continuous ?? true,
-          inputDeviceId: selectedDeviceId,
-        } : undefined,
-      });
-
-      if (!adapter) { setIsActivating(false); setError('Failed to create dictation adapter'); return; }
-
-      const session = adapter.listen();
-      sessionRef.current = session;
-
-      // Transition to listening when the speech engine is actually ready
-      let transitioned = false;
-      const fallbackTimer = setTimeout(() => {
-        if (transitioned || !sessionRef.current) return;
-        transitioned = true;
-        setIsListening(true);
-        playTone(320, 480);
-      }, 500);
-
-      session.onSpeechStart(() => {
-        if (transitioned) return;
-        transitioned = true;
-        clearTimeout(fallbackTimer);
-        setIsListening(true); // clears isActivating
-        playTone(320, 480); // rising tone — listening
-      });
-
-      // Track the committed text (finalized segments) vs partial preview
-      let baseText = getTextFn();
-
-      session.onSpeech((result) => {
-        const transcript = result.transcript?.trim();
-        if (!transcript) return;
-        console.log('[DictationButton] onSpeech: "%s" isFinal=%s', transcript, result.isFinal);
-        if (result.isFinal) {
-          baseText = baseText ? baseText.trimEnd() + ' ' + transcript : transcript;
-          setTextFn(baseText);
-        } else {
-          const preview = baseText ? baseText.trimEnd() + ' ' + transcript : transcript;
-          setTextFn(preview);
-        }
-      });
-
-      const extSession = session as DictationSession & {
-        onError?: (cb: (err: string) => void) => void;
-      };
-      extSession.onError?.((err) => {
-        console.error('[DictationButton] onError:', err);
-        clearTimeout(fallbackTimer);
-        setIsListening(false);
-        setIsActivating(false);
-        sessionRef.current = null;
-        setError(err === 'not-allowed' ? 'Microphone permission denied'
-          : err === 'no-speech' ? 'No speech detected — try again'
-          : err === 'network' ? 'Network connection required'
-          : `Dictation error: ${err}`);
-      });
-    } catch (err) {
-      console.error('[DictationButton] Failed:', err);
-      setIsListening(false);
-      setIsActivating(false);
-      setError('Failed to start dictation');
-    }
-  }, [isListening, isActivating, audioProvider, dictationConfig, azureConfig, getTextFn, setTextFn, selectedDeviceId, setIsListening, playTone]);
-
-  // Expose start/stop to parent via refs (for keyboard shortcut)
-  useEffect(() => {
-    if (startRef) (startRef as { current: (() => void) | null }).current = handleStart;
-    if (stopRef) (stopRef as { current: (() => void) | null }).current = handleStop;
-    return () => {
-      if (startRef) (startRef as { current: (() => void) | null }).current = null;
-      if (stopRef) (stopRef as { current: (() => void) | null }).current = null;
-    };
-  }, [startRef, stopRef, handleStart, handleStop]);
-
-  // Poll session status for cleanup
-  useEffect(() => {
-    if (!isListening || !sessionRef.current) return;
-    const session = sessionRef.current;
-    const interval = setInterval(() => {
-      if (session.status.type === 'ended') {
-        setIsListening(false);
-        sessionRef.current = null;
-        clearInterval(interval);
-      }
-    }, 200);
-    return () => clearInterval(interval);
-  }, [isListening]);
-
-  useEffect(() => { return () => { sessionRef.current?.cancel(); }; }, []);
-
-  useEffect(() => {
-    if (!error) return;
-    const t = setTimeout(() => setError(null), 5000);
-    return () => clearTimeout(t);
-  }, [error]);
-
-  const isActive = isListening;
-  const { expanded: dictationExpanded, containerProps: dictationContainerProps } = useSplitButtonHover({ popoverOpen: pickerOpen, forceExpanded: isActive || isActivating });
-
-  return (
-    <div ref={rootRef} {...dictationContainerProps} className="relative flex items-center">
-      {/* Joined button group: chevron/dots + mic */}
-      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
-        isActive
-          ? 'border-primary/50 bg-primary/10'
-          : isActivating
-            ? 'border-primary/30 bg-primary/5'
-            : 'border-border/50 bg-muted/40'
-      }`}>
-        {/* Left segment: chevron (idle) or animated dots (active) */}
-        <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-          dictationExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
-        }`}>
-          {isActive || isActivating ? (
-              <div className="flex h-10 w-10 items-center justify-center gap-[3px]">
-                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
-                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
-                <span className="h-[5px] w-[5px] rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
-              </div>
-            ) : (
-              <Tooltip content="Microphone settings" side="top" sideOffset={8}>
-                <button
-                  type="button"
-                  onClick={() => setPickerOpen(!pickerOpen)}
-                  className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-muted/50 text-muted-foreground"
-                >
-                  <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${pickerOpen ? '' : 'rotate-180'}`} />
-                </button>
-              </Tooltip>
-            )
-          }
-        </div>
-
-        {/* Right segment: mic button */}
-        <Tooltip
-          content={
-            <span className="flex items-center gap-2">
-              {holdToRecord ? 'Press and hold to record' : 'Voice dictation'}
-              <kbd className="inline-flex items-center gap-0.5 rounded bg-background/20 px-1.5 py-0.5 text-[10px] font-semibold"><span className="text-[13px] leading-none">⌘</span>D</kbd>
-            </span>
-          }
-          side="top"
-          sideOffset={8}
-        >
-          <button
-            type="button"
-            onMouseDown={holdToRecord ? handleStart : undefined}
-            onMouseUp={holdToRecord ? handleStop : undefined}
-            onMouseLeave={holdToRecord ? handleStop : undefined}
-            onTouchStart={holdToRecord ? (e) => { e.preventDefault(); handleStart(); } : undefined}
-            onTouchEnd={holdToRecord ? (e) => { e.preventDefault(); handleStop(); } : undefined}
-            onClick={holdToRecord ? undefined : () => {
-              if (isListening || isActivating) { handleStop(); } else { handleStart(); }
-            }}
-            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
-              isActive
-                ? 'bg-primary text-primary-foreground'
-                : isActivating
-                  ? 'bg-primary/40 text-primary-foreground'
-                  : 'text-muted-foreground hover:bg-muted/50'
-            }`}
-          >
-            <MicIcon className="h-4 w-4" />
-          </button>
-        </Tooltip>
-      </div>
-
-      {/* Error tooltip */}
-      {error && (
-        <div className="absolute bottom-full right-0 mb-2 whitespace-nowrap rounded-lg bg-popover border border-border/50 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-lg z-50">
-          {error}
-        </div>
-      )}
-
-      {/* Device picker popover — toggled by chevron button */}
-      {pickerOpen && (
-        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[300px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
-          {/* Input device header with level indicator */}
-          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
-            <MicIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide shrink-0">Input Device</span>
-            <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
-              {(() => {
-                const pct = Math.min(100, Math.round((levels[selectedDeviceId ?? 'default'] ?? 0) * 500));
-                const barColor = pct > 60 ? '#22c55e' : pct > 20 ? '#eab308' : '#6b7280';
-                return (
-                  <div
-                    className="h-full rounded-full transition-all duration-75"
-                    style={{ width: `${pct}%`, backgroundColor: barColor }}
-                  />
-                );
-              })()}
-            </div>
-          </div>
-
-          <div className="max-h-[280px] overflow-y-auto space-y-0.5">
-            {/* Default device */}
-            <DeviceRow
-              label="System Default"
-              selected={!selectedDeviceId}
-              level={levels['default'] ?? 0}
-              onClick={() => selectDevice(undefined)}
-            />
-
-            {devices.filter(d => d.deviceId !== 'default').map((d) => (
-              <DeviceRow
-                key={d.deviceId}
-                label={d.label}
-                selected={selectedDeviceId === d.deviceId}
-                level={levels[d.deviceId] ?? 0}
-                onClick={() => selectDevice(d.deviceId)}
-              />
-            ))}
-
-            {devices.length === 0 && (
-              <div className="px-3 py-3 text-[10px] text-muted-foreground text-center">
-                No input devices found
-              </div>
-            )}
-          </div>
-
-          {/* Hold to record toggle */}
-          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
-          <div className="flex items-center justify-between px-3 py-2">
-            <div className="flex items-center gap-2">
-              <PointerIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Hold to record</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => updateConfig('audio.dictation.continuous', !(dictationConfig?.continuous ?? true))}
-              className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
-                (dictationConfig?.continuous ?? true) ? 'bg-primary' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
-                (dictationConfig?.continuous ?? true) ? 'translate-x-[21px]' : 'translate-x-[3px]'
-              }`} />
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const CallButton: FC = () => {
-  const { startCall } = useRealtime();
-
-  const handleClick = useCallback(async () => {
-    try {
-      const id = await app.conversations.getActiveId() as string | null;
-      if (id) {
-        await startCall(id);
-      }
-    } catch (err) {
-      console.error('[CallButton] Failed to start call:', err);
-    }
-  }, [startCall]);
-
-  return (
-    <Tooltip content="Voice call" side="top" sideOffset={8}>
-      <button
-        type="button"
-        onClick={handleClick}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors text-muted-foreground hover:bg-muted/60"
-      >
-        <PhoneIcon className="h-4 w-4" />
-      </button>
-    </Tooltip>
-  );
-};
-
 const Composer: FC<{
   mode: ThreadMode;
   onChangeMode: (mode: ThreadMode) => void;
@@ -2056,7 +1488,7 @@ const Composer: FC<{
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   return (
-    <div className="relative z-20 px-3 pb-3 pt-4 md:px-6 md:pb-6 md:pt-5">
+    <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input
@@ -2078,7 +1510,7 @@ const Composer: FC<{
           onCancel={() => setShowDirectoryBrowser(false)}
         />
       )}
-      <div className="mx-auto w-full max-w-5xl">
+      <div className="mx-auto w-full">
         {mode === 'chat' && hasFileAttachments && (
           <div className="mb-3 flex flex-wrap gap-2">
             {attachments.map((file, i) => (
@@ -2155,7 +1587,7 @@ const Composer: FC<{
             ) : (
               <>
                 <ComposerInput
-                  placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : __BRAND_COMPOSER_PLACEHOLDER}
+                  placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : 'Discuss your thoughts and ideas...'}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -2259,15 +1691,9 @@ const Composer: FC<{
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 md:gap-2">
-                  <ModelSettingsButton
-                    selectedModelKey={selectedModelKey}
-                    onSelectModel={onSelectModel}
+                  <ChatSettingsButton
                     reasoningEffort={reasoningEffort}
                     onChangeReasoningEffort={onChangeReasoningEffort}
-                    fallbackEnabled={fallbackEnabled}
-                    onToggleFallback={onToggleFallback}
-                    selectedProfileKey={selectedProfileKey}
-                    onSelectProfile={onSelectProfile}
                     executionMode={executionMode}
                     onChangeExecutionMode={onChangeExecutionMode}
                   />
@@ -2287,8 +1713,8 @@ const Composer: FC<{
                       }}
                     />
                   )}
-                  {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
                   <CallButton />
+                  {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
                   <ThreadPrimitive.If running={false}>
                     <Tooltip content="Send message" side="top" sideOffset={8}>
                       <button

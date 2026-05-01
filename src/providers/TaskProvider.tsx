@@ -12,6 +12,7 @@ import {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
   type FC,
   type PropsWithChildren,
 } from 'react';
@@ -25,6 +26,12 @@ interface TaskState {
   selectedTaskId: string | null;
   taskOrder: KaiTaskOrder;
   isLoading: boolean;
+  /** ID of the task currently being AI-created (splash → streaming flow). */
+  creatingTaskId: string | null;
+  /** Accumulated streaming text for the AI plan being generated. */
+  streamingText: string;
+  /** Whether a plan stream is currently in flight. */
+  isStreamingPlan: boolean;
 }
 
 type TaskAction =
@@ -34,7 +41,11 @@ type TaskAction =
   | { type: 'DELETE_TASK'; id: string }
   | { type: 'SELECT_TASK'; id: string | null }
   | { type: 'SET_ORDER'; order: KaiTaskOrder }
-  | { type: 'SET_LOADING'; loading: boolean };
+  | { type: 'SET_LOADING'; loading: boolean }
+  | { type: 'START_AI_CREATE'; taskId: string }
+  | { type: 'STREAM_TEXT_DELTA'; text: string }
+  | { type: 'STREAM_DONE' }
+  | { type: 'CANCEL_AI_CREATE' };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
@@ -49,6 +60,9 @@ const initialState: TaskState = {
   selectedTaskId: null,
   taskOrder: emptyOrder,
   isLoading: true,
+  creatingTaskId: null,
+  streamingText: '',
+  isStreamingPlan: false,
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -76,6 +90,14 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
       return { ...state, taskOrder: action.order };
     case 'SET_LOADING':
       return { ...state, isLoading: action.loading };
+    case 'START_AI_CREATE':
+      return { ...state, creatingTaskId: action.taskId, streamingText: '', isStreamingPlan: true };
+    case 'STREAM_TEXT_DELTA':
+      return { ...state, streamingText: state.streamingText + action.text };
+    case 'STREAM_DONE':
+      return { ...state, isStreamingPlan: false };
+    case 'CANCEL_AI_CREATE':
+      return { ...state, creatingTaskId: null, streamingText: '', isStreamingPlan: false };
     default:
       return state;
   }
@@ -124,6 +146,18 @@ interface TaskContextValue {
     targetStatus: KaiTaskStatus,
     sourceStatus: KaiTaskStatus,
   ) => void;
+
+  /** Start the AI task creation flow — creates a placeholder task, streams plan. */
+  startAITaskCreation: (userMessage: string) => Promise<void>;
+
+  /** Send a follow-up message to refine the currently streaming task plan. */
+  refineTaskPlan: (taskId: string, userMessage: string) => Promise<void>;
+
+  /** Cancel any active AI plan stream. */
+  cancelAIStream: () => void;
+
+  /** Exit AI creation mode (reset state, keep the task). */
+  exitAICreation: () => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -135,6 +169,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   // Hydrate on mount
   useEffect(() => {
+    if (!window.app?.tasks) {
+      dispatch({ type: 'SET_LOADING', loading: false });
+      return;
+    }
     let cancelled = false;
     async function load() {
       try {
@@ -174,6 +212,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   // Subscribe to IPC broadcasts (changes from main process)
   useEffect(() => {
+    if (!window.app?.tasks?.onChanged) return;
     const unsub = app.tasks.onChanged((tasks) => {
       dispatch({ type: 'SET_TASKS', tasks: tasks as TaskFile[] });
     });
@@ -332,6 +371,95 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     [state.taskOrder, state.tasks],
   );
 
+  // ── AI Creation Actions ─────────────────────────────────────────────
+
+  // Track creatingTaskId in a ref for the stream event callback
+  const creatingTaskIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    creatingTaskIdRef.current = state.creatingTaskId;
+  }, [state.creatingTaskId]);
+
+  // Subscribe to task stream events from main process
+  useEffect(() => {
+    if (!window.app?.tasks?.onStreamEvent) return;
+    const unsub = app.tasks.onStreamEvent((event: unknown) => {
+      const evt = event as { taskId: string; type: string; text?: string; error?: string };
+      // Only process events for the task we're currently creating
+      if (evt.taskId !== creatingTaskIdRef.current) return;
+
+      switch (evt.type) {
+        case 'text-delta':
+          if (evt.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: evt.text });
+          break;
+        case 'done':
+          dispatch({ type: 'STREAM_DONE' });
+          break;
+        case 'error':
+          console.error('[TaskProvider] Stream error:', evt.error);
+          dispatch({ type: 'STREAM_DONE' });
+          break;
+      }
+    });
+    return unsub;
+  }, []);
+
+  const startAITaskCreation = useCallback(async (userMessage: string) => {
+    try {
+      // Create a placeholder task
+      const task = (await app.tasks.create({
+        title: 'Generating…',
+        description: '',
+        status: 'todo',
+      })) as TaskFile;
+      if (!task || !task.id) return;
+
+      dispatch({ type: 'START_AI_CREATE', taskId: task.id });
+
+      // Generate title in parallel (non-blocking)
+      void app.tasks.generateTitle(userMessage).then(({ title }) => {
+        if (title) {
+          dispatch({ type: 'UPDATE_TASK', id: task.id, updates: { title } });
+          void app.tasks.update(task.id, { title });
+        }
+      });
+
+      // Start streaming the plan
+      await app.tasks.streamPlan(task.id, userMessage);
+    } catch (err) {
+      console.error('[TaskProvider] Failed to start AI task creation:', err);
+      dispatch({ type: 'CANCEL_AI_CREATE' });
+    }
+  }, []);
+
+  const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
+    try {
+      // Get the current task to access conversation history
+      const task = state.tasks.find((t) => t.id === taskId);
+      const history = task?.conversationHistory ?? [];
+
+      dispatch({ type: 'START_AI_CREATE', taskId });
+
+      await app.tasks.streamPlan(taskId, userMessage, history);
+    } catch (err) {
+      console.error('[TaskProvider] Failed to refine task plan:', err);
+      dispatch({ type: 'STREAM_DONE' });
+    }
+  }, [state.tasks]);
+
+  const cancelAIStream = useCallback(() => {
+    if (state.creatingTaskId) {
+      void app.tasks.cancelPlanStream(state.creatingTaskId);
+    }
+    dispatch({ type: 'CANCEL_AI_CREATE' });
+  }, [state.creatingTaskId]);
+
+  const exitAICreation = useCallback(() => {
+    if (state.isStreamingPlan && state.creatingTaskId) {
+      void app.tasks.cancelPlanStream(state.creatingTaskId);
+    }
+    dispatch({ type: 'CANCEL_AI_CREATE' });
+  }, [state.isStreamingPlan, state.creatingTaskId]);
+
   // ── Memoized context value ───────────────────────────────────────────
 
   const value = useMemo<TaskContextValue>(
@@ -345,6 +473,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       selectTask,
       reorderTasks,
       moveTaskToColumn,
+      startAITaskCreation,
+      refineTaskPlan,
+      cancelAIStream,
+      exitAICreation,
     }),
     [
       state,
@@ -356,6 +488,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       selectTask,
       reorderTasks,
       moveTaskToColumn,
+      startAITaskCreation,
+      refineTaskPlan,
+      cancelAIStream,
+      exitAICreation,
     ],
   );
 

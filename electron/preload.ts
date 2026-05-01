@@ -284,6 +284,18 @@ const appAPI = {
       ipcRenderer.on('tasks:terminal-exit', handler);
       return () => ipcRenderer.removeListener('tasks:terminal-exit', handler);
     },
+    // AI plan generation
+    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) =>
+      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history) as Promise<{ taskId: string }>,
+    cancelPlanStream: (taskId: string) =>
+      ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
+    generateTitle: (userMessage: string) =>
+      ipcRenderer.invoke('tasks:generate-title', userMessage) as Promise<{ title: string | null }>,
+    onStreamEvent: (callback: (event: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('tasks:stream-event', handler);
+      return () => ipcRenderer.removeListener('tasks:stream-event', handler);
+    },
   },
 
   computerUse: {

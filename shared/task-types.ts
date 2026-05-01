@@ -11,6 +11,13 @@ export interface KaiTaskMetadata {
   cwd?: string;
 }
 
+/** A message in the task's AI conversation history (for plan generation/refinement). */
+export interface TaskConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+}
+
 export interface TaskFile {
   id: string;
   title: string;
@@ -23,6 +30,8 @@ export interface TaskFile {
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
   terminalSessionId?: string;
   metadata?: KaiTaskMetadata;
+  /** Conversation history used to generate/refine the task description. */
+  conversationHistory?: TaskConversationMessage[];
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */
