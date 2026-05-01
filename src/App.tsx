@@ -16,6 +16,7 @@ import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay'
 import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
+import { PluginModalHost } from '@/components/plugins/PluginModalHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { PermissionConsentModal } from '@/components/plugins/PermissionConsentModal';
 import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
@@ -1024,6 +1025,7 @@ function AppShell() {
         }}
       />
       <RealtimeProvider>
+        <PluginModalHost />
         <PluginToastHost />
         <PermissionConsentModal />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
