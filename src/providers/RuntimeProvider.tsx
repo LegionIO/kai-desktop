@@ -917,7 +917,7 @@ async function patchConversation(conversationId: string, patch: Partial<Conversa
   await app.conversations.put({ ...latest, ...patch });
 }
 
-async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[]): Promise<void> {
+async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
   try {
     const settings = await getTitleSettings();
     if (!settings.enabled) return;
@@ -951,7 +951,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       // Brief stagger to avoid simultaneous requests hitting rate limits
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined);
+      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined, hint);
       if (result.title) {
         await patchConversation(conversationId, {
           title: result.title,
@@ -1544,6 +1544,10 @@ export function RuntimeProvider({
           };
           acc.messages.push(userMsg);
           acc.headId = userMsg.id;
+
+          // Generate title after the first user message in a voice call
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          void maybeGenerateTitle(convId, branch, 'This conversation took place via voice call');
         }
       } else if (e.type === 'realtime-interrupt') {
         // User interrupted the AI response. Replace the assistant message content

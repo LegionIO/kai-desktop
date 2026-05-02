@@ -1205,7 +1205,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string) => {
+  ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string, hint?: string) => {
     let config: AppConfig;
     try {
       config = readEffectiveConfig(appHome);
@@ -1216,13 +1216,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const input = buildTitleGenerationInput(messages);
     if (!input) return { title: null };
 
-    const CHAT_TITLE_PROMPT = [
+    const promptParts = [
       'Generate a concise conversation title using at most 4 words.',
       'Summarize the user\'s main topic or task, not the assistant\'s answer.',
       'Use a neutral noun phrase, not a sentence.',
       'Avoid apologies, disclaimers, or copied response text.',
       'Return only the title text with no quotes or formatting.',
-    ].join(' ');
+    ];
+
+    if (hint) {
+      promptParts.push(`Context: ${hint}.`);
+    }
+
+    const CHAT_TITLE_PROMPT = promptParts.join(' ');
 
     const title = await generateTitle({
       systemPrompt: CHAT_TITLE_PROMPT,
