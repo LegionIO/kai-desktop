@@ -144,33 +144,33 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
             <thead>
               <tr className="border-b border-border/40">
                 <th className="text-left py-1 pr-3 font-medium text-muted-foreground">Feature</th>
-                <th className="text-center py-1 px-2 font-medium">Mastra</th>
                 <th className="text-center py-1 px-2 font-medium">Claude Code</th>
                 <th className="text-center py-1 px-2 font-medium">Codex</th>
+                <th className="text-center py-1 px-2 font-medium">Mastra</th>
               </tr>
             </thead>
             <tbody className="text-muted-foreground">
               {[
-                ['Real-time streaming', true, true, false],
+                ['Real-time streaming', true, false, true],
                 ['Tool execution', true, true, true],
-                ['MCP support', true, true, false],
-                ['Custom tools', true, true, false],
-                ['Plan mode', true, true, false],
-                ['User questions (ask_user)', true, true, false],
-                ['Skills & CLI tools', true, true, false],
-                ['Memory layers', true, false, false],
-                ['Context compaction', true, false, false],
-                ['Tool observer', true, false, false],
-                ['Sub-agents', true, true, false],
-                ['Multi-provider', true, true, false],
-                ['Model fallback', true, true, false],
-                ['Session resume', false, true, true],
-              ].map(([feature, mastra, claude, codex]) => (
+                ['MCP support', true, false, true],
+                ['Custom tools', true, false, true],
+                ['Plan mode', true, false, true],
+                ['User questions (ask_user)', true, false, true],
+                ['Skills & CLI tools', true, false, true],
+                ['Memory layers', false, false, true],
+                ['Context compaction', false, false, true],
+                ['Tool observer', false, false, true],
+                ['Sub-agents', true, false, true],
+                ['Multi-provider', true, false, true],
+                ['Model fallback', true, false, true],
+                ['Session resume', true, true, false],
+              ].map(([feature, claude, codex, mastra]) => (
                 <tr key={feature as string} className="border-b border-border/20">
                   <td className="py-1 pr-3">{feature as string}</td>
-                  <td className="text-center py-1 px-2">{mastra ? '✓' : '—'}</td>
                   <td className="text-center py-1 px-2">{claude ? '✓' : '—'}</td>
                   <td className="text-center py-1 px-2">{codex ? '✓' : '—'}</td>
+                  <td className="text-center py-1 px-2">{mastra ? '✓' : '—'}</td>
                 </tr>
               ))}
             </tbody>
