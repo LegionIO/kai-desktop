@@ -731,14 +731,42 @@ export function readEffectiveConfig(appHome: string): AppConfig {
   if (existsSync(configPath)) {
     try {
       const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-      return normalizeResponsesApiConfig(applyExternalModelConfig(deepMerge(defaults, raw) as AppConfig, appHome));
+      return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(deepMerge(defaults, raw) as AppConfig, appHome)));
     } catch (error) {
       console.error('[Config] Failed to parse desktop.json, using defaults:', error);
-      return normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome));
+      return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)));
     }
   }
 
-  return normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome));
+  return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)));
+}
+
+/**
+ * Ensure a default profile exists so profiles are always the source of truth
+ * for model selection. If no profiles exist, synthesize one from `defaultModelKey`.
+ */
+function ensureDefaultProfile(config: AppConfig): AppConfig {
+  const profiles = config.profiles ?? [];
+  if (profiles.length > 0 && config.defaultProfileKey) return config;
+
+  // Already have profiles but no default selected — pick the first one
+  if (profiles.length > 0 && !config.defaultProfileKey) {
+    return { ...config, defaultProfileKey: profiles[0].key };
+  }
+
+  // No profiles — create a Default profile from the global defaultModelKey
+  const defaultProfile = {
+    key: 'default',
+    name: 'Default',
+    primaryModelKey: config.models.defaultModelKey,
+    fallbackModelKeys: config.fallback?.modelKeys ?? [],
+  };
+
+  return {
+    ...config,
+    profiles: [defaultProfile],
+    defaultProfileKey: 'default',
+  };
 }
 
 function normalizeResponsesApiConfig(config: AppConfig): AppConfig {

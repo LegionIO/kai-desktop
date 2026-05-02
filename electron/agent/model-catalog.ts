@@ -122,37 +122,45 @@ export function resolveStreamConfig(
 ): ResolvedStreamConfig | null {
   const catalog = resolveModelCatalog(config);
 
-  // 1. Find active profile: conversation → global default → none
+  // 1. Find active profile: conversation → global default → synthesize from defaultModelKey
   const profileKey = opts.threadProfileKey ?? config.defaultProfileKey ?? null;
-  const profile = profileKey
+  let profile = profileKey
     ? (config.profiles ?? []).find((p) => p.key === profileKey)
     : undefined;
 
-  // 2. Resolve primary model: manual override → profile → global default
+  // If no profile resolved, synthesize an implicit one from the global defaultModelKey
+  // so the resolution always flows through a profile path.
+  if (!profile) {
+    profile = {
+      key: '__default__',
+      name: 'Default',
+      primaryModelKey: config.models.defaultModelKey,
+      fallbackModelKeys: config.fallback?.modelKeys ?? [],
+    };
+  }
+
+  // 2. Resolve primary model: manual override → profile's primary model
   const primaryModelKey = opts.threadModelKey
-    ?? profile?.primaryModelKey
-    ?? config.models.defaultModelKey;
+    ?? profile.primaryModelKey;
   const primaryModel = catalog.byKey.get(primaryModelKey) ?? catalog.defaultEntry;
   if (!primaryModel) return null;
 
-  // 3. Resolve fallback chain (profile fallbacks → global fallback)
-  const fallbackKeys = profile?.fallbackModelKeys
-    ?? config.fallback?.modelKeys
-    ?? [];
+  // 3. Resolve fallback chain from profile
+  const fallbackKeys = profile.fallbackModelKeys;
   const fallbackModels = fallbackKeys
     .filter((k) => k !== primaryModelKey)
     .map((k) => catalog.byKey.get(k))
     .filter((e): e is ModelCatalogEntry => e != null);
 
   // 4. Merge parameters: profile overrides → global
-  const temperature = profile?.temperature ?? config.advanced.temperature;
-  const maxSteps = profile?.maxSteps ?? config.advanced.maxSteps;
-  const maxRetries = profile?.maxRetries ?? config.advanced.maxRetries;
-  const profileUseResponsesApi = profile?.useResponsesApi;
+  const temperature = profile.temperature ?? config.advanced.temperature;
+  const maxSteps = profile.maxSteps ?? config.advanced.maxSteps;
+  const maxRetries = profile.maxRetries ?? config.advanced.maxRetries;
+  const profileUseResponsesApi = profile.useResponsesApi;
   const useResponsesApi = profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
   const globalSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
-  const systemPrompt = profile?.systemPrompt?.trim() || globalSystemPrompt;
-  const reasoningEffort = opts.reasoningEffort ?? profile?.reasoningEffort as ReasoningEffort | undefined;
+  const systemPrompt = profile.systemPrompt?.trim() || globalSystemPrompt;
+  const reasoningEffort = opts.reasoningEffort ?? profile.reasoningEffort as ReasoningEffort | undefined;
 
   // 5. Apply merged parameters to model configs (cloned so we don't mutate catalog)
   // For useResponsesApi, precedence is: profile explicit > model/provider default > global default.

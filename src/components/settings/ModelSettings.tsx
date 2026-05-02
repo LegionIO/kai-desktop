@@ -3,8 +3,10 @@ import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, EyeIcon, EyeOffIcon
 import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
+import { ProfileSettings } from './ProfileSettings';
+import { RuntimeSettings } from './RuntimeSettings';
 
-type Provider = {
+export type Provider = {
   type: string;
   enabled?: boolean;
   endpoint?: string;
@@ -34,13 +36,36 @@ type CatalogEntry = {
 };
 
 export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  return (
+    <div className="space-y-6">
+      <h3 className="text-sm font-semibold">Model Config</h3>
+
+      {/* Model Profiles */}
+      <ProfileSettings config={config} updateConfig={updateConfig} embedded />
+
+      {/* Agent Runtime */}
+      <RuntimeSettings config={config} updateConfig={updateConfig} embedded />
+    </div>
+  );
+};
+
+/* ── Model Providers (standalone tab) ── */
+
+type ProviderSubTab = 'providers' | 'catalog';
+
+export const ModelProviderSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const models = config.models as {
-    defaultModelKey: string;
     providers: Record<string, Provider>;
     catalog: CatalogEntry[];
   };
 
   const providerKeys = Object.keys(models.providers);
+  const [activeSubTab, setActiveSubTab] = useState<ProviderSubTab>('providers');
+
+  const subTabs: Array<{ key: ProviderSubTab; label: string }> = [
+    { key: 'providers', label: 'Providers' },
+    { key: 'catalog', label: 'Models' },
+  ];
 
   const updateCatalog = (newCatalog: CatalogEntry[]) => updateConfig('models.catalog', newCatalog);
 
@@ -60,41 +85,50 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Models</h3>
-
-      {/* Default model */}
       <div>
-        <label className="text-xs text-muted-foreground block mb-1">Default Model</label>
-        <select
-          className={settingsSelectClass}
-          value={models.defaultModelKey}
-          onChange={(e) => updateConfig('models.defaultModelKey', e.target.value)}
-        >
-          {models.catalog
-            .filter((m) => models.providers[m.provider]?.enabled !== false)
-            .map((m) => (
-              <option key={m.key} value={m.key}>{formatModelDisplayName(m.displayName)}</option>
-            ))}
-        </select>
+        <h3 className="text-sm font-semibold">Model Providers</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Configure API endpoints, credentials, and available models for each provider.
+        </p>
       </div>
 
-      {/* Providers */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Providers</h4>
-        {Object.entries(models.providers).map(([key, provider]) => (
-          <ProviderCard key={key} name={key} provider={provider} updateConfig={updateConfig} />
+      {/* Sub-tab navigation */}
+      <div className="flex w-fit gap-1 rounded-xl border border-border/70 bg-card/60 p-1">
+        {subTabs.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => setActiveSubTab(tab.key)}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+              activeSubTab === tab.key
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
         ))}
       </div>
 
-      {/* Model catalog */}
-      <ModelCatalog
-        catalog={models.catalog}
-        providerKeys={providerKeys}
-        providers={models.providers}
-        onAdd={addModel}
-        onUpdate={updateModel}
-        onDelete={deleteModel}
-      />
+      {/* Sub-tab content */}
+      {activeSubTab === 'providers' && (
+        <div className="space-y-3">
+          {Object.entries(models.providers).map(([key, provider]) => (
+            <ProviderCard key={key} name={key} provider={provider} updateConfig={updateConfig} />
+          ))}
+        </div>
+      )}
+
+      {activeSubTab === 'catalog' && (
+        <ModelCatalog
+          catalog={models.catalog}
+          providerKeys={providerKeys}
+          providers={models.providers}
+          onAdd={addModel}
+          onUpdate={updateModel}
+          onDelete={deleteModel}
+        />
+      )}
     </div>
   );
 };
@@ -114,8 +148,6 @@ const ModelCatalog: FC<{
 
   return (
     <div className="space-y-2">
-      <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Model Catalog</h4>
-
       <div className="space-y-1.5">
         {catalog.map((m, i) =>
           editIndex === i ? (

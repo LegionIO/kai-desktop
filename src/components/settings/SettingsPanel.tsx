@@ -3,8 +3,7 @@ import { ChevronRightIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { EditableTextarea } from '@/components/EditableTextarea';
 import { EditableInput } from '@/components/EditableInput';
-import { ModelSettings } from './ModelSettings';
-import { ProfileSettings } from './ProfileSettings';
+import { ModelSettings, ModelProviderSettings } from './ModelSettings';
 import { CompactionSettings } from './CompactionSettings';
 import { MemorySettings } from './MemorySettings';
 import { ToolSettings } from './ToolSettings';
@@ -18,13 +17,11 @@ import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { UsageDashboard } from './UsageDashboard';
 import { WebServerSettings } from './WebServerSettings';
-import { RuntimeSettings } from './RuntimeSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
   | 'models'
-  | 'profiles'
-  | 'runtime'
+  | 'providers'
   | 'memory'
   | 'compaction'
   | 'tools'
@@ -42,9 +39,8 @@ type SettingsSection =
   | 'usage';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
-  { key: 'models', label: 'Models' },
-  { key: 'profiles', label: 'Profiles' },
-  { key: 'runtime', label: 'Agent Runtime' },
+  { key: 'models', label: 'Model Config' },
+  { key: 'providers', label: 'Model Providers' },
   { key: 'memory', label: 'Memory' },
   { key: 'compaction', label: 'Compaction' },
   { key: 'tools', label: 'Tools' },
@@ -115,8 +111,7 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'profiles' && <ProfileSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'runtime' && <RuntimeSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'providers' && <ModelProviderSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'memory' && <MemorySettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'compaction' && <CompactionSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'tools' && <ToolSettings config={config} updateConfig={updateConfig} />}

@@ -162,12 +162,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Resolve system prompt (model is managed by Claude Code itself)
+    // 2. Resolve system prompt & model from the pre-resolved stream config
     // -----------------------------------------------------------------------
-    // NOTE: We do NOT pass Kai's model or API key to the Claude Code SDK.
-    // Claude Code has its own model config (~/.claude/settings.json) and auth.
-    // Passing Kai's model (e.g. "gpt-5.4") would override Claude Code's model
-    // with something it can't use properly.
+    // options.streamConfig carries the user's model selection from the IPC layer.
+    // The fallback re-resolves with defaults only when streamConfig is absent.
     const streamConfig = options.streamConfig ?? resolveStreamConfig(config, {
       threadModelKey: null,
       threadProfileKey: null,
@@ -297,16 +295,22 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // If so, pass `resume` so the SDK replays its stored history.
     const existingSessionId = this.sessionMap.get(conversationId);
 
+    const primaryModel = options.primaryModel ?? options.streamConfig?.primaryModel ?? null;
+    const resolvedModelName = primaryModel?.modelConfig?.modelName ?? null;
+    const resolvedProvider = primaryModel?.modelConfig?.provider ?? null;
+
     debugLog(`[STREAM] conversationId=${conversationId} prompt=${JSON.stringify(prompt).slice(0, 200)}`);
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} (model managed by Claude Code CLI)`);
+    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${resolvedModelName ?? 'default'} provider=${resolvedProvider ?? 'none'}`);
 
     const sdkOptions: SdkOptions = {
       abortController,
       cwd: cwd ?? process.cwd(),
-      // NOTE: model is intentionally omitted — Claude Code uses its own model
-      // from ~/.claude/settings.json. Passing Kai's model (e.g. "gpt-5.4")
-      // would override it with something incompatible.
+      // Pass the user-selected model if it comes from an Anthropic-compatible provider.
+      // Non-Anthropic models (e.g. GPT) are incompatible with the Claude Code subprocess.
+      ...((resolvedProvider === 'anthropic' || resolvedProvider === 'amazon-bedrock') && resolvedModelName
+        ? { model: resolvedModelName }
+        : {}),
       maxTurns,
       thinking: thinkingConfig as SdkOptions['thinking'],
       effort: effort as SdkOptions['effort'],

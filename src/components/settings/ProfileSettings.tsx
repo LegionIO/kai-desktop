@@ -22,7 +22,7 @@ type CatalogModel = {
   displayName: string;
 };
 
-export const ProfileSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ config, updateConfig, embedded }) => {
   const profiles = (config.profiles as ProfileEntry[] | undefined) ?? [];
   const models = ((config.models as { catalog?: CatalogModel[] })?.catalog ?? []) as CatalogModel[];
   const defaultProfileKey = config.defaultProfileKey as string | undefined;
@@ -36,37 +36,63 @@ export const ProfileSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
     const next = [...profiles];
     next[i] = p;
     updateProfiles(next);
+    // Keep defaultModelKey in sync when the default profile's primary model changes
+    if (defaultProfileKey === p.key) {
+      void updateConfig('models.defaultModelKey', p.primaryModelKey);
+    }
   };
   const deleteProfile = (i: number) => {
     const deleted = profiles[i];
     const next = profiles.filter((_, idx) => idx !== i);
     updateProfiles(next);
     if (deleted && defaultProfileKey === deleted.key) {
-      updateConfig('defaultProfileKey', undefined);
+      // Deleted the default profile — fall back to the first remaining profile
+      const fallbackProfile = next[0];
+      if (fallbackProfile) {
+        void updateConfig('defaultProfileKey', fallbackProfile.key);
+        void updateConfig('models.defaultModelKey', fallbackProfile.primaryModelKey);
+      } else {
+        void updateConfig('defaultProfileKey', undefined);
+      }
+    }
+  };
+
+  /** When the user picks a new default profile, sync defaultModelKey to match */
+  const handleDefaultProfileChange = (newKey: string) => {
+    void updateConfig('defaultProfileKey', newKey || undefined);
+    const profile = profiles.find((p) => p.key === newKey);
+    if (profile) {
+      void updateConfig('models.defaultModelKey', profile.primaryModelKey);
     }
   };
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Profiles</h3>
-      <p className="text-xs text-muted-foreground">
-        Profiles bundle a primary model, fallback chain, system prompt, and LLM parameters into named presets.
-        Select a profile per-conversation in the composer area.
-      </p>
+      {!embedded && (
+        <>
+          <h3 className="text-sm font-semibold">Profiles</h3>
+          <p className="text-xs text-muted-foreground">
+            Profiles bundle a primary model, fallback chain, system prompt, and LLM parameters into named presets.
+            Select a profile per-conversation in the composer area.
+          </p>
+        </>
+      )}
 
       {/* Default profile selector */}
       <div>
-        <label className="text-xs text-muted-foreground block mb-1">Default Profile</label>
+        <label className="text-xs text-muted-foreground block mb-1">Default Model Profile</label>
         <select
           className={settingsSelectClass}
           value={defaultProfileKey ?? ''}
-          onChange={(e) => updateConfig('defaultProfileKey', e.target.value || undefined)}
+          onChange={(e) => handleDefaultProfileChange(e.target.value)}
         >
-          <option value="">None (use global settings)</option>
           {profiles.map((p) => (
             <option key={p.key} value={p.key}>{p.name}</option>
           ))}
         </select>
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          The active profile determines which model is used for new conversations.
+        </p>
       </div>
 
       {/* Profile list */}
