@@ -35,10 +35,10 @@ export const CallButton: FC = () => {
 
   const audioConfig = (config as Record<string, unknown> | null)?.audio as {
     provider?: AudioProvider;
-    dictation?: { enabled?: boolean; inputDeviceId?: string };
+    recording?: { enabled?: boolean; inputDeviceId?: string };
   } | undefined;
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
-  const selectedDeviceId = audioConfig?.dictation?.inputDeviceId;
+  const selectedDeviceId = audioConfig?.recording?.inputDeviceId;
 
   const { expanded, containerProps } = useSplitButtonHover({ popoverOpen: pickerOpen });
 
@@ -121,7 +121,7 @@ export const CallButton: FC = () => {
   }, [pickerOpen, isWebBridge]);
 
   const selectDevice = useCallback((deviceId: string | undefined) => {
-    updateConfig('audio.dictation.inputDeviceId', deviceId);
+    updateConfig('audio.recording.inputDeviceId', deviceId);
   }, [updateConfig]);
 
   // ── Render ────────────────────────────────────────────────────────
@@ -133,7 +133,7 @@ export const CallButton: FC = () => {
         <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
           expanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
         }`}>
-          <Tooltip content="Microphone settings" side="top" sideOffset={8}>
+          <Tooltip content="Voice settings" side="top" sideOffset={8}>
             <button
               type="button"
               onClick={() => setPickerOpen(!pickerOpen)}

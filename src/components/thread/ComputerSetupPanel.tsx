@@ -28,7 +28,7 @@ type ComputerSetupPanelProps = {
   startSurface?: ComputerUseSurface;
   activeComputerSession?: ComputerSession;
   onOpenPopout?: () => void;
-  renderDictation?: (opts: { getText: () => string; setText: (text: string) => void; isDictating: boolean; onDictatingChange: (v: boolean) => void }) => ReactNode;
+  renderRecording?: () => ReactNode;
 };
 
 
@@ -45,7 +45,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   startSurface = 'docked',
   activeComputerSession,
   onOpenPopout,
-  renderDictation,
+  renderRecording,
 }) => {
   const { config } = useConfig();
   const {
@@ -58,7 +58,6 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     probeInputMonitoring,
   } = useComputerUse();
   const [computerGoal, setComputerGoal] = useState('');
-  const [isDictating, setIsDictating] = useState(false);
   const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>('local-macos');
   const [computerApprovalMode, setComputerApprovalMode] = useState<'step' | 'goal' | 'autonomous'>('autonomous');
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
@@ -243,12 +242,6 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     }
   };
 
-  // Stable accessors for dictation to read/write the goal textarea
-  const goalTextRef = useRef(computerGoal);
-  goalTextRef.current = computerGoal;
-  const getGoalText = useCallback(() => goalTextRef.current, []);
-  const setGoalText = useCallback((text: string) => setComputerGoal(text), []);
-
 
   return (
     <div className="relative px-1 pb-1">
@@ -320,7 +313,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
         value={computerGoal}
         onChange={(event) => setComputerGoal(event.target.value)}
         onKeyDown={handleGoalKeyDown}
-        placeholder={!conversationId ? 'Select a chat first...' : isDictating ? 'Listening...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
+        placeholder={!conversationId ? 'Select a chat first...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
         disabled={!conversationId}
         rows={2}
         className="w-full resize-none bg-transparent px-1 py-0.5 text-base md:text-[15px] outline-none placeholder:text-muted-foreground/50 disabled:cursor-not-allowed disabled:opacity-50"
@@ -342,7 +335,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           onChangeReasoningEffort={onChangeReasoningEffort}
         />
 
-        {renderDictation?.({ getText: getGoalText, setText: setGoalText, isDictating, onDictatingChange: setIsDictating })}
+        {renderRecording?.()}
 
         {/* Start button */}
         <button

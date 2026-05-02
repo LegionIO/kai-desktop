@@ -256,7 +256,7 @@ const audioConfigSchema = z.object({
     voice: z.string().optional(),
     rate: z.number().min(0.5).max(3),
   }),
-  dictation: z.object({
+  recording: z.object({
     enabled: z.boolean(),
     language: z.string().optional(),
     continuous: z.boolean(),
@@ -389,8 +389,7 @@ const cliToolSchema = z.object({
 // Agent runtime config
 // ---------------------------------------------------------------------------
 
-const runtimeIdSchema = z.enum(['mastra', 'claude-agent-sdk', 'codex-sdk']);
-export type RuntimeIdConfig = z.infer<typeof runtimeIdSchema>;
+export type RuntimeIdConfig = 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
 
 const claudeAgentSdkConfigSchema = z.object({
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),

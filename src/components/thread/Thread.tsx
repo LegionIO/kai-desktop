@@ -52,7 +52,8 @@ import type { PipelineEnrichments } from './PipelineInsights';
 import { TokenUsage } from './TokenUsage';
 import { ComposerInput } from './ComposerInput';
 import { RichChatInput } from './RichChatInput';
-import { DictationButton } from './DictationButton';
+import { RecordingButton } from './RecordingButton';
+import { RecordingOverlay } from './RecordingOverlay';
 import { CallButton } from './CallButton';
 import { SearchBar } from './SearchBar';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
@@ -61,6 +62,7 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 import { ComputerSetupPanel } from './ComputerSetupPanel';
@@ -91,7 +93,8 @@ export const Thread: FC<{
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
-  const activeConversationId = useActiveConversationId();
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- hook must run for reactivity
+  const _activeConversationId = useActiveConversationId();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
   // Track whether the splash should hide instantly (loading existing thread)
@@ -1308,40 +1311,20 @@ const Composer: FC<{
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.defaultTarget, computerConfig?.approvalModeDefault]);
 
-  const dictationEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
+  const recordingEnabled = (config as Record<string, unknown> | null)?.audio
+    ? ((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true
     : true;
-  const [isDictating, setIsDictating] = useState(false);
-  const dictationStartRef = useRef<(() => void) | null>(null);
-  const dictationStopRef = useRef<(() => void) | null>(null);
+  const {
+    recordingState,
+    elapsedSec: recordingElapsedSec,
+    inputLevel: recordingInputLevel,
+    startRecording,
+    stopAndTranscribe,
+    cancelRecording,
+  } = useVoiceRecording();
 
-  // ⌘D keyboard shortcut: hold to record, release to stop
-  const dictatingViaKeyboard = useRef(false);
-  useEffect(() => {
-    if (!dictationEnabled) return;
-    const onDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
-        e.preventDefault();
-        dictatingViaKeyboard.current = true;
-        dictationStartRef.current?.();
-      }
-    };
-    const stop = () => {
-      if (dictatingViaKeyboard.current) {
-        dictatingViaKeyboard.current = false;
-        dictationStopRef.current?.();
-      }
-    };
-    window.addEventListener('keydown', onDown);
-    window.addEventListener('keyup', stop);
-    window.addEventListener('blur', stop);
-    return () => {
-      window.removeEventListener('keydown', onDown);
-      window.removeEventListener('keyup', stop);
-      window.removeEventListener('blur', stop);
-    };
-  }, [dictationEnabled]);
+  const isRecording = recordingState === 'recording';
+
 
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1484,8 +1467,34 @@ const Composer: FC<{
 
   const canSend = composerText.trim().length > 0 || attachments.length > 0;
   const hasFileAttachments = attachments.length > 0;
+
+  // Voice recording: stop, transcribe, set text, send
+  const handleRecordingSend = useCallback(() => {
+    const transcript = stopAndTranscribe();
+    if (!transcript.trim()) return;
+    composerRuntime.setText(transcript.trim());
+    // Schedule send on next tick so the runtime picks up the new text
+    setTimeout(() => composerRuntime.send(), 0);
+  }, [stopAndTranscribe, composerRuntime]);
+
+  const handleRecordingCancel = useCallback(() => {
+    cancelRecording();
+  }, [cancelRecording]);
+
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
+
+  // When recording, show the RecordingOverlay instead of the normal composer
+  if (isRecording) {
+    return (
+      <RecordingOverlay
+        elapsedSec={recordingElapsedSec}
+        inputLevel={recordingInputLevel}
+        onCancel={handleRecordingCancel}
+        onSend={handleRecordingSend}
+      />
+    );
+  }
 
   return (
     <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
@@ -1560,12 +1569,8 @@ const Composer: FC<{
                   onToggleFallback={onToggleFallback}
                   activeComputerSession={activeComputerSession}
                   onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
-                  renderDictation={dictationEnabled ? ({ getText, setText, onDictatingChange }) => (
-                    <DictationButton
-                      onListeningChange={onDictatingChange}
-                      getText={getText}
-                      setText={setText}
-                    />
+                  renderRecording={recordingEnabled ? () => (
+                    <RecordingButton onStart={startRecording} />
                   ) : undefined}
                 />
                 <div className="mt-2 flex justify-end">
@@ -1587,7 +1592,7 @@ const Composer: FC<{
             ) : (
               <>
                 <ComposerInput
-                  placeholder={isDictating ? 'Listening...' : computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : 'Discuss your thoughts and ideas...'}
+                  placeholder={computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : 'Discuss your thoughts and ideas...'}
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -1714,7 +1719,7 @@ const Composer: FC<{
                     />
                   )}
                   <CallButton />
-                  {dictationEnabled && <DictationButton onListeningChange={setIsDictating} startRef={dictationStartRef} stopRef={dictationStopRef} />}
+                  {recordingEnabled && <RecordingButton onStart={startRecording} />}
                   <ThreadPrimitive.If running={false}>
                     <Tooltip content="Send message" side="top" sideOffset={8}>
                       <button

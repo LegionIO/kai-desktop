@@ -5,7 +5,7 @@
  * Phase 2: Streaming markdown plan + composer for refinements.
  *
  * The composer matches the chat composer's button layout: add files, folder,
- * model settings, computer use, dictation, call, send/stop.
+ * model settings, computer use, voice recording, call, send/stop.
  */
 
 import {
@@ -30,7 +30,8 @@ import {
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { SplashBackground } from '@/components/SplashBackground';
 import { MarkdownText } from '@/components/thread/MarkdownText';
-import { DictationButton } from '@/components/thread/DictationButton';
+import { RecordingButton } from '@/components/thread/RecordingButton';
+import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { useTasks } from '@/providers/TaskProvider';
 import { useAttachments } from '@/providers/AttachmentContext';
@@ -65,15 +66,12 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Stable getText/setText for DictationButton (avoids stale closures)
-  const inputRef = useRef(input);
-  inputRef.current = input;
-  const getInputText = useCallback(() => inputRef.current, []);
-  const setInputText = useCallback((text: string) => setInput(text), []);
+  // Voice recording hook
+  const { recordingState: taskRecordingState, startRecording: taskStartRecording, stopAndTranscribe: taskStopAndTranscribe } = useVoiceRecording();
 
-  // Dictation config (just to check enabled state)
-  const dictationEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { dictation?: { enabled?: boolean } })?.dictation?.enabled ?? true
+  // Recording config (just to check enabled state)
+  const recordingEnabled = (config as Record<string, unknown> | null)?.audio
+    ? ((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true
     : true;
 
   // ── CWD popover / split-button state ────────────────────────────────
@@ -180,7 +178,12 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
   }, []);
 
   const handleSubmit = useCallback(() => {
-    const text = input.trim();
+    // If recording, stop and use the transcript
+    let text = input.trim();
+    if (taskRecordingState === 'recording') {
+      const transcript = taskStopAndTranscribe();
+      text = transcript.trim() || text;
+    }
     if (!text) return;
 
     setInput('');
@@ -190,7 +193,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
     } else if (creatingTaskId) {
       void refineTaskPlan(creatingTaskId, text);
     }
-  }, [input, hasSubmitted, creatingTaskId, startAITaskCreation, refineTaskPlan]);
+  }, [input, hasSubmitted, creatingTaskId, startAITaskCreation, refineTaskPlan, taskRecordingState, taskStopAndTranscribe]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -398,10 +401,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
                   )}
                 </div>
               </div>
-              {/* Right side: dictation, send/stop */}
+              {/* Right side: recording, send/stop */}
               <div className="flex items-center gap-1.5 md:gap-2">
-                {dictationEnabled && (
-                  <DictationButton getText={getInputText} setText={setInputText} />
+                {recordingEnabled && (
+                  <RecordingButton onStart={taskStartRecording} />
                 )}
                 {isStreamingPlan ? (
                   <button
