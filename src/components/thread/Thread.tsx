@@ -1233,12 +1233,6 @@ const MessageInfoIndicator: FC = () => {
               <span>{effortDisplay}</span>
             </>
           )}
-          {elapsedDisplay && (
-            <>
-              <span className="text-popover-foreground/50">Elapsed</span>
-              <span>{elapsedDisplay}</span>
-            </>
-          )}
           {tokenUsage && (
             <>
               <span className="text-popover-foreground/50">Tokens</span>
@@ -1261,6 +1255,12 @@ const MessageInfoIndicator: FC = () => {
                   </span>
                 )}
               </span>
+            </>
+          )}
+          {elapsedDisplay && (
+            <>
+              <span className="text-popover-foreground/50">Elapsed</span>
+              <span>{elapsedDisplay}</span>
             </>
           )}
         </div>
