@@ -7,6 +7,8 @@ interface TooltipProps {
   side?: 'top' | 'right' | 'bottom' | 'left';
   sideOffset?: number;
   delayDuration?: number;
+  /** Override the default content container classes */
+  contentClassName?: string;
 }
 
 export const Tooltip: FC<TooltipProps> = ({
@@ -15,6 +17,7 @@ export const Tooltip: FC<TooltipProps> = ({
   side = 'top',
   sideOffset = 6,
   delayDuration = 200,
+  contentClassName,
 }) => (
   <TooltipPrimitive.Root delayDuration={delayDuration}>
     <TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>
@@ -22,10 +25,10 @@ export const Tooltip: FC<TooltipProps> = ({
       <TooltipPrimitive.Content
         side={side}
         sideOffset={sideOffset}
-        className="z-50 rounded-lg bg-foreground/90 px-2.5 py-1 text-xs font-medium text-background shadow-lg backdrop-blur-sm animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
+        className={contentClassName ?? "z-50 rounded-lg bg-foreground/90 px-2.5 py-1 text-xs font-medium text-background shadow-lg backdrop-blur-sm animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"}
       >
         {content}
-        <TooltipPrimitive.Arrow className="fill-foreground/90" />
+        <TooltipPrimitive.Arrow className={contentClassName ? "fill-popover" : "fill-foreground/90"} />
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
   </TooltipPrimitive.Root>

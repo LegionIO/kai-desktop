@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, type FC, type PropsWithChildren } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext, type FC, type PropsWithChildren } from 'react';
 import {
   ThreadPrimitive,
   ComposerPrimitive,
@@ -8,6 +8,7 @@ import {
   useThreadRuntime,
   useMessage,
   useComposerRuntime,
+  getExternalStoreMessage,
 } from '@assistant-ui/react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import {
@@ -15,6 +16,7 @@ import {
   CopyIcon,
   CheckIcon,
   RefreshCwIcon,
+  InfoIcon,
   StopCircleIcon,
   PlusIcon,
   XIcon,
@@ -38,18 +40,16 @@ import { app } from '@/lib/ipc-client';
 import { refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
-import { useAssistantResponseTiming, useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
+import { useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { MarkdownText } from './MarkdownText';
 import { UserCodeMarkdown } from './UserCodeMarkdown';
-import { ElapsedBadge } from './ElapsedBadge';
 import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
-import { TokenUsage } from './TokenUsage';
 import { ComposerInput } from './ComposerInput';
 import { RichChatInput } from './RichChatInput';
 import { RecordingButton } from './RecordingButton';
@@ -70,11 +70,17 @@ import { ComputerSettingsButton } from './ComputerSettingsButton';
 import type { ExecutionMode } from './ChatSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
-import { getResponseTiming } from '@/lib/response-timing';
+import { getResponseTiming, formatElapsed } from '@/lib/response-timing';
+import { formatModelDisplayName } from '@/lib/model-display';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
 import { useTasksOptional } from '@/providers/TaskProvider';
 
 export type ThreadMode = 'chat' | 'computer';
+
+/** Lightweight context so deeply-nested message components can read thread-level metadata. */
+type ThreadMetaState = { selectedModelKey: string | null; resolvedRuntime: string | null; reasoningEffort: string | null };
+const ThreadMetaContext = createContext<ThreadMetaState>({ selectedModelKey: null, resolvedRuntime: null, reasoningEffort: null });
+const useThreadMeta = () => useContext(ThreadMetaContext);
 
 export const Thread: FC<{
   mode: ThreadMode;
@@ -120,7 +126,23 @@ export const Thread: FC<{
     return cleanup;
   }, []);
 
+  // Resolve the actual runtime (e.g. "auto" → "mastra") so message info shows the real value
+  const [resolvedRuntime, setResolvedRuntime] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    app.agent.getActiveRuntime()
+      .then((id) => { if (!cancelled) setResolvedRuntime(id as string); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedModelKey]); // re-fetch when model changes as runtime may change with it
+
+  const threadMeta = useMemo<ThreadMetaState>(
+    () => ({ selectedModelKey, resolvedRuntime, reasoningEffort }),
+    [selectedModelKey, resolvedRuntime, reasoningEffort],
+  );
+
   return (
+    <ThreadMetaContext.Provider value={threadMeta}>
     <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col">
       <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
       <div
@@ -197,6 +219,7 @@ export const Thread: FC<{
         </>
       )}
     </ThreadPrimitive.Root>
+    </ThreadMetaContext.Provider>
   );
 };
 
@@ -977,7 +1000,6 @@ const assistantContentComponents = {
 
 const AssistantMessage: FC = () => {
   const message = useMessage();
-  const { activeRunStartedAt } = useAssistantResponseTiming();
   const isRunning = message.status?.type === 'running';
   const content = message.content ?? [];
   const hasContent = content.some((p: { type: string; text?: string }) =>
@@ -1007,12 +1029,6 @@ const AssistantMessage: FC = () => {
     | { type: 'enrichments'; enrichments: PipelineEnrichments }
     | undefined;
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
-
-  const tokenUsage = (message as { tokenUsage?: TokenUsageData }).tokenUsage ?? null;
-  const responseTiming = getResponseTiming(message);
-  const badgeStartedAt = responseTiming?.startedAt ?? (isRunning ? activeRunStartedAt ?? undefined : undefined);
-  const badgeFinishedAt = responseTiming?.finishedAt;
-  const badgeDurationMs = responseTiming?.durationMs;
 
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1093,21 +1109,11 @@ const AssistantMessage: FC = () => {
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
-          {tokenUsage && !isRunning && <TokenUsage usage={tokenUsage} />}
         </div>
         <div className={`flex items-center gap-1 mt-3 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
+          {!isRunning && <MessageInfoIndicator />}
           <MessageTimestamp date={message.createdAt} align="left" />
-          {badgeStartedAt && (
-            <span className="ml-2 -translate-y-px">
-              <ElapsedBadge
-                startedAt={badgeStartedAt}
-                finishedAt={badgeFinishedAt}
-                durationMs={badgeDurationMs}
-                isRunning={isRunning && !isAwaitingInput}
-              />
-            </span>
-          )}
         </div>
       </div>
     </MessagePrimitive.Root>
@@ -1131,6 +1137,132 @@ const AssistantActionBar: FC = () => {
 
       <BranchPicker />
     </ActionBarPrimitive.Root>
+  );
+};
+
+const RUNTIME_DISPLAY_NAMES: Record<string, string> = {
+  mastra: 'Mastra',
+  'claude-agent-sdk': 'Claude Code',
+  'codex-sdk': 'Codex',
+  auto: 'Auto',
+};
+
+const EFFORT_DISPLAY_NAMES: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'X-High',
+};
+
+function formatCompactTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+const MessageInfoIndicator: FC = () => {
+  const message = useMessage();
+  const { selectedModelKey, resolvedRuntime, reasoningEffort } = useThreadMeta();
+  const { config } = useConfig();
+  const responseTiming = getResponseTiming(message);
+
+  // Access the original StoredMessage via assistant-ui's external store binding
+  const storedMessage = getExternalStoreMessage<{ tokenUsage?: TokenUsageData; messageMeta?: Record<string, unknown> }>(message);
+  const stored = Array.isArray(storedMessage) ? storedMessage[0] : storedMessage;
+
+  // Model: use conversation's selectedModelKey (catalog key), fall back to per-message sourceModel or config default
+  const sourceModel = stored?.messageMeta?.sourceModel as string | undefined;
+  const modelKey = selectedModelKey ?? (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ?? sourceModel ?? null;
+
+  // Runtime: use the resolved runtime from context (resolves "auto" to actual)
+  const runtimeId = resolvedRuntime;
+
+  const elapsedMs = responseTiming?.durationMs
+    ?? (responseTiming?.startedAt && responseTiming?.finishedAt
+      ? Math.max(0, new Date(responseTiming.finishedAt).getTime() - new Date(responseTiming.startedAt).getTime())
+      : undefined);
+
+  // Token usage from the original stored message
+  const tokenUsage = stored?.tokenUsage ?? null;
+
+  // Only show if we have at least one piece of info
+  if (!modelKey && !runtimeId && elapsedMs == null && !reasoningEffort && !tokenUsage) return null;
+
+  // Look up catalog display name; fall back to formatting the raw key
+  const catalog = (config as { models?: { catalog?: Array<{ key: string; displayName: string; provider: string; modelName: string }> } })?.models?.catalog;
+  const catalogEntry = modelKey
+    ? catalog?.find((m) => m.key === modelKey)
+      ?? catalog?.find((m) => `${m.provider}:${m.modelName}` === modelKey)
+      ?? catalog?.find((m) => m.modelName === modelKey || m.modelName === modelKey.split(':').slice(1).join(':'))
+    : undefined;
+  const modelDisplay = catalogEntry?.displayName
+    ?? (modelKey ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey) : null);
+  const runtimeDisplay = runtimeId ? RUNTIME_DISPLAY_NAMES[runtimeId] ?? runtimeId : null;
+  const effortDisplay = reasoningEffort ? EFFORT_DISPLAY_NAMES[reasoningEffort] ?? reasoningEffort : null;
+  const elapsedDisplay = elapsedMs != null ? formatElapsed(Math.max(1, elapsedMs)) : null;
+
+  return (
+    <Tooltip
+      content={
+        <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[10px]">
+          {modelDisplay && (
+            <>
+              <span className="text-popover-foreground/50">Model</span>
+              <span>{modelDisplay}</span>
+            </>
+          )}
+          {runtimeDisplay && (
+            <>
+              <span className="text-popover-foreground/50">Runtime</span>
+              <span>{runtimeDisplay}</span>
+            </>
+          )}
+          {effortDisplay && (
+            <>
+              <span className="text-popover-foreground/50">Effort</span>
+              <span>{effortDisplay}</span>
+            </>
+          )}
+          {elapsedDisplay && (
+            <>
+              <span className="text-popover-foreground/50">Elapsed</span>
+              <span>{elapsedDisplay}</span>
+            </>
+          )}
+          {tokenUsage && (
+            <>
+              <span className="text-popover-foreground/50">Tokens</span>
+              <span className="tabular-nums">
+                {formatCompactTokens(tokenUsage.totalTokens)}
+                <span className="text-popover-foreground/35 ml-1">
+                  ({formatCompactTokens(tokenUsage.inputTokens)} in · {formatCompactTokens(tokenUsage.outputTokens)} out)
+                </span>
+              </span>
+            </>
+          )}
+          {tokenUsage && (tokenUsage.cacheReadTokens > 0 || tokenUsage.cacheWriteTokens > 0) && (
+            <>
+              <span className="text-popover-foreground/50">Cache</span>
+              <span className="tabular-nums">
+                {formatCompactTokens(tokenUsage.cacheReadTokens)} read · {formatCompactTokens(tokenUsage.cacheWriteTokens)} write
+                {tokenUsage.totalTokens > 0 && tokenUsage.cacheReadTokens > 0 && (
+                  <span className="text-emerald-400/70 ml-1">
+                    ({Math.round((tokenUsage.cacheReadTokens / tokenUsage.totalTokens) * 100)}% hit)
+                  </span>
+                )}
+              </span>
+            </>
+          )}
+        </div>
+      }
+      contentClassName="z-50 rounded-lg bg-popover px-2.5 py-1.5 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
+      side="right"
+      delayDuration={150}
+    >
+      <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
+        <InfoIcon className="h-3.5 w-3.5 text-muted-foreground" />
+      </button>
+    </Tooltip>
   );
 };
 
