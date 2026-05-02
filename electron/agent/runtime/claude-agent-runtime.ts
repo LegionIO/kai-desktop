@@ -283,8 +283,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 7. Start the query
     // -----------------------------------------------------------------------
-    // NOTE: Claude Code uses its own auth from ~/.claude/settings.json
-    // (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.) so we don't pass env.
+    // When claudeAuth is provided, model + endpoint + API key are passed via
+    // the SDK's `settings` option (highest-priority layer). Otherwise the SDK
+    // falls back to its own config (~/.claude/settings.json).
 
     // Resolve the system-installed `claude` binary path as a fallback
     // in case the SDK's bundled platform binary is missing (e.g. optional
@@ -295,22 +296,22 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // If so, pass `resume` so the SDK replays its stored history.
     const existingSessionId = this.sessionMap.get(conversationId);
 
-    const primaryModel = options.primaryModel ?? options.streamConfig?.primaryModel ?? null;
-    const resolvedModelName = primaryModel?.modelConfig?.modelName ?? null;
-    const resolvedProvider = primaryModel?.modelConfig?.provider ?? null;
+    // Use pre-resolved auth from the model-runtime compatibility layer.
+    // This ensures Kai is always in control of which model + endpoint is used,
+    // rather than silently falling back to ~/.claude/settings.json.
+    const auth = options.claudeAuth ?? null;
 
     debugLog(`[STREAM] conversationId=${conversationId} prompt=${JSON.stringify(prompt).slice(0, 200)}`);
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${resolvedModelName ?? 'default'} provider=${resolvedProvider ?? 'none'}`);
+    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`);
 
     const sdkOptions: SdkOptions = {
       abortController,
       cwd: cwd ?? process.cwd(),
-      // Pass the user-selected model if it comes from an Anthropic-compatible provider.
-      // Non-Anthropic models (e.g. GPT) are incompatible with the Claude Code subprocess.
-      ...((resolvedProvider === 'anthropic' || resolvedProvider === 'amazon-bedrock') && resolvedModelName
-        ? { model: resolvedModelName }
-        : {}),
+      // Model + auth from Kai's model-runtime resolver.
+      // When auth is present, we pass model name directly and override the SDK's
+      // default endpoint/key via the settings option (highest priority layer).
+      ...(auth ? { model: auth.modelName } : {}),
       maxTurns,
       thinking: thinkingConfig as SdkOptions['thinking'],
       effort: effort as SdkOptions['effort'],
@@ -318,8 +319,6 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
       includePartialMessages: true,
       persistSession: true,
-      // NOTE: env is intentionally omitted — Claude Code uses its own auth
-      // from ~/.claude/settings.json (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.)
       // Use specific Claude Code tools — SDK's built-in file/code tools.
       // Kai's custom tools are available via the MCP bridge above.
       tools: [
@@ -341,14 +340,21 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       systemPrompt: assembledPrompt
         ? { type: 'preset', preset: 'claude_code', append: assembledPrompt }
         : { type: 'preset', preset: 'claude_code' },
+      // Override the SDK's default auth when Kai provides explicit credentials.
+      // This uses the "flag settings" layer which has highest priority.
+      ...(auth?.baseUrl || auth?.apiKey ? {
+        settings: {
+          env: {
+            ...(auth.baseUrl ? { ANTHROPIC_BASE_URL: auth.baseUrl } : {}),
+            ...(auth.apiKey ? { ANTHROPIC_AUTH_TOKEN: auth.apiKey } : {}),
+          },
+        },
+      } : {}),
       // Resume previous session for conversation continuity
       ...(existingSessionId ? { resume: existingSessionId } : {}),
       // Fall back to system-installed CLI when bundled binary is missing
       ...(claudeCliPath ? { pathToClaudeCodeExecutable: claudeCliPath } : {}),
     };
-
-    // NOTE: fallbackModel is intentionally not passed — Claude Code manages
-    // its own fallback via ~/.claude/settings.json.
 
     // -----------------------------------------------------------------------
     // 8. Stream and translate events

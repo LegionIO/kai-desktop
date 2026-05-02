@@ -25,7 +25,7 @@ function ipcDebugLog(msg: string): void {
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
-import { resolveRuntime } from '../agent/runtime/index.js';
+import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import {
   ToolObserverManager,
   resolveToolObserverConfig,
@@ -310,9 +310,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
 
-    // Resolve runtime early to access capabilities for middleware gating
-    const runtime = await resolveRuntime(config);
-    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} capabilities=${JSON.stringify(runtime.capabilities)}`);
+    // Resolve runtime using model-aware logic:
+    //   - auto mode: picks the best runtime for the model's provider type
+    //   - explicit mode: validates compatibility, returns a warning on mismatch
+    const { runtime, resolution } = await resolveRuntimeForStream(config, modelEntry);
+    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} claudeAuth=${resolution.claudeAuth ? `model=${resolution.claudeAuth.modelName} baseUrl=${resolution.claudeAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
+
+    // If the user has an explicitly-set runtime that is incompatible with the
+    // selected model, surface the warning in the chat and bail early.
+    if (resolution.warning) {
+      broadcastStreamEvent({ conversationId, type: 'text-delta', text: `⚠️ ${resolution.warning}` });
+      broadcastStreamEvent({ conversationId, type: 'done' });
+      activeStreams.delete(conversationId);
+      activeStreamModelKeys.delete(conversationId);
+      activeObserverSessions.delete(conversationId);
+      return { conversationId };
+    }
+
     const observerSupported = runtime.capabilities.toolObserver;
     const compactionSupported = runtime.capabilities.compaction;
 
@@ -1018,6 +1032,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           abortSignal: controller.signal,
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
+          claudeAuth: resolution.claudeAuth,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
