@@ -1169,13 +1169,22 @@ const MessageInfoIndicator: FC = () => {
   // Access the original StoredMessage via assistant-ui's external store binding
   const storedMessage = getExternalStoreMessage<{ tokenUsage?: TokenUsageData; messageMeta?: Record<string, unknown> }>(message);
   const stored = Array.isArray(storedMessage) ? storedMessage[0] : storedMessage;
+  const meta = stored?.messageMeta;
 
-  // Model: use conversation's selectedModelKey (catalog key), fall back to per-message sourceModel or config default
-  const sourceModel = stored?.messageMeta?.sourceModel as string | undefined;
+  // Prefer persisted per-message values; fall back to live context for older messages
+  const persistedModelDisplay = meta?.sourceModelDisplayName as string | undefined;
+  const persistedEffort = meta?.reasoningEffort as string | undefined;
+  const persistedRuntimeId = meta?.runtimeId as string | undefined;
+
+  // Model: persisted display name > catalog lookup > formatted raw key
+  const sourceModel = meta?.sourceModel as string | undefined;
   const modelKey = selectedModelKey ?? (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ?? sourceModel ?? null;
 
-  // Runtime: use the resolved runtime from context (resolves "auto" to actual)
-  const runtimeId = resolvedRuntime;
+  // Runtime
+  const effectiveRuntimeId = persistedRuntimeId ?? resolvedRuntime;
+
+  // Effort
+  const effectiveEffort = persistedEffort ?? reasoningEffort;
 
   const elapsedMs = responseTiming?.durationMs
     ?? (responseTiming?.startedAt && responseTiming?.finishedAt
@@ -1186,19 +1195,20 @@ const MessageInfoIndicator: FC = () => {
   const tokenUsage = stored?.tokenUsage ?? null;
 
   // Only show if we have at least one piece of info
-  if (!modelKey && !runtimeId && elapsedMs == null && !reasoningEffort && !tokenUsage) return null;
+  if (!modelKey && !effectiveRuntimeId && elapsedMs == null && !effectiveEffort && !tokenUsage) return null;
 
-  // Look up catalog display name; fall back to formatting the raw key
+  // Look up catalog display name as fallback when no persisted display name
   const catalog = (config as { models?: { catalog?: Array<{ key: string; displayName: string; provider: string; modelName: string }> } })?.models?.catalog;
-  const catalogEntry = modelKey
+  const catalogEntry = !persistedModelDisplay && modelKey
     ? catalog?.find((m) => m.key === modelKey)
       ?? catalog?.find((m) => `${m.provider}:${m.modelName}` === modelKey)
       ?? catalog?.find((m) => m.modelName === modelKey || m.modelName === modelKey.split(':').slice(1).join(':'))
     : undefined;
-  const modelDisplay = catalogEntry?.displayName
+  const modelDisplay = persistedModelDisplay
+    ?? catalogEntry?.displayName
     ?? (modelKey ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey) : null);
-  const runtimeDisplay = runtimeId ? RUNTIME_DISPLAY_NAMES[runtimeId] ?? runtimeId : null;
-  const effortDisplay = reasoningEffort ? EFFORT_DISPLAY_NAMES[reasoningEffort] ?? reasoningEffort : null;
+  const runtimeDisplay = effectiveRuntimeId ? RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId : null;
+  const effortDisplay = effectiveEffort ? EFFORT_DISPLAY_NAMES[effectiveEffort] ?? effectiveEffort : null;
   const elapsedDisplay = elapsedMs != null ? formatElapsed(Math.max(1, elapsedMs)) : null;
 
   return (
@@ -1600,13 +1610,12 @@ const Composer: FC<{
   const canSend = composerText.trim().length > 0 || attachments.length > 0;
   const hasFileAttachments = attachments.length > 0;
 
-  // Voice recording: stop, transcribe, set text, send
-  const handleRecordingSend = useCallback(() => {
+  // Voice recording: stop, transcribe, put text in composer (don't send)
+  const handleRecordingDone = useCallback(() => {
     const transcript = stopAndTranscribe();
-    if (!transcript.trim()) return;
-    composerRuntime.setText(transcript.trim());
-    // Schedule send on next tick so the runtime picks up the new text
-    setTimeout(() => composerRuntime.send(), 0);
+    if (transcript.trim()) {
+      composerRuntime.setText(transcript.trim());
+    }
   }, [stopAndTranscribe, composerRuntime]);
 
   const handleRecordingCancel = useCallback(() => {
@@ -1623,7 +1632,7 @@ const Composer: FC<{
         elapsedSec={recordingElapsedSec}
         inputLevel={recordingInputLevel}
         onCancel={handleRecordingCancel}
-        onSend={handleRecordingSend}
+        onDone={handleRecordingDone}
       />
     );
   }

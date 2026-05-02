@@ -406,6 +406,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       let activeSourceModel = modelEntry?.modelConfig
         ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
         : null;
+      let activeModelDisplayName: string | null = modelEntry?.displayName ?? null;
       // Compaction metadata keyed by execute-side toolCallId.
       // Populated in augmentToolResult, consumed when the matching
       // tool-result stream event is broadcast.
@@ -1108,6 +1109,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               );
               if (fallbackEntry?.modelConfig) {
                 activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
+                activeModelDisplayName = fallbackEntry.displayName ?? null;
               }
             }
           }
@@ -1115,6 +1117,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
               sourceModel: activeSourceModel,
+              sourceModelDisplayName: activeModelDisplayName,
+              reasoningEffort: reasoningEffort ?? null,
+              runtimeId: runtime.id,
             };
           }
           if (activeObserverSessions.get(conversationId) !== observerSessionId) {
