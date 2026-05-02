@@ -138,7 +138,7 @@ function getDefaultConfig() {
         sttLanguage: 'en-US',
       },
       tts: { enabled: true, rate: 1 },
-      dictation: { enabled: true, language: 'en-US', continuous: true },
+      recording: { enabled: true, language: 'en-US', continuous: true },
     },
     realtime: {
       enabled: true,

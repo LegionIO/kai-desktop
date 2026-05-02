@@ -18,6 +18,7 @@ interface TaskCardProps {
 
 function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return 'just now';
   const secs = Math.floor(diff / 1000);
   if (secs < 60) return 'just now';
   const mins = Math.floor(secs / 60);

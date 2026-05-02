@@ -1,10 +1,10 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
+import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import { normalizeAgentCwd } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
-import { createLanguageModelFromConfig } from '../agent/language-model.js';
+import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
@@ -223,50 +223,6 @@ function nowIso(): string {
 
 function logToolCompactionDebug(stage: string, details: Record<string, unknown>): void {
   console.info(`[ToolCompactionDebug] ${stage} ${JSON.stringify(details)}`);
-}
-
-function normalizeGeneratedTitle(rawTitle: string | null): string | null {
-  if (!rawTitle) return null;
-
-  const cleaned = rawTitle
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .replace(/^(title|summary)\s*:\s*/i, '')
-    .replace(/\s+/g, ' ');
-
-  if (!cleaned) return null;
-
-  return cleaned
-    .split(/\s+/)
-    .slice(0, 4)
-    .join(' ')
-    .slice(0, 80);
-}
-
-function resolveTitleModel(
-  config: AppConfig,
-  threadModelKey: string | null,
-): ModelCatalogEntry | null {
-  const catalog = resolveModelCatalog(config);
-  const threadEntry = resolveModelForThread(config, threadModelKey);
-
-  const matchingHaiku = catalog.entries.find((entry) => {
-    const modelName = entry.modelConfig.modelName.toLowerCase();
-    return modelName.includes('haiku');
-  });
-
-  if (matchingHaiku) return matchingHaiku;
-  return threadEntry;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableTitleGenerationError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const maybeError = error as { statusCode?: number; isRetryable?: boolean; data?: { message?: string } };
-  return maybeError.statusCode === 503 || maybeError.isRetryable === true || maybeError.data?.message === 'Bedrock is unable to process your request.';
 }
 
 // Tool registry - will be populated by Phase 4
@@ -1237,94 +1193,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { title: null };
     }
 
-    const modelEntry = resolveTitleModel(config, modelKey ?? null);
-    if (!modelEntry) return { title: null };
+    const input = buildTitleGenerationInput(messages);
+    if (!input) return { title: null };
 
-    // Check if a plugin inference provider is available
-    const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
-    if (inferenceProvider) {
-      try {
-        const titleInput = buildTitleGenerationInput(messages);
-        if (!titleInput) return { title: null };
+    const CHAT_TITLE_PROMPT = [
+      'Generate a concise conversation title using at most 4 words.',
+      'Summarize the user\'s main topic or task, not the assistant\'s answer.',
+      'Use a neutral noun phrase, not a sentence.',
+      'Avoid apologies, disclaimers, or copied response text.',
+      'Return only the title text with no quotes or formatting.',
+    ].join(' ');
 
-        const systemPrompt = [
-          'Generate a concise conversation title using at most 4 words.',
-          'Summarize the user\'s main topic or task, not the assistant\'s answer.',
-          'Use a neutral noun phrase, not a sentence.',
-          'Avoid apologies, disclaimers, or copied response text.',
-          'Return only the title text with no quotes or formatting.',
-        ].join(' ');
+    const title = await generateTitle({
+      systemPrompt: CHAT_TITLE_PROMPT,
+      maxWords: 4,
+      input,
+      config,
+      modelKey,
+      inferenceProvider: pluginManager?.getInferenceProvider() ?? null,
+    });
 
-        let titleText = '';
-        const providerStream = inferenceProvider.stream({
-          conversationId: `title-gen-${Date.now()}`,
-          messages: [{ role: 'user', content: titleInput }],
-          modelKey: modelEntry.key,
-          systemPrompt,
-          abortSignal: undefined,
-        });
-
-        for await (const event of providerStream) {
-          if (event.type === 'text-delta' && event.text) {
-            titleText += event.text;
-          }
-          if (event.type === 'done' || event.type === 'error') break;
-        }
-
-        const title = normalizeGeneratedTitle(titleText);
-        if (title) return { title };
-      } catch (error) {
-        console.warn('[Agent] Title generation via plugin inference provider failed, falling back to Mastra:', error);
-      }
-    }
-
-    // Fallback to standard Mastra title generation
-    try {
-      const { Agent } = await import('@mastra/core/agent');
-      const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
-      type AgentConfig = ConstructorParameters<typeof Agent>[0];
-
-      const agent = new Agent({
-        id: `title-gen-${Date.now()}`,
-        name: 'title-generator',
-        instructions: [
-          'Generate a concise conversation title using at most 4 words.',
-          'Summarize the user\'s main topic or task, not the assistant\'s answer.',
-          'Use a neutral noun phrase, not a sentence.',
-          'Avoid apologies, disclaimers, or copied response text.',
-          'Return only the title text with no quotes or formatting.',
-        ].join(' '),
-        model: model as AgentConfig['model'],
-      });
-
-      const titleInput = buildTitleGenerationInput(messages);
-      if (!titleInput) return { title: null };
-
-      let lastError: unknown;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          const result = await agent.generate(titleInput, { maxSteps: 1 });
-          const rawTitle = typeof result.text === 'string' ? result.text : null;
-          const title = normalizeGeneratedTitle(rawTitle);
-          return { title };
-        } catch (error) {
-          lastError = error;
-          if (!isRetryableTitleGenerationError(error) || attempt === 2) {
-            throw error;
-          }
-          await sleep(600 * (attempt + 1));
-        }
-      }
-
-      throw lastError;
-    } catch (error) {
-      if (isRetryableTitleGenerationError(error)) {
-        console.warn('[Agent] Title generation skipped after retryable provider error.');
-      } else {
-        console.error('[Agent] Title generation failed:', error);
-      }
-      return { title: null };
-    }
+    return { title };
   });
 
   // Sub-agent interaction handlers

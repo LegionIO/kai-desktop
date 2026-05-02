@@ -36,3 +36,11 @@ export interface TaskFile {
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */
 export type KaiTaskOrder = Record<KaiTaskStatus, string[]>;
+
+/** Events emitted during AI plan streaming. */
+export type TaskStreamEvent = {
+  taskId: string;
+  type: 'text-delta' | 'done' | 'error';
+  text?: string;
+  error?: string;
+};

@@ -84,7 +84,7 @@ export const branding = {
 
   // ── macOS permission-usage strings (shown in system dialogs) ──────────
   microphoneUsage:
-    '{{productName}} uses the microphone for voice dictation (speech-to-text).',
+    '{{productName}} uses the microphone for voice recording (speech-to-text).',
   appleEventsUsage:
     '{{productName}} uses Apple Events to activate apps and inspect focused windows during local Mac computer control.',
   screenCaptureUsage:

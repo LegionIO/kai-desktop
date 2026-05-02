@@ -80,7 +80,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               onChange={(v) => updateConfig('webServer.tls.enabled', v)}
             />
             <p className="text-[10px] text-muted-foreground">
-              HTTPS is required for microphone access (dictation, realtime calls) when connecting from other devices.
+              HTTPS is required for microphone access (voice recording, realtime calls) when connecting from other devices.
             </p>
 
             {ws.tls.enabled && (

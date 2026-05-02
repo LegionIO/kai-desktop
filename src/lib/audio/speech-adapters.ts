@@ -1,12 +1,12 @@
 /**
  * Speech adapter factories for assistant-ui runtime.
- * Uses the OS-native Web Speech API for both TTS and dictation.
+ * Uses the OS-native Web Speech API for both TTS and voice recording.
  * Also provides unified factory functions that delegate to Azure AI adapters.
  */
 
 import {
   createAzureSpeechAdapter,
-  createAzureDictationAdapter,
+  createAzureRecordingAdapter,
   type AzureTtsConfig,
   type AzureSttConfig,
 } from './azure-speech-adapters';
@@ -29,27 +29,27 @@ export type SpeechSynthesisAdapter = {
   speak: (text: string) => SpeechSynthesisUtterance;
 };
 
-export type DictationStatus =
+export type RecordingStatus =
   | { type: 'starting' | 'running' }
   | { type: 'ended'; reason: 'stopped' | 'cancelled' | 'error' };
 
-export type DictationResult = {
+export type TranscriptionResult = {
   transcript: string;
   isFinal?: boolean;
 };
 
-export type DictationSession = {
-  status: DictationStatus;
+export type RecordingSession = {
+  status: RecordingStatus;
   stop: () => Promise<void>;
   cancel: () => void;
   onSpeechStart: (callback: () => void) => Unsubscribe;
-  onSpeechEnd: (callback: (result: DictationResult) => void) => Unsubscribe;
-  onSpeech: (callback: (result: DictationResult) => void) => Unsubscribe;
+  onSpeechEnd: (callback: (result: TranscriptionResult) => void) => Unsubscribe;
+  onSpeech: (callback: (result: TranscriptionResult) => void) => Unsubscribe;
 };
 
-export type DictationAdapter = {
-  listen: () => DictationSession;
-  disableInputDuringDictation?: boolean;
+export type RecordingAdapter = {
+  listen: () => RecordingSession;
+  disableInputDuringRecording?: boolean;
 };
 
 // -- TTS Config --
@@ -60,9 +60,9 @@ type TtsConfig = {
   rate: number;
 };
 
-// -- Dictation Config --
+// -- Recording Config --
 
-type DictationConfig = {
+type RecordingConfig = {
   enabled: boolean;
   language?: string;
   continuous: boolean;
@@ -140,7 +140,7 @@ export function createSpeechAdapter(config: TtsConfig): SpeechSynthesisAdapter {
 }
 
 // -----------------------------------------------------------------
-// Dictation Adapter — wraps Web Speech Recognition API
+// Recording Adapter — wraps Web Speech Recognition API
 // -----------------------------------------------------------------
 
 interface SpeechRecognitionInstance extends EventTarget {
@@ -163,14 +163,14 @@ declare global {
   }
 }
 
-export function isDictationSupported(): boolean {
+export function isRecordingSupported(): boolean {
   return typeof window !== 'undefined' &&
     !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
 
-export function createDictationAdapter(config: DictationConfig): DictationAdapter {
+export function createNativeRecordingAdapter(config: RecordingConfig): RecordingAdapter {
   return {
-    listen(): DictationSession {
+    listen(): RecordingSession {
       const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (!SpeechRecognitionClass) {
         throw new Error('Speech recognition is not supported in this browser.');
@@ -182,11 +182,11 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
       recognition.continuous = config.continuous ?? true;
       recognition.interimResults = true;
 
-      let status: DictationStatus = { type: 'starting' };
+      let status: RecordingStatus = { type: 'starting' };
       let stopRequested = false;
       const speechStartListeners = new Set<() => void>();
-      const speechEndListeners = new Set<(result: DictationResult) => void>();
-      const speechListeners = new Set<(result: DictationResult) => void>();
+      const speechEndListeners = new Set<(result: TranscriptionResult) => void>();
+      const speechListeners = new Set<(result: TranscriptionResult) => void>();
       const errorListeners = new Set<(error: string) => void>();
 
       // Auto-restart: the Web Speech API in Chromium frequently disconnects
@@ -196,36 +196,36 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
 
       function attachListeners(rec: SpeechRecognitionInstance) {
         rec.addEventListener('start', () => {
-          console.log('[Dictation] Recognition started');
+          console.log('[Recording] Recognition started');
           status = { type: 'running' };
         });
 
         rec.addEventListener('audiostart', () => {
-          console.log('[Dictation] Audio capture started');
+          console.log('[Recording] Audio capture started');
         });
 
         rec.addEventListener('soundstart', () => {
-          console.log('[Dictation] Sound detected');
+          console.log('[Recording] Sound detected');
         });
 
         rec.addEventListener('speechstart', () => {
-          console.log('[Dictation] Speech detected');
+          console.log('[Recording] Speech detected');
           speechStartListeners.forEach((cb) => cb());
         });
 
         rec.addEventListener('speechend', () => {
-          console.log('[Dictation] Speech ended');
+          console.log('[Recording] Speech ended');
         });
 
         rec.addEventListener('result', (event: Event) => {
           const e = event as Event & { results: SpeechRecognitionResultList; resultIndex: number };
-          console.log('[Dictation] Result event:', e.results.length, 'results, index:', e.resultIndex);
+          console.log('[Recording] Result event:', e.results.length, 'results, index:', e.resultIndex);
           for (let i = e.resultIndex; i < e.results.length; i++) {
             const result = e.results[i];
             if (!result || !result[0]) continue;
             const transcript = result[0].transcript;
             const isFinal = result.isFinal;
-            console.log('[Dictation] Transcript:', JSON.stringify(transcript), 'isFinal:', isFinal);
+            console.log('[Recording] Transcript:', JSON.stringify(transcript), 'isFinal:', isFinal);
             speechListeners.forEach((cb) => cb({ transcript, isFinal }));
             if (isFinal) {
               speechEndListeners.forEach((cb) => cb({ transcript, isFinal: true }));
@@ -234,11 +234,11 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
         });
 
         rec.addEventListener('nomatch', () => {
-          console.log('[Dictation] No speech match detected');
+          console.log('[Recording] No speech match detected');
         });
 
         rec.addEventListener('end', () => {
-          console.log('[Dictation] Recognition ended, stopRequested=%s', stopRequested);
+          console.log('[Recording] Recognition ended, stopRequested=%s', stopRequested);
           if (!stopRequested && status.type !== 'ended') {
             // Unexpected end — restart
             tryRestart();
@@ -252,7 +252,7 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
         rec.addEventListener('error', (event: Event) => {
           const errorEvent = event as Event & { error?: string; message?: string };
           const errorType = errorEvent.error ?? errorEvent.message ?? 'unknown';
-          console.warn('[Dictation] Error: %s, stopRequested=%s', errorType, stopRequested);
+          console.warn('[Recording] Error: %s, stopRequested=%s', errorType, stopRequested);
 
           if (!stopRequested && restartableErrors.has(errorType)) {
             // Transient error — the 'end' event will fire next and trigger restart
@@ -267,7 +267,7 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
       function tryRestart() {
         if (stopRequested) return;
         try {
-          console.log('[Dictation] Auto-restarting recognition...');
+          console.log('[Recording] Auto-restarting recognition...');
           recognition = new SpeechRecClass();
           recognition.lang = config.language ?? 'en-US';
           recognition.continuous = config.continuous ?? true;
@@ -275,7 +275,7 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
           attachListeners(recognition);
           recognition.start();
         } catch (err) {
-          console.error('[Dictation] Restart failed:', err);
+          console.error('[Recording] Restart failed:', err);
           status = { type: 'ended', reason: 'error' };
           errorListeners.forEach((cb) => cb('restart-failed'));
         }
@@ -285,9 +285,9 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
 
       try {
         recognition.start();
-        console.log('[Dictation] Recognition.start() called');
+        console.log('[Recording] Recognition.start() called');
       } catch (err) {
-        console.error('[Dictation] Failed to start:', err);
+        console.error('[Recording] Failed to start:', err);
         status = { type: 'ended', reason: 'error' };
         throw err;
       }
@@ -322,7 +322,7 @@ export function createDictationAdapter(config: DictationConfig): DictationAdapte
           errorListeners.add(callback);
           return () => errorListeners.delete(callback);
         },
-      } as DictationSession & { onError: (callback: (error: string) => void) => Unsubscribe };
+      } as RecordingSession & { onError: (callback: (error: string) => void) => Unsubscribe };
     },
   };
 }
@@ -360,37 +360,37 @@ export function createUnifiedSpeechAdapter(opts: {
 }
 
 /**
- * Create a dictation adapter based on the configured provider.
+ * Create a recording adapter based on the configured provider.
  * Falls back to native if Azure is selected but credentials are missing.
  */
-export function createUnifiedDictationAdapter(opts: {
+export function createUnifiedRecordingAdapter(opts: {
   provider: AudioProvider;
   enabled: boolean;
   language?: string;
   continuous: boolean;
   azure?: AzureSttConfig;
-}): DictationAdapter | undefined {
+}): RecordingAdapter | undefined {
   if (!opts.enabled) return undefined;
 
   if (opts.provider === 'azure' && opts.azure?.subscriptionKey) {
-    return createAzureDictationAdapter(opts.azure);
+    return createAzureRecordingAdapter(opts.azure);
   }
 
   // Fall back to native (also covers azure-selected-but-no-key)
   if (opts.provider === 'azure' && !opts.azure?.subscriptionKey) {
     console.warn('[Audio] Azure STT selected but no subscription key configured, falling back to native');
   }
-  return createDictationAdapter({ enabled: true, language: opts.language, continuous: opts.continuous });
+  return createNativeRecordingAdapter({ enabled: true, language: opts.language, continuous: opts.continuous });
 }
 
 /**
- * Check if dictation is supported for the given provider.
+ * Check if voice recording is supported for the given provider.
  * Azure STT uses WebSocket, so doesn't depend on browser's Web Speech API.
  * Native STT requires window.SpeechRecognition.
  */
-export function isDictationSupportedForProvider(provider: AudioProvider, azureKeySet?: boolean): boolean {
+export function isRecordingSupportedForProvider(provider: AudioProvider, azureKeySet?: boolean): boolean {
   if (provider === 'azure' && azureKeySet) {
     return true; // Azure uses WebSocket — always available
   }
-  return isDictationSupported(); // Check native browser support
+  return isRecordingSupported(); // Check native browser support
 }

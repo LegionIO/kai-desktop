@@ -28,7 +28,7 @@ type AudioConfig = {
     voice?: string;
     rate?: number;
   };
-  dictation?: {
+  recording?: {
     enabled?: boolean;
     language?: string;
     continuous?: boolean;
@@ -182,7 +182,7 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const provider: AudioProvider = audio?.provider ?? 'native';
   const azure = audio?.azure;
   const tts = audio?.tts;
-  const dictation = audio?.dictation;
+  const recording = audio?.recording;
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
 
   // Load available OS voices (only needed for native provider)
@@ -204,7 +204,7 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       <div>
         <h3 className="text-sm font-semibold">Audio</h3>
         <p className="text-xs text-muted-foreground mt-1">
-          Configure text-to-speech and voice dictation. Choose between your OS&apos;s
+          Configure text-to-speech and voice recording. Choose between your OS&apos;s
           built-in speech services or Azure AI Speech Service.
         </p>
       </div>
@@ -281,17 +281,17 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         )}
       </div>
 
-      {/* ── Dictation ── */}
+      {/* ── Voice Recording ── */}
       <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Dictation</h4>
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Voice Recording</h4>
 
         <Toggle
-          label="Enable voice dictation"
-          checked={dictation?.enabled ?? true}
-          onChange={(v) => updateConfig('audio.dictation.enabled', v)}
+          label="Enable voice recording"
+          checked={recording?.enabled ?? true}
+          onChange={(v) => updateConfig('audio.recording.enabled', v)}
         />
 
-        {(dictation?.enabled ?? true) && provider === 'native' && (
+        {(recording?.enabled ?? true) && provider === 'native' && (
           <div className="space-y-3 pl-1">
             {/* Language */}
             <div>
@@ -299,24 +299,14 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
               <input
                 type="text"
                 className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                value={dictation?.language ?? 'en-US'}
-                onChange={(e) => updateConfig('audio.dictation.language', e.target.value)}
+                value={recording?.language ?? 'en-US'}
+                onChange={(e) => updateConfig('audio.recording.language', e.target.value)}
                 placeholder="en-US"
               />
               <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
                 e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP
               </span>
             </div>
-
-            {/* Continuous */}
-            <Toggle
-              label="Continuous listening"
-              checked={dictation?.continuous ?? true}
-              onChange={(v) => updateConfig('audio.dictation.continuous', v)}
-            />
-            <span className="text-[10px] text-muted-foreground/60 block -mt-2 pl-1">
-              Keep the microphone active between pauses instead of stopping after each phrase.
-            </span>
           </div>
         )}
       </div>
@@ -379,7 +369,7 @@ const AzureConfigPanel: FC<{
 
       {!hasKey && (
         <p className="text-[10px] text-amber-600/80 dark:text-amber-400/80">
-          Enter a subscription key to enable Azure AI Speech. Without one, TTS and dictation will fall back to native.
+          Enter a subscription key to enable Azure AI Speech. Without one, TTS and voice recording will fall back to native.
         </p>
       )}
 

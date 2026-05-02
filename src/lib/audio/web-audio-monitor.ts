@@ -4,7 +4,7 @@
  * Provides reference-counted, per-device microphone level monitoring using a
  * single shared AudioContext. This prevents multiple components from opening
  * competing getUserMedia streams which can starve the Web Speech API and cause
- * "network" errors during dictation.
+ * "network" errors during voice recording.
  *
  * Desktop (Electron) code should continue using the IPC mic monitor
  * (window.app.mic.startMonitor / getLevel / stopMonitor). This class is only

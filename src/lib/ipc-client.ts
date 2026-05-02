@@ -5,6 +5,7 @@ import type {
   ComputerUsePermissionSection,
   ComputerUseSurface,
 } from '../../shared/computer-use';
+import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 
 type AppAPI = {
   config: {
@@ -151,14 +152,14 @@ type AppAPI = {
     readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
   };
   tasks: {
-    list: () => Promise<unknown[]>;
-    get: (id: string) => Promise<unknown>;
-    create: (taskData: unknown) => Promise<unknown>;
-    update: (id: string, updates: unknown) => Promise<unknown>;
+    list: () => Promise<TaskFile[]>;
+    get: (id: string) => Promise<TaskFile | null>;
+    create: (taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => Promise<TaskFile>;
+    update: (id: string, updates: Partial<TaskFile>) => Promise<TaskFile>;
     delete: (id: string) => Promise<{ ok: boolean }>;
-    getOrder: () => Promise<unknown>;
-    saveOrder: (order: unknown) => Promise<{ ok: boolean }>;
-    onChanged: (callback: (tasks: unknown[]) => void) => () => void;
+    getOrder: () => Promise<KaiTaskOrder | null>;
+    saveOrder: (order: KaiTaskOrder) => Promise<{ ok: boolean }>;
+    onChanged: (callback: (tasks: TaskFile[]) => void) => () => void;
     terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => Promise<{ sessionId?: string; error?: string }>;
     terminalWrite: (sessionId: string, data: string) => Promise<void>;
     terminalResize: (sessionId: string, cols: number, rows: number) => Promise<void>;
@@ -166,10 +167,10 @@ type AppAPI = {
     onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
     onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
     // AI plan generation
-    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) => Promise<{ taskId: string }>;
+    streamPlan: (taskId: string, userMessage: string, history?: TaskConversationMessage[]) => Promise<{ taskId: string }>;
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
-    onStreamEvent: (callback: (event: unknown) => void) => () => void;
+    onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
   };
   platform: {
     homedir: () => Promise<string>;

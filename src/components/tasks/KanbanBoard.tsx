@@ -214,10 +214,11 @@ export const KanbanBoard: FC = () => {
         <div className="flex-1" />
 
         {/* Status filter chips */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5" role="group" aria-label="Filter by status">
           <FilterIcon className="h-3.5 w-3.5 text-muted-foreground/60" />
           <button
             type="button"
+            aria-pressed={statusFilter === null}
             onClick={() => setStatusFilter(null)}
             className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
               statusFilter === null
@@ -231,6 +232,7 @@ export const KanbanBoard: FC = () => {
             <button
               key={status}
               type="button"
+              aria-pressed={statusFilter === status}
               onClick={() => setStatusFilter(statusFilter === status ? null : status)}
               className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 statusFilter === status

@@ -377,6 +377,23 @@ const appAPI = {
       ipcRenderer.on('stt:error', handler);
       return () => ipcRenderer.removeListener('stt:error', handler);
     },
+    batchTranscribe: (options: {
+      wavBase64?: string;
+      tempFilePath?: string;
+      language: string;
+      azureKey: string;
+      azureRegion: string;
+      azureEndpoint?: string;
+    }) => ipcRenderer.invoke('stt:batch-transcribe', options) as Promise<{
+      text: string;
+      durationSec?: number;
+      error?: string;
+    }>,
+    onTranscriptionProgress: (callback: (progress: { percent: number; chunkIndex: number; totalChunks: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, progress: { percent: number; chunkIndex: number; totalChunks: number }) => callback(progress);
+      ipcRenderer.on('stt:transcription-progress', handler);
+      return () => ipcRenderer.removeListener('stt:transcription-progress', handler);
+    },
   },
 
   usage: {
@@ -421,6 +438,10 @@ const appAPI = {
     const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
     ipcRenderer.on('agent:execution-mode-changed', handler);
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
+  },
+
+  debug: {
+    log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
   },
 };
 

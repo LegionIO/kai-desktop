@@ -177,8 +177,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     async function load() {
       try {
         const [tasks, order] = await Promise.all([
-          app.tasks.list() as Promise<TaskFile[]>,
-          app.tasks.getOrder() as Promise<KaiTaskOrder | null>,
+          app.tasks.list(),
+          app.tasks.getOrder(),
         ]);
         if (cancelled) return;
         dispatch({ type: 'SET_TASKS', tasks });
@@ -214,7 +214,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     if (!window.app?.tasks?.onChanged) return;
     const unsub = app.tasks.onChanged((tasks) => {
-      dispatch({ type: 'SET_TASKS', tasks: tasks as TaskFile[] });
+      dispatch({ type: 'SET_TASKS', tasks: tasks });
     });
     return unsub;
   }, []);
@@ -234,7 +234,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           description: data.description,
           status: data.status ?? 'todo',
           metadata: data.metadata,
-        })) as TaskFile;
+        }));
         // No optimistic ADD_TASK dispatch — the IPC broadcast from main
         // process triggers SET_TASKS which includes the new task.
         return task;
@@ -262,7 +262,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           sourceConversationId: opts.sourceConversationId,
           sourceToolCallId: opts.sourceToolCallId,
           metadata: opts.planFileName ? { planFileName: opts.planFileName } : undefined,
-        })) as TaskFile;
+        }));
         // No optimistic ADD_TASK dispatch — broadcast handles it.
         return task;
       } catch (err) {
@@ -281,7 +281,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     } catch (err) {
       console.error('[TaskProvider] Failed to update task:', err);
       // Re-fetch to reconcile state
-      const tasks = (await app.tasks.list()) as TaskFile[];
+      const tasks = (await app.tasks.list());
       dispatch({ type: 'SET_TASKS', tasks });
     }
   }, []);
@@ -308,7 +308,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       await app.tasks.delete(id);
     } catch (err) {
       console.error('[TaskProvider] Failed to delete task:', err);
-      const tasks = (await app.tasks.list()) as TaskFile[];
+      const tasks = (await app.tasks.list());
       dispatch({ type: 'SET_TASKS', tasks });
     }
   }, []);
@@ -337,36 +337,41 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   );
 
   const moveTaskToColumn = useCallback(
-    (taskId: string, targetStatus: KaiTaskStatus, sourceStatus: KaiTaskStatus) => {
-      // Kill terminal when task moves to "done"
-      if (targetStatus === 'done') {
-        const task = state.tasks.find((t) => t.id === taskId);
-        if (task?.terminalSessionId) {
-          void app.tasks.terminalKill(task.terminalSessionId);
-          dispatch({
-            type: 'UPDATE_TASK',
-            id: taskId,
-            updates: { status: targetStatus, terminalSessionId: undefined },
-          });
-          void app.tasks.update(taskId, { status: targetStatus, terminalSessionId: undefined });
-        } else {
-          dispatch({ type: 'UPDATE_TASK', id: taskId, updates: { status: targetStatus } });
-          void app.tasks.update(taskId, { status: targetStatus });
-        }
-      } else {
-        dispatch({ type: 'UPDATE_TASK', id: taskId, updates: { status: targetStatus } });
-        void app.tasks.update(taskId, { status: targetStatus });
-      }
+    async (taskId: string, targetStatus: KaiTaskStatus, sourceStatus: KaiTaskStatus) => {
+      // Optimistic status update
+      const statusUpdates: Partial<TaskFile> =
+        targetStatus === 'done'
+          ? (() => {
+              const task = state.tasks.find((t) => t.id === taskId);
+              if (task?.terminalSessionId) {
+                void app.tasks.terminalKill(task.terminalSessionId);
+                return { status: targetStatus, terminalSessionId: undefined };
+              }
+              return { status: targetStatus };
+            })()
+          : { status: targetStatus };
 
-      // Update column ordering
+      dispatch({ type: 'UPDATE_TASK', id: taskId, updates: statusUpdates });
+
+      // Optimistic order update
       const currentOrder = { ...state.taskOrder };
       currentOrder[sourceStatus] = (currentOrder[sourceStatus] ?? []).filter(
         (id) => id !== taskId,
       );
       currentOrder[targetStatus] = [taskId, ...(currentOrder[targetStatus] ?? [])];
-
       dispatch({ type: 'SET_ORDER', order: currentOrder });
-      void app.tasks.saveOrder(currentOrder);
+
+      // Persist both — reconcile on failure
+      try {
+        await Promise.all([
+          app.tasks.update(taskId, statusUpdates),
+          app.tasks.saveOrder(currentOrder),
+        ]);
+      } catch (err) {
+        console.error('[TaskProvider] Failed to move task to column:', err);
+        const tasks = (await app.tasks.list());
+        dispatch({ type: 'SET_TASKS', tasks });
+      }
     },
     [state.taskOrder, state.tasks],
   );
@@ -382,8 +387,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // Subscribe to task stream events from main process
   useEffect(() => {
     if (!window.app?.tasks?.onStreamEvent) return;
-    const unsub = app.tasks.onStreamEvent((event: unknown) => {
-      const evt = event as { taskId: string; type: string; text?: string; error?: string };
+    const unsub = app.tasks.onStreamEvent((evt) => {
       // Only process events for the task we're currently creating
       if (evt.taskId !== creatingTaskIdRef.current) return;
 
@@ -410,7 +414,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         title: 'Generating…',
         description: '',
         status: 'todo',
-      })) as TaskFile;
+      }));
       if (!task || !task.id) return;
 
       dispatch({ type: 'START_AI_CREATE', taskId: task.id });
@@ -433,8 +437,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
     try {
-      // Get the current task to access conversation history
-      const task = state.tasks.find((t) => t.id === taskId);
+      // Fetch fresh task from IPC to avoid stale closure over state.tasks
+      const task = await app.tasks.get(taskId);
       const history = task?.conversationHistory ?? [];
 
       dispatch({ type: 'START_AI_CREATE', taskId });
@@ -444,7 +448,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       console.error('[TaskProvider] Failed to refine task plan:', err);
       dispatch({ type: 'STREAM_DONE' });
     }
-  }, [state.tasks]);
+  }, []);
 
   const cancelAIStream = useCallback(() => {
     if (state.creatingTaskId) {

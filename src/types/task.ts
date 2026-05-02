@@ -4,7 +4,7 @@
  * Core types are re-exported from the shared module to keep main/renderer in sync.
  */
 
-export type { TaskFile, KaiTaskMetadata, KaiTaskOrder, TaskConversationMessage } from '../../shared/task-types';
+export type { TaskFile, KaiTaskMetadata, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 export type { KaiTaskStatus } from '../../shared/task-types';
 
 import type { KaiTaskStatus } from '../../shared/task-types';

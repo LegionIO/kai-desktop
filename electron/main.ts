@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen } from 'electron';
 import { join } from 'path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import { registerAgentHandlers, registerTools, updateMcpTools, updateSkillTools, updatePluginTools, updateCliTools, getRegisteredTools } from './ipc/agent.js';
@@ -16,6 +16,7 @@ import { PluginManager } from './plugins/plugin-manager.js';
 import { registerPluginHandlers } from './ipc/plugins.js';
 import { registerMicRecorderHandlers, cleanupMicRecorder } from './audio/mic-recorder.js';
 import { registerLiveSttHandlers } from './audio/live-stt.js';
+import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
 import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
 import { registerRuntime } from './agent/runtime/index.js';
@@ -138,6 +139,7 @@ if (!gotSingleInstanceLock) {
 
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
+let taskTerminalManagerRef: TaskTerminalManager | null = null;
 
 function ensureAppHome(): void {
   const dirs = [
@@ -484,7 +486,7 @@ if (gotSingleInstanceLock) {
       return process.env.PATH ?? '';
     });
 
-    // Request microphone permission on macOS (needed for speech-to-text dictation)
+    // Request microphone permission on macOS (needed for voice recording / speech-to-text)
     if (process.platform === 'darwin') {
       systemPreferences.askForMediaAccess('microphone').then((granted) => {
         console.info(`[${__BRAND_PRODUCT_NAME}] Microphone permission: ${granted ? 'granted' : 'denied'}`);
@@ -631,11 +633,23 @@ if (gotSingleInstanceLock) {
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
+    registerBatchTranscribeHandlers(ipcMain);
+
+    // Debug logging: renderer can write to debug-logs/ via IPC
+    const debugLogDir = join(process.cwd(), 'debug-logs');
+    ipcMain.on('debug:log', (_event, file: string, message: string) => {
+      try {
+        mkdirSync(debugLogDir, { recursive: true });
+        const safeName = file.replace(/[^a-zA-Z0-9_-]/g, '');
+        appendFileSync(join(debugLogDir, `${safeName}.log`), `[${new Date().toISOString()}] ${message}\n`);
+      } catch { /* ignore */ }
+    });
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerTaskHandlers(ipcMain, APP_HOME);
     const taskTerminalManager = new TaskTerminalManager();
+    taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
@@ -1023,4 +1037,5 @@ app.on('before-quit', () => {
   });
   cleanupMicRecorder();
   closeAllOverlayWindows();
+  taskTerminalManagerRef?.dispose();
 });

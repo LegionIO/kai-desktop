@@ -261,7 +261,7 @@ export function createAudioSettingsTool(appHome: string): ToolDefinition {
   return {
     name: 'audio_settings',
     description: [
-      'View or update audio settings. Controls speech provider (native/azure), text-to-speech, dictation, and Azure AI Speech configuration.',
+      'View or update audio settings. Controls speech provider (native/azure), text-to-speech, voice recording, and Azure AI Speech configuration.',
       'Use "get" to see current values, "set" to change one.',
     ].join(' '),
     inputSchema: z.object({
@@ -271,9 +271,8 @@ export function createAudioSettingsTool(appHome: string): ToolDefinition {
         'tts.enabled',
         'tts.voice',
         'tts.rate',
-        'dictation.enabled',
-        'dictation.language',
-        'dictation.continuous',
+        'recording.enabled',
+        'recording.language',
         'azure.endpoint',
         'azure.region',
         'azure.subscriptionKey',

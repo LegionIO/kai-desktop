@@ -3,17 +3,10 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import type { TaskFile, KaiTaskOrder, TaskConversationMessage } from '../../shared/task-types.js';
+import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
 
-// ── Task plan streaming types ─────────────────────────────────────────────
-
-export type TaskStreamEvent = {
-  taskId: string;
-  type: 'text-delta' | 'done' | 'error';
-  text?: string;
-  error?: string;
-};
+export type { TaskStreamEvent } from '../../shared/task-types.js';
 
 const TASK_PLAN_SYSTEM_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
 
@@ -51,6 +44,12 @@ function getTasksDir(appHome: string): string {
   const dir = join(appHome, 'data', 'tasks');
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Validate that a task ID is a well-formed UUID to prevent path traversal. */
+const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+function isValidTaskId(id: unknown): id is string {
+  return typeof id === 'string' && UUID_RE.test(id);
 }
 
 function broadcastTaskChange(appHome: string): void {
@@ -106,6 +105,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   });
 
   ipcMain.handle('tasks:get', (_e, id: string) => {
+    if (!isValidTaskId(id)) return null;
     const filePath = join(getTasksDir(appHome), `${id}.json`);
     if (!existsSync(filePath)) return null;
     try {
@@ -137,6 +137,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   );
 
   ipcMain.handle('tasks:update', (_e, id: string, updates: Partial<TaskFile>) => {
+    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     const filePath = join(getTasksDir(appHome), `${id}.json`);
     if (!existsSync(filePath)) {
       return { error: `Task ${id} not found` };
@@ -158,6 +159,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   });
 
   ipcMain.handle('tasks:delete', (_e, id: string) => {
+    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     try {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       if (existsSync(filePath)) {
@@ -330,41 +332,21 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
       return { title: null };
     }
 
-    const { resolveModelCatalog } = await import('../agent/model-catalog.js');
-    const catalog = resolveModelCatalog(config);
-    const haikuModel = catalog.entries.find((e) =>
-      e.modelConfig.modelName.toLowerCase().includes('haiku'),
-    );
-    const modelEntry = haikuModel ?? catalog.defaultEntry;
-    if (!modelEntry) return { title: null };
+    const TASK_TITLE_PROMPT = [
+      'Generate a concise task title using at most 6 words.',
+      'Summarize what needs to be done, not how.',
+      'Use imperative form (e.g. "Add user auth", "Fix sidebar overflow").',
+      'Return only the title text with no quotes or formatting.',
+    ].join(' ');
 
-    try {
-      const { Agent } = await import('@mastra/core/agent');
-      const { createLanguageModelFromConfig } = await import('../agent/language-model.js');
-      const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
-      type AgentConfig = ConstructorParameters<typeof Agent>[0];
+    const { generateTitle } = await import('../agent/title-generation.js');
+    const title = await generateTitle({
+      systemPrompt: TASK_TITLE_PROMPT,
+      maxWords: 6,
+      input: userMessage,
+      config,
+    });
 
-      const agent = new Agent({
-        id: `task-title-gen-${Date.now()}`,
-        name: 'task-title-generator',
-        instructions: [
-          'Generate a concise task title using at most 6 words.',
-          'Summarize what needs to be done, not how.',
-          'Use imperative form (e.g. "Add user auth", "Fix sidebar overflow").',
-          'Return only the title text with no quotes or formatting.',
-        ].join(' '),
-        model: model as AgentConfig['model'],
-      });
-
-      const result = await agent.generate(userMessage, { maxSteps: 1 });
-      const rawTitle = typeof result.text === 'string' ? result.text : null;
-      if (!rawTitle) return { title: null };
-      const cleaned = rawTitle.trim().replace(/^["']|["']$/g, '').replace(/\s+/g, ' ');
-      const title = cleaned.split(/\s+/).slice(0, 6).join(' ').slice(0, 80);
-      return { title: title || null };
-    } catch (error) {
-      console.error('[tasks] Title generation failed:', error);
-      return { title: null };
-    }
+    return { title };
   });
 }
