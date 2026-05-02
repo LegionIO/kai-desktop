@@ -381,9 +381,6 @@ const appAPI = {
       wavBase64?: string;
       tempFilePath?: string;
       language: string;
-      azureKey: string;
-      azureRegion: string;
-      azureEndpoint?: string;
     }) => ipcRenderer.invoke('stt:batch-transcribe', options) as Promise<{
       text: string;
       durationSec?: number;

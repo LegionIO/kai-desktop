@@ -19,6 +19,7 @@ export interface RecordingOverlayProps {
   elapsedSec: number;
   inputLevel: number;
   isMuted: boolean;
+  isTranscribing?: boolean;
   onToggleMute: () => void;
   onCancel: () => void;
   onDone: () => void;
@@ -28,6 +29,7 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
   elapsedSec,
   inputLevel,
   isMuted,
+  isTranscribing,
   onToggleMute,
   onCancel,
   onDone,
@@ -117,9 +119,9 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
-                <StatusDot status="recording" />
-                <span className="text-xs font-medium text-red-500">
-                  Recording
+                <StatusDot status={isTranscribing ? 'preparing' : 'recording'} />
+                <span className={`text-xs font-medium ${isTranscribing ? 'text-blue-500 animate-pulse' : 'text-red-500'}`}>
+                  {isTranscribing ? 'Transcribing…' : 'Recording'}
                 </span>
               </div>
               <DevicePicker
@@ -149,13 +151,14 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
               <button
                 type="button"
                 onClick={onCancel}
-                className="flex h-9 w-9 items-center justify-center rounded-full bg-muted/60 text-muted-foreground transition-colors hover:bg-muted"
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-muted/60 text-muted-foreground transition-colors hover:bg-muted disabled:opacity-40"
                 title="Cancel recording"
+                disabled={isTranscribing}
               >
                 <XIcon className="h-4 w-4" />
               </button>
-              <span className={`text-xs font-medium ${isMuted ? 'text-amber-500' : 'text-muted-foreground animate-pulse'}`}>
-                {isMuted ? 'Muted' : 'Listening...'}
+              <span className={`text-xs font-medium ${isTranscribing ? 'text-blue-500 animate-pulse' : isMuted ? 'text-amber-500' : 'text-muted-foreground animate-pulse'}`}>
+                {isTranscribing ? 'Processing audio…' : isMuted ? 'Muted' : 'Listening...'}
               </span>
             </div>
 
@@ -163,12 +166,13 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
               <button
                 type="button"
                 onClick={onToggleMute}
-                className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
+                className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors disabled:opacity-40 ${
                   isMuted
                     ? 'bg-amber-600 text-white hover:bg-amber-700'
                     : 'bg-muted/60 text-muted-foreground hover:bg-muted'
                 }`}
                 title={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+                disabled={isTranscribing}
               >
                 {isMuted ? <MicOffIcon className="h-4 w-4" /> : <MicIcon className="h-4 w-4" />}
               </button>
@@ -176,8 +180,9 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
               <button
                 type="button"
                 onClick={onDone}
-                className="flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90"
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
                 title="Finish recording"
+                disabled={isTranscribing}
               >
                 <CheckIcon className="h-4 w-4" />
               </button>

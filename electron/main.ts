@@ -633,7 +633,7 @@ if (gotSingleInstanceLock) {
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
-    registerBatchTranscribeHandlers(ipcMain);
+    registerBatchTranscribeHandlers(ipcMain, getConfig);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
     const debugLogDir = join(process.cwd(), 'debug-logs');

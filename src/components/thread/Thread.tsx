@@ -1467,7 +1467,7 @@ const Composer: FC<{
     cancelRecording,
   } = useVoiceRecording();
 
-  const isRecording = recordingState === 'recording';
+  const isRecording = recordingState === 'recording' || recordingState === 'transcribing';
 
 
   const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
@@ -1613,8 +1613,8 @@ const Composer: FC<{
   const hasFileAttachments = attachments.length > 0;
 
   // Voice recording: stop, transcribe, put text in composer (don't send)
-  const handleRecordingDone = useCallback(() => {
-    const transcript = stopAndTranscribe();
+  const handleRecordingDone = useCallback(async () => {
+    const transcript = await stopAndTranscribe();
     if (transcript.trim()) {
       composerRuntime.setText(transcript.trim());
     }
@@ -1634,6 +1634,7 @@ const Composer: FC<{
         elapsedSec={recordingElapsedSec}
         inputLevel={recordingInputLevel}
         isMuted={recordingMuted}
+        isTranscribing={recordingState === 'transcribing'}
         onToggleMute={toggleRecordingMute}
         onCancel={handleRecordingCancel}
         onDone={handleRecordingDone}

@@ -2,22 +2,24 @@
  * Batch transcription handler for the main process.
  *
  * Accepts a WAV buffer (via base64 or temp file path) and transcribes it
- * using the Azure Speech SDK's continuous recognition. This provides
- * higher-quality transcription than real-time streaming because the SDK
- * can use the full audio context.
+ * using either:
+ *   1. OpenAI Whisper API (/v1/audio/transcriptions) — preferred, fast
+ *   2. Azure Speech SDK continuous recognition — fallback for Azure-only setups
  *
- * For long recordings (> 3 minutes), the audio is split into ~2-minute
- * chunks with silence-boundary detection, transcribed sequentially, and
- * reassembled. Progress events are emitted for each completed chunk.
+ * For long recordings (> 3 minutes) with Azure, the audio is split into
+ * ~2-minute chunks with silence-boundary detection, transcribed sequentially,
+ * and reassembled. Whisper handles up to 25 MB files natively.
  *
  * For the native (Web Speech API) provider, batch transcription is handled
  * in the renderer via the background speech collector — this module is only
- * used for the Azure path.
+ * used for Electron.
  */
 
 import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
 import { readFileSync, unlinkSync } from 'fs';
+import { net } from 'electron';
 import type { IpcMain, WebContents } from 'electron';
+import type { AppConfig } from '../config/schema.js';
 import { chunkWavBuffer, calculateWavDuration } from './audio-chunker.js';
 
 export interface BatchTranscribeRequest {
@@ -27,12 +29,6 @@ export interface BatchTranscribeRequest {
   tempFilePath?: string;
   /** BCP-47 language code, e.g. 'en-US' */
   language: string;
-  /** Azure Speech subscription key */
-  azureKey: string;
-  /** Azure region, e.g. 'eastus' */
-  azureRegion: string;
-  /** Optional custom Azure endpoint URL */
-  azureEndpoint?: string;
 }
 
 export interface BatchTranscribeResult {
@@ -188,12 +184,199 @@ function transcribeSingleBuffer(
   });
 }
 
-export function registerBatchTranscribeHandlers(ipc: IpcMain): void {
+interface WhisperCredentials {
+  /** Full URL to POST the transcription request to */
+  url: string;
+  /** HTTP headers (auth, api-version, etc.) */
+  headers: Record<string, string>;
+  /** Model name for the form data (e.g. 'whisper-1' or deployment name) */
+  model: string;
+  /** Multipart field name for the audio file ('file' for OpenAI, 'audio' for some gateways) */
+  fileField: string;
+}
+
+/**
+ * Resolve Whisper transcription credentials from the app config.
+ *
+ * The LLM gateway plugin configures audio + realtime as Azure-protocol
+ * endpoints pointing at the gateway. The gateway hosts a `speech-to-text`
+ * deployment that speaks the Azure OpenAI transcription API:
+ *   POST {endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version=...
+ *
+ * Priority:
+ *   1. Audio azure config (set by the gateway plugin) — Azure OpenAI protocol
+ *   2. Realtime azure config — Azure OpenAI protocol
+ *   3. Realtime openai config — vanilla OpenAI protocol
+ *   4. Realtime custom config — vanilla OpenAI protocol
+ *   5. Model providers — first openai-compatible provider
+ *
+ * Returns null if no suitable credentials are found.
+ */
+function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null {
+  const DEFAULT_STT_DEPLOYMENT = 'speech-to-text';
+
+  // 1. Audio azure config (gateway plugin sets this)
+  const audio = config.audio;
+  if (audio?.provider === 'azure' && audio.azure?.subscriptionKey && audio.azure?.endpoint) {
+    const base = audio.azure.endpoint.replace(/\/+$/, '');
+    return {
+      url: `${base}/v1/audio/transcriptions`,
+      headers: { 'api-key': audio.azure.subscriptionKey },
+      model: DEFAULT_STT_DEPLOYMENT,
+      fileField: 'audio',
+    };
+  }
+
+  // 2. Realtime azure config
+  const rt = config.realtime;
+  if (rt?.provider === 'azure' && rt.azure?.apiKey && rt.azure?.endpoint) {
+    const base = rt.azure.endpoint.replace(/\/+$/, '');
+    return {
+      url: `${base}/v1/audio/transcriptions`,
+      headers: { 'api-key': rt.azure.apiKey },
+      model: DEFAULT_STT_DEPLOYMENT,
+      fileField: 'audio',
+    };
+  }
+
+  // 3. Realtime openai config — vanilla OpenAI
+  if (rt?.provider === 'openai' && rt.openai?.apiKey) {
+    return {
+      url: 'https://api.openai.com/v1/audio/transcriptions',
+      headers: { 'Authorization': `Bearer ${rt.openai.apiKey}` },
+      model: 'whisper-1',
+      fileField: 'file',
+    };
+  }
+
+  // 4. Realtime custom config
+  if (rt?.provider === 'custom' && rt.custom?.apiKey && rt.custom?.baseUrl) {
+    let httpBase = rt.custom.baseUrl.replace(/\/+$/, '');
+    if (/^wss?:\/\//.test(httpBase)) {
+      httpBase = httpBase.replace(/^ws/, 'http');
+    }
+    return {
+      url: `${httpBase}/v1/audio/transcriptions`,
+      headers: { 'Authorization': `Bearer ${rt.custom.apiKey}` },
+      model: 'whisper-1',
+      fileField: 'file',
+    };
+  }
+
+  // 5. Model providers — first OpenAI-compatible with an API key
+  if (config.models?.providers) {
+    for (const provider of Object.values(config.models.providers)) {
+      if (provider.type === 'openai-compatible' && provider.apiKey) {
+        const base = provider.endpoint?.replace(/\/+$/, '') || 'https://api.openai.com';
+        return {
+          url: `${base}/v1/audio/transcriptions`,
+          headers: { 'Authorization': `Bearer ${provider.apiKey}` },
+          model: 'whisper-1',
+          fileField: 'file',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Transcribe audio using Whisper-compatible API (OpenAI or Azure OpenAI).
+ *
+ * Uses Electron's net.fetch (Chromium network stack) which respects the
+ * OS certificate store — essential for corporate proxies that intercept TLS.
+ */
+async function transcribeWithWhisper(
+  wavBuffer: Buffer,
+  language: string,
+  creds: WhisperCredentials,
+): Promise<{ text: string }> {
+  // Convert BCP-47 (e.g. 'en-US') to ISO-639-1 (e.g. 'en') for Whisper
+  const langCode = language.split('-')[0].toLowerCase();
+
+  // Build multipart/form-data body manually
+  const boundary = `----WhisperBoundary${Date.now()}${Math.random().toString(36).slice(2)}`;
+  const parts: Buffer[] = [];
+
+  // file/audio field (field name varies by provider)
+  parts.push(Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="${creds.fileField}"; filename="recording.wav"\r\n` +
+    `Content-Type: audio/wav\r\n\r\n`
+  ));
+  parts.push(wavBuffer);
+  parts.push(Buffer.from('\r\n'));
+
+  // model field
+  parts.push(Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="model"\r\n\r\n` +
+    `${creds.model}\r\n`
+  ));
+
+  // language field
+  parts.push(Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="language"\r\n\r\n` +
+    `${langCode}\r\n`
+  ));
+
+  // closing boundary
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+
+  const body = Buffer.concat(parts);
+
+  console.log('[BatchTranscribe:Whisper] POST %s, model=%s, language=%s, wav=%d bytes, body=%d bytes',
+    creds.url, creds.model, langCode, wavBuffer.length, body.length);
+
+  const response = await net.fetch(creds.url, {
+    method: 'POST',
+    headers: {
+      ...creds.headers,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`Whisper API error ${response.status}: ${errorBody}`);
+  }
+
+  const responseText = await response.text();
+
+  // Parse response — gateway returns JSON with combinedPhrases, OpenAI returns plain text
+  let transcribedText: string;
+  try {
+    const json = JSON.parse(responseText) as {
+      text?: string;
+      combinedPhrases?: Array<{ text: string }>;
+    };
+    // Gateway format: { combinedPhrases: [{ text: "..." }] }
+    if (json.combinedPhrases?.length) {
+      transcribedText = json.combinedPhrases.map(p => p.text).join(' ');
+    } else {
+      // Standard OpenAI JSON format: { text: "..." }
+      transcribedText = json.text ?? responseText;
+    }
+  } catch {
+    // Plain text response (response_format=text)
+    transcribedText = responseText;
+  }
+
+  console.log('[BatchTranscribe:Whisper] Done: %d chars', transcribedText.length);
+  return { text: transcribedText.trim() };
+}
+
+export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => AppConfig): void {
   ipc.handle('stt:batch-transcribe', async (event, request: BatchTranscribeRequest): Promise<BatchTranscribeResult> => {
     console.log('[BatchTranscribe] Request received, language=%s, hasWavBase64=%s, hasTempFile=%s',
       request.language, Boolean(request.wavBase64), Boolean(request.tempFilePath));
 
     try {
+      const config = getConfig();
+
       // Load the WAV buffer
       let wavBuffer: Buffer;
       if (request.tempFilePath) {
@@ -213,16 +396,43 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain): void {
       const durationSec = calculateWavDuration(wavBuffer);
       console.log('[BatchTranscribe] WAV buffer: %d bytes, ~%.1f seconds', wavBuffer.length, durationSec);
 
+      // ── Whisper HTTP path (preferred — fast, simple HTTP) ──────
+      const whisperCreds = resolveWhisperCredentials(config);
+      if (whisperCreds) {
+        console.log('[BatchTranscribe] Using Whisper API: %s', whisperCreds.url);
+        try {
+          const result = await transcribeWithWhisper(
+            wavBuffer,
+            request.language,
+            whisperCreds,
+          );
+          return { text: result.text, durationSec };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[BatchTranscribe:Whisper] Error:', msg);
+          return { text: '', error: `Whisper transcription failed: ${msg}` };
+        }
+      }
+
+      // ── Azure Speech SDK path ───────────────────────────────────
+      const azureConfig = config.audio?.azure;
+      if (!azureConfig?.subscriptionKey) {
+        return { text: '', error: 'No transcription credentials configured. Configure an OpenAI-compatible provider or Azure Speech credentials.' };
+      }
+
       const sender = event.sender;
+      const azureKey = azureConfig.subscriptionKey;
+      const azureRegion = azureConfig.region ?? 'eastus';
+      const azureEndpoint = azureConfig.sttEndpoint ?? azureConfig.endpoint;
 
       // Short recordings (< 3 min): transcribe as single unit
       if (durationSec < CHUNK_THRESHOLD_SEC) {
         const result = await transcribeSingleBuffer(
           wavBuffer,
           request.language,
-          request.azureKey,
-          request.azureRegion,
-          request.azureEndpoint,
+          azureKey,
+          azureRegion,
+          azureEndpoint,
           sender,
           0,
           1,
@@ -242,9 +452,9 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain): void {
         const result = await transcribeSingleBuffer(
           chunk.wavBuffer,
           request.language,
-          request.azureKey,
-          request.azureRegion,
-          request.azureEndpoint,
+          azureKey,
+          azureRegion,
+          azureEndpoint,
           sender,
           chunk.index,
           chunk.total,
