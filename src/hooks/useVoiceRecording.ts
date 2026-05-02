@@ -9,6 +9,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { createBackgroundSpeechCollector, type BackgroundSpeechCollector } from '@/lib/audio/background-speech-collector';
+import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 
 type RecordingState = 'idle' | 'recording';
 
@@ -41,6 +42,8 @@ export interface UseVoiceRecordingResult {
   recordingState: RecordingState;
   elapsedSec: number;
   inputLevel: number;
+  isMuted: boolean;
+  toggleMute: () => void;
   startRecording: () => void;
   stopAndTranscribe: () => string;
   cancelRecording: () => void;
@@ -51,10 +54,17 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [elapsedSec, setElapsedSec] = useState(0);
   const [inputLevel, setInputLevel] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const collectorRef = useRef<BackgroundSpeechCollector | null>(null);
+  const webMonitorUnsubRef = useRef<(() => void) | null>(null);
+
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app &&
+    (window.app as Record<string, unknown>).__isWebBridge,
+  );
 
   const audioConfig = (config as Record<string, unknown> | null)?.audio as {
     recording?: { enabled?: boolean; language?: string; inputDeviceId?: string };
@@ -74,6 +84,8 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       clearInterval(levelTimerRef.current);
       levelTimerRef.current = null;
     }
+    webMonitorUnsubRef.current?.();
+    webMonitorUnsubRef.current = null;
   }, []);
 
   const stopMic = useCallback(() => {
@@ -92,6 +104,41 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
   const startRecording = useCallback(async () => {
     if (recordingState !== 'idle') return;
 
+    const deviceId = selectedDeviceId ?? 'default';
+
+    // Show the overlay immediately (optimistic UI)
+    setRecordingState('recording');
+    setElapsedSec(0);
+    playTone(320, 480);
+
+    // Elapsed timer — start right away
+    let elapsed = 0;
+    timerRef.current = setInterval(() => {
+      elapsed += 1;
+      setElapsedSec(elapsed);
+    }, 1000);
+
+    // For web bridge, we don't need the IPC mic — use WebAudioMonitor for levels
+    if (isWebBridge) {
+      debugLog(`web bridge recording, device=${deviceId}, language=${language}`);
+
+      // Start background speech collector
+      const collector = createBackgroundSpeechCollector(language);
+      collectorRef.current = collector;
+      collector.start();
+
+      // Audio level polling via WebAudioMonitor
+      const monitor = WebAudioMonitor.getInstance();
+      webMonitorUnsubRef.current = monitor.subscribeAll([deviceId]);
+      levelTimerRef.current = setInterval(() => {
+        const levels = monitor.getLevels();
+        setInputLevel(levels[deviceId] ?? 0);
+      }, 66);
+
+      return;
+    }
+
+    // Electron path: use IPC mic API
     const mic = (window as unknown as { app?: { mic?: Record<string, unknown> } }).app?.mic as {
       startRecording: (deviceId?: string) => Promise<{ ok?: boolean; error?: string }>;
       startMonitor: (deviceIds?: string[]) => Promise<unknown>;
@@ -100,18 +147,24 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
 
     if (!mic) {
       debugLog('mic API not available');
+      cleanupTimers();
+      setRecordingState('idle');
       return;
     }
 
     try {
-      const result = await mic.startRecording(selectedDeviceId ?? undefined);
+      // Start mic recording and monitoring in parallel
+      const [result] = await Promise.all([
+        mic.startRecording(selectedDeviceId ?? undefined),
+        mic.startMonitor([deviceId]),
+      ]);
+
       if (result.error) {
         debugLog(`start error: ${result.error}`);
+        cleanupTimers();
+        setRecordingState('idle');
         return;
       }
-
-      // Start audio level monitoring
-      void mic.startMonitor();
 
       // Start background speech collector
       debugLog(`creating speech collector language=${language}`);
@@ -119,32 +172,19 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       collectorRef.current = collector;
       collector.start();
 
-      setRecordingState('recording');
-      playTone(320, 480); // rising tone
-
-      // Elapsed timer
-      setElapsedSec(0);
-      let elapsed = 0;
-      timerRef.current = setInterval(() => {
-        elapsed += 1;
-        setElapsedSec(elapsed);
-      }, 1000);
-
       // Audio level polling
       levelTimerRef.current = setInterval(() => {
         mic.getLevel().then((levels) => {
-          const values = Object.values(levels);
-          const avg = values.length > 0
-            ? values.reduce((a, b) => a + b, 0) / values.length
-            : 0;
-          setInputLevel(avg);
+          setInputLevel(levels[deviceId] ?? 0);
         }).catch(() => setInputLevel(0));
       }, 66);
 
     } catch (err) {
       console.error('[useVoiceRecording] Start failed:', err);
+      cleanupTimers();
+      setRecordingState('idle');
     }
-  }, [recordingState, selectedDeviceId, language]);
+  }, [recordingState, selectedDeviceId, language, isWebBridge, cleanupTimers]);
 
   // ── Stop & Transcribe ────────────────────────────────────────────
 
@@ -166,6 +206,7 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     setRecordingState('idle');
     setElapsedSec(0);
     setInputLevel(0);
+    setIsMuted(false);
 
     return transcript;
   }, [recordingState, cleanupTimers, stopMic]);
@@ -185,7 +226,14 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     setRecordingState('idle');
     setElapsedSec(0);
     setInputLevel(0);
+    setIsMuted(false);
   }, [recordingState, cleanupTimers, stopMic]);
+
+  // ── Toggle Mute ─────────────────────────────────────────────────
+
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => !prev);
+  }, []);
 
   // ── Cleanup on unmount ───────────────────────────────────────────
 
@@ -199,7 +247,9 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
   return {
     recordingState,
     elapsedSec,
-    inputLevel,
+    inputLevel: isMuted ? 0 : inputLevel,
+    isMuted,
+    toggleMute,
     startRecording: () => void startRecording(),
     stopAndTranscribe,
     cancelRecording,

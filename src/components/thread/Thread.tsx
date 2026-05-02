@@ -1460,6 +1460,8 @@ const Composer: FC<{
     recordingState,
     elapsedSec: recordingElapsedSec,
     inputLevel: recordingInputLevel,
+    isMuted: recordingMuted,
+    toggleMute: toggleRecordingMute,
     startRecording,
     stopAndTranscribe,
     cancelRecording,
@@ -1631,6 +1633,8 @@ const Composer: FC<{
       <RecordingOverlay
         elapsedSec={recordingElapsedSec}
         inputLevel={recordingInputLevel}
+        isMuted={recordingMuted}
+        onToggleMute={toggleRecordingMute}
         onCancel={handleRecordingCancel}
         onDone={handleRecordingDone}
       />

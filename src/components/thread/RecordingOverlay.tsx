@@ -12,21 +12,25 @@ import { useState, useEffect, useRef, useCallback, type FC } from 'react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
 import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
-import { MicIcon, XIcon, SendHorizontalIcon } from 'lucide-react';
+import { MicIcon, MicOffIcon, XIcon, CheckIcon } from 'lucide-react';
 import { formatDuration, LevelBars, StatusDot, DevicePicker } from './overlay-shared';
 
 export interface RecordingOverlayProps {
   elapsedSec: number;
   inputLevel: number;
+  isMuted: boolean;
+  onToggleMute: () => void;
   onCancel: () => void;
-  onSend: () => void;
+  onDone: () => void;
 }
 
 export const RecordingOverlay: FC<RecordingOverlayProps> = ({
   elapsedSec,
   inputLevel,
+  isMuted,
+  onToggleMute,
   onCancel,
-  onSend,
+  onDone,
 }) => {
   const { config, updateConfig } = useConfig();
   const isWebBridge = Boolean(
@@ -139,12 +143,8 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
             </div>
           </div>
 
-          {/* Row 2: Cancel + Send */}
+          {/* Row 2: Cancel + Status + Mute + Done */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-            <span className="text-xs font-medium text-muted-foreground animate-pulse">
-              Listening...
-            </span>
-
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -154,15 +154,32 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
               >
                 <XIcon className="h-4 w-4" />
               </button>
+              <span className={`text-xs font-medium ${isMuted ? 'text-amber-500' : 'text-muted-foreground animate-pulse'}`}>
+                {isMuted ? 'Muted' : 'Listening...'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onToggleMute}
+                className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${
+                  isMuted
+                    ? 'bg-amber-600 text-white hover:bg-amber-700'
+                    : 'bg-muted/60 text-muted-foreground hover:bg-muted'
+                }`}
+                title={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+              >
+                {isMuted ? <MicOffIcon className="h-4 w-4" /> : <MicIcon className="h-4 w-4" />}
+              </button>
 
               <button
                 type="button"
-                onClick={onSend}
-                className="flex h-9 items-center gap-1.5 rounded-full bg-primary px-4 text-primary-foreground transition-colors hover:bg-primary/90"
-                title="Send message"
+                onClick={onDone}
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90"
+                title="Finish recording"
               >
-                <SendHorizontalIcon className="h-4 w-4" />
-                <span className="text-xs font-medium">Send</span>
+                <CheckIcon className="h-4 w-4" />
               </button>
             </div>
           </div>
