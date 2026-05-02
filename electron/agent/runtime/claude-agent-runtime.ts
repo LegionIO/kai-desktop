@@ -550,6 +550,25 @@ function normalizeToolName(name: string): string {
     .replace(/^_/, '');
 }
 
+/**
+ * Rewrite Claude Code CLI-specific advice in SDK error messages.
+ *
+ * The SDK was designed for the interactive CLI and its error messages
+ * reference CLI commands (`--model`, `claude login`, etc.) that don't
+ * apply when running inside Kai's desktop UI.
+ */
+function rewriteSdkError(text: string): string {
+  return text
+    .replace(
+      /Run --model to pick a different model\.?/gi,
+      'Try selecting a different model in the model picker, or check that your provider endpoint and API key are configured correctly in Settings → Model Providers.',
+    )
+    .replace(
+      /Run `claude login`[^.]*/gi,
+      'Check your API key in Settings → Model Providers.',
+    );
+}
+
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
   const events: StreamEvent[] = [];
 
@@ -711,10 +730,11 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
 
       if (msg.subtype === 'error_during_execution' || msg.subtype === 'error_max_turns' || msg.subtype === 'error_max_budget_usd') {
         const errors = msg.errors as string[] | undefined;
+        const rawError = errors?.join('; ') ?? `SDK error: ${msg.subtype}`;
         events.push({
           conversationId,
           type: 'error',
-          error: errors?.join('; ') ?? `SDK error: ${msg.subtype}`,
+          error: rewriteSdkError(rawError),
         });
       }
 

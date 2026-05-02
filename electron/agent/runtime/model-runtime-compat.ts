@@ -195,7 +195,7 @@ function resolveExplicitMode(
 function extractClaudeAuth(model: ModelCatalogEntry): ClaudeAuth {
   return {
     modelName: model.modelConfig.modelName,
-    baseUrl: model.modelConfig.endpoint,
+    baseUrl: stripV1Suffix(model.modelConfig.endpoint),
     apiKey: model.modelConfig.apiKey,
   };
 }
@@ -218,13 +218,25 @@ function crossReferenceAnthropicProvider(
     ) {
       return {
         modelName: entry.modelConfig.modelName,
-        baseUrl: entry.modelConfig.endpoint,
+        baseUrl: stripV1Suffix(entry.modelConfig.endpoint),
         apiKey: entry.modelConfig.apiKey,
       };
     }
   }
 
   return null;
+}
+
+/**
+ * Strip a trailing `/v1` (with optional trailing slash) from an endpoint URL.
+ *
+ * The Claude Code SDK sets `ANTHROPIC_BASE_URL` and appends `/v1/messages`
+ * itself.  Kai's Anthropic-type providers store endpoints with `/v1`
+ * (the standard Anthropic Messages API convention), so passing the raw
+ * endpoint would produce a double-path like `.../v1/v1/messages`.
+ */
+function stripV1Suffix(url: string): string {
+  return url.replace(/\/v1\/?$/, '');
 }
 
 function providerTypeLabel(type: LLMProviderType): string {

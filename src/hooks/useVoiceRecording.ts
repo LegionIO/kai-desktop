@@ -108,14 +108,6 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     webMonitorUnsubRef.current = null;
   }, []);
 
-  const stopMic = useCallback(() => {
-    const mic = getMic();
-    if (mic) {
-      mic.stopRecording().catch(() => { /* ignore */ });
-      mic.stopMonitor().catch(() => { /* ignore */ });
-    }
-  }, [getMic]);
-
   // ── Start Recording ──────────────────────────────────────────────
 
   const startRecording = useCallback(async () => {
