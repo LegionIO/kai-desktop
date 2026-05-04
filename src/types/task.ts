@@ -31,8 +31,8 @@ export const KAI_TASK_STATUS_LABELS: Record<KaiTaskStatus, string> = {
 
 /** Tailwind color classes for each lane's status badge. */
 export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
-  todo: 'bg-muted text-muted-foreground',
-  in_progress: 'bg-blue-500/10 text-blue-500',
+  todo: 'bg-sky-500/10 text-sky-600',
+  in_progress: 'bg-rose-500/10 text-rose-500',
   ai_review: 'bg-amber-500/10 text-amber-500',
   human_review: 'bg-purple-500/10 text-purple-400',
   done: 'bg-emerald-500/10 text-emerald-500',
@@ -40,8 +40,8 @@ export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
 
 /** Border-top accent color for kanban column headers. */
 export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
-  todo: 'border-t-muted-foreground/40',
-  in_progress: 'border-t-blue-500',
+  todo: 'border-t-sky-500',
+  in_progress: 'border-t-rose-500',
   ai_review: 'border-t-amber-500',
   human_review: 'border-t-purple-400',
   done: 'border-t-emerald-500',

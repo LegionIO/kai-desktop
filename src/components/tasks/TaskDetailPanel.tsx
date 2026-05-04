@@ -279,7 +279,27 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   // Runtime display name helper
   const runtimeDisplayName = (rt: string) =>
-    rt === 'claude-code' ? 'Claude Code' : rt === 'codex' ? 'Codex' : rt === 'mastra' ? 'Mastra' : 'Shell';
+    rt === 'claude-code' ? 'Claude Code' : rt === 'codex' ? 'Codex' : rt === 'mastra' ? 'Mastra' : rt;
+
+  const runtimeColors: Record<string, string> = {
+    'claude-code': 'bg-amber-500/10 text-amber-600',
+    'codex': 'bg-emerald-500/10 text-emerald-600',
+    'mastra': 'bg-violet-500/10 text-violet-500',
+  };
+
+  const runtimeDotColors: Record<string, string> = {
+    'claude-code': 'bg-amber-500',
+    'codex': 'bg-emerald-500',
+    'mastra': 'bg-violet-500',
+  };
+
+  const statusDotColors: Record<KaiTaskStatus, string> = {
+    todo: 'bg-sky-500',
+    in_progress: 'bg-rose-500',
+    ai_review: 'bg-amber-500',
+    human_review: 'bg-purple-400',
+    done: 'bg-emerald-500',
+  };
 
   return (
     <div className="relative flex h-full w-full flex-col bg-background">
@@ -290,7 +310,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto">
         <div className="flex min-h-full flex-col">
         <div className="flex-1">
-        <div className="relative z-10 mx-auto max-w-5xl px-3 pr-5 pt-16 pb-5 md:px-6 md:pr-8 md:pt-20">
+        <div className="relative z-10 mx-auto max-w-3xl px-3 pr-5 pt-16 pb-5 md:px-6 md:pr-8 md:pt-20">
         {/* ─── Task title + Delete ─── */}
         <div className="flex items-start gap-1.5">
           <h1 className="text-2xl font-semibold text-foreground leading-tight">
@@ -325,17 +345,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           )}
         </div>
 
-        {/* ─── Row 1: Status | Created ─── */}
+        {/* ─── Row 1: Status | Updated ─── */}
         <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
           {/* Status */}
           <div className="flex items-center gap-2">
-            <span className="text-muted-foreground">Status</span>
+            <span className="w-11 shrink-0 text-muted-foreground">Status</span>
             <DropdownMenu.Root>
               <DropdownMenu.Trigger asChild>
                 <button
                   type="button"
                   className={cn(
-                    'inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors hover:opacity-80',
+                    'inline-flex w-32 items-center justify-between gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors hover:opacity-80',
                     KAI_TASK_STATUS_COLORS[task.status],
                   )}
                 >
@@ -355,13 +375,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     <DropdownMenu.Item
                       key={status}
                       disabled={status === task.status}
-                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70 data-[disabled]:opacity-40"
+                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70 data-[disabled]:opacity-50"
                       onSelect={() => handleStatusChange(status)}
                     >
                       <span
                         className={cn(
                           'h-2 w-2 rounded-full',
-                          KAI_TASK_STATUS_COLORS[status].split(' ')[0],
+                          statusDotColors[status],
                         )}
                       />
                       {KAI_TASK_STATUS_LABELS[status]}
@@ -372,26 +392,46 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
             </DropdownMenu.Root>
           </div>
 
-          {/* Created date */}
+          {/* Updated date (hover pill shows both Created & Updated) */}
           <div className="flex items-center gap-2">
-            <span className="text-muted-foreground">Created</span>
-            <span className="font-medium text-foreground">
-              {new Date(task.createdAt).toLocaleDateString()}
-            </span>
+            <span className="text-muted-foreground">Updated</span>
+            <Tooltip
+              content={
+                <div className="flex flex-col gap-1 py-0.5">
+                  <div className="flex items-center gap-2">
+                    <span className="opacity-60">Created</span>
+                    <span>{new Date(task.createdAt).toLocaleString()}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="opacity-60">Updated</span>
+                    <span>{new Date(task.updatedAt).toLocaleString()}</span>
+                  </div>
+                </div>
+              }
+              side="bottom"
+              sideOffset={4}
+            >
+              <span className="cursor-default rounded-full bg-muted/60 px-2.5 py-0.5 text-xs font-medium text-foreground transition-colors hover:bg-muted">
+                {new Date(task.updatedAt).toLocaleString()}
+              </span>
+            </Tooltip>
           </div>
         </div>
 
         {/* ─── Row 2: Agent runtime + Start/Stop Agent ─── */}
-        <div className="mt-2 flex items-center gap-3 text-sm">
-          <span className="text-muted-foreground">Agent</span>
+        <div className="mt-2 flex items-center gap-2 text-sm">
+          <span className="w-11 shrink-0 text-muted-foreground">Agent</span>
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
               <button
                 type="button"
-                className="inline-flex items-center gap-1 text-sm font-medium text-foreground transition-colors hover:text-foreground/80"
+                className={cn(
+                  'inline-flex w-32 items-center justify-between gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors hover:opacity-80',
+                  runtimeColors[selectedRuntime] ?? 'bg-muted/60 text-foreground',
+                )}
               >
                 {runtimeDisplayName(selectedRuntime)}
-                <svg className="h-3 w-3 text-muted-foreground" viewBox="0 0 12 12" fill="none">
+                <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
                   <path d="M3 5l3 3 3-3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </button>
@@ -402,12 +442,19 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 sideOffset={4}
                 className="z-[9999] min-w-[140px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
               >
-                {['claude-code', 'codex', 'mastra', 'shell'].map((rt) => (
+                {['claude-code', 'codex', 'mastra'].map((rt) => (
                   <DropdownMenu.Item
                     key={rt}
-                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
+                    disabled={rt === selectedRuntime}
+                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70 data-[disabled]:opacity-50"
                     onSelect={() => setSelectedRuntime(rt)}
                   >
+                    <span
+                      className={cn(
+                        'h-2 w-2 rounded-full',
+                        runtimeDotColors[rt] ?? 'bg-muted-foreground',
+                      )}
+                    />
                     {runtimeDisplayName(rt)}
                   </DropdownMenu.Item>
                 ))}

@@ -161,7 +161,7 @@ export const Thread: FC<{
           <PinnedUserMessage viewportRef={viewportRef} />
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
-              <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
+              <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
                 <ThreadPrimitive.Messages
                   components={{
                     UserMessage,
@@ -270,7 +270,7 @@ const ComputerTabSurface: FC = () => {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-          <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
+          <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
@@ -291,7 +291,7 @@ const ComputerTabSurface: FC = () => {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-        <div className="mx-auto flex w-full max-w-5xl min-h-0 flex-col">
+        <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
           <ComputerSessionPanel session={activeComputerSession} stickyTopClassName="top-12 md:top-14" />
         </div>
       </div>
@@ -585,7 +585,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
           : 'h-0 overflow-hidden opacity-0'
       }`}
     >
-      <div className="mx-auto flex w-full max-w-5xl justify-end px-3 pr-5 md:px-6 md:pr-8">
+      <div className="mx-auto flex w-full max-w-3xl justify-end px-3 pr-5 md:px-6 md:pr-8">
         <div className="max-w-[88%] md:max-w-[72%]">
           <div
             className="pointer-events-auto ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
