@@ -384,27 +384,27 @@ export const ConversationList: FC<ConversationListProps> = ({
         <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           Chats
         </span>
-        <div className="relative">
-          <DropdownMenu.Root>
-            <DropdownMenu.Trigger asChild>
-              <button
-                ref={moreButtonRef}
-                type="button"
-                className={cn(
-                  'rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground',
-                  (!isDefaultSort || activeFilterCount > 0 || showArchived) && 'text-primary',
-                )}
-              >
-                <ListFilterIcon className="h-3.5 w-3.5" />
-              </button>
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Portal>
-              <DropdownMenu.Content
-                align="start"
-                side="bottom"
-                sideOffset={6}
-                className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-              >
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button
+              ref={moreButtonRef}
+              type="button"
+              className="relative rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
+            >
+              <ListFilterIcon className="h-3.5 w-3.5" />
+              {/* Activity dot — visible when sort, filter, or archive is non-default */}
+              {(!isDefaultSort || activeFilterCount > 0 || showArchived) && (
+                <span className="pointer-events-none absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary" />
+              )}
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="start"
+              side="bottom"
+              sideOffset={6}
+              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
                 <DropdownMenu.Item
                   className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
                   onSelect={() => { setSortOpen(true); setFilterOpen(false); }}
@@ -447,11 +447,6 @@ export const ConversationList: FC<ConversationListProps> = ({
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
-          {/* Activity dot — visible when sort, filter, or archive is non-default */}
-          {(!isDefaultSort || activeFilterCount > 0) && (
-            <span className="pointer-events-none absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary" />
-          )}
-        </div>
         <div className="flex-1" />
         <button
           type="button"

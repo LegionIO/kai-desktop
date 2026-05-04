@@ -1,11 +1,9 @@
 /**
- * TaskCreationView — AI-powered task creation with splash + streaming plan.
+ * TaskCreationView — AI-powered task creation splash screen.
  *
- * Phase 1: Splash background (reuses SplashBackground) + composer at bottom.
- * Phase 2: Streaming markdown plan + composer for refinements.
- *
- * The composer matches the chat composer's button layout: add files, folder,
- * model settings, computer use, voice recording, call, send/stop.
+ * Phase 1: Splash background + composer at bottom for initial prompt.
+ * After the user submits, creates an AI task and selects it in the sidebar,
+ * transitioning to the unified TaskDetailPanel view.
  */
 
 import {
@@ -18,7 +16,6 @@ import {
 } from 'react';
 import {
   SendHorizonalIcon,
-  StopCircleIcon,
   PlusIcon,
   FolderOpenIcon,
   FileIcon,
@@ -29,7 +26,6 @@ import {
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { SplashBackground } from '@/components/SplashBackground';
-import { MarkdownText } from '@/components/thread/MarkdownText';
 import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -45,7 +41,7 @@ import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 // ── Props ───────────────────────────────────────────────────────────────
 
 interface TaskCreationViewProps {
-  /** Called when the user navigates away / finishes creation. */
+  /** Called when the user submits and the task is created — passes the new task ID. */
   onDone?: (taskId: string) => void;
   /** Called when the user cancels without creating a task. */
   onCancel?: () => void;
@@ -53,21 +49,17 @@ interface TaskCreationViewProps {
 
 // ── Component ───────────────────────────────────────────────────────────
 
-export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, onCancel: _onCancel }) => {
-  const { state, startAITaskCreation, refineTaskPlan, cancelAIStream, exitAICreation } =
-    useTasks();
-  const { creatingTaskId, streamingText, isStreamingPlan } = state;
+export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: _onCancel }) => {
+  const { startAITaskCreation, selectTask } = useTasks();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
 
   const [input, setInput] = useState('');
-  const [hasSubmitted, setHasSubmitted] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Voice recording hook
-  const { recordingState: taskRecordingState, startRecording: taskStartRecording, stopAndTranscribe: taskStopAndTranscribe } = useVoiceRecording();
+  const { startRecording: taskStartRecording } = useVoiceRecording();
 
   // Recording config (just to check enabled state)
   const recordingEnabled = (config as Record<string, unknown> | null)?.audio
@@ -148,13 +140,6 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
 
   const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
-  // ── Auto-scroll to bottom as streaming text arrives ─────────────────
-  useEffect(() => {
-    if (scrollRef.current && isStreamingPlan) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [streamingText, isStreamingPlan]);
-
   // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
@@ -168,32 +153,13 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
     textareaRef.current?.focus();
   }, []);
 
-  // Cleanup on unmount — use ref to avoid stale closure
-  const exitRef = useRef(exitAICreation);
-  exitRef.current = exitAICreation;
-  useEffect(() => {
-    return () => {
-      exitRef.current();
-    };
-  }, []);
-
   const handleSubmit = useCallback(() => {
-    // If recording, stop and use the transcript
-    let text = input.trim();
-    if (taskRecordingState === 'recording') {
-      const transcript = taskStopAndTranscribe();
-      text = transcript.trim() || text;
-    }
+    const text = input.trim();
     if (!text) return;
 
     setInput('');
-    if (!hasSubmitted) {
-      setHasSubmitted(true);
-      void startAITaskCreation(text);
-    } else if (creatingTaskId) {
-      void refineTaskPlan(creatingTaskId, text);
-    }
-  }, [input, hasSubmitted, creatingTaskId, startAITaskCreation, refineTaskPlan, taskRecordingState, taskStopAndTranscribe]);
+    void startAITaskCreation(text);
+  }, [input, startAITaskCreation]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -205,49 +171,28 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
     [handleSubmit],
   );
 
-  const handleStop = useCallback(() => {
-    cancelAIStream();
-  }, [cancelAIStream]);
+  // Watch for creatingTaskId to appear — once the task is created, select it and exit creation mode
+  const { state } = useTasks();
+  const hasTransitioned = useRef(false);
+  useEffect(() => {
+    if (state.creatingTaskId && !hasTransitioned.current) {
+      hasTransitioned.current = true;
+      selectTask(state.creatingTaskId);
+      onDone?.(state.creatingTaskId);
+    }
+  }, [state.creatingTaskId, selectTask, onDone]);
 
-  // Get the current task title for the header
-  const creatingTask = creatingTaskId
-    ? state.tasks.find((t) => t.id === creatingTaskId)
-    : null;
-
-  // Display text: prefer accumulated streaming text, fall back to persisted description
-  const displayText = streamingText || creatingTask?.description || '';
-
-  // ── Unified layout: splash fades out when content appears ───────────
+  // ── Render: Splash + Composer ──────────────────────────────────────────
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
-      {/* Full-bleed background — fades out after first submit */}
-      <SplashBackground visible={!hasSubmitted} storageKey="__task_bg_last_index" />
+      {/* Full-bleed splash background */}
+      <SplashBackground visible storageKey="__task_bg_last_index" />
 
-      {/* Content area (empty in Phase 1, streaming markdown in Phase 2) */}
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto">
-        {hasSubmitted && (
-          <div className="mx-auto max-w-3xl px-6 pt-16 pb-6 md:pt-20">
-            {displayText ? (
-              <div className="prose prose-sm dark:prose-invert max-w-none">
-                <MarkdownText text={displayText} />
-              </div>
-            ) : isStreamingPlan ? (
-              <div className="flex items-center gap-2 text-muted-foreground">
-                <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                <span className="text-sm">Generating plan...</span>
-              </div>
-            ) : null}
-          </div>
-        )}
-      </div>
+      {/* Spacer */}
+      <div className="flex-1" />
 
-      {/* Bottom gradient (matches chat — only shown when content is scrollable) */}
-      {hasSubmitted && (
-        <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />
-      )}
-
-      {/* Composer at bottom — matches chat composer layout exactly */}
+      {/* Composer at bottom */}
       <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
         {/* Hidden file input for web bridge */}
         {isWebBridge && (
@@ -293,16 +238,9 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={
-                !hasSubmitted
-                  ? 'Describe what you want to accomplish...'
-                  : isStreamingPlan
-                    ? 'Waiting for plan to finish...'
-                    : 'Refine the plan...'
-              }
-              disabled={isStreamingPlan}
+              placeholder="Describe what you want to accomplish..."
               rows={1}
-              className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none disabled:opacity-50 md:text-[15px]"
+              className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]"
             />
             <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
               {/* Left side: add files + working directory */}
@@ -401,31 +339,21 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone: _onDone, o
                   )}
                 </div>
               </div>
-              {/* Right side: recording, send/stop */}
+              {/* Right side: recording, send */}
               <div className="flex items-center gap-1.5 md:gap-2">
                 {recordingEnabled && (
                   <RecordingButton onStart={taskStartRecording} />
                 )}
-                {isStreamingPlan ? (
+                <Tooltip content="Send message" side="top" sideOffset={8}>
                   <button
                     type="button"
-                    onClick={handleStop}
-                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
+                    onClick={handleSubmit}
+                    disabled={!canSend}
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
                   >
-                    <StopCircleIcon className="h-4 w-4" />
+                    <SendHorizonalIcon className="h-4 w-4" />
                   </button>
-                ) : (
-                  <Tooltip content="Send message" side="top" sideOffset={8}>
-                    <button
-                      type="button"
-                      onClick={handleSubmit}
-                      disabled={!canSend}
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
-                    >
-                      <SendHorizonalIcon className="h-4 w-4" />
-                    </button>
-                  </Tooltip>
-                )}
+                </Tooltip>
               </div>
             </div>
           </div>
