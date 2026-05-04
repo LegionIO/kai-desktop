@@ -125,7 +125,7 @@ export function convertJsonSchemaToZod(schema: Record<string, unknown>): z.ZodTy
         }
         shape[key] = fieldType;
       }
-      return finalize(z.object(shape));
+      return finalize(z.object(shape).passthrough());
     }
     default:
       return finalize(z.any());
