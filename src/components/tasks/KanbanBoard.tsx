@@ -19,7 +19,7 @@ import {
   type DragEndEvent,
 } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
-import { SearchIcon, FilterIcon, XIcon } from 'lucide-react';
+import { SearchIcon, FilterIcon, XIcon, PlusIcon } from 'lucide-react';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_COLUMNS, KAI_TASK_STATUS_LABELS } from '@/types/task';
@@ -27,9 +27,13 @@ import { KanbanColumn } from './KanbanColumn';
 import { TaskCard } from './TaskCard';
 import { TaskDetailPanel } from './TaskDetailPanel';
 import { TaskDetailModal } from './TaskDetailModal';
-import { CreateTaskDialog } from './CreateTaskDialog';
 
-export const KanbanBoard: FC = () => {
+interface KanbanBoardProps {
+  /** Navigate to the full-screen task creation view */
+  onCreateTask?: () => void;
+}
+
+export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
   const { state, reorderTasks, moveTaskToColumn } =
     useTasks();
 
@@ -160,8 +164,6 @@ export const KanbanBoard: FC = () => {
     [state.tasks, modalTaskId],
   );
 
-  const [createDialogOpen, setCreateDialogOpen] = useState(false);
-
   // ── Loading state ───────────────────────────────────────────────────
 
   if (state.isLoading) {
@@ -189,8 +191,21 @@ export const KanbanBoard: FC = () => {
     <div className="flex h-full flex-col">
       {/* Board toolbar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border/50 px-6 py-2.5">
+        {/* Create task */}
+        <button
+          type="button"
+          onClick={onCreateTask}
+          className="flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/60"
+        >
+          <PlusIcon className="h-3.5 w-3.5" />
+          Create Task
+        </button>
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
         {/* Search */}
-        <div className="relative w-80">
+        <div className="relative w-64">
           <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
             type="text"
@@ -209,9 +224,6 @@ export const KanbanBoard: FC = () => {
             </button>
           )}
         </div>
-
-        {/* Spacer */}
-        <div className="flex-1" />
 
         {/* Status filter chips */}
         <div className="flex items-center gap-1.5" role="group" aria-label="Filter by status">
@@ -275,12 +287,6 @@ export const KanbanBoard: FC = () => {
           )}
         </DragOverlay>
       </DndContext>
-
-      {/* Create task dialog */}
-      <CreateTaskDialog
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-      />
 
       {/* Task detail modal (opened from board card clicks) */}
       <TaskDetailModal

@@ -30,6 +30,7 @@ type ConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
+  workspaceId?: string;
   metadata?: Record<string, unknown>;
 };
 

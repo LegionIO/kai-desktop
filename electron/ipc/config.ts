@@ -120,6 +120,16 @@ function getDefaultConfig() {
     ui: {
       theme: 'system' as const,
       sidebarWidth: 280,
+      workspaces: [] as Array<{
+        id: string;
+        name: string;
+        directory: string;
+        color: string;
+        lastActiveAt: number;
+        createdAt: number;
+        lastActiveConversationId: string | null;
+      }>,
+      activeWorkspaceId: null as string | null,
     },
     webServer: {
       enabled: false,

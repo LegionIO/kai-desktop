@@ -27,6 +27,7 @@ import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
+import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { registerUsageHandlers } from './ipc/usage.js';
@@ -648,6 +649,7 @@ if (gotSingleInstanceLock) {
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerTaskHandlers(ipcMain, APP_HOME);
+    registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);

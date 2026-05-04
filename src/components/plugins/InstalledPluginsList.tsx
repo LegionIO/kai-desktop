@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PuzzleIcon, XIcon, PackageSearchIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon } from 'lucide-react';
+import { SearchIcon, PuzzleIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
-import { Tooltip } from '@/components/ui/Tooltip';
 
 /* ── Types ────────────────────────────────────────────── */
 
@@ -221,37 +221,49 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Browse Plugins button */}
-      <div className="border-b border-sidebar-border/70 px-4 py-3">
+      {/* PLUGINS heading row — label + options dropdown + Install pill */}
+      <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+          Plugins
+        </span>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button
+              type="button"
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
+            >
+              <ListFilterIcon className="h-3.5 w-3.5" />
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="start"
+              side="bottom"
+              sideOffset={6}
+              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
+              <DropdownMenu.Item
+                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                onSelect={onOpenPlugins}
+              >
+                <Settings2Icon size={14} className="text-muted-foreground" />
+                Manage plugins
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+        <div className="flex-1" />
         <button
           type="button"
           onClick={onOpenMarketplace}
           className={cn(
-            'flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80',
-            activeView === 'marketplace' && 'bg-primary/10 text-primary',
+            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
+            activeView === 'marketplace' && 'border-primary/40 bg-primary/10 text-primary',
           )}
         >
-          <PackageSearchIcon className="h-4 w-4 text-primary" />
-          Explore Plugins
+          <DownloadIcon className="h-3 w-3" />
+          Install Plugins
         </button>
-      </div>
-
-      {/* PLUGINS header */}
-      <div className="flex items-center justify-between px-4 pb-2 pt-4">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-          Plugins
-        </span>
-        <div className="flex items-center gap-1 text-muted-foreground">
-          <Tooltip content="Manage plugins" side="bottom" sideOffset={6}>
-            <button
-              type="button"
-              onClick={onOpenPlugins}
-              className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary"
-            >
-              <Settings2Icon className="h-4 w-4" />
-            </button>
-          </Tooltip>
-        </div>
       </div>
 
       {/* Search */}

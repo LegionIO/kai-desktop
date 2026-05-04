@@ -38,6 +38,14 @@ type AppAPI = {
     setActiveId: (id: string) => Promise<unknown>;
     onChanged: (callback: (store: unknown) => void) => () => void;
   };
+  workspaces: {
+    create: (args: { name: string; directory: string }) => Promise<unknown>;
+    rename: (args: { id: string; name: string }) => Promise<void>;
+    delete: (args: { id: string }) => Promise<void>;
+    setActive: (args: { id: string | null }) => Promise<void>;
+    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) => Promise<void>;
+    browseDirectory: () => Promise<{ path: string; name: string } | null>;
+  };
   memory: {
     clear: (options: { working?: boolean; observational?: boolean; semantic?: boolean; all?: boolean }) =>
       Promise<{ success?: boolean; cleared?: string[]; error?: string }>;

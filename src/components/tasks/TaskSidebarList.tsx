@@ -8,7 +8,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  ClipboardPlusIcon,
   SearchIcon,
   Trash2Icon,
   XIcon,
@@ -17,13 +16,15 @@ import {
   PinIcon,
   EllipsisVerticalIcon,
   LoaderIcon,
+  ListFilterIcon,
+  LayoutDashboardIcon,
 } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { CreateTaskDialog } from './CreateTaskDialog';
-import { Tooltip } from '@/components/ui/Tooltip';
 
 // Status colors for the task icon
 const STATUS_DOT_COLORS: Record<KaiTaskStatus, string> = {
@@ -50,11 +51,20 @@ interface TaskSidebarListProps {
   onSelectTask?: (taskId: string) => void;
   /** When provided, "Create Task" opens the AI creation view instead of the dialog. */
   onCreateTask?: () => void;
+  /** Navigate to the kanban board view in the main panel. */
+  onViewBoard?: () => void;
+  /** Whether the board view is currently shown in the main panel. */
+  isBoardActive?: boolean;
+  /** When set, only tasks matching this workspace (or unscoped legacy tasks) are shown. */
+  workspaceId?: string | null;
 }
 
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
-  onCreateTask,
+  onCreateTask: _onCreateTask,
+  onViewBoard,
+  isBoardActive,
+  workspaceId,
 }) => {
   const { state, selectTask, deleteTask } = useTasks();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -140,6 +150,13 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
 
   const sortedTasks = useMemo(() => {
     let tasks = [...state.tasks];
+
+    // Workspace scoping — show only tasks belonging to the active workspace
+    // (or legacy/unscoped tasks that have no workspaceId)
+    if (workspaceId) {
+      tasks = tasks.filter((t) => t.workspaceId === workspaceId || !t.workspaceId);
+    }
+
     const query = searchQuery.toLowerCase().trim();
     if (query) {
       tasks = tasks.filter(
@@ -150,7 +167,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     }
     tasks.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return tasks;
-  }, [state.tasks, searchQuery]);
+  }, [state.tasks, searchQuery, workspaceId]);
 
   // Split into pinned / unpinned
   const sections = useMemo(() => {
@@ -178,42 +195,56 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Create Task button */}
-      <div className="border-b border-sidebar-border/70 px-4 py-3">
-        <button
-          type="button"
-          onClick={() => {
-            if (onCreateTask) {
-              onCreateTask();
-            } else {
-              setCreateDialogOpen(true);
-            }
-          }}
-          className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80"
-        >
-          <ClipboardPlusIcon className="h-4 w-4 text-primary" />
-          Create Task
-        </button>
-      </div>
-
-      {/* Section heading with icon bar */}
-      <div className="flex items-center justify-between px-4 pb-2 pt-4">
+      {/* TASKS heading row — label + options dropdown + View Board pill */}
+      <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
         <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           Tasks
         </span>
-        <div className="flex items-center gap-1 text-muted-foreground">
-          <Tooltip content={sortedTasks.length > 0 ? (isSearchActive ? `Delete ${sortedTasks.length} shown` : 'Delete all tasks') : 'No tasks to delete'} side="bottom" sideOffset={6}>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
             <button
               type="button"
-              disabled={sortedTasks.length === 0}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => setBulkDeleteOpen(true)}
-              className={`rounded-md p-1.5 transition-colors ${sortedTasks.length > 0 ? 'hover:bg-sidebar-accent/80 hover:text-destructive' : 'opacity-30 cursor-default'}`}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
             >
-              <Trash2Icon className="h-4 w-4" />
+              <ListFilterIcon className="h-3.5 w-3.5" />
             </button>
-          </Tooltip>
-        </div>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="start"
+              side="bottom"
+              sideOffset={6}
+              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
+              <DropdownMenu.Item
+                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                disabled={sortedTasks.length === 0}
+                onSelect={() => setBulkDeleteOpen(true)}
+              >
+                <Trash2Icon size={14} />
+                {isSearchActive
+                  ? `Delete ${sortedTasks.length} shown`
+                  : 'Delete all'}
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+        <div className="flex-1" />
+        <button
+          type="button"
+          onClick={() => {
+            if (onViewBoard) {
+              onViewBoard();
+            }
+          }}
+          className={cn(
+            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
+            isBoardActive && 'border-primary/40 bg-primary/10 text-primary',
+          )}
+        >
+          <LayoutDashboardIcon className="h-3 w-3" />
+          View Board
+        </button>
       </div>
 
       {/* Search bar */}

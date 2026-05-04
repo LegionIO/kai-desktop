@@ -429,6 +429,30 @@ const webServerConfigSchema = z.object({
   }),
 });
 
+// ── Workspace ─────────────────────────────────────────────────────────────
+
+export const WORKSPACE_COLORS = [
+  '#EF4444', '#F97316', '#F59E0B', '#22C55E',
+  '#14B8A6', '#3B82F6', '#8B5CF6', '#EC4899',
+] as const;
+
+export const workspaceSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(100),
+  directory: z.string().min(1),
+  color: z.string(),
+  lastActiveAt: z.number(),
+  createdAt: z.number(),
+  lastActiveConversationId: z.string().nullable().default(null),
+});
+
+export type Workspace = z.infer<typeof workspaceSchema>;
+
+/** Sidebar tab identifiers — scoped tabs filter by active workspace, global tabs show everything. */
+export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins';
+
+export const sidebarTabSchema = z.enum(['chats', 'tasks', 'messages', 'agents', 'plugins']);
+
 export const appConfigSchema = z.object({
   agent: agentConfigSchema.optional(),
   models: modelsConfigSchema,
@@ -466,6 +490,8 @@ export const appConfigSchema = z.object({
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),
+    workspaces: z.array(workspaceSchema).default([]),
+    activeWorkspaceId: z.string().nullable().default(null),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

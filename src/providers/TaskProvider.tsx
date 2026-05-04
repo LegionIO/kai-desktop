@@ -17,6 +17,7 @@ import {
   type PropsWithChildren,
 } from 'react';
 import { app } from '@/lib/ipc-client';
+import { useConfig } from '@/providers/ConfigProvider';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
 
 // ── State & Actions ──────────────────────────────────────────────────────
@@ -166,6 +167,8 @@ const TaskContext = createContext<TaskContextValue | null>(null);
 
 export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const [state, dispatch] = useReducer(taskReducer, initialState);
+  const { config } = useConfig();
+  const activeWorkspaceId = (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
 
   // Hydrate on mount
   useEffect(() => {
@@ -234,6 +237,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           description: data.description,
           status: data.status ?? 'todo',
           metadata: data.metadata,
+          workspaceId: activeWorkspaceId ?? undefined,
         }));
         // No optimistic ADD_TASK dispatch — the IPC broadcast from main
         // process triggers SET_TASKS which includes the new task.
@@ -243,7 +247,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return null;
       }
     },
-    [],
+    [activeWorkspaceId],
   );
 
   const createTaskFromPlan = useCallback(
@@ -262,6 +266,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           sourceConversationId: opts.sourceConversationId,
           sourceToolCallId: opts.sourceToolCallId,
           metadata: opts.planFileName ? { planFileName: opts.planFileName } : undefined,
+          workspaceId: activeWorkspaceId ?? undefined,
         }));
         // No optimistic ADD_TASK dispatch — broadcast handles it.
         return task;
@@ -270,7 +275,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return null;
       }
     },
-    [],
+    [activeWorkspaceId],
   );
 
   const updateTask = useCallback(async (id: string, updates: Partial<TaskFile>) => {

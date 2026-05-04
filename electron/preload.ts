@@ -67,6 +67,21 @@ const appAPI = {
     },
   },
 
+  workspaces: {
+    create: (args: { name: string; directory: string }) =>
+      ipcRenderer.invoke('workspaces:create', args),
+    rename: (args: { id: string; name: string }) =>
+      ipcRenderer.invoke('workspaces:rename', args),
+    delete: (args: { id: string }) =>
+      ipcRenderer.invoke('workspaces:delete', args),
+    setActive: (args: { id: string | null }) =>
+      ipcRenderer.invoke('workspaces:set-active', args),
+    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) =>
+      ipcRenderer.invoke('workspaces:save-last-conversation', args),
+    browseDirectory: () =>
+      ipcRenderer.invoke('workspaces:browse-directory') as Promise<{ path: string; name: string } | null>,
+  },
+
   memory: {
     clear: (options: { working?: boolean; observational?: boolean; semantic?: boolean; all?: boolean }) =>
       ipcRenderer.invoke('memory:clear', options) as Promise<{ success?: boolean; cleared?: string[]; error?: string }>,
