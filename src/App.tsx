@@ -1508,7 +1508,7 @@ function AppShell() {
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
                     if (isCreatingTask) {
-                      return null;
+                      return <span className="text-sm font-medium text-muted-foreground">New Task</span>;
                     }
                     const selectedTaskId = tasksCtx?.state.selectedTaskId;
                     const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
@@ -1762,7 +1762,7 @@ function AppShell() {
                     }}
                   />
                 ) : (
-                  <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex flex-col flex-1 min-h-0">
                     <KanbanBoard onCreateTask={() => {
                       tasksCtx?.selectTask(null);
                       setIsCreatingTask(true);

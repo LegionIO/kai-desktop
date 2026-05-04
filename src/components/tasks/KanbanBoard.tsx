@@ -178,17 +178,11 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
 
   // When a task is selected from sidebar, show full-width detail view (no breadcrumb — App.tsx title bar handles it)
   if (selectedTask) {
-    return (
-      <div className="flex h-full flex-col">
-        <div className="flex-1 min-h-0 overflow-y-auto">
-          <TaskDetailPanel task={selectedTask} />
-        </div>
-      </div>
-    );
+    return <TaskDetailPanel task={selectedTask} />;
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col pt-12 md:pt-14">
       {/* Board toolbar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border/50 px-6 py-2.5">
         {/* Create task */}
