@@ -22,8 +22,8 @@ const SCOPED_TABS: readonly TabDef[] = [
 ];
 
 const GLOBAL_TABS: readonly TabDef[] = [
-  { id: 'messages', icon: InboxIcon, label: 'Messages' },
-  { id: 'agents', icon: BotIcon, label: 'Agents' },
+  // { id: 'messages', icon: InboxIcon, label: 'Messages' },  // TODO: re-enable later
+  // { id: 'agents', icon: BotIcon, label: 'Agents' },        // TODO: re-enable later
   { id: 'plugins', icon: PuzzleIcon, label: 'Plugins' },
 ];
 
@@ -84,9 +84,6 @@ export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, se
         onClick={() => onSelectTab(tab.id)}
       />
     ))}
-
-    {/* Divider between scoped and global tabs */}
-    <div className="my-1.5 h-px w-5 bg-sidebar-border/60" />
 
     {GLOBAL_TABS.map((tab) => (
       <IconRailButton
