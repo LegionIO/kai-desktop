@@ -185,19 +185,6 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
     <div className="flex h-full flex-col pt-12 md:pt-14">
       {/* Board toolbar */}
       <div className="flex shrink-0 items-center gap-3 border-b border-border/50 px-6 py-2.5">
-        {/* Create task */}
-        <button
-          type="button"
-          onClick={onCreateTask}
-          className="flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/60"
-        >
-          <PlusIcon className="h-3.5 w-3.5" />
-          Create Task
-        </button>
-
-        {/* Spacer */}
-        <div className="flex-1" />
-
         {/* Search */}
         <div className="relative w-64">
           <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -250,6 +237,19 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
             </button>
           ))}
         </div>
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* Create task */}
+        <button
+          type="button"
+          onClick={onCreateTask}
+          className="flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/60"
+        >
+          <PlusIcon className="h-3.5 w-3.5" />
+          Create Task
+        </button>
       </div>
 
       {/* Columns */}

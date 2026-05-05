@@ -1508,7 +1508,7 @@ function AppShell() {
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
                     if (isCreatingTask) {
-                      return <span className="text-sm font-medium text-muted-foreground">New Task</span>;
+                      return null;
                     }
                     const selectedTaskId = tasksCtx?.state.selectedTaskId;
                     const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;

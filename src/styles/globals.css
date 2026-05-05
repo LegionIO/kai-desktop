@@ -250,6 +250,12 @@
   padding-left: 32px;
 }
 
+/* Collapse bottom margin on the last paragraph in each timeline item
+   so the action bar sits close to the message (matches user-bubble spacing). */
+.aui-assistant-content > .timeline-item:not(.timeline-detached) > div > p:last-child {
+  margin-bottom: 0;
+}
+
 .timeline-item {
   position: relative;
   display: flex;
@@ -550,6 +556,15 @@ html:not(.dark) .app-gradient-text {
   50%      { color: color-mix(in oklch, var(--primary) 25%, white); }
 }
 
+@keyframes verb-glow-light {
+  0%, 100% { color: var(--primary); }
+  50%      { color: color-mix(in oklch, var(--primary) 50%, black); }
+}
+
 .thinking-verb-shimmer {
   animation: verb-glow 3s ease-in-out infinite;
+}
+
+html:not(.dark) .thinking-verb-shimmer {
+  animation: verb-glow-light 3s ease-in-out infinite;
 }

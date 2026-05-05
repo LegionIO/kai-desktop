@@ -1077,7 +1077,7 @@ const AssistantMessage: FC = () => {
   return (
     <MessagePrimitive.Root className="group mb-8 flex justify-start">
       <div className="w-full max-w-4xl">
-        <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 py-3 text-foreground">
+        <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 pt-3 text-foreground">
           {isEmpty ? (
             <div className="flex items-center gap-2 py-0.5 text-muted-foreground">
               <BanIcon className="h-3.5 w-3.5" />
@@ -1110,7 +1110,7 @@ const AssistantMessage: FC = () => {
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
         </div>
-        <div className={`flex items-center gap-1 mt-3 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        <div className={`flex items-center gap-1 mt-1.5 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
           {!isRunning && <MessageInfoIndicator />}
           <MessageTimestamp date={message.createdAt} align="left" />
