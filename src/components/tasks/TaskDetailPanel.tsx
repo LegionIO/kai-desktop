@@ -411,7 +411,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               side="bottom"
               sideOffset={4}
             >
-              <span className="cursor-default rounded-full bg-muted/60 px-2.5 py-0.5 text-xs font-medium text-foreground transition-colors hover:bg-muted">
+              <span className="cursor-default rounded-full bg-foreground/10 px-2.5 py-0.5 text-xs font-medium text-foreground transition-colors hover:bg-foreground/15">
                 {new Date(task.updatedAt).toLocaleString()}
               </span>
             </Tooltip>
@@ -465,7 +465,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
             <button
               type="button"
               onClick={handleStopAgent}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
+              className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
             >
               <StopCircleIcon className="h-3.5 w-3.5" />
               Stop Agent
@@ -475,7 +475,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               type="button"
               onClick={handleStartAgent}
               disabled={isStartingAgent || isActivelyStreaming}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50"
             >
               <PlayIcon className="h-3.5 w-3.5" />
               {isStartingAgent ? 'Starting…' : 'Start Agent'}

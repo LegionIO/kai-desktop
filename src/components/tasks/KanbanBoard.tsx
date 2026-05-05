@@ -34,7 +34,7 @@ interface KanbanBoardProps {
 }
 
 export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
-  const { state, reorderTasks, moveTaskToColumn } =
+  const { state, reorderTasks, moveTaskToColumn, selectTask } =
     useTasks();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
@@ -152,6 +152,14 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
       setModalTaskId(task.id);
     },
     [],
+  );
+
+  const handleOpenFullView = useCallback(
+    (taskId: string) => {
+      setModalTaskId(null);
+      selectTask(taskId);
+    },
+    [selectTask],
   );
 
   const selectedTask = useMemo(
@@ -282,11 +290,12 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
         </DragOverlay>
       </DndContext>
 
-      {/* Task detail modal (opened from board card clicks) */}
+      {/* Read-only task preview modal */}
       <TaskDetailModal
         task={modalTask}
         open={!!modalTask}
         onOpenChange={(open) => { if (!open) setModalTaskId(null); }}
+        onOpenFullView={handleOpenFullView}
       />
     </div>
   );
