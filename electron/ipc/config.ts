@@ -130,6 +130,7 @@ function getDefaultConfig() {
         lastActiveConversationId: string | null;
       }>,
       activeWorkspaceId: null as string | null,
+      composer: { showModelProfileSelector: false },
     },
     webServer: {
       enabled: false,

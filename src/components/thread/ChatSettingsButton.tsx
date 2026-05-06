@@ -1,9 +1,37 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
-import { ChevronUpIcon, DumbbellIcon, MessageCircleIcon, ScrollTextIcon } from 'lucide-react';
+import { CheckIcon, ChevronUpIcon, CpuIcon, DumbbellIcon, MessageCircleIcon, ScrollTextIcon, ShuffleIcon, UserCircleIcon } from 'lucide-react';
+import { app } from '@/lib/ipc-client';
+import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useConfig } from '@/providers/ConfigProvider';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
+
+type ModelInfo = {
+  key: string;
+  displayName: string;
+  maxInputTokens?: number;
+  computerUseSupport?: string;
+  visionCapable?: boolean;
+};
+
+type ModelCatalog = {
+  models: ModelInfo[];
+  defaultKey: string | null;
+};
+
+type ProfileInfo = {
+  key: string;
+  name: string;
+  primaryModelKey: string;
+  fallbackModelKeys: string[];
+};
+
+type ProfileCatalog = {
+  profiles: ProfileInfo[];
+  defaultKey: string | null;
+};
 
 const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'low', label: 'Low' },
@@ -24,9 +52,41 @@ export const ChatSettingsButton: FC<{
   onChangeReasoningEffort: (value: ReasoningEffort) => void;
   executionMode?: ExecutionMode;
   onChangeExecutionMode?: (value: ExecutionMode) => void;
-}> = ({ reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode }) => {
+  selectedModelKey?: string | null;
+  onSelectModel?: (key: string) => void;
+  selectedProfileKey?: string | null;
+  onSelectProfile?: (key: string | null, primaryModelKey: string | null) => void;
+  fallbackEnabled?: boolean;
+  onToggleFallback?: (value: boolean) => void;
+}> = ({ reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedModelKey, onSelectModel, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const { config } = useConfig();
+
+  // Determine whether to show model/profile/routing in the popover
+  const showModelProfile = !!(config?.ui as { composer?: { showModelProfileSelector?: boolean } } | undefined)?.composer?.showModelProfileSelector;
+
+  // Load catalogs when the popover sections are enabled
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+  const [profileCatalog, setProfileCatalog] = useState<ProfileCatalog | null>(null);
+
+  useEffect(() => {
+    if (!showModelProfile) return;
+    let cancelled = false;
+    app.modelCatalog()
+      .then((data) => { if (!cancelled) setCatalog(data as ModelCatalog); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [config, showModelProfile]);
+
+  useEffect(() => {
+    if (!showModelProfile || !onSelectProfile) return;
+    let cancelled = false;
+    app.profileCatalog()
+      .then((data) => { if (!cancelled) setProfileCatalog(data as ProfileCatalog); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [config, showModelProfile, onSelectProfile]);
 
   // Close on outside click
   useEffect(() => {
@@ -67,6 +127,16 @@ export const ChatSettingsButton: FC<{
   const ModeIcon = hasExecutionMode
     ? MODE_ICONS[executionMode ?? 'auto']
     : MessageCircleIcon;
+
+  // Model/profile derived state
+  const models = catalog?.models ?? [];
+  const profiles = profileCatalog?.profiles ?? [];
+  const hasProfiles = showModelProfile && onSelectProfile && profiles.length > 0;
+  const currentProfileKey = selectedProfileKey ?? profileCatalog?.defaultKey;
+  const effectiveProfileModelKey = currentProfileKey
+    ? profiles.find((p) => p.key === currentProfileKey)?.primaryModelKey
+    : undefined;
+  const currentModelKey = selectedModelKey ?? effectiveProfileModelKey ?? catalog?.defaultKey ?? models[0]?.key;
 
   return (
     <div ref={rootRef} {...containerProps} className="relative flex items-center">
@@ -111,9 +181,95 @@ export const ChatSettingsButton: FC<{
         </Tooltip>
       </div>
 
-      {/* Settings popover (reasoning effort + plan mode) */}
+      {/* Settings popover */}
       {settingsOpen && (
         <div ref={settingsPopover.ref} style={settingsPopover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+          {/* Profile section (opt-in) */}
+          {hasProfiles && (
+            <>
+              <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                <UserCircleIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Profile</span>
+              </div>
+              <div className="max-h-[160px] overflow-y-auto space-y-0.5">
+                <button
+                  type="button"
+                  onClick={() => { onSelectProfile!(null, null); }}
+                  className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
+                    !currentProfileKey
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'hover:bg-muted/60 text-foreground'
+                  }`}
+                >
+                  {!currentProfileKey && <CheckIcon className="h-3 w-3 shrink-0" />}
+                  <span className="flex-1 min-w-0 truncate text-left">Default</span>
+                </button>
+                {profiles.map((profile) => (
+                  <button
+                    key={profile.key}
+                    type="button"
+                    onClick={() => { onSelectProfile!(profile.key, profile.primaryModelKey); }}
+                    className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
+                      profile.key === currentProfileKey
+                        ? 'bg-primary/10 text-primary font-medium'
+                        : 'hover:bg-muted/60 text-foreground'
+                    }`}
+                  >
+                    {profile.key === currentProfileKey && <CheckIcon className="h-3 w-3 shrink-0" />}
+                    <span className="flex-1 min-w-0 truncate text-left">{profile.name}</span>
+                    {profile.fallbackModelKeys.length > 0 && (
+                      <span className="text-[10px] opacity-50">
+                        {profile.fallbackModelKeys.length} fallback{profile.fallbackModelKeys.length > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              <div className="border-t border-border/50 mx-1.5 mt-1" />
+            </>
+          )}
+
+          {/* Model section (opt-in) */}
+          {showModelProfile && onSelectModel && models.length > 0 && (
+            <>
+              <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                <CpuIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Model</span>
+              </div>
+              <div className="max-h-[200px] overflow-y-auto space-y-0.5">
+                {models.map((model) => {
+                  const label = formatModelDisplayName(model.displayName);
+                  return (
+                    <button
+                      key={model.key}
+                      type="button"
+                      onClick={() => onSelectModel(model.key)}
+                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
+                        model.key === currentModelKey
+                          ? 'bg-primary/10 text-primary font-medium'
+                          : 'hover:bg-muted/60 text-foreground'
+                      }`}
+                    >
+                      {model.key === currentModelKey && <CheckIcon className="h-3 w-3 shrink-0" />}
+                      <span className="flex-1 min-w-0 truncate text-left">{label}</span>
+                      {model.maxInputTokens && (
+                        <span className="text-[10px] opacity-50">
+                          {Math.round(model.maxInputTokens / 1000)}k
+                        </span>
+                      )}
+                      {model.computerUseSupport && model.computerUseSupport !== 'none' && (
+                        <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary">
+                          CU
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+            </>
+          )}
+
           {/* Effort track selector */}
           <div className="flex items-center justify-between px-3 py-2">
             <div className="flex items-center gap-2">
@@ -145,6 +301,30 @@ export const ChatSettingsButton: FC<{
               })}
             </div>
           </div>
+
+          {/* Auto-routing toggle (opt-in) */}
+          {showModelProfile && onToggleFallback && (
+            <>
+              <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+              <div className="flex items-center justify-between px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <ShuffleIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Auto-routing</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onToggleFallback(!fallbackEnabled)}
+                  className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full transition-colors ${
+                    fallbackEnabled ? 'bg-primary' : 'bg-muted-foreground/30'
+                  }`}
+                >
+                  <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                    fallbackEnabled ? 'translate-x-[21px]' : 'translate-x-[3px]'
+                  }`} />
+                </button>
+              </div>
+            </>
+          )}
 
           {/* Plan mode toggle */}
           {hasExecutionMode && (

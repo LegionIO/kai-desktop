@@ -494,6 +494,9 @@ export const appConfigSchema = z.object({
     sidebarWidth: z.number().positive(),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
+    composer: z.object({
+      showModelProfileSelector: z.boolean(),
+    }).default({ showModelProfileSelector: false }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

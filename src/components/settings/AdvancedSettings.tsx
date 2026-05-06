@@ -24,7 +24,7 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
     retitleIntervalMessages: number;
     retitleEagerUntilMessage: number;
   };
-  const ui = config.ui as { theme: string; sidebarWidth: number };
+  const ui = config.ui as { theme: string; sidebarWidth: number; composer?: { showModelProfileSelector?: boolean } };
   const fallback = (config.fallback as FallbackConfig | undefined) ?? { enabled: false, modelKeys: [] };
   const models = ((config.models as { catalog?: CatalogModel[] })?.catalog ?? []) as CatalogModel[];
 
@@ -102,6 +102,13 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
             <option value="light">Light</option>
             <option value="dark">Dark</option>
           </select>
+        </div>
+        <div className="flex items-start justify-between gap-3 rounded-md border p-3">
+          <div>
+            <span className="text-xs font-medium">Show model &amp; profile selector in composer</span>
+            <p className="mt-0.5 text-[10px] text-muted-foreground">Display inline model and profile dropdowns in the chat composer toolbar.</p>
+          </div>
+          <input type="checkbox" checked={!!ui.composer?.showModelProfileSelector} onChange={(e) => updateConfig('ui.composer.showModelProfileSelector', e.target.checked)} className="mt-0.5 h-4 w-4 rounded" />
         </div>
       </fieldset>
     </div>

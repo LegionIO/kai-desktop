@@ -1847,6 +1847,12 @@ const Composer: FC<{
                     onChangeReasoningEffort={onChangeReasoningEffort}
                     executionMode={executionMode}
                     onChangeExecutionMode={onChangeExecutionMode}
+                    selectedModelKey={selectedModelKey}
+                    onSelectModel={onSelectModel}
+                    selectedProfileKey={selectedProfileKey}
+                    onSelectProfile={onSelectProfile}
+                    fallbackEnabled={fallbackEnabled}
+                    onToggleFallback={onToggleFallback}
                   />
                   {computerUseEnabled && (
                     <ComputerSettingsButton
