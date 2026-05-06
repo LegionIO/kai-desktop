@@ -162,12 +162,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Resolve system prompt (model is managed by Claude Code itself)
+    // 2. Resolve system prompt & model from the pre-resolved stream config
     // -----------------------------------------------------------------------
-    // NOTE: We do NOT pass Kai's model or API key to the Claude Code SDK.
-    // Claude Code has its own model config (~/.claude/settings.json) and auth.
-    // Passing Kai's model (e.g. "gpt-5.4") would override Claude Code's model
-    // with something it can't use properly.
+    // options.streamConfig carries the user's model selection from the IPC layer.
+    // The fallback re-resolves with defaults only when streamConfig is absent.
     const streamConfig = options.streamConfig ?? resolveStreamConfig(config, {
       threadModelKey: null,
       threadProfileKey: null,
@@ -285,8 +283,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 7. Start the query
     // -----------------------------------------------------------------------
-    // NOTE: Claude Code uses its own auth from ~/.claude/settings.json
-    // (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.) so we don't pass env.
+    // When claudeAuth is provided, model + endpoint + API key are passed via
+    // the SDK's `settings` option (highest-priority layer). Otherwise the SDK
+    // falls back to its own config (~/.claude/settings.json).
 
     // Resolve the system-installed `claude` binary path as a fallback
     // in case the SDK's bundled platform binary is missing (e.g. optional
@@ -297,16 +296,22 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // If so, pass `resume` so the SDK replays its stored history.
     const existingSessionId = this.sessionMap.get(conversationId);
 
+    // Use pre-resolved auth from the model-runtime compatibility layer.
+    // This ensures Kai is always in control of which model + endpoint is used,
+    // rather than silently falling back to ~/.claude/settings.json.
+    const auth = options.claudeAuth ?? null;
+
     debugLog(`[STREAM] conversationId=${conversationId} prompt=${JSON.stringify(prompt).slice(0, 200)}`);
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} (model managed by Claude Code CLI)`);
+    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`);
 
     const sdkOptions: SdkOptions = {
       abortController,
       cwd: cwd ?? process.cwd(),
-      // NOTE: model is intentionally omitted — Claude Code uses its own model
-      // from ~/.claude/settings.json. Passing Kai's model (e.g. "gpt-5.4")
-      // would override it with something incompatible.
+      // Model + auth from Kai's model-runtime resolver.
+      // When auth is present, we pass model name directly and override the SDK's
+      // default endpoint/key via the settings option (highest priority layer).
+      ...(auth ? { model: auth.modelName } : {}),
       maxTurns,
       thinking: thinkingConfig as SdkOptions['thinking'],
       effort: effort as SdkOptions['effort'],
@@ -314,8 +319,6 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
       includePartialMessages: true,
       persistSession: true,
-      // NOTE: env is intentionally omitted — Claude Code uses its own auth
-      // from ~/.claude/settings.json (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.)
       // Use specific Claude Code tools — SDK's built-in file/code tools.
       // Kai's custom tools are available via the MCP bridge above.
       tools: [
@@ -337,14 +340,21 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       systemPrompt: assembledPrompt
         ? { type: 'preset', preset: 'claude_code', append: assembledPrompt }
         : { type: 'preset', preset: 'claude_code' },
+      // Override the SDK's default auth when Kai provides explicit credentials.
+      // This uses the "flag settings" layer which has highest priority.
+      ...(auth?.baseUrl || auth?.apiKey ? {
+        settings: {
+          env: {
+            ...(auth.baseUrl ? { ANTHROPIC_BASE_URL: auth.baseUrl } : {}),
+            ...(auth.apiKey ? { ANTHROPIC_AUTH_TOKEN: auth.apiKey } : {}),
+          },
+        },
+      } : {}),
       // Resume previous session for conversation continuity
       ...(existingSessionId ? { resume: existingSessionId } : {}),
       // Fall back to system-installed CLI when bundled binary is missing
       ...(claudeCliPath ? { pathToClaudeCodeExecutable: claudeCliPath } : {}),
     };
-
-    // NOTE: fallbackModel is intentionally not passed — Claude Code manages
-    // its own fallback via ~/.claude/settings.json.
 
     // -----------------------------------------------------------------------
     // 8. Stream and translate events
@@ -540,6 +550,25 @@ function normalizeToolName(name: string): string {
     .replace(/^_/, '');
 }
 
+/**
+ * Rewrite Claude Code CLI-specific advice in SDK error messages.
+ *
+ * The SDK was designed for the interactive CLI and its error messages
+ * reference CLI commands (`--model`, `claude login`, etc.) that don't
+ * apply when running inside Kai's desktop UI.
+ */
+function rewriteSdkError(text: string): string {
+  return text
+    .replace(
+      /Run --model to pick a different model\.?/gi,
+      'Try selecting a different model in the model picker, or check that your provider endpoint and API key are configured correctly in Settings → Model Providers.',
+    )
+    .replace(
+      /Run `claude login`[^.]*/gi,
+      'Check your API key in Settings → Model Providers.',
+    );
+}
+
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
   const events: StreamEvent[] = [];
 
@@ -701,10 +730,11 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
 
       if (msg.subtype === 'error_during_execution' || msg.subtype === 'error_max_turns' || msg.subtype === 'error_max_budget_usd') {
         const errors = msg.errors as string[] | undefined;
+        const rawError = errors?.join('; ') ?? `SDK error: ${msg.subtype}`;
         events.push({
           conversationId,
           type: 'error',
-          error: errors?.join('; ') ?? `SDK error: ${msg.subtype}`,
+          error: rewriteSdkError(rawError),
         });
       }
 

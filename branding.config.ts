@@ -35,8 +35,6 @@ export const branding = {
   // ── User-facing strings ───────────────────────────────────────────────
   /** Name used in the default system prompt: "You are {assistantName}, a powerful…" */
   assistantName: '{{productName}}',
-  /** Placeholder inside the message composer. */
-  composerPlaceholder: 'How can I help you today?',
   /** Text shown in the file drop zone overlay. */
   dropZoneText: 'Drop files for {{productName}}',
   /** Heading shown in the error boundary fallback UI. */
@@ -45,6 +43,8 @@ export const branding = {
   sidebarSectionThreads: 'Chats',
   /** Sidebar section label for the plugins/extensions tab. */
   sidebarSectionPlugins: 'Plugins',
+  /** Sidebar section label for the tasks/kanban tab. */
+  sidebarSectionTasks: 'Tasks',
 
   // ── Protocol & machine IDs ────────────────────────────────────────────
   /** Custom Electron protocol scheme for serving generated media (e.g. "kai-media://"). */
@@ -84,7 +84,7 @@ export const branding = {
 
   // ── macOS permission-usage strings (shown in system dialogs) ──────────
   microphoneUsage:
-    '{{productName}} uses the microphone for voice dictation (speech-to-text).',
+    '{{productName}} uses the microphone for voice recording (speech-to-text).',
   appleEventsUsage:
     '{{productName}} uses Apple Events to activate apps and inspect focused windows during local Mac computer control.',
   screenCaptureUsage:

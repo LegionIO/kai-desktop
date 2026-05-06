@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { PlusIcon, SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, PanelTopOpenIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon } from 'lucide-react';
+import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, ListFilterIcon, SquarePenIcon, CheckIcon, ArrowUpDownIcon } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
-import { EditableInput } from '@/components/EditableInput';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import type { ComputerSession } from '../../../shared/computer-use';
@@ -11,12 +11,11 @@ import { useConversationPreferences } from './useConversationPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
-import { Tooltip } from '@/components/ui/Tooltip';
 
 type ConversationSummary = Pick<
   ConversationRecord,
   'id' | 'title' | 'fallbackTitle' | 'createdAt' | 'updatedAt' | 'lastMessageAt' |
-  'messageCount' | 'userMessageCount' | 'runStatus' | 'hasUnread' | 'lastAssistantUpdateAt' | 'archived'
+  'messageCount' | 'userMessageCount' | 'runStatus' | 'hasUnread' | 'lastAssistantUpdateAt' | 'archived' | 'workspaceId'
 > & {
   /** Computed server-side: true if any message contains a tool-call content part */
   hasToolCalls?: boolean;
@@ -28,6 +27,8 @@ type ConversationListProps = {
   onSwitchConversation: (id: string) => void;
   onNewConversation: () => Promise<void> | void;
   onDeleteConversation?: (id: string) => Promise<void> | void;
+  /** When set, only conversations matching this workspace (or unscoped legacy conversations) are shown. */
+  workspaceId?: string | null;
 };
 
 function formatRelativeTime(timestamp: string | null): string {
@@ -86,6 +87,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   onSwitchConversation,
   onNewConversation,
   onDeleteConversation: _onDeleteConversation,
+  workspaceId,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -99,8 +101,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   const { sessionsByConversation } = useComputerUse();
   const [sortOpen, setSortOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
-  const sortButtonRef = useRef<HTMLButtonElement>(null);
-  const filterButtonRef = useRef<HTMLButtonElement>(null);
+  const moreButtonRef = useRef<HTMLButtonElement>(null);
   const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters, isDefaultSort } = useConversationPreferences();
   const [showArchived, setShowArchived] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
@@ -200,6 +201,12 @@ export const ConversationList: FC<ConversationListProps> = ({
   const processedConversations = useMemo(() => {
     let result = [...conversations];
 
+    // Stage 0: Workspace scoping — show only conversations belonging to the active workspace
+    // (or legacy/unscoped conversations that have no workspaceId)
+    if (workspaceId) {
+      result = result.filter((conv) => conv.workspaceId === workspaceId || !conv.workspaceId);
+    }
+
     result = result.filter((conv) => showArchived ? Boolean(conv.archived) : !conv.archived);
 
     // Hide empty threads (no messages, no title) — they only appear after the user sends a message
@@ -253,7 +260,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived]);
+  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived, workspaceId]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
@@ -372,99 +379,111 @@ export const ConversationList: FC<ConversationListProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="border-b border-sidebar-border/70 px-4 py-3">
+      {/* CHATS heading row — label + options dropdown + New Chat pill */}
+      <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+          Chats
+        </span>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button
+              ref={moreButtonRef}
+              type="button"
+              className="relative rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
+            >
+              <ListFilterIcon className="h-3.5 w-3.5" />
+              {/* Activity dot — visible when sort, filter, or archive is non-default */}
+              {(!isDefaultSort || activeFilterCount > 0 || showArchived) && (
+                <span className="pointer-events-none absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary" />
+              )}
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="start"
+              side="bottom"
+              sideOffset={6}
+              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
+                <DropdownMenu.Item
+                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                  onSelect={() => { setSortOpen(true); setFilterOpen(false); }}
+                >
+                  <ArrowUpDownIcon size={14} className="text-muted-foreground" />
+                  Sort chats
+                  {!isDefaultSort && <CheckIcon size={13} className="ml-auto text-primary" />}
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                  onSelect={() => { setFilterOpen(true); setSortOpen(false); }}
+                >
+                  <SlidersHorizontalIcon size={14} className="text-muted-foreground" />
+                  Filter chats
+                  {activeFilterCount > 0 && (
+                    <span className="ml-auto flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
+                      {activeFilterCount > 9 ? '9+' : activeFilterCount}
+                    </span>
+                  )}
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                  onSelect={() => setShowArchived((p) => !p)}
+                >
+                  <ArchiveIcon size={14} className="text-muted-foreground" />
+                  {showArchived ? 'Show active' : 'Show archived'}
+                  {showArchived && <CheckIcon size={13} className="ml-auto text-primary" />}
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator className="my-1 h-px bg-border/50" />
+                <DropdownMenu.Item
+                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                  disabled={processedConversations.length === 0}
+                  onSelect={() => setBulkDeleteOpen(true)}
+                >
+                  <Trash2Icon size={14} />
+                  {isSearchActive || hasActiveFilters
+                    ? `Delete ${processedConversations.length} shown`
+                    : 'Delete all'}
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        <div className="flex-1" />
         <button
           type="button"
-          onClick={() => {
-            void onNewConversation();
-          }}
+          onClick={() => { void onNewConversation(); }}
           className={cn(
-            'flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[15px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/80',
-            isNewChat && 'bg-primary/10 text-primary',
+            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
+            isNewChat && 'border-primary/40 bg-primary/10 text-primary',
           )}
         >
-          <PlusIcon className="h-4 w-4 text-primary" />
+          <SquarePenIcon className="h-3 w-3" />
           New Chat
         </button>
       </div>
-
-      <div className="flex items-center justify-between px-4 pb-2 pt-4">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Chats</span>
-        <div className="flex items-center gap-1 text-muted-foreground">
-          <Tooltip content="Sort chats" side="bottom" sideOffset={6}>
-            <button
-              ref={sortButtonRef}
-              type="button"
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => { setSortOpen((p) => !p); setFilterOpen(false); }}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${!isDefaultSort ? 'text-primary' : ''}`}
-            >
-              <PanelTopOpenIcon className="h-4 w-4" />
-            </button>
-          </Tooltip>
-          <div className="relative">
-            <Tooltip content="Filter chats" side="bottom" sideOffset={6}>
-              <button
-                ref={filterButtonRef}
-                type="button"
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={() => { setFilterOpen((p) => !p); setSortOpen(false); }}
-                className="rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary"
-              >
-                <SlidersHorizontalIcon className="h-4 w-4" />
-              </button>
-            </Tooltip>
-            {activeFilterCount > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-[9px] font-bold text-primary-foreground pointer-events-none">
-                {activeFilterCount > 9 ? '9+' : activeFilterCount}
-              </span>
-            )}
-          </div>
-          <Tooltip content={showArchived ? 'Show active chats' : 'Show archived chats'} side="bottom" sideOffset={6}>
-            <button
-              type="button"
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => setShowArchived((p) => !p)}
-              className={`rounded-md p-1.5 transition-colors hover:bg-sidebar-accent/80 hover:text-primary ${showArchived ? 'text-primary' : ''}`}
-            >
-              <ArchiveIcon className="h-4 w-4" />
-            </button>
-          </Tooltip>
-          <Tooltip content={processedConversations.length > 0 ? (isSearchActive || hasActiveFilters ? `Delete ${processedConversations.length} shown` : 'Delete all chats') : 'No chats to delete'} side="bottom" sideOffset={6}>
-            <button
-              type="button"
-              disabled={processedConversations.length === 0}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => setBulkDeleteOpen(true)}
-              className={`rounded-md p-1.5 transition-colors ${processedConversations.length > 0 ? 'hover:bg-sidebar-accent/80 hover:text-destructive' : 'opacity-30 cursor-default'}`}
-            >
-              <Trash2Icon className="h-4 w-4" />
-            </button>
-          </Tooltip>
-          {sortOpen && (
-            <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortButtonRef} />
-          )}
-          {filterOpen && (
-            <FilterPopover
-              filter={filter}
-              onFilterChange={setFilter}
-              activeFilterCount={activeFilterCount}
-              onClear={clearFilters}
-              onClose={() => setFilterOpen(false)}
-              anchorRef={filterButtonRef}
-            />
-          )}
-        </div>
-      </div>
+      {/* Sort/Filter popovers — anchored to the ··· button */}
+      {sortOpen && (
+        <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={moreButtonRef} />
+      )}
+      {filterOpen && (
+        <FilterPopover
+          filter={filter}
+          onFilterChange={setFilter}
+          activeFilterCount={activeFilterCount}
+          onClear={clearFilters}
+          onClose={() => setFilterOpen(false)}
+          anchorRef={moreButtonRef}
+        />
+      )}
 
       <div className="px-3 pb-3">
         <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/60 bg-sidebar-accent/50 px-3 py-2">
           <SearchIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-          <EditableInput
+          <input
+            type="text"
             placeholder="Search..."
             value={searchQuery}
-            onChange={setSearchQuery}
-            className="flex-1 bg-transparent text-xs"
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 bg-transparent text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none"
           />
           {searchQuery && (
             <button
@@ -576,9 +595,10 @@ export const ConversationList: FC<ConversationListProps> = ({
         })()}
 
         {processedConversations.length === 0 && (
-          <p className="text-xs text-muted-foreground p-3 text-center">
-            {searchQuery || hasActiveFilters ? 'No matching chats' : 'No chats yet'}
-          </p>
+          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
+            <MessageSquareIcon className="h-6 w-6 opacity-40" />
+            <span>{searchQuery || hasActiveFilters ? 'No chats match your search' : 'No chats yet'}</span>
+          </div>
         )}
       </div>
 

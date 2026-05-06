@@ -17,6 +17,11 @@
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
 import { detectCodexSdk } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
+import {
+  buildCodexMcpPrompt,
+  buildCodexMcpServerConfig,
+  CodexMcpBridge,
+} from './codex-mcp-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Capabilities
@@ -32,7 +37,7 @@ const CODEX_CAPABILITIES: RuntimeCapabilities = {
   multiProvider: false,  // OpenAI models only
   subAgents: false,     // No sub-agent delegation
   sessions: true,       // Thread resume via thread ID
-  customTools: false,   // No custom Kai tools (MCP only)
+  customTools: true,   // Custom Kai tools via local MCP bridge
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +127,7 @@ export class CodexRuntime implements AgentRuntime {
     const {
       conversationId,
       config,
+      tools,
       cwd,
       reasoningEffort,
       abortSignal,
@@ -186,10 +192,41 @@ export class CodexRuntime implements AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // 4. Create Codex instance and thread
+    // 4. Start MCP bridge for custom tools (before creating Codex instance)
+    //    Only bridge plugin/skill/mcp tools — Codex has its own built-in tools
+    // -----------------------------------------------------------------------
+    const bridge = new CodexMcpBridge();
+    let bridgeUrl: string | undefined;
+
+    const customTools = tools?.filter(
+      (t) => t.source === 'plugin' || t.source === 'skill' || t.source === 'mcp',
+    );
+
+    if (customTools && customTools.length > 0) {
+      try {
+        bridgeUrl = await bridge.start(customTools, conversationId, cwd, abortSignal);
+        console.info(`[codex-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
+      } catch (err) {
+        // Non-fatal — Codex can still work with its built-in tools only
+        console.warn('[codex-runtime] Failed to start MCP bridge:', err);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Create Codex instance and thread
     // -----------------------------------------------------------------------
     const codex = new CodexCtor({
       ...(apiKey ? { apiKey } : {}),
+      ...(bridgeUrl ? {
+        config: {
+          features: {
+            tool_search_always_defer_mcp_tools: false,
+          },
+          mcp_servers: {
+            kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? []),
+          },
+        },
+      } : {}),
     });
 
     const threadOptions = {
@@ -206,10 +243,14 @@ export class CodexRuntime implements AgentRuntime {
       : codex.startThread(threadOptions);
 
     // -----------------------------------------------------------------------
-    // 5. Stream and translate events
+    // 6. Stream and translate events
     // -----------------------------------------------------------------------
     try {
-      const { events } = await thread.runStreamed(prompt, {
+      const codexPrompt = bridgeUrl && customTools
+        ? buildCodexMcpPrompt(prompt, customTools)
+        : prompt;
+
+      const { events } = await thread.runStreamed(codexPrompt, {
         signal: abortSignal,
       });
 
@@ -235,6 +276,15 @@ export class CodexRuntime implements AgentRuntime {
         error: err instanceof Error ? err.message : String(err),
       };
       yield { conversationId, type: 'done' };
+    } finally {
+      // -----------------------------------------------------------------------
+      // 7. Cleanup: stop the MCP bridge
+      // -----------------------------------------------------------------------
+      try {
+        await bridge.stop();
+      } catch {
+        // Ignore cleanup errors
+      }
     }
   }
 

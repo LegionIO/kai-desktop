@@ -34,7 +34,7 @@ const appAPI = {
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
-    generateTitle: (messages: unknown[], modelKey?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey),
+    generateTitle: (messages: unknown[], modelKey?: string, hint?: string) => ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint),
     onStreamEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('agent:stream-event', handler);
@@ -65,6 +65,21 @@ const appAPI = {
       ipcRenderer.on('conversations:changed', handler);
       return () => ipcRenderer.removeListener('conversations:changed', handler);
     },
+  },
+
+  workspaces: {
+    create: (args: { name: string; directory: string }) =>
+      ipcRenderer.invoke('workspaces:create', args),
+    rename: (args: { id: string; name: string }) =>
+      ipcRenderer.invoke('workspaces:rename', args),
+    delete: (args: { id: string }) =>
+      ipcRenderer.invoke('workspaces:delete', args),
+    setActive: (args: { id: string | null }) =>
+      ipcRenderer.invoke('workspaces:set-active', args),
+    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) =>
+      ipcRenderer.invoke('workspaces:save-last-conversation', args),
+    browseDirectory: () =>
+      ipcRenderer.invoke('workspaces:browse-directory') as Promise<{ path: string; name: string } | null>,
   },
 
   memory: {
@@ -252,6 +267,52 @@ const appAPI = {
     readFile: (filename: string) => ipcRenderer.invoke('plans:read-file', filename) as Promise<{ content?: string; error?: string }>,
   },
 
+  tasks: {
+    list: () => ipcRenderer.invoke('tasks:list'),
+    get: (id: string) => ipcRenderer.invoke('tasks:get', id),
+    create: (taskData: unknown) => ipcRenderer.invoke('tasks:create', taskData),
+    update: (id: string, updates: unknown) => ipcRenderer.invoke('tasks:update', id, updates),
+    delete: (id: string) => ipcRenderer.invoke('tasks:delete', id),
+    getOrder: () => ipcRenderer.invoke('tasks:get-order'),
+    saveOrder: (order: unknown) => ipcRenderer.invoke('tasks:save-order', order),
+    onChanged: (callback: (tasks: unknown[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, tasks: unknown[]) => callback(tasks);
+      ipcRenderer.on('tasks:changed', handler);
+      return () => ipcRenderer.removeListener('tasks:changed', handler);
+    },
+    // Terminal methods
+    terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) =>
+      ipcRenderer.invoke('tasks:terminal-create', taskId, options) as Promise<{ sessionId?: string; error?: string }>,
+    terminalWrite: (sessionId: string, data: string) =>
+      ipcRenderer.invoke('tasks:terminal-write', sessionId, data),
+    terminalResize: (sessionId: string, cols: number, rows: number) =>
+      ipcRenderer.invoke('tasks:terminal-resize', sessionId, cols, rows),
+    terminalKill: (sessionId: string) =>
+      ipcRenderer.invoke('tasks:terminal-kill', sessionId) as Promise<{ ok: boolean }>,
+    onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { sessionId: string; data: string }) => callback(data);
+      ipcRenderer.on('tasks:terminal-data', handler);
+      return () => ipcRenderer.removeListener('tasks:terminal-data', handler);
+    },
+    onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { sessionId: string; exitCode: number }) => callback(data);
+      ipcRenderer.on('tasks:terminal-exit', handler);
+      return () => ipcRenderer.removeListener('tasks:terminal-exit', handler);
+    },
+    // AI plan generation
+    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) =>
+      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history) as Promise<{ taskId: string }>,
+    cancelPlanStream: (taskId: string) =>
+      ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
+    generateTitle: (userMessage: string) =>
+      ipcRenderer.invoke('tasks:generate-title', userMessage) as Promise<{ title: string | null }>,
+    onStreamEvent: (callback: (event: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('tasks:stream-event', handler);
+      return () => ipcRenderer.removeListener('tasks:stream-event', handler);
+    },
+  },
+
   computerUse: {
     startSession: (goal: string, options: unknown) => ipcRenderer.invoke('computer-use:start-session', goal, options),
     pauseSession: (sessionId: string) => ipcRenderer.invoke('computer-use:pause-session', sessionId),
@@ -331,6 +392,20 @@ const appAPI = {
       ipcRenderer.on('stt:error', handler);
       return () => ipcRenderer.removeListener('stt:error', handler);
     },
+    batchTranscribe: (options: {
+      wavBase64?: string;
+      tempFilePath?: string;
+      language: string;
+    }) => ipcRenderer.invoke('stt:batch-transcribe', options) as Promise<{
+      text: string;
+      durationSec?: number;
+      error?: string;
+    }>,
+    onTranscriptionProgress: (callback: (progress: { percent: number; chunkIndex: number; totalChunks: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, progress: { percent: number; chunkIndex: number; totalChunks: number }) => callback(progress);
+      ipcRenderer.on('stt:transcription-progress', handler);
+      return () => ipcRenderer.removeListener('stt:transcription-progress', handler);
+    },
   },
 
   usage: {
@@ -375,6 +450,10 @@ const appAPI = {
     const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
     ipcRenderer.on('agent:execution-mode-changed', handler);
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
+  },
+
+  debug: {
+    log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
   },
 };
 

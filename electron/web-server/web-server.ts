@@ -233,13 +233,19 @@ function getBridgeScript(): string {
       onChanged: function(cb) { return on('config:changed', cb); }
     },
     agent: {
-      stream: function(cId, msgs, mk, re, pk, fb, cwd) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd); },
+      stream: function(cId, msgs, mk, re, pk, fb, cwd, em) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd, em); },
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
-      generateTitle: function(msgs, mk) { return invoke('agent:generate-title', msgs, mk); },
+      approveToolCall: function(id) { return invoke('agent:approve-tool', id); },
+      rejectToolCall: function(id) { return invoke('agent:reject-tool', id); },
+      dismissToolCall: function(id) { return invoke('agent:dismiss-tool', id); },
+      answerToolQuestion: function(id, answers) { return invoke('agent:answer-tool-question', id, answers); },
+      generateTitle: function(msgs, mk, hint) { return invoke('agent:generate-title', msgs, mk, hint); },
       onStreamEvent: function(cb) { return on('agent:stream-event', cb); },
       sendSubAgentMessage: function(cId, msg) { return invoke('agent:sub-agent-message', cId, msg); },
       stopSubAgent: function(cId) { return invoke('agent:sub-agent-stop', cId); },
-      listSubAgents: function() { return invoke('agent:sub-agent-list'); }
+      listSubAgents: function() { return invoke('agent:sub-agent-list'); },
+      getAvailableRuntimes: function() { return invoke('agent:get-available-runtimes'); },
+      getActiveRuntime: function() { return invoke('agent:get-active-runtime'); }
     },
     conversations: {
       list: function() { return invoke('conversations:list'); },
@@ -371,7 +377,8 @@ function getBridgeScript(): string {
     },
     onMenuOpenSettings: function(cb) { return on('menu:open-settings', cb); },
     onFind: function(cb) { return on('menu:find', cb); },
-    onModelSwitched: function(cb) { return on('agent:model-switched', cb); }
+    onModelSwitched: function(cb) { return on('agent:model-switched', cb); },
+    onExecutionModeChanged: function(cb) { return on('agent:execution-mode-changed', cb); }
   };
 
   connect();

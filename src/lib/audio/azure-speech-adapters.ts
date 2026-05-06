@@ -13,10 +13,10 @@ import type {
   SpeechSynthesisAdapter,
   SpeechSynthesisStatus,
   SpeechSynthesisUtterance,
-  DictationAdapter,
-  DictationResult,
-  DictationSession,
-  DictationStatus,
+  RecordingAdapter,
+  TranscriptionResult,
+  RecordingSession,
+  RecordingStatus,
 } from './speech-adapters';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -238,17 +238,17 @@ export function createAzureSpeechAdapter(config: AzureTtsConfig): SpeechSynthesi
 //   4. Receive partial (stt:partial) and final (stt:final) transcripts via events
 //   5. On stop: tear down mic + SDK (stt:live-mic-stop, stt:live-stop)
 
-export function createAzureDictationAdapter(config: AzureSttConfig): DictationAdapter {
+export function createAzureRecordingAdapter(config: AzureSttConfig): RecordingAdapter {
   return {
-    listen(): DictationSession {
+    listen(): RecordingSession {
       if (!config.subscriptionKey) {
         throw new Error('Azure subscription key not configured for STT');
       }
 
-      let status: DictationStatus = { type: 'starting' };
+      let status: RecordingStatus = { type: 'starting' };
       const speechStartListeners = new Set<() => void>();
-      const speechEndListeners = new Set<(result: DictationResult) => void>();
-      const speechListeners = new Set<(result: DictationResult) => void>();
+      const speechEndListeners = new Set<(result: TranscriptionResult) => void>();
+      const speechListeners = new Set<(result: TranscriptionResult) => void>();
       const errorListeners = new Set<(error: string) => void>();
 
       let stopRequested = false;
@@ -380,7 +380,7 @@ export function createAzureDictationAdapter(config: AzureSttConfig): DictationAd
           errorListeners.add(callback);
           return () => errorListeners.delete(callback);
         },
-      } as DictationSession & {
+      } as RecordingSession & {
         onError: (callback: (error: string) => void) => Unsubscribe;
       };
     },

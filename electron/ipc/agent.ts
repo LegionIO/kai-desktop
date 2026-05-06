@@ -1,10 +1,10 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { resolveModelForThread, resolveModelCatalog, resolveStreamConfig, type ModelCatalogEntry } from '../agent/model-catalog.js';
+import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import { normalizeAgentCwd } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
-import { createLanguageModelFromConfig } from '../agent/language-model.js';
+import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
@@ -25,7 +25,7 @@ function ipcDebugLog(msg: string): void {
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
-import { resolveRuntime } from '../agent/runtime/index.js';
+import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import {
   ToolObserverManager,
   resolveToolObserverConfig,
@@ -226,50 +226,6 @@ function logToolCompactionDebug(stage: string, details: Record<string, unknown>)
   console.info(`[ToolCompactionDebug] ${stage} ${JSON.stringify(details)}`);
 }
 
-function normalizeGeneratedTitle(rawTitle: string | null): string | null {
-  if (!rawTitle) return null;
-
-  const cleaned = rawTitle
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .replace(/^(title|summary)\s*:\s*/i, '')
-    .replace(/\s+/g, ' ');
-
-  if (!cleaned) return null;
-
-  return cleaned
-    .split(/\s+/)
-    .slice(0, 4)
-    .join(' ')
-    .slice(0, 80);
-}
-
-function resolveTitleModel(
-  config: AppConfig,
-  threadModelKey: string | null,
-): ModelCatalogEntry | null {
-  const catalog = resolveModelCatalog(config);
-  const threadEntry = resolveModelForThread(config, threadModelKey);
-
-  const matchingHaiku = catalog.entries.find((entry) => {
-    const modelName = entry.modelConfig.modelName.toLowerCase();
-    return modelName.includes('haiku');
-  });
-
-  if (matchingHaiku) return matchingHaiku;
-  return threadEntry;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableTitleGenerationError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const maybeError = error as { statusCode?: number; isRetryable?: boolean; data?: { message?: string } };
-  return maybeError.statusCode === 503 || maybeError.isRetryable === true || maybeError.data?.message === 'Bedrock is unable to process your request.';
-}
-
 // Tool registry - will be populated by Phase 4
 let registeredTools: ToolDefinition[] = [];
 
@@ -396,9 +352,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
-    // Resolve runtime early to access capabilities for middleware gating
-    const runtime = await resolveRuntime(config);
-    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} capabilities=${JSON.stringify(runtime.capabilities)}`);
+    // Resolve runtime using model-aware logic:
+    //   - auto mode: picks the best runtime for the model's provider type
+    //   - explicit mode: validates compatibility, returns a warning on mismatch
+    const { runtime, resolution } = await resolveRuntimeForStream(config, modelEntry);
+    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} claudeAuth=${resolution.claudeAuth ? `model=${resolution.claudeAuth.modelName} baseUrl=${resolution.claudeAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
+
+    // If the user has an explicitly-set runtime that is incompatible with the
+    // selected model, surface the warning in the chat and bail early.
+    if (resolution.warning) {
+      broadcastStreamEvent({ conversationId, type: 'text-delta', text: `⚠️ ${resolution.warning}` });
+      broadcastStreamEvent({ conversationId, type: 'done' });
+      activeStreams.delete(conversationId);
+      activeStreamModelKeys.delete(conversationId);
+      activeObserverSessions.delete(conversationId);
+      return { conversationId };
+    }
+
     const observerSupported = runtime.capabilities.toolObserver;
     const compactionSupported = runtime.capabilities.compaction;
 
@@ -478,6 +448,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       let activeSourceModel = modelEntry?.modelConfig
         ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
         : null;
+      let activeModelDisplayName: string | null = modelEntry?.displayName ?? null;
       // Compaction metadata keyed by execute-side toolCallId.
       // Populated in augmentToolResult, consumed when the matching
       // tool-result stream event is broadcast.
@@ -1095,6 +1066,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           abortSignal: controller.signal,
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
+          claudeAuth: resolution.claudeAuth,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
@@ -1170,6 +1142,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               );
               if (fallbackEntry?.modelConfig) {
                 activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
+                activeModelDisplayName = fallbackEntry.displayName ?? null;
               }
             }
           }
@@ -1177,6 +1150,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
               sourceModel: activeSourceModel,
+              sourceModelDisplayName: activeModelDisplayName,
+              reasoningEffort: reasoningEffort ?? null,
+              runtimeId: runtime.id,
             };
           }
           if (activeObserverSessions.get(conversationId) !== observerSessionId) {
@@ -1262,7 +1238,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string) => {
+  ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string, hint?: string) => {
     let config: AppConfig;
     try {
       config = readEffectiveConfig(appHome);
@@ -1270,94 +1246,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { title: null };
     }
 
-    const modelEntry = resolveTitleModel(config, modelKey ?? null);
-    if (!modelEntry) return { title: null };
+    const input = buildTitleGenerationInput(messages);
+    if (!input) return { title: null };
 
-    // Check if a plugin inference provider is available
-    const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
-    if (inferenceProvider) {
-      try {
-        const titleInput = buildTitleGenerationInput(messages);
-        if (!titleInput) return { title: null };
+    const promptParts = [
+      'Generate a concise conversation title using at most 4 words.',
+      'Summarize the user\'s main topic or task, not the assistant\'s answer.',
+      'Use a neutral noun phrase, not a sentence.',
+      'Avoid apologies, disclaimers, or copied response text.',
+      'Return only the title text with no quotes or formatting.',
+    ];
 
-        const systemPrompt = [
-          'Generate a concise conversation title using at most 4 words.',
-          'Summarize the user\'s main topic or task, not the assistant\'s answer.',
-          'Use a neutral noun phrase, not a sentence.',
-          'Avoid apologies, disclaimers, or copied response text.',
-          'Return only the title text with no quotes or formatting.',
-        ].join(' ');
-
-        let titleText = '';
-        const providerStream = inferenceProvider.stream({
-          conversationId: `title-gen-${Date.now()}`,
-          messages: [{ role: 'user', content: titleInput }],
-          modelKey: modelEntry.key,
-          systemPrompt,
-          abortSignal: undefined,
-        });
-
-        for await (const event of providerStream) {
-          if (event.type === 'text-delta' && event.text) {
-            titleText += event.text;
-          }
-          if (event.type === 'done' || event.type === 'error') break;
-        }
-
-        const title = normalizeGeneratedTitle(titleText);
-        if (title) return { title };
-      } catch (error) {
-        console.warn('[Agent] Title generation via plugin inference provider failed, falling back to Mastra:', error);
-      }
+    if (hint) {
+      promptParts.push(`Context: ${hint}.`);
     }
 
-    // Fallback to standard Mastra title generation
-    try {
-      const { Agent } = await import('@mastra/core/agent');
-      const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
-      type AgentConfig = ConstructorParameters<typeof Agent>[0];
+    const CHAT_TITLE_PROMPT = promptParts.join(' ');
 
-      const agent = new Agent({
-        id: `title-gen-${Date.now()}`,
-        name: 'title-generator',
-        instructions: [
-          'Generate a concise conversation title using at most 4 words.',
-          'Summarize the user\'s main topic or task, not the assistant\'s answer.',
-          'Use a neutral noun phrase, not a sentence.',
-          'Avoid apologies, disclaimers, or copied response text.',
-          'Return only the title text with no quotes or formatting.',
-        ].join(' '),
-        model: model as AgentConfig['model'],
-      });
+    const title = await generateTitle({
+      systemPrompt: CHAT_TITLE_PROMPT,
+      maxWords: 4,
+      input,
+      config,
+      modelKey,
+      inferenceProvider: pluginManager?.getInferenceProvider() ?? null,
+    });
 
-      const titleInput = buildTitleGenerationInput(messages);
-      if (!titleInput) return { title: null };
-
-      let lastError: unknown;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          const result = await agent.generate(titleInput, { maxSteps: 1 });
-          const rawTitle = typeof result.text === 'string' ? result.text : null;
-          const title = normalizeGeneratedTitle(rawTitle);
-          return { title };
-        } catch (error) {
-          lastError = error;
-          if (!isRetryableTitleGenerationError(error) || attempt === 2) {
-            throw error;
-          }
-          await sleep(600 * (attempt + 1));
-        }
-      }
-
-      throw lastError;
-    } catch (error) {
-      if (isRetryableTitleGenerationError(error)) {
-        console.warn('[Agent] Title generation skipped after retryable provider error.');
-      } else {
-        console.error('[Agent] Title generation failed:', error);
-      }
-      return { title: null };
-    }
+    return { title };
   });
 
   // Sub-agent interaction handlers

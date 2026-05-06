@@ -5,7 +5,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { usePromptHistory } from '@/providers/RuntimeProvider';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
-  placeholder = __BRAND_COMPOSER_PLACEHOLDER,
+  placeholder = 'Discuss your thoughts and ideas...',
   className = '',
   autoFocus,
 }) => {

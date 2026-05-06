@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react';
-import { EyeIcon, EyeOffIcon, Volume2Icon, SquareIcon, SearchIcon, XIcon } from 'lucide-react';
+import { EyeIcon, EyeOffIcon, Volume2Icon, SquareIcon, SearchIcon, XIcon, MicIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
 import { Toggle, SliderField, settingsSelectClass } from './shared';
 import { createAzureSpeechAdapter, type AzureTtsConfig } from '@/lib/audio/azure-speech-adapters';
 import type { SpeechSynthesisUtterance } from '@/lib/audio/speech-adapters';
+import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
 import { AZURE_NEURAL_VOICES } from '@/lib/azureNeuralVoices';
 
 const PREVIEW_TEXT = 'Hello! This is a preview of how this voice sounds.';
@@ -28,10 +29,11 @@ type AudioConfig = {
     voice?: string;
     rate?: number;
   };
-  dictation?: {
+  recording?: {
     enabled?: boolean;
     language?: string;
     continuous?: boolean;
+    inputDeviceId?: string;
   };
 };
 
@@ -182,8 +184,80 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const provider: AudioProvider = audio?.provider ?? 'native';
   const azure = audio?.azure;
   const tts = audio?.tts;
-  const dictation = audio?.dictation;
+  const recording = audio?.recording;
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [inputDevices, setInputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
+
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app &&
+    (window.app as Record<string, unknown>).__isWebBridge,
+  );
+
+  // Load available input devices
+  useEffect(() => {
+    if (isWebBridge) {
+      WebAudioMonitor.getInstance().listInputDevices()
+        .then(setInputDevices)
+        .catch(() => setInputDevices([]));
+    } else {
+      window.app?.mic?.listDevices?.()
+        .then(setInputDevices)
+        .catch(() => setInputDevices([]));
+    }
+  }, [isWebBridge]);
+
+  // ── Mic test level monitoring ──
+  const [micTesting, setMicTesting] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const micTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const webMonitorUnsubRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (!micTesting) {
+      // Cleanup
+      if (!isWebBridge) window.app?.mic?.stopMonitor?.();
+      if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+      webMonitorUnsubRef.current?.();
+      webMonitorUnsubRef.current = null;
+      setMicLevel(0);
+      return;
+    }
+
+    const deviceId = recording?.inputDeviceId ?? 'default';
+
+    if (isWebBridge) {
+      const monitor = WebAudioMonitor.getInstance();
+      webMonitorUnsubRef.current = monitor.subscribeAll([deviceId]);
+      micTimerRef.current = setInterval(() => {
+        const levels = monitor.getLevels();
+        setMicLevel(levels[deviceId] ?? 0);
+      }, 66);
+      return () => {
+        if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+        webMonitorUnsubRef.current?.();
+        webMonitorUnsubRef.current = null;
+      };
+    } else {
+      const mic = window.app?.mic;
+      if (!mic) return;
+      mic.startMonitor([deviceId]).then(() => {
+        micTimerRef.current = setInterval(() => {
+          mic.getLevel().then((levels) => {
+            setMicLevel(levels[deviceId] ?? 0);
+          }).catch(() => setMicLevel(0));
+        }, 66);
+      });
+      return () => {
+        mic.stopMonitor();
+        if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+      };
+    }
+  }, [micTesting, isWebBridge, recording?.inputDeviceId]);
+
+  // Stop mic test when recording is disabled
+  useEffect(() => {
+    if (!(recording?.enabled ?? true)) setMicTesting(false);
+  }, [recording?.enabled]);
 
   // Load available OS voices (only needed for native provider)
   useEffect(() => {
@@ -204,7 +278,7 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       <div>
         <h3 className="text-sm font-semibold">Audio</h3>
         <p className="text-xs text-muted-foreground mt-1">
-          Configure text-to-speech and voice dictation. Choose between your OS&apos;s
+          Configure text-to-speech and voice recording. Choose between your OS&apos;s
           built-in speech services or Azure AI Speech Service.
         </p>
       </div>
@@ -281,42 +355,85 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         )}
       </div>
 
-      {/* ── Dictation ── */}
+      {/* ── Voice Recording ── */}
       <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Dictation</h4>
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Voice Recording</h4>
 
         <Toggle
-          label="Enable voice dictation"
-          checked={dictation?.enabled ?? true}
-          onChange={(v) => updateConfig('audio.dictation.enabled', v)}
+          label="Enable voice recording"
+          checked={recording?.enabled ?? true}
+          onChange={(v) => updateConfig('audio.recording.enabled', v)}
         />
 
-        {(dictation?.enabled ?? true) && provider === 'native' && (
+        {(recording?.enabled ?? true) && (
           <div className="space-y-3 pl-1">
-            {/* Language */}
+            {/* Input Device */}
             <div>
-              <label className="text-[10px] text-muted-foreground block mb-0.5">Language (BCP-47)</label>
-              <input
-                type="text"
-                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
-                value={dictation?.language ?? 'en-US'}
-                onChange={(e) => updateConfig('audio.dictation.language', e.target.value)}
-                placeholder="en-US"
-              />
-              <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-                e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP
-              </span>
+              <label className="text-[10px] text-muted-foreground block mb-0.5">Input Device</label>
+              <select
+                className={settingsSelectClass}
+                value={recording?.inputDeviceId ?? ''}
+                onChange={(e) => updateConfig('audio.recording.inputDeviceId', e.target.value || undefined)}
+              >
+                <option value="">System Default</option>
+                {inputDevices.filter(d => d.deviceId !== 'default').map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+              {inputDevices.length === 0 && (
+                <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
+                  No input devices found.
+                </span>
+              )}
             </div>
 
-            {/* Continuous */}
-            <Toggle
-              label="Continuous listening"
-              checked={dictation?.continuous ?? true}
-              onChange={(v) => updateConfig('audio.dictation.continuous', v)}
-            />
-            <span className="text-[10px] text-muted-foreground/60 block -mt-2 pl-1">
-              Keep the microphone active between pauses instead of stopping after each phrase.
-            </span>
+            {/* Test Microphone */}
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => setMicTesting((v) => !v)}
+                className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-all ${
+                  micTesting
+                    ? 'border-red-500/40 bg-red-500/10 text-red-500'
+                    : 'border-border/70 bg-card/70 text-foreground hover:bg-muted/60'
+                }`}
+              >
+                <MicIcon className="h-3 w-3" />
+                {micTesting ? 'Stop Test' : 'Test Microphone'}
+              </button>
+              {micTesting && (
+                <div className="flex flex-1 items-center gap-2">
+                  <div className="flex-1 h-2 rounded-full bg-muted/50 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-75"
+                      style={{
+                        width: `${Math.min(100, Math.round(micLevel * 500))}%`,
+                        backgroundColor: micLevel > 0.12 ? '#22c55e' : micLevel > 0.04 ? '#eab308' : '#6b7280',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Language (native provider only) */}
+            {provider === 'native' && (
+              <div>
+                <label className="text-[10px] text-muted-foreground block mb-0.5">Language (BCP-47)</label>
+                <input
+                  type="text"
+                  className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
+                  value={recording?.language ?? 'en-US'}
+                  onChange={(e) => updateConfig('audio.recording.language', e.target.value)}
+                  placeholder="en-US"
+                />
+                <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
+                  e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -379,7 +496,7 @@ const AzureConfigPanel: FC<{
 
       {!hasKey && (
         <p className="text-[10px] text-amber-600/80 dark:text-amber-400/80">
-          Enter a subscription key to enable Azure AI Speech. Without one, TTS and dictation will fall back to native.
+          Enter a subscription key to enable Azure AI Speech. Without one, TTS and voice recording will fall back to native.
         </p>
       )}
 

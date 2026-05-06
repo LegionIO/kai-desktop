@@ -5,7 +5,7 @@
  * handling), getTool, hasTool, updateTools, dispose.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { ToolMcpBridge } from '../tool-mcp-bridge.js';
 import type { ToolDefinition } from '../../../tools/types.js';

@@ -5,6 +5,7 @@ import type {
   ComputerUsePermissionSection,
   ComputerUseSurface,
 } from '../../shared/computer-use';
+import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 
 type AppAPI = {
   config: {
@@ -19,7 +20,7 @@ type AppAPI = {
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
-    generateTitle: (messages: unknown[], modelKey?: string) => Promise<{ title: string | null }>;
+    generateTitle: (messages: unknown[], modelKey?: string, hint?: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: unknown) => void) => () => void;
     sendSubAgentMessage: (subAgentConversationId: string, message: string) => Promise<{ ok: boolean }>;
     stopSubAgent: (subAgentConversationId: string) => Promise<{ ok: boolean }>;
@@ -36,6 +37,14 @@ type AppAPI = {
     getActiveId: () => Promise<string | null>;
     setActiveId: (id: string) => Promise<unknown>;
     onChanged: (callback: (store: unknown) => void) => () => void;
+  };
+  workspaces: {
+    create: (args: { name: string; directory: string }) => Promise<unknown>;
+    rename: (args: { id: string; name: string }) => Promise<void>;
+    delete: (args: { id: string }) => Promise<void>;
+    setActive: (args: { id: string | null }) => Promise<void>;
+    saveLastConversation: (args: { workspaceId: string; conversationId: string | null }) => Promise<void>;
+    browseDirectory: () => Promise<{ path: string; name: string } | null>;
   };
   memory: {
     clear: (options: { working?: boolean; observational?: boolean; semantic?: boolean; all?: boolean }) =>
@@ -149,6 +158,27 @@ type AppAPI = {
   };
   plans: {
     readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
+  };
+  tasks: {
+    list: () => Promise<TaskFile[]>;
+    get: (id: string) => Promise<TaskFile | null>;
+    create: (taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => Promise<TaskFile>;
+    update: (id: string, updates: Partial<TaskFile>) => Promise<TaskFile>;
+    delete: (id: string) => Promise<{ ok: boolean }>;
+    getOrder: () => Promise<KaiTaskOrder | null>;
+    saveOrder: (order: KaiTaskOrder) => Promise<{ ok: boolean }>;
+    onChanged: (callback: (tasks: TaskFile[]) => void) => () => void;
+    terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => Promise<{ sessionId?: string; error?: string }>;
+    terminalWrite: (sessionId: string, data: string) => Promise<void>;
+    terminalResize: (sessionId: string, cols: number, rows: number) => Promise<void>;
+    terminalKill: (sessionId: string) => Promise<{ ok: boolean }>;
+    onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
+    onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
+    // AI plan generation
+    streamPlan: (taskId: string, userMessage: string, history?: TaskConversationMessage[]) => Promise<{ taskId: string }>;
+    cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
+    generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
+    onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
   };
   platform: {
     homedir: () => Promise<string>;

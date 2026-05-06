@@ -60,8 +60,8 @@ function zodToJsonSchemaObject(zodSchema: unknown): Record<string, unknown> {
     if (typeof toJsonSchema === 'function') {
       const jsonSchema = toJsonSchema.call(zodSchema);
       // Strip $schema metadata — MCP consumers don't need it
-      const { $schema: _schema, ...rest } = jsonSchema;
-      const result = rest as Record<string, unknown>;
+      const result = { ...jsonSchema } as Record<string, unknown>;
+      delete result.$schema;
       schemaCache.set(zodSchema, result);
       return result;
     }

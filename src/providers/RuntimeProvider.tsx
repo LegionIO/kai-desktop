@@ -8,7 +8,7 @@ import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
 import { useConfig } from './ConfigProvider';
-import { createUnifiedSpeechAdapter, createUnifiedDictationAdapter, type AudioProvider } from '@/lib/audio/speech-adapters';
+import { createUnifiedSpeechAdapter, createUnifiedRecordingAdapter, type AudioProvider } from '@/lib/audio/speech-adapters';
 import { buildResponseTiming, getResponseTiming, withResponseTiming } from '@/lib/response-timing';
 
 export type DebateEnrichment = {
@@ -118,6 +118,7 @@ export type ConversationRecord = {
   fallbackEnabled?: boolean;
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
+  workspaceId?: string;
   metadata?: Record<string, unknown>;
   // Sub-agent metadata
   parentConversationId?: string | null;
@@ -917,7 +918,7 @@ async function patchConversation(conversationId: string, patch: Partial<Conversa
   await app.conversations.put({ ...latest, ...patch });
 }
 
-async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[]): Promise<void> {
+async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
   try {
     const settings = await getTitleSettings();
     if (!settings.enabled) return;
@@ -951,7 +952,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       // Brief stagger to avoid simultaneous requests hitting rate limits
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined);
+      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined, hint);
       if (result.title) {
         await patchConversation(conversationId, {
           title: result.title,
@@ -1076,7 +1077,7 @@ export function RuntimeProvider({
   onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
   const { consumeAttachments } = useAttachments();
 
-  // --- Audio adapters (TTS & Dictation) ---
+  // --- Audio adapters (TTS & Voice Recording) ---
   const { config } = useConfig();
   type ExpandedAudioConfig = {
     provider?: AudioProvider;
@@ -1091,7 +1092,7 @@ export function RuntimeProvider({
       sttEndpoint?: string;
     };
     tts?: { enabled?: boolean; voice?: string; rate?: number };
-    dictation?: { enabled?: boolean; language?: string; continuous?: boolean };
+    recording?: { enabled?: boolean; language?: string; continuous?: boolean };
   };
   const audioConfig = (config as Record<string, unknown> | null)?.audio as ExpandedAudioConfig | undefined;
   const audioProvider: AudioProvider = audioConfig?.provider ?? 'native';
@@ -1122,27 +1123,27 @@ export function RuntimeProvider({
     audioConfig?.azure?.ttsOutputFormat, audioConfig?.azure?.ttsRate,
   ]);
 
-  const dictationAdapter = useMemo(() => {
-    const dict = audioConfig?.dictation;
-    if (!dict?.enabled) return undefined;
+  const recordingAdapter = useMemo(() => {
+    const rec = audioConfig?.recording;
+    if (!rec?.enabled) return undefined;
 
-    return createUnifiedDictationAdapter({
+    return createUnifiedRecordingAdapter({
       provider: audioProvider,
       enabled: true,
-      language: dict.language,
-      continuous: dict.continuous ?? true,
+      language: rec.language,
+      continuous: rec.continuous ?? true,
       azure: audioProvider === 'azure' ? {
         endpoint: audioConfig?.azure?.endpoint,
         region: audioConfig?.azure?.region ?? 'eastus',
         subscriptionKey: audioConfig?.azure?.subscriptionKey ?? '',
-        language: audioConfig?.azure?.sttLanguage ?? dict.language ?? 'en-US',
-        continuous: dict.continuous ?? true,
-        inputDeviceId: (audioConfig?.dictation as { inputDeviceId?: string } | undefined)?.inputDeviceId,
+        language: audioConfig?.azure?.sttLanguage ?? rec.language ?? 'en-US',
+        continuous: rec.continuous ?? true,
+        inputDeviceId: (audioConfig?.recording as { inputDeviceId?: string } | undefined)?.inputDeviceId,
       } : undefined,
     });
   }, [
     audioProvider,
-    audioConfig?.dictation?.enabled, audioConfig?.dictation?.language, audioConfig?.dictation?.continuous,
+    audioConfig?.recording?.enabled, audioConfig?.recording?.language, audioConfig?.recording?.continuous,
     audioConfig?.azure?.endpoint, audioConfig?.azure?.region,
     audioConfig?.azure?.subscriptionKey, audioConfig?.azure?.sttLanguage,
   ]);
@@ -1544,6 +1545,10 @@ export function RuntimeProvider({
           };
           acc.messages.push(userMsg);
           acc.headId = userMsg.id;
+
+          // Generate title after the first user message in a voice call
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          void maybeGenerateTitle(convId, branch, 'This conversation took place via voice call');
         }
       } else if (e.type === 'realtime-interrupt') {
         // User interrupted the AI response. Replace the assistant message content
@@ -2129,7 +2134,7 @@ export function RuntimeProvider({
     isRunning,
     adapters: {
       ...(speechAdapter ? { speech: speechAdapter } : {}),
-      ...(dictationAdapter ? { dictation: dictationAdapter } : {}),
+      ...(recordingAdapter ? { dictation: recordingAdapter } : {}),
     },
   });
 

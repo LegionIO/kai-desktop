@@ -1,154 +1,11 @@
 import { useState, useEffect, useRef, useCallback, type FC } from 'react';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
-import { DeviceRow } from './DeviceRow';
 import { app } from '@/lib/ipc-client';
 import { listOutputDevices } from '@/lib/audio/realtime-playback';
 import { WebAudioMonitor } from '@/lib/audio/web-audio-monitor';
-import { PhoneOffIcon, MicIcon, MicOffIcon, Volume2Icon, ChevronUpIcon } from 'lucide-react';
-
-/* ── Helpers ── */
-
-function formatDuration(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-}
-
-function LevelBars({ level, count = 5 }: { level: number; count?: number }) {
-  const filled = Math.round(level * count);
-  return (
-    <div className="flex items-end gap-[2px]">
-      {Array.from({ length: count }, (_, i) => (
-        <div
-          key={i}
-          className="w-[3px] rounded-full transition-all duration-75"
-          style={{
-            height: `${6 + i * 2}px`,
-            backgroundColor: i < filled ? '#22c55e' : 'rgba(128,128,128,0.25)',
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-/* ── Status Dot ── */
-
-function StatusDot({ status }: { status: string }) {
-  if (status === 'connected') {
-    return (
-      <span className="relative flex h-2.5 w-2.5">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
-      </span>
-    );
-  }
-  if (status === 'preparing') {
-    return (
-      <span className="relative flex h-2.5 w-2.5">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
-        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-primary" />
-      </span>
-    );
-  }
-  if (status === 'connecting') {
-    return (
-      <span className="relative flex h-2.5 w-2.5">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-yellow-400 opacity-75" />
-        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-yellow-500" />
-      </span>
-    );
-  }
-  return <span className="inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />;
-}
-
-/* ── Device Picker Popover ── */
-
-function DevicePicker({
-  label,
-  icon,
-  devices,
-  selectedDeviceId,
-  levels,
-  onSelect,
-  onOpenChange,
-}: {
-  label: string;
-  icon: React.ReactNode;
-  devices: Array<{ deviceId: string; label: string }>;
-  selectedDeviceId: string | undefined;
-  levels: Record<string, number>;
-  onSelect: (deviceId: string | undefined) => void;
-  onOpenChange?: (open: boolean) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  const toggleOpen = useCallback((next: boolean) => {
-    setOpen(next);
-    onOpenChange?.(next);
-  }, [onOpenChange]);
-
-  // Close on outside click
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) toggleOpen(false);
-    };
-    window.addEventListener('pointerdown', handler);
-    return () => window.removeEventListener('pointerdown', handler);
-  }, [open, toggleOpen]);
-
-  const selectedLabel =
-    (!selectedDeviceId
-      ? 'System Default'
-      : devices.find((d) => d.deviceId === selectedDeviceId)?.label) ?? 'System Default';
-
-  return (
-    <div ref={rootRef} className="relative">
-      <button
-        type="button"
-        onClick={() => toggleOpen(!open)}
-        className="flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50"
-      >
-        {icon}
-        <span className="max-w-[120px] truncate">{selectedLabel}</span>
-        <ChevronUpIcon className="h-2.5 w-2.5" />
-      </button>
-
-      {open && (
-        <div className="absolute bottom-full left-0 z-50 mb-2 w-[300px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
-          <div className="px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
-            {label}
-          </div>
-          <div className="max-h-[280px] overflow-y-auto space-y-0.5">
-            <DeviceRow
-              label="System Default"
-              selected={!selectedDeviceId}
-              level={levels['default'] ?? 0}
-              onClick={() => { onSelect(undefined); toggleOpen(false); }}
-            />
-            {devices.filter((d) => d.deviceId !== 'default').map((d) => (
-              <DeviceRow
-                key={d.deviceId}
-                label={d.label}
-                selected={selectedDeviceId === d.deviceId}
-                level={levels[d.deviceId] ?? 0}
-                onClick={() => { onSelect(d.deviceId); toggleOpen(false); }}
-              />
-            ))}
-            {devices.length === 0 && (
-              <div className="px-3 py-3 text-[10px] text-muted-foreground text-center">
-                No devices found
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+import { PhoneOffIcon, MicIcon, MicOffIcon, Volume2Icon } from 'lucide-react';
+import { formatDuration, LevelBars, StatusDot, DevicePicker } from './overlay-shared';
 
 /* ── CallOverlay ── */
 
@@ -254,16 +111,35 @@ export const CallOverlay: FC = () => {
   const statusPulse = callState.isSpeaking || callState.isResponding || callState.isProcessing;
 
   return (
-    <div className="relative z-20 border-t border-border/70 bg-background/88 px-3 pb-3 pt-3 backdrop-blur-md md:px-6 md:pb-6 md:pt-4">
-      <div className="mx-auto w-full max-w-5xl">
-        <div className="flex flex-col gap-3 rounded-[1.7rem] border border-border/70 bg-card/78 px-4 py-4 app-composer-shadow">
-          {/* Row 1: Status, audio levels, timer */}
+    <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
+      <div className="mx-auto w-full">
+        <div className="flex flex-col gap-2.5 rounded-2xl border border-border/70 bg-card/78 px-4 py-[18.75px] app-composer-shadow">
+          {/* Row 1: Status, audio levels, device selectors, timer */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-            <div className="flex items-center gap-2.5">
-              <StatusDot status={callState.status} />
-              <span className="text-xs font-medium capitalize text-muted-foreground">
-                {callState.status === 'connected' ? 'Connected' : callState.status === 'preparing' ? 'Ringing...' : callState.status === 'connecting' ? 'Connecting...' : callState.status}
-              </span>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <StatusDot status={callState.status} />
+                <span className="text-xs font-medium capitalize text-muted-foreground">
+                  {callState.status === 'connected' ? 'Connected' : callState.status === 'preparing' ? 'Ringing...' : callState.status === 'connecting' ? 'Connecting...' : callState.status}
+                </span>
+              </div>
+              <DevicePicker
+                label="Input Device"
+                icon={<MicIcon className="h-3 w-3" />}
+                devices={inputDevices}
+                selectedDeviceId={selectedInputDeviceId}
+                levels={inputLevels}
+                onSelect={handleSelectInput}
+                onOpenChange={setInputPickerOpen}
+              />
+              <DevicePicker
+                label="Output Device"
+                icon={<Volume2Icon className="h-3 w-3" />}
+                devices={outputDevices}
+                selectedDeviceId={selectedOutputDeviceId}
+                levels={outputLevels}
+                onSelect={handleSelectOutput}
+              />
             </div>
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-1.5" title="Input level">
@@ -280,28 +156,7 @@ export const CallOverlay: FC = () => {
             </div>
           </div>
 
-          {/* Row 2: Device selectors */}
-          <div className="flex items-center gap-2 px-1">
-            <DevicePicker
-              label="Input Device"
-              icon={<MicIcon className="h-3 w-3" />}
-              devices={inputDevices}
-              selectedDeviceId={selectedInputDeviceId}
-              levels={inputLevels}
-              onSelect={handleSelectInput}
-              onOpenChange={setInputPickerOpen}
-            />
-            <DevicePicker
-              label="Output Device"
-              icon={<Volume2Icon className="h-3 w-3" />}
-              devices={outputDevices}
-              selectedDeviceId={selectedOutputDeviceId}
-              levels={outputLevels}
-              onSelect={handleSelectOutput}
-            />
-          </div>
-
-          {/* Row 3: Speaking status + End Call */}
+          {/* Row 2: Speaking status + Mute + End Call */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
             <div className="flex items-center gap-2 min-w-0">
               <span

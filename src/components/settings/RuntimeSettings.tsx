@@ -32,7 +32,7 @@ function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
   });
 }
 
-export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ config, updateConfig, embedded }) => {
   const agentConfig = (config.agent as AgentConfig | undefined) ?? { runtime: 'auto' };
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
   const [activeRuntime, setActiveRuntime] = useState<string>('mastra');
@@ -66,12 +66,14 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
 
   return (
     <div className="space-y-6">
-      <div>
-        <h3 className="text-sm font-semibold">Agent Runtime</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Choose which agent runtime powers conversations. Each runtime offers different capabilities and trade-offs.
-        </p>
-      </div>
+      {!embedded && (
+        <div>
+          <h3 className="text-sm font-semibold">Agent Runtime</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Choose which agent runtime powers conversations. Each runtime offers different capabilities and trade-offs.
+          </p>
+        </div>
+      )}
 
       {/* Runtime selector */}
       <div>
@@ -82,9 +84,9 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
           onChange={(e) => void updateConfig('agent.runtime', e.target.value)}
         >
           <option value="auto">Auto (prefer external runtime if available)</option>
-          <option value="mastra">Mastra (built-in)</option>
           <option value="claude-agent-sdk">Claude Code</option>
           <option value="codex-sdk">Codex</option>
+          <option value="mastra">Mastra</option>
         </select>
       </div>
 
@@ -133,50 +135,6 @@ export const RuntimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
           {RUNTIME_DESCRIPTIONS[selectedRuntime]}
         </p>
       )}
-
-      {/* Capability comparison */}
-      <details className="text-xs">
-        <summary className="cursor-pointer text-muted-foreground hover:text-foreground transition-colors">
-          Runtime Capability Comparison
-        </summary>
-        <div className="mt-2 overflow-x-auto">
-          <table className="w-full text-[10px] border-collapse">
-            <thead>
-              <tr className="border-b border-border/40">
-                <th className="text-left py-1 pr-3 font-medium text-muted-foreground">Feature</th>
-                <th className="text-center py-1 px-2 font-medium">Mastra</th>
-                <th className="text-center py-1 px-2 font-medium">Claude Code</th>
-                <th className="text-center py-1 px-2 font-medium">Codex</th>
-              </tr>
-            </thead>
-            <tbody className="text-muted-foreground">
-              {[
-                ['Real-time streaming', true, true, false],
-                ['Tool execution', true, true, true],
-                ['MCP support', true, true, false],
-                ['Custom tools', true, true, false],
-                ['Plan mode', true, true, false],
-                ['User questions (ask_user)', true, true, false],
-                ['Skills & CLI tools', true, true, false],
-                ['Memory layers', true, false, false],
-                ['Context compaction', true, false, false],
-                ['Tool observer', true, false, false],
-                ['Sub-agents', true, true, false],
-                ['Multi-provider', true, true, false],
-                ['Model fallback', true, true, false],
-                ['Session resume', false, true, true],
-              ].map(([feature, mastra, claude, codex]) => (
-                <tr key={feature as string} className="border-b border-border/20">
-                  <td className="py-1 pr-3">{feature as string}</td>
-                  <td className="text-center py-1 px-2">{mastra ? '✓' : '—'}</td>
-                  <td className="text-center py-1 px-2">{claude ? '✓' : '—'}</td>
-                  <td className="text-center py-1 px-2">{codex ? '✓' : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </details>
     </div>
   );
 };

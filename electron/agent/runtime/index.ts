@@ -13,6 +13,8 @@
 
 import type { AgentRuntime, RuntimeId } from './types.js';
 import type { AppConfig } from '../../config/schema.js';
+import type { ModelCatalogEntry } from '../model-catalog.js';
+import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-compat.js';
 
 // ---------------------------------------------------------------------------
 // Registry state
@@ -77,6 +79,48 @@ function getMastraOrThrow(): AgentRuntime {
     throw new Error('[Runtime] Mastra runtime is not registered. This is a bug.');
   }
   return mastra;
+}
+
+// ---------------------------------------------------------------------------
+// Model-aware resolution (for streaming)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the runtime to use for a stream, taking the selected model into
+ * account.  In `auto` mode the runtime is chosen based on the model's provider
+ * type; in explicit mode it validates compatibility and may return a warning.
+ *
+ * This replaces `resolveRuntime()` in the stream handler.
+ */
+export async function resolveRuntimeForStream(
+  config: AppConfig,
+  model: ModelCatalogEntry | null,
+): Promise<{ runtime: AgentRuntime; resolution: RuntimeResolution }> {
+  const preferred: RuntimeId | 'auto' =
+    (config as Record<string, unknown>).agent &&
+    typeof ((config as Record<string, unknown>).agent as Record<string, unknown>)?.runtime === 'string'
+      ? (((config as Record<string, unknown>).agent as Record<string, unknown>).runtime as RuntimeId | 'auto')
+      : 'auto';
+
+  // Build the set of currently available runtimes
+  const available = new Set<RuntimeId>();
+  for (const [id, rt] of runtimes) {
+    if (await rt.isAvailable()) {
+      available.add(id);
+    }
+  }
+  // Mastra is always available
+  available.add('mastra');
+
+  const resolution = resolveRuntimeForModel(model, config, preferred, available);
+
+  // Look up the actual runtime instance
+  const runtime = runtimes.get(resolution.runtimeId);
+  if (!runtime) {
+    return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };
+  }
+
+  return { runtime, resolution };
 }
 
 // ---------------------------------------------------------------------------

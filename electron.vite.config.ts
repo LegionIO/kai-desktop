@@ -88,6 +88,7 @@ export default defineConfig({
           // Native addons that can't be bundled
           'better-sqlite3',
           'tiktoken',
+          '@lydell/node-pty',
           // libsql uses platform-specific native binaries
           'libsql',
           /^@libsql\//,

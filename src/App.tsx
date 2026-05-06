@@ -23,17 +23,20 @@ import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SettingsIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
-import { SidebarSectionSwitcher, type SidebarSection } from '@/components/SidebarSectionSwitcher';
+import { IconRail } from '@/components/sidebar/IconRail';
+import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
+import { ContentPanel } from '@/components/sidebar/ContentPanel';
+import type { SidebarTab, Workspace } from '../electron/config/schema';
 import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
 import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
 import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
 import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
-import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
+import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
-import type { ExecutionMode } from '@/components/thread/ModelSettingsButton';
+import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
@@ -41,7 +44,11 @@ import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface 
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
+import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
+import { KanbanBoard } from '@/components/tasks/KanbanBoard';
+import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
+import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -50,7 +57,9 @@ export default function App() {
       <ConfigProvider>
         <PluginProvider>
           <ComputerUseProvider>
-            <AppRoot />
+            <TaskProvider>
+              <AppRoot />
+            </TaskProvider>
           </ComputerUseProvider>
         </PluginProvider>
       </ConfigProvider>
@@ -302,7 +311,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   );
 };
 
-const SIDEBAR_MIN_WIDTH = 240;
+const SIDEBAR_MIN_WIDTH = 260;
 const SIDEBAR_MAX_WIDTH = 520;
 
 function clampSidebarWidth(width: number) {
@@ -348,6 +357,7 @@ const CHAT_VIEW = 'chat';
 const SETTINGS_VIEW = 'settings';
 const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
+const TASKS_VIEW = 'tasks';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function isPluginView(view: string): boolean {
@@ -440,9 +450,17 @@ function AppShell() {
   const [pluginTitleMenuOpen, setPluginTitleMenuOpen] = useState(false);
   const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
+  const [taskTitleMenuOpen, setTaskTitleMenuOpen] = useState(false);
+  const [renamingTask, setRenamingTask] = useState(false);
+  const [taskRenameValue, setTaskRenameValue] = useState('');
+  const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
+  const [pinnedTaskIds, setPinnedTaskIds] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]')); } catch { return new Set(); }
+  });
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('threads');
+  const [sidebarSection, setSidebarSection] = useState<SidebarTab>('chats');
   const lastPluginViewRef = useRef<string>(MARKETPLACE_VIEW);
   const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
   const isMobile = useIsMobile();
@@ -457,6 +475,17 @@ function AppShell() {
     navigationRequests,
   } = usePlugins();
 
+  // ── Workspace state (derived from config) ──────────────────────────────
+  const workspaces = useMemo<Workspace[]>(
+    () => (config?.ui as { workspaces?: Workspace[] } | undefined)?.workspaces ?? [],
+    [config],
+  );
+  const activeWorkspaceId = (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
+  const activeWorkspace = useMemo<Workspace | null>(
+    () => workspaces.find((w) => w.id === activeWorkspaceId) ?? null,
+    [workspaces, activeWorkspaceId],
+  );
+
   useEffect(() => {
     const ui = config?.ui as { sidebarWidth?: number } | undefined;
     if (typeof ui?.sidebarWidth === 'number') {
@@ -470,6 +499,33 @@ function AppShell() {
       lastPluginViewRef.current = activeView;
     }
   }, [activeView]);
+
+  // Restore the last active conversation when switching workspaces
+  const prevWorkspaceIdRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (prevWorkspaceIdRef.current === undefined) {
+      // First render — just record the initial value
+      prevWorkspaceIdRef.current = activeWorkspaceId;
+      return;
+    }
+    if (prevWorkspaceIdRef.current === activeWorkspaceId) return;
+
+    const departingId = prevWorkspaceIdRef.current;
+    prevWorkspaceIdRef.current = activeWorkspaceId;
+
+    // Save the current conversation to the departing workspace
+    if (departingId && activeConversationId) {
+      void app.workspaces.saveLastConversation({
+        workspaceId: departingId,
+        conversationId: activeConversationId,
+      });
+    }
+
+    // Restore the arriving workspace's last conversation
+    if (activeWorkspace?.lastActiveConversationId) {
+      void handleSwitchConversation(activeWorkspace.lastActiveConversationId);
+    }
+  }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
 
   // Build a name→displayName map from the plugin list (refreshed when pluginUIState changes)
   useEffect(() => {
@@ -711,7 +767,8 @@ function AppShell() {
         messageCount: 0, userMessageCount: 0,
         runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
         selectedModelKey: null,
-        currentWorkingDirectory: null,
+        currentWorkingDirectory: activeWorkspace?.directory ?? null,
+        workspaceId: activeWorkspaceId ?? undefined,
       });
       await app.conversations.setActiveId(newId);
       setActiveView(CHAT_VIEW);
@@ -727,7 +784,7 @@ function AppShell() {
     } finally {
       suppressStoreSync.current = false;
     }
-  }, [isMobile]);
+  }, [isMobile, activeWorkspace, activeWorkspaceId]);
 
   const [preSettingsView, setPreSettingsView] = useState<string>(CHAT_VIEW);
 
@@ -922,6 +979,56 @@ function AppShell() {
     return () => window.removeEventListener('plugin-navigate', handler);
   }, [handleSwitchConversation]);
 
+  // Handle "View Task" links from chat — navigate to task board and open the task modal
+  const tasksCtx = useTasksOptional();
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { taskId } = (e as CustomEvent<{ taskId: string }>).detail;
+      if (taskId) {
+        setSidebarSection('tasks');
+        setActiveView(TASKS_VIEW);
+        tasksCtx?.selectTask(taskId);
+      }
+    };
+    window.addEventListener('kai:open-task', handler);
+    return () => window.removeEventListener('kai:open-task', handler);
+  }, [tasksCtx]);
+
+  // Sync pinned-tasks from other components (sidebar context menu, etc.)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      try { setPinnedTaskIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+    };
+    window.addEventListener('pinned-tasks-changed', handler);
+    return () => window.removeEventListener('pinned-tasks-changed', handler);
+  }, []);
+
+  const toggleTaskPin = useCallback((id: string) => {
+    const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]';
+    let ids: string[];
+    try { ids = JSON.parse(raw); } catch { ids = []; }
+    const set = new Set(ids);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    const serialized = JSON.stringify([...set]);
+    localStorage.setItem(__BRAND_APP_SLUG + ':pinned-tasks', serialized);
+    setPinnedTaskIds(set);
+    window.dispatchEvent(new CustomEvent('pinned-tasks-changed', { detail: serialized }));
+  }, []);
+
+  const handleTaskRename = useCallback(async (taskId: string, newTitle: string) => {
+    if (!tasksCtx || !newTitle.trim()) return;
+    await tasksCtx.updateTask(taskId, { title: newTitle.trim() });
+    setRenamingTask(false);
+  }, [tasksCtx]);
+
+  const handleTaskDelete = useCallback(async (taskId: string) => {
+    if (!tasksCtx) return;
+    await tasksCtx.deleteTask(taskId);
+    tasksCtx.selectTask(null);
+    setConfirmingTaskDelete(false);
+  }, [tasksCtx]);
+
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
   const activePluginPanel = useMemo(() => {
     // First try to match a real panel descriptor
@@ -992,6 +1099,18 @@ function AppShell() {
       if (matchingPluginCommand) {
         e.preventDefault();
         handlePluginNavigationItem(matchingPluginCommand.pluginName, matchingPluginCommand.target as { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown });
+        return;
+      }
+
+      // Sidebar tab shortcuts: Cmd+1 through Cmd+5
+      const tabShortcuts: Record<string, SidebarTab> = { '1': 'chats', '2': 'tasks', '3': 'messages', '4': 'agents', '5': 'plugins' };
+      if (e.key in tabShortcuts) {
+        e.preventDefault();
+        const tab = tabShortcuts[e.key];
+        setSidebarSection(tab);
+        if (tab === 'chats') setActiveView(CHAT_VIEW);
+        else if (tab === 'tasks') setActiveView(TASKS_VIEW);
+        else if (tab === 'plugins') setActiveView(lastPluginViewRef.current);
         return;
       }
 
@@ -1165,6 +1284,64 @@ function AppShell() {
           </div>,
           document.body,
         )}
+        {renamingTask && tasksCtx?.state.selectedTaskId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTask(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
+              <input
+                ref={renameInputRef}
+                value={taskRenameValue}
+                onChange={(e) => setTaskRenameValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue); if (e.key === 'Escape') setRenamingTask(false); }}
+                className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRenamingTask(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
+                  className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+        {confirmingTaskDelete && tasksCtx?.state.selectedTaskId && createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingTaskDelete(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
+              <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this task? This cannot be undone.</p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmingTaskDelete(false)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void handleTaskDelete(tasksCtx.state.selectedTaskId!); }}
+                  className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
         <div className="relative flex h-screen overflow-hidden text-foreground">
           {/* Mobile sidebar backdrop */}
           {isMobile && sidebarOpen && (
@@ -1189,71 +1366,88 @@ function AppShell() {
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
               <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
-                <Tooltip content="Settings" side="bottom" sideOffset={6}>
-                  <button
-                    type="button"
-                    onClick={() => { void handleSettingsToggle(); }}
-                    className={`rounded-lg p-1.5 transition-colors hover:bg-sidebar-accent/80 ${activeView === SETTINGS_VIEW ? 'bg-primary/15 text-primary' : 'text-muted-foreground'}`}
-                  >
-                    <SettingsIcon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
-                <Tooltip content={themeTitle} side="bottom" sideOffset={6}>
-                  <button
-                    type="button"
-                    onClick={toggleTheme}
-                    className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
-                  >
-                    <ThemeIcon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
+                <button
+                  type="button"
+                  onClick={toggleTheme}
+                  className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
+                  title={themeTitle}
+                >
+                  <ThemeIcon className="h-4 w-4" />
+                </button>
               </div>
             </div>
-            <div className="flex min-h-0 flex-1 flex-col">
-              <SidebarSectionSwitcher
-                value={sidebarSection}
-                onValueChange={(section) => {
-                  setSidebarSection(section);
-                  if (section === 'extensions') {
+            <div className="flex min-h-0 flex-1">
+              <IconRail
+                activeTab={sidebarSection}
+                onSelectTab={(tab) => {
+                  setSidebarSection(tab);
+                  if (tab === 'plugins') {
                     setActiveView(lastPluginViewRef.current);
-                  } else if (section === 'threads') {
+                  } else if (tab === 'chats') {
                     setActiveView(CHAT_VIEW);
+                  } else if (tab === 'tasks') {
+                    setActiveView(TASKS_VIEW);
                   }
                 }}
+                settingsActive={activeView === SETTINGS_VIEW}
+                onSettingsClick={() => { void handleSettingsToggle(); }}
               />
-
-              {sidebarSection === 'threads' && (
-                <>
-                  <div className="min-h-0 flex-1 overflow-y-auto">
-                    <ConversationList
-                      activeConversationId={activeConversationId}
-                      activeThreadMode={threadMode}
-                      onSwitchConversation={handleSwitchConversation}
-                      onNewConversation={handleNewConversation}
-                      onDeleteConversation={handleDeleteConversation}
-                    />
-                  </div>
-                  <div className="shrink-0">
-                    <SubAgentSidebarSection />
-                  </div>
-                </>
-              )}
-
-              {sidebarSection === 'extensions' && (
-                <>
-                  <div className="min-h-0 flex-1 overflow-y-auto">
-                    <InstalledPluginsList
-                      activeView={activeView}
-                      onNavigate={handlePluginNavigationItem}
-                      onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                      onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
-                      onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
-                    />
-                  </div>
-                </>
-              )}
-
-              <UpdateCard />
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                <ContentPanel
+                  activeTab={sidebarSection}
+                  chatsContent={
+                    <>
+                      <div className="min-h-0 flex-1 overflow-y-auto">
+                        <ConversationList
+                          activeConversationId={activeConversationId}
+                          activeThreadMode={threadMode}
+                          onSwitchConversation={handleSwitchConversation}
+                          onNewConversation={handleNewConversation}
+                          onDeleteConversation={handleDeleteConversation}
+                          workspaceId={activeWorkspaceId}
+                        />
+                      </div>
+                      <div className="shrink-0">
+                        <SubAgentSidebarSection />
+                      </div>
+                    </>
+                  }
+                  tasksContent={
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <TaskSidebarList
+                        onSelectTask={() => {
+                          setIsCreatingTask(false);
+                          setActiveView(TASKS_VIEW);
+                        }}
+                        onCreateTask={() => {
+                          tasksCtx?.selectTask(null);
+                          setIsCreatingTask(true);
+                          setActiveView(TASKS_VIEW);
+                        }}
+                        onViewBoard={() => {
+                          tasksCtx?.selectTask(null);
+                          setIsCreatingTask(false);
+                          setActiveView(TASKS_VIEW);
+                        }}
+                        isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
+                        workspaceId={activeWorkspaceId}
+                      />
+                    </div>
+                  }
+                  pluginsContent={
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <InstalledPluginsList
+                        activeView={activeView}
+                        onNavigate={handlePluginNavigationItem}
+                        onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                        onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                        onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                      />
+                    </div>
+                  }
+                />
+                <UpdateCard />
+              </div>
             </div>
             </div>
           </aside>
@@ -1288,7 +1482,7 @@ function AppShell() {
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <UpdateCard />
             {/* Interactive title bar */}
-            <div className={`${titleMenuOpen || pluginTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+            <div className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
@@ -1307,6 +1501,59 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
                 ) : activeView === PLUGINS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                ) : activeView === TASKS_VIEW ? (
+                  (() => {
+                    if (isCreatingTask) {
+                      return null;
+                    }
+                    const selectedTaskId = tasksCtx?.state.selectedTaskId;
+                    const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
+                    if (selectedTask) {
+                      return (
+                        <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
+                          <DropdownMenu.Trigger asChild>
+                            <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                              <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                {selectedTask.title}
+                              </span>
+                              <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                            </button>
+                          </DropdownMenu.Trigger>
+                          <DropdownMenu.Portal>
+                            <DropdownMenu.Content
+                              align="start"
+                              sideOffset={4}
+                              className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                            >
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                onSelect={() => toggleTaskPin(selectedTask.id)}
+                              >
+                                <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
+                              </DropdownMenu.Item>
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                onSelect={() => { setTaskRenameValue(selectedTask.title); setRenamingTask(true); }}
+                              >
+                                <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                <span>Rename</span>
+                              </DropdownMenu.Item>
+                              <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                              <DropdownMenu.Item
+                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                onSelect={() => setConfirmingTaskDelete(true)}
+                              >
+                                <Trash2Icon className="h-4 w-4" />
+                                <span>Delete</span>
+                              </DropdownMenu.Item>
+                            </DropdownMenu.Content>
+                          </DropdownMenu.Portal>
+                        </DropdownMenu.Root>
+                      );
+                    }
+                    return <span className="text-sm font-medium text-foreground">Task Board</span>;
+                  })()
                 ) : activeErrorPluginName ? (
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
@@ -1464,6 +1711,11 @@ function AppShell() {
                   Settings
                 </button>
               )}
+              <WorkspaceSelector
+                workspaces={workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                activeWorkspace={activeWorkspace}
+              />
               </div>
               </div>
             </div>
@@ -1499,6 +1751,25 @@ function AppShell() {
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
                 </div>
+              ) : activeView === TASKS_VIEW ? (
+                isCreatingTask ? (
+                  <TaskCreationView
+                    onDone={(taskId) => {
+                      setIsCreatingTask(false);
+                      tasksCtx?.selectTask(taskId);
+                    }}
+                    onCancel={() => {
+                      setIsCreatingTask(false);
+                    }}
+                  />
+                ) : (
+                  <div className="flex flex-col flex-1 min-h-0">
+                    <KanbanBoard onCreateTask={() => {
+                      tasksCtx?.selectTask(null);
+                      setIsCreatingTask(true);
+                    }} />
+                  </div>
+                )
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                   <div className="flex h-full min-h-0">
