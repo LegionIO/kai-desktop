@@ -1363,6 +1363,16 @@ function AppShell() {
               <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
+              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={toggleTheme}
+                  className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
+                  title={themeTitle}
+                >
+                  <ThemeIcon className="h-4 w-4" />
+                </button>
+              </div>
             </div>
             <div className="flex min-h-0 flex-1">
               <IconRail
@@ -1379,7 +1389,6 @@ function AppShell() {
                 }}
                 settingsActive={activeView === SETTINGS_VIEW}
                 onSettingsClick={() => { void handleSettingsToggle(); }}
-                themeButton={{ icon: ThemeIcon, title: themeTitle, onClick: toggleTheme }}
               />
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <ContentPanel
