@@ -132,7 +132,7 @@ export const ChatSettingsButton: FC<{
   const models = catalog?.models ?? [];
   const profiles = profileCatalog?.profiles ?? [];
   const hasProfiles = showModelProfile && onSelectProfile && profiles.length > 0;
-  const currentProfileKey = selectedProfileKey ?? profileCatalog?.defaultKey;
+  const currentProfileKey = selectedProfileKey === undefined ? profileCatalog?.defaultKey : selectedProfileKey;
   const effectiveProfileModelKey = currentProfileKey
     ? profiles.find((p) => p.key === currentProfileKey)?.primaryModelKey
     : undefined;
