@@ -49,6 +49,39 @@ import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 
+// ─── Session Cookie Promotion ────────────────────────────────────────────────
+// Electron drops session cookies (those without an Expires/Max-Age) when the
+// last BrowserWindow using that partition's session closes.  For auth windows
+// that open briefly and close, this means SSO cookies vanish immediately.
+// This helper promotes session cookies to persistent ones (7-day TTL) so they
+// survive across window opens, matching Chrome's behavior of keeping session
+// cookies alive for the lifetime of the browser process.
+const promotedSessions = new WeakSet<Electron.Session>();
+const SESSION_COOKIE_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+function ensureSessionCookiePromotion(ses: Electron.Session): void {
+  if (promotedSessions.has(ses)) return;
+  promotedSessions.add(ses);
+
+  ses.cookies.on('changed', (_event, cookie, _cause, removed) => {
+    // Only promote cookies that were just set (not removed) and lack an expiry
+    if (removed || cookie.expirationDate) return;
+
+    const expirationDate = Math.floor(Date.now() / 1000) + SESSION_COOKIE_TTL_SECONDS;
+    ses.cookies.set({
+      url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      secure: cookie.secure,
+      httpOnly: cookie.httpOnly,
+      sameSite: cookie.sameSite as any,
+      expirationDate,
+    }).catch(() => { /* best-effort — ignore failures */ });
+  });
+}
+
 type PluginAPICallbacks = {
   appHome: string;
   getConfig: () => AppConfig;
@@ -519,6 +552,7 @@ export function createPluginAPI(
           let revealTimer: NodeJS.Timeout | null = null;
 
           const ses = partition ? session.fromPartition(partition) : undefined;
+          if (ses) ensureSessionCookiePromotion(ses);
 
           const authWin = new BrowserWindow({
             width,
@@ -715,6 +749,7 @@ export function createPluginAPI(
         } = options;
 
         const ses = partition ? session.fromPartition(partition) : undefined;
+        if (ses) ensureSessionCookiePromotion(ses);
 
         const browserWin = new BrowserWindow({
           width,
