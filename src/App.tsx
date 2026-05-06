@@ -423,6 +423,13 @@ function AppShell() {
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
+  const [threadOverrides, setThreadOverrides] = useState<{
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  } | undefined>(undefined);
   const { sessionsByConversation: cuSessionsByConversation } = useComputerUse();
   // Track the primary model key of the currently selected profile so we can
   // restore it when auto-routing is re-enabled.
@@ -903,11 +910,29 @@ function AppShell() {
     selectedProfileKey: string | null;
     fallbackEnabled: boolean;
     profilePrimaryModelKey: string | null;
+    reasoningEffort?: ReasoningEffort | null;
+    executionMode?: ExecutionMode | null;
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
   }) => {
     setSelectedModelKey(settings.selectedModelKey);
     setSelectedProfileKey(settings.selectedProfileKey);
     setFallbackEnabled(settings.fallbackEnabled);
     setProfilePrimaryModelKey(settings.profilePrimaryModelKey);
+    if (settings.reasoningEffort) setReasoningEffort(settings.reasoningEffort);
+    else setReasoningEffort('medium');
+    if (settings.executionMode) setExecutionMode(settings.executionMode as ExecutionMode);
+    else setExecutionMode('auto');
+    setThreadOverrides({
+      temperature: settings.temperature ?? null,
+      systemPromptOverride: settings.systemPromptOverride ?? null,
+      maxSteps: settings.maxSteps ?? null,
+      maxRetries: settings.maxRetries ?? null,
+      runtimeOverride: settings.runtimeOverride ?? null,
+    });
   }, []);
 
   // Persist per-conversation settings whenever they change
@@ -921,17 +946,57 @@ function AppShell() {
       if (record.selectedModelKey === selectedModelKey
         && record.selectedProfileKey === selectedProfileKey
         && record.fallbackEnabled === fallbackEnabled
-        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
+        && record.profilePrimaryModelKey === profilePrimaryModelKey
+        && (record.reasoningEffort ?? null) === (reasoningEffort === 'medium' ? null : reasoningEffort)
+        && (record.executionMode ?? null) === (executionMode === 'auto' ? null : executionMode)
+        && (record.temperature ?? null) === (threadOverrides?.temperature ?? null)
+        && (record.systemPromptOverride ?? null) === (threadOverrides?.systemPromptOverride ?? null)
+        && (record.maxSteps ?? null) === (threadOverrides?.maxSteps ?? null)
+        && (record.maxRetries ?? null) === (threadOverrides?.maxRetries ?? null)
+        && (record.runtimeOverride ?? null) === (threadOverrides?.runtimeOverride ?? null)) return;
       app.conversations.put({
         ...record,
         selectedModelKey,
         selectedProfileKey,
         fallbackEnabled,
         profilePrimaryModelKey,
+        reasoningEffort: reasoningEffort === 'medium' ? null : reasoningEffort,
+        executionMode: executionMode === 'auto' ? null : executionMode,
+        temperature: threadOverrides?.temperature ?? null,
+        systemPromptOverride: threadOverrides?.systemPromptOverride ?? null,
+        maxSteps: threadOverrides?.maxSteps ?? null,
+        maxRetries: threadOverrides?.maxRetries ?? null,
+        runtimeOverride: threadOverrides?.runtimeOverride ?? null,
         updatedAt: new Date().toISOString(),
       });
     }).catch(() => {});
-  }, [activeConversationId, selectedModelKey, selectedProfileKey, fallbackEnabled, profilePrimaryModelKey]);
+  }, [activeConversationId, selectedModelKey, selectedProfileKey, fallbackEnabled, profilePrimaryModelKey, reasoningEffort, executionMode, threadOverrides]);
+
+  // Sync when the ThreadSettingsModal modifies the ACTIVE conversation
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as Record<string, unknown> & { conversationId: string };
+      if (detail.conversationId !== activeConversationId) return;
+      if ('selectedModelKey' in detail) setSelectedModelKey(detail.selectedModelKey as string | null);
+      if ('selectedProfileKey' in detail) setSelectedProfileKey(detail.selectedProfileKey as string | null);
+      if ('fallbackEnabled' in detail) setFallbackEnabled(detail.fallbackEnabled as boolean);
+      if ('reasoningEffort' in detail) setReasoningEffort((detail.reasoningEffort as ReasoningEffort) ?? 'medium');
+      if ('executionMode' in detail) setExecutionMode((detail.executionMode as ExecutionMode) ?? 'auto');
+      // Thread overrides (temperature, systemPrompt, maxSteps, etc.)
+      if ('temperature' in detail || 'systemPromptOverride' in detail || 'maxSteps' in detail || 'maxRetries' in detail || 'runtimeOverride' in detail) {
+        setThreadOverrides((prev) => ({
+          ...prev,
+          ...('temperature' in detail ? { temperature: detail.temperature as number | null } : {}),
+          ...('systemPromptOverride' in detail ? { systemPromptOverride: detail.systemPromptOverride as string | null } : {}),
+          ...('maxSteps' in detail ? { maxSteps: detail.maxSteps as number | null } : {}),
+          ...('maxRetries' in detail ? { maxRetries: detail.maxRetries as number | null } : {}),
+          ...('runtimeOverride' in detail ? { runtimeOverride: detail.runtimeOverride as string | null } : {}),
+        }));
+      }
+    };
+    window.addEventListener('thread-settings-changed', handler);
+    return () => window.removeEventListener('thread-settings-changed', handler);
+  }, [activeConversationId]);
 
   // When the overlay banner is clicked (paused session), the main process
   // sends this event after switching the active conversation and focusing
@@ -1133,6 +1198,7 @@ function AppShell() {
         executionMode={executionMode}
         selectedProfileKey={selectedProfileKey}
         fallbackEnabled={fallbackEnabled}
+        threadOverrides={threadOverrides}
         onModelFallback={setSelectedModelKey}
         onConversationSettingsLoaded={handleConversationSettingsLoaded}
       >

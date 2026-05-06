@@ -11,6 +11,7 @@ import { useConversationPreferences } from './useConversationPreferences';
 import { SortPopover } from './SortPopover';
 import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
+import { ThreadSettingsModal } from './ThreadSettingsModal';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -108,6 +109,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [exportConvId, setExportConvId] = useState<string | null>(null);
+  const [threadSettingsConvId, setThreadSettingsConvId] = useState<string | null>(null);
 
   const togglePin = useCallback((id: string) => {
     setPinnedIds((prev) => {
@@ -684,6 +686,12 @@ export const ConversationList: FC<ConversationListProps> = ({
           >
             <DownloadIcon className="h-4 w-4 text-muted-foreground" /> Export
           </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { setThreadSettingsConvId(contextMenu.convId); setContextMenu(null); }}
+          >
+            <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" /> Settings
+          </button>
           <div className="my-1 h-px bg-border/60" />
           <button
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
@@ -699,6 +707,13 @@ export const ConversationList: FC<ConversationListProps> = ({
         open={exportConvId !== null}
         onClose={() => setExportConvId(null)}
         conversationId={exportConvId}
+      />
+
+      <ThreadSettingsModal
+        open={threadSettingsConvId !== null}
+        conversationId={threadSettingsConvId}
+        onClose={() => setThreadSettingsConvId(null)}
+        isActiveConversation={threadSettingsConvId === activeConversationId}
       />
     </div>
   );

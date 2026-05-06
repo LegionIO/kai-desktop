@@ -120,6 +120,14 @@ export type ConversationRecord = {
   currentWorkingDirectory?: string | null;
   workspaceId?: string;
   metadata?: Record<string, unknown>;
+  // Per-thread settings overrides (null = inherit from profile/global)
+  reasoningEffort?: ReasoningEffort | null;
+  executionMode?: 'auto' | 'plan-first' | null;
+  temperature?: number | null;
+  systemPromptOverride?: string | null;
+  maxSteps?: number | null;
+  maxRetries?: number | null;
+  runtimeOverride?: string | null; // 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | null
   // Sub-agent metadata
   parentConversationId?: string | null;
   parentToolCallId?: string | null;
@@ -1046,6 +1054,7 @@ export function RuntimeProvider({
   executionMode,
   selectedProfileKey,
   fallbackEnabled,
+  threadOverrides,
   onModelFallback,
   onConversationSettingsLoaded,
 }: {
@@ -1056,8 +1065,15 @@ export function RuntimeProvider({
   executionMode?: ExecutionMode;
   selectedProfileKey?: string | null;
   fallbackEnabled?: boolean;
+  threadOverrides?: {
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  };
   onModelFallback?: (toModelKey: string) => void;
-  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null }) => void;
+  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null; reasoningEffort?: ReasoningEffort | null; executionMode?: ExecutionMode | null; temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null }) => void;
 }) {
   const [tree, setTree] = useState<StoredMessage[]>([]);
   const [headId, setHeadId] = useState<string | null>(null);
@@ -1230,12 +1246,19 @@ export function RuntimeProvider({
       void persistConversation(id, t, h, { runStatus: 'idle' });
     }
 
-    // Restore per-conversation settings (model, profile, fallback)
+    // Restore per-conversation settings (model, profile, fallback, thread overrides)
     onConversationSettingsLoadedRef.current?.({
       selectedModelKey: conv.selectedModelKey ?? null,
       selectedProfileKey: conv.selectedProfileKey ?? null,
       fallbackEnabled: conv.fallbackEnabled ?? false,
       profilePrimaryModelKey: conv.profilePrimaryModelKey ?? null,
+      reasoningEffort: conv.reasoningEffort ?? null,
+      executionMode: conv.executionMode ?? null,
+      temperature: conv.temperature ?? null,
+      systemPromptOverride: conv.systemPromptOverride ?? null,
+      maxSteps: conv.maxSteps ?? null,
+      maxRetries: conv.maxRetries ?? null,
+      runtimeOverride: conv.runtimeOverride ?? null,
     });
 
     return true;
@@ -1328,8 +1351,8 @@ export function RuntimeProvider({
   }, []);
 
   // Stable ref for values the stream handler needs without re-subscribing
-  const streamHandlerRef = useRef({ tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled });
-  useEffect(() => { streamHandlerRef.current = { tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled }; }, [tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled]);
+  const streamHandlerRef = useRef({ tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides });
+  useEffect(() => { streamHandlerRef.current = { tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides }; }, [tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides]);
 
   // Stream event listener — subscribes ONCE, reads mutable values via refs/globals
   useEffect(() => {
@@ -1840,6 +1863,7 @@ export function RuntimeProvider({
                   cfg.fallbackEnabled ?? false,
                   currentWorkingDirectoryRef.current ?? undefined,
                   'plan-first',
+                  cfg.threadOverrides ?? undefined,
                 );
               }
             }, 100);
@@ -1922,8 +1946,8 @@ export function RuntimeProvider({
     await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     void maybeGenerateTitle(convId, branch);
     console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`);    console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
-    app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto');
-  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, consumeAttachments]);
+    app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto', threadOverrides ?? undefined);
+  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides, consumeAttachments]);
 
   const onReload = useCallback(async (parentId: string | null) => {
     const convId = activeIdRef.current;
@@ -1962,8 +1986,9 @@ export function RuntimeProvider({
       fallbackEnabled ?? false,
       currentWorkingDirectoryRef.current ?? undefined,
       executionMode ?? 'auto',
+      threadOverrides ?? undefined,
     );
-  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled]);
+  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides]);
 
   const onCancel = useCallback(async () => {
     const convId = activeIdRef.current;

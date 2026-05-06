@@ -14,7 +14,7 @@ type AppAPI = {
     onChanged: (callback: (config: unknown) => void) => () => void;
   };
   agent: {
-    stream: (conversationId: string, messages: unknown[], modelKey?: string, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', profileKey?: string, fallbackEnabled?: boolean, cwd?: string, executionMode?: 'auto' | 'plan-first') => Promise<unknown>;
+    stream: (conversationId: string, messages: unknown[], modelKey?: string, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', profileKey?: string, fallbackEnabled?: boolean, cwd?: string, executionMode?: 'auto' | 'plan-first', threadOverrides?: { temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null }) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
