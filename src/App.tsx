@@ -33,7 +33,7 @@ import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList'
 import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
 import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
-import { Tooltip, TooltipProvider } from '@/components/ui/Tooltip';
+import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app } from '@/lib/ipc-client';
@@ -1363,17 +1363,6 @@ function AppShell() {
               <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
-              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
-                <Tooltip content={themeTitle} side="bottom" sideOffset={6}>
-                  <button
-                    type="button"
-                    onClick={toggleTheme}
-                    className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
-                  >
-                    <ThemeIcon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
-              </div>
             </div>
             <div className="flex min-h-0 flex-1">
               <IconRail
@@ -1390,13 +1379,9 @@ function AppShell() {
                 }}
                 settingsActive={activeView === SETTINGS_VIEW}
                 onSettingsClick={() => { void handleSettingsToggle(); }}
+                themeButton={{ icon: ThemeIcon, title: themeTitle, onClick: toggleTheme }}
               />
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                <WorkspaceSelector
-                  workspaces={workspaces}
-                  activeWorkspaceId={activeWorkspaceId}
-                  activeWorkspace={activeWorkspace}
-                />
                 <ContentPanel
                   activeTab={sidebarSection}
                   chatsContent={
@@ -1715,6 +1700,11 @@ function AppShell() {
                   Settings
                 </button>
               )}
+              <WorkspaceSelector
+                workspaces={workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                activeWorkspace={activeWorkspace}
+              />
               </div>
               </div>
             </div>

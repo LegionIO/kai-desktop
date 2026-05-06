@@ -20,10 +20,10 @@ const SelectorButton = forwardRef<
         ref={ref}
         type="button"
         className={cn(
-          'titlebar-no-drag mx-2.5 mt-2 mb-1 flex items-center gap-2 rounded-lg',
-          'border border-dashed border-sidebar-border/60',
-          'px-2.5 py-1.5 text-sm text-muted-foreground/50',
-          'transition-colors hover:border-sidebar-border hover:text-muted-foreground/70',
+          'titlebar-no-drag flex items-center gap-2 rounded-full',
+          'border border-dashed border-border/60',
+          'px-3 py-1.5 text-sm text-muted-foreground/50',
+          'transition-colors hover:border-border hover:text-muted-foreground/70',
           className,
         )}
         {...props}
@@ -39,27 +39,27 @@ const SelectorButton = forwardRef<
       ref={ref}
       type="button"
       className={cn(
-        'titlebar-no-drag mx-2.5 mt-2 mb-1 flex items-center gap-2 rounded-lg',
-        'px-2.5 py-1.5 text-sm',
-        'transition-colors hover:bg-sidebar-accent/40',
+        'titlebar-no-drag flex items-center gap-2 rounded-full',
+        'border border-border/70 px-3 py-1.5 text-sm',
+        'transition-colors hover:bg-muted/40',
         className,
       )}
       {...props}
     >
       <div
-        className="flex h-5 w-5 shrink-0 items-center justify-center rounded"
+        className="flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded"
         style={{ backgroundColor: workspace.color }}
       >
-        <svg width="11" height="11" viewBox="0 0 11 11" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <svg width="10" height="10" viewBox="0 0 11 11" fill="none" xmlns="http://www.w3.org/2000/svg">
           <rect x="1" y="2.5" width="9" height="1.2" rx="0.6" fill="rgba(255,255,255,0.85)" />
           <rect x="1" y="5" width="9" height="1.2" rx="0.6" fill="rgba(255,255,255,0.85)" />
           <rect x="1" y="7.5" width="6" height="1.2" rx="0.6" fill="rgba(255,255,255,0.85)" />
         </svg>
       </div>
-      <span className="flex-1 truncate text-left text-xs font-medium text-sidebar-foreground">
+      <span className="truncate text-xs font-medium text-foreground">
         {workspace.name}
       </span>
-      <ChevronDownIcon size={13} className="shrink-0 text-muted-foreground/60" />
+      <ChevronDownIcon size={12} className="shrink-0 text-muted-foreground/50" />
     </button>
   );
 });
