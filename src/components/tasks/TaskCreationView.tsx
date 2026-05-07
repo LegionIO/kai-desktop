@@ -158,8 +158,8 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     if (!text) return;
 
     setInput('');
-    void startAITaskCreation(text);
-  }, [input, startAITaskCreation]);
+    void startAITaskCreation(text, currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined);
+  }, [input, startAITaskCreation, currentWorkingDirectory]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {

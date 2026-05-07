@@ -139,6 +139,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       const result = await app.dialog.openDirectory();
       if (!result.canceled && result.directoryPath) {
         await setCurrentWorkingDirectory(result.directoryPath);
+        // Persist to task metadata so the terminal spawns in this directory
+        void updateTask(task.id, {
+          metadata: { ...task.metadata, cwd: result.directoryPath },
+        });
       }
     } catch (err) {
       console.error('Attach directory failed:', err);
@@ -221,7 +225,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     try {
       const result = await app.tasks.terminalCreate(task.id, {
         runtime: selectedRuntime,
-        cwd: task.metadata?.cwd,
+        cwd: task.metadata?.cwd ?? currentWorkingDirectory ?? undefined,
       });
       if (result.sessionId) {
         setTerminalSessionId(result.sessionId);
@@ -235,7 +239,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     } finally {
       setIsStartingAgent(false);
     }
-  }, [task.id, task.metadata?.cwd, selectedRuntime, updateTask]);
+  }, [task.id, task.metadata?.cwd, currentWorkingDirectory, selectedRuntime, updateTask]);
 
   const handleStopAgent = useCallback(() => {
     if (terminalSessionId) {
@@ -645,7 +649,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                         <div className="border-t border-border/50 mx-1.5 mt-0.5" />
                         <button
                           type="button"
-                          onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                          onClick={() => { void setCurrentWorkingDirectory(null); void updateTask(task.id, { metadata: { ...task.metadata, cwd: undefined } }); setCwdPopoverOpen(false); }}
                           className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
                         >
                           <XIcon className="h-3.5 w-3.5" />

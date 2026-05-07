@@ -110,7 +110,7 @@ export class TaskTerminalManager {
   private getShellCommand(runtime: string): { command: string; args: string[] } {
     switch (runtime) {
       case 'claude-code':
-        return { command: 'claude', args: [] };
+        return { command: 'claude', args: ['--permission-mode', 'bypassPermissions'] };
       case 'codex':
         return { command: 'codex', args: [] };
       case 'mastra':
