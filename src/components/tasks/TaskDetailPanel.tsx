@@ -262,11 +262,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     if (!text || isActivelyStreaming) return;
 
     setInput('');
-    void refineTaskPlan(task.id, text);
+    void refineTaskPlan(task.id, text, selectedRuntime);
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, task.id, refineTaskPlan, isActivelyStreaming]);
+  }, [input, task.id, refineTaskPlan, isActivelyStreaming, selectedRuntime]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

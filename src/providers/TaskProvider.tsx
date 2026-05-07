@@ -20,6 +20,36 @@ import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
 
+// ── Task Plan System Prompt ─────────────────────────────────────────────────
+// Used as systemPromptOverride when routing task chat through agent:stream.
+
+const TASK_PLAN_SYSTEM_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
+
+Write the plan as clear, actionable markdown with this structure:
+
+## Objective
+One sentence summarizing the goal.
+
+## Steps
+1. First step — specific and actionable
+2. Second step — with enough detail to execute
+3. Continue as needed...
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Any additional context, risks, or dependencies.
+
+Rules:
+- Be specific and actionable, not vague
+- Include technical details where relevant
+- Use markdown checkboxes for criteria
+- Keep the plan concise but complete
+- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
+- Always output the complete updated plan, never just a diff or partial update`;
+
 // ── State & Actions ──────────────────────────────────────────────────────
 
 interface TaskState {
@@ -149,10 +179,10 @@ interface TaskContextValue {
   ) => void;
 
   /** Start the AI task creation flow — creates a placeholder task, streams plan. */
-  startAITaskCreation: (userMessage: string, metadata?: KaiTaskMetadata) => Promise<void>;
+  startAITaskCreation: (userMessage: string, metadata?: KaiTaskMetadata, runtime?: string) => Promise<void>;
 
   /** Send a follow-up message to refine the currently streaming task plan. */
-  refineTaskPlan: (taskId: string, userMessage: string) => Promise<void>;
+  refineTaskPlan: (taskId: string, userMessage: string, runtime?: string) => Promise<void>;
 
   /** Cancel any active AI plan stream. */
   cancelAIStream: () => void;
@@ -389,22 +419,25 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     creatingTaskIdRef.current = state.creatingTaskId;
   }, [state.creatingTaskId]);
 
-  // Subscribe to task stream events from main process
+  // Subscribe to agent stream events for task plan generation
   useEffect(() => {
-    if (!window.app?.tasks?.onStreamEvent) return;
-    const unsub = app.tasks.onStreamEvent((evt) => {
-      // Only process events for the task we're currently creating
-      if (evt.taskId !== creatingTaskIdRef.current) return;
+    if (!window.app?.agent?.onStreamEvent) return;
+    const unsub = app.agent.onStreamEvent((evt: unknown) => {
+      const event = evt as { conversationId?: string; type?: string; text?: string; error?: string };
+      // Only process events for task plan conversations (namespaced with 'task-plan:')
+      const taskId = creatingTaskIdRef.current;
+      if (!taskId) return;
+      if (event.conversationId !== `task-plan:${taskId}`) return;
 
-      switch (evt.type) {
+      switch (event.type) {
         case 'text-delta':
-          if (evt.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: evt.text });
+          if (event.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: event.text });
           break;
         case 'done':
           dispatch({ type: 'STREAM_DONE' });
           break;
         case 'error':
-          console.error('[TaskProvider] Stream error:', evt.error);
+          console.error('[TaskProvider] Stream error:', event.error);
           dispatch({ type: 'STREAM_DONE' });
           break;
       }
@@ -412,7 +445,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     return unsub;
   }, []);
 
-  const startAITaskCreation = useCallback(async (userMessage: string, metadata?: KaiTaskMetadata) => {
+  const startAITaskCreation = useCallback(async (userMessage: string, metadata?: KaiTaskMetadata, runtime?: string) => {
     try {
       // Create a placeholder task
       const task = (await app.tasks.create({
@@ -433,15 +466,37 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         }
       });
 
-      // Start streaming the plan
-      await app.tasks.streamPlan(task.id, userMessage);
+      // Map terminal runtime names to agent runtime IDs
+      const runtimeOverride = runtime === 'codex' ? 'codex-sdk'
+        : runtime === 'claude-code' ? 'claude-agent-sdk'
+        : runtime === 'mastra' ? 'mastra'
+        : null;
+
+      // Build messages for agent:stream
+      const messages = [{ role: 'user', content: userMessage }];
+
+      // Route through the main agent:stream pipeline
+      await app.agent.stream(
+        `task-plan:${task.id}`,
+        messages,
+        undefined, // modelKey — use default
+        undefined, // reasoningEffort
+        undefined, // profileKey
+        false,     // fallbackEnabled
+        metadata?.cwd ?? undefined,
+        'auto',    // executionMode
+        {
+          runtimeOverride,
+          systemPromptOverride: TASK_PLAN_SYSTEM_PROMPT,
+        },
+      );
     } catch (err) {
       console.error('[TaskProvider] Failed to start AI task creation:', err);
       dispatch({ type: 'CANCEL_AI_CREATE' });
     }
   }, []);
 
-  const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
+  const refineTaskPlan = useCallback(async (taskId: string, userMessage: string, runtime?: string) => {
     try {
       // Fetch fresh task from IPC to avoid stale closure over state.tasks
       const task = await app.tasks.get(taskId);
@@ -449,7 +504,33 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
       dispatch({ type: 'START_AI_CREATE', taskId });
 
-      await app.tasks.streamPlan(taskId, userMessage, history);
+      // Map terminal runtime names to agent runtime IDs
+      const runtimeOverride = runtime === 'codex' ? 'codex-sdk'
+        : runtime === 'claude-code' ? 'claude-agent-sdk'
+        : runtime === 'mastra' ? 'mastra'
+        : null;
+
+      // Build messages from conversation history + new user message
+      const messages = [
+        ...history.map((msg: { role: string; content: string }) => ({ role: msg.role, content: msg.content })),
+        { role: 'user', content: userMessage },
+      ];
+
+      // Route through the main agent:stream pipeline
+      await app.agent.stream(
+        `task-plan:${taskId}`,
+        messages,
+        undefined, // modelKey — use default
+        undefined, // reasoningEffort
+        undefined, // profileKey
+        false,     // fallbackEnabled
+        task?.metadata?.cwd ?? undefined,
+        'auto',    // executionMode
+        {
+          runtimeOverride,
+          systemPromptOverride: TASK_PLAN_SYSTEM_PROMPT,
+        },
+      );
     } catch (err) {
       console.error('[TaskProvider] Failed to refine task plan:', err);
       dispatch({ type: 'STREAM_DONE' });
@@ -458,14 +539,14 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const cancelAIStream = useCallback(() => {
     if (state.creatingTaskId) {
-      void app.tasks.cancelPlanStream(state.creatingTaskId);
+      void app.agent.cancelStream(`task-plan:${state.creatingTaskId}`);
     }
     dispatch({ type: 'CANCEL_AI_CREATE' });
   }, [state.creatingTaskId]);
 
   const exitAICreation = useCallback(() => {
     if (state.isStreamingPlan && state.creatingTaskId) {
-      void app.tasks.cancelPlanStream(state.creatingTaskId);
+      void app.agent.cancelStream(`task-plan:${state.creatingTaskId}`);
     }
     dispatch({ type: 'CANCEL_AI_CREATE' });
   }, [state.isStreamingPlan, state.creatingTaskId]);

@@ -158,7 +158,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     if (!text) return;
 
     setInput('');
-    void startAITaskCreation(text, currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined);
+    void startAITaskCreation(text, currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined, 'claude-code');
   }, [input, startAITaskCreation, currentWorkingDirectory]);
 
   const handleKeyDown = useCallback(
