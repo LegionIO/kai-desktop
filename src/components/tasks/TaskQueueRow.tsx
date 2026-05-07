@@ -55,7 +55,7 @@ export const TaskQueueRow: FC<TaskQueueRowProps> = memo(
         {/* Row container */}
         <div
           className={cn(
-            'rounded-xl border transition-colors duration-150',
+            'rounded-xl border bg-sidebar transition-colors duration-150',
             KAI_TASK_STATUS_OUTER_BORDER_COLORS[status],
           )}
         >

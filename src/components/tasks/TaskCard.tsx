@@ -7,8 +7,17 @@
 import { memo, type FC } from 'react';
 import { TerminalIcon, ClockIcon, MessageSquareIcon, BotIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import type { TaskFile } from '@/types/task';
+import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { useAgents } from '@/providers/AgentProvider';
+
+/** Subtle status-tinted background for task cards. */
+const CARD_BG_COLORS: Record<KaiTaskStatus, string> = {
+  todo: 'bg-sky-500/5',
+  in_progress: 'bg-amber-500/5',
+  ai_review: 'bg-rose-500/5',
+  human_review: 'bg-purple-400/5',
+  done: 'bg-emerald-500/5',
+};
 
 interface TaskCardProps {
   task: TaskFile;
@@ -41,7 +50,8 @@ export const TaskCard: FC<TaskCardProps> = memo(
       type="button"
       onClick={onClick}
       className={cn(
-        'flex h-[72px] w-[180px] shrink-0 flex-col justify-between rounded-lg border border-border/60 bg-card px-3.5 py-2.5 text-left transition-all',
+        'flex h-[72px] w-[180px] shrink-0 flex-col justify-between rounded-lg border border-border/60 px-3.5 py-2.5 text-left transition-all',
+        CARD_BG_COLORS[task.status],
         'hover:border-border hover:shadow-sm',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         isSelected && 'border-primary/50 ring-1 ring-primary/30',
