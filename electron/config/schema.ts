@@ -165,12 +165,6 @@ const subAgentConfigSchema = z.object({
   defaultModel: z.string().optional(),
 });
 
-const titleGenerationSchema = z.object({
-  enabled: z.boolean(),
-  retitleIntervalMessages: z.number().positive(),
-  retitleEagerUntilMessage: z.number().nonnegative(),
-});
-
 const profileConfigSchema = z.object({
   key: z.string(),
   name: z.string(),
@@ -492,6 +486,7 @@ export const appConfigSchema = z.object({
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),
+    fullWidthContent: z.boolean().default(false),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
   }),
@@ -505,7 +500,6 @@ export const appConfigSchema = z.object({
     maxRetries: z.number().nonnegative(),
     useResponsesApi: z.boolean(),
   }),
-  titleGeneration: titleGenerationSchema,
   profiles: z.array(profileConfigSchema).optional(),
   defaultProfileKey: z.string().optional(),
   fallback: fallbackConfigSchema.optional(),

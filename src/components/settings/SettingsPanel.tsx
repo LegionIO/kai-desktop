@@ -2,59 +2,50 @@ import { useState, useEffect, useRef, useCallback, type FC } from 'react';
 import { ChevronRightIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
 import { EditableTextarea } from '@/components/EditableTextarea';
-import { EditableInput } from '@/components/EditableInput';
 import { ModelSettings, ModelProviderSettings } from './ModelSettings';
-import { CompactionSettings } from './CompactionSettings';
-import { MemorySettings } from './MemorySettings';
 import { ToolSettings } from './ToolSettings';
 import { CliToolsSettings } from './CliToolsSettings';
-import { AdvancedSettings } from './AdvancedSettings';
 import { McpSettings } from './McpSettings';
 import { SkillSettings } from './SkillSettings';
-import { AudioSettings } from './AudioSettings';
-import { RealtimeSettings } from './RealtimeSettings';
+import { AudioVoiceSettings } from './AudioVoiceSettings';
 import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { UsageDashboard } from './UsageDashboard';
 import { WebServerSettings } from './WebServerSettings';
+import { GeneralSettings } from './GeneralSettings';
+import { AppearanceSettings } from './AppearanceSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
   | 'models'
   | 'providers'
-  | 'memory'
-  | 'compaction'
-  | 'tools'
+  | 'built-in-tools'
   | 'cli-tools'
   | 'skills'
-  | 'sub-agents'
   | 'system-prompt'
   | 'mcp'
-  | 'audio'
-  | 'realtime'
+  | 'audio-voice'
   | 'media-generation'
   | 'computer-use'
   | 'web-server'
-  | 'advanced'
+  | 'general'
+  | 'appearance'
   | 'usage';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Model Config' },
   { key: 'providers', label: 'Model Providers' },
-  { key: 'memory', label: 'Memory' },
-  { key: 'compaction', label: 'Compaction' },
-  { key: 'tools', label: 'Tools' },
+  { key: 'built-in-tools', label: 'Built-in Tools' },
   { key: 'cli-tools', label: 'CLI Tools' },
   { key: 'skills', label: 'Skills' },
-  { key: 'sub-agents', label: 'Sub-Agents' },
-  { key: 'system-prompt', label: 'System Prompt' },
+  { key: 'system-prompt', label: 'System Prompts' },
   { key: 'mcp', label: 'MCP Servers' },
-  { key: 'audio', label: 'Audio' },
-  { key: 'realtime', label: 'Realtime Audio' },
+  { key: 'audio-voice', label: 'Audio & Voice' },
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'web-server', label: 'Web UI' },
-  { key: 'advanced', label: 'Advanced' },
+  { key: 'general', label: 'General' },
+  { key: 'appearance', label: 'Appearance' },
   { key: 'usage', label: 'Usage' },
 ];
 
@@ -112,20 +103,17 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
       <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'providers' && <ModelProviderSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'memory' && <MemorySettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'compaction' && <CompactionSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'tools' && <ToolSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'built-in-tools' && <ToolSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'cli-tools' && <CliToolsSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'skills' && <SkillSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'sub-agents' && <SubAgentSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'system-prompt' && <SystemPromptSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'mcp' && <McpSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'realtime' && <RealtimeSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'audio-voice' && <AudioVoiceSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'advanced' && <AdvancedSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'appearance' && <AppearanceSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
       </div>
     </div>
@@ -213,74 +201,4 @@ const SystemPromptSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   );
 };
 
-const SubAgentSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
-  const subAgents = (config as { tools?: { subAgents?: { enabled: boolean; maxDepth: number; maxConcurrent: number; maxPerParent: number; defaultModel?: string } } }).tools?.subAgents;
 
-  return (
-    <div className="space-y-4">
-      <h3 className="text-sm font-semibold">Sub-Agents</h3>
-      <p className="text-xs text-muted-foreground">
-        Configure limits for sub-agent spawning. Sub-agents allow the AI to delegate tasks to child agents that work autonomously.
-      </p>
-
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={subAgents?.enabled ?? true}
-          onChange={(event) => updateConfig('tools.subAgents.enabled', event.target.checked)}
-          className="rounded"
-        />
-        <span className="text-xs">Enable sub-agents</span>
-      </label>
-
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="mb-1 block text-xs text-muted-foreground">Max Nesting Depth</label>
-          <EditableInput
-            className="w-full rounded-md border bg-card px-3 py-1.5 text-xs focus:ring-1 focus:ring-ring"
-            value={String(subAgents?.maxDepth ?? 3)}
-            onChange={(value) => {
-              const next = parseInt(value, 10);
-              if (!Number.isNaN(next) && next >= 1 && next <= 10) updateConfig('tools.subAgents.maxDepth', next);
-            }}
-          />
-          <span className="text-[10px] text-muted-foreground">1-10</span>
-        </div>
-        <div>
-          <label className="mb-1 block text-xs text-muted-foreground">Max Concurrent</label>
-          <EditableInput
-            className="w-full rounded-md border bg-card px-3 py-1.5 text-xs focus:ring-1 focus:ring-ring"
-            value={String(subAgents?.maxConcurrent ?? 5)}
-            onChange={(value) => {
-              const next = parseInt(value, 10);
-              if (!Number.isNaN(next) && next >= 1 && next <= 20) updateConfig('tools.subAgents.maxConcurrent', next);
-            }}
-          />
-          <span className="text-[10px] text-muted-foreground">1-20</span>
-        </div>
-        <div>
-          <label className="mb-1 block text-xs text-muted-foreground">Max Per Parent</label>
-          <EditableInput
-            className="w-full rounded-md border bg-card px-3 py-1.5 text-xs focus:ring-1 focus:ring-ring"
-            value={String(subAgents?.maxPerParent ?? 3)}
-            onChange={(value) => {
-              const next = parseInt(value, 10);
-              if (!Number.isNaN(next) && next >= 1 && next <= 10) updateConfig('tools.subAgents.maxPerParent', next);
-            }}
-          />
-          <span className="text-[10px] text-muted-foreground">1-10</span>
-        </div>
-        <div>
-          <label className="mb-1 block text-xs text-muted-foreground">Default Model Override</label>
-          <EditableInput
-            className="w-full rounded-md border bg-card px-3 py-1.5 text-xs focus:ring-1 focus:ring-ring"
-            placeholder="Inherit from parent"
-            value={subAgents?.defaultModel ?? ''}
-            onChange={(value) => updateConfig('tools.subAgents.defaultModel', value || undefined)}
-          />
-          <span className="text-[10px] text-muted-foreground">Leave blank to inherit</span>
-        </div>
-      </div>
-    </div>
-  );
-};

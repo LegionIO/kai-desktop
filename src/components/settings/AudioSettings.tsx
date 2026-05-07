@@ -179,7 +179,7 @@ const VoicePreviewButton: FC<{
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const audio = (config as Record<string, unknown>).audio as AudioConfig | undefined;
   const provider: AudioProvider = audio?.provider ?? 'native';
   const azure = audio?.azure;
@@ -275,13 +275,15 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h3 className="text-sm font-semibold">Audio</h3>
-        <p className="text-xs text-muted-foreground mt-1">
-          Configure text-to-speech and voice recording. Choose between your OS&apos;s
-          built-in speech services or Azure AI Speech Service.
-        </p>
-      </div>
+      {!hideTitle && (
+        <div>
+          <h3 className="text-sm font-semibold">Audio</h3>
+          <p className="text-xs text-muted-foreground mt-1">
+            Configure text-to-speech and voice recording. Choose between your OS&apos;s
+            built-in speech services or Azure AI Speech Service.
+          </p>
+        </div>
+      )}
 
       {/* ── Provider Selector ── */}
       <div>

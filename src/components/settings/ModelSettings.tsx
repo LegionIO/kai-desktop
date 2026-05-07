@@ -5,6 +5,7 @@ import { formatModelDisplayName } from '@/lib/model-display';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 import { ProfileSettings } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
+import { MastraRuntimeSettings } from './MastraRuntimeSettings';
 
 export type Provider = {
   type: string;
@@ -45,6 +46,9 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
       {/* Agent Runtime */}
       <RuntimeSettings config={config} updateConfig={updateConfig} embedded />
+
+      {/* Mastra Runtime Config (Memory & Compaction) */}
+      <MastraRuntimeSettings config={config} updateConfig={updateConfig} />
     </div>
   );
 };
@@ -93,16 +97,16 @@ export const ModelProviderSettings: FC<SettingsProps> = ({ config, updateConfig 
       </div>
 
       {/* Sub-tab navigation */}
-      <div className="flex w-fit gap-1 rounded-xl border border-border/70 bg-card/60 p-1">
+      <div className="flex gap-1 border-b border-border/60">
         {subTabs.map((tab) => (
           <button
             key={tab.key}
             type="button"
             onClick={() => setActiveSubTab(tab.key)}
-            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
               activeSubTab === tab.key
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
             }`}
           >
             {tab.label}

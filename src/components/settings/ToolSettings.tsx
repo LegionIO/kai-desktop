@@ -25,7 +25,9 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         maxTotalLaunchedTools: number;
       };
     };
+    subAgents?: { enabled: boolean; maxDepth: number; maxConcurrent: number; maxPerParent: number; defaultModel?: string };
   };
+  const subAgents = tools.subAgents;
 
   return (
     <div className="space-y-6">
@@ -104,6 +106,29 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
           <NumberField label="Max Mid-Tool Messages Per Tool" value={tools.processStreaming.observer.maxMessagesPerTool} onChange={(v) => updateConfig('tools.processStreaming.observer.maxMessagesPerTool', v)} min={1} />
           <NumberField label="Max Observer-Launched Tools" value={tools.processStreaming.observer.maxTotalLaunchedTools} onChange={(v) => updateConfig('tools.processStreaming.observer.maxTotalLaunchedTools', v)} min={1} />
         </fieldset>
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Sub-Agents</legend>
+        <p className="text-xs text-muted-foreground">
+          Sub-agents allow the AI to delegate tasks to child agents that work autonomously.
+        </p>
+        <Toggle label="Enabled" checked={subAgents?.enabled ?? true} onChange={(v) => updateConfig('tools.subAgents.enabled', v)} />
+        <div className="grid grid-cols-2 gap-3">
+          <NumberField label="Max Nesting Depth (1-10)" value={subAgents?.maxDepth ?? 3} onChange={(v) => { const next = Math.max(1, Math.min(10, v ?? 3)); updateConfig('tools.subAgents.maxDepth', next); }} min={1} max={10} />
+          <NumberField label="Max Concurrent (1-20)" value={subAgents?.maxConcurrent ?? 5} onChange={(v) => { const next = Math.max(1, Math.min(20, v ?? 5)); updateConfig('tools.subAgents.maxConcurrent', next); }} min={1} max={20} />
+          <NumberField label="Max Per Parent (1-10)" value={subAgents?.maxPerParent ?? 3} onChange={(v) => { const next = Math.max(1, Math.min(10, v ?? 3)); updateConfig('tools.subAgents.maxPerParent', next); }} min={1} max={10} />
+          <div>
+            <label className="text-[10px] text-muted-foreground block mb-0.5">Default Model Override</label>
+            <EditableInput
+              className="w-full rounded border bg-card px-2 py-1.5 text-xs"
+              placeholder="Inherit from parent"
+              value={subAgents?.defaultModel ?? ''}
+              onChange={(value) => updateConfig('tools.subAgents.defaultModel', value || undefined)}
+            />
+            <span className="text-[10px] text-muted-foreground">Leave blank to inherit</span>
+          </div>
+        </div>
       </fieldset>
     </div>
   );

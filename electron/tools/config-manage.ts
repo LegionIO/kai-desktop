@@ -189,9 +189,6 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
         'maxSteps',
         'maxRetries',
         'useResponsesApi',
-        'titleGeneration.enabled',
-        'titleGeneration.retitleIntervalMessages',
-        'titleGeneration.retitleEagerUntilMessage',
         'ui.theme',
       ]).optional().describe('Field to set (required for "set")'),
       value: z.any().optional().describe('New value (required for "set")'),
@@ -202,18 +199,13 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
       if (action === 'get') {
         return {
           advanced: config.advanced,
-          titleGeneration: config.titleGeneration,
           ui: config.ui,
         };
       }
       if (!field || value === undefined) return { error: 'Field and value required for "set".' };
 
       let previous: unknown;
-      if (field.startsWith('titleGeneration.')) {
-        const subField = field.replace('titleGeneration.', '');
-        previous = getNested(config.titleGeneration as unknown as Record<string, unknown>, subField);
-        setNested(config.titleGeneration as unknown as Record<string, unknown>, subField, value);
-      } else if (field.startsWith('ui.')) {
+      if (field.startsWith('ui.')) {
         const subField = field.replace('ui.', '');
         previous = getNested(config.ui as unknown as Record<string, unknown>, subField);
         setNested(config.ui as unknown as Record<string, unknown>, subField, value);

@@ -1,7 +1,7 @@
 import type { FC } from 'react';
 import { Toggle, NumberField, SliderField, headTailLabel, type SettingsProps } from './shared';
 
-export const CompactionSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const CompactionSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const compaction = config.compaction as {
     tool: { enabled: boolean; useAI: boolean; triggerTokens: number; outputMaxTokens: number; truncateMinChars: number; truncateHeadRatio: number; truncateMinTailChars: number };
     conversation: { enabled: boolean; mode: string; triggerPercent: number; ignoreRecentUserMessages: number; ignoreRecentAssistantMessages: number; outputMaxTokens: number; promptReserveTokens: number };
@@ -9,7 +9,7 @@ export const CompactionSettings: FC<SettingsProps> = ({ config, updateConfig }) 
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Compaction</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">Compaction</h3>}
 
       {/* Tool compaction */}
       <fieldset className="rounded-lg border p-3 space-y-3">

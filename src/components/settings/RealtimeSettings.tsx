@@ -167,7 +167,7 @@ const TestConnectionButton: FC = () => {
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export const RealtimeSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const realtime = (config as Record<string, unknown>).realtime as RealtimeConfig | undefined;
   const enabled = realtime?.enabled ?? false;
   const provider: RealtimeProvider = realtime?.provider ?? 'openai';
@@ -178,13 +178,15 @@ export const RealtimeSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
   return (
     <div className="space-y-6">
       {/* ── Header ── */}
-      <div>
-        <h3 className="text-sm font-semibold">Realtime Audio</h3>
-        <p className="text-xs text-muted-foreground mt-1">
-          Configure bidirectional voice conversations using OpenAI&apos;s Realtime API.
-          Speak directly to the model and hear responses in real time.
-        </p>
-      </div>
+      {!hideTitle && (
+        <div>
+          <h3 className="text-sm font-semibold">Realtime Audio</h3>
+          <p className="text-xs text-muted-foreground mt-1">
+            Configure bidirectional voice conversations using OpenAI&apos;s Realtime API.
+            Speak directly to the model and hear responses in real time.
+          </p>
+        </div>
+      )}
 
       {/* ── Enable / Disable ── */}
       <Toggle

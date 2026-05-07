@@ -889,26 +889,11 @@ async function persistConversation(
   }
 }
 
-// --- Title generation with maelstrom-style retitle logic ---
-
-type TitleSettings = {
-  enabled: boolean;
-  retitleIntervalMessages: number;
-  retitleEagerUntilMessage: number;
-};
+// --- Title generation logic ---
 
 // Track last retitle count per conversation to avoid duplicate title gen
 const lastRetitleCount = new Map<string, number>();
 const titleGenInFlight = new Set<string>();
-
-async function getTitleSettings(): Promise<TitleSettings> {
-  try {
-    const config = await app.config.get() as { titleGeneration?: TitleSettings } | null;
-    return config?.titleGeneration ?? { enabled: true, retitleIntervalMessages: 5, retitleEagerUntilMessage: 5 };
-  } catch {
-    return { enabled: true, retitleIntervalMessages: 5, retitleEagerUntilMessage: 5 };
-  }
-}
 
 /** Update only specific fields on a conversation without overwriting message data.
  *  Reads the latest record from disk immediately before writing to minimize race windows. */
@@ -920,9 +905,6 @@ async function patchConversation(conversationId: string, patch: Partial<Conversa
 
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
   try {
-    const settings = await getTitleSettings();
-    if (!settings.enabled) return;
-
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (!conv) return;
 

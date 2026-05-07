@@ -120,6 +120,7 @@ function getDefaultConfig() {
     ui: {
       theme: 'system' as const,
       sidebarWidth: 280,
+      fullWidthContent: false,
       workspaces: [] as Array<{
         id: string;
         name: string;
@@ -220,11 +221,6 @@ function getDefaultConfig() {
       maxSteps: 10,
       maxRetries: 4,
       useResponsesApi: false,
-    },
-    titleGeneration: {
-      enabled: true,
-      retitleIntervalMessages: 5,
-      retitleEagerUntilMessage: 5,
     },
     profiles: [] as Array<{
       key: string;
@@ -724,7 +720,6 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     realtime: config.realtime,
     computerUse: config.computerUse,
     advanced: config.advanced,
-    titleGeneration: config.titleGeneration,
     profiles: config.profiles,
     defaultProfileKey: config.defaultProfileKey,
     fallback: config.fallback,
