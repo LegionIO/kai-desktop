@@ -313,8 +313,24 @@ const appAPI = {
     },
   },
 
+  agents: {
+    list: () => ipcRenderer.invoke('agents:list'),
+    get: (id: string) => ipcRenderer.invoke('agents:get', id),
+    create: (payload: unknown) => ipcRenderer.invoke('agents:create', payload),
+    update: (id: string, updates: unknown) => ipcRenderer.invoke('agents:update', id, updates),
+    delete: (id: string) => ipcRenderer.invoke('agents:delete', id),
+    assignTask: (agentId: string, taskId: string) => ipcRenderer.invoke('agents:assign-task', agentId, taskId),
+    unassignTask: (agentId: string) => ipcRenderer.invoke('agents:unassign-task', agentId),
+    start: (agentId: string) => ipcRenderer.invoke('agents:start', agentId) as Promise<{ sessionId?: string; error?: string }>,
+    stop: (agentId: string) => ipcRenderer.invoke('agents:stop', agentId),
+    onChanged: (callback: (agents: unknown[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, agents: unknown[]) => callback(agents);
+      ipcRenderer.on('agents:changed', handler);
+      return () => ipcRenderer.removeListener('agents:changed', handler);
+    },
+  },
+
   computerUse: {
-    startSession: (goal: string, options: unknown) => ipcRenderer.invoke('computer-use:start-session', goal, options),
     pauseSession: (sessionId: string) => ipcRenderer.invoke('computer-use:pause-session', sessionId),
     resumeSession: (sessionId: string) => ipcRenderer.invoke('computer-use:resume-session', sessionId),
     stopSession: (sessionId: string) => ipcRenderer.invoke('computer-use:stop-session', sessionId),

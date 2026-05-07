@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, ListFilterIcon, SquarePenIcon, CheckIcon, ArrowUpDownIcon } from 'lucide-react';
+import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, ListFilterIcon, SquarePenIcon, CheckIcon, ArrowUpDownIcon, PlusIcon } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
@@ -595,9 +595,28 @@ export const ConversationList: FC<ConversationListProps> = ({
         })()}
 
         {processedConversations.length === 0 && (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <MessageSquareIcon className="h-6 w-6 opacity-40" />
-            <span>{searchQuery || hasActiveFilters ? 'No chats match your search' : 'No chats yet'}</span>
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <MessageSquareIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              {searchQuery || hasActiveFilters ? 'No chats match your search' : 'No chats yet'}
+            </h3>
+            {!(searchQuery || hasActiveFilters) && (
+              <>
+                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                  Start a conversation with Kai. Your chat history will appear here for easy access.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => { void onNewConversation(); }}
+                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <PlusIcon size={13} />
+                  Start Your First Chat
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>

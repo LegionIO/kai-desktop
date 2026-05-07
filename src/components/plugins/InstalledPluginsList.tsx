@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PuzzleIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon } from 'lucide-react';
+import { SearchIcon, PuzzleIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon, PlusIcon } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
@@ -292,17 +292,27 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
       {/* Plugin list */}
       <div className="flex-1 overflow-y-auto px-3">
         {filteredPlugins.length === 0 ? (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <PuzzleIcon className="h-6 w-6 opacity-40" />
-            <span>{isSearchActive ? 'No plugins match your search' : 'No plugins installed'}</span>
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <PuzzleIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              {isSearchActive ? 'No plugins match your search' : 'No plugins installed'}
+            </h3>
             {!isSearchActive && (
-              <button
-                type="button"
-                onClick={onOpenMarketplace}
-                className="mt-1 text-primary hover:underline text-xs"
-              >
-                Browse Marketplace
-              </button>
+              <>
+                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                  Extend Kai with plugins for extra tools, integrations, and custom workflows.
+                </p>
+                <button
+                  type="button"
+                  onClick={onOpenMarketplace}
+                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <PlusIcon size={13} />
+                  Install Your First Plugin
+                </button>
+              </>
             )}
           </div>
         ) : (

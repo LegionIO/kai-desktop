@@ -30,6 +30,8 @@ export interface TaskFile {
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
   terminalSessionId?: string;
   metadata?: KaiTaskMetadata;
+  /** The agent assigned to work on this task. */
+  assignedAgentId?: string;
   /** The workspace this task belongs to. Undefined = legacy/unscoped. */
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */

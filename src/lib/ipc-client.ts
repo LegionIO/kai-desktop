@@ -6,6 +6,7 @@ import type {
   ComputerUseSurface,
 } from '../../shared/computer-use';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
+import type { AgentFile, HireAgentPayload } from '../../shared/agent-types';
 
 type AppAPI = {
   config: {
@@ -179,6 +180,18 @@ type AppAPI = {
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
+  };
+  agents: {
+    list: () => Promise<AgentFile[]>;
+    get: (id: string) => Promise<AgentFile | null>;
+    create: (payload: HireAgentPayload) => Promise<AgentFile>;
+    update: (id: string, updates: Partial<AgentFile>) => Promise<AgentFile>;
+    delete: (id: string) => Promise<{ ok: boolean }>;
+    assignTask: (agentId: string, taskId: string) => Promise<{ ok: boolean; error?: string }>;
+    unassignTask: (agentId: string) => Promise<{ ok: boolean; error?: string }>;
+    start: (agentId: string) => Promise<{ sessionId?: string; error?: string }>;
+    stop: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
+    onChanged: (callback: (agents: AgentFile[]) => void) => () => void;
   };
   platform: {
     homedir: () => Promise<string>;

@@ -5,10 +5,11 @@
  */
 
 import { memo, type FC } from 'react';
-import { TerminalIcon, ClockIcon, MessageSquareIcon } from 'lucide-react';
+import { TerminalIcon, ClockIcon, MessageSquareIcon, BotIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
+import { useAgents } from '@/providers/AgentProvider';
 
 interface TaskCardProps {
   task: TaskFile;
@@ -31,6 +32,11 @@ function relativeTime(iso: string): string {
 
 export const TaskCard: FC<TaskCardProps> = memo(
   ({ task, onClick, isSelected }) => {
+  const { state: agentState } = useAgents();
+  const assignedAgent = task.assignedAgentId
+    ? agentState.agents.find((a) => a.id === task.assignedAgentId) ?? null
+    : null;
+
   return (
     <button
       type="button"
@@ -63,7 +69,14 @@ export const TaskCard: FC<TaskCardProps> = memo(
           {relativeTime(task.updatedAt)}
         </span>
 
-        {task.agentRuntime && (
+        {assignedAgent && (
+          <span className="flex items-center gap-1 rounded-full bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            <BotIcon className="h-2.5 w-2.5" />
+            {assignedAgent.name}
+          </span>
+        )}
+
+        {task.agentRuntime && !assignedAgent && (
           <TerminalIcon className="h-3 w-3 text-muted-foreground" />
         )}
 
@@ -80,6 +93,7 @@ export const TaskCard: FC<TaskCardProps> = memo(
     prev.task.status === next.task.status &&
     prev.task.updatedAt === next.task.updatedAt &&
     prev.task.agentRuntime === next.task.agentRuntime &&
+    prev.task.assignedAgentId === next.task.assignedAgentId &&
     prev.task.sourceConversationId === next.task.sourceConversationId &&
     prev.task.terminalSessionId === next.task.terminalSessionId &&
     prev.isSelected === next.isSelected,

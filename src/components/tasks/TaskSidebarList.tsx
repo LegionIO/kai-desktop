@@ -5,7 +5,7 @@
  * search, and animated removal.
  */
 
-import { useState, useMemo, useCallback, useEffect, useRef, type FC } from 'react';
+import { useState, useMemo, useCallback, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import {
   SearchIcon,
@@ -18,6 +18,7 @@ import {
   LoaderIcon,
   ListFilterIcon,
   LayoutDashboardIcon,
+  PlusIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -61,7 +62,7 @@ interface TaskSidebarListProps {
 
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
-  onCreateTask: _onCreateTask,
+  onCreateTask,
   onViewBoard,
   isBoardActive,
   workspaceId,
@@ -120,26 +121,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   }, [contextMenu]);
 
   // ── Delete animation state ─────────────────────────────────────────────
-  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
-  const removingIdsRef = useRef<Set<string>>(new Set());
-
-  const handleDeleteSingle = useCallback(async (id: string) => {
-    setRemovingIds((prev) => {
-      const next = new Set(prev);
-      next.add(id);
-      removingIdsRef.current = next;
-      return next;
-    });
-    setTimeout(() => {
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        removingIdsRef.current = next;
-        return next;
-      });
-    }, 300);
-    await deleteTask(id);
-  }, [deleteTask]);
+  const [removingIds] = useState<Set<string>>(new Set());
 
   // ── Bulk delete state ──────────────────────────────────────────────────
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
@@ -340,9 +322,28 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         ))}
 
         {sortedTasks.length === 0 && (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <CircleDotIcon className="h-6 w-6 opacity-40" />
-            <span>{searchQuery ? 'No tasks match your search' : 'No tasks yet'}</span>
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <ClipboardListIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              {searchQuery ? 'No tasks match your search' : 'No tasks yet'}
+            </h3>
+            {!searchQuery && (
+              <>
+                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                  Create tasks to track your work. Organize them on the board and assign them to agents.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onCreateTask?.()}
+                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <PlusIcon size={13} />
+                  Create Your First Task
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -369,7 +370,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           <div className="my-1 h-px bg-border/60" />
           <button
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-            onClick={() => { void handleDeleteSingle(contextMenu.taskId); setContextMenu(null); }}
+            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-delete', { detail: contextMenu.taskId })); setContextMenu(null); }}
           >
             <Trash2Icon className="h-4 w-4" /> Delete
           </button>

@@ -80,6 +80,7 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Workspace | null>(null);
 
   const handleSelectWorkspace = async (workspaceId: string) => {
@@ -95,6 +96,15 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
   const handleRequestDelete = (workspace: Workspace) => {
     setDropdownOpen(false);
     setDeleteTarget(workspace);
+    setDeleteOpen(true);
+  };
+
+  const handleDeleteOpenChange = (open: boolean) => {
+    setDeleteOpen(open);
+    if (!open) {
+      // Clear target after close animation completes
+      setTimeout(() => setDeleteTarget(null), 300);
+    }
   };
 
   return (
@@ -113,13 +123,11 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={createOpen}
         onOpenChange={setCreateOpen}
       />
-      {deleteTarget && (
-        <DeleteWorkspaceDialog
-          workspace={deleteTarget}
-          open={!!deleteTarget}
-          onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
-        />
-      )}
+      <DeleteWorkspaceDialog
+        workspace={deleteTarget}
+        open={deleteOpen}
+        onOpenChange={handleDeleteOpenChange}
+      />
     </>
   );
 };

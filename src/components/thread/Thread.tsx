@@ -37,7 +37,7 @@ import {
   ArrowUpIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { refocusComposer } from '@/lib/utils';
+import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
 import { useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
@@ -62,6 +62,7 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
@@ -99,6 +100,7 @@ export const Thread: FC<{
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
+  const fullWidth = useFullWidthContent();
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- hook must run for reactivity
   const _activeConversationId = useActiveConversationId();
   const threadRuntime = useThreadRuntime();
@@ -161,7 +163,7 @@ export const Thread: FC<{
           <PinnedUserMessage viewportRef={viewportRef} />
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
-              <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
+              <div className={cn('relative z-10 mx-auto flex w-full flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20', !fullWidth && 'max-w-3xl')}>
                 <ThreadPrimitive.Messages
                   components={{
                     UserMessage,
@@ -264,13 +266,14 @@ function getActiveComputerSession(
 const ComputerTabSurface: FC = () => {
   const activeConversationId = useActiveConversationId();
   const { sessionsByConversation } = useComputerUse();
+  const fullWidth = useFullWidthContent();
   const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
 
   if (!activeComputerSession) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-          <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
+          <div className={cn('mx-auto flex w-full min-h-0 flex-col', !fullWidth && 'max-w-3xl')}>
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
@@ -291,7 +294,7 @@ const ComputerTabSurface: FC = () => {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-        <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
+        <div className={cn('mx-auto flex w-full min-h-0 flex-col', !fullWidth && 'max-w-3xl')}>
           <ComputerSessionPanel session={activeComputerSession} stickyTopClassName="top-12 md:top-14" />
         </div>
       </div>
@@ -460,6 +463,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
  */
 const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null> }> = ({ viewportRef }) => {
   const threadRuntime = useThreadRuntime();
+  const fullWidth = useFullWidthContent();
   const [lastUserMessage, setLastUserMessage] = useState<{
     text: string;
     imageCount: number;
@@ -585,7 +589,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
           : 'h-0 overflow-hidden opacity-0'
       }`}
     >
-      <div className="mx-auto flex w-full max-w-3xl justify-end px-3 pr-5 md:px-6 md:pr-8">
+      <div className={cn('mx-auto flex w-full justify-end px-3 pr-5 md:px-6 md:pr-8', !fullWidth && 'max-w-3xl')}>
         <div className="max-w-[88%] md:max-w-[72%]">
           <div
             className="pointer-events-auto ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
@@ -1431,6 +1435,7 @@ const Composer: FC<{
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
+  const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
@@ -1643,7 +1648,7 @@ const Composer: FC<{
   }
 
   return (
-    <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
+    <div className={cn('relative z-20 mx-auto w-full px-4 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input

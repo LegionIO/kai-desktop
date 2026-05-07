@@ -38,17 +38,21 @@ import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app } from '@/lib/ipc-client';
-import { generateId } from '@/lib/utils';
+import { cn, generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
+import { AgentProvider } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
 import { KanbanBoard } from '@/components/tasks/KanbanBoard';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
+import { AgentListPanel } from '@/components/agents/AgentListPanel';
+import { AgentSwarmView } from '@/components/agents/AgentSwarmView';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -58,7 +62,9 @@ export default function App() {
         <PluginProvider>
           <ComputerUseProvider>
             <TaskProvider>
-              <AppRoot />
+              <AgentProvider>
+                <AppRoot />
+              </AgentProvider>
             </TaskProvider>
           </ComputerUseProvider>
         </PluginProvider>
@@ -358,6 +364,7 @@ const SETTINGS_VIEW = 'settings';
 const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
 const TASKS_VIEW = 'tasks';
+const AGENTS_VIEW = 'agents';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function isPluginView(view: string): boolean {
@@ -467,6 +474,7 @@ function AppShell() {
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
   const { config, updateConfig } = useConfig();
+  const fullWidth = useFullWidthContent();
   const { title: themeTitle, Icon: ThemeIcon, toggle: toggleTheme } = useThemeToggleControl();
   const {
     uiState: pluginUIState,
@@ -994,6 +1002,19 @@ function AppShell() {
     return () => window.removeEventListener('kai:open-task', handler);
   }, [tasksCtx]);
 
+  // Handle "Delete Task" requests from child components (detail panel, sidebar context menu)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const taskId = (e as CustomEvent<string>).detail;
+      if (taskId && tasksCtx) {
+        tasksCtx.selectTask(taskId);
+        setConfirmingTaskDelete(true);
+      }
+    };
+    window.addEventListener('kai:request-task-delete', handler);
+    return () => window.removeEventListener('kai:request-task-delete', handler);
+  }, [tasksCtx]);
+
   // Sync pinned-tasks from other components (sidebar context menu, etc.)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -1024,6 +1045,11 @@ function AppShell() {
 
   const handleTaskDelete = useCallback(async (taskId: string) => {
     if (!tasksCtx) return;
+    // Kill any running terminal session before deleting
+    const task = tasksCtx.state.tasks.find((t) => t.id === taskId);
+    if (task?.terminalSessionId) {
+      void app.tasks.terminalKill(task.terminalSessionId);
+    }
     await tasksCtx.deleteTask(taskId);
     tasksCtx.selectTask(null);
     setConfirmingTaskDelete(false);
@@ -1110,6 +1136,7 @@ function AppShell() {
         setSidebarSection(tab);
         if (tab === 'chats') setActiveView(CHAT_VIEW);
         else if (tab === 'tasks') setActiveView(TASKS_VIEW);
+        else if (tab === 'agents') setActiveView(AGENTS_VIEW);
         else if (tab === 'plugins') setActiveView(lastPluginViewRef.current);
         return;
       }
@@ -1387,6 +1414,8 @@ function AppShell() {
                     setActiveView(CHAT_VIEW);
                   } else if (tab === 'tasks') {
                     setActiveView(TASKS_VIEW);
+                  } else if (tab === 'agents') {
+                    setActiveView(AGENTS_VIEW);
                   }
                 }}
                 settingsActive={activeView === SETTINGS_VIEW}
@@ -1432,6 +1461,11 @@ function AppShell() {
                         isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
                         workspaceId={activeWorkspaceId}
                       />
+                    </div>
+                  }
+                  agentsContent={
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <AgentListPanel />
                     </div>
                   }
                   pluginsContent={
@@ -1501,6 +1535,8 @@ function AppShell() {
                   <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
                 ) : activeView === PLUGINS_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                ) : activeView === AGENTS_VIEW ? (
+                  <span className="text-sm font-medium text-foreground">Agent Swarm</span>
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
                     if (isCreatingTask) {
@@ -1723,7 +1759,7 @@ function AppShell() {
               {activeView === MARKETPLACE_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className="mx-auto max-w-3xl">
+                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
                       <PluginMarketplace />
                     </div>
                   </div>
@@ -1731,7 +1767,7 @@ function AppShell() {
               ) : activeView === PLUGINS_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className="mx-auto max-w-3xl">
+                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
                       <InstalledPluginsView onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)} />
                     </div>
                   </div>
@@ -1739,7 +1775,7 @@ function AppShell() {
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
                   <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className="mx-auto max-w-3xl">
+                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
                       <BrokenPluginView
                         pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
                         onUninstalled={() => setActiveView(PLUGINS_VIEW)}
@@ -1770,6 +1806,10 @@ function AppShell() {
                     }} />
                   </div>
                 )
+              ) : activeView === AGENTS_VIEW ? (
+                <div className="flex flex-col flex-1 min-h-0">
+                  <AgentSwarmView />
+                </div>
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                   <div className="flex h-full min-h-0">
