@@ -25,10 +25,10 @@ import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { CreateTaskDialog } from './CreateTaskDialog';
 
-// Status colors for the task icon
+// Status colors for the task icon — matches TaskQueueRow label colors
 const STATUS_DOT_COLORS: Record<KaiTaskStatus, string> = {
-  todo: 'text-muted-foreground',
-  in_progress: 'text-blue-500',
+  todo: 'text-sky-500',
+  in_progress: 'text-rose-500',
   ai_review: 'text-amber-500',
   human_review: 'text-purple-400',
   done: 'text-emerald-500',
