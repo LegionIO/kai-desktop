@@ -11,6 +11,7 @@ import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import {
   KAI_TASK_STATUS_LABELS,
   KAI_TASK_STATUS_BORDER_COLORS,
+  KAI_TASK_STATUS_OUTER_BORDER_COLORS,
 } from '@/types/task';
 import { SortableTaskCard } from './SortableTaskCard';
 
@@ -31,11 +32,17 @@ export const KanbanColumn: FC<KanbanColumnProps> = memo(
       <div
         ref={setNodeRef}
         className={cn(
-          'flex min-w-[220px] flex-1 flex-col rounded-xl border-t-2 bg-muted/30 transition-colors duration-150',
-          KAI_TASK_STATUS_BORDER_COLORS[status],
-          isOver && 'bg-primary/5 ring-2 ring-primary/25 ring-inset',
+          'flex min-w-[220px] flex-1 flex-col rounded-xl border transition-colors duration-150',
+          KAI_TASK_STATUS_OUTER_BORDER_COLORS[status],
+          isOver && 'ring-2 ring-primary/25 ring-inset',
         )}
       >
+        <div
+          className={cn(
+            'flex flex-1 flex-col rounded-t-[10px] border-t-2 bg-muted/30',
+            KAI_TASK_STATUS_BORDER_COLORS[status],
+          )}
+        >
         {/* Column header */}
         <div className="flex items-center gap-2 px-3 py-2.5">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -86,6 +93,7 @@ export const KanbanColumn: FC<KanbanColumnProps> = memo(
               )}
             </div>
           )}
+        </div>
         </div>
       </div>
     );

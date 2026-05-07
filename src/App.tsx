@@ -23,7 +23,7 @@ import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { IconRail } from '@/components/sidebar/IconRail';
 import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
@@ -529,9 +529,20 @@ function AppShell() {
       });
     }
 
-    // Restore the arriving workspace's last conversation
+    // Restore the arriving workspace's last conversation without changing
+    // the active view — this preserves the current tab (tasks, agents, etc.)
+    // instead of forcing a switch back to the chat view.
     if (activeWorkspace?.lastActiveConversationId) {
-      void handleSwitchConversation(activeWorkspace.lastActiveConversationId);
+      const restoredId = activeWorkspace.lastActiveConversationId;
+      void (async () => {
+        await app.conversations.setActiveId(restoredId);
+        setActiveConversationId(restoredId);
+        const conv = await app.conversations.get(restoredId) as ConversationRecord | null;
+        setActiveConversationTitle(getConversationDisplayTitle(
+          conv,
+          cuSessionsByConversation.get(restoredId),
+        ));
+      })();
     }
   }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
 
@@ -989,6 +1000,13 @@ function AppShell() {
 
   // Handle "View Task" links from chat — navigate to task board and open the task modal
   const tasksCtx = useTasksOptional();
+
+  // Clear selected task when switching workspaces so we don't show a stale detail panel
+  useEffect(() => {
+    tasksCtx?.selectTask(null);
+    setIsCreatingTask(false);
+  }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
+
   useEffect(() => {
     const handler = (e: Event) => {
       const { taskId } = (e as CustomEvent<{ taskId: string }>).detail;
@@ -1450,6 +1468,7 @@ function AppShell() {
                         }}
                         onCreateTask={() => {
                           tasksCtx?.selectTask(null);
+                          tasksCtx?.exitAICreation();
                           setIsCreatingTask(true);
                           setActiveView(TASKS_VIEW);
                         }}
@@ -1546,46 +1565,56 @@ function AppShell() {
                     const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
                     if (selectedTask) {
                       return (
-                        <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
-                          <DropdownMenu.Trigger asChild>
-                            <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                              <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                                {selectedTask.title}
-                              </span>
-                              <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                            </button>
-                          </DropdownMenu.Trigger>
-                          <DropdownMenu.Portal>
-                            <DropdownMenu.Content
-                              align="start"
-                              sideOffset={4}
-                              className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                            >
-                              <DropdownMenu.Item
-                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                onSelect={() => toggleTaskPin(selectedTask.id)}
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => tasksCtx?.selectTask(null)}
+                            className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                          >
+                            Task Board
+                          </button>
+                          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                          <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
+                            <DropdownMenu.Trigger asChild>
+                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                                <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                  {selectedTask.title}
+                                </span>
+                                <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              </button>
+                            </DropdownMenu.Trigger>
+                            <DropdownMenu.Portal>
+                              <DropdownMenu.Content
+                                align="start"
+                                sideOffset={4}
+                                className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                               >
-                                <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
-                              </DropdownMenu.Item>
-                              <DropdownMenu.Item
-                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                onSelect={() => { setTaskRenameValue(selectedTask.title); setRenamingTask(true); }}
-                              >
-                                <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                <span>Rename</span>
-                              </DropdownMenu.Item>
-                              <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                              <DropdownMenu.Item
-                                className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                onSelect={() => setConfirmingTaskDelete(true)}
-                              >
-                                <Trash2Icon className="h-4 w-4" />
-                                <span>Delete</span>
-                              </DropdownMenu.Item>
-                            </DropdownMenu.Content>
-                          </DropdownMenu.Portal>
-                        </DropdownMenu.Root>
+                                <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                  onSelect={() => toggleTaskPin(selectedTask.id)}
+                                >
+                                  <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                  <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
+                                </DropdownMenu.Item>
+                                <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                  onSelect={() => { setTaskRenameValue(selectedTask.title); setRenamingTask(true); }}
+                                >
+                                  <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                  <span>Rename</span>
+                                </DropdownMenu.Item>
+                                <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                  onSelect={() => setConfirmingTaskDelete(true)}
+                                >
+                                  <Trash2Icon className="h-4 w-4" />
+                                  <span>Delete</span>
+                                </DropdownMenu.Item>
+                              </DropdownMenu.Content>
+                            </DropdownMenu.Portal>
+                          </DropdownMenu.Root>
+                        </div>
                       );
                     }
                     return <span className="text-sm font-medium text-foreground">Task Board</span>;
@@ -1800,10 +1829,7 @@ function AppShell() {
                   />
                 ) : (
                   <div className="flex flex-col flex-1 min-h-0">
-                    <KanbanBoard onCreateTask={() => {
-                      tasksCtx?.selectTask(null);
-                      setIsCreatingTask(true);
-                    }} />
+                    <KanbanBoard workspaceId={activeWorkspaceId} />
                   </div>
                 )
               ) : activeView === AGENTS_VIEW ? (

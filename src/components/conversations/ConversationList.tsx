@@ -594,7 +594,7 @@ export const ConversationList: FC<ConversationListProps> = ({
           ));
         })()}
 
-        {processedConversations.length === 0 && (
+        {hasLoaded && processedConversations.length === 0 && (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
               <MessageSquareIcon size={24} strokeWidth={1.3} />

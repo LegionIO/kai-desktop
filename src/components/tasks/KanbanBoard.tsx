@@ -19,7 +19,8 @@ import {
   type DragEndEvent,
 } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
-import { SearchIcon, FilterIcon, XIcon, PlusIcon } from 'lucide-react';
+import { SearchIcon, FilterIcon, XIcon } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_COLUMNS, KAI_TASK_STATUS_LABELS } from '@/types/task';
@@ -29,18 +30,18 @@ import { TaskDetailPanel } from './TaskDetailPanel';
 import { TaskDetailModal } from './TaskDetailModal';
 
 interface KanbanBoardProps {
-  /** Navigate to the full-screen task creation view */
-  onCreateTask?: () => void;
+  /** Active workspace ID — only tasks belonging to this workspace (or unscoped) are shown */
+  workspaceId?: string | null;
 }
 
-export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
+export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
   const { state, reorderTasks, moveTaskToColumn, selectTask } =
     useTasks();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
   const [overColumnId, setOverColumnId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<KaiTaskStatus | null>(null);
+  const [statusFilters, setStatusFilters] = useState<Set<KaiTaskStatus>>(new Set());
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
 
   const sensors = useSensors(
@@ -62,10 +63,12 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
       done: [],
     };
     for (const task of state.tasks) {
+      // Apply workspace filter — only show tasks belonging to the active workspace
+      if (workspaceId && task.workspaceId !== workspaceId) continue;
       // Apply search filter
       if (query && !task.title.toLowerCase().includes(query) && !task.description.toLowerCase().includes(query)) continue;
       // Apply status filter
-      if (statusFilter && task.status !== statusFilter) continue;
+      if (statusFilters.size > 0 && !statusFilters.has(task.status)) continue;
       grouped[task.status]?.push(task);
     }
     // Sort within columns by order, fallback to createdAt descending
@@ -81,7 +84,7 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
       }
     }
     return grouped;
-  }, [state.tasks, state.taskOrder, searchQuery, statusFilter]);
+  }, [state.tasks, state.taskOrder, searchQuery, statusFilters, workspaceId]);
 
   // ── Drag handlers ───────────────────────────────────────────────────
 
@@ -214,50 +217,69 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ onCreateTask }) => {
           )}
         </div>
 
-        {/* Status filter chips */}
-        <div className="flex items-center gap-1.5" role="group" aria-label="Filter by status">
-          <FilterIcon className="h-3.5 w-3.5 text-muted-foreground/60" />
-          <button
-            type="button"
-            aria-pressed={statusFilter === null}
-            onClick={() => setStatusFilter(null)}
-            className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
-              statusFilter === null
-                ? 'bg-foreground/10 text-foreground'
-                : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
-            }`}
-          >
-            All
-          </button>
-          {KAI_TASK_STATUS_COLUMNS.filter((s) => s !== 'done').map((status) => (
+        {/* Status filter dropdown */}
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
             <button
-              key={status}
               type="button"
-              aria-pressed={statusFilter === status}
-              onClick={() => setStatusFilter(statusFilter === status ? null : status)}
-              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
-                statusFilter === status
-                  ? 'bg-foreground/10 text-foreground'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+              className={`relative rounded-lg p-1.5 transition-colors hover:bg-muted/60 ${
+                statusFilters.size > 0 ? 'text-primary' : 'text-muted-foreground'
               }`}
+              aria-label="Filter by status"
             >
-              {KAI_TASK_STATUS_LABELS[status]}
+              <FilterIcon className="h-4 w-4" />
+              {statusFilters.size > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-primary-foreground">
+                  {statusFilters.size}
+                </span>
+              )}
             </button>
-          ))}
-        </div>
-
-        {/* Spacer */}
-        <div className="flex-1" />
-
-        {/* Create task */}
-        <button
-          type="button"
-          onClick={onCreateTask}
-          className="flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted/60"
-        >
-          <PlusIcon className="h-3.5 w-3.5" />
-          Create Task
-        </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="start"
+              sideOffset={6}
+              className="z-[9999] min-w-[160px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
+              {KAI_TASK_STATUS_COLUMNS.map((status) => (
+                <DropdownMenu.CheckboxItem
+                  key={status}
+                  checked={statusFilters.has(status)}
+                  onSelect={(e) => e.preventDefault()}
+                  onCheckedChange={(checked) => {
+                    setStatusFilters((prev) => {
+                      const next = new Set(prev);
+                      if (checked) next.add(status);
+                      else next.delete(status);
+                      return next;
+                    });
+                  }}
+                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
+                >
+                  <DropdownMenu.ItemIndicator className="inline-flex h-3.5 w-3.5 items-center justify-center">
+                    <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
+                      <path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </DropdownMenu.ItemIndicator>
+                  <span className={statusFilters.has(status) ? '' : 'ml-5'}>
+                    {KAI_TASK_STATUS_LABELS[status]}
+                  </span>
+                </DropdownMenu.CheckboxItem>
+              ))}
+              {statusFilters.size > 0 && (
+                <>
+                  <DropdownMenu.Separator className="my-1 h-px bg-border/50" />
+                  <DropdownMenu.Item
+                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                    onSelect={() => setStatusFilters(new Set())}
+                  >
+                    Clear filters
+                  </DropdownMenu.Item>
+                </>
+              )}
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
       </div>
 
       {/* Columns */}

@@ -237,7 +237,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           description: data.description,
           status: data.status ?? 'todo',
           metadata: data.metadata,
-          workspaceId: activeWorkspaceId ?? undefined,
+          workspaceId: activeWorkspaceId || undefined,
         }));
         // No optimistic ADD_TASK dispatch — the IPC broadcast from main
         // process triggers SET_TASKS which includes the new task.
@@ -266,7 +266,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           sourceConversationId: opts.sourceConversationId,
           sourceToolCallId: opts.sourceToolCallId,
           metadata: opts.planFileName ? { planFileName: opts.planFileName } : undefined,
-          workspaceId: activeWorkspaceId ?? undefined,
+          workspaceId: activeWorkspaceId || undefined,
         }));
         // No optimistic ADD_TASK dispatch — broadcast handles it.
         return task;
@@ -419,6 +419,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         title: 'Generating…',
         description: '',
         status: 'todo',
+        workspaceId: activeWorkspaceId || undefined,
       }));
       if (!task || !task.id) return;
 
@@ -438,7 +439,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       console.error('[TaskProvider] Failed to start AI task creation:', err);
       dispatch({ type: 'CANCEL_AI_CREATE' });
     }
-  }, []);
+  }, [activeWorkspaceId]);
 
   const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
     try {

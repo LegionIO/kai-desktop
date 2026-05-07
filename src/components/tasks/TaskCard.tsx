@@ -8,7 +8,6 @@ import { memo, type FC } from 'react';
 import { TerminalIcon, ClockIcon, MessageSquareIcon, BotIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { TaskFile } from '@/types/task';
-import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
 import { useAgents } from '@/providers/AgentProvider';
 
 interface TaskCardProps {
@@ -53,17 +52,8 @@ export const TaskCard: FC<TaskCardProps> = memo(
         {task.title}
       </p>
 
-      {/* Bottom row: status badge + metadata */}
+      {/* Bottom row: metadata */}
       <div className="mt-2 flex items-center gap-2">
-        <span
-          className={cn(
-            'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
-            KAI_TASK_STATUS_COLORS[task.status],
-          )}
-        >
-          {KAI_TASK_STATUS_LABELS[task.status]}
-        </span>
-
         <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
           <ClockIcon className="h-3 w-3" />
           {relativeTime(task.updatedAt)}

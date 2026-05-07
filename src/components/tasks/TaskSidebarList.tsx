@@ -12,12 +12,10 @@ import {
   Trash2Icon,
   XIcon,
   ClipboardListIcon,
-  CircleDotIcon,
   PinIcon,
   EllipsisVerticalIcon,
   LoaderIcon,
   ListFilterIcon,
-  LayoutDashboardIcon,
   PlusIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
@@ -63,8 +61,6 @@ interface TaskSidebarListProps {
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
   onCreateTask,
-  onViewBoard,
-  isBoardActive,
   workspaceId,
 }) => {
   const { state, selectTask, deleteTask } = useTasks();
@@ -133,10 +129,9 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   const sortedTasks = useMemo(() => {
     let tasks = [...state.tasks];
 
-    // Workspace scoping — show only tasks belonging to the active workspace
-    // (or legacy/unscoped tasks that have no workspaceId)
+    // Workspace scoping — only show tasks belonging to the active workspace
     if (workspaceId) {
-      tasks = tasks.filter((t) => t.workspaceId === workspaceId || !t.workspaceId);
+      tasks = tasks.filter((t) => t.workspaceId === workspaceId);
     }
 
     const query = searchQuery.toLowerCase().trim();
@@ -214,18 +209,11 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => {
-            if (onViewBoard) {
-              onViewBoard();
-            }
-          }}
-          className={cn(
-            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
-            isBoardActive && 'border-primary/40 bg-primary/10 text-primary',
-          )}
+          onClick={(e) => { e.stopPropagation(); onCreateTask?.(); }}
+          className="flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
-          <LayoutDashboardIcon className="h-3 w-3" />
-          View Board
+          <PlusIcon className="h-3 w-3" />
+          Create Task
         </button>
       </div>
 
@@ -321,7 +309,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           </div>
         ))}
 
-        {sortedTasks.length === 0 && (
+        {!state.isLoading && sortedTasks.length === 0 && (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
               <ClipboardListIcon size={24} strokeWidth={1.3} />

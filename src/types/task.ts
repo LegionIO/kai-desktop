@@ -38,13 +38,22 @@ export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
   done: 'bg-emerald-500/10 text-emerald-500',
 };
 
-/** Border-top accent color for kanban column headers. */
+/** Border accent color for kanban columns (thick top). */
 export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'border-t-sky-500',
   in_progress: 'border-t-rose-500',
   ai_review: 'border-t-amber-500',
   human_review: 'border-t-purple-400',
   done: 'border-t-emerald-500',
+};
+
+/** Subtle outer border color for kanban columns. */
+export const KAI_TASK_STATUS_OUTER_BORDER_COLORS: Record<KaiTaskStatus, string> = {
+  todo: 'border-sky-500/20',
+  in_progress: 'border-rose-500/20',
+  ai_review: 'border-amber-500/20',
+  human_review: 'border-purple-400/20',
+  done: 'border-emerald-500/20',
 };
 
 // ── Plan → Task bridge type ───────────────────────────────────────────────

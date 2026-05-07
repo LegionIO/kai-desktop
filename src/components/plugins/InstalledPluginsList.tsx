@@ -44,6 +44,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 }) => {
   const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [pinnedNames, setPinnedNames] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(PINNED_PLUGINS_KEY) || '[]')); } catch { return new Set(); }
@@ -55,7 +56,10 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   useEffect(() => {
     let cancelled = false;
     app.plugins.list().then((list) => {
-      if (!cancelled) setPlugins(list);
+      if (!cancelled) {
+        setPlugins(list);
+        setHasLoaded(true);
+      }
     });
     return () => { cancelled = true; };
   }, [uiState]);
@@ -291,7 +295,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
       {/* Plugin list */}
       <div className="flex-1 overflow-y-auto px-3">
-        {filteredPlugins.length === 0 ? (
+        {!hasLoaded ? null : filteredPlugins.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
               <PuzzleIcon size={24} strokeWidth={1.3} />
