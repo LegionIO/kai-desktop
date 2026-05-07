@@ -1,5 +1,5 @@
 /**
- * Types shared between main and renderer process for the Tasks kanban board.
+ * Types shared between main and renderer process for the Task Queue.
  */
 
 export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';

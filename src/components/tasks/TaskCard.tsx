@@ -1,5 +1,5 @@
 /**
- * TaskCard — a compact card rendered inside kanban columns.
+ * TaskCard — a compact card rendered inside task queue rows.
  *
  * Shows task title, status badge, relative timestamp, and agent runtime icon.
  */
@@ -41,19 +41,19 @@ export const TaskCard: FC<TaskCardProps> = memo(
       type="button"
       onClick={onClick}
       className={cn(
-        'w-full rounded-lg border border-border/60 bg-card p-3 text-left transition-all',
+        'flex h-[72px] w-[180px] shrink-0 flex-col justify-between rounded-lg border border-border/60 bg-card px-3.5 py-2.5 text-left transition-all',
         'hover:border-border hover:shadow-sm',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         isSelected && 'border-primary/50 ring-1 ring-primary/30',
       )}
     >
       {/* Title */}
-      <p className="line-clamp-2 text-sm font-medium leading-snug text-foreground">
+      <p className="truncate text-sm font-medium leading-snug text-foreground">
         {task.title}
       </p>
 
       {/* Bottom row: metadata */}
-      <div className="mt-2 flex items-center gap-2">
+      <div className="flex items-center gap-2">
         <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
           <ClockIcon className="h-3 w-3" />
           {relativeTime(task.updatedAt)}

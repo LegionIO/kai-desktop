@@ -121,7 +121,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const handleApprove = useCallback(async () => {
     setLocalApproval('approved');
     void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
-    // Bridge: create a kanban task from approved plan
+    // Bridge: create a task queue entry from approved plan
     if (isPlanApproval && planContent) {
       const task = await onPlanApproved?.({
         title: planArgs?.planTitle ? String(planArgs.planTitle) : 'Untitled Plan',
@@ -678,7 +678,7 @@ const PlanApprovalCard: FC<{
       {(approvalStatus === 'approved' || (hasResult && !isError)) && (
         <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
-          <span>Plan accepted — added to Task Board</span>
+          <span>Plan accepted — added to Task Queue</span>
           {createdTaskId && (
             <button
               type="button"

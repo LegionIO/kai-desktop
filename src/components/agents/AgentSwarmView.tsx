@@ -2,7 +2,7 @@
  * AgentSwarmView — main panel visualization of all agents in the swarm.
  *
  * Shows a grid of agent cards with status, runtime, current task, and controls.
- * Matches the visual density and style of the KanbanBoard / Plugin Marketplace.
+ * Matches the visual density and style of the TaskQueue / Plugin Marketplace.
  */
 
 import { type FC, useState } from 'react';

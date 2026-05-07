@@ -1,5 +1,5 @@
 /**
- * Renderer-side task types, constants, and helpers for the kanban board.
+ * Renderer-side task types, constants, and helpers for the task queue.
  *
  * Core types are re-exported from the shared module to keep main/renderer in sync.
  */
@@ -11,7 +11,7 @@ import type { KaiTaskStatus } from '../../shared/task-types';
 
 // ── Column Definitions ────────────────────────────────────────────────────
 
-/** Ordered list of columns in the kanban board. */
+/** Ordered list of status rows in the task queue. */
 export const KAI_TASK_STATUS_COLUMNS: KaiTaskStatus[] = [
   'todo',
   'in_progress',
@@ -38,7 +38,7 @@ export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
   done: 'bg-emerald-500/10 text-emerald-500',
 };
 
-/** Border accent color for kanban columns (thick top). */
+/** Border accent color for task queue rows (thick top). */
 export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'border-t-sky-500',
   in_progress: 'border-t-rose-500',
@@ -47,7 +47,7 @@ export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   done: 'border-t-emerald-500',
 };
 
-/** Subtle outer border color for kanban columns. */
+/** Subtle outer border color for task queue rows. */
 export const KAI_TASK_STATUS_OUTER_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'border-sky-500/20',
   in_progress: 'border-rose-500/20',

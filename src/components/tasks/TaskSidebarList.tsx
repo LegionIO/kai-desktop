@@ -50,7 +50,7 @@ interface TaskSidebarListProps {
   onSelectTask?: (taskId: string) => void;
   /** When provided, "Create Task" opens the AI creation view instead of the dialog. */
   onCreateTask?: () => void;
-  /** Navigate to the kanban board view in the main panel. */
+  /** Navigate to the task queue view in the main panel. */
   onViewBoard?: () => void;
   /** Whether the board view is currently shown in the main panel. */
   isBoardActive?: boolean;

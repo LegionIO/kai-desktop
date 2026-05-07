@@ -155,7 +155,7 @@ export const AgentDetailSheet: FC<AgentDetailSheetProps> = ({ agent, onClose }) 
             </div>
           ) : (
             <p className="mt-1.5 text-xs text-muted-foreground/60 italic">
-              No task assigned. Assign a task from the task board.
+              No task assigned. Assign a task from the task queue.
             </p>
           )}
         </div>

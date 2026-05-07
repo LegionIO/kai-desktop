@@ -1,5 +1,5 @@
 /**
- * TaskProvider — React Context + useReducer store for the kanban board.
+ * TaskProvider — React Context + useReducer store for the task queue.
  *
  * Manages task state in the renderer and syncs with the main process via IPC.
  * Follows the same Context pattern as PlanPanelProvider and ConfigProvider.
@@ -201,6 +201,20 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           }
           dispatch({ type: 'SET_ORDER', order: cleanOrder });
           if (pruned) void app.tasks.saveOrder(cleanOrder);
+        } else if (tasks.length > 0) {
+          // No order.json — initialize order from current tasks
+          const initialOrder: KaiTaskOrder = {
+            todo: [],
+            in_progress: [],
+            ai_review: [],
+            human_review: [],
+            done: [],
+          };
+          for (const task of tasks) {
+            initialOrder[task.status]?.push(task.id);
+          }
+          dispatch({ type: 'SET_ORDER', order: initialOrder });
+          void app.tasks.saveOrder(initialOrder);
         }
       } catch (err) {
         console.error('[TaskProvider] Failed to load tasks:', err);
@@ -325,7 +339,21 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const reorderTasks = useCallback(
     (status: KaiTaskStatus, activeId: string, overId: string) => {
       const currentOrder = { ...state.taskOrder };
-      const column = [...(currentOrder[status] ?? [])];
+      let column = [...(currentOrder[status] ?? [])];
+
+      // If the order array is empty or missing task IDs, rebuild from current tasks
+      const tasksInStatus = state.tasks.filter((t) => t.status === status);
+      if (column.length === 0) {
+        column = tasksInStatus
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((t) => t.id);
+      } else {
+        // Ensure any tasks not yet in the order array get appended
+        const columnSet = new Set(column);
+        for (const t of tasksInStatus) {
+          if (!columnSet.has(t.id)) column.push(t.id);
+        }
+      }
 
       const activeIdx = column.indexOf(activeId);
       const overIdx = column.indexOf(overId);
@@ -338,7 +366,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       dispatch({ type: 'SET_ORDER', order: currentOrder });
       void app.tasks.saveOrder(currentOrder);
     },
-    [state.taskOrder],
+    [state.taskOrder, state.tasks],
   );
 
   const moveTaskToColumn = useCallback(

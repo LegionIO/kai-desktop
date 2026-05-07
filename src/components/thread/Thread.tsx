@@ -808,7 +808,7 @@ const ToolFallback: FC<{
         ? 'bg-red-500'
         : 'bg-emerald-500';
 
-  // Bridge: create kanban task when a plan is approved
+  // Bridge: create task queue entry when a plan is approved
   const taskCtx = useTasksOptional();
   const handlePlanApproved = useCallback(async (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => {
     const task = await taskCtx?.createTaskFromPlan({

@@ -29,10 +29,11 @@ export const SortableTaskCard: FC<SortableTaskCardProps> = ({ task, onClick, isS
     transition,
     opacity: isDragging ? 0.4 : 1,
     zIndex: isDragging ? 50 : undefined,
+    touchAction: 'none' as const,
   };
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div ref={setNodeRef} style={style} {...attributes} {...listeners} className="shrink-0">
       <TaskCard task={task} onClick={onClick} isSelected={isSelected} />
     </div>
   );

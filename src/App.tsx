@@ -48,7 +48,7 @@ import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { AgentProvider } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
-import { KanbanBoard } from '@/components/tasks/KanbanBoard';
+import { TaskQueue } from '@/components/tasks/TaskQueue';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import { AgentListPanel } from '@/components/agents/AgentListPanel';
@@ -998,7 +998,7 @@ function AppShell() {
     return () => window.removeEventListener('plugin-navigate', handler);
   }, [handleSwitchConversation]);
 
-  // Handle "View Task" links from chat — navigate to task board and open the task modal
+  // Handle "View Task" links from chat — navigate to task queue and open the task modal
   const tasksCtx = useTasksOptional();
 
   // Clear selected task when switching workspaces so we don't show a stale detail panel
@@ -1571,7 +1571,7 @@ function AppShell() {
                             onClick={() => tasksCtx?.selectTask(null)}
                             className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                           >
-                            Task Board
+                            Task Queue
                           </button>
                           <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                           <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
@@ -1617,7 +1617,7 @@ function AppShell() {
                         </div>
                       );
                     }
-                    return <span className="text-sm font-medium text-foreground">Task Board</span>;
+                    return <span className="text-sm font-medium text-foreground">Task Queue</span>;
                   })()
                 ) : activeErrorPluginName ? (
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
@@ -1827,8 +1827,12 @@ function AppShell() {
                     }}
                   />
                 ) : (
-                  <div className="flex flex-col flex-1 min-h-0">
-                    <KanbanBoard workspaceId={activeWorkspaceId} />
+                  <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                    <div className="flex-1 overflow-y-auto">
+                      <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
+                        <TaskQueue workspaceId={activeWorkspaceId} />
+                      </div>
+                    </div>
                   </div>
                 )
               ) : activeView === AGENTS_VIEW ? (

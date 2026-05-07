@@ -1,7 +1,7 @@
 /**
- * KanbanBoard — main kanban view with 5 columns and drag-and-drop.
+ * TaskQueue — main task queue view with 5 status rows and drag-and-drop reordering.
  *
- * Adapted from Aperant's KanbanBoard pattern with dnd-kit,
+ * Adapted from Aperant's kanban pattern with dnd-kit,
  * simplified for Kai's 5-lane workflow.
  */
 
@@ -9,13 +9,12 @@ import { useState, useMemo, useCallback, type FC } from 'react';
 import {
   DndContext,
   DragOverlay,
-  closestCorners,
+  closestCenter,
   PointerSensor,
   KeyboardSensor,
   useSensors,
   useSensor,
   type DragStartEvent,
-  type DragOverEvent,
   type DragEndEvent,
 } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
@@ -24,22 +23,21 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_COLUMNS, KAI_TASK_STATUS_LABELS } from '@/types/task';
-import { KanbanColumn } from './KanbanColumn';
+import { TaskQueueRow } from './TaskQueueRow';
 import { TaskCard } from './TaskCard';
 import { TaskDetailPanel } from './TaskDetailPanel';
 import { TaskDetailModal } from './TaskDetailModal';
 
-interface KanbanBoardProps {
+interface TaskQueueProps {
   /** Active workspace ID — only tasks belonging to this workspace (or unscoped) are shown */
   workspaceId?: string | null;
 }
 
-export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
-  const { state, reorderTasks, moveTaskToColumn, selectTask } =
+export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
+  const { state, reorderTasks, selectTask } =
     useTasks();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
-  const [overColumnId, setOverColumnId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilters, setStatusFilters] = useState<Set<KaiTaskStatus>>(new Set());
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
@@ -97,57 +95,25 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
     [state.tasks],
   );
 
-  const handleDragOver = useCallback((event: DragOverEvent) => {
-    const { over } = event;
-    if (!over) {
-      setOverColumnId(null);
-      return;
-    }
-    // `over.id` is either a column ID (status) or a task ID
-    const isColumn = KAI_TASK_STATUS_COLUMNS.includes(over.id as KaiTaskStatus);
-    setOverColumnId(isColumn ? (over.id as string) : null);
-  }, []);
-
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const { active, over } = event;
       setActiveTask(null);
-      setOverColumnId(null);
 
-      if (!over || !active) return;
+      if (!over || !active || active.id === over.id) return;
 
       const activeId = active.id as string;
       const overId = over.id as string;
+
+      // Find which status row these tasks belong to
       const task = state.tasks.find((t) => t.id === activeId);
-      if (!task) return;
-
-      const sourceStatus = task.status;
-
-      // Dropping on a column directly
-      const isColumn = KAI_TASK_STATUS_COLUMNS.includes(overId as KaiTaskStatus);
-      if (isColumn) {
-        const targetStatus = overId as KaiTaskStatus;
-        if (targetStatus !== sourceStatus) {
-          moveTaskToColumn(activeId, targetStatus, sourceStatus);
-        }
-        return;
-      }
-
-      // Dropping on another task
       const overTask = state.tasks.find((t) => t.id === overId);
-      if (!overTask) return;
+      if (!task || !overTask) return;
+      if (task.status !== overTask.status) return;
 
-      if (sourceStatus === overTask.status) {
-        // Reorder within same column
-        if (activeId !== overId) {
-          reorderTasks(sourceStatus, activeId, overId);
-        }
-      } else {
-        // Move across columns
-        moveTaskToColumn(activeId, overTask.status, sourceStatus);
-      }
+      reorderTasks(task.status, activeId, overId);
     },
-    [state.tasks, moveTaskToColumn, reorderTasks],
+    [state.tasks, reorderTasks],
   );
 
   const handleTaskClick = useCallback(
@@ -193,11 +159,11 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
   }
 
   return (
-    <div className="flex h-full flex-col pt-12 md:pt-14">
+    <div className="flex flex-col">
       {/* Board toolbar */}
-      <div className="flex shrink-0 items-center gap-3 border-b border-border/50 px-6 py-2.5">
+      <div className="flex shrink-0 items-center gap-3 px-4 py-2.5">
         {/* Search */}
-        <div className="relative w-64">
+        <div className="relative flex-1">
           <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
             type="text"
@@ -285,18 +251,16 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
       {/* Columns */}
       <DndContext
         sensors={sensors}
-        collisionDetection={closestCorners}
+        collisionDetection={closestCenter}
         onDragStart={handleDragStart}
-        onDragOver={handleDragOver}
         onDragEnd={handleDragEnd}
       >
-        <div className="flex flex-1 gap-3 overflow-x-auto p-4">
+        <div className="flex flex-col gap-4 p-4">
           {KAI_TASK_STATUS_COLUMNS.map((status) => (
-            <KanbanColumn
+            <TaskQueueRow
               key={status}
               status={status}
               tasks={tasksByStatus[status]}
-              isOver={overColumnId === status}
               selectedTaskId={state.selectedTaskId}
               onTaskClick={handleTaskClick}
             />
@@ -305,7 +269,7 @@ export const KanbanBoard: FC<KanbanBoardProps> = ({ workspaceId }) => {
 
         <DragOverlay dropAnimation={null}>
           {activeTask && (
-            <div className="w-[220px] scale-105 rotate-1 opacity-90 shadow-lg shadow-black/20">
+            <div className="w-[180px] scale-105 rotate-1 opacity-90 shadow-lg shadow-black/20">
               <TaskCard task={activeTask} onClick={() => {}} />
             </div>
           )}
