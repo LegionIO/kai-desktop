@@ -149,7 +149,7 @@ interface TaskContextValue {
   ) => void;
 
   /** Start the AI task creation flow — creates a placeholder task, streams plan. */
-  startAITaskCreation: (userMessage: string) => Promise<void>;
+  startAITaskCreation: (userMessage: string, metadata?: KaiTaskMetadata) => Promise<void>;
 
   /** Send a follow-up message to refine the currently streaming task plan. */
   refineTaskPlan: (taskId: string, userMessage: string) => Promise<void>;
@@ -412,13 +412,14 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     return unsub;
   }, []);
 
-  const startAITaskCreation = useCallback(async (userMessage: string) => {
+  const startAITaskCreation = useCallback(async (userMessage: string, metadata?: KaiTaskMetadata) => {
     try {
       // Create a placeholder task
       const task = (await app.tasks.create({
         title: 'Generating…',
         description: '',
         status: 'todo',
+        metadata,
       }));
       if (!task || !task.id) return;
 
