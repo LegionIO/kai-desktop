@@ -38,7 +38,7 @@ const emptyServer = (): McpServer => ({
   enabled: true,
 });
 
-export const McpSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const McpSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const servers = ((config as { mcpServers?: McpServer[] }).mcpServers ?? []) as McpServer[];
   const [showAdd, setShowAdd] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
@@ -70,7 +70,7 @@ export const McpSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-4">
-      <h3 className="text-sm font-semibold">MCP Servers</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">MCP Servers</h3>}
 
       {servers.length === 0 && !showAdd && (
         <p className="text-xs text-muted-foreground">No MCP servers configured.</p>

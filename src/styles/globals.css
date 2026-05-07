@@ -360,7 +360,9 @@
   content: attr(data-placeholder);
   position: absolute;
   inset: 0;
-  padding-left: 0.35rem;
+  padding: inherit;
+  display: flex;
+  align-items: center;
   color: var(--muted-foreground);
   pointer-events: none;
   white-space: pre-wrap;

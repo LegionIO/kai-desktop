@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef, useCallback, type FC } from 'react';
+import { useState, useEffect, useRef, type FC } from 'react';
 import { ChevronRightIcon } from 'lucide-react';
 import { useConfig } from '@/providers/ConfigProvider';
-import { EditableTextarea } from '@/components/EditableTextarea';
-import { ModelSettings, ModelProviderSettings } from './ModelSettings';
+import { ModelSettings } from './ModelSettings';
 import { ToolSettings } from './ToolSettings';
 import { CliToolsSettings } from './CliToolsSettings';
 import { McpSettings } from './McpSettings';
@@ -10,43 +9,27 @@ import { SkillSettings } from './SkillSettings';
 import { AudioVoiceSettings } from './AudioVoiceSettings';
 import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
-import { UsageDashboard } from './UsageDashboard';
 import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
-import { AppearanceSettings } from './AppearanceSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
   | 'models'
-  | 'providers'
-  | 'built-in-tools'
-  | 'cli-tools'
-  | 'skills'
-  | 'system-prompt'
-  | 'mcp'
-  | 'audio-voice'
-  | 'media-generation'
-  | 'computer-use'
-  | 'web-server'
+  | 'tools'
   | 'general'
-  | 'appearance'
-  | 'usage';
+  | 'audio-voice'
+  | 'computer-use'
+  | 'media-generation'
+  | 'web-server';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
-  { key: 'models', label: 'Model Config' },
-  { key: 'providers', label: 'Model Providers' },
-  { key: 'built-in-tools', label: 'Built-in Tools' },
-  { key: 'cli-tools', label: 'CLI Tools' },
-  { key: 'skills', label: 'Skills' },
-  { key: 'system-prompt', label: 'System Prompts' },
-  { key: 'mcp', label: 'MCP Servers' },
+  { key: 'models', label: 'Models' },
+  { key: 'tools', label: 'Tools' },
+  { key: 'general', label: 'Application' },
   { key: 'audio-voice', label: 'Audio & Voice' },
-  { key: 'media-generation', label: 'Media Generation' },
   { key: 'computer-use', label: 'Autopilot' },
+  { key: 'media-generation', label: 'Media Generation' },
   { key: 'web-server', label: 'Web UI' },
-  { key: 'general', label: 'General' },
-  { key: 'appearance', label: 'Appearance' },
-  { key: 'usage', label: 'Usage' },
 ];
 
 export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
@@ -102,103 +85,61 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'providers' && <ModelProviderSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'built-in-tools' && <ToolSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'cli-tools' && <CliToolsSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'skills' && <SkillSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'system-prompt' && <SystemPromptSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'mcp' && <McpSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'tools' && <CombinedToolsSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'audio-voice' && <AudioVoiceSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'appearance' && <AppearanceSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
       </div>
     </div>
   );
 };
 
-const SystemPromptSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
-  type PromptKey = 'chat' | 'plan' | 'implement' | 'computerUse';
-  const promptTabs: Array<{ key: PromptKey; label: string }> = [
-    { key: 'chat', label: 'Chat' },
-    { key: 'plan', label: 'Plan' },
-    { key: 'implement', label: 'Implement' },
-    { key: 'computerUse', label: 'Computer Use' },
+type ToolTab = 'built-in' | 'cli' | 'skills' | 'mcp';
+
+const CombinedToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const [activeTab, setActiveTab] = useState<ToolTab>('built-in');
+
+  const tabs: Array<{ key: ToolTab; label: string }> = [
+    { key: 'built-in', label: 'System' },
+    { key: 'cli', label: 'CLI' },
+    { key: 'mcp', label: 'MCP' },
+    { key: 'skills', label: 'Skills' },
   ];
-  const configPrompt = (config as { systemPrompt?: string }).systemPrompt ?? '';
-  const configPrompts = (config as { systemPrompts?: Partial<Record<PromptKey, string>> }).systemPrompts ?? {};
-  const [activePrompt, setActivePrompt] = useState<PromptKey>('chat');
-  const promptValue = activePrompt === 'chat'
-    ? (configPrompts.chat?.trim() ? configPrompts.chat : configPrompt)
-    : (configPrompts[activePrompt] ?? '');
-  const [draft, setDraft] = useState(promptValue);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isFocusedRef = useRef(false);
-
-  useEffect(() => {
-    if (!isFocusedRef.current) setDraft(promptValue);
-  }, [promptValue]);
-
-  const flushToConfig = useCallback((value: string) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-    if (activePrompt === 'chat') {
-      void updateConfig('systemPrompt', value);
-      void updateConfig('systemPrompts.chat', value);
-    } else {
-      void updateConfig(`systemPrompts.${activePrompt}`, value);
-    }
-  }, [activePrompt, updateConfig]);
-
-  const handleChange = (value: string) => {
-    setDraft(value);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => flushToConfig(value), 800);
-  };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div>
-        <h3 className="text-sm font-semibold">System Prompts</h3>
+        <h3 className="text-sm font-semibold">Tools</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Plan, implement, and computer-use prompts inherit the chat prompt when left blank.
+          Manage built-in tools, CLI integrations, MCP servers, and skills.
         </p>
       </div>
-      <div className="flex flex-wrap gap-1 rounded-xl border border-border/70 bg-card/60 p-1">
-        {promptTabs.map((tab) => (
+
+      {/* Tab Bar */}
+      <div className="flex gap-1 border-b border-border/60">
+        {tabs.map((tab) => (
           <button
             key={tab.key}
             type="button"
-            onClick={() => {
-              if (timerRef.current) flushToConfig(draft);
-              isFocusedRef.current = false;
-              setActivePrompt(tab.key);
-            }}
-            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-              activePrompt === tab.key
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+            onClick={() => setActiveTab(tab.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
+              activeTab === tab.key
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
             }`}
           >
             {tab.label}
           </button>
         ))}
       </div>
-      <EditableTextarea
-        className="h-[300px] w-full overflow-y-auto rounded-lg border bg-card p-3 text-xs font-mono outline-none focus:ring-1 focus:ring-ring"
-        value={draft}
-        onFocus={() => { isFocusedRef.current = true; }}
-        onBlur={() => { isFocusedRef.current = false; }}
-        onChange={(value) => handleChange(value)}
-        placeholder={activePrompt === 'chat'
-          ? `Enter the system prompt for ${__BRAND_PRODUCT_NAME}...`
-          : 'Leave blank to inherit the chat prompt.'}
-      />
+
+      {/* Content */}
+      {activeTab === 'built-in' && <ToolSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'cli' && <CliToolsSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'skills' && <SkillSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'mcp' && <McpSettings config={config} updateConfig={updateConfig} hideTitle />}
     </div>
   );
 };
-
-

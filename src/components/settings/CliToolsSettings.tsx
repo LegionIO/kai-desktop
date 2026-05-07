@@ -22,7 +22,7 @@ type CliTool = {
   builtIn?: boolean;
 };
 
-export const CliToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const tools = ((config as { cliTools?: CliTool[] }).cliTools ?? []) as CliTool[];
   const [showAdd, setShowAdd] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
@@ -65,12 +65,14 @@ export const CliToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold">CLI Tools</h3>
-        <span className="text-[10px] text-muted-foreground">
-          {availableCount} active / {totalCount} configured
-        </span>
-      </div>
+      {!hideTitle && (
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold">CLI Tools</h3>
+          <span className="text-[10px] text-muted-foreground">
+            {availableCount} active / {totalCount} configured
+          </span>
+        </div>
+      )}
       <p className="text-xs text-muted-foreground">
         CLI tools give the AI access to command-line programs. Tools are only available if their binary is found on the system.
       </p>

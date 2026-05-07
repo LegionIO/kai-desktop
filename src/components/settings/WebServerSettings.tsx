@@ -33,21 +33,23 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Web UI</h3>
-      <p className="text-xs text-muted-foreground">
-        Serve the same chat interface over HTTP/HTTPS so you can access it from any browser on your network.
-      </p>
+      <div>
+        <h3 className="text-sm font-semibold">Web UI</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Serve the same chat interface over HTTP/HTTPS so you can access it from any browser on your network.
+        </p>
+      </div>
 
-      <Toggle
-        label="Enable Web UI server"
-        checked={ws.enabled}
-        onChange={(v) => updateConfig('webServer.enabled', v)}
-      />
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Server</legend>
+        <Toggle
+          label="Enable Web UI server"
+          checked={ws.enabled}
+          onChange={(v) => updateConfig('webServer.enabled', v)}
+        />
 
-      {ws.enabled && (
-        <>
-          <fieldset className="rounded-lg border p-3 space-y-3">
-            <legend className="text-xs font-semibold px-1">Server</legend>
+        {ws.enabled && (
+          <>
             <NumberField
               label="Port"
               value={ws.port}
@@ -70,8 +72,12 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
                 {protocol}://{['0.0.0.0', '::', ''].includes(ws.bindAddress) ? 'localhost' : ws.bindAddress}:{ws.port}
               </span>
             </p>
-          </fieldset>
+          </>
+        )}
+      </fieldset>
 
+      {ws.enabled && (
+        <>
           <fieldset className="rounded-lg border p-3 space-y-3">
             <legend className="text-xs font-semibold px-1">TLS / HTTPS</legend>
             <Toggle

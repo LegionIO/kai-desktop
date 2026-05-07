@@ -188,44 +188,47 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         </div>
       )}
 
-      {/* ── Enable / Disable ── */}
-      <Toggle
-        label="Enable realtime audio"
-        checked={enabled}
-        onChange={(v) => updateConfig('realtime.enabled', v)}
-      />
+      {/* ── Enable / Provider ── */}
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Provider</legend>
 
-      {/* ── Provider Selector ── */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Provider</label>
-        <select
-          className={settingsSelectClass}
-          value={provider}
-          onChange={(e) => updateConfig('realtime.provider', e.target.value)}
-        >
-          <option value="openai">OpenAI</option>
-          <option value="azure">Azure OpenAI</option>
-          <option value="custom">Custom</option>
-        </select>
-      </div>
+        <Toggle
+          label="Enable realtime audio"
+          checked={enabled}
+          onChange={(v) => updateConfig('realtime.enabled', v)}
+        />
+
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Provider</label>
+          <select
+            className={settingsSelectClass}
+            value={provider}
+            onChange={(e) => updateConfig('realtime.provider', e.target.value)}
+          >
+            <option value="openai">OpenAI</option>
+            <option value="azure">Azure OpenAI</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+      </fieldset>
 
       {/* ── OpenAI Configuration ── */}
       {provider === 'openai' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">OpenAI Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">OpenAI Configuration</legend>
           <PasswordField
             label="API Key"
             value={realtime?.openai?.apiKey ?? ''}
             onChange={(v) => updateConfig('realtime.openai.apiKey', v)}
             placeholder="sk-..."
           />
-        </div>
+        </fieldset>
       )}
 
       {/* ── Azure Configuration ── */}
       {provider === 'azure' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Azure OpenAI Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Azure OpenAI Configuration</legend>
 
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Endpoint</label>
@@ -269,13 +272,13 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
               placeholder="2024-10-01-preview"
             />
           </div>
-        </div>
+        </fieldset>
       )}
 
       {/* ── Custom Configuration ── */}
       {provider === 'custom' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Custom Provider Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Custom Provider Configuration</legend>
 
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Base URL</label>
@@ -294,14 +297,14 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             onChange={(v) => updateConfig('realtime.custom.apiKey', v)}
             placeholder="Enter your API key"
           />
-        </div>
+        </fieldset>
       )}
 
-      {/* ── Model ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Model</h4>
+      {/* ── Model & Voice ── */}
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Model & Voice</legend>
         <div>
-          <label className="text-[10px] text-muted-foreground block mb-0.5">Model name</label>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Model</label>
           <input
             type="text"
             className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
@@ -310,11 +313,6 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             placeholder="gpt-4o-realtime-preview"
           />
         </div>
-      </div>
-
-      {/* ── Voice ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Voice</h4>
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Voice</label>
           <select
@@ -332,35 +330,20 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             <option value="verse">Verse</option>
           </select>
         </div>
-      </div>
+      </fieldset>
 
       {/* ── Test Connection ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Connection</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Connection</legend>
         <p className="text-[10px] text-muted-foreground/60">
           Test that your configuration can connect to the realtime API endpoint.
         </p>
         <TestConnectionButton />
-      </div>
-
-      {/* ── System Instructions ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">System Instructions</h4>
-        <div>
-          <label className="text-[10px] text-muted-foreground block mb-0.5">Custom instructions for the realtime session</label>
-          <textarea
-            className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none min-h-[80px] resize-y"
-            value={realtime?.instructions ?? ''}
-            onChange={(e) => updateConfig('realtime.instructions', e.target.value)}
-            placeholder="You are a helpful assistant. Respond concisely and naturally in conversation."
-            rows={4}
-          />
-        </div>
-      </div>
+      </fieldset>
 
       {/* ── Memory Context ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Memory Context</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Memory Context</legend>
         <p className="text-[10px] text-muted-foreground/60">
           Include chat memory in the call context so the AI has awareness of prior messages,
           user preferences, and relevant history. Uses part of the 32k context budget.
@@ -383,8 +366,8 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
               onChange={(v) => updateConfig('realtime.memoryContext.maxTokens', v)}
             />
 
-            <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-              <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Memory Types</h4>
+            <fieldset className="rounded-lg border p-3 space-y-3">
+              <legend className="text-[10px] font-semibold px-1">Memory Types</legend>
 
               <Toggle
                 label="Recent chat history"
@@ -434,14 +417,14 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
                 checked={memoryCtx?.observationalMemory?.enabled ?? true}
                 onChange={(v) => updateConfig('realtime.memoryContext.observationalMemory.enabled', v)}
               />
-            </div>
+            </fieldset>
           </div>
         )}
-      </div>
+      </fieldset>
 
       {/* ── Turn Detection ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Turn Detection</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Turn Detection</legend>
 
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Type</label>
@@ -476,22 +459,22 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             />
           </div>
         )}
-      </div>
+      </fieldset>
 
       {/* ── Input Audio Transcription ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Transcription</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Transcription</legend>
 
         <Toggle
           label="Enable input audio transcription"
           checked={realtime?.inputAudioTranscription ?? false}
           onChange={(v) => updateConfig('realtime.inputAudioTranscription', v)}
         />
-      </div>
+      </fieldset>
 
       {/* ── Auto-End Call ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Auto-End Call</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Auto-End Call</legend>
 
         <Toggle
           label="Automatically end call on silence"
@@ -520,7 +503,7 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             </div>
           </div>
         )}
-      </div>
+      </fieldset>
 
       {/* Computer Use Updates */}
       <fieldset className="rounded-lg border p-3 space-y-3">

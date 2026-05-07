@@ -1,5 +1,5 @@
 import type { FC } from 'react';
-import { settingsSelectClass, type SettingsProps } from './shared';
+import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
 export const AppearanceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const ui = config.ui as { theme: string; sidebarWidth: number; fullWidthContent?: boolean };
@@ -22,13 +22,11 @@ export const AppearanceSettings: FC<SettingsProps> = ({ config, updateConfig }) 
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Layout</legend>
-        <div className="flex items-start justify-between gap-3 rounded-md border p-3">
-          <div>
-            <span className="text-xs font-medium">Full width content</span>
-            <p className="mt-0.5 text-[10px] text-muted-foreground">Remove max-width constraints so content uses the full panel width.</p>
-          </div>
-          <input type="checkbox" checked={!!ui.fullWidthContent} onChange={(e) => updateConfig('ui.fullWidthContent', e.target.checked)} className="mt-0.5 h-4 w-4 rounded" />
-        </div>
+        <Toggle
+          label="Full width content"
+          checked={!!ui.fullWidthContent}
+          onChange={(v) => updateConfig('ui.fullWidthContent', v)}
+        />
       </fieldset>
     </div>
   );

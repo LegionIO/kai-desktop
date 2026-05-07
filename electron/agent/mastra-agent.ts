@@ -1385,12 +1385,14 @@ export async function* streamWithFallback(
   yield { conversationId, type: 'done' };
 }
 
+const DEFAULT_PLAN_PROMPT = 'You are a thorough planning assistant. Explore the codebase, understand the architecture, and create detailed implementation plans. Use only read-only tools to investigate. Ask the user to clarify requirements or preferences you cannot resolve from code alone. When your plan is ready, call exit_plan_mode with the full plan as markdown.';
+
 function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): string {
   const prompts = config.systemPrompts;
   const chatPrompt = prompts?.chat?.trim() || config.systemPrompt;
 
   if (executionMode === 'plan-first') {
-    return prompts?.plan?.trim() || chatPrompt;
+    return prompts?.plan?.trim() || DEFAULT_PLAN_PROMPT;
   }
 
   return chatPrompt;

@@ -3,7 +3,7 @@ import { PlusIcon, XIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { Toggle, NumberField, SliderField, headTailLabel, settingsSelectClass, type SettingsProps } from './shared';
 
-export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const tools = config.tools as {
     shell: { enabled: boolean; timeout: number; allowPatterns: string[]; denyPatterns: string[] };
     fileAccess: { enabled: boolean; allowPaths: string[]; denyPaths: string[] };
@@ -31,7 +31,7 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Tools</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">Tools</h3>}
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Shell Tool</legend>
@@ -154,24 +154,24 @@ const PatternList: FC<{ label: string; patterns: string[]; onChange: (patterns: 
       <div className="space-y-1">
         {patterns.map((p, i) => (
           <div key={`${p}-${i}`} className="flex items-center gap-1">
-            <span className="text-xs font-mono bg-muted rounded px-2 py-0.5 flex-1">{p}</span>
-            <button type="button" onClick={() => removePattern(i)} className="p-0.5 rounded hover:bg-destructive/10">
+            <span className="text-xs font-mono rounded-xl border border-border/70 bg-card/80 px-3 py-1 flex-1">{p}</span>
+            <button type="button" onClick={() => removePattern(i)} className="p-1 rounded hover:bg-destructive/10">
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           </div>
         ))}
-      </div>
-      <div className="flex items-center gap-1 mt-1">
-        <EditableInput
-          className="flex-1 rounded border bg-card px-2 py-1 text-xs font-mono"
-          value={newPattern}
-          onChange={setNewPattern}
-          onSubmit={addPattern}
-          placeholder="Add pattern..."
-        />
-        <button type="button" onClick={addPattern} className="p-1 rounded hover:bg-muted">
-          <PlusIcon className="h-3 w-3" />
-        </button>
+        <div className="flex items-center gap-1">
+          <EditableInput
+            className="flex-1 rounded-xl border border-border/70 bg-card/80 px-3 py-1 text-xs font-mono"
+            value={newPattern}
+            onChange={setNewPattern}
+            onSubmit={addPattern}
+            placeholder="Add pattern..."
+          />
+          <button type="button" onClick={addPattern} className="p-1 rounded hover:bg-muted">
+            <PlusIcon className="h-3 w-3" />
+          </button>
+        </div>
       </div>
     </div>
   );

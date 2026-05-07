@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
-import { ChevronDownIcon, ChevronRightIcon, XIcon } from 'lucide-react';
-import { NumberField, Toggle, settingsSelectClass, type SettingsProps } from './shared';
+import { XIcon } from 'lucide-react';
+import { NumberField, Toggle, CollapsibleSection, settingsSelectClass, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
 type ComputerUseConfig = {
@@ -406,21 +406,6 @@ const DisplayListPicker: FC<{
   );
 };
 
-const CollapsibleSection: FC<{ title: string; defaultOpen?: boolean; children: React.ReactNode }> = ({ title, defaultOpen = false, children }) => {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <fieldset className="rounded-lg border p-3 space-y-3">
-      <legend className="text-xs font-semibold px-1">
-        <button type="button" onClick={() => setOpen(!open)} className="inline-flex items-center gap-1 transition-colors hover:text-foreground">
-          {open ? <ChevronDownIcon className="h-3 w-3" /> : <ChevronRightIcon className="h-3 w-3" />}
-          {title}
-        </button>
-      </legend>
-      {open && children}
-    </fieldset>
-  );
-};
-
 export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const computerUse = config.computerUse as ComputerUseConfig;
   const models = config.models as { catalog: Array<{ key: string; displayName: string }> };
@@ -437,7 +422,12 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Autopilot</h3>
+      <div>
+        <h3 className="text-sm font-semibold">Autopilot</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Configure AI-driven computer use, safety limits, and screen capture behavior.
+        </p>
+      </div>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">General</legend>

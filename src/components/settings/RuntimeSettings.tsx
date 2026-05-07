@@ -76,64 +76,67 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       )}
 
       {/* Runtime selector */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-1">Runtime</label>
-        <select
-          className={settingsSelectClass}
-          value={selectedRuntime}
-          onChange={(e) => void updateConfig('agent.runtime', e.target.value)}
-        >
-          <option value="auto">Auto (prefer external runtime if available)</option>
-          <option value="claude-agent-sdk">Claude Code</option>
-          <option value="codex-sdk">Codex</option>
-          <option value="mastra">Mastra</option>
-        </select>
-      </div>
-
-      {/* Active runtime indicator */}
-      {!loading && (
-        <div className="rounded-xl border border-border/60 bg-card/60 px-3 py-2">
-          <span className="text-[10px] text-muted-foreground block mb-1">Active Runtime</span>
-          <span className="text-xs font-medium">
-            {runtimes.find((r) => r.id === activeRuntime)?.name ?? activeRuntime}
-          </span>
-        </div>
-      )}
-
-      {/* Availability table */}
-      {!loading && sortedRuntimes.length > 0 && (
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Runtime</legend>
         <div>
-          <span className="text-[10px] text-muted-foreground block mb-2">Runtimes</span>
-          <div className="space-y-1.5">
-            {sortedRuntimes.map((rt) => (
-              <div
-                key={rt.id}
-                className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/60 px-3 py-2"
-              >
-                <span
-                  className={`h-2 w-2 rounded-full ${
-                    rt.available ? 'bg-green-500' : 'bg-yellow-500'
-                  }`}
-                />
-                <span className="text-xs font-medium flex-1">{rt.name}</span>
-                <span className="text-[10px] text-muted-foreground">
-                  {rt.available
-                    ? 'Available'
-                    : rt.reason
-                      ? `Inactive — ${rt.reason}`
-                      : 'Inactive'}
-                </span>
-              </div>
-            ))}
-          </div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Agent runtime</label>
+          <select
+            className={settingsSelectClass}
+            value={selectedRuntime}
+            onChange={(e) => void updateConfig('agent.runtime', e.target.value)}
+          >
+            <option value="auto">Auto (prefer external runtime if available)</option>
+            <option value="claude-agent-sdk">Claude Code</option>
+            <option value="codex-sdk">Codex</option>
+            <option value="mastra">Mastra</option>
+          </select>
         </div>
-      )}
 
-      {/* Runtime descriptions */}
-      {selectedRuntime !== 'auto' && RUNTIME_DESCRIPTIONS[selectedRuntime] && (
-        <p className="text-xs text-muted-foreground/80 italic">
-          {RUNTIME_DESCRIPTIONS[selectedRuntime]}
-        </p>
+        {/* Runtime descriptions */}
+        {selectedRuntime !== 'auto' && RUNTIME_DESCRIPTIONS[selectedRuntime] && (
+          <p className="text-[10px] text-muted-foreground/80 italic">
+            {RUNTIME_DESCRIPTIONS[selectedRuntime]}
+          </p>
+        )}
+      </fieldset>
+
+      {/* Availability */}
+      {!loading && (
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Availability</legend>
+
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-muted-foreground">Active:</span>
+            <span className="text-xs font-medium">
+              {runtimes.find((r) => r.id === activeRuntime)?.name ?? activeRuntime}
+            </span>
+          </div>
+
+          {sortedRuntimes.length > 0 && (
+            <div className="space-y-1.5">
+              {sortedRuntimes.map((rt) => (
+                <div
+                  key={rt.id}
+                  className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/60 px-3 py-2"
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      rt.available ? 'bg-green-500' : 'bg-yellow-500'
+                    }`}
+                  />
+                  <span className="text-xs font-medium flex-1">{rt.name}</span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {rt.available
+                      ? 'Available'
+                      : rt.reason
+                        ? `Inactive — ${rt.reason}`
+                        : 'Inactive'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </fieldset>
       )}
     </div>
   );
