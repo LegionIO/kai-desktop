@@ -17,8 +17,8 @@ import { SortableTaskCard } from './SortableTaskCard';
 /** Status-specific text colors for the floating label. */
 const KAI_TASK_STATUS_LABEL_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'text-sky-500',
-  in_progress: 'text-rose-500',
-  ai_review: 'text-amber-500',
+  in_progress: 'text-amber-500',
+  ai_review: 'text-rose-500',
   human_review: 'text-purple-400',
   done: 'text-emerald-500',
 };
