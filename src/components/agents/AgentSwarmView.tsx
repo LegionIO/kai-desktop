@@ -18,6 +18,7 @@ import {
   LinkIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import { AgentStatusBadge } from './AgentStatusBadge';
@@ -41,6 +42,7 @@ const ROLE_LABELS: Record<AgentRole, string> = {
 export const AgentSwarmView: FC = () => {
   const { state, startAgent, stopAgent, fireAgent } = useAgents();
   const { state: taskState } = useTasks();
+  const fullWidth = useFullWidthContent();
   const { agents } = state;
 
   const [hireDialogOpen, setHireDialogOpen] = useState(false);
@@ -56,7 +58,8 @@ export const AgentSwarmView: FC = () => {
       {/* Top gradient fade */}
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
 
-      <div className="relative z-10 min-h-0 flex-1 overflow-y-auto px-6 pb-6 pt-16 md:px-8 md:pt-20">
+      <div className="relative z-10 min-h-0 flex-1 overflow-y-auto pt-16 md:pt-20">
+        <div className={cn('mx-auto w-full px-4 pb-6', !fullWidth && 'max-w-3xl')}>
         {/* Header */}
         <div className="mb-6 flex items-center justify-between">
           <div>
@@ -98,6 +101,7 @@ export const AgentSwarmView: FC = () => {
             ))}
           </div>
         )}
+        </div>
       </div>
 
       <HireAgentDialog open={hireDialogOpen} onOpenChange={setHireDialogOpen} />

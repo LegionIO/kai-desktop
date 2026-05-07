@@ -127,6 +127,7 @@ const appAPI = {
       description: string;
       state: string;
       brandRequired: boolean;
+      icon?: { lucide: string } | { svg: string };
       error?: string;
     }>>,
     getConfig: (pluginName: string) => ipcRenderer.invoke('plugin:get-config', pluginName) as Promise<Record<string, unknown>>,

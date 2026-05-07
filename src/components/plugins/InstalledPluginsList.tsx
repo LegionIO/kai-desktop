@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PuzzleIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon, PlusIcon } from 'lucide-react';
+import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon, PlusIcon } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
@@ -17,6 +17,7 @@ type PluginListEntry = {
   description: string;
   state: string;
   brandRequired: boolean;
+  icon?: { lucide: string } | { svg: string };
   error?: string;
 };
 
@@ -183,7 +184,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
             'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center',
             isActive ? 'text-primary' : 'text-muted-foreground',
           )}>
-            {navItem ? getPluginNavigationIcon(navItem.icon) : <PuzzleIcon className="h-4 w-4" />}
+            {getPluginNavigationIcon(plugin.icon ?? navItem?.icon)}
           </span>
 
           {/* Text content */}
@@ -298,7 +299,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
         {!hasLoaded ? null : filteredPlugins.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
-              <PuzzleIcon size={24} strokeWidth={1.3} />
+              <PackageIcon size={24} strokeWidth={1.3} />
             </div>
             <h3 className="mb-1 text-sm font-medium text-foreground/80">
               {isSearchActive ? 'No plugins match your search' : 'No plugins installed'}

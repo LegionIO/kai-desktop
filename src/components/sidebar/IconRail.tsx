@@ -3,7 +3,7 @@ import {
   MessageSquareIcon,
   CheckSquareIcon,
   BotIcon,
-  PuzzleIcon,
+  PackageIcon,
   SettingsIcon,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -29,7 +29,7 @@ const SCOPED_TABS: readonly TabDef[] = [
 const GLOBAL_TABS: readonly TabDef[] = [
   // { id: 'messages', icon: InboxIcon, label: 'Messages' },  // TODO: re-enable later
   { id: 'agents', icon: BotIcon, label: 'Agents' },
-  { id: 'plugins', icon: PuzzleIcon, label: 'Plugins' },
+  { id: 'plugins', icon: PackageIcon, label: 'Plugins' },
 ];
 
 // ── IconRailButton ───────────────────────────────────────────────────────

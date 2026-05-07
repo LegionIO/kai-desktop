@@ -1766,16 +1766,6 @@ function AppShell() {
                   </span>
                 ) : null}
               </div>
-              {activePluginPanel && pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName) && (
-                <button
-                  type="button"
-                  onClick={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
-                  className="titlebar-no-drag flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors"
-                >
-                  <Settings2Icon className="h-3.5 w-3.5" />
-                  Settings
-                </button>
-              )}
               <WorkspaceSelector
                 workspaces={workspaces}
                 activeWorkspaceId={activeWorkspaceId}
@@ -1787,24 +1777,24 @@ function AppShell() {
             <div className="min-h-0 flex-1 flex flex-col">
               {activeView === MARKETPLACE_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
+                  <div className="flex-1 overflow-y-auto">
+                    <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
                       <PluginMarketplace />
                     </div>
                   </div>
                 </div>
               ) : activeView === PLUGINS_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
+                  <div className="flex-1 overflow-y-auto">
+                    <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
                       <InstalledPluginsView onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)} />
                     </div>
                   </div>
                 </div>
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <div className="flex-1 overflow-y-auto px-6 py-6">
-                    <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
+                  <div className="flex-1 overflow-y-auto">
+                    <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
                       <BrokenPluginView
                         pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
                         onUninstalled={() => setActiveView(PLUGINS_VIEW)}
@@ -1814,7 +1804,16 @@ function AppShell() {
                 </div>
               ) : activePluginPanel ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <PluginPanelHost panel={activePluginPanel} onClose={() => setActiveView(CHAT_VIEW)} />
+                  <PluginPanelHost
+                    panel={activePluginPanel}
+                    onClose={() => setActiveView(CHAT_VIEW)}
+                    displayName={pluginDisplayName(activePluginPanel.pluginName)}
+                    onOpenSettings={
+                      pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName)
+                        ? () => setPluginSettingsOpen(activePluginPanel.pluginName)
+                        : undefined
+                    }
+                  />
                 </div>
               ) : activeView === TASKS_VIEW ? (
                 isCreatingTask ? (

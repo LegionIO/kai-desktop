@@ -69,6 +69,7 @@ type PluginListEntry = {
   description: string;
   state: string;
   brandRequired: boolean;
+  icon?: { lucide: string } | { svg: string };
   error?: string;
 };
 
@@ -525,6 +526,7 @@ export class PluginManager {
       description: instance.manifest.description,
       state: instance.state,
       brandRequired: this.brandRequiredPluginNamesSet.has(instance.manifest.name),
+      icon: instance.manifest.icon,
       error: instance.error,
     }));
   }
