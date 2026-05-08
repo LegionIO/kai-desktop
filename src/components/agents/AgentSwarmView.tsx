@@ -5,7 +5,7 @@
  * Matches the visual density and style of the TaskQueue / Plugin Marketplace.
  */
 
-import { type FC, useState } from 'react';
+import { type FC, useState, useCallback } from 'react';
 import {
   BotIcon,
   PlusIcon,
@@ -16,6 +16,8 @@ import {
   ZapIcon,
   Trash2Icon,
   LinkIcon,
+  UnlinkIcon,
+  TrashIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
@@ -40,10 +42,10 @@ const ROLE_LABELS: Record<AgentRole, string> = {
 };
 
 export const AgentSwarmView: FC = () => {
-  const { state, startAgent, stopAgent, fireAgent } = useAgents();
+  const { state, selectAgent, startAgent, stopAgent, fireAgent } = useAgents();
   const { state: taskState } = useTasks();
   const fullWidth = useFullWidthContent();
-  const { agents } = state;
+  const { agents, selectedAgentId } = state;
 
   const [hireDialogOpen, setHireDialogOpen] = useState(false);
   const [expandedAgentId, setExpandedAgentId] = useState<string | null>(null);
@@ -52,6 +54,12 @@ export const AgentSwarmView: FC = () => {
     agent.currentTaskId
       ? taskState.tasks.find((t) => t.id === agent.currentTaskId) ?? null
       : null;
+
+  // Detail view when an agent is selected
+  const selectedAgent = selectedAgentId ? agents.find((a) => a.id === selectedAgentId) : null;
+  if (selectedAgent) {
+    return <AgentDetailPanel agent={selectedAgent} />;
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -94,6 +102,7 @@ export const AgentSwarmView: FC = () => {
                 onToggleExpand={() =>
                   setExpandedAgentId(expandedAgentId === agent.id ? null : agent.id)
                 }
+                onSelect={() => selectAgent(agent.id)}
                 onStart={() => void startAgent(agent.id)}
                 onStop={() => void stopAgent(agent.id)}
                 onFire={() => void fireAgent(agent.id)}
@@ -116,6 +125,7 @@ interface SwarmCardProps {
   task: { id: string; title: string; status: string } | null;
   isExpanded: boolean;
   onToggleExpand: () => void;
+  onSelect: () => void;
   onStart: () => void;
   onStop: () => void;
   onFire: () => void;
@@ -126,6 +136,7 @@ const SwarmCard: FC<SwarmCardProps> = ({
   task,
   isExpanded,
   onToggleExpand,
+  onSelect,
   onStart,
   onStop,
   onFire,
@@ -144,7 +155,7 @@ const SwarmCard: FC<SwarmCardProps> = ({
       )}
     >
       {/* Card Header */}
-      <div className="flex items-start gap-3 p-4 pb-3">
+      <div className="flex items-start gap-3 p-4 pb-3 cursor-pointer" onClick={onSelect}>
         {/* Avatar */}
         <div
           className={cn(
@@ -282,6 +293,209 @@ const SwarmCard: FC<SwarmCardProps> = ({
           <TaskTerminal sessionId={agent.terminalSessionId} />
         </div>
       )}
+    </div>
+  );
+};
+
+// ── Agent Detail Panel (full-width, shown when an agent is selected) ────
+
+const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
+  const { startAgent, stopAgent, fireAgent, unassignTask, selectAgent } = useAgents();
+  const fullWidth = useFullWidthContent();
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [confirmFire, setConfirmFire] = useState(false);
+
+  const runtime = RUNTIME_META[agent.runtime];
+  const RuntimeIcon = runtime.icon;
+
+  const handleStart = useCallback(async () => {
+    setIsStarting(true);
+    try {
+      const result = await startAgent(agent.id);
+      if (result.error) {
+        console.warn('[AgentDetail] Start failed:', result.error);
+      }
+    } finally {
+      setIsStarting(false);
+    }
+  }, [agent.id, startAgent]);
+
+  const handleStop = useCallback(async () => {
+    setIsStopping(true);
+    try {
+      await stopAgent(agent.id);
+    } finally {
+      setIsStopping(false);
+    }
+  }, [agent.id, stopAgent]);
+
+  const handleFire = useCallback(async () => {
+    await fireAgent(agent.id);
+    selectAgent(null);
+  }, [agent.id, fireAgent, selectAgent]);
+
+  const handleUnassign = useCallback(async () => {
+    await unassignTask(agent.id);
+  }, [agent.id, unassignTask]);
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Top gradient fade */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent md:h-20" />
+
+      <div className="relative z-10 min-h-0 flex-1 overflow-y-auto pt-16 md:pt-20">
+        <div className={cn('mx-auto w-full px-4 pb-6', !fullWidth && 'max-w-3xl')}>
+          {/* Agent Header */}
+          <div className="mb-6 flex items-start gap-4">
+            <div
+              className={cn(
+                'flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl text-2xl',
+                agent.status === 'running' ? 'bg-emerald-500/10' : 'bg-muted/50',
+              )}
+            >
+              {agent.icon ?? '🤖'}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-xl font-semibold text-foreground">{agent.name}</h1>
+                <AgentStatusBadge status={agent.status} />
+              </div>
+              <div className="mt-1 flex items-center gap-3 text-sm text-muted-foreground">
+                <span className="capitalize">{ROLE_LABELS[agent.role]}</span>
+                <span className="text-border">·</span>
+                <span className={cn('flex items-center gap-1', runtime.color)}>
+                  <RuntimeIcon size={13} />
+                  {runtime.label}
+                </span>
+              </div>
+              {agent.description && (
+                <p className="mt-2 text-sm text-muted-foreground/80">{agent.description}</p>
+              )}
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="mb-6 flex items-center gap-6 text-sm text-muted-foreground">
+            <span>{agent.stats.tasksCompleted} tasks completed</span>
+            {agent.stats.lastRunAt && (
+              <span>Last run: {new Date(agent.stats.lastRunAt).toLocaleDateString()}</span>
+            )}
+            {agent.stats.crashCount > 0 && (
+              <span className="text-red-400">{agent.stats.crashCount} crashes</span>
+            )}
+          </div>
+
+          {/* Task Assignment */}
+          <div className="mb-6 rounded-xl border border-border/60 bg-card p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-foreground">Current Task</span>
+              {agent.currentTaskId && agent.status !== 'running' && (
+                <button
+                  type="button"
+                  onClick={() => void handleUnassign()}
+                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/50 hover:text-foreground transition-colors"
+                >
+                  <UnlinkIcon size={11} />
+                  Unassign
+                </button>
+              )}
+            </div>
+            {agent.currentTaskId ? (
+              <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2 text-sm">
+                <LinkIcon size={12} className="text-muted-foreground shrink-0" />
+                <span className="truncate text-foreground/80">Task assigned</span>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground/60 italic">
+                No task assigned. Assign a task from the task queue.
+              </p>
+            )}
+          </div>
+
+          {/* Controls */}
+          <div className="mb-6 rounded-xl border border-border/60 bg-card p-4">
+            <span className="text-sm font-medium text-foreground block mb-3">Controls</span>
+            <div className="flex gap-2">
+              {agent.status === 'running' ? (
+                <button
+                  type="button"
+                  onClick={() => void handleStop()}
+                  disabled={isStopping}
+                  className="flex items-center gap-1.5 rounded-lg bg-red-500/10 px-3.5 py-2 text-sm font-medium text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                >
+                  <SquareIcon size={13} />
+                  {isStopping ? 'Stopping...' : 'Stop'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void handleStart()}
+                  disabled={isStarting || !agent.currentTaskId}
+                  className="flex items-center gap-1.5 rounded-lg bg-emerald-500/10 px-3.5 py-2 text-sm font-medium text-emerald-600 dark:text-emerald-400 transition-colors hover:bg-emerald-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <PlayIcon size={13} />
+                  {isStarting ? 'Starting...' : 'Start'}
+                </button>
+              )}
+            </div>
+            {!agent.currentTaskId && agent.status !== 'running' && (
+              <p className="mt-2 text-xs text-muted-foreground/60">
+                Assign a task before starting the agent.
+              </p>
+            )}
+          </div>
+
+          {/* Terminal (when running) */}
+          {agent.status === 'running' && agent.terminalSessionId && (
+            <div className="mb-6 rounded-xl border border-border/60 bg-card overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-border/40">
+                <span className="text-sm font-medium text-foreground flex items-center gap-2">
+                  <TerminalIcon size={13} />
+                  Terminal
+                </span>
+              </div>
+              <div className="p-2">
+                <TaskTerminal sessionId={agent.terminalSessionId} />
+              </div>
+            </div>
+          )}
+
+          {/* Danger Zone */}
+          <div className="rounded-xl border border-red-500/20 bg-card p-4">
+            <span className="text-sm font-medium text-foreground block mb-3">Danger Zone</span>
+            {confirmFire ? (
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-red-500">Are you sure you want to fire this agent?</span>
+                <button
+                  type="button"
+                  onClick={() => void handleFire()}
+                  className="rounded-lg bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-500/20 transition-colors"
+                >
+                  Yes, fire
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmFire(false)}
+                  className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmFire(true)}
+                disabled={agent.status === 'running'}
+                className="flex items-center gap-1.5 text-sm text-muted-foreground/60 hover:text-red-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <TrashIcon size={13} />
+                Fire agent
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 };

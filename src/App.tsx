@@ -46,7 +46,7 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
-import { AgentProvider } from '@/providers/AgentProvider';
+import { AgentProvider, useAgents } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
 import { TaskQueue } from '@/components/tasks/TaskQueue';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
@@ -458,6 +458,7 @@ function AppShell() {
   const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
   const [taskTitleMenuOpen, setTaskTitleMenuOpen] = useState(false);
+  const [agentTitleMenuOpen, setAgentTitleMenuOpen] = useState(false);
   const [renamingTask, setRenamingTask] = useState(false);
   const [taskRenameValue, setTaskRenameValue] = useState('');
   const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
@@ -1000,6 +1001,7 @@ function AppShell() {
 
   // Handle "View Task" links from chat — navigate to task queue and open the task modal
   const tasksCtx = useTasksOptional();
+  const agentsCtx = useAgents();
 
   // Clear selected task when switching workspaces so we don't show a stale detail panel
   useEffect(() => {
@@ -1535,7 +1537,7 @@ function AppShell() {
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <UpdateCard />
             {/* Interactive title bar */}
-            <div className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+            <div className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
               <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
@@ -1553,9 +1555,54 @@ function AppShell() {
                 ) : activeView === MARKETPLACE_VIEW ? (
                   <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
                 ) : activeView === PLUGINS_VIEW ? (
-                  <span className="text-sm font-medium text-foreground">Installed Plugins</span>
+                  <span className="text-sm font-medium text-foreground">Plugin Hub</span>
                 ) : activeView === AGENTS_VIEW ? (
-                  <span className="text-sm font-medium text-foreground">Agent Swarm</span>
+                  (() => {
+                    const selectedAgentId = agentsCtx.state.selectedAgentId;
+                    const selectedAgent = selectedAgentId
+                      ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
+                      : null;
+                    if (selectedAgent) {
+                      return (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => agentsCtx.selectAgent(null)}
+                            className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                          >
+                            Agent Swarm
+                          </button>
+                          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                          <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
+                            <DropdownMenu.Trigger asChild>
+                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                                <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                  {selectedAgent.name}
+                                </span>
+                                <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              </button>
+                            </DropdownMenu.Trigger>
+                            <DropdownMenu.Portal>
+                              <DropdownMenu.Content
+                                align="start"
+                                sideOffset={4}
+                                className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                              >
+                                <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                  onSelect={() => { agentsCtx.fireAgent(selectedAgent.id); agentsCtx.selectAgent(null); }}
+                                >
+                                  <Trash2Icon className="h-4 w-4" />
+                                  <span>Fire Agent</span>
+                                </DropdownMenu.Item>
+                              </DropdownMenu.Content>
+                            </DropdownMenu.Portal>
+                          </DropdownMenu.Root>
+                        </div>
+                      );
+                    }
+                    return <span className="text-sm font-medium text-foreground">Agent Swarm</span>;
+                  })()
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
                     if (isCreatingTask) {
@@ -1620,9 +1667,18 @@ function AppShell() {
                     return <span className="text-sm font-medium text-foreground">Task Queue</span>;
                   })()
                 ) : activeErrorPluginName ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setActiveView(PLUGINS_VIEW)}
+                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                    >
+                      Plugin Hub
+                    </button>
+                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
                         <span className="whitespace-nowrap text-sm font-medium text-foreground">
                           {pluginDisplayName(activeErrorPluginName)}
                         </span>
@@ -1662,10 +1718,20 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
+                  </div>
                 ) : activePluginPanel ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setActiveView(PLUGINS_VIEW)}
+                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                    >
+                      Plugin Hub
+                    </button>
+                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
                         <span className="whitespace-nowrap text-sm font-medium text-foreground">
                           {pluginDisplayName(activePluginPanel.pluginName)}
                         </span>
@@ -1705,10 +1771,20 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
+                  </div>
                 ) : activeConversationId && activeConversationTitle ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => { setActiveConversationId(null); setActiveConversationTitle(null); }}
+                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                    >
+                      Chat Threads
+                    </button>
+                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="-ml-2 flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
+                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
                         <span className="whitespace-nowrap text-sm font-medium text-foreground">
                           {activeConversationTitle}
                         </span>
@@ -1760,11 +1836,12 @@ function AppShell() {
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
+                  </div>
                 ) : activeConversationTitle ? (
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
-                ) : null}
+                ) : <span className="text-sm font-medium text-foreground">Chat Threads</span>}
               </div>
               <WorkspaceSelector
                 workspaces={workspaces}
