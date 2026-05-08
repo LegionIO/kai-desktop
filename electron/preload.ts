@@ -453,6 +453,11 @@ const appAPI = {
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
   },
 
+  partitions: {
+    list: () => ipcRenderer.invoke('partitions:list') as Promise<Array<{ name: string; sizeBytes: number }>>,
+    delete: (names: string[]) => ipcRenderer.invoke('partitions:delete', names) as Promise<{ success?: boolean; deleted?: string[]; error?: string }>,
+  },
+
   debug: {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
   },

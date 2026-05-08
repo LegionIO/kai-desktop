@@ -156,6 +156,10 @@ type AppAPI = {
   shell: {
     openPath: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
   };
+  partitions: {
+    list: () => Promise<Array<{ name: string; sizeBytes: number }>>;
+    delete: (names: string[]) => Promise<{ success?: boolean; deleted?: string[]; error?: string }>;
+  };
   plans: {
     readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
   };
