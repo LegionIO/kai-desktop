@@ -2,7 +2,7 @@ import type { FC } from 'react';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
 export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
-  const ui = config.ui as { theme: string; sidebarWidth: number; fullWidthContent?: boolean };
+  const ui = config.ui as { theme: string; sidebarWidth: number; fullWidthContent?: boolean; splashBackground?: string };
 
   return (
     <div className="space-y-6">
@@ -31,6 +31,17 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
             <option value="system">System</option>
             <option value="light">Light</option>
             <option value="dark">Dark</option>
+          </select>
+        </div>
+
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Splash background</label>
+          <select className={settingsSelectClass} value={ui.splashBackground ?? 'random'} onChange={(e) => updateConfig('ui.splashBackground', e.target.value)}>
+            <option value="random">Random</option>
+            <option value="matrix">Matrix</option>
+            <option value="constellations">Constellations</option>
+            <option value="hexagons">Hexagons</option>
+            <option value="smokescreen">Smokescreen</option>
           </select>
         </div>
 

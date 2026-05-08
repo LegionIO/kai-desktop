@@ -11,3 +11,11 @@ export const backgrounds: FC[] = [
   Hexagons,
   Smokescreen,
 ];
+
+/** Human-readable names for each background, in the same order as `backgrounds`. */
+export const backgroundNames: string[] = [
+  'Matrix',
+  'Constellations',
+  'Hexagons',
+  'Smokescreen',
+];

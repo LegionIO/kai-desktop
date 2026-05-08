@@ -4,7 +4,7 @@
  * Used by both the chat Thread (empty conversation) and TaskCreationView
  * (before the user submits their first prompt). Encapsulates:
  *
- * 1. Random background selection (never repeats consecutively)
+ * 1. Background selection based on user preference (or random if not set)
  * 2. Fade-in animation on mount (2 s ease-out)
  * 3. Fade-out when `visible` becomes false (300 ms)
  * 4. Full-bleed positioning that extends behind the title bar
@@ -12,11 +12,24 @@
  */
 
 import { useState, useEffect, useRef, type FC } from 'react';
-import { backgrounds } from '@/components/backgrounds';
+import { backgrounds, backgroundNames } from '@/components/backgrounds';
+import { useConfig } from '@/providers/ConfigProvider';
 
 // ── Background picker ────────────────────────────────────────────────
 
-function pickBackground(storageKey: string): FC {
+/** Map of lowercase background name → index in the backgrounds array. */
+const backgroundIndexMap: Record<string, number> = Object.fromEntries(
+  backgroundNames.map((name, i) => [name.toLowerCase(), i]),
+);
+
+function pickBackground(storageKey: string, preference?: string): FC {
+  // If the user chose a specific background, use it directly
+  if (preference && preference !== 'random') {
+    const idx = backgroundIndexMap[preference];
+    if (idx !== undefined) return backgrounds[idx];
+  }
+
+  // Random selection (never repeats consecutively)
   const lastIndex = parseInt(sessionStorage.getItem(storageKey) ?? '-1', 10);
   const available =
     backgrounds.length > 1 ? backgrounds.filter((_, i) => i !== lastIndex) : backgrounds;
@@ -120,7 +133,10 @@ export const SplashBackground: FC<SplashBackgroundProps> = ({
 // ── Internal: picks + renders the actual background ──────────────────
 
 const BackgroundImage: FC<{ storageKey: string }> = ({ storageKey }) => {
-  const [Background] = useState<FC>(() => pickBackground(storageKey));
+  const { config } = useConfig();
+  const splashBackground = (config?.ui as { splashBackground?: string } | undefined)?.splashBackground;
+
+  const [Background] = useState<FC>(() => pickBackground(storageKey, splashBackground));
 
   // Persist which background is displayed — useEffect only commits once,
   // unlike useState initializers which StrictMode may call twice.

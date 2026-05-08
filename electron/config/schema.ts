@@ -487,6 +487,7 @@ export const appConfigSchema = z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),
     fullWidthContent: z.boolean().default(false),
+    splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
   }),
