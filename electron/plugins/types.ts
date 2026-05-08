@@ -603,6 +603,43 @@ export type PluginActionPayload = {
 
 /* ── Auth Window Types ── */
 
+/* ── Session Cookie Promotion Types ── */
+
+/**
+ * Describes a session cookie being considered for promotion.
+ * Passed to the cookiePromotion callback when using function mode.
+ */
+export type SessionCookieInfo = {
+  /** The cookie's domain (e.g. ".login.microsoftonline.com") */
+  domain: string;
+  /** The cookie name */
+  name: string;
+  /** The cookie path */
+  path: string;
+  /** Whether the cookie is secure */
+  secure: boolean;
+  /** Whether the cookie is httpOnly */
+  httpOnly: boolean;
+};
+
+/**
+ * Controls how session cookies (those without Expires/Max-Age) are promoted
+ * to persistent cookies so they survive auth window closes.
+ *
+ * By default (undefined/false), NO promotion happens — session cookies die
+ * when the last BrowserWindow using the partition closes. Plugins must opt in.
+ *
+ * Domain patterns support:
+ * - `"*"` — matches all domains
+ * - `"example.com"` — exact match (also matches cookie domain ".example.com")
+ * - `"*.example.com"` — suffix wildcard (matches sub.example.com, deep.sub.example.com)
+ * - `"prefix.*"` — prefix wildcard (matches prefix.anything.com)
+ */
+export type CookiePromotionConfig =
+  | false
+  | { domains: string[]; ttlDays?: number }
+  | ((cookie: SessionCookieInfo) => { promote: boolean; ttlDays?: number } | false);
+
 export type PluginAuthWindowOptions = {
   url: string;
   callbackMatch?: string;
@@ -626,6 +663,12 @@ export type PluginAuthWindowOptions = {
    * - `string`: uses the provided string as-is.
    */
   customUserAgent?: string | false;
+  /**
+   * Controls session cookie promotion for this window's partition.
+   * By default, no promotion happens. Opt in to persist session cookies
+   * across window closes.
+   */
+  cookiePromotion?: CookiePromotionConfig;
 };
 
 export type AuthWindowHelpers = {
@@ -650,6 +693,12 @@ export type PluginBrowserWindowOptions = {
    * - `string`: uses the provided string as-is.
    */
   customUserAgent?: string | false;
+  /**
+   * Controls session cookie promotion for this window's partition.
+   * By default, no promotion happens. Opt in to persist session cookies
+   * across window closes.
+   */
+  cookiePromotion?: CookiePromotionConfig;
 };
 
 export type PluginAuthResult = {

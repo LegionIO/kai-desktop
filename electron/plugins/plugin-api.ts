@@ -35,6 +35,8 @@ import type {
   PluginInferenceProvider,
   AllowedBinary,
   ExecRequest,
+  CookiePromotionConfig,
+  SessionCookieInfo,
 } from './types.js';
 import {
   executeCommand,
@@ -53,21 +55,119 @@ import { readConversationStore, writeConversationStore, broadcastConversationCha
 // Electron drops session cookies (those without an Expires/Max-Age) when the
 // last BrowserWindow using that partition's session closes.  For auth windows
 // that open briefly and close, this means SSO cookies vanish immediately.
-// This helper promotes session cookies to persistent ones (7-day TTL) so they
-// survive across window opens, matching Chrome's behavior of keeping session
-// cookies alive for the lifetime of the browser process.
-const promotedSessions = new WeakSet<Electron.Session>();
-const SESSION_COOKIE_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+//
+// This system allows plugins to opt in to promoting session cookies to
+// persistent ones with configurable domain filtering and TTLs.
+// By default NO promotion happens — plugins must explicitly opt in.
 
-function ensureSessionCookiePromotion(ses: Electron.Session): void {
-  if (promotedSessions.has(ses)) return;
-  promotedSessions.add(ses);
+const DEFAULT_TTL_DAYS = 7;
+
+interface SessionPromotionState {
+  config: CookiePromotionConfig | undefined;
+}
+
+const sessionPromotionState = new WeakMap<Electron.Session, SessionPromotionState>();
+
+/**
+ * Matches a cookie domain against a glob-style pattern.
+ *
+ * Supports:
+ * - "*" — matches everything
+ * - "example.com" — exact match (also matches ".example.com")
+ * - "*.example.com" — suffix wildcard (sub.example.com, deep.sub.example.com)
+ * - "prefix.*" — prefix wildcard (prefix.anything.com)
+ */
+function domainMatchesPattern(cookieDomain: string, pattern: string): boolean {
+  if (pattern === '*') return true;
+
+  // Normalize: strip leading dot from cookie domain for comparison
+  const normalized = cookieDomain.replace(/^\./, '').toLowerCase();
+  const lowerPattern = pattern.toLowerCase();
+
+  // Suffix wildcard: "*.example.com"
+  if (lowerPattern.startsWith('*.')) {
+    const suffix = lowerPattern.slice(2); // "example.com"
+    return normalized === suffix || normalized.endsWith('.' + suffix);
+  }
+
+  // Prefix wildcard: "prefix.*"
+  if (lowerPattern.endsWith('.*')) {
+    const prefix = lowerPattern.slice(0, -2); // "prefix"
+    return normalized.startsWith(prefix + '.') || normalized === prefix;
+  }
+
+  // Exact match
+  return normalized === lowerPattern;
+}
+
+/**
+ * Resolves whether a cookie should be promoted and with what TTL.
+ * Returns TTL in seconds, or false if the cookie should not be promoted.
+ */
+function resolveCookiePromotion(
+  config: CookiePromotionConfig | undefined,
+  cookie: Electron.Cookie,
+): number | false {
+  // No config or explicitly false = no promotion
+  if (!config) return false;
+
+  // Callback mode: let the plugin decide per-cookie
+  if (typeof config === 'function') {
+    const info: SessionCookieInfo = {
+      domain: cookie.domain ?? '',
+      name: cookie.name,
+      path: cookie.path ?? '/',
+      secure: cookie.secure ?? false,
+      httpOnly: cookie.httpOnly ?? false,
+    };
+    const result = config(info);
+    if (!result || !result.promote) return false;
+    const ttlDays = result.ttlDays ?? DEFAULT_TTL_DAYS;
+    return ttlDays * 24 * 60 * 60;
+  }
+
+  // Domain pattern mode: check if cookie domain matches any pattern
+  const cookieDomain = cookie.domain ?? '';
+  const matches = config.domains.some((pattern) => domainMatchesPattern(cookieDomain, pattern));
+  if (!matches) return false;
+
+  const ttlDays = config.ttlDays ?? DEFAULT_TTL_DAYS;
+  return ttlDays * 24 * 60 * 60;
+}
+
+/**
+ * Configures session cookie promotion for a partition's session.
+ * Installs the cookie listener once; subsequent calls update the config.
+ */
+function configureSessionCookiePromotion(
+  ses: Electron.Session,
+  config?: CookiePromotionConfig,
+): void {
+  const existing = sessionPromotionState.get(ses);
+
+  if (existing) {
+    // Update config — last caller wins
+    if (config !== undefined) {
+      existing.config = config;
+    }
+    return;
+  }
+
+  // First time: install the listener and store state
+  const state: SessionPromotionState = { config };
+  sessionPromotionState.set(ses, state);
 
   ses.cookies.on('changed', (_event, cookie, _cause, removed) => {
     // Only promote cookies that were just set (not removed) and lack an expiry
     if (removed || cookie.expirationDate) return;
 
-    const expirationDate = Math.floor(Date.now() / 1000) + SESSION_COOKIE_TTL_SECONDS;
+    const currentState = sessionPromotionState.get(ses);
+    if (!currentState) return;
+
+    const ttlSeconds = resolveCookiePromotion(currentState.config, cookie);
+    if (ttlSeconds === false) return;
+
+    const expirationDate = Math.floor(Date.now() / 1000) + ttlSeconds;
     ses.cookies.set({
       url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
       name: cookie.name,
@@ -552,7 +652,7 @@ export function createPluginAPI(
           let revealTimer: NodeJS.Timeout | null = null;
 
           const ses = partition ? session.fromPartition(partition) : undefined;
-          if (ses) ensureSessionCookiePromotion(ses);
+          if (ses) configureSessionCookiePromotion(ses, options.cookiePromotion);
 
           const authWin = new BrowserWindow({
             width,
@@ -749,7 +849,7 @@ export function createPluginAPI(
         } = options;
 
         const ses = partition ? session.fromPartition(partition) : undefined;
-        if (ses) ensureSessionCookiePromotion(ses);
+        if (ses) configureSessionCookiePromotion(ses, options.cookiePromotion);
 
         const browserWin = new BrowserWindow({
           width,
