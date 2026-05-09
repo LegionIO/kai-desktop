@@ -145,7 +145,7 @@ export const Thread: FC<{
 
   return (
     <ThreadMetaContext.Provider value={threadMeta}>
-    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col" id="kai-chat-viewport">
       <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
       <div
         className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"

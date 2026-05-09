@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useMemo, type FC } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, type FC } from 'react';
+import { createPortal } from 'react-dom';
 import { CodeBlock } from './CodeBlock';
 import { MarkdownText } from './MarkdownText';
 import { ElapsedBadge } from './ElapsedBadge';
@@ -14,15 +15,25 @@ import {
   DownloadIcon,
   FileIcon,
   FileTextIcon,
+  FilePenIcon,
   FolderIcon,
+  FolderOpenIcon,
   ExternalLinkIcon,
   TerminalIcon,
   AlertTriangleIcon,
   CodeIcon,
+  SearchIcon,
   BookOpenIcon,
   ScrollTextIcon,
   SendHorizontalIcon,
   XIcon,
+  CopyIcon,
+  BotIcon,
+  ImageIcon,
+  VideoIcon,
+  HelpCircleIcon,
+  ListTodoIcon,
+  SparklesIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -76,7 +87,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: stri
 };
 
 export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ part, onSendFeedback, onPlanApproved }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
@@ -105,6 +116,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const mediaResult = hasResult && !isError ? detectMediaResult(part.result) : null;
   const todoItems = detectTodoItems(part);
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
+  // For bash tools, detect even on error so we render IN/OUT box instead of raw JSON
+  const isBashTool = part.toolName === 'sh' || part.toolName === 'bash' || part.toolName === 'mastra_workspace_execute_command';
+  const bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
   const isPlanApproval = part.toolName === 'exit_plan_mode';
@@ -158,26 +172,63 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback]);
 
   const summary = getToolSummary(part);
+  const subtitle = getToolSubtitle(part);
+  const miniPreview = getMiniCodePreview(part);
+  // Use result shape to drive rendering — works regardless of tool name
+  const isBash = smartResult?.type === 'sh' || isBashTool;
+  const isFileRead = smartResult?.type === 'file_read';
+  const [fileModalOpen, setFileModalOpen] = useState(false);
+
+  const ToolIcon = getToolIcon(part.toolName);
+  const iconColor = getToolIconColor(part.toolName);
 
   return (
     <div className="text-sm min-w-0 flex-1">
-      {/* Compact header row — label + description */}
+      {/* Header row — clickable toggle */}
       <button
         type="button"
-        className="group/tool flex w-full items-center gap-2 py-1 hover:bg-muted/30 rounded-md px-1 -mx-1 transition-colors"
+        className="group/tool flex w-full items-center gap-2 py-1 hover:bg-muted/40 rounded-md px-1.5 -mx-1.5 transition-colors text-left"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="font-semibold text-xs text-foreground whitespace-nowrap shrink-0">{getToolLabel(part.toolName)}</span>
+        {/* Tool icon chip */}
+        <span className={`shrink-0 flex items-center justify-center w-5 h-5 rounded ${iconColor}`}>
+          <ToolIcon className="w-3 h-3" />
+        </span>
+
+        {/* Tool name */}
+        <span className="font-medium text-xs text-foreground whitespace-nowrap shrink-0">{getToolLabel(part.toolName)}</span>
+
+        {/* Separator dot */}
+        {summary && <span className="text-muted-foreground/30 text-[10px] shrink-0">·</span>}
+
+        {/* Inline arg summary — clickable for file_read (opens modal), plain text otherwise */}
         {summary && (
-          <span className="text-xs text-muted-foreground truncate min-w-0">{summary}</span>
+          isFileRead && hasResult ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); setFileModalOpen(true); }}
+              className="text-xs text-muted-foreground/70 truncate min-w-0 font-mono leading-none hover:text-foreground/80 hover:underline underline-offset-2 transition-colors text-left"
+            >
+              {summary}
+            </button>
+          ) : (
+            <span className="text-xs text-muted-foreground/70 truncate min-w-0 font-mono leading-none">{summary}</span>
+          )
         )}
+
+        {/* Spacer */}
+        <span className="flex-1" />
+
+        {/* Status indicators */}
         {isHung && (
-          <span className="text-[10px] font-medium text-amber-500 shrink-0">HUNG</span>
+          <span className="text-[10px] font-semibold text-amber-500 shrink-0 tracking-wide">HUNG</span>
         )}
         {isSummarizing && (
-          <span className="text-[10px] text-amber-500 animate-pulse shrink-0">Summarizing...</span>
+          <span className="text-[10px] text-amber-500 animate-pulse shrink-0">Summarizing…</span>
         )}
-        <span className={`ml-auto shrink-0 transition-opacity duration-300 ${isRunning ? 'opacity-100' : 'opacity-0 group-hover/tool:opacity-100'}`}>
+
+        {/* Elapsed badge — always visible when running, hover-only when done */}
+        <span className={`shrink-0 transition-opacity ${isRunning ? 'opacity-100' : 'opacity-0 group-hover/tool:opacity-100'}`}>
           <ToolElapsedBadge
             isRunning={isRunning}
             isError={Boolean(isError)}
@@ -187,7 +238,20 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
             durationMs={part.durationMs}
           />
         </span>
+
+        {/* Expand chevron */}
+        <ChevronIcon expanded={expanded} />
       </button>
+
+      {/* Subtitle line — always visible */}
+      {subtitle && (
+        <div className="text-[11px] text-muted-foreground/50 pl-1.5 leading-snug -mt-0.5 mb-0.5">{subtitle}</div>
+      )}
+
+      {/* Mini code preview for Write/Edit tools */}
+      {miniPreview && (
+        <MiniCodePreview lines={miniPreview.lines} language={miniPreview.language} />
+      )}
 
       {/* Ask user questionnaire UI */}
       {isPendingApproval && isAskUser && (
@@ -289,23 +353,32 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         </div>
       )}
 
-      {/* Todo items — always visible below header */}
+      {/* Todo items — always visible */}
       {todoItems && <TodoListView items={todoItems} />}
 
-      {/* Expanded detail */}
-      {expanded && (
+      {/* Collapsible tool content — expanded by default */}
+      {expanded && (isBash ? (
+        <BashInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
+      ) : isFileRead ? (
+        <>
+          {isRunning && (
+            <div className="ml-5 pl-3 py-1.5 flex items-center gap-2">
+              <LoaderIcon className="h-3.5 w-3.5 animate-spin text-blue-500" />
+              <span className="text-xs text-blue-600 dark:text-blue-400">Reading…</span>
+            </div>
+          )}
+          {fileModalOpen && (
+            <FileContentModal part={part} onClose={() => setFileModalOpen(false)} />
+          )}
+        </>
+      ) : (
         <div className="tool-detail-code ml-5 mt-1 mb-2 pl-3">
-          {/* Arguments section */}
-          <ToolSection title="Arguments" defaultOpen>
-            <CodeBlock code={formatArgs(part.args)} language="json" />
-          </ToolSection>
-
-          {/* Pre-extraction / In-progress indicator */}
+          {/* Running spinner */}
           {isRunning && !isSummarizing && (
             <div className="py-1.5">
               <div className="flex items-center gap-2">
                 <LoaderIcon className="h-3.5 w-3.5 animate-spin text-blue-500" />
-                <span className="text-xs text-blue-600 dark:text-blue-400">Executing tool...</span>
+                <span className="text-xs text-blue-600 dark:text-blue-400">Running…</span>
               </div>
             </div>
           )}
@@ -321,7 +394,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           )}
 
           {hasLiveOutput && (
-            <ToolSection title="Live Output" defaultOpen={isRunning}>
+            <ToolSection title="Live Output">
               <CodeBlock code={formatLiveOutput(part.liveOutput)} language="text" />
             </ToolSection>
           )}
@@ -330,7 +403,6 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           {hasResult && (
             <ToolSection
               title={isError ? 'Error' : 'Result'}
-              defaultOpen
               badge={canShowOriginal ? (
                 <CompactionToggle showOriginal={showOriginal} onToggle={() => setShowOriginal(!showOriginal)} />
               ) : undefined}
@@ -350,7 +422,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
             </ToolSection>
           )}
         </div>
-      )}
+      ))}
     </div>
   );
 };
@@ -933,9 +1005,8 @@ function detectListDirResult(result: unknown): ListDirData | null {
   return null;
 }
 
-function detectShResult(result: unknown, toolName: string): ShData | null {
-  if (toolName !== 'sh' && toolName !== 'mastra_workspace_execute_command') return null;
-  if (typeof result === 'string') {
+function detectShResult(result: unknown): ShData | null {
+  if (typeof result === 'string' && result.length > 0) {
     return { stdout: result, stderr: '', exitCode: null };
   }
   if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
@@ -950,23 +1021,26 @@ function detectShResult(result: unknown, toolName: string): ShData | null {
   return null;
 }
 
-/** Detect the smart result type for a tool call */
+/** Detect the smart result type for a tool call — shape-based, not tool-name-gated */
 function detectSmartResult(part: ToolCallPart): { type: 'file_read'; data: FileReadData } | { type: 'glob'; data: GlobData } | { type: 'list_dir'; data: ListDirData } | { type: 'sh'; data: ShData } | null {
   const result = sanitizeResultForDisplay(part.result);
-  if (part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') {
-    const data = detectFileReadResult(result);
-    if (data) return { type: 'file_read', data };
-  }
-  if (part.toolName === 'glob') {
-    const data = detectGlobResult(result);
-    if (data) return { type: 'glob', data };
-  }
-  if (part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') {
-    const data = detectListDirResult(result);
-    if (data) return { type: 'list_dir', data };
-  }
-  const shData = detectShResult(result, part.toolName);
+
+  // file_read: detect by shape (content + path) first, then by known tool names
+  const fileReadData = detectFileReadResult(result);
+  if (fileReadData) return { type: 'file_read', data: fileReadData };
+
+  // glob: detect by shape (files array + count)
+  const globData = detectGlobResult(result);
+  if (globData) return { type: 'glob', data: globData };
+
+  // list_dir: detect by shape (items array + count + path)
+  const listDirData = detectListDirResult(result);
+  if (listDirData) return { type: 'list_dir', data: listDirData };
+
+  // sh: detect by shape (stdout/stderr/exitCode or plain string)
+  const shData = detectShResult(result);
   if (shData) return { type: 'sh', data: shData };
+
   return null;
 }
 
@@ -1262,20 +1336,225 @@ const ToolElapsedBadge: FC<{
   );
 };
 
-const ToolSection: FC<{ title: string; defaultOpen?: boolean; badge?: React.ReactNode; children: React.ReactNode }> = ({ title, defaultOpen = false, badge, children }) => {
-  const [open, setOpen] = useState(defaultOpen);
+/* ── Chevron helper ── */
+const ChevronIcon: FC<{ expanded: boolean }> = ({ expanded }) => (
+  <span className="shrink-0 text-muted-foreground/40 group-hover/tool:text-muted-foreground/70 transition-colors">
+    {expanded ? <ChevronDownIcon className="w-3 h-3" /> : <ChevronRightIcon className="w-3 h-3" />}
+  </span>
+);
+
+/* ── Portal helper — renders modals over the full app (document.body) ── */
+
+function useModalPortalTarget(): HTMLElement {
+  return useMemo(() => document.body, []);
+}
+
+/* ── File Content Modal (for Read tool) ── */
+
+const FileContentModal: FC<{ part: ToolCallPart; onClose: () => void }> = ({ part, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const smartResult = detectSmartResult(part);
+  const fileData = smartResult?.type === 'file_read' ? smartResult.data : null;
+  const portalTarget = useModalPortalTarget();
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); onClose(); }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/50 bg-background shadow-2xl overflow-hidden">
+        {/* Modal header */}
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-border/30 shrink-0">
+          <FileTextIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+          {fileData ? (
+            <ClickablePath path={fileData.path} className="text-sm text-foreground/80 min-w-0" />
+          ) : (
+            <span className="text-sm text-foreground/80">File contents</span>
+          )}
+          {fileData?.totalLines != null && (
+            <span className="text-[10px] text-muted-foreground ml-auto shrink-0">
+              {fileData.totalLines} lines{fileData.truncated ? ' (truncated)' : ''}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="ml-auto shrink-0 p-1 text-muted-foreground hover:text-foreground transition-colors"
+            aria-label="Close"
+          >
+            <XIcon className="h-4 w-4" />
+          </button>
+        </div>
+        {/* Content */}
+        <div className="overflow-y-auto flex-1 p-4">
+          {fileData ? (
+            <FileReadResultView data={fileData} />
+          ) : (
+            <CodeBlock
+              code={formatResult(part.result)}
+              language="text"
+            />
+          )}
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
+/* ── Bash Inline Terminal View ── */
+
+const BashOutputModal: FC<{ command: string; shData: ShData; onClose: () => void }> = ({ command, shData, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-[#0d0d0d] shadow-2xl overflow-hidden font-mono text-xs">
+        {/* Header */}
+        <div className="flex items-center gap-3 px-3 py-2 border-b border-border/20 shrink-0">
+          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider">IN</span>
+          <span className="text-foreground/60 truncate flex-1">{command}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {/* Full output */}
+        <div className="overflow-y-auto flex-1 px-3 py-2 space-y-2">
+          {shData.exitCode != null && shData.exitCode !== 0 && (
+            <div className="text-destructive text-[10px] font-semibold">Exit code {shData.exitCode}</div>
+          )}
+          {shData.stdout && <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">{shData.stdout}</pre>}
+          {shData.stderr && <pre className="text-amber-400/80 whitespace-pre-wrap break-all leading-5">{shData.stderr}</pre>}
+          {!shData.stdout && !shData.stderr && <span className="text-muted-foreground/40 italic">No output</span>}
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
+const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
+  const args = part.args as Record<string, unknown>;
+  const rawCommand = typeof args.command === 'string' ? args.command : '';
+  // Unwrap /bin/zsh -lc '...' style wrappers for display
+  const shellWrapped = rawCommand.match(/^\/bin\/(?:zsh|bash|sh)\s+-\w+\s+'(.+)'$/s);
+  const command = shellWrapped ? shellWrapped[1] : rawCommand;
+  const shData = detectShResult(part.result);
+  // For error results that don't have stdout/stderr shape, extract the error string
+  const resultObj = part.result && typeof part.result === 'object' ? part.result as Record<string, unknown> : null;
+  const errorMessage = isError && !shData && resultObj
+    ? String(resultObj.error ?? resultObj.message ?? JSON.stringify(part.result))
+        .replace(/<tool_use_error>/g, '').replace(/<\/tool_use_error>/g, '').trim()
+    : null;
+  const [outputModalOpen, setOutputModalOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    void navigator.clipboard.writeText(command);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [command]);
+
+  // Combine stdout + stderr for the preview, cap at 3 lines
+  const fullOutput = shData ? [shData.stdout, shData.stderr].filter(Boolean).join('\n') : '';
+  const allLines = fullOutput.split('\n');
+  const previewLines = allLines.slice(0, 3);
+  const hasMore = allLines.length > 3;
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* IN row — single line + hover copy button */}
+        <div className="group/in flex items-center gap-3 px-3 py-2 border-b border-border/50 dark:border-white/10">
+          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider shrink-0">IN</span>
+          <span className="text-foreground/75 truncate flex-1 leading-5">{command}</span>
+          <button
+            type="button"
+            onClick={handleCopy}
+            className={`shrink-0 transition-all p-1 rounded ${copied ? 'opacity-100 text-emerald-400' : 'opacity-0 group-hover/in:opacity-100 text-muted-foreground/50 hover:text-foreground'}`}
+            title={copied ? 'Copied!' : 'Copy command'}
+          >
+            {copied ? <CheckIcon className="h-3 w-3" /> : <CopyIcon className="h-3 w-3" />}
+          </button>
+        </div>
+        {/* OUT row */}
+        <div className="flex gap-3 px-3 py-2">
+          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider shrink-0 pt-px">OUT</span>
+          <div className="flex-1 min-w-0">
+            {isRunning ? (
+              <span className="flex items-center gap-1.5 text-blue-400">
+                <LoaderIcon className="h-3 w-3 animate-spin" />
+                <span>Running…</span>
+              </span>
+            ) : errorMessage ? (
+              <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{errorMessage}</pre>
+            ) : shData ? (
+              <div className="group/out relative">
+                {shData.exitCode != null && shData.exitCode !== 0 && (
+                  <div className="text-destructive text-[10px] font-semibold mb-1">Exit code {shData.exitCode}</div>
+                )}
+                <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">
+                  {previewLines.join('\n')}
+                </pre>
+                {hasMore && (
+                  <div className="absolute bottom-0 right-0 opacity-0 group-hover/out:opacity-100 transition-opacity">
+                    <button
+                      type="button"
+                      onClick={() => setOutputModalOpen(true)}
+                      className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm backdrop-blur-sm transition-colors"
+                    >
+                      <ExternalLinkIcon className="h-2.5 w-2.5" />
+                      <span>Expand output</span>
+                    </button>
+                  </div>
+                )}
+                {!hasMore && !shData.stdout && !shData.stderr && (
+                  <span className="text-muted-foreground/40 italic">No output</span>
+                )}
+              </div>
+            ) : (
+              <span className="text-muted-foreground/40 italic">No output</span>
+            )}
+          </div>
+        </div>
+      </div>
+      {outputModalOpen && shData && (
+        <BashOutputModal command={command} shData={shData} onClose={() => setOutputModalOpen(false)} />
+      )}
+    </>
+  );
+};
+
+/* ── Tool Section (always-open label + content) ── */
+
+const ToolSection: FC<{ title: string; badge?: React.ReactNode; children: React.ReactNode }> = ({ title, badge, children }) => {
   return (
     <div className="mt-1">
-      <button
-        type="button"
-        className="flex w-full items-center gap-1.5 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider hover:text-foreground/70 transition-colors"
-        onClick={() => setOpen(!open)}
-      >
-        {open ? <ChevronDownIcon className="h-2.5 w-2.5" /> : <ChevronRightIcon className="h-2.5 w-2.5" />}
+      <div className="flex w-full items-center gap-1.5 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
         {title}
         {badge}
-      </button>
-      {open && <div className="pb-1">{children}</div>}
+      </div>
+      <div className="pb-1">{children}</div>
     </div>
   );
 };
@@ -1290,6 +1569,7 @@ function isErrorResult(result: unknown): boolean {
 
 const toolLabels: Record<string, string> = {
   sh: 'Bash',
+  bash: 'Bash',
   mastra_workspace_execute_command: 'Bash',
   file_read: 'Read',
   mastra_workspace_read_file: 'Read',
@@ -1321,10 +1601,66 @@ function getToolLabel(toolName: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+type LucideIcon = FC<{ className?: string }>;
+
+function getToolIcon(toolName: string): LucideIcon {
+  if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command') return TerminalIcon;
+  if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file') return FileTextIcon;
+  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file') return FileIcon;
+  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file') return FilePenIcon;
+  if (toolName === 'grep' || toolName === 'mastra_workspace_grep') return SearchIcon;
+  if (toolName === 'glob') return FolderOpenIcon;
+  if (toolName === 'list_directory' || toolName === 'mastra_workspace_list_files') return FolderIcon;
+  if (toolName === 'ask_user') return HelpCircleIcon;
+  if (toolName === 'enter_plan_mode') return ListTodoIcon;
+  if (toolName === 'exit_plan_mode') return ScrollTextIcon;
+  if (toolName === 'agent_lattice_chat' || toolName === 'sub_agent') return BotIcon;
+  if (toolName === 'generate_image') return ImageIcon;
+  if (toolName === 'generate_video') return VideoIcon;
+  return SparklesIcon;
+}
+
+function getToolIconColor(toolName: string): string {
+  if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command')
+    return 'bg-violet-500/15 text-violet-500';
+  if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file')
+    return 'bg-blue-500/15 text-blue-500';
+  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file')
+    return 'bg-emerald-500/15 text-emerald-500';
+  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file')
+    return 'bg-amber-500/15 text-amber-500';
+  if (toolName === 'grep' || toolName === 'mastra_workspace_grep')
+    return 'bg-sky-500/15 text-sky-500';
+  if (toolName === 'glob' || toolName === 'list_directory' || toolName === 'mastra_workspace_list_files')
+    return 'bg-indigo-500/15 text-indigo-500';
+  if (toolName === 'ask_user')
+    return 'bg-orange-500/15 text-orange-500';
+  if (toolName === 'enter_plan_mode' || toolName === 'exit_plan_mode')
+    return 'bg-primary/15 text-primary';
+  if (toolName === 'agent_lattice_chat' || toolName === 'sub_agent')
+    return 'bg-pink-500/15 text-pink-500';
+  if (toolName === 'generate_image' || toolName === 'generate_video')
+    return 'bg-rose-500/15 text-rose-500';
+  return 'bg-muted text-muted-foreground';
+}
+
 function getToolSummary(part: ToolCallPart): string {
   const args = part.args as Record<string, unknown>;
-  if ((part.toolName === 'sh' || part.toolName === 'mastra_workspace_execute_command') && args.command) return String(args.command).slice(0, 60);
-  if ((part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') && args.path) return String(args.path).split('/').pop() ?? '';
+  if ((part.toolName === 'sh' || part.toolName === 'bash' || part.toolName === 'mastra_workspace_execute_command') && args.command) {
+    // Strip common shell wrappers like /bin/zsh -lc '...' or /bin/bash -c '...'
+    const raw = String(args.command);
+    const shellWrapped = raw.match(/^\/bin\/(?:zsh|bash|sh)\s+-\w+\s+'(.+)'$/s);
+    if (shellWrapped) return shellWrapped[1].slice(0, 80);
+    return raw.slice(0, 80);
+  }
+  if ((part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') && args.path) {
+    const fileName = String(args.path).split('/').pop() ?? '';
+    const offset = typeof args.offset === 'number' ? args.offset : null;
+    const limit = typeof args.limit === 'number' ? args.limit : null;
+    if (offset != null && limit != null) return `${fileName} (lines ${offset}–${offset + limit - 1})`;
+    if (offset != null) return `${fileName} (from line ${offset})`;
+    return fileName;
+  }
   if ((part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file') && args.path) return String(args.path).split('/').pop() ?? '';
   if ((part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file') && args.path) return String(args.path).split('/').pop() ?? '';
   if ((part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') && args.pattern) return `/${args.pattern}/`;
@@ -1341,6 +1677,135 @@ function getToolSummary(part: ToolCallPart): string {
   if (part.toolName === 'exit_plan_mode') return (args as Record<string, unknown>).summary ? String((args as Record<string, unknown>).summary) : '';
   return '';
 }
+
+/** Returns a short subtitle line shown below the tool name — muted metadata about the result */
+function getToolSubtitle(part: ToolCallPart): string {
+  if (!part.result || part.isError) return '';
+  const result = part.result as Record<string, unknown>;
+  const args = part.args as Record<string, unknown>;
+
+  // file_read → "Read N lines"
+  if (part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') {
+    if (typeof result.totalLines === 'number') {
+      return `Read ${result.totalLines} line${result.totalLines !== 1 ? 's' : ''}${result.truncated ? ' (truncated)' : ''}`;
+    }
+    if (typeof result.content === 'string') {
+      const lines = result.content.split('\n').length;
+      return `Read ${lines} line${lines !== 1 ? 's' : ''}`;
+    }
+  }
+
+  // file_write → "Wrote N lines" or "Wrote file"
+  if (part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file') {
+    if (typeof args.content === 'string') {
+      const lines = args.content.split('\n').length;
+      return `Wrote ${lines} line${lines !== 1 ? 's' : ''}`;
+    }
+    return 'Wrote file';
+  }
+
+  // file_edit → "Edited file"
+  if (part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file') {
+    return 'Edited file';
+  }
+
+  // sh / bash → "Exit code N" or "Completed"
+  if (part.toolName === 'sh' || part.toolName === 'bash' || part.toolName === 'mastra_workspace_execute_command') {
+    if (typeof result.exitCode === 'number') {
+      return result.exitCode === 0 ? 'Exited with code 0' : `Exit code ${result.exitCode}`;
+    }
+    if (typeof result.stdout === 'string' || typeof result.stderr === 'string') {
+      return 'Command completed';
+    }
+  }
+
+  // grep → "N matches"
+  if (part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') {
+    if (Array.isArray(result.matches)) return `${result.matches.length} match${result.matches.length !== 1 ? 'es' : ''}`;
+    if (typeof result.count === 'number') return `${result.count} match${result.count !== 1 ? 'es' : ''}`;
+  }
+
+  // glob → "N files"
+  if (part.toolName === 'glob') {
+    if (typeof result.count === 'number') return `${result.count} file${result.count !== 1 ? 's' : ''}`;
+    if (Array.isArray(result.files)) return `${result.files.length} file${result.files.length !== 1 ? 's' : ''}`;
+  }
+
+  // list_directory → "N items"
+  if (part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') {
+    if (typeof result.count === 'number') return `${result.count} item${result.count !== 1 ? 's' : ''}`;
+    if (Array.isArray(result.items)) return `${result.items.length} item${result.items.length !== 1 ? 's' : ''}`;
+  }
+
+  return '';
+}
+
+type MiniPreviewLine = { lineNum: number; text: string; type: 'added' | 'removed' | 'context' };
+
+/** Returns a small set of lines to preview for Write/Edit tools */
+function getMiniCodePreview(part: ToolCallPart): { lines: MiniPreviewLine[]; language: string } | null {
+  const isWrite = part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file';
+  const isEdit = part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file';
+  if (!isWrite && !isEdit) return null;
+
+  const args = part.args as Record<string, unknown>;
+  const filePath = typeof args.path === 'string' ? args.path : '';
+  const language = langFromPath(filePath);
+  const MAX_PREVIEW = 5;
+
+  if (isWrite && typeof args.content === 'string') {
+    const allLines = args.content.split('\n');
+    const preview = allLines.slice(0, MAX_PREVIEW);
+    return {
+      language,
+      lines: preview.map((text, i) => ({ lineNum: i + 1, text, type: 'added' as const })),
+    };
+  }
+
+  if (isEdit) {
+    // Try to show new_string (the replacement) as added lines
+    const newStr = typeof args.new_string === 'string' ? args.new_string : typeof args.newContent === 'string' ? args.newContent : null;
+    if (newStr) {
+      const allLines = newStr.split('\n');
+      const preview = allLines.slice(0, MAX_PREVIEW);
+      return {
+        language,
+        lines: preview.map((text, i) => ({ lineNum: i + 1, text, type: 'added' as const })),
+      };
+    }
+  }
+
+  return null;
+}
+
+/** Mini inline code preview shown below Write/Edit tool headers */
+const MiniCodePreview: FC<{ lines: MiniPreviewLine[]; language: string }> = ({ lines }) => {
+  if (lines.length === 0) return null;
+  return (
+    <div className="mt-1 mb-0.5 rounded-md overflow-hidden border border-border/30" style={{ backgroundColor: 'var(--mini-preview-bg, #1e1e1e)' }}>
+      <table className="w-full text-[11px] font-mono leading-5 border-collapse">
+        <tbody>
+          {lines.map((line) => (
+            <tr
+              key={line.lineNum}
+              className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}
+            >
+              <td
+                className="select-none text-right pr-3 pl-2 text-muted-foreground/40 tabular-nums w-8 shrink-0 border-r border-border/20"
+                style={{ userSelect: 'none' }}
+              >
+                {line.lineNum}
+              </td>
+              <td className={`pl-3 pr-2 whitespace-pre truncate max-w-0 ${line.type === 'added' ? 'text-emerald-300' : line.type === 'removed' ? 'text-red-300' : 'text-foreground/70'}`}>
+                {line.text || ' '}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
 
 function formatArgs(args: unknown): string {
   try {

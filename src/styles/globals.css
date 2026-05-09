@@ -348,6 +348,14 @@
   background-color: #1e1e1e;
 }
 
+/* Mini inline code preview (Write/Edit tool calls — VS Code extension style) */
+:root {
+  --mini-preview-bg: #f5f5f5;
+}
+.dark {
+  --mini-preview-bg: #1e1e1e;
+}
+
 /* (System prompt uses contentEditable — no overlay CSS needed) */
 
 /* contentEditable placeholder — data-placeholder attr is only set when isEmpty.
