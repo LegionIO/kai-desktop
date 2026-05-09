@@ -105,10 +105,11 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
-  // Auto-expand on error
+  const isAgentTool = part.toolName === 'agent';
+  // Auto-expand on error or for agent tool calls (always show response)
   useEffect(() => {
-    if (isError) setExpanded(true);
-  }, [isError]);
+    if (isError || isAgentTool) setExpanded(true);
+  }, [isError, isAgentTool]);
   const approvalStatus = localApproval ?? part.approvalStatus;
   const isPendingApproval = approvalStatus === 'pending' && !hasResult;
   const isAskUser = part.toolName === 'ask_user';
@@ -367,6 +368,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       {/* Collapsible tool content — expanded by default */}
       {expanded && (isBash ? (
         <BashInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
+      ) : isAgentTool ? (
+        <AgentInlineView part={part} isRunning={isRunning} />
       ) : isEdit ? (
         <EditInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isFileRead ? (
@@ -2419,6 +2422,54 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   );
 };
 
+/* ── Agent inline view — renders sub-agent response as assistant-style text ── */
+
+const AgentInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  // Extract text content from result (array of {type: "text", text: "..."} blocks)
+  const responseText = useMemo(() => {
+    if (!part.result) return null;
+    if (Array.isArray(part.result)) {
+      return (part.result as Array<Record<string, unknown>>)
+        .filter((b) => b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text as string)
+        .join('\n\n')
+        .trim();
+    }
+    if (typeof part.result === 'string') return part.result.trim();
+    return null;
+  }, [part.result]);
+
+  const args = part.args as Record<string, unknown>;
+  const prompt = typeof args.prompt === 'string' ? args.prompt : null;
+
+  return (
+    <div className="mt-1.5 mb-2 ml-1 rounded-xl border border-border/50 bg-muted/20 overflow-hidden">
+      {/* Prompt row */}
+      {prompt && (
+        <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
+          <div className="text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider mb-1">Prompt</div>
+          <div className="text-xs text-muted-foreground/80 leading-5 line-clamp-3">{prompt}</div>
+        </div>
+      )}
+      {/* Response */}
+      <div className="px-3 py-2.5">
+        {isRunning ? (
+          <div className="flex items-center gap-2 py-1">
+            <LoaderIcon className="h-3.5 w-3.5 animate-spin text-pink-500" />
+            <span className="text-xs text-muted-foreground/70">Running agent…</span>
+          </div>
+        ) : responseText ? (
+          <div className="prose-agent text-sm leading-relaxed text-foreground/90">
+            <MarkdownText text={responseText} />
+          </div>
+        ) : (
+          <span className="text-xs italic text-muted-foreground/50">No response</span>
+        )}
+      </div>
+    </div>
+  );
+};
+
 /* ── Tool Section (always-open label + content) ── */
 
 const ToolSection: FC<{ title: string; badge?: React.ReactNode; children: React.ReactNode }> = ({ title, badge, children }) => {
@@ -2468,6 +2519,7 @@ const toolLabels: Record<string, string> = {
   glob_search: 'Glob',
   list_directory: 'List Directory',
   mastra_workspace_list_files: 'List Files',
+  agent: 'Agent',
   agent_lattice_chat: 'Agent',
   sub_agent: 'Sub Agent',
   generate_image: 'Image Generation',
@@ -2500,7 +2552,7 @@ function getToolIcon(toolName: string): LucideIcon {
   if (toolName === 'ask_user') return HelpCircleIcon;
   if (toolName === 'enter_plan_mode') return ListTodoIcon;
   if (toolName === 'exit_plan_mode') return ScrollTextIcon;
-  if (toolName === 'agent_lattice_chat' || toolName === 'sub_agent') return BotIcon;
+  if (toolName === 'agent' || toolName === 'agent_lattice_chat' || toolName === 'sub_agent') return BotIcon;
   if (toolName === 'generate_image') return ImageIcon;
   if (toolName === 'generate_video') return VideoIcon;
   return SparklesIcon;
@@ -2523,7 +2575,7 @@ function getToolIconColor(toolName: string): string {
     return 'bg-orange-500/15 text-orange-500';
   if (toolName === 'enter_plan_mode' || toolName === 'exit_plan_mode')
     return 'bg-primary/15 text-primary';
-  if (toolName === 'agent_lattice_chat' || toolName === 'sub_agent')
+  if (toolName === 'agent' || toolName === 'agent_lattice_chat' || toolName === 'sub_agent')
     return 'bg-pink-500/15 text-pink-500';
   if (toolName === 'generate_image' || toolName === 'generate_video')
     return 'bg-rose-500/15 text-rose-500';
@@ -2570,6 +2622,7 @@ function getToolSummary(part: ToolCallPart): string {
   if ((part.toolName === 'grep' || part.toolName === 'Grep' || part.toolName === 'mastra_workspace_grep' || part.toolName === 'grep_search') && args.pattern) return `/${args.pattern}/`;
   if ((part.toolName === 'glob' || part.toolName === 'Glob' || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search') && args.pattern) return String(args.pattern);
   if ((part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') && args.path) return String(args.path);
+  if (part.toolName === 'agent' && args.description) return String(args.description).slice(0, 80);
   if (part.toolName === 'agent_lattice_chat') return 'Remote agent call';
   if (part.toolName === 'generate_image' && args.prompt) return String(args.prompt).slice(0, 60);
   if (part.toolName === 'generate_video' && args.prompt) return String(args.prompt).slice(0, 60);
