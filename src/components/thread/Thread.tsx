@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext, type FC, type PropsWithChildren } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ThreadPrimitive,
   ComposerPrimitive,
@@ -40,7 +41,7 @@ import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
-import { useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
+import { useBranchNav, useCurrentWorkingDirectory, useRuntimeConversationId, type TokenUsageData } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { MarkdownText } from './MarkdownText';
@@ -101,10 +102,25 @@ export const Thread: FC<{
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
   const fullWidth = useFullWidthContent();
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- hook must run for reactivity
-  const _activeConversationId = useActiveConversationId();
+  // useRuntimeConversationId updates in the same React batch as setTree/setHeadId,
+  // so the scroll fires only after the new thread's messages are already in the DOM.
+  const runtimeConversationId = useRuntimeConversationId();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
+
+  // Scroll to the bottom whenever the active conversation changes.
+  // We key off runtimeConversationId (not the IPC-driven useActiveConversationId)
+  // because it updates only after the new thread's tree has been loaded into state.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // rAF lets the browser finish painting the new messages before we scroll
+    const raf = requestAnimationFrame(() => {
+      viewport.scrollTop = viewport.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runtimeConversationId]);
   // Track whether the splash should hide instantly (loading existing thread)
   // vs fade out gradually (user just sent first message in new thread).
   const [splashInstantHide, setSplashInstantHide] = useState(false);
@@ -606,7 +622,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
             )}
 
             {/* Action buttons — always anchored right, never move */}
-            <div className="flex shrink-0 items-center gap-0.5 px-2 py-2">
+            <div className="flex shrink-0 items-start gap-0.5 px-2 py-2">
               <button
                 type="button"
                 onClick={() => setExpanded((e) => !e)}
@@ -740,7 +756,7 @@ const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClo
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[100] flex cursor-pointer items-center justify-center bg-black/80 backdrop-blur-sm"
       onClick={onClose}
@@ -762,7 +778,8 @@ const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClo
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };
 
@@ -1013,8 +1030,21 @@ const AssistantMessage: FC = () => {
 
   // Detect "thinking between tool calls" — model is running, content exists,
   // but there's no actively-executing tool (all tool calls have results).
+  // Rules:
+  //  - A regular tool is "done" when result !== undefined AND finishedAt !== undefined.
+  //  - A sub_agent tool is always treated as "handled" — it has its own inline UI and
+  //    streams partial results early, so we never want it to suppress the parent spinner.
   const allToolsDone = isRunning && hasContent && content.every(
-    (p: { type: string; result?: unknown }) => p.type !== 'tool-call' || p.result !== undefined,
+    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+      p.type !== 'tool-call' ||
+      p.toolName === 'sub_agent' ||
+      (p.result !== undefined && p.finishedAt !== undefined),
+  );
+
+  // A sub_agent is actively running when it has no result yet (or result but no finishedAt)
+  const hasRunnningSubAgent = isRunning && content.some(
+    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+      p.type === 'tool-call' && p.toolName === 'sub_agent' && p.finishedAt === undefined,
   );
 
   // Detect paused-for-input — a tool is awaiting user approval/answer
@@ -1104,8 +1134,9 @@ const AssistantMessage: FC = () => {
               <div className="aui-typing-dots">
                 <ThinkingSpinner />
               </div>
-              {/* Between-tool-calls spinner: all tools finished but model is still running */}
-              {allToolsDone && (
+              {/* Between-tool-calls spinner: all tools finished but model is still running,
+                  OR a sub-agent is actively working (parent model is blocked waiting on it) */}
+              {(allToolsDone || hasRunnningSubAgent) && (
                 <div className="mt-5 mb-2 timeline-detached">
                   <ThinkingSpinner />
                 </div>

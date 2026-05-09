@@ -87,7 +87,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: stri
 };
 
 export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ part, onSendFeedback, onPlanApproved }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(part.toolName === 'ask_user');
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
@@ -106,10 +106,6 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
   const isAgentTool = part.toolName === 'agent';
-  // Auto-expand on error or for agent tool calls (always show response)
-  useEffect(() => {
-    if (isError || isAgentTool) setExpanded(true);
-  }, [isError, isAgentTool]);
   const approvalStatus = localApproval ?? part.approvalStatus;
   const isPendingApproval = approvalStatus === 'pending' && !hasResult;
   const isAskUser = part.toolName === 'ask_user';
@@ -262,8 +258,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         <MiniCodePreview lines={miniPreview.lines} language={miniPreview.language} />
       )}
 
-      {/* Ask user questionnaire UI */}
-      {isPendingApproval && isAskUser && (
+      {/* Ask user questionnaire UI — collapsible, expanded by default */}
+      {expanded && isPendingApproval && isAskUser && (
         <QuestionnaireView
           toolCallId={part.approvalId ?? part.toolCallId}
           args={part.args}
@@ -271,13 +267,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
           onCancel={handleDismiss}
         />
       )}
-      {!isPendingApproval && isAskUser && approvalStatus !== 'dismissed' && (approvalStatus === 'approved' || hasResult) && (
-        <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
-          <CheckIcon className="h-3 w-3" />
-          <span>Answered</span>
-        </div>
-      )}
-      {!isPendingApproval && isAskUser && approvalStatus === 'dismissed' && (
+      {expanded && !isPendingApproval && isAskUser && approvalStatus === 'dismissed' && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-red-500 dark:text-red-400">
           <XIcon className="h-3 w-3" />
           <span>Dismissed</span>
@@ -373,11 +363,15 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       ) : isEdit ? (
         <EditInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isFileRead ? (
-        <ReadInlineView part={part} isRunning={isRunning} />
+        <ReadInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isGrepTool ? (
-        <GrepInlineView part={part} isRunning={isRunning} />
+        <GrepInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isGlobTool ? (
-        <GlobInlineView part={part} isRunning={isRunning} />
+        <GlobInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
+      ) : isAskUser && isError ? (
+        <AskUserErrorView result={part.result} />
+      ) : isAskUser && hasResult && !isError ? (
+        <AskUserAnswersView args={part.args} result={part.result} />
       ) : (
         <div className="tool-detail-code ml-5 mt-1 mb-2 pl-3">
           {/* Running spinner */}
@@ -428,6 +422,120 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
               )}
             </ToolSection>
           )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+/* ── Friendly error display for ask_user tool failures ── */
+
+function extractAskUserErrorMessage(result: unknown): string {
+  if (!result || typeof result !== 'object') return 'The question could not be displayed.';
+  const r = result as Record<string, unknown>;
+  const raw = typeof r.error === 'string' ? r.error : '';
+  // MCP validation error: extract the human-readable "message" fields from the JSON payload
+  const mcpMatch = raw.match(/Input validation error[^[]*(\[[\s\S]*\])/);
+  if (mcpMatch) {
+    try {
+      const issues = JSON.parse(mcpMatch[1]) as Array<{ message?: string; path?: unknown[] }>;
+      const msgs = issues
+        .map((i) => {
+          const pathStr = Array.isArray(i.path) ? i.path.join(' › ') : '';
+          return pathStr ? `${pathStr}: ${i.message ?? ''}` : (i.message ?? '');
+        })
+        .filter(Boolean);
+      if (msgs.length > 0) return msgs.join('\n');
+    } catch { /* fall through */ }
+  }
+  // Trim to a reasonable length
+  return raw.length > 200 ? raw.slice(0, 200) + '…' : raw || 'The question could not be displayed.';
+}
+
+const AskUserErrorView: FC<{ result: unknown }> = ({ result }) => {
+  const message = extractAskUserErrorMessage(result);
+  return (
+    <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+        <span className="text-foreground/80 font-semibold flex-1 font-sans">Responses</span>
+        <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive font-sans">
+          Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
+        </span>
+      </div>
+      <div className="px-3 py-2">
+        <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{message}</pre>
+      </div>
+    </div>
+  );
+};
+
+/** Renders submitted Q&A pairs from a completed ask_user result */
+const AskUserAnswersView: FC<{ args: unknown; result: unknown }> = ({ args, result }) => {
+  const questions = parseQuestions(args);
+
+  // Unwrap the result — it may arrive in several shapes:
+  //   1. { success: true, answers: { "Q": "A" } }
+  //   2. [{ type: "text", text: "{\"success\":true,\"answers\":{...}}" }]  (MCP text-content wrapper)
+  //   3. A plain JSON string
+  const unwrap = (raw: unknown): Record<string, string> | null => {
+    // Shape 1: direct object
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const r = raw as Record<string, unknown>;
+      if (r.answers && typeof r.answers === 'object') return r.answers as Record<string, string>;
+      // answers may itself be a JSON string
+      if (typeof r.answers === 'string') {
+        try { return JSON.parse(r.answers) as Record<string, string>; } catch { /* fall through */ }
+      }
+    }
+    // Shape 2: array of content parts
+    if (Array.isArray(raw)) {
+      for (const item of raw) {
+        if (item && typeof item === 'object' && (item as Record<string, unknown>).type === 'text') {
+          const text = (item as Record<string, unknown>).text;
+          if (typeof text === 'string') {
+            try {
+              const parsed = JSON.parse(text) as Record<string, unknown>;
+              if (parsed.answers && typeof parsed.answers === 'object') return parsed.answers as Record<string, string>;
+              if (typeof parsed.answers === 'string') return JSON.parse(parsed.answers) as Record<string, string>;
+            } catch { /* fall through */ }
+          }
+        }
+      }
+    }
+    // Shape 3: plain JSON string
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (parsed.answers && typeof parsed.answers === 'object') return parsed.answers as Record<string, string>;
+      } catch { /* fall through */ }
+    }
+    return null;
+  };
+
+  const answers = unwrap(result);
+  if (!answers || questions.length === 0) return null;
+
+  const answered = questions.filter((q) => answers[q.question]);
+
+  return (
+    <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+        <span className="text-foreground/80 font-semibold flex-1">Responses</span>
+        <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-emerald-500 tabular-nums">
+          [{answered.length}/{questions.length}] Answered
+          <CheckIcon className="h-2.5 w-2.5" />
+        </span>
+      </div>
+      {/* Q&A rows */}
+      {answered.map((q, i) => (
+        <div
+          key={q.question}
+          className={`px-3 py-2 ${i < answered.length - 1 ? 'border-b border-border/30 dark:border-white/[0.06]' : ''}`}
+        >
+          <div className="text-[10px] text-muted-foreground/40 truncate mb-0.5">{q.question}</div>
+          <div className="font-medium text-foreground/80">{answers[q.question]}</div>
         </div>
       ))}
     </div>
@@ -757,7 +865,7 @@ const PlanApprovalCard: FC<{
       {(approvalStatus === 'approved' || (hasResult && !isError)) && (
         <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
-          <span>Plan accepted — added to Task Queue</span>
+          <span>Plan accepted — added to Tasks</span>
           {createdTaskId && (
             <button
               type="button"
@@ -1535,6 +1643,11 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
         <div className="group/in flex items-center gap-2 px-3 py-2 border-b border-border/50 dark:border-white/10">
           <TerminalIcon className="h-3 w-3 text-violet-500 shrink-0" />
           <span className="text-foreground/75 truncate flex-1 leading-5">{command}</span>
+          {isError && (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive">
+              Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
+            </span>
+          )}
           <button
             type="button"
             onClick={handleCopy}
@@ -1625,7 +1738,7 @@ function parseReadContent(raw: string): { lines: string[]; startLine: number } {
   return { lines: allLines, startLine: 1 };
 }
 
-const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
   const fileData = useMemo(() => {
     const smart = detectSmartResult(part);
     return smart?.type === 'file_read' ? smart.data : null;
@@ -1695,6 +1808,10 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
           {isRunning ? (
             <span className="shrink-0 flex items-center gap-1 text-blue-400">
               <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : isError ? (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive">
+              Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
             </span>
           ) : totalLines > 0 ? (
             <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{rangeLabel}</span>
@@ -1809,7 +1926,7 @@ const ReadContentModal: FC<{ fileName: string; filePath: string; lines: string[]
 
 /* ── Grep Inline View ── */
 
-const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
   const args = part.args as Record<string, unknown>;
   const pattern = typeof args.pattern === 'string' ? args.pattern : '';
   const searchPath = typeof args.path === 'string' ? args.path : typeof args.cwd === 'string' ? args.cwd : '';
@@ -1885,6 +2002,10 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
           {isRunning ? (
             <span className="shrink-0 flex items-center gap-1 text-blue-400">
               <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : isError ? (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive">
+              Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
             </span>
           ) : allLines.length > 0 ? (
             <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">
@@ -2032,7 +2153,7 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
 
 /* ── Glob Inline View ── */
 
-const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
   const args = part.args as Record<string, unknown>;
   const pattern = typeof args.pattern === 'string' ? args.pattern : '';
   const searchPath = typeof args.path === 'string' ? args.path : '';
@@ -2073,6 +2194,10 @@ const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
           {isRunning ? (
             <span className="shrink-0 flex items-center gap-1 text-blue-400">
               <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : isError ? (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive">
+              Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
             </span>
           ) : files.length > 0 ? (
             <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{files.length} file{files.length !== 1 ? 's' : ''}</span>
@@ -2334,6 +2459,10 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             <span className="shrink-0 flex items-center gap-1 text-blue-400">
               <LoaderIcon className="h-3 w-3 animate-spin" />
             </span>
+          ) : isError ? (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-destructive">
+              Errored <AlertTriangleIcon className="h-2.5 w-2.5" />
+            </span>
           ) : (
             <span className="shrink-0 text-[11px] tabular-nums">
               {addedCount > 0 && <span className="text-emerald-500">+{addedCount}</span>}
@@ -2578,13 +2707,13 @@ function getToolIconColor(toolName: string): string {
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write')
     return 'bg-emerald-500/15 text-emerald-500';
   if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor')
-    return 'bg-amber-500/15 text-amber-500';
+    return 'bg-orange-500/15 text-orange-500';
   if (toolName === 'grep' || toolName === 'Grep' || toolName === 'mastra_workspace_grep')
     return 'bg-sky-500/15 text-sky-500';
   if (toolName === 'glob' || toolName === 'Glob' || toolName === 'mastra_workspace_glob' || toolName === 'glob_search' || toolName === 'list_directory' || toolName === 'mastra_workspace_list_files')
     return 'bg-indigo-500/15 text-indigo-500';
   if (toolName === 'ask_user')
-    return 'bg-orange-500/15 text-orange-500';
+    return 'bg-amber-500/15 text-amber-500';
   if (toolName === 'enter_plan_mode' || toolName === 'exit_plan_mode')
     return 'bg-primary/15 text-primary';
   if (toolName === 'agent' || toolName === 'agent_lattice_chat' || toolName === 'sub_agent')
