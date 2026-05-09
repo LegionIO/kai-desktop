@@ -118,6 +118,10 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const smartResult = hasResult && !isError ? detectSmartResult(part) : null;
   // For bash tools, detect even on error so we render IN/OUT box instead of raw JSON
   const isBashTool = part.toolName === 'sh' || part.toolName === 'bash' || part.toolName === 'mastra_workspace_execute_command';
+  const isEditTool = part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file'
+    || part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file'
+    || part.toolName === 'edit' || part.toolName === 'Edit' || part.toolName === 'write' || part.toolName === 'Write'
+    || part.toolName === 'str_replace_based_edit_tool' || part.toolName === 'str_replace_editor';
   const bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
@@ -175,7 +179,10 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const subtitle = getToolSubtitle(part);
   const miniPreview = getMiniCodePreview(part);
   // Use result shape to drive rendering — works regardless of tool name
-  const isBash = smartResult?.type === 'sh' || isBashTool;
+  // isEdit takes priority: a plain-string result from edit tools would otherwise
+  // match the sh shape detector (detectShResult accepts any non-empty string).
+  const isBash = !isEditTool && (smartResult?.type === 'sh' || isBashTool);
+  const isEdit = isEditTool;
   const isFileRead = smartResult?.type === 'file_read';
   const [fileModalOpen, setFileModalOpen] = useState(false);
 
@@ -248,8 +255,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         <div className="text-[11px] text-muted-foreground/50 pl-1.5 leading-snug -mt-0.5 mb-0.5">{subtitle}</div>
       )}
 
-      {/* Mini code preview for Write/Edit tools */}
-      {miniPreview && (
+      {/* Mini code preview for Write/Edit tools — hidden when EditInlineView is shown */}
+      {miniPreview && !isEdit && (
         <MiniCodePreview lines={miniPreview.lines} language={miniPreview.language} />
       )}
 
@@ -359,6 +366,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       {/* Collapsible tool content — expanded by default */}
       {expanded && (isBash ? (
         <BashInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
+      ) : isEdit ? (
+        <EditInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isFileRead ? (
         <>
           {isRunning && (
@@ -1545,6 +1554,238 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   );
 };
 
+/* ── Edit Diff Modal ── */
+
+type DiffLine = { text: string; type: 'added' | 'removed' | 'context' };
+
+const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLine[]; addedCount: number; removedCount: number; onClose: () => void }> = ({ fileName, filePath, diffLines, addedCount, removedCount, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+  const shortStat = [
+    addedCount > 0 ? <span key="a" className="text-emerald-400">+{addedCount}</span> : null,
+    addedCount > 0 && removedCount > 0 ? <span key="sep" className="text-muted-foreground/40"> / </span> : null,
+    removedCount > 0 ? <span key="r" className="text-red-400">−{removedCount}</span> : null,
+  ];
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        {/* Modal header */}
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
+          <FilePenIcon className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+          <span className="font-semibold text-foreground/90 truncate flex-1">{fileName}</span>
+          <span className="text-[11px] shrink-0 tabular-nums">{shortStat}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {/* Full path */}
+        {filePath && (
+          <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{filePath}</div>
+        )}
+        {/* Full diff */}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          <table className="w-full border-collapse">
+            <tbody>
+              {diffLines.map((line, i) => (
+                <tr key={i} className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}>
+                  <td className="select-none w-5 pl-3 pr-1 text-center text-[10px] font-bold shrink-0">
+                    {line.type === 'added' ? <span className="text-emerald-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
+                  </td>
+                  <td className={`pl-1 pr-4 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
+                    {line.text || ' '}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
+/* ── Edit / Write Inline View ── */
+
+const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
+  const args = part.args as Record<string, unknown>;
+  // Support both 'path' (local tools) and 'file_path' (Claude Code agent tools)
+  const rawPath = typeof args.file_path === 'string' ? args.file_path : typeof args.path === 'string' ? args.path : '';
+  const fileName = rawPath.split('/').pop() ?? rawPath;
+
+  const isWriteTool = part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file' || part.toolName === 'write' || part.toolName === 'Write';
+  const oldStr = typeof args.old_string === 'string' ? args.old_string : null;
+  const newStr = typeof args.new_string === 'string' ? args.new_string
+    : typeof args.new_content === 'string' ? args.new_content
+    : typeof args.content === 'string' ? args.content
+    : null;
+
+  const language = langFromPath(rawPath);
+
+  // Build an interleaved diff using a simple LCS-based Myers diff
+  const diffLines: DiffLine[] = useMemo(() => {
+    if (isWriteTool && newStr != null) {
+      return newStr.split('\n').map((text) => ({ text, type: 'added' as const }));
+    }
+    if (oldStr == null && newStr == null) return [];
+    if (oldStr == null) return (newStr ?? '').split('\n').map((text) => ({ text, type: 'added' as const }));
+    if (newStr == null) return oldStr.split('\n').map((text) => ({ text, type: 'removed' as const }));
+
+    const aLines = oldStr.split('\n');
+    const bLines = newStr.split('\n');
+
+    // Simple patience-style LCS diff for small inputs, fallback to block diff for large
+    if (aLines.length + bLines.length > 400) {
+      // Too large for LCS — just show removed block then added block
+      return [
+        ...aLines.map((text) => ({ text, type: 'removed' as const })),
+        ...bLines.map((text) => ({ text, type: 'added' as const })),
+      ];
+    }
+
+    // Myers diff via DP LCS
+    const m = aLines.length, n = bLines.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = m - 1; i >= 0; i--) {
+      for (let j = n - 1; j >= 0; j--) {
+        if (aLines[i] === bLines[j]) dp[i][j] = dp[i+1][j+1] + 1;
+        else dp[i][j] = Math.max(dp[i+1][j], dp[i][j+1]);
+      }
+    }
+    const result: DiffLine[] = [];
+    let i = 0, j = 0;
+    while (i < m || j < n) {
+      if (i < m && j < n && aLines[i] === bLines[j]) {
+        result.push({ text: aLines[i], type: 'context' });
+        i++; j++;
+      } else if (j < n && (i >= m || dp[i][j+1] >= dp[i+1][j])) {
+        result.push({ text: bLines[j], type: 'added' });
+        j++;
+      } else {
+        result.push({ text: aLines[i], type: 'removed' });
+        i++;
+      }
+    }
+    return result;
+  }, [isWriteTool, oldStr, newStr]);
+
+  const PREVIEW_LINES = 3;
+  const hasMore = diffLines.length > PREVIEW_LINES;
+  const previewLines = hasMore ? diffLines.slice(0, PREVIEW_LINES) : diffLines;
+
+  const addedCount = diffLines.filter((l) => l.type === 'added').length;
+  const removedCount = diffLines.filter((l) => l.type === 'removed').length;
+
+  // Result message (success string or error)
+  const resultObj = part.result && typeof part.result === 'object' ? part.result as Record<string, unknown> : null;
+  const resultStr = typeof part.result === 'string' ? part.result : null;
+  const errorMessage = isError
+    ? (resultObj ? String(resultObj.error ?? resultObj.message ?? JSON.stringify(part.result)) : resultStr ?? '')
+        .replace(/<tool_use_error>/g, '').replace(/<\/tool_use_error>/g, '').trim()
+    : null;
+
+  const [diffModalOpen, setDiffModalOpen] = useState(false);
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* Header: filename + +N/-N counts */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+          <span className="text-foreground/80 font-semibold truncate flex-1">{fileName || rawPath}</span>
+          {isRunning ? (
+            <span className="shrink-0 flex items-center gap-1 text-blue-400">
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : (
+            <span className="shrink-0 text-[11px] tabular-nums">
+              {addedCount > 0 && <span className="text-emerald-500">+{addedCount}</span>}
+              {addedCount > 0 && removedCount > 0 && <span className="text-muted-foreground/40"> / </span>}
+              {removedCount > 0 && <span className="text-red-400">−{removedCount}</span>}
+            </span>
+          )}
+        </div>
+        {/* Full file path */}
+        {rawPath && (
+          <div className="px-3 py-1 text-[10px] text-muted-foreground/40 border-b border-border/30 dark:border-white/[0.06] truncate">{rawPath}</div>
+        )}
+
+        {/* Diff preview lines */}
+        {diffLines.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <tbody>
+                {previewLines.map((line, i) => (
+                  <tr
+                    key={i}
+                    className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}
+                  >
+                    <td className="select-none w-5 pl-2 pr-1 text-center shrink-0 text-[10px] font-bold">
+                      {line.type === 'added' ? (
+                        <span className="text-emerald-500">+</span>
+                      ) : line.type === 'removed' ? (
+                        <span className="text-red-500">−</span>
+                      ) : null}
+                    </td>
+                    <td className={`pl-1 pr-3 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
+                      {line.text || ' '}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Click to expand — shown when there are more than 3 lines */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{diffLines.length - PREVIEW_LINES} more line{diffLines.length - PREVIEW_LINES !== 1 ? 's' : ''}</span>
+            <button
+              type="button"
+              onClick={() => setDiffModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
+
+        {/* Error or no-diff state */}
+        {errorMessage && (
+          <div className="px-3 py-2 text-destructive whitespace-pre-wrap break-all leading-5">{errorMessage}</div>
+        )}
+        {!isRunning && diffLines.length === 0 && !errorMessage && (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">No changes</div>
+        )}
+      </div>
+
+      {diffModalOpen && (
+        <EditDiffModal
+          fileName={fileName || rawPath}
+          filePath={rawPath}
+          diffLines={diffLines}
+          addedCount={addedCount}
+          removedCount={removedCount}
+          onClose={() => setDiffModalOpen(false)}
+        />
+      )}
+    </>
+
+  );
+};
+
 /* ── Tool Section (always-open label + content) ── */
 
 const ToolSection: FC<{ title: string; badge?: React.ReactNode; children: React.ReactNode }> = ({ title, badge, children }) => {
@@ -1575,8 +1816,14 @@ const toolLabels: Record<string, string> = {
   mastra_workspace_read_file: 'Read',
   file_write: 'Write',
   mastra_workspace_write_file: 'Write',
+  write: 'Write',
+  Write: 'Write',
   file_edit: 'Edit',
   mastra_workspace_edit_file: 'Edit',
+  edit: 'Edit',
+  Edit: 'Edit',
+  str_replace_based_edit_tool: 'Edit',
+  str_replace_editor: 'Edit',
   grep: 'Grep',
   mastra_workspace_grep: 'Grep',
   glob: 'Glob',
@@ -1606,8 +1853,8 @@ type LucideIcon = FC<{ className?: string }>;
 function getToolIcon(toolName: string): LucideIcon {
   if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command') return TerminalIcon;
   if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file') return FileTextIcon;
-  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file') return FileIcon;
-  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file') return FilePenIcon;
+  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write') return FileIcon;
+  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor') return FilePenIcon;
   if (toolName === 'grep' || toolName === 'mastra_workspace_grep') return SearchIcon;
   if (toolName === 'glob') return FolderOpenIcon;
   if (toolName === 'list_directory' || toolName === 'mastra_workspace_list_files') return FolderIcon;
@@ -1625,9 +1872,9 @@ function getToolIconColor(toolName: string): string {
     return 'bg-violet-500/15 text-violet-500';
   if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file')
     return 'bg-blue-500/15 text-blue-500';
-  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file')
+  if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write')
     return 'bg-emerald-500/15 text-emerald-500';
-  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file')
+  if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor')
     return 'bg-amber-500/15 text-amber-500';
   if (toolName === 'grep' || toolName === 'mastra_workspace_grep')
     return 'bg-sky-500/15 text-sky-500';
@@ -1661,8 +1908,12 @@ function getToolSummary(part: ToolCallPart): string {
     if (offset != null) return `${fileName} (from line ${offset})`;
     return fileName;
   }
-  if ((part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file') && args.path) return String(args.path).split('/').pop() ?? '';
-  if ((part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file') && args.path) return String(args.path).split('/').pop() ?? '';
+  const isWriteToolName = part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file' || part.toolName === 'write' || part.toolName === 'Write';
+  const isEditToolName = part.toolName === 'file_edit' || part.toolName === 'mastra_workspace_edit_file' || part.toolName === 'edit' || part.toolName === 'Edit' || part.toolName === 'str_replace_based_edit_tool' || part.toolName === 'str_replace_editor';
+  // Support both 'path' and 'file_path' arg names
+  const filePath = typeof args.path === 'string' ? args.path : typeof args.file_path === 'string' ? args.file_path : null;
+  if (isWriteToolName && filePath) return filePath.split('/').pop() ?? '';
+  if (isEditToolName && filePath) return filePath.split('/').pop() ?? '';
   if ((part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') && args.pattern) return `/${args.pattern}/`;
   if ((part.toolName === 'glob') && args.pattern) return String(args.pattern);
   if ((part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') && args.path) return String(args.path);
