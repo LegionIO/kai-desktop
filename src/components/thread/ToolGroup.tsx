@@ -122,6 +122,12 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
     || part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file'
     || part.toolName === 'edit' || part.toolName === 'Edit' || part.toolName === 'write' || part.toolName === 'Write'
     || part.toolName === 'str_replace_based_edit_tool' || part.toolName === 'str_replace_editor';
+  const isReadTool = part.toolName === 'file_read' || part.toolName === 'read' || part.toolName === 'Read'
+    || part.toolName === 'mastra_workspace_read_file';
+  const isGrepToolName = part.toolName === 'grep' || part.toolName === 'Grep'
+    || part.toolName === 'mastra_workspace_grep' || part.toolName === 'grep_search';
+  const isGlobToolName = part.toolName === 'glob' || part.toolName === 'Glob'
+    || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search';
   const bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
@@ -181,10 +187,11 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   // Use result shape to drive rendering — works regardless of tool name
   // isEdit takes priority: a plain-string result from edit tools would otherwise
   // match the sh shape detector (detectShResult accepts any non-empty string).
-  const isBash = !isEditTool && (smartResult?.type === 'sh' || isBashTool);
+  const isBash = !isEditTool && !isReadTool && !isGrepToolName && !isGlobToolName && (smartResult?.type === 'sh' || isBashTool);
   const isEdit = isEditTool;
-  const isFileRead = smartResult?.type === 'file_read';
-  const [fileModalOpen, setFileModalOpen] = useState(false);
+  const isFileRead = isReadTool || smartResult?.type === 'file_read';
+  const isGrepTool = isGrepToolName;
+  const isGlobTool = isGlobToolName;
 
   const ToolIcon = getToolIcon(part.toolName);
   const iconColor = getToolIconColor(part.toolName);
@@ -208,19 +215,9 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         {/* Separator dot */}
         {summary && <span className="text-muted-foreground/30 text-[10px] shrink-0">·</span>}
 
-        {/* Inline arg summary — clickable for file_read (opens modal), plain text otherwise */}
+        {/* Inline arg summary */}
         {summary && (
-          isFileRead && hasResult ? (
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); setFileModalOpen(true); }}
-              className="text-xs text-muted-foreground/70 truncate min-w-0 font-mono leading-none hover:text-foreground/80 hover:underline underline-offset-2 transition-colors text-left"
-            >
-              {summary}
-            </button>
-          ) : (
-            <span className="text-xs text-muted-foreground/70 truncate min-w-0 font-mono leading-none">{summary}</span>
-          )
+          <span className="text-xs text-muted-foreground/70 truncate min-w-0 font-mono leading-none">{summary}</span>
         )}
 
         {/* Spacer */}
@@ -369,17 +366,11 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
       ) : isEdit ? (
         <EditInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isFileRead ? (
-        <>
-          {isRunning && (
-            <div className="ml-5 pl-3 py-1.5 flex items-center gap-2">
-              <LoaderIcon className="h-3.5 w-3.5 animate-spin text-blue-500" />
-              <span className="text-xs text-blue-600 dark:text-blue-400">Reading…</span>
-            </div>
-          )}
-          {fileModalOpen && (
-            <FileContentModal part={part} onClose={() => setFileModalOpen(false)} />
-          )}
-        </>
+        <ReadInlineView part={part} isRunning={isRunning} />
+      ) : isGrepTool ? (
+        <GrepInlineView part={part} isRunning={isRunning} />
+      ) : isGlobTool ? (
+        <GlobInlineView part={part} isRunning={isRunning} />
       ) : (
         <div className="tool-detail-code ml-5 mt-1 mb-2 pl-3">
           {/* Running spinner */}
@@ -1554,6 +1545,467 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   );
 };
 
+/* ── Read Inline View ── */
+
+/** Parse a plain-string Read result that may have embedded line numbers.
+ *  Claude Code emits: "1\tcontent\n2\tcontent\n..."
+ *  Returns { lines, startLine } where startLine is the first line number found (default 1).
+ *  If the format isn't detected, returns raw lines with startLine=1.
+ */
+function parseReadContent(raw: string): { lines: string[]; startLine: number } {
+  if (!raw) return { lines: [], startLine: 1 };
+  const allLines = raw.split('\n');
+  // Detect embedded line numbers: "N\t..." or "N  ..." where N is a number at the start
+  const numberedRe = /^(\d+)\t(.*)/;
+  const firstMatch = numberedRe.exec(allLines[0]);
+  if (firstMatch) {
+    const startLine = parseInt(firstMatch[1], 10);
+    const parsed = allLines.map((l) => {
+      const m = numberedRe.exec(l);
+      return m ? m[2] : l;
+    });
+    return { lines: parsed, startLine };
+  }
+  return { lines: allLines, startLine: 1 };
+}
+
+const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  const fileData = useMemo(() => {
+    const smart = detectSmartResult(part);
+    return smart?.type === 'file_read' ? smart.data : null;
+  }, [part]);
+
+  const args = part.args as Record<string, unknown>;
+  const rawPath = fileData?.path
+    ?? (typeof args.path === 'string' ? args.path : typeof args.file_path === 'string' ? args.file_path : '');
+  const fileName = rawPath.split('/').pop() ?? rawPath;
+
+  // Result can be a shaped {content,path} object, a plain string (Claude Code Read tool),
+  // an observer-wrapped { value: string }, or an array of content blocks [{ type:'text', text }].
+  const resultValue = useMemo(() => {
+    if (typeof part.result === 'string') return part.result;
+    if (Array.isArray(part.result)) {
+      // Anthropic tool_result content blocks: [{ type: 'text', text: '...' }]
+      return (part.result as Array<Record<string, unknown>>)
+        .filter((b) => b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text as string)
+        .join('\n') || null;
+    }
+    if (part.result && typeof part.result === 'object') {
+      const r = part.result as Record<string, unknown>;
+      // Observer-wrapped: { value: "...", observer: ... }
+      if (typeof r.value === 'string') return r.value;
+    }
+    return null;
+  }, [part.result]);
+
+  const rawContent = fileData?.content ?? resultValue ?? '';
+
+  const { lines, startLine } = useMemo(() => parseReadContent(rawContent), [rawContent]);
+  const totalLines = fileData?.totalLines ?? lines.length;
+  const truncated = fileData?.truncated ?? false;
+  const endLine = startLine + lines.length - 1;
+  const rangeLabel = lines.length > 0
+    ? `lines ${startLine}–${endLine}${truncated ? ' (truncated)' : ''}`
+    : '';
+
+  const PREVIEW_LINES = 3;
+  const previewLines = lines.slice(0, PREVIEW_LINES);
+  const hasMore = lines.length > PREVIEW_LINES || truncated;
+
+  const [modalOpen, setModalOpen] = useState(false);
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* Header */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+          <span className="text-foreground/80 font-semibold truncate flex-1">{fileName || rawPath}</span>
+          {isRunning ? (
+            <span className="shrink-0 flex items-center gap-1 text-blue-400">
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : totalLines > 0 ? (
+            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{rangeLabel}</span>
+          ) : null}
+        </div>
+        {/* Full path */}
+        {rawPath && (
+          <div className="px-3 py-1 text-[10px] text-muted-foreground/40 border-b border-border/30 dark:border-white/[0.06] truncate">{rawPath}</div>
+        )}
+        {/* Preview lines */}
+        {!isRunning && previewLines.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <tbody>
+                {previewLines.map((line, i) => (
+                  <tr key={i}>
+                    <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">{startLine + i}</td>
+                    <td className="pl-3 pr-3 py-px whitespace-pre leading-5 text-foreground/75">{line || ' '}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {/* Click to expand */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{lines.length - PREVIEW_LINES > 0 ? `${lines.length - PREVIEW_LINES} more line${lines.length - PREVIEW_LINES !== 1 ? 's' : ''}` : 'truncated'}</span>
+            <button
+              type="button"
+              onClick={() => setModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
+        {!isRunning && lines.length === 0 && (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">Empty file</div>
+        )}
+      </div>
+      {modalOpen && (
+        <ReadContentModal
+          fileName={fileName || rawPath}
+          filePath={rawPath}
+          lines={lines}
+          startLine={startLine}
+          truncated={truncated}
+          onClose={() => setModalOpen(false)}
+        />
+      )}
+    </>
+  );
+};
+
+const ReadContentModal: FC<{ fileName: string; filePath: string; lines: string[]; startLine: number; truncated: boolean; onClose: () => void }> = ({ fileName, filePath, lines, startLine, truncated, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+  const endLine = startLine + lines.length - 1;
+  const rangeLabel = lines.length > 0
+    ? `lines ${startLine}–${endLine}${truncated ? ' (truncated)' : ''}`
+    : '';
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        {/* Header */}
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
+          <FileTextIcon className="h-3.5 w-3.5 text-blue-500 shrink-0" />
+          <span className="font-semibold text-foreground/90 truncate flex-1">{fileName}</span>
+          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{rangeLabel}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {/* Full path */}
+        {filePath && (
+          <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{filePath}</div>
+        )}
+        {/* Content */}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          <table className="w-full border-collapse">
+            <tbody>
+              {lines.map((line, i) => (
+                <tr key={i}>
+                  <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">{startLine + i}</td>
+                  <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80">{line || ' '}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
+/* ── Grep Inline View ── */
+
+const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  const args = part.args as Record<string, unknown>;
+  const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+  const searchPath = typeof args.path === 'string' ? args.path : typeof args.cwd === 'string' ? args.cwd : '';
+
+  // Parse result — grep returns { matches: [{file, line, content}] } or plain string output
+  const result = part.result;
+  type GrepMatch = { file?: string; line?: number; content?: string; text?: string };
+  const matches: GrepMatch[] = useMemo(() => {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return [];
+    const r = result as Record<string, unknown>;
+    if (Array.isArray(r.matches)) return r.matches as GrepMatch[];
+    // Plain string output — split into lines
+    if (typeof r.output === 'string') {
+      return r.output.split('\n').filter(Boolean).map((l) => ({ text: l }));
+    }
+    return [];
+  }, [result]);
+
+  // Plain string result (e.g. raw grep output)
+  const rawOutput = typeof result === 'string' ? result : null;
+  const outputLines = rawOutput ? rawOutput.split('\n').filter(Boolean) : [];
+
+  type GrepLine = { file?: string; line?: number; text: string };
+  const allLines: GrepLine[] = matches.length > 0
+    ? matches.map((m) => ({ file: m.file, line: m.line, text: m.content ?? m.text ?? '' }))
+    : outputLines.map((l) => ({ text: l }));
+
+  const PREVIEW_LINES = 3;
+  const hasMore = allLines.length > PREVIEW_LINES;
+  const previewItems = allLines.slice(0, PREVIEW_LINES);
+  const [modalOpen, setModalOpen] = useState(false);
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* Header */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+          <span className="text-foreground/80 font-semibold truncate flex-1">/{pattern}/</span>
+          {isRunning ? (
+            <span className="shrink-0 flex items-center gap-1 text-blue-400">
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : allLines.length > 0 ? (
+            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{allLines.length} match{allLines.length !== 1 ? 'es' : ''}</span>
+          ) : null}
+        </div>
+        {/* Search path */}
+        {searchPath && (
+          <div className="px-3 py-1 text-[10px] text-muted-foreground/40 border-b border-border/30 dark:border-white/[0.06] truncate">{searchPath}</div>
+        )}
+        {/* Preview matches */}
+        {!isRunning && previewItems.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <tbody>
+                {previewItems.map((item, i) => (
+                  <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
+                    {item.file && (
+                      <td className="select-none pl-2 pr-1 text-[10px] text-muted-foreground/40 whitespace-nowrap shrink-0 truncate max-w-[120px]">{item.file.split('/').pop()}</td>
+                    )}
+                    {item.line != null && (
+                      <td className="select-none pr-3 text-[10px] text-muted-foreground/30 tabular-nums shrink-0">{item.line}</td>
+                    )}
+                    <td className="pl-2 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full">{item.text || ' '}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {/* Click to expand */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{allLines.length - PREVIEW_LINES} more match{allLines.length - PREVIEW_LINES !== 1 ? 'es' : ''}</span>
+            <button
+              type="button"
+              onClick={() => setModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
+        {!isRunning && allLines.length === 0 && (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">No matches</div>
+        )}
+      </div>
+      {modalOpen && (
+        <GrepResultModal pattern={pattern} searchPath={searchPath} allLines={allLines} onClose={() => setModalOpen(false)} />
+      )}
+    </>
+  );
+};
+
+const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { file?: string; line?: number; text: string }[]; onClose: () => void }> = ({ pattern, searchPath, allLines, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
+          <SearchIcon className="h-3.5 w-3.5 text-sky-500 shrink-0" />
+          <span className="font-semibold text-foreground/90 truncate flex-1">/{pattern}/</span>
+          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{allLines.length} match{allLines.length !== 1 ? 'es' : ''}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {searchPath && (
+          <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{searchPath}</div>
+        )}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          <table className="w-full border-collapse">
+            <tbody>
+              {allLines.map((item, i) => (
+                <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
+                  {item.file && (
+                    <td className="select-none pl-3 pr-2 py-px text-[10px] text-muted-foreground/40 whitespace-nowrap shrink-0 truncate max-w-[140px]">{item.file.split('/').pop()}</td>
+                  )}
+                  {item.line != null && (
+                    <td className="select-none pr-3 py-px text-[10px] text-muted-foreground/30 tabular-nums shrink-0 text-right">{item.line}</td>
+                  )}
+                  <td className="pl-2 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full">{item.text || ' '}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
+/* ── Glob Inline View ── */
+
+const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  const args = part.args as Record<string, unknown>;
+  const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+  const searchPath = typeof args.path === 'string' ? args.path : '';
+
+  // Result can be:
+  //   - an array of file path strings (Claude Code Glob)
+  //   - { files: string[], count: number, path?: string } (Mastra workspace glob)
+  //   - a plain string listing of files
+  const result = part.result;
+  const files: string[] = useMemo(() => {
+    if (!result) return [];
+    if (Array.isArray(result)) return (result as unknown[]).map(String);
+    if (typeof result === 'object' && result !== null) {
+      const r = result as Record<string, unknown>;
+      if (Array.isArray(r.files)) return (r.files as unknown[]).map(String);
+    }
+    if (typeof result === 'string') return result.split('\n').filter(Boolean);
+    return [];
+  }, [result]);
+
+  const PREVIEW_COUNT = 5;
+  const previewFiles = files.slice(0, PREVIEW_COUNT);
+  const hasMore = files.length > PREVIEW_COUNT;
+  const [modalOpen, setModalOpen] = useState(false);
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* Header */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+          <span className="text-foreground/80 font-semibold truncate flex-1">{pattern || '*'}</span>
+          {isRunning ? (
+            <span className="shrink-0 flex items-center gap-1 text-blue-400">
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : files.length > 0 ? (
+            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{files.length} file{files.length !== 1 ? 's' : ''}</span>
+          ) : null}
+        </div>
+        {/* Search path */}
+        {searchPath && (
+          <div className="px-3 py-1 text-[10px] text-muted-foreground/40 border-b border-border/30 dark:border-white/[0.06] truncate">{searchPath}</div>
+        )}
+        {/* Preview files */}
+        {!isRunning && previewFiles.length > 0 && (
+          <div className="divide-y divide-border/20 dark:divide-white/[0.04]">
+            {previewFiles.map((filePath, i) => (
+              <div key={i} className="flex items-center gap-1.5 px-3 py-0.5">
+                <FileIcon className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+                <ClickablePath path={filePath} className="text-foreground/75 truncate" />
+              </div>
+            ))}
+          </div>
+        )}
+        {/* Click to expand */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{files.length - PREVIEW_COUNT} more file{files.length - PREVIEW_COUNT !== 1 ? 's' : ''}</span>
+            <button
+              type="button"
+              onClick={() => setModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
+        {!isRunning && files.length === 0 && (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">No files found</div>
+        )}
+      </div>
+      {modalOpen && (
+        <GlobResultModal pattern={pattern} searchPath={searchPath} files={files} onClose={() => setModalOpen(false)} />
+      )}
+    </>
+  );
+};
+
+const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]; onClose: () => void }> = ({ pattern, searchPath, files, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-2xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
+          <FolderOpenIcon className="h-3.5 w-3.5 text-indigo-500 shrink-0" />
+          <span className="font-semibold text-foreground/90 truncate flex-1">{pattern || '*'}</span>
+          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{files.length} file{files.length !== 1 ? 's' : ''}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {searchPath && (
+          <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{searchPath}</div>
+        )}
+        <div className="overflow-y-auto flex-1 divide-y divide-border/10 dark:divide-white/[0.04]">
+          {files.map((filePath, i) => (
+            <div key={i} className="flex items-center gap-2 px-4 py-1">
+              <FileIcon className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+              <ClickablePath path={filePath} className="text-foreground/80 truncate" />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
 /* ── Edit Diff Modal ── */
 
 type DiffLine = { text: string; type: 'added' | 'removed' | 'context' };
@@ -1597,16 +2049,25 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
         <div className="overflow-y-auto overflow-x-auto flex-1">
           <table className="w-full border-collapse">
             <tbody>
-              {diffLines.map((line, i) => (
-                <tr key={i} className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}>
-                  <td className="select-none w-5 pl-3 pr-1 text-center text-[10px] font-bold shrink-0">
-                    {line.type === 'added' ? <span className="text-emerald-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
-                  </td>
-                  <td className={`pl-1 pr-4 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
-                    {line.text || ' '}
-                  </td>
-                </tr>
-              ))}
+              {diffLines.map((line, i) => {
+                let newN = 1;
+                for (let k = 0; k < i; k++) {
+                  if (diffLines[k].type !== 'removed') newN++;
+                }
+                return (
+                  <tr key={i} className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}>
+                    <td className="select-none w-10 pl-3 pr-2 text-right text-[10px] text-muted-foreground/25 tabular-nums shrink-0 border-r border-border/15">
+                      {line.type !== 'removed' ? newN : ''}
+                    </td>
+                    <td className="select-none w-5 pl-1 pr-1 text-center text-[10px] font-bold shrink-0">
+                      {line.type === 'added' ? <span className="text-emerald-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
+                    </td>
+                    <td className={`pl-1 pr-4 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
+                      {line.text || ' '}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1725,23 +2186,32 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
           <div className="overflow-x-auto">
             <table className="w-full border-collapse">
               <tbody>
-                {previewLines.map((line, i) => (
-                  <tr
-                    key={i}
-                    className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}
-                  >
-                    <td className="select-none w-5 pl-2 pr-1 text-center shrink-0 text-[10px] font-bold">
-                      {line.type === 'added' ? (
-                        <span className="text-emerald-500">+</span>
-                      ) : line.type === 'removed' ? (
-                        <span className="text-red-500">−</span>
-                      ) : null}
-                    </td>
-                    <td className={`pl-1 pr-3 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
-                      {line.text || ' '}
-                    </td>
-                  </tr>
-                ))}
+                {previewLines.map((line, i) => {
+                  let newN = 1;
+                  for (let k = 0; k < i; k++) {
+                    if (previewLines[k].type !== 'removed') newN++;
+                  }
+                  return (
+                    <tr
+                      key={i}
+                      className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}
+                    >
+                      <td className="select-none w-8 pl-2 pr-2 text-right text-[10px] text-muted-foreground/25 tabular-nums shrink-0 border-r border-border/15">
+                        {line.type !== 'removed' ? newN : ''}
+                      </td>
+                      <td className="select-none w-4 pl-1 text-center shrink-0 text-[10px] font-bold">
+                        {line.type === 'added' ? (
+                          <span className="text-emerald-500">+</span>
+                        ) : line.type === 'removed' ? (
+                          <span className="text-red-500">−</span>
+                        ) : null}
+                      </td>
+                      <td className={`pl-1 pr-3 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
+                        {line.text || ' '}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1813,6 +2283,8 @@ const toolLabels: Record<string, string> = {
   bash: 'Bash',
   mastra_workspace_execute_command: 'Bash',
   file_read: 'Read',
+  read: 'Read',
+  Read: 'Read',
   mastra_workspace_read_file: 'Read',
   file_write: 'Write',
   mastra_workspace_write_file: 'Write',
@@ -1825,8 +2297,12 @@ const toolLabels: Record<string, string> = {
   str_replace_based_edit_tool: 'Edit',
   str_replace_editor: 'Edit',
   grep: 'Grep',
+  Grep: 'Grep',
   mastra_workspace_grep: 'Grep',
   glob: 'Glob',
+  Glob: 'Glob',
+  mastra_workspace_glob: 'Glob',
+  glob_search: 'Glob',
   list_directory: 'List Directory',
   mastra_workspace_list_files: 'List Files',
   agent_lattice_chat: 'Agent',
@@ -1852,11 +2328,11 @@ type LucideIcon = FC<{ className?: string }>;
 
 function getToolIcon(toolName: string): LucideIcon {
   if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command') return TerminalIcon;
-  if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file') return FileTextIcon;
+  if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file') return FileTextIcon;
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write') return FileIcon;
   if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor') return FilePenIcon;
-  if (toolName === 'grep' || toolName === 'mastra_workspace_grep') return SearchIcon;
-  if (toolName === 'glob') return FolderOpenIcon;
+  if (toolName === 'grep' || toolName === 'Grep' || toolName === 'mastra_workspace_grep') return SearchIcon;
+  if (toolName === 'glob' || toolName === 'Glob' || toolName === 'mastra_workspace_glob' || toolName === 'glob_search') return FolderOpenIcon;
   if (toolName === 'list_directory' || toolName === 'mastra_workspace_list_files') return FolderIcon;
   if (toolName === 'ask_user') return HelpCircleIcon;
   if (toolName === 'enter_plan_mode') return ListTodoIcon;
@@ -1870,15 +2346,15 @@ function getToolIcon(toolName: string): LucideIcon {
 function getToolIconColor(toolName: string): string {
   if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command')
     return 'bg-violet-500/15 text-violet-500';
-  if (toolName === 'file_read' || toolName === 'mastra_workspace_read_file')
+  if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file')
     return 'bg-blue-500/15 text-blue-500';
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write')
     return 'bg-emerald-500/15 text-emerald-500';
   if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor')
     return 'bg-amber-500/15 text-amber-500';
-  if (toolName === 'grep' || toolName === 'mastra_workspace_grep')
+  if (toolName === 'grep' || toolName === 'Grep' || toolName === 'mastra_workspace_grep')
     return 'bg-sky-500/15 text-sky-500';
-  if (toolName === 'glob' || toolName === 'list_directory' || toolName === 'mastra_workspace_list_files')
+  if (toolName === 'glob' || toolName === 'Glob' || toolName === 'mastra_workspace_glob' || toolName === 'glob_search' || toolName === 'list_directory' || toolName === 'mastra_workspace_list_files')
     return 'bg-indigo-500/15 text-indigo-500';
   if (toolName === 'ask_user')
     return 'bg-orange-500/15 text-orange-500';
@@ -1900,8 +2376,22 @@ function getToolSummary(part: ToolCallPart): string {
     if (shellWrapped) return shellWrapped[1].slice(0, 80);
     return raw.slice(0, 80);
   }
-  if ((part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') && args.path) {
-    const fileName = String(args.path).split('/').pop() ?? '';
+  if ((part.toolName === 'file_read' || part.toolName === 'read' || part.toolName === 'Read' || part.toolName === 'mastra_workspace_read_file') && (args.path || args.file_path)) {
+    const filePath = String(args.path ?? args.file_path ?? '');
+    const fileName = filePath.split('/').pop() ?? '';
+    // Try to derive line range from the result first (most accurate)
+    if (part.result !== undefined && !part.isError) {
+      const rawStr = typeof part.result === 'string' ? part.result
+        : Array.isArray(part.result)
+          ? (part.result as Array<Record<string, unknown>>).filter((b) => b.type === 'text' && typeof b.text === 'string').map((b) => b.text as string).join('\n')
+          : typeof part.result === 'object' && part.result !== null ? (() => { const r = part.result as Record<string, unknown>; return typeof r.value === 'string' ? r.value : typeof r.content === 'string' ? r.content : null; })()
+          : null;
+      if (rawStr) {
+        const { lines, startLine } = parseReadContent(rawStr);
+        if (lines.length > 0) return `${fileName} (lines ${startLine}–${startLine + lines.length - 1})`;
+      }
+    }
+    // Fall back to args when result not yet available
     const offset = typeof args.offset === 'number' ? args.offset : null;
     const limit = typeof args.limit === 'number' ? args.limit : null;
     if (offset != null && limit != null) return `${fileName} (lines ${offset}–${offset + limit - 1})`;
@@ -1914,8 +2404,8 @@ function getToolSummary(part: ToolCallPart): string {
   const filePath = typeof args.path === 'string' ? args.path : typeof args.file_path === 'string' ? args.file_path : null;
   if (isWriteToolName && filePath) return filePath.split('/').pop() ?? '';
   if (isEditToolName && filePath) return filePath.split('/').pop() ?? '';
-  if ((part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') && args.pattern) return `/${args.pattern}/`;
-  if ((part.toolName === 'glob') && args.pattern) return String(args.pattern);
+  if ((part.toolName === 'grep' || part.toolName === 'Grep' || part.toolName === 'mastra_workspace_grep' || part.toolName === 'grep_search') && args.pattern) return `/${args.pattern}/`;
+  if ((part.toolName === 'glob' || part.toolName === 'Glob' || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search') && args.pattern) return String(args.pattern);
   if ((part.toolName === 'list_directory' || part.toolName === 'mastra_workspace_list_files') && args.path) return String(args.path);
   if (part.toolName === 'agent_lattice_chat') return 'Remote agent call';
   if (part.toolName === 'generate_image' && args.prompt) return String(args.prompt).slice(0, 60);
@@ -1934,17 +2424,6 @@ function getToolSubtitle(part: ToolCallPart): string {
   if (!part.result || part.isError) return '';
   const result = part.result as Record<string, unknown>;
   const args = part.args as Record<string, unknown>;
-
-  // file_read → "Read N lines"
-  if (part.toolName === 'file_read' || part.toolName === 'mastra_workspace_read_file') {
-    if (typeof result.totalLines === 'number') {
-      return `Read ${result.totalLines} line${result.totalLines !== 1 ? 's' : ''}${result.truncated ? ' (truncated)' : ''}`;
-    }
-    if (typeof result.content === 'string') {
-      const lines = result.content.split('\n').length;
-      return `Read ${lines} line${lines !== 1 ? 's' : ''}`;
-    }
-  }
 
   // file_write → "Wrote N lines" or "Wrote file"
   if (part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file') {
@@ -1977,9 +2456,11 @@ function getToolSubtitle(part: ToolCallPart): string {
   }
 
   // glob → "N files"
-  if (part.toolName === 'glob') {
+  if (part.toolName === 'glob' || part.toolName === 'Glob' || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search') {
     if (typeof result.count === 'number') return `${result.count} file${result.count !== 1 ? 's' : ''}`;
     if (Array.isArray(result.files)) return `${result.files.length} file${result.files.length !== 1 ? 's' : ''}`;
+    // Claude Code returns a plain array as the result
+    if (Array.isArray(part.result)) return `${(part.result as unknown[]).length} file${(part.result as unknown[]).length !== 1 ? 's' : ''}`;
   }
 
   // list_directory → "N items"
