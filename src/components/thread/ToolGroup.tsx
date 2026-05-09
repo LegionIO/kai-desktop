@@ -2425,6 +2425,8 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
 /* ── Agent inline view — renders sub-agent response as assistant-style text ── */
 
 const AgentInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  const [promptOpen, setPromptOpen] = useState(false);
+
   // Extract text content from result (array of {type: "text", text: "..."} blocks)
   const responseText = useMemo(() => {
     if (!part.result) return null;
@@ -2444,11 +2446,21 @@ const AgentInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part,
 
   return (
     <div className="mt-1.5 mb-2 ml-1 rounded-xl border border-border/50 bg-muted/20 overflow-hidden">
-      {/* Prompt row */}
+      {/* Prompt toggle */}
       {prompt && (
-        <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
-          <div className="text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider mb-1">Prompt</div>
-          <div className="text-xs text-muted-foreground/80 leading-5 line-clamp-3">{prompt}</div>
+        <div className="border-b border-border/30">
+          <button
+            onClick={() => setPromptOpen((o) => !o)}
+            className="w-full flex items-center gap-1.5 px-3 py-1.5 text-left hover:bg-muted/30 transition-colors"
+          >
+            <ChevronRightIcon className={`h-3 w-3 text-muted-foreground/40 transition-transform${promptOpen ? ' rotate-90' : ''}`} />
+            <span className="text-[10px] font-semibold text-muted-foreground/50 uppercase tracking-wider">Prompt</span>
+          </button>
+          {promptOpen && (
+            <div className="px-3 pb-2.5 pt-0.5 bg-muted/30">
+              <div className="text-xs text-muted-foreground/80 leading-5 whitespace-pre-wrap">{prompt}</div>
+            </div>
+          )}
         </div>
       )}
       {/* Response */}
