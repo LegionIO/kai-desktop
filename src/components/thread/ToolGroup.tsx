@@ -528,7 +528,7 @@ const QuestionnaireView: FC<{
                       : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
-                  {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-emerald-500" />}
+                  {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-violet-500" />}
                   {q.header}
                 </button>
               );
@@ -814,7 +814,7 @@ function detectTodoItems(part: ToolCallPart): TodoItem[] | null {
 }
 
 const TodoItemIcon: FC<{ status: TodoItem['status'] }> = ({ status }) => {
-  if (status === 'completed') return <CheckIcon className="h-3.5 w-3.5 shrink-0 text-emerald-500" />;
+  if (status === 'completed') return <CheckIcon className="h-3.5 w-3.5 shrink-0 text-violet-500" />;
   if (status === 'in_progress') return <AsteriskIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />;
   return <SquareIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />;
 };
@@ -1428,6 +1428,13 @@ const FileContentModal: FC<{ part: ToolCallPart; onClose: () => void }> = ({ par
 const BashOutputModal: FC<{ command: string; shData: ShData; onClose: () => void }> = ({ command, shData, onClose }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const portalTarget = useModalPortalTarget();
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    void navigator.clipboard.writeText(command);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [command]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
@@ -1435,29 +1442,50 @@ const BashOutputModal: FC<{ command: string; shData: ShData; onClose: () => void
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
+  const allLines = [shData.stdout, shData.stderr].filter(Boolean).join('\n').split('\n');
+
   return createPortal(
     <div
       ref={overlayRef}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
       onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
     >
-      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-[#0d0d0d] shadow-2xl overflow-hidden font-mono text-xs">
-        {/* Header */}
-        <div className="flex items-center gap-3 px-3 py-2 border-b border-border/20 shrink-0">
-          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider">IN</span>
-          <span className="text-foreground/60 truncate flex-1">{command}</span>
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        {/* Header — command row */}
+        <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border/40 bg-muted/30 shrink-0">
+          <TerminalIcon className="h-3.5 w-3.5 text-violet-500 shrink-0" />
+          <span className="text-foreground/70 truncate flex-1">{command}</span>
+          {shData.exitCode != null && shData.exitCode !== 0 && (
+            <span className="shrink-0 text-[10px] font-semibold text-destructive tabular-nums">exit {shData.exitCode}</span>
+          )}
+          <button
+            type="button"
+            onClick={handleCopy}
+            className={`shrink-0 p-1 rounded transition-all ${copied ? 'text-emerald-400' : 'text-muted-foreground/50 hover:text-foreground'}`}
+            title={copied ? 'Copied!' : 'Copy command'}
+          >
+            {copied ? <CheckIcon className="h-3.5 w-3.5" /> : <CopyIcon className="h-3.5 w-3.5" />}
+          </button>
           <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
             <XIcon className="h-3.5 w-3.5" />
           </button>
         </div>
-        {/* Full output */}
-        <div className="overflow-y-auto flex-1 px-3 py-2 space-y-2">
-          {shData.exitCode != null && shData.exitCode !== 0 && (
-            <div className="text-destructive text-[10px] font-semibold">Exit code {shData.exitCode}</div>
+        {/* Output with line numbers */}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          {allLines.length > 0 && (allLines[0] !== '') ? (
+            <table className="w-full border-collapse table-fixed">
+              <tbody>
+                {allLines.map((line, i) => (
+                  <tr key={i}>
+                    <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">{i + 1}</td>
+                    <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full max-w-0">{line || ' '}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="px-4 py-3 text-muted-foreground/40 italic">No output</div>
           )}
-          {shData.stdout && <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">{shData.stdout}</pre>}
-          {shData.stderr && <pre className="text-amber-400/80 whitespace-pre-wrap break-all leading-5">{shData.stderr}</pre>}
-          {!shData.stdout && !shData.stderr && <span className="text-muted-foreground/40 italic">No output</span>}
         </div>
       </div>
     </div>,
@@ -1496,9 +1524,9 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   return (
     <>
       <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
-        {/* IN row — single line + hover copy button */}
-        <div className="group/in flex items-center gap-3 px-3 py-2 border-b border-border/50 dark:border-white/10">
-          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider shrink-0">IN</span>
+        {/* Command row */}
+        <div className="group/in flex items-center gap-2 px-3 py-2 border-b border-border/50 dark:border-white/10">
+          <TerminalIcon className="h-3 w-3 text-violet-500 shrink-0" />
           <span className="text-foreground/75 truncate flex-1 leading-5">{command}</span>
           <button
             type="button"
@@ -1509,35 +1537,41 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             {copied ? <CheckIcon className="h-3 w-3" /> : <CopyIcon className="h-3 w-3" />}
           </button>
         </div>
-        {/* OUT row */}
-        <div className="flex gap-3 px-3 py-2">
-          <span className="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-wider shrink-0 pt-px">OUT</span>
-          <div className="flex-1 min-w-0">
-            {isRunning ? (
-              <span className="flex items-center gap-1.5 text-blue-400">
-                <LoaderIcon className="h-3 w-3 animate-spin" />
-                <span>Running…</span>
-              </span>
-            ) : errorMessage ? (
-              <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{errorMessage}</pre>
-            ) : shData ? (
-              <div>
-                {shData.exitCode != null && shData.exitCode !== 0 && (
-                  <div className="text-destructive text-[10px] font-semibold mb-1">Exit code {shData.exitCode}</div>
-                )}
-                {(shData.stdout || shData.stderr) ? (
-                  <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">
-                    {previewLines.join('\n')}
-                  </pre>
-                ) : (
-                  <span className="text-muted-foreground/40 italic">No output</span>
-                )}
+        {/* Output */}
+        {isRunning ? (
+          <div className="flex items-center gap-1.5 px-3 py-2 text-blue-400">
+            <LoaderIcon className="h-3 w-3 animate-spin" />
+            <span>Running…</span>
+          </div>
+        ) : errorMessage ? (
+          <div className="px-3 py-2">
+            <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{errorMessage}</pre>
+          </div>
+        ) : shData ? (
+          <>
+            {shData.exitCode != null && shData.exitCode !== 0 && (
+              <div className="px-3 pt-2 text-destructive text-[10px] font-semibold">Exit code {shData.exitCode}</div>
+            )}
+            {(shData.stdout || shData.stderr) ? (
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse table-fixed">
+                  <tbody>
+                    {previewLines.map((line, i) => (
+                      <tr key={i}>
+                        <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">{i + 1}</td>
+                        <td className="pl-3 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full max-w-0">{line || ' '}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             ) : (
-              <span className="text-muted-foreground/40 italic">No output</span>
+              <div className="px-3 py-2 text-muted-foreground/40 italic">No output</div>
             )}
-          </div>
-        </div>
+          </>
+        ) : (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">No output</div>
+        )}
         {/* N more lines / Click to expand bar */}
         {hasMore && !isRunning && (
           <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
@@ -1666,7 +1700,7 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
         {/* Preview lines */}
         {!isRunning && previewLines.length > 0 && (
           <div className="overflow-x-auto">
-            <table className="w-full border-collapse">
+            <table className="w-full border-collapse table-fixed">
               <tbody>
                 {previewLines.map((line, i) => (
                   <tr key={i}>
@@ -1749,7 +1783,7 @@ const ReadContentModal: FC<{ fileName: string; filePath: string; lines: string[]
         )}
         {/* Content */}
         <div className="overflow-y-auto overflow-x-auto flex-1">
-          <table className="w-full border-collapse">
+          <table className="w-full border-collapse table-fixed">
             <tbody>
               {lines.map((line, i) => (
                 <tr key={i}>
@@ -1862,7 +1896,7 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
           isFilesMode ? (
             /* Files-with-matches mode — numbered gutter + file path */
             <div className="overflow-x-auto">
-              <table className="w-full border-collapse">
+              <table className="w-full border-collapse table-fixed">
                 <tbody>
                   {previewItems.map((item, i) => (
                     <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
@@ -1878,14 +1912,14 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
           ) : (
             /* Content mode — line-number gutter + content, like Read */
             <div className="overflow-x-auto">
-              <table className="w-full border-collapse">
+              <table className="w-full border-collapse table-fixed">
                 <tbody>
                   {previewItems.map((item, i) => (
                     <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
                       <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">
                         {item.line ?? ''}
                       </td>
-                      <td className="pl-3 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full">{item.text || ' '}</td>
+                      <td className="pl-3 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full max-w-0">{item.text || ' '}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1956,7 +1990,7 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
         )}
         <div className="overflow-y-auto overflow-x-auto flex-1">
           {isFilesMode ? (
-            <table className="w-full border-collapse">
+            <table className="w-full border-collapse table-fixed">
               <tbody>
                 {allLines.map((item, i) => (
                   <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
@@ -1969,14 +2003,14 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
               </tbody>
             </table>
           ) : (
-            <table className="w-full border-collapse">
+            <table className="w-full border-collapse table-fixed">
               <tbody>
                 {allLines.map((item, i) => (
                   <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
                     <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">
                       {item.line ?? ''}
                     </td>
-                    <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full">{item.text || ' '}</td>
+                    <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full max-w-0">{item.text || ' '}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2044,7 +2078,7 @@ const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
         {/* Preview files */}
         {!isRunning && previewFiles.length > 0 && (
           <div className="overflow-x-auto">
-            <table className="w-full border-collapse">
+            <table className="w-full border-collapse table-fixed">
               <tbody>
                 {previewFiles.map((filePath, i) => (
                   <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
@@ -2112,7 +2146,7 @@ const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]
           <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{searchPath}</div>
         )}
         <div className="overflow-y-auto overflow-x-auto flex-1">
-          <table className="w-full border-collapse">
+          <table className="w-full border-collapse table-fixed">
             <tbody>
               {files.map((filePath, i) => (
                 <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
@@ -2172,7 +2206,7 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
         )}
         {/* Full diff */}
         <div className="overflow-y-auto overflow-x-auto flex-1">
-          <table className="w-full border-collapse">
+          <table className="w-full border-collapse table-fixed">
             <tbody>
               {diffLines.map((line, i) => {
                 let newN = 1;
@@ -2185,7 +2219,7 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
                       {line.type !== 'removed' ? newN : ''}
                     </td>
                     <td className="select-none w-5 pl-1 pr-1 text-center text-[10px] font-bold shrink-0">
-                      {line.type === 'added' ? <span className="text-emerald-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
+                      {line.type === 'added' ? <span className="text-violet-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
                     </td>
                     <td className={`pl-1 pr-4 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
                       {line.text || ' '}
@@ -2295,7 +2329,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             </span>
           ) : (
             <span className="shrink-0 text-[11px] tabular-nums">
-              {addedCount > 0 && <span className="text-emerald-500">+{addedCount}</span>}
+              {addedCount > 0 && <span className="text-violet-500">+{addedCount}</span>}
               {addedCount > 0 && removedCount > 0 && <span className="text-muted-foreground/40"> / </span>}
               {removedCount > 0 && <span className="text-red-400">−{removedCount}</span>}
             </span>
@@ -2309,7 +2343,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
         {/* Diff preview lines */}
         {diffLines.length > 0 && (
           <div className="overflow-x-auto">
-            <table className="w-full border-collapse">
+            <table className="w-full border-collapse table-fixed">
               <tbody>
                 {previewLines.map((line, i) => {
                   let newN = 1;
@@ -2326,7 +2360,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
                       </td>
                       <td className="select-none w-4 pl-1 text-center shrink-0 text-[10px] font-bold">
                         {line.type === 'added' ? (
-                          <span className="text-emerald-500">+</span>
+                          <span className="text-violet-500">+</span>
                         ) : line.type === 'removed' ? (
                           <span className="text-red-500">−</span>
                         ) : null}
@@ -2474,7 +2508,7 @@ function getToolIconColor(toolName: string): string {
   if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file')
     return 'bg-blue-500/15 text-blue-500';
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write')
-    return 'bg-emerald-500/15 text-emerald-500';
+    return 'bg-emerald-500/15 text-violet-500';
   if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor')
     return 'bg-amber-500/15 text-amber-500';
   if (toolName === 'grep' || toolName === 'Grep' || toolName === 'mastra_workspace_grep')
