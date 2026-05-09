@@ -1086,13 +1086,25 @@ const ClickablePath: FC<{ path: string; className?: string }> = ({ path, classNa
       <button
         type="button"
         onClick={handleClick}
-        className={`group/path inline-flex items-center gap-1 text-left hover:underline decoration-muted-foreground/40 transition-colors ${className ?? ''}`}
+        className={`group/path flex items-center gap-1 text-left min-w-0 w-full hover:underline decoration-muted-foreground/40 transition-colors ${className ?? ''}`}
       >
         <ExternalLinkIcon className="h-2.5 w-2.5 shrink-0 opacity-0 group-hover/path:opacity-60 transition-opacity" />
-        {dirPath && <span className="text-muted-foreground/60 truncate">{dirPath}</span>}
-        <span className="font-medium">{fileName}</span>
+        {dirPath && <span className="text-muted-foreground/60 truncate min-w-0 shrink">{dirPath}</span>}
+        <span className="font-medium shrink-0">{fileName}</span>
       </button>
     </Tooltip>
+  );
+};
+
+/** Non-clickable path display — dir truncates, filename stays visible */
+const FilePath: FC<{ path: string; className?: string }> = ({ path, className }) => {
+  const fileName = path.split('/').pop() ?? path;
+  const dirPath = path.slice(0, path.length - fileName.length);
+  return (
+    <span className={`flex items-center gap-1 min-w-0 w-full ${className ?? ''}`}>
+      {dirPath && <span className="text-muted-foreground/60 truncate min-w-0 shrink">{dirPath}</span>}
+      <span className="font-medium shrink-0">{fileName}</span>
+    </span>
   );
 };
 
@@ -1585,6 +1597,21 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
 
   // Result can be a shaped {content,path} object, a plain string (Claude Code Read tool),
   // an observer-wrapped { value: string }, or an array of content blocks [{ type:'text', text }].
+  // It can also be an error object: { isError: true, error: "EISDIR: ..." }
+  const resultError = useMemo(() => {
+    if (part.result && typeof part.result === 'object' && !Array.isArray(part.result)) {
+      const r = part.result as Record<string, unknown>;
+      if (r.isError && typeof r.error === 'string') {
+        // Extract a human-readable label from common error codes
+        if (r.error.includes('EISDIR')) return 'Path is a directory';
+        if (r.error.includes('ENOENT')) return 'File not found';
+        if (r.error.includes('EACCES') || r.error.includes('EPERM')) return 'Permission denied';
+        return r.error.split('\n')[0]; // first line of error message
+      }
+    }
+    return null;
+  }, [part.result]);
+
   const resultValue = useMemo(() => {
     if (typeof part.result === 'string') return part.result;
     if (Array.isArray(part.result)) {
@@ -1665,7 +1692,10 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
             </button>
           </div>
         )}
-        {!isRunning && lines.length === 0 && (
+        {!isRunning && resultError && (
+          <div className="px-3 py-2 text-destructive/70 italic">{resultError}</div>
+        )}
+        {!isRunning && !resultError && lines.length === 0 && (
           <div className="px-3 py-2 text-muted-foreground/40 italic">Empty file</div>
         )}
       </div>
@@ -1744,46 +1774,60 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
   const searchPath = typeof args.path === 'string' ? args.path : typeof args.cwd === 'string' ? args.cwd : '';
 
   // Parse result — grep returns:
-  //   { matches: [{file, line, content}] }  (Mastra)
-  //   a plain array of strings              (Claude Code)
-  //   a plain string                        (raw grep output)
+  //   { matches: [{file, line, content}] }        (Mastra)
+  //   a plain array of strings                    (Claude Code)
+  //   "Found N files\npath1\npath2..."            (Claude Code files-with-matches mode)
+  //   "lineNum:matchContent\nlineNum-contextLine" (Claude Code content mode)
   const result = part.result;
   type GrepMatch = { file?: string; line?: number; content?: string; text?: string };
 
-  type GrepLine = { file?: string; line?: number; text: string };
-  const allLines: GrepLine[] = useMemo(() => {
-    if (!result) return [];
-    // Claude Code returns a plain array of "file:line:content" strings
+  // isFilesMode: result is a list of file paths, not line content
+  type GrepLine = { file?: string; line?: number; text: string; isContext?: boolean };
+  const { allLines, isFilesMode } = useMemo<{ allLines: GrepLine[]; isFilesMode: boolean }>(() => {
+    if (!result) return { allLines: [], isFilesMode: false };
+
+    const parseContentLines = (lines: string[]): { allLines: GrepLine[]; isFilesMode: boolean } => {
+      // Check if it's files-with-matches mode (plain paths, no line numbers)
+      const looksLikeFiles = lines.every((l) => !l.match(/^\d+[:\-]/));
+      if (looksLikeFiles) {
+        return { allLines: lines.map((l) => ({ text: l })), isFilesMode: true };
+      }
+      // Content mode: "702:match line" or "703-context line"
+      return {
+        isFilesMode: false,
+        allLines: lines.map((l) => {
+          const m = l.match(/^(\d+)([:\-])(.*)/);
+          if (m) return { line: parseInt(m[1], 10), text: m[3], isContext: m[2] === '-' };
+          return { text: l };
+        }),
+      };
+    };
+
     if (Array.isArray(result)) {
-      return (result as unknown[]).map((item) => {
-        const s = String(item);
-        const m = s.match(/^(.+):(\d+):(.*)/);
-        if (m) return { file: m[1], line: parseInt(m[2], 10), text: m[3] };
-        return { text: s };
-      }).filter((l) => l.text !== '');
+      const lines = (result as unknown[]).map(String).filter(Boolean);
+      return parseContentLines(lines);
     }
     if (typeof result === 'string') {
-      // Sentinel strings returned by Claude Code when there are no results
-      if (result.trim() === 'No matches found' || result.trim() === '') return [];
-      // "Found N files\npath1\npath2..." — strip the summary header line
+      if (result.trim() === 'No matches found' || result.trim() === '') return { allLines: [], isFilesMode: false };
       const lines = result.split('\n').filter(Boolean);
+      // Strip "Found N files" header
       const dataLines = lines[0]?.match(/^Found \d+ files?$/) ? lines.slice(1) : lines;
-      return dataLines.map((l) => {
-        const m = l.match(/^(.+):(\d+):(.*)/);
-        if (m) return { file: m[1], line: parseInt(m[2], 10), text: m[3] };
-        return { text: l };
-      });
+      return parseContentLines(dataLines);
     }
     if (typeof result === 'object' && result !== null) {
       const r = result as Record<string, unknown>;
       if (Array.isArray(r.matches)) {
-        return (r.matches as GrepMatch[]).map((m) => ({ file: m.file, line: m.line, text: m.content ?? m.text ?? '' }));
+        return {
+          isFilesMode: false,
+          allLines: (r.matches as GrepMatch[]).map((m) => ({ file: m.file, line: m.line, text: m.content ?? m.text ?? '' })),
+        };
       }
       if (typeof r.output === 'string') {
-        return r.output.split('\n').filter(Boolean).map((l) => ({ text: l }));
+        const lines = r.output.split('\n').filter(Boolean);
+        return parseContentLines(lines);
       }
     }
-    return [];
+    return { allLines: [], isFilesMode: false };
   }, [result]);
 
   const PREVIEW_LINES = 3;
@@ -1802,7 +1846,11 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
               <LoaderIcon className="h-3 w-3 animate-spin" />
             </span>
           ) : allLines.length > 0 ? (
-            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{allLines.length} match{allLines.length !== 1 ? 'es' : ''}</span>
+            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">
+              {isFilesMode
+                ? `${allLines.length} file${allLines.length !== 1 ? 's' : ''}`
+                : `${allLines.length} match${allLines.length !== 1 ? 'es' : ''}`}
+            </span>
           ) : null}
         </div>
         {/* Search path */}
@@ -1811,28 +1859,48 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
         )}
         {/* Preview matches */}
         {!isRunning && previewItems.length > 0 && (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse">
-              <tbody>
-                {previewItems.map((item, i) => (
-                  <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
-                    {item.file && (
-                      <td className="select-none pl-2 pr-1 text-[10px] text-muted-foreground/40 whitespace-nowrap shrink-0 truncate max-w-[120px]">{item.file.split('/').pop()}</td>
-                    )}
-                    {item.line != null && (
-                      <td className="select-none pr-3 text-[10px] text-muted-foreground/30 tabular-nums shrink-0">{item.line}</td>
-                    )}
-                    <td className="pl-2 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full">{item.text || ' '}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          isFilesMode ? (
+            /* Files-with-matches mode — numbered gutter + file path */
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse">
+                <tbody>
+                  {previewItems.map((item, i) => (
+                    <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
+                      <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">{i + 1}</td>
+                      <td className="pl-3 pr-3 py-px leading-5 w-full max-w-0">
+                        <FilePath path={item.text} className="text-foreground/75" />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            /* Content mode — line-number gutter + content, like Read */
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse">
+                <tbody>
+                  {previewItems.map((item, i) => (
+                    <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
+                      <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">
+                        {item.line ?? ''}
+                      </td>
+                      <td className="pl-3 pr-3 py-px whitespace-pre leading-5 text-foreground/75 w-full">{item.text || ' '}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
         )}
         {/* Click to expand */}
         {hasMore && !isRunning && (
           <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
-            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{allLines.length - PREVIEW_LINES} more match{allLines.length - PREVIEW_LINES !== 1 ? 'es' : ''}</span>
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">
+              {isFilesMode
+                ? `${allLines.length - PREVIEW_LINES} more file${allLines.length - PREVIEW_LINES !== 1 ? 's' : ''}`
+                : `${allLines.length - PREVIEW_LINES} more match${allLines.length - PREVIEW_LINES !== 1 ? 'es' : ''}`}
+            </span>
             <button
               type="button"
               onClick={() => setModalOpen(true)}
@@ -1848,13 +1916,13 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
         )}
       </div>
       {modalOpen && (
-        <GrepResultModal pattern={pattern} searchPath={searchPath} allLines={allLines} onClose={() => setModalOpen(false)} />
+        <GrepResultModal pattern={pattern} searchPath={searchPath} allLines={allLines} isFilesMode={isFilesMode} onClose={() => setModalOpen(false)} />
       )}
     </>
   );
 };
 
-const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { file?: string; line?: number; text: string }[]; onClose: () => void }> = ({ pattern, searchPath, allLines, onClose }) => {
+const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { file?: string; line?: number; text: string; isContext?: boolean }[]; isFilesMode: boolean; onClose: () => void }> = ({ pattern, searchPath, allLines, isFilesMode, onClose }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const portalTarget = useModalPortalTarget();
 
@@ -1863,6 +1931,10 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [onClose]);
+
+  const countLabel = isFilesMode
+    ? `${allLines.length} file${allLines.length !== 1 ? 's' : ''}`
+    : `${allLines.length} match${allLines.length !== 1 ? 'es' : ''}`;
 
   return createPortal(
     <div
@@ -1874,7 +1946,7 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
         <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
           <SearchIcon className="h-3.5 w-3.5 text-sky-500 shrink-0" />
           <span className="font-semibold text-foreground/90 truncate flex-1">/{pattern}/</span>
-          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{allLines.length} match{allLines.length !== 1 ? 'es' : ''}</span>
+          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{countLabel}</span>
           <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
             <XIcon className="h-3.5 w-3.5" />
           </button>
@@ -1883,21 +1955,33 @@ const GrepResultModal: FC<{ pattern: string; searchPath: string; allLines: { fil
           <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{searchPath}</div>
         )}
         <div className="overflow-y-auto overflow-x-auto flex-1">
-          <table className="w-full border-collapse">
-            <tbody>
-              {allLines.map((item, i) => (
-                <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
-                  {item.file && (
-                    <td className="select-none pl-3 pr-2 py-px text-[10px] text-muted-foreground/40 whitespace-nowrap shrink-0 truncate max-w-[140px]">{item.file.split('/').pop()}</td>
-                  )}
-                  {item.line != null && (
-                    <td className="select-none pr-3 py-px text-[10px] text-muted-foreground/30 tabular-nums shrink-0 text-right">{item.line}</td>
-                  )}
-                  <td className="pl-2 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full">{item.text || ' '}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {isFilesMode ? (
+            <table className="w-full border-collapse">
+              <tbody>
+                {allLines.map((item, i) => (
+                  <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
+                    <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">{i + 1}</td>
+                    <td className="pl-3 pr-4 py-px leading-5 w-full max-w-0">
+                      <FilePath path={item.text} className="text-foreground/80" />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <table className="w-full border-collapse">
+              <tbody>
+                {allLines.map((item, i) => (
+                  <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
+                    <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">
+                      {item.line ?? ''}
+                    </td>
+                    <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80 w-full">{item.text || ' '}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </div>,
@@ -1959,13 +2043,19 @@ const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
         )}
         {/* Preview files */}
         {!isRunning && previewFiles.length > 0 && (
-          <div className="divide-y divide-border/20 dark:divide-white/[0.04]">
-            {previewFiles.map((filePath, i) => (
-              <div key={i} className="flex items-center gap-1.5 px-3 py-0.5">
-                <FileIcon className="h-3 w-3 shrink-0 text-muted-foreground/40" />
-                <ClickablePath path={filePath} className="text-foreground/75 truncate" />
-              </div>
-            ))}
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <tbody>
+                {previewFiles.map((filePath, i) => (
+                  <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
+                    <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">{i + 1}</td>
+                    <td className="pl-3 pr-3 py-px leading-5 w-full max-w-0">
+                      <FilePath path={filePath} className="text-foreground/75" />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
         {/* Click to expand */}
@@ -2021,13 +2111,19 @@ const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]
         {searchPath && (
           <div className="px-4 py-1.5 text-[10px] text-muted-foreground/40 border-b border-border/20 shrink-0 truncate">{searchPath}</div>
         )}
-        <div className="overflow-y-auto flex-1 divide-y divide-border/10 dark:divide-white/[0.04]">
-          {files.map((filePath, i) => (
-            <div key={i} className="flex items-center gap-2 px-4 py-1">
-              <FileIcon className="h-3 w-3 shrink-0 text-muted-foreground/40" />
-              <ClickablePath path={filePath} className="text-foreground/80 truncate" />
-            </div>
-          ))}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          <table className="w-full border-collapse">
+            <tbody>
+              {files.map((filePath, i) => (
+                <tr key={i} className="border-b border-border/10 dark:border-white/[0.04] last:border-0">
+                  <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">{i + 1}</td>
+                  <td className="pl-3 pr-4 py-px leading-5 w-full max-w-0">
+                    <FilePath path={filePath} className="text-foreground/80" />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>,
