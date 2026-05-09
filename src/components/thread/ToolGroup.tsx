@@ -87,7 +87,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: stri
 };
 
 export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ part, onSendFeedback, onPlanApproved }) => {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
@@ -105,6 +105,10 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const hasResult = part.result !== undefined;
   const isHung = Boolean(part.isHung);
   const isError = !isHung && (part.isError || (hasResult && isErrorResult(part.result)));
+  // Auto-expand on error
+  useEffect(() => {
+    if (isError) setExpanded(true);
+  }, [isError]);
   const approvalStatus = localApproval ?? part.approvalStatus;
   const isPendingApproval = approvalStatus === 'pending' && !hasResult;
   const isAskUser = part.toolName === 'ask_user';
@@ -2215,11 +2219,11 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
                 }
                 return (
                   <tr key={i} className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}>
-                    <td className="select-none w-10 pl-3 pr-2 text-right text-[10px] text-muted-foreground/25 tabular-nums shrink-0 border-r border-border/15">
+                    <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums shrink-0 border-r border-border/20 dark:border-white/[0.06]">
                       {line.type !== 'removed' ? newN : ''}
                     </td>
                     <td className="select-none w-5 pl-1 pr-1 text-center text-[10px] font-bold shrink-0">
-                      {line.type === 'added' ? <span className="text-violet-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
+                      {line.type === 'added' ? <span className="text-emerald-500">+</span> : line.type === 'removed' ? <span className="text-red-500">−</span> : null}
                     </td>
                     <td className={`pl-1 pr-4 py-px whitespace-pre leading-5 ${line.type === 'added' ? 'text-emerald-300/90' : line.type === 'removed' ? 'text-red-300/90' : 'text-foreground/60'}`}>
                       {line.text || ' '}
@@ -2329,7 +2333,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             </span>
           ) : (
             <span className="shrink-0 text-[11px] tabular-nums">
-              {addedCount > 0 && <span className="text-violet-500">+{addedCount}</span>}
+              {addedCount > 0 && <span className="text-emerald-500">+{addedCount}</span>}
               {addedCount > 0 && removedCount > 0 && <span className="text-muted-foreground/40"> / </span>}
               {removedCount > 0 && <span className="text-red-400">−{removedCount}</span>}
             </span>
@@ -2355,12 +2359,12 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
                       key={i}
                       className={line.type === 'added' ? 'bg-emerald-500/10' : line.type === 'removed' ? 'bg-red-500/10' : ''}
                     >
-                      <td className="select-none w-8 pl-2 pr-2 text-right text-[10px] text-muted-foreground/25 tabular-nums shrink-0 border-r border-border/15">
+                      <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums shrink-0 border-r border-border/20 dark:border-white/[0.06]">
                         {line.type !== 'removed' ? newN : ''}
                       </td>
                       <td className="select-none w-4 pl-1 text-center shrink-0 text-[10px] font-bold">
                         {line.type === 'added' ? (
-                          <span className="text-violet-500">+</span>
+                          <span className="text-emerald-500">+</span>
                         ) : line.type === 'removed' ? (
                           <span className="text-red-500">−</span>
                         ) : null}
@@ -2508,7 +2512,7 @@ function getToolIconColor(toolName: string): string {
   if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file')
     return 'bg-blue-500/15 text-blue-500';
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write')
-    return 'bg-emerald-500/15 text-violet-500';
+    return 'bg-emerald-500/15 text-emerald-500';
   if (toolName === 'file_edit' || toolName === 'mastra_workspace_edit_file' || toolName === 'edit' || toolName === 'Edit' || toolName === 'str_replace_based_edit_tool' || toolName === 'str_replace_editor')
     return 'bg-amber-500/15 text-amber-500';
   if (toolName === 'grep' || toolName === 'Grep' || toolName === 'mastra_workspace_grep')
