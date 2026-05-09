@@ -1509,26 +1509,15 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             ) : errorMessage ? (
               <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{errorMessage}</pre>
             ) : shData ? (
-              <div className="group/out relative">
+              <div>
                 {shData.exitCode != null && shData.exitCode !== 0 && (
                   <div className="text-destructive text-[10px] font-semibold mb-1">Exit code {shData.exitCode}</div>
                 )}
-                <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">
-                  {previewLines.join('\n')}
-                </pre>
-                {hasMore && (
-                  <div className="absolute bottom-0 right-0 opacity-0 group-hover/out:opacity-100 transition-opacity">
-                    <button
-                      type="button"
-                      onClick={() => setOutputModalOpen(true)}
-                      className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm backdrop-blur-sm transition-colors"
-                    >
-                      <ExternalLinkIcon className="h-2.5 w-2.5" />
-                      <span>Expand output</span>
-                    </button>
-                  </div>
-                )}
-                {!hasMore && !shData.stdout && !shData.stderr && (
+                {(shData.stdout || shData.stderr) ? (
+                  <pre className="text-foreground/75 whitespace-pre-wrap break-all leading-5">
+                    {previewLines.join('\n')}
+                  </pre>
+                ) : (
                   <span className="text-muted-foreground/40 italic">No output</span>
                 )}
               </div>
@@ -1537,6 +1526,20 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             )}
           </div>
         </div>
+        {/* N more lines / Click to expand bar */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{allLines.length - 3} more line{allLines.length - 3 !== 1 ? 's' : ''}</span>
+            <button
+              type="button"
+              onClick={() => setOutputModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
       </div>
       {outputModalOpen && shData && (
         <BashOutputModal command={command} shData={shData} onClose={() => setOutputModalOpen(false)} />
@@ -1740,28 +1743,48 @@ const GrepInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
   const pattern = typeof args.pattern === 'string' ? args.pattern : '';
   const searchPath = typeof args.path === 'string' ? args.path : typeof args.cwd === 'string' ? args.cwd : '';
 
-  // Parse result — grep returns { matches: [{file, line, content}] } or plain string output
+  // Parse result — grep returns:
+  //   { matches: [{file, line, content}] }  (Mastra)
+  //   a plain array of strings              (Claude Code)
+  //   a plain string                        (raw grep output)
   const result = part.result;
   type GrepMatch = { file?: string; line?: number; content?: string; text?: string };
-  const matches: GrepMatch[] = useMemo(() => {
-    if (!result || typeof result !== 'object' || Array.isArray(result)) return [];
-    const r = result as Record<string, unknown>;
-    if (Array.isArray(r.matches)) return r.matches as GrepMatch[];
-    // Plain string output — split into lines
-    if (typeof r.output === 'string') {
-      return r.output.split('\n').filter(Boolean).map((l) => ({ text: l }));
+
+  type GrepLine = { file?: string; line?: number; text: string };
+  const allLines: GrepLine[] = useMemo(() => {
+    if (!result) return [];
+    // Claude Code returns a plain array of "file:line:content" strings
+    if (Array.isArray(result)) {
+      return (result as unknown[]).map((item) => {
+        const s = String(item);
+        const m = s.match(/^(.+):(\d+):(.*)/);
+        if (m) return { file: m[1], line: parseInt(m[2], 10), text: m[3] };
+        return { text: s };
+      }).filter((l) => l.text !== '');
+    }
+    if (typeof result === 'string') {
+      // Sentinel strings returned by Claude Code when there are no results
+      if (result.trim() === 'No matches found' || result.trim() === '') return [];
+      // "Found N files\npath1\npath2..." — strip the summary header line
+      const lines = result.split('\n').filter(Boolean);
+      const dataLines = lines[0]?.match(/^Found \d+ files?$/) ? lines.slice(1) : lines;
+      return dataLines.map((l) => {
+        const m = l.match(/^(.+):(\d+):(.*)/);
+        if (m) return { file: m[1], line: parseInt(m[2], 10), text: m[3] };
+        return { text: l };
+      });
+    }
+    if (typeof result === 'object' && result !== null) {
+      const r = result as Record<string, unknown>;
+      if (Array.isArray(r.matches)) {
+        return (r.matches as GrepMatch[]).map((m) => ({ file: m.file, line: m.line, text: m.content ?? m.text ?? '' }));
+      }
+      if (typeof r.output === 'string') {
+        return r.output.split('\n').filter(Boolean).map((l) => ({ text: l }));
+      }
     }
     return [];
   }, [result]);
-
-  // Plain string result (e.g. raw grep output)
-  const rawOutput = typeof result === 'string' ? result : null;
-  const outputLines = rawOutput ? rawOutput.split('\n').filter(Boolean) : [];
-
-  type GrepLine = { file?: string; line?: number; text: string };
-  const allLines: GrepLine[] = matches.length > 0
-    ? matches.map((m) => ({ file: m.file, line: m.line, text: m.content ?? m.text ?? '' }))
-    : outputLines.map((l) => ({ text: l }));
 
   const PREVIEW_LINES = 3;
   const hasMore = allLines.length > PREVIEW_LINES;
@@ -1896,12 +1919,18 @@ const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, 
   const result = part.result;
   const files: string[] = useMemo(() => {
     if (!result) return [];
-    if (Array.isArray(result)) return (result as unknown[]).map(String);
+    if (Array.isArray(result)) return (result as unknown[]).map(String).filter(Boolean);
     if (typeof result === 'object' && result !== null) {
       const r = result as Record<string, unknown>;
-      if (Array.isArray(r.files)) return (r.files as unknown[]).map(String);
+      if (Array.isArray(r.files)) return (r.files as unknown[]).map(String).filter(Boolean);
     }
-    if (typeof result === 'string') return result.split('\n').filter(Boolean);
+    if (typeof result === 'string') {
+      // Sentinel string returned by Claude Code when there are no results
+      if (result.trim() === 'No files found' || result.trim() === '') return [];
+      // "Found N files\npath1\npath2..." — strip the summary header line
+      const lines = result.split('\n').filter(Boolean);
+      return lines[0]?.match(/^Found \d+ files?$/) ? lines.slice(1) : lines;
+    }
     return [];
   }, [result]);
 
@@ -2447,20 +2476,6 @@ function getToolSubtitle(part: ToolCallPart): string {
     if (typeof result.stdout === 'string' || typeof result.stderr === 'string') {
       return 'Command completed';
     }
-  }
-
-  // grep → "N matches"
-  if (part.toolName === 'grep' || part.toolName === 'mastra_workspace_grep') {
-    if (Array.isArray(result.matches)) return `${result.matches.length} match${result.matches.length !== 1 ? 'es' : ''}`;
-    if (typeof result.count === 'number') return `${result.count} match${result.count !== 1 ? 'es' : ''}`;
-  }
-
-  // glob → "N files"
-  if (part.toolName === 'glob' || part.toolName === 'Glob' || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search') {
-    if (typeof result.count === 'number') return `${result.count} file${result.count !== 1 ? 's' : ''}`;
-    if (Array.isArray(result.files)) return `${result.files.length} file${result.files.length !== 1 ? 's' : ''}`;
-    // Claude Code returns a plain array as the result
-    if (Array.isArray(part.result)) return `${(part.result as unknown[]).length} file${(part.result as unknown[]).length !== 1 ? 's' : ''}`;
   }
 
   // list_directory → "N items"
