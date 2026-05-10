@@ -1109,7 +1109,7 @@ const AssistantMessage: FC = () => {
   });
 
   return (
-    <MessagePrimitive.Root className="group mb-8 flex justify-start">
+    <MessagePrimitive.Root className={`group flex justify-start ${message.isLast && isRunning ? 'mb-2' : 'mb-8'}`}>
       <div className="w-full max-w-4xl">
         <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 pt-3 text-foreground">
           {isEmpty ? (
@@ -1137,7 +1137,7 @@ const AssistantMessage: FC = () => {
               {/* Between-tool-calls spinner: all tools finished but model is still running,
                   OR a sub-agent is actively working (parent model is blocked waiting on it) */}
               {(allToolsDone || hasRunnningSubAgent) && (
-                <div className="mt-5 mb-2 timeline-detached">
+                <div className="mt-5 timeline-detached">
                   <ThinkingSpinner />
                 </div>
               )}
