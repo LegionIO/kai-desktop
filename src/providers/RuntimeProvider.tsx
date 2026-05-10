@@ -1620,7 +1620,7 @@ export function RuntimeProvider({
           const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
           if (tcIdx >= 0) {
             const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId };
+            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId, finishedAt: nowIso() };
             acc.messages[idx] = { ...msg, content: toStoredContent(content) };
           }
         }
