@@ -17,6 +17,7 @@ import {
   LoaderIcon,
   ListFilterIcon,
   PlusIcon,
+  FilePlusIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -48,7 +49,7 @@ const PIN_EVENT = 'pinned-tasks-changed';
 
 interface TaskSidebarListProps {
   onSelectTask?: (taskId: string) => void;
-  /** When provided, "Create Task" opens the AI creation view instead of the dialog. */
+  /** When provided, "New Task" opens the AI creation view instead of the dialog. */
   onCreateTask?: () => void;
   /** Navigate to the task queue view in the main panel. */
   onViewBoard?: () => void;
@@ -212,8 +213,8 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           onClick={(e) => { e.stopPropagation(); onCreateTask?.(); }}
           className="flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
-          <PlusIcon className="h-3 w-3" />
-          Create Task
+          <FilePlusIcon className="h-3 w-3" />
+          New Task
         </button>
       </div>
 

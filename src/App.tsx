@@ -1570,7 +1570,7 @@ function AppShell() {
                             onClick={() => agentsCtx.selectAgent(null)}
                             className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                           >
-                            Agent Swarm
+                            Agents
                           </button>
                           <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                           <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
@@ -1601,7 +1601,7 @@ function AppShell() {
                         </div>
                       );
                     }
-                    return <span className="text-sm font-medium text-foreground">Agent Swarm</span>;
+                    return <span className="text-sm font-medium text-foreground">Agents</span>;
                   })()
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
@@ -1618,7 +1618,7 @@ function AppShell() {
                             onClick={() => tasksCtx?.selectTask(null)}
                             className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                           >
-                            Task Queue
+                            Tasks
                           </button>
                           <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                           <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
@@ -1664,7 +1664,7 @@ function AppShell() {
                         </div>
                       );
                     }
-                    return <span className="text-sm font-medium text-foreground">Task Queue</span>;
+                    return <span className="text-sm font-medium text-foreground">Tasks</span>;
                   })()
                 ) : activeErrorPluginName ? (
                   <div className="flex items-center gap-1.5">
@@ -1779,7 +1779,7 @@ function AppShell() {
                       onClick={() => { setActiveConversationId(null); setActiveConversationTitle(null); }}
                       className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                     >
-                      Chat Threads
+                      Chats
                     </button>
                     <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
@@ -1841,7 +1841,7 @@ function AppShell() {
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
-                ) : <span className="text-sm font-medium text-foreground">Chat Threads</span>}
+                ) : <span className="text-sm font-medium text-foreground">Chats</span>}
               </div>
               <WorkspaceSelector
                 workspaces={workspaces}

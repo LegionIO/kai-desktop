@@ -1,5 +1,5 @@
 /**
- * Types shared between main and renderer process for the Task Queue.
+ * Types shared between main and renderer process for Tasks.
  */
 
 export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';

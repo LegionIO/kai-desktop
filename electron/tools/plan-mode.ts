@@ -91,10 +91,10 @@ export function createExitPlanModeTool(): ToolDefinition {
         planName: `${planName}.md`,
         message: [
           `Plan approved and saved to ${planFilePath}.`,
-          'The plan has been added to the Task Queue.',
-          'Implementation will happen in the Task Queue with a separate agent session that reads the plan.',
+          'The plan has been added to Tasks.',
+          'Implementation will happen in Tasks with a separate agent session that reads the plan.',
           'Do NOT offer to implement the plan yourself in this conversation.',
-          'Simply acknowledge that the plan is on the Task Queue and the user can implement it from there.',
+          'Simply acknowledge that the plan is in Tasks and the user can implement it from there.',
         ].join(' '),
         ...(summary ? { summary } : {}),
       };

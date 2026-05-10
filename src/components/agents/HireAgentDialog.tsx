@@ -60,7 +60,7 @@ export const HireAgentDialog: FC<HireAgentDialogProps> = ({ open, onOpenChange }
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border/70 bg-popover p-6 shadow-2xl animate-in fade-in-0 zoom-in-95 slide-in-from-left-1/2 slide-in-from-top-[48%] data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:pointer-events-none">
           <div className="flex items-center justify-between mb-5">
             <Dialog.Title className="text-base font-semibold">
-              Hire Agent
+              New Agent
             </Dialog.Title>
             <Dialog.Close className="rounded-md p-1 text-muted-foreground hover:bg-muted/50 hover:text-foreground transition-colors">
               <XIcon size={16} />

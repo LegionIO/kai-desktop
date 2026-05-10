@@ -71,7 +71,7 @@ export const AgentSwarmView: FC = () => {
         {/* Header */}
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-semibold text-foreground">Agent Swarm</h1>
+            <h1 className="text-xl font-semibold text-foreground">Agents</h1>
             <p className="mt-0.5 text-sm text-muted-foreground">
               {agents.length === 0
                 ? 'Hire agents to automate your workflow'
@@ -83,8 +83,8 @@ export const AgentSwarmView: FC = () => {
             onClick={() => setHireDialogOpen(true)}
             className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
           >
-            <PlusIcon size={15} />
-            Hire Agent
+            <BotIcon size={15} />
+            New Agent
           </button>
         </div>
 

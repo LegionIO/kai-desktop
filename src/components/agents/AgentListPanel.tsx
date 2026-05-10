@@ -1,8 +1,8 @@
 /**
  * AgentListPanel — main sidebar panel for the Agents tab.
  *
- * Shows a searchable list of hired agents with options (delete all) and a
- * "Hire Agent" button. Matches the layout patterns of TaskSidebarList.
+ * Shows a searchable list of agents with options (delete all) and a
+ * "New Agent" button. Matches the layout patterns of TaskSidebarList.
  */
 
 import { type FC, useState, useMemo, useCallback } from 'react';
@@ -73,7 +73,7 @@ export const AgentListPanel: FC = () => {
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header row — label + options dropdown + Hire Agent button */}
+      {/* Header row — label + options dropdown + New Agent button */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
         <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           Agents
@@ -113,8 +113,8 @@ export const AgentListPanel: FC = () => {
           onClick={() => setHireDialogOpen(true)}
           className="flex items-center gap-1 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
-          <PlusIcon size={12} />
-          Hire Agent
+          <BotIcon size={12} />
+          New Agent
         </button>
       </div>
 

@@ -4,7 +4,7 @@
 
 import { useState, type FC } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { PlusIcon, XIcon } from 'lucide-react';
+import { FilePlusIcon, XIcon } from 'lucide-react';
 import { useTasks } from '@/providers/TaskProvider';
 
 interface CreateTaskDialogProps {
@@ -99,8 +99,8 @@ export const CreateTaskDialog: FC<CreateTaskDialogProps> = ({ open, onOpenChange
                 disabled={!title.trim() || isSubmitting}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
               >
-                <PlusIcon className="h-3.5 w-3.5" />
-                {isSubmitting ? 'Creating…' : 'Create Task'}
+                <FilePlusIcon className="h-3.5 w-3.5" />
+                {isSubmitting ? 'Creating…' : 'New Task'}
               </button>
             </div>
           </form>
