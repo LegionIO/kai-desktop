@@ -19,6 +19,42 @@ type RendererContentPart = {
   [key: string]: unknown;
 };
 
+function inferMimeTypeFromDataUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = value.match(/^data:([^;,]+)(?:;[^,]*)?,/);
+  return match?.[1];
+}
+
+function normalizeImagePart(part: RendererContentPart): { type: 'image'; image: unknown; mimeType?: string } {
+  const mimeType = typeof part.mimeType === 'string'
+    ? part.mimeType
+    : inferMimeTypeFromDataUrl(part.image);
+
+  return {
+    type: 'image',
+    image: part.image,
+    ...(mimeType ? { mimeType } : {}),
+  };
+}
+
+function normalizeFilePart(part: RendererContentPart): {
+  type: 'file';
+  data: unknown;
+  mimeType?: unknown;
+  filename?: unknown;
+} {
+  const mimeType = typeof part.mimeType === 'string'
+    ? part.mimeType
+    : inferMimeTypeFromDataUrl(part.data);
+
+  return {
+    type: 'file',
+    data: part.data,
+    ...(mimeType ? { mimeType } : {}),
+    ...(part.filename ? { filename: part.filename } : {}),
+  };
+}
+
 export function normalizeMessagesForApi(
   messages: unknown[],
 ): Array<{ role: string; content: unknown }> {
@@ -46,13 +82,8 @@ export function normalizeMessagesForApi(
         .filter(p => p.type === 'text' || p.type === 'image' || p.type === 'file')
         .map(p => {
           if (p.type === 'text') return { type: 'text' as const, text: p.text };
-          if (p.type === 'image') return { type: 'image' as const, image: p.image };
-          return {
-            type: 'file' as const,
-            data: p.data,
-            mimeType: p.mimeType,
-            ...(p.filename ? { filename: p.filename } : {}),
-          };
+          if (p.type === 'image') return normalizeImagePart(p);
+          return normalizeFilePart(p);
         });
       if (cleanParts.length > 0) {
         result.push({ role, content: cleanParts });

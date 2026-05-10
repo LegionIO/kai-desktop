@@ -46,7 +46,7 @@ export type TokenUsageData = {
 
 type ContentPart =
   | { type: 'text'; text: string; source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' }
-  | { type: 'image'; image: string }
+  | { type: 'image'; image: string; mimeType?: string }
   | { type: 'file'; data: string; mimeType: string; filename: string }
   | { type: 'enrichments'; enrichments: PipelineEnrichments }
   | {
@@ -184,6 +184,15 @@ function toStoredContent(parts: ContentPart[]): ThreadMessageLike['content'] {
   return parts as unknown as ThreadMessageLike['content'];
 }
 
+function messagesHaveImages(messages: ThreadMessageLike[]): boolean {
+  return messages.some(
+    (m) =>
+      m.role === 'user' &&
+      Array.isArray(m.content) &&
+      m.content.some((part: unknown) => (part as { type?: string }).type === 'image'),
+  );
+}
+
 function extractUserText(messages: ThreadMessageLike[]): string {
   const firstUser = messages.find((message) => message.role === 'user');
   if (!firstUser || !Array.isArray(firstUser.content)) return '';
@@ -204,10 +213,20 @@ function toTitleCase(value: string): string {
     .join(' ');
 }
 
+// Generic image-request phrases that convey no meaningful title on their own
+const IMAGE_GENERIC_PHRASES = /^(can you |could you |please )?(read|look at|analyze|describe|explain|summarize|check|view|see|show me|tell me about)\s+(this\s+)?(image|picture|photo|screenshot|diagram|chart|graph|file)s?[?.!]*$/i;
+
 function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
+  const hasImages = messagesHaveImages(messages);
   const text = extractUserText(messages)
     .replace(/[?!.,]+$/g, '')
     .trim();
+
+  // If the message has images and the text is empty or a generic image-request phrase,
+  // use a sensible image-analysis title rather than producing garbage.
+  if (hasImages && (!text || IMAGE_GENERIC_PHRASES.test(text))) {
+    return 'Image Analysis';
+  }
 
   if (!text) return null;
 
@@ -223,7 +242,7 @@ function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (!simplified) return null;
+  if (!simplified) return hasImages ? 'Image Analysis' : null;
 
   return toTitleCase(
     simplified
@@ -231,7 +250,7 @@ function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
       .filter((word) => word.length > 1)
       .slice(0, 4)
       .join(' '),
-  ) || null;
+  ) || (hasImages ? 'Image Analysis' : null);
 }
 
 function extractPromptHistoryText(message: ThreadMessageLike): string | null {
@@ -339,6 +358,17 @@ const CurrentWorkingDirectoryContext = createCtx<CurrentWorkingDirectoryState>({
 
 export function useCurrentWorkingDirectory(): CurrentWorkingDirectoryState {
   return useCtx(CurrentWorkingDirectoryContext);
+}
+
+// Exposes the activeConversationId that is set in the same React batch as
+// setTree/setHeadId inside loadConversationState. Consumers that need to react
+// *after* the new thread's messages are in the tree (e.g. scroll-to-bottom)
+// should use this instead of the IPC-driven app.conversations.onChanged event,
+// which fires before the tree has been loaded.
+const RuntimeConversationIdContext = createCtx<string | null>(null);
+
+export function useRuntimeConversationId(): string | null {
+  return useCtx(RuntimeConversationIdContext);
 }
 
 // --- Module-level sub-agent state (survives RuntimeProvider remounts) ---
@@ -1873,13 +1903,20 @@ export function RuntimeProvider({
     const userContent: ContentPart[] = [];
     for (const part of message.content) {
       if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
-      else if (part.type === 'image') userContent.push({ type: 'image', image: (part as { image: string }).image });
+      else if (part.type === 'image') {
+        const imagePart = part as { image: string; mimeType?: string };
+        userContent.push({
+          type: 'image',
+          image: imagePart.image,
+          ...(imagePart.mimeType ? { mimeType: imagePart.mimeType } : {}),
+        });
+      }
     }
     for (const att of pendingAttachments) {
       const pathLabel = att.filePath ? att.filePath : att.name;
       if (att.isImage) {
-        userContent.push({ type: 'image', image: att.dataUrl });
-        userContent.push({ type: 'text', text: `\n[Attached image: ${pathLabel}]` });
+        // Send the actual image data — the model reads the image directly, no text placeholder needed
+        userContent.push({ type: 'image', image: att.dataUrl, mimeType: att.mime });
       } else if (att.text) {
         userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
         userContent.push({ type: 'text', text: `\n\n--- File: ${pathLabel} ---\n${att.text}\n--- End File ---\n` });
@@ -1888,7 +1925,7 @@ export function RuntimeProvider({
         userContent.push({ type: 'text', text: `\n[Attached file: ${pathLabel} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]` });
       }
     }
-    if (!userContent.some((p) => p.type === 'text')) return;
+    if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
 
     const userMsg: StoredMessage = { id: msgId(), parentId: headId, role: 'user', content: toStoredContent(userContent), createdAt: new Date() };
     const newTree = [...tree, userMsg];
@@ -2140,9 +2177,11 @@ export function RuntimeProvider({
           <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
             <PromptHistoryContext.Provider value={promptHistory}>
               <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                <AssistantRuntimeProvider runtime={runtime}>
-                  {children}
-                </AssistantRuntimeProvider>
+                <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                  <AssistantRuntimeProvider runtime={runtime}>
+                    {children}
+                  </AssistantRuntimeProvider>
+                </RuntimeConversationIdContext.Provider>
               </CurrentWorkingDirectoryContext.Provider>
             </PromptHistoryContext.Provider>
           </AssistantResponseTimingContext.Provider>

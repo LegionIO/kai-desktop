@@ -199,6 +199,17 @@ function extractMessageText(content: unknown): string {
     .trim();
 }
 
+function messagesContainImages(messages: unknown[]): boolean {
+  return messages.some((message) => {
+    if (!message || typeof message !== 'object') return false;
+    const typedMessage = message as { role?: string; content?: unknown };
+    if (typedMessage.role !== 'user' || !Array.isArray(typedMessage.content)) return false;
+    return typedMessage.content.some(
+      (part: unknown) => part && typeof part === 'object' && (part as { type?: string }).type === 'image',
+    );
+  });
+}
+
 function buildTitleGenerationInput(messages: unknown[]): string {
   // Only include user messages — prevents weaker models from parroting assistant responses
   const normalized = messages
@@ -1249,6 +1260,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const input = buildTitleGenerationInput(messages);
     if (!input) return { title: null };
 
+    const hasImages = messagesContainImages(messages);
+
     const promptParts = [
       'Generate a concise conversation title using at most 4 words.',
       'Summarize the user\'s main topic or task, not the assistant\'s answer.',
@@ -1256,6 +1269,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       'Avoid apologies, disclaimers, or copied response text.',
       'Return only the title text with no quotes or formatting.',
     ];
+
+    if (hasImages) {
+      promptParts.push(
+        'The user attached one or more images. [Image] is a placeholder — do not treat it as literal text.',
+        'If the user\'s text is a short generic phrase like "read this image" or "what is this", title it based on the action, e.g. "Image Analysis" or "Analyze Image".',
+        'Never generate text that refers to not seeing an image or being unable to view it.',
+      );
+    }
 
     if (hint) {
       promptParts.push(`Context: ${hint}.`);
