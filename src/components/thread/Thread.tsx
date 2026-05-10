@@ -1037,14 +1037,14 @@ const AssistantMessage: FC = () => {
   const allToolsDone = isRunning && hasContent && content.every(
     (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
       p.type !== 'tool-call' ||
-      p.toolName === 'sub_agent' ||
+      p.toolName === 'sub_agent' || p.toolName === 'agent' ||
       (p.result !== undefined && p.finishedAt !== undefined),
   );
 
-  // A sub_agent is actively running when it has no result yet (or result but no finishedAt)
+  // A sub_agent (or SDK 'agent') is actively running when it has no result yet (or result but no finishedAt)
   const hasRunnningSubAgent = isRunning && content.some(
     (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
-      p.type === 'tool-call' && p.toolName === 'sub_agent' && p.finishedAt === undefined,
+      p.type === 'tool-call' && (p.toolName === 'sub_agent' || p.toolName === 'agent') && p.finishedAt === undefined,
   );
 
   // Detect paused-for-input — a tool is awaiting user approval/answer
