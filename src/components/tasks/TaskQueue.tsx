@@ -215,6 +215,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                 sideOffset={6}
                 className="z-[9999] min-w-[160px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
               >
+                <DropdownMenu.Label className="px-2 pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60">
+                  Filter
+                </DropdownMenu.Label>
                 {KAI_TASK_STATUS_COLUMNS.map((status) => (
                   <DropdownMenu.CheckboxItem
                     key={status}
