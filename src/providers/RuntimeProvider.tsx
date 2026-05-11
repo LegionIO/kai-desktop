@@ -49,6 +49,7 @@ type ContentPart =
   | { type: 'image'; image: string; mimeType?: string }
   | { type: 'file'; data: string; mimeType: string; filename: string }
   | { type: 'enrichments'; enrichments: PipelineEnrichments }
+  | { type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }
   | {
     type: 'tool-call';
     toolCallId: string;
@@ -1046,6 +1047,12 @@ export function useFallbackBanner(): FallbackBannerActions {
   return useCtx(FallbackBannerContext);
 }
 
+const MaxTurnsContinueContext = createCtx<((messageId: string) => void) | null>(null);
+
+export function useMaxTurnsContinue(): ((messageId: string) => void) | null {
+  return useCtx(MaxTurnsContinueContext);
+}
+
 // =============================================================================
 
 export type ExecutionMode = 'auto' | 'plan-first';
@@ -1704,6 +1711,28 @@ export function RuntimeProvider({
       } else if (e.type === 'enrichment') {
         const enrichData = e.data as Record<string, unknown> | undefined;
         if (enrichData) applyEnrichments(acc, enrichData);
+
+        // Persist runtime session IDs so they survive app restarts.
+        // Claude Code SDK: claudeSdkSessionId → used by ClaudeAgentRuntime to resume via `resume` option.
+        // Codex SDK:       codexSdkThreadId → used by CodexRuntime to call resumeThread().
+        const claudeSdkSessionId = enrichData?.claudeSdkSessionId as string | undefined;
+        const codexSdkThreadId = enrichData?.codexSdkThreadId as string | undefined;
+        if (claudeSdkSessionId || codexSdkThreadId) {
+          // Merge into existing metadata rather than replacing it wholesale.
+          void (async () => {
+            const latest = await app.conversations.get(convId) as ConversationRecord | null;
+            if (!latest) return;
+            const existingMeta = (latest.metadata ?? {}) as Record<string, unknown>;
+            await app.conversations.put({
+              ...latest,
+              metadata: {
+                ...existingMeta,
+                ...(claudeSdkSessionId ? { claudeSdkSessionId } : {}),
+                ...(codexSdkThreadId ? { codexSdkThreadId } : {}),
+              },
+            });
+          })();
+        }
       } else if (e.type === 'context-usage') {
         const usageData = e.data as {
           inputTokens?: number;
@@ -1759,6 +1788,53 @@ export function RuntimeProvider({
             setHeadId(acc.headId);
           }
         }
+      } else if (e.type === 'error' && e.errorCategory === 'max_turns') {
+        // Max turns reached — auto-continue or show interactive continue card
+        console.warn(`[StreamEvent] MAX_TURNS conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)}`);
+        const agentCfg = (config as Record<string, unknown>)?.agent as Record<string, unknown> | undefined;
+        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true;
+
+        if (autoContinue) {
+          // Auto-continue: finalize current response and immediately restart the stream
+          finalizeAssistantResponse(acc);
+          const _ptAC = persistTimersRef.current.get(convId); if (_ptAC) { clearTimeout(_ptAC); persistTimersRef.current.delete(convId); }
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' });
+          streamAccumulators.set(convId, { messages: [...acc.messages], headId: acc.headId, pendingAssistantTiming: createPendingAssistantTiming() });
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
+          const cfg = streamHandlerRef.current;
+          app.agent.stream(
+            convId, branch,
+            cfg.selectedModelKey ?? undefined,
+            cfg.reasoningEffort ?? 'medium',
+            cfg.selectedProfileKey ?? undefined,
+            cfg.fallbackEnabled ?? false,
+            currentWorkingDirectoryRef.current ?? undefined,
+            executionMode ?? 'auto',
+          );
+          return;
+        }
+
+        // Manual continue: show interactive card
+        const { msg: mtMsg, idx: mtIdx } = getOrCreateAssistantInAcc(acc);
+        const mtContent = (Array.isArray(mtMsg.content) ? [...mtMsg.content] : []) as ContentPart[];
+        mtContent.push({ type: 'max-turns-reached', text: e.error ?? 'Reached maximum number of turns', status: 'pending' });
+        acc.messages[mtIdx] = { ...mtMsg, content: toStoredContent(mtContent) };
+        finalizeAssistantResponse(acc);
+        const _ptMaxTurns = persistTimersRef.current.get(convId); if (_ptMaxTurns) { clearTimeout(_ptMaxTurns); persistTimersRef.current.delete(convId); }
+        streamAccumulators.delete(convId);
+        persistConversation(convId, acc.messages, acc.headId, {
+          runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
+        });
+        if (isActiveConv) {
+          setIsRunning(false);
+          setTree([...acc.messages]);
+          setHeadId(acc.headId);
+        }
+        return;
       } else if (e.type === 'error') {
         console.warn(`[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`);
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
@@ -2157,6 +2233,42 @@ export function RuntimeProvider({
     },
   });
 
+  const handleContinueAfterMaxTurns = useCallback((messageId: string) => {
+    const convId = activeIdRef.current;
+    if (!convId || isRunning) return;
+
+    // Update the max-turns-reached part status to 'continued'
+    setTree(prev => {
+      const updated = prev.map(msg => {
+        if (msg.id !== messageId) return msg;
+        const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+        const updatedContent = content.map(p =>
+          (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
+            ? { ...p, status: 'continued' as const }
+            : p
+        );
+        return { ...msg, content: toStoredContent(updatedContent) };
+      });
+      // Re-invoke stream with updated tree
+      const cfg = streamHandlerRef.current;
+      const newHead = cfg.headId;
+      const branch = getActiveBranch(updated, newHead);
+      streamAccumulators.set(convId, { messages: [...updated], headId: newHead, pendingAssistantTiming: createPendingAssistantTiming() });
+      persistConversation(convId, updated, newHead, { runStatus: 'running' });
+      app.agent.stream(
+        convId, branch,
+        cfg.selectedModelKey ?? undefined,
+        cfg.reasoningEffort ?? 'medium',
+        cfg.selectedProfileKey ?? undefined,
+        cfg.fallbackEnabled ?? false,
+        currentWorkingDirectoryRef.current ?? undefined,
+        executionMode ?? 'auto',
+      );
+      return updated;
+    });
+    setIsRunning(true);
+  }, [isRunning, executionMode]);
+
   const dismissFallbackBanner = useCallback(() => {
     setFallbackBanner(null);
     if (fallbackBannerTimerRef.current) {
@@ -2171,22 +2283,24 @@ export function RuntimeProvider({
   }), [fallbackBanner, dismissFallbackBanner]);
 
   return (
-    <FallbackBannerContext.Provider value={fallbackBannerActions}>
-      <SubAgentContext.Provider value={subAgentActions}>
-        <BranchNavContext.Provider value={branchNav}>
-          <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
-            <PromptHistoryContext.Provider value={promptHistory}>
-              <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                <RuntimeConversationIdContext.Provider value={activeConversationId}>
-                  <AssistantRuntimeProvider runtime={runtime}>
-                    {children}
-                  </AssistantRuntimeProvider>
-                </RuntimeConversationIdContext.Provider>
-              </CurrentWorkingDirectoryContext.Provider>
-            </PromptHistoryContext.Provider>
-          </AssistantResponseTimingContext.Provider>
-        </BranchNavContext.Provider>
-      </SubAgentContext.Provider>
-    </FallbackBannerContext.Provider>
+    <MaxTurnsContinueContext.Provider value={handleContinueAfterMaxTurns}>
+      <FallbackBannerContext.Provider value={fallbackBannerActions}>
+        <SubAgentContext.Provider value={subAgentActions}>
+          <BranchNavContext.Provider value={branchNav}>
+            <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
+              <PromptHistoryContext.Provider value={promptHistory}>
+                <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
+                  <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                    <AssistantRuntimeProvider runtime={runtime}>
+                      {children}
+                    </AssistantRuntimeProvider>
+                  </RuntimeConversationIdContext.Provider>
+                </CurrentWorkingDirectoryContext.Provider>
+              </PromptHistoryContext.Provider>
+            </AssistantResponseTimingContext.Provider>
+          </BranchNavContext.Provider>
+        </SubAgentContext.Provider>
+      </FallbackBannerContext.Provider>
+    </MaxTurnsContinueContext.Provider>
   );
 }

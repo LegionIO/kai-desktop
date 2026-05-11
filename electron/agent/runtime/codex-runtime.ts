@@ -242,8 +242,14 @@ export class CodexRuntime implements AgentRuntime {
       skipGitRepoCheck: true,
     };
 
-    // Resume or start new thread
-    const resumeId = (sdkConfig.resumeThreadId as string) ?? undefined;
+    // Resume or start new thread.
+    // `codexSdkThreadId` is written to conversation.metadata when the `thread.started`
+    // enrichment event is persisted by the renderer — see RuntimeProvider applyEnrichments.
+    // This makes context persist across both turns within a session and app restarts.
+    const resumeId =
+      (options.conversationMetadata?.codexSdkThreadId as string | undefined) ??
+      (sdkConfig.resumeThreadId as string | undefined) ??
+      undefined;
     const thread = resumeId
       ? codex.resumeThread(resumeId, threadOptions)
       : codex.startThread(threadOptions);
@@ -413,7 +419,7 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
         events.push({
           conversationId,
           type: 'enrichment',
-          data: { codexThreadId: event.thread_id },
+          data: { codexSdkThreadId: event.thread_id },
         });
       }
       break;

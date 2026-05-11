@@ -134,6 +134,14 @@ export type StreamOptions = {
     baseUrl: string;
     apiKey: string;
   };
+
+  /**
+   * Persisted metadata from the conversation record.
+   * Runtimes use this to resume prior sessions:
+   *   - `claudeSdkSessionId` (Claude Code SDK): resume the Claude Code session
+   *   - `codexSdkThreadId` (Codex SDK): resume the Codex thread
+   */
+  conversationMetadata?: Record<string, unknown>;
 };
 
 // ---------------------------------------------------------------------------

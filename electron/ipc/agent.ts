@@ -7,6 +7,7 @@ import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
+import { readConversationStore } from './conversations.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1066,6 +1067,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // Custom tools are filtered here so planning cannot mutate app state and
         // implementation cannot fall back to asking more questions or re-planning.
 
+        // Load persisted conversation metadata so runtimes can resume sessions.
+        // Claude Code SDK uses `claudeSdkSessionId`; Codex SDK uses `codexSdkThreadId`.
+        const convStore = readConversationStore(appHome);
+        const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
+
         const stream = runtime.stream({
           conversationId,
           messages,
@@ -1078,6 +1084,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
           claudeAuth: resolution.claudeAuth,
+          conversationMetadata: convMetadata,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,

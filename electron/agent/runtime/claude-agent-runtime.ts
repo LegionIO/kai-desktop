@@ -247,7 +247,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // Kai manages its own UX — bypass Claude Code's permission prompts entirely.
     // Without this, the SDK blocks on interactive approval for writes/bash/etc.
     const permissionMode = 'bypassPermissions';
-    const maxTurns = (sdkConfig.maxTurns as number) ?? 25;
+    const maxTurns = (agentConfig?.maxTurns as number) ?? (sdkConfig.maxTurns as number) ?? 25;
     const thinkingConfig = (sdkConfig.thinking as { type: string; budgetTokens?: number }) ?? { type: 'adaptive' };
 
     // Map reasoningEffort to SDK effort level
@@ -326,6 +326,14 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
     // Check if we have a prior SDK session for this conversation.
     // If so, pass `resume` so the SDK replays its stored history.
+    // On app restart the in-memory sessionMap is empty, so fall back to the
+    // persisted claudeSdkSessionId from the conversation's metadata (written to disk
+    // when the enrichment event arrived in the previous session).
+    const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
+    if (persistedSessionId && !this.sessionMap.has(conversationId)) {
+      debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
+      this.sessionMap.set(conversationId, persistedSessionId);
+    }
     const existingSessionId = this.sessionMap.get(conversationId);
 
     // Use pre-resolved auth from the model-runtime compatibility layer.
@@ -797,6 +805,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           conversationId,
           type: 'error',
           error: rewriteSdkError(rawError),
+          ...(msg.subtype === 'error_max_turns' ? { errorCategory: 'max_turns' } : {}),
         });
       }
 
@@ -831,7 +840,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
             conversationId,
             type: 'enrichment',
             data: {
-              sdkSessionId: sessionId,
+              claudeSdkSessionId: sessionId,
               sdkModel: msg.model as string | undefined,
               sdkTools: msg.tools as string[] | undefined,
               sdkVersion: msg.claude_code_version as string | undefined,
