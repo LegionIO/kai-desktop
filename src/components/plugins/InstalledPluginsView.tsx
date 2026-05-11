@@ -50,17 +50,16 @@ interface InstalledPluginsViewProps {
   onNavigate: (pluginName: string, target: PluginNavigationTarget) => void;
   onOpenPluginError: (pluginName: string) => void;
   onOpenPluginSettings: (pluginName: string) => void;
-  focusTrigger?: number;
 }
 
-export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError, onOpenPluginSettings, focusTrigger }) => {
+export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError, onOpenPluginSettings }) => {
   const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, [focusTrigger]);
+  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());

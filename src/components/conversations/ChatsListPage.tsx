@@ -47,7 +47,6 @@ type ChatsListPageProps = {
   onOpenConversation: (id: string) => void;
   onNewConversation: () => Promise<void> | void;
   workspaceId?: string | null;
-  focusTrigger?: number;
 };
 
 type FilterMode = 'all' | 'recent' | 'pinned' | 'archived';
@@ -93,7 +92,6 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   onOpenConversation,
   onNewConversation,
   workspaceId,
-  focusTrigger,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -134,11 +132,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     }
   }, []);
 
-  // Focus the search input when the page mounts or becomes active
+  // Focus the search input when the page mounts
   useEffect(() => {
-    const t = setTimeout(() => searchInputRef.current?.focus(), 50);
-    return () => clearTimeout(t);
-  }, [focusTrigger]);
+    searchInputRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
