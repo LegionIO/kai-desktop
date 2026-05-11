@@ -1534,9 +1534,7 @@ function AppShell() {
                     <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Settings</div>
                   </div>
                 ) : activeView === MARKETPLACE_VIEW ? (
-                  <div className="flex items-center gap-1.5">
-                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugin Marketplace</div>
-                  </div>
+                  <div className="flex items-center gap-1.5" />
                 ) : activeView === PLUGINS_VIEW ? (
                   <div className="flex items-center gap-1.5">
                     <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugins</div>

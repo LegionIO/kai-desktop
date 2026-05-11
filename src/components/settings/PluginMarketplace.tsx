@@ -120,7 +120,7 @@ export const PluginMarketplace: FC = () => {
             <input
               ref={searchRef}
               type="text"
-              placeholder="Search plugin marketplace…"
+              placeholder="Search marketplace…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
