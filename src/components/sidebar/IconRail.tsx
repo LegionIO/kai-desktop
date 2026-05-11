@@ -52,7 +52,7 @@ const IconRailButton: FC<{
       className={cn(
         'flex h-8 w-8 items-center justify-center rounded-lg transition-colors',
         isActive
-          ? 'bg-sidebar-accent/90 text-sidebar-foreground shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]'
+          ? 'bg-[var(--brand-accent)]/20 text-[var(--brand-accent)] shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]'
           : dimmed
             ? 'text-muted-foreground/30'
             : 'text-muted-foreground hover:bg-sidebar-accent/40 hover:text-sidebar-foreground/80',
