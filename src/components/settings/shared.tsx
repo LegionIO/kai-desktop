@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, type FC } from 'react';
+import { useState, useEffect, useRef, type FC, type ReactNode } from 'react';
+import { ChevronDownIcon, ChevronRightIcon } from 'lucide-react';
 
 export type SettingsProps = {
   config: Record<string, unknown>;
@@ -8,7 +9,7 @@ export type SettingsProps = {
 export const settingsSelectClass = 'app-settings-select w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none';
 
 export const Toggle: FC<{ label: string; checked: boolean; onChange: (value: boolean) => void }> = ({ label, checked, onChange }) => (
-  <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-border/60 bg-card/60 px-3 py-2">
+  <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2">
     <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="rounded" />
     <span className="text-xs">{label}</span>
   </label>
@@ -100,5 +101,20 @@ export const TextField: FC<{
       />
       {hint && <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">{hint}</span>}
     </div>
+  );
+};
+
+export const CollapsibleSection: FC<{ title: string; defaultOpen?: boolean; children: ReactNode }> = ({ title, defaultOpen = false, children }) => {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <fieldset className="rounded-lg border p-3 space-y-3">
+      <legend className="text-xs font-semibold px-1">
+        <button type="button" onClick={() => setOpen(!open)} className="inline-flex items-center gap-1 transition-colors hover:text-foreground">
+          {open ? <ChevronDownIcon className="h-3 w-3" /> : <ChevronRightIcon className="h-3 w-3" />}
+          {title}
+        </button>
+      </legend>
+      {open && children}
+    </fieldset>
   );
 };

@@ -16,6 +16,8 @@ import { LocalMacosHarness } from './harnesses/local-macos.js';
 import type { ComputerHarness, ComputerHarnessActionResult } from './harnesses/shared.js';
 import { closeOverlayWindow, hideOverlayForCapture, showOverlayAfterCapture } from './overlay-window.js';
 
+const DEFAULT_COMPUTER_USE_PROMPT = 'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
+
 type SessionMutator = (sessionId: string, update: (session: ComputerSession) => ComputerSession) => ComputerSession | null;
 type SessionReader = (sessionId: string) => ComputerSession | null;
 type EventSink = (event: ComputerUseEvent) => void;
@@ -326,7 +328,7 @@ export class ComputerUseOrchestrator {
 
         const freshSession = this.readSession(sessionId) ?? planningSession;
         const excludedApps = config.computerUse.localMacos.captureExcludedApps;
-        const computerUseInstructions = config.systemPrompts?.computerUse?.trim() || undefined;
+        const computerUseInstructions = config.systemPrompts?.computerUse?.trim() || DEFAULT_COMPUTER_USE_PROMPT;
 
         const plan = support === 'anthropic-client-tool'
           ? await anthropicPlanSession(freshSession, modelChain, maxRetries, planningRole, computerUseInstructions, excludedApps, fallbackCallbacks)

@@ -34,9 +34,10 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
-import { refocusComposer } from '@/lib/utils';
+import { cn, refocusComposer } from '@/lib/utils';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 
 // ── Props ───────────────────────────────────────────────────────────────
 
@@ -54,6 +55,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
+  const fullWidth = useFullWidthContent();
 
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -193,7 +195,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       <div className="flex-1" />
 
       {/* Composer at bottom */}
-      <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
+      <div className={cn('relative z-20 mx-auto w-full px-5 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
         {/* Hidden file input for web bridge */}
         {isWebBridge && (
           <input
@@ -240,7 +242,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
               onKeyDown={handleKeyDown}
               placeholder="Describe what you want to accomplish..."
               rows={1}
-              className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]"
+              className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', input.includes('\n') && 'pb-3')}
             />
             <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
               {/* Left side: add files + working directory */}

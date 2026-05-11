@@ -2,7 +2,8 @@ import type { FC } from 'react';
 import {
   MessageSquareIcon,
   CheckSquareIcon,
-  PuzzleIcon,
+  BotIcon,
+  PackageIcon,
   SettingsIcon,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -27,8 +28,8 @@ const SCOPED_TABS: readonly TabDef[] = [
 
 const GLOBAL_TABS: readonly TabDef[] = [
   // { id: 'messages', icon: InboxIcon, label: 'Messages' },  // TODO: re-enable later
-  // { id: 'agents', icon: BotIcon, label: 'Agents' },        // TODO: re-enable later
-  { id: 'plugins', icon: PuzzleIcon, label: 'Plugins' },
+  { id: 'agents', icon: BotIcon, label: 'Agents' },
+  { id: 'plugins', icon: PackageIcon, label: 'Plugins' },
 ];
 
 // ── IconRailButton ───────────────────────────────────────────────────────
@@ -44,7 +45,6 @@ const IconRailButton: FC<{
     content={label}
     side="right"
     sideOffset={6}
-    contentClassName="z-50 rounded-md bg-popover px-2 py-1 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
   >
     <button
       type="button"
@@ -52,7 +52,7 @@ const IconRailButton: FC<{
       className={cn(
         'flex h-8 w-8 items-center justify-center rounded-lg transition-colors',
         isActive
-          ? 'bg-sidebar-accent/90 text-sidebar-foreground shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]'
+          ? 'bg-[var(--brand-accent)]/20 text-[var(--brand-accent)] shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]'
           : dimmed
             ? 'text-muted-foreground/30'
             : 'text-muted-foreground hover:bg-sidebar-accent/40 hover:text-sidebar-foreground/80',
@@ -110,7 +110,6 @@ export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, se
         content={themeButton.title}
         side="right"
         sideOffset={6}
-        contentClassName="z-50 rounded-md bg-popover px-2 py-1 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
       >
         <button
           type="button"

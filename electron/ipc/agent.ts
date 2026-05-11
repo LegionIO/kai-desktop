@@ -7,6 +7,8 @@ import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
+import { readConversationStore } from './conversations.js';
+import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -197,6 +199,17 @@ function extractMessageText(content: unknown): string {
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function messagesContainImages(messages: unknown[]): boolean {
+  return messages.some((message) => {
+    if (!message || typeof message !== 'object') return false;
+    const typedMessage = message as { role?: string; content?: unknown };
+    if (typedMessage.role !== 'user' || !Array.isArray(typedMessage.content)) return false;
+    return typedMessage.content.some(
+      (part: unknown) => part && typeof part === 'object' && (part as { type?: string }).type === 'image',
+    );
+  });
 }
 
 function buildTitleGenerationInput(messages: unknown[]): string {
@@ -1066,6 +1079,60 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // Custom tools are filtered here so planning cannot mutate app state and
         // implementation cannot fall back to asking more questions or re-planning.
 
+        // Load persisted conversation metadata so runtimes can resume sessions.
+        // Claude Code SDK uses `claudeSdkSessionId`; Codex SDK uses `codexSdkThreadId`.
+        const convStore = readConversationStore(appHome);
+        const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
+
+        // -----------------------------------------------------------------------
+        // Cross-runtime switch: detect runtime change and inject prior context
+        // -----------------------------------------------------------------------
+        let switchContext: string | undefined;
+        // Skip for Mastra — it already receives the full message history natively.
+        if (runtime.id !== 'mastra') {
+          const previousRuntimeId = detectRuntimeSwitch(messages, runtime.id);
+          if (previousRuntimeId && modelEntry) {
+            const switchToolCallId = `switch-${Date.now()}`;
+            broadcastStreamEvent({
+              conversationId,
+              type: 'tool-call',
+              toolCallId: switchToolCallId,
+              toolName: 'runtime_switch',
+              args: { fromRuntime: previousRuntimeId, toRuntime: runtime.id },
+              startedAt: new Date().toISOString(),
+            });
+
+            const generatedContext = await generateSwitchContext(
+              messages,
+              modelEntry.modelConfig,
+              { abortSignal: controller.signal },
+            );
+
+            broadcastStreamEvent({
+              conversationId,
+              type: 'tool-result',
+              toolCallId: switchToolCallId,
+              toolName: 'runtime_switch',
+              result: generatedContext
+                ? generatedContext
+                : 'No prior context to transfer',
+              finishedAt: new Date().toISOString(),
+            });
+
+            if (generatedContext && !controller.signal.aborted) {
+              // Wrap the raw context in XML tags for LLM injection
+              const wrappedContext = wrapSwitchContext(generatedContext, previousRuntimeId);
+              switchContext = wrappedContext;
+              effectiveSystemPrompt = effectiveSystemPrompt
+                ? `${wrappedContext}\n\n${effectiveSystemPrompt}`
+                : wrappedContext;
+              if (streamConfig) {
+                streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
+              }
+            }
+          }
+        }
+
         const stream = runtime.stream({
           conversationId,
           messages,
@@ -1078,6 +1145,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
           claudeAuth: resolution.claudeAuth,
+          conversationMetadata: convMetadata,
+          switchContext,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
@@ -1157,11 +1226,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
             }
           }
-          if (event.type === 'text-delta' && activeSourceModel) {
+          if (event.type === 'text-delta') {
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
-              sourceModel: activeSourceModel,
-              sourceModelDisplayName: activeModelDisplayName,
+              ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
+              ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
               reasoningEffort: reasoningEffort ?? null,
               runtimeId: runtime.id,
             };
@@ -1260,6 +1329,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const input = buildTitleGenerationInput(messages);
     if (!input) return { title: null };
 
+    const hasImages = messagesContainImages(messages);
+
     const promptParts = [
       'Generate a concise conversation title using at most 4 words.',
       'Summarize the user\'s main topic or task, not the assistant\'s answer.',
@@ -1267,6 +1338,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       'Avoid apologies, disclaimers, or copied response text.',
       'Return only the title text with no quotes or formatting.',
     ];
+
+    if (hasImages) {
+      promptParts.push(
+        'The user attached one or more images. [Image] is a placeholder — do not treat it as literal text.',
+        'If the user\'s text is a short generic phrase like "read this image" or "what is this", title it based on the action, e.g. "Image Analysis" or "Analyze Image".',
+        'Never generate text that refers to not seeing an image or being unable to view it.',
+      );
+    }
 
     if (hint) {
       promptParts.push(`Context: ${hint}.`);

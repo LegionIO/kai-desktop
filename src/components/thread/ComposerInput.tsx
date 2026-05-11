@@ -3,6 +3,7 @@ import { useComposerRuntime } from '@assistant-ui/react';
 import { RichChatInput } from './RichChatInput';
 import { useAttachments } from '@/providers/AttachmentContext';
 import { usePromptHistory } from '@/providers/RuntimeProvider';
+import { cn } from '@/lib/utils';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
   placeholder = 'Discuss your thoughts and ideas...',
@@ -121,6 +122,8 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     return true;
   }, [addAttachments]);
 
+  const isMultiline = text.includes('\n');
+
   return (
     <RichChatInput
       value={text}
@@ -136,7 +139,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       }}
       onPaste={handlePaste}
       placeholder={placeholder}
-      className={className}
+      className={cn(className, isMultiline && 'pb-3')}
       autoFocus={autoFocus}
       focusKey={conversationId}
     />

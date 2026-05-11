@@ -79,65 +79,67 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       )}
 
       {/* Default profile selector */}
-      <div>
-        <label className="text-xs text-muted-foreground block mb-1">Default Model Profile</label>
-        <select
-          className={settingsSelectClass}
-          value={defaultProfileKey ?? ''}
-          onChange={(e) => handleDefaultProfileChange(e.target.value)}
-        >
-          {profiles.map((p) => (
-            <option key={p.key} value={p.key}>{p.name}</option>
-          ))}
-        </select>
-        <p className="mt-1 text-[10px] text-muted-foreground">
-          The active profile determines which model is used for new conversations.
-        </p>
-      </div>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Default Profile</legend>
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Active profile for new conversations</label>
+          <select
+            className={settingsSelectClass}
+            value={defaultProfileKey ?? ''}
+            onChange={(e) => handleDefaultProfileChange(e.target.value)}
+          >
+            {profiles.map((p) => (
+              <option key={p.key} value={p.key}>{p.name}</option>
+            ))}
+          </select>
+        </div>
+      </fieldset>
 
       {/* Profile list */}
-      <div className="space-y-2">
-        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Profile List</h4>
-        {profiles.map((profile, i) =>
-          editIndex === i ? (
-            <ProfileForm
-              key={`edit-${i}`}
-              initial={profile}
-              models={models}
-              onSave={(p) => { updateProfile(i, p); setEditIndex(null); }}
-              onCancel={() => setEditIndex(null)}
-              submitLabel="Save"
-            />
-          ) : (
-            <ProfileCard
-              key={profile.key}
-              profile={profile}
-              models={models}
-              onEdit={() => setEditIndex(i)}
-              onDelete={() => deleteProfile(i)}
-            />
-          ),
-        )}
-      </div>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Profile List</legend>
+        <div className="space-y-1.5">
+          {profiles.map((profile, i) =>
+            editIndex === i ? (
+              <ProfileForm
+                key={`edit-${i}`}
+                initial={profile}
+                models={models}
+                onSave={(p) => { updateProfile(i, p); setEditIndex(null); }}
+                onCancel={() => setEditIndex(null)}
+                submitLabel="Save"
+              />
+            ) : (
+              <ProfileCard
+                key={profile.key}
+                profile={profile}
+                models={models}
+                onEdit={() => setEditIndex(i)}
+                onDelete={() => deleteProfile(i)}
+              />
+            ),
+          )}
+        </div>
 
-      {showAdd ? (
-        <ProfileForm
-          initial={{ key: '', name: '', primaryModelKey: models[0]?.key ?? '', fallbackModelKeys: [] }}
-          models={models}
-          onSave={(p) => { addProfile(p); setShowAdd(false); }}
-          onCancel={() => setShowAdd(false)}
-          submitLabel="Add Profile"
-        />
-      ) : (
-        <button
-          type="button"
-          onClick={() => setShowAdd(true)}
-          className="flex items-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/50 transition-colors w-full"
-        >
-          <PlusIcon className="h-3.5 w-3.5" />
-          Add Profile
-        </button>
-      )}
+        {showAdd ? (
+          <ProfileForm
+            initial={{ key: '', name: '', primaryModelKey: models[0]?.key ?? '', fallbackModelKeys: [] }}
+            models={models}
+            onSave={(p) => { addProfile(p); setShowAdd(false); }}
+            onCancel={() => setShowAdd(false)}
+            submitLabel="Add Profile"
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowAdd(true)}
+            className="flex items-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/50 transition-colors w-full"
+          >
+            <PlusIcon className="h-3.5 w-3.5" />
+            Add Profile
+          </button>
+        )}
+      </fieldset>
     </div>
   );
 };

@@ -46,9 +46,10 @@ export type TokenUsageData = {
 
 type ContentPart =
   | { type: 'text'; text: string; source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' }
-  | { type: 'image'; image: string }
+  | { type: 'image'; image: string; mimeType?: string }
   | { type: 'file'; data: string; mimeType: string; filename: string }
   | { type: 'enrichments'; enrichments: PipelineEnrichments }
+  | { type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }
   | {
     type: 'tool-call';
     toolCallId: string;
@@ -192,6 +193,15 @@ function toStoredContent(parts: ContentPart[]): ThreadMessageLike['content'] {
   return parts as unknown as ThreadMessageLike['content'];
 }
 
+function messagesHaveImages(messages: ThreadMessageLike[]): boolean {
+  return messages.some(
+    (m) =>
+      m.role === 'user' &&
+      Array.isArray(m.content) &&
+      m.content.some((part: unknown) => (part as { type?: string }).type === 'image'),
+  );
+}
+
 function extractUserText(messages: ThreadMessageLike[]): string {
   const firstUser = messages.find((message) => message.role === 'user');
   if (!firstUser || !Array.isArray(firstUser.content)) return '';
@@ -212,10 +222,20 @@ function toTitleCase(value: string): string {
     .join(' ');
 }
 
+// Generic image-request phrases that convey no meaningful title on their own
+const IMAGE_GENERIC_PHRASES = /^(can you |could you |please )?(read|look at|analyze|describe|explain|summarize|check|view|see|show me|tell me about)\s+(this\s+)?(image|picture|photo|screenshot|diagram|chart|graph|file)s?[?.!]*$/i;
+
 function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
+  const hasImages = messagesHaveImages(messages);
   const text = extractUserText(messages)
     .replace(/[?!.,]+$/g, '')
     .trim();
+
+  // If the message has images and the text is empty or a generic image-request phrase,
+  // use a sensible image-analysis title rather than producing garbage.
+  if (hasImages && (!text || IMAGE_GENERIC_PHRASES.test(text))) {
+    return 'Image Analysis';
+  }
 
   if (!text) return null;
 
@@ -231,7 +251,7 @@ function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (!simplified) return null;
+  if (!simplified) return hasImages ? 'Image Analysis' : null;
 
   return toTitleCase(
     simplified
@@ -239,7 +259,7 @@ function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
       .filter((word) => word.length > 1)
       .slice(0, 4)
       .join(' '),
-  ) || null;
+  ) || (hasImages ? 'Image Analysis' : null);
 }
 
 function extractPromptHistoryText(message: ThreadMessageLike): string | null {
@@ -347,6 +367,17 @@ const CurrentWorkingDirectoryContext = createCtx<CurrentWorkingDirectoryState>({
 
 export function useCurrentWorkingDirectory(): CurrentWorkingDirectoryState {
   return useCtx(CurrentWorkingDirectoryContext);
+}
+
+// Exposes the activeConversationId that is set in the same React batch as
+// setTree/setHeadId inside loadConversationState. Consumers that need to react
+// *after* the new thread's messages are in the tree (e.g. scroll-to-bottom)
+// should use this instead of the IPC-driven app.conversations.onChanged event,
+// which fires before the tree has been loaded.
+const RuntimeConversationIdContext = createCtx<string | null>(null);
+
+export function useRuntimeConversationId(): string | null {
+  return useCtx(RuntimeConversationIdContext);
 }
 
 // --- Module-level sub-agent state (survives RuntimeProvider remounts) ---
@@ -897,26 +928,41 @@ async function persistConversation(
   }
 }
 
-// --- Title generation with maelstrom-style retitle logic ---
+// --- Title generation logic ---
 
-type TitleSettings = {
+// Retitle cadence defaults (used when config.titleGeneration is absent).
+// Intent: eagerly refine early (topic usually crystallizes in the first few
+// turns), then refresh periodically.
+const DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE = 3;
+const DEFAULT_RETITLE_INTERVAL_MESSAGES = 5;
+
+type TitleGenerationSettings = {
   enabled: boolean;
   retitleIntervalMessages: number;
   retitleEagerUntilMessage: number;
 };
 
+async function getTitleGenerationSettings(): Promise<TitleGenerationSettings> {
+  try {
+    const config = await app.config.get() as { titleGeneration?: Partial<TitleGenerationSettings> } | null;
+    const tg = config?.titleGeneration ?? {};
+    return {
+      enabled: tg.enabled ?? true,
+      retitleIntervalMessages: Math.max(1, tg.retitleIntervalMessages ?? DEFAULT_RETITLE_INTERVAL_MESSAGES),
+      retitleEagerUntilMessage: Math.max(0, tg.retitleEagerUntilMessage ?? DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE),
+    };
+  } catch {
+    return {
+      enabled: true,
+      retitleIntervalMessages: DEFAULT_RETITLE_INTERVAL_MESSAGES,
+      retitleEagerUntilMessage: DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE,
+    };
+  }
+}
+
 // Track last retitle count per conversation to avoid duplicate title gen
 const lastRetitleCount = new Map<string, number>();
 const titleGenInFlight = new Set<string>();
-
-async function getTitleSettings(): Promise<TitleSettings> {
-  try {
-    const config = await app.config.get() as { titleGeneration?: TitleSettings } | null;
-    return config?.titleGeneration ?? { enabled: true, retitleIntervalMessages: 5, retitleEagerUntilMessage: 5 };
-  } catch {
-    return { enabled: true, retitleIntervalMessages: 5, retitleEagerUntilMessage: 5 };
-  }
-}
 
 /** Update only specific fields on a conversation without overwriting message data.
  *  Reads the latest record from disk immediately before writing to minimize race windows. */
@@ -928,20 +974,28 @@ async function patchConversation(conversationId: string, patch: Partial<Conversa
 
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
   try {
-    const settings = await getTitleSettings();
-    if (!settings.enabled) return;
-
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (!conv) return;
 
-    const userMessageCount = messages.filter((m) => m.role === 'user').length;
+    // Don't clobber a user-renamed conversation. Rename sites
+    // (src/App.tsx, src/components/conversations/*) set titleStatus='manual'.
+    if (conv.titleStatus === 'manual') return;
 
-    // Always attempt on the first user message.
-    // On subsequent messages, retry only if the conversation still has no title
-    // (both title and fallbackTitle are empty), which means prior generation failed.
-    const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
-    if (userMessageCount !== 1 && !hasNoTitle) return;
+    const settings = await getTitleGenerationSettings();
+    if (!settings.enabled) return;
+
+    const userMessageCount = messages.filter((m) => m.role === 'user').length;
     if (userMessageCount < 1) return;
+
+    // Retitle cadence:
+    //   - always run on the first user message,
+    //   - eagerly refine for the first few messages (quick topic drift),
+    //   - then every N user messages thereafter,
+    //   - plus a retry if generation failed and no title/fallbackTitle landed.
+    const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
+    const isEager = userMessageCount <= settings.retitleEagerUntilMessage;
+    const isOnInterval = userMessageCount % settings.retitleIntervalMessages === 0;
+    if (!isEager && !isOnInterval && !hasNoTitle) return;
 
     // Dedup: don't regenerate if we already did for this exact user message count
     const lastCount = lastRetitleCount.get(conversationId);
@@ -1040,6 +1094,12 @@ const FallbackBannerContext = createCtx<FallbackBannerActions>({
 
 export function useFallbackBanner(): FallbackBannerActions {
   return useCtx(FallbackBannerContext);
+}
+
+const MaxTurnsContinueContext = createCtx<((messageId: string) => void) | null>(null);
+
+export function useMaxTurnsContinue(): ((messageId: string) => void) | null {
+  return useCtx(MaxTurnsContinueContext);
 }
 
 // =============================================================================
@@ -1631,7 +1691,7 @@ export function RuntimeProvider({
           const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
           if (tcIdx >= 0) {
             const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId };
+            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId, finishedAt: nowIso() };
             acc.messages[idx] = { ...msg, content: toStoredContent(content) };
           }
         }
@@ -1715,6 +1775,28 @@ export function RuntimeProvider({
       } else if (e.type === 'enrichment') {
         const enrichData = e.data as Record<string, unknown> | undefined;
         if (enrichData) applyEnrichments(acc, enrichData);
+
+        // Persist runtime session IDs so they survive app restarts.
+        // Claude Code SDK: claudeSdkSessionId → used by ClaudeAgentRuntime to resume via `resume` option.
+        // Codex SDK:       codexSdkThreadId → used by CodexRuntime to call resumeThread().
+        const claudeSdkSessionId = enrichData?.claudeSdkSessionId as string | undefined;
+        const codexSdkThreadId = enrichData?.codexSdkThreadId as string | undefined;
+        if (claudeSdkSessionId || codexSdkThreadId) {
+          // Merge into existing metadata rather than replacing it wholesale.
+          void (async () => {
+            const latest = await app.conversations.get(convId) as ConversationRecord | null;
+            if (!latest) return;
+            const existingMeta = (latest.metadata ?? {}) as Record<string, unknown>;
+            await app.conversations.put({
+              ...latest,
+              metadata: {
+                ...existingMeta,
+                ...(claudeSdkSessionId ? { claudeSdkSessionId } : {}),
+                ...(codexSdkThreadId ? { codexSdkThreadId } : {}),
+              },
+            });
+          })();
+        }
       } else if (e.type === 'context-usage') {
         const usageData = e.data as {
           inputTokens?: number;
@@ -1770,6 +1852,54 @@ export function RuntimeProvider({
             setHeadId(acc.headId);
           }
         }
+      } else if (e.type === 'error' && e.errorCategory === 'max_turns') {
+        // Max turns reached — auto-continue or show interactive continue card
+        console.warn(`[StreamEvent] MAX_TURNS conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)}`);
+        const agentCfg = (config as Record<string, unknown>)?.agent as Record<string, unknown> | undefined;
+        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true;
+
+        if (autoContinue) {
+          // Auto-continue: finalize current response and immediately restart the stream
+          finalizeAssistantResponse(acc);
+          const _ptAC = persistTimersRef.current.get(convId); if (_ptAC) { clearTimeout(_ptAC); persistTimersRef.current.delete(convId); }
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' });
+          streamAccumulators.set(convId, { messages: [...acc.messages], headId: acc.headId, pendingAssistantTiming: createPendingAssistantTiming() });
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
+          const cfg = streamHandlerRef.current;
+          app.agent.stream(
+            convId, branch,
+            cfg.selectedModelKey ?? undefined,
+            cfg.reasoningEffort ?? 'medium',
+            cfg.selectedProfileKey ?? undefined,
+            cfg.fallbackEnabled ?? false,
+            currentWorkingDirectoryRef.current ?? undefined,
+            executionMode ?? 'auto',
+            cfg.threadOverrides ?? undefined,
+          );
+          return;
+        }
+
+        // Manual continue: show interactive card
+        const { msg: mtMsg, idx: mtIdx } = getOrCreateAssistantInAcc(acc);
+        const mtContent = (Array.isArray(mtMsg.content) ? [...mtMsg.content] : []) as ContentPart[];
+        mtContent.push({ type: 'max-turns-reached', text: e.error ?? 'Reached maximum number of turns', status: 'pending' });
+        acc.messages[mtIdx] = { ...mtMsg, content: toStoredContent(mtContent) };
+        finalizeAssistantResponse(acc);
+        const _ptMaxTurns = persistTimersRef.current.get(convId); if (_ptMaxTurns) { clearTimeout(_ptMaxTurns); persistTimersRef.current.delete(convId); }
+        streamAccumulators.delete(convId);
+        persistConversation(convId, acc.messages, acc.headId, {
+          runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
+        });
+        if (isActiveConv) {
+          setIsRunning(false);
+          setTree([...acc.messages]);
+          setHeadId(acc.headId);
+        }
+        return;
       } else if (e.type === 'error') {
         console.warn(`[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`);
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
@@ -1915,13 +2045,20 @@ export function RuntimeProvider({
     const userContent: ContentPart[] = [];
     for (const part of message.content) {
       if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
-      else if (part.type === 'image') userContent.push({ type: 'image', image: (part as { image: string }).image });
+      else if (part.type === 'image') {
+        const imagePart = part as { image: string; mimeType?: string };
+        userContent.push({
+          type: 'image',
+          image: imagePart.image,
+          ...(imagePart.mimeType ? { mimeType: imagePart.mimeType } : {}),
+        });
+      }
     }
     for (const att of pendingAttachments) {
       const pathLabel = att.filePath ? att.filePath : att.name;
       if (att.isImage) {
-        userContent.push({ type: 'image', image: att.dataUrl });
-        userContent.push({ type: 'text', text: `\n[Attached image: ${pathLabel}]` });
+        // Send the actual image data — the model reads the image directly, no text placeholder needed
+        userContent.push({ type: 'image', image: att.dataUrl, mimeType: att.mime });
       } else if (att.text) {
         userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
         userContent.push({ type: 'text', text: `\n\n--- File: ${pathLabel} ---\n${att.text}\n--- End File ---\n` });
@@ -1930,7 +2067,7 @@ export function RuntimeProvider({
         userContent.push({ type: 'text', text: `\n[Attached file: ${pathLabel} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]` });
       }
     }
-    if (!userContent.some((p) => p.type === 'text')) return;
+    if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
 
     const userMsg: StoredMessage = { id: msgId(), parentId: headId, role: 'user', content: toStoredContent(userContent), createdAt: new Date() };
     const newTree = [...tree, userMsg];
@@ -2163,6 +2300,43 @@ export function RuntimeProvider({
     },
   });
 
+  const handleContinueAfterMaxTurns = useCallback((messageId: string) => {
+    const convId = activeIdRef.current;
+    if (!convId || isRunning) return;
+
+    // Update the max-turns-reached part status to 'continued'
+    setTree(prev => {
+      const updated = prev.map(msg => {
+        if (msg.id !== messageId) return msg;
+        const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+        const updatedContent = content.map(p =>
+          (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
+            ? { ...p, status: 'continued' as const }
+            : p
+        );
+        return { ...msg, content: toStoredContent(updatedContent) };
+      });
+      // Re-invoke stream with updated tree
+      const cfg = streamHandlerRef.current;
+      const newHead = cfg.headId;
+      const branch = getActiveBranch(updated, newHead);
+      streamAccumulators.set(convId, { messages: [...updated], headId: newHead, pendingAssistantTiming: createPendingAssistantTiming() });
+      persistConversation(convId, updated, newHead, { runStatus: 'running' });
+      app.agent.stream(
+        convId, branch,
+        cfg.selectedModelKey ?? undefined,
+        cfg.reasoningEffort ?? 'medium',
+        cfg.selectedProfileKey ?? undefined,
+        cfg.fallbackEnabled ?? false,
+        currentWorkingDirectoryRef.current ?? undefined,
+        executionMode ?? 'auto',
+        cfg.threadOverrides ?? undefined,
+      );
+      return updated;
+    });
+    setIsRunning(true);
+  }, [isRunning, executionMode]);
+
   const dismissFallbackBanner = useCallback(() => {
     setFallbackBanner(null);
     if (fallbackBannerTimerRef.current) {
@@ -2177,20 +2351,24 @@ export function RuntimeProvider({
   }), [fallbackBanner, dismissFallbackBanner]);
 
   return (
-    <FallbackBannerContext.Provider value={fallbackBannerActions}>
-      <SubAgentContext.Provider value={subAgentActions}>
-        <BranchNavContext.Provider value={branchNav}>
-          <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
-            <PromptHistoryContext.Provider value={promptHistory}>
-              <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                <AssistantRuntimeProvider runtime={runtime}>
-                  {children}
-                </AssistantRuntimeProvider>
-              </CurrentWorkingDirectoryContext.Provider>
-            </PromptHistoryContext.Provider>
-          </AssistantResponseTimingContext.Provider>
-        </BranchNavContext.Provider>
-      </SubAgentContext.Provider>
-    </FallbackBannerContext.Provider>
+    <MaxTurnsContinueContext.Provider value={handleContinueAfterMaxTurns}>
+      <FallbackBannerContext.Provider value={fallbackBannerActions}>
+        <SubAgentContext.Provider value={subAgentActions}>
+          <BranchNavContext.Provider value={branchNav}>
+            <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
+              <PromptHistoryContext.Provider value={promptHistory}>
+                <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
+                  <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                    <AssistantRuntimeProvider runtime={runtime}>
+                      {children}
+                    </AssistantRuntimeProvider>
+                  </RuntimeConversationIdContext.Provider>
+                </CurrentWorkingDirectoryContext.Provider>
+              </PromptHistoryContext.Provider>
+            </AssistantResponseTimingContext.Provider>
+          </BranchNavContext.Provider>
+        </SubAgentContext.Provider>
+      </FallbackBannerContext.Provider>
+    </MaxTurnsContinueContext.Provider>
   );
 }

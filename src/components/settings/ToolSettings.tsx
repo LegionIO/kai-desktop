@@ -3,7 +3,7 @@ import { PlusIcon, XIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { Toggle, NumberField, SliderField, headTailLabel, settingsSelectClass, type SettingsProps } from './shared';
 
-export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const tools = config.tools as {
     shell: { enabled: boolean; timeout: number; allowPatterns: string[]; denyPatterns: string[] };
     fileAccess: { enabled: boolean; allowPaths: string[]; denyPaths: string[] };
@@ -25,11 +25,13 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
         maxTotalLaunchedTools: number;
       };
     };
+    subAgents?: { enabled: boolean; maxDepth: number; maxConcurrent: number; maxPerParent: number; defaultModel?: string };
   };
+  const subAgents = tools.subAgents;
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Tools</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">Tools</h3>}
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Shell Tool</legend>
@@ -105,6 +107,29 @@ export const ToolSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
           <NumberField label="Max Observer-Launched Tools" value={tools.processStreaming.observer.maxTotalLaunchedTools} onChange={(v) => updateConfig('tools.processStreaming.observer.maxTotalLaunchedTools', v)} min={1} />
         </fieldset>
       </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Sub-Agents</legend>
+        <p className="text-xs text-muted-foreground">
+          Sub-agents allow the AI to delegate tasks to child agents that work autonomously.
+        </p>
+        <Toggle label="Enabled" checked={subAgents?.enabled ?? true} onChange={(v) => updateConfig('tools.subAgents.enabled', v)} />
+        <div className="grid grid-cols-2 gap-3">
+          <NumberField label="Max Nesting Depth (1-10)" value={subAgents?.maxDepth ?? 3} onChange={(v) => { const next = Math.max(1, Math.min(10, v ?? 3)); updateConfig('tools.subAgents.maxDepth', next); }} min={1} max={10} />
+          <NumberField label="Max Concurrent (1-20)" value={subAgents?.maxConcurrent ?? 5} onChange={(v) => { const next = Math.max(1, Math.min(20, v ?? 5)); updateConfig('tools.subAgents.maxConcurrent', next); }} min={1} max={20} />
+          <NumberField label="Max Per Parent (1-10)" value={subAgents?.maxPerParent ?? 3} onChange={(v) => { const next = Math.max(1, Math.min(10, v ?? 3)); updateConfig('tools.subAgents.maxPerParent', next); }} min={1} max={10} />
+          <div>
+            <label className="text-[10px] text-muted-foreground block mb-0.5">Default Model Override</label>
+            <EditableInput
+              className="w-full rounded border bg-card px-2 py-1.5 text-xs"
+              placeholder="Inherit from parent"
+              value={subAgents?.defaultModel ?? ''}
+              onChange={(value) => updateConfig('tools.subAgents.defaultModel', value || undefined)}
+            />
+            <span className="text-[10px] text-muted-foreground">Leave blank to inherit</span>
+          </div>
+        </div>
+      </fieldset>
     </div>
   );
 };
@@ -129,24 +154,24 @@ const PatternList: FC<{ label: string; patterns: string[]; onChange: (patterns: 
       <div className="space-y-1">
         {patterns.map((p, i) => (
           <div key={`${p}-${i}`} className="flex items-center gap-1">
-            <span className="text-xs font-mono bg-muted rounded px-2 py-0.5 flex-1">{p}</span>
-            <button type="button" onClick={() => removePattern(i)} className="p-0.5 rounded hover:bg-destructive/10">
+            <span className="text-xs font-mono rounded-xl border border-border/70 bg-card/80 px-3 py-1 flex-1">{p}</span>
+            <button type="button" onClick={() => removePattern(i)} className="p-1 rounded hover:bg-destructive/10">
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           </div>
         ))}
-      </div>
-      <div className="flex items-center gap-1 mt-1">
-        <EditableInput
-          className="flex-1 rounded border bg-card px-2 py-1 text-xs font-mono"
-          value={newPattern}
-          onChange={setNewPattern}
-          onSubmit={addPattern}
-          placeholder="Add pattern..."
-        />
-        <button type="button" onClick={addPattern} className="p-1 rounded hover:bg-muted">
-          <PlusIcon className="h-3 w-3" />
-        </button>
+        <div className="flex items-center gap-1">
+          <EditableInput
+            className="flex-1 rounded-xl border border-border/70 bg-card/80 px-3 py-1 text-xs font-mono"
+            value={newPattern}
+            onChange={setNewPattern}
+            onSubmit={addPattern}
+            placeholder="Add pattern..."
+          />
+          <button type="button" onClick={addPattern} className="p-1 rounded hover:bg-muted">
+            <PlusIcon className="h-3 w-3" />
+          </button>
+        </div>
       </div>
     </div>
   );

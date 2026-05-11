@@ -28,6 +28,7 @@ import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
+import { registerAgentHandlers as registerAgentEntityHandlers } from './ipc/agents.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
@@ -190,9 +191,9 @@ let updateDownloaded = false;
 function buildMenu(): void {
   const updateMenuItem: Electron.MenuItemConstructorOptions = updateDownloaded
     ? {
-        label: 'Restart to Update',
+        label: 'Install Update…',
         click: () => {
-          performQuitAndInstall();
+          void performQuitAndInstall();
         },
       }
     : {
@@ -655,6 +656,7 @@ if (gotSingleInstanceLock) {
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
+    registerAgentEntityHandlers(ipcMain, APP_HOME, taskTerminalManager);
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;

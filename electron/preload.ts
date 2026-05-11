@@ -128,6 +128,7 @@ const appAPI = {
       description: string;
       state: string;
       brandRequired: boolean;
+      icon?: { lucide: string } | { svg: string };
       error?: string;
     }>>,
     getConfig: (pluginName: string) => ipcRenderer.invoke('plugin:get-config', pluginName) as Promise<Record<string, unknown>>,
@@ -270,10 +271,12 @@ const appAPI = {
 
   tasks: {
     list: () => ipcRenderer.invoke('tasks:list'),
+    listAll: () => ipcRenderer.invoke('tasks:list-all'),
     get: (id: string) => ipcRenderer.invoke('tasks:get', id),
     create: (taskData: unknown) => ipcRenderer.invoke('tasks:create', taskData),
     update: (id: string, updates: unknown) => ipcRenderer.invoke('tasks:update', id, updates),
     delete: (id: string) => ipcRenderer.invoke('tasks:delete', id),
+    unarchive: (id: string) => ipcRenderer.invoke('tasks:unarchive', id),
     getOrder: () => ipcRenderer.invoke('tasks:get-order'),
     saveOrder: (order: unknown) => ipcRenderer.invoke('tasks:save-order', order),
     onChanged: (callback: (tasks: unknown[]) => void) => {
@@ -311,6 +314,24 @@ const appAPI = {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('tasks:stream-event', handler);
       return () => ipcRenderer.removeListener('tasks:stream-event', handler);
+    },
+  },
+
+  agents: {
+    list: () => ipcRenderer.invoke('agents:list'),
+    get: (id: string) => ipcRenderer.invoke('agents:get', id),
+    create: (payload: unknown) => ipcRenderer.invoke('agents:create', payload),
+    update: (id: string, updates: unknown) => ipcRenderer.invoke('agents:update', id, updates),
+    delete: (id: string) => ipcRenderer.invoke('agents:delete', id),
+    assignTask: (agentId: string, taskId: string) => ipcRenderer.invoke('agents:assign-task', agentId, taskId),
+    unassignTask: (agentId: string) => ipcRenderer.invoke('agents:unassign-task', agentId),
+    start: (agentId: string) => ipcRenderer.invoke('agents:start', agentId) as Promise<{ sessionId?: string; error?: string }>,
+    stop: (agentId: string) => ipcRenderer.invoke('agents:stop', agentId),
+    synthesizePrompt: (agentId: string, userDescription: string) => ipcRenderer.invoke('agents:synthesize-prompt', agentId, userDescription),
+    onChanged: (callback: (agents: unknown[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, agents: unknown[]) => callback(agents);
+      ipcRenderer.on('agents:changed', handler);
+      return () => ipcRenderer.removeListener('agents:changed', handler);
     },
   },
 

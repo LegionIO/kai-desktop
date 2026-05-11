@@ -67,11 +67,18 @@ const ProviderConfigSection: FC<{
   prefix: string;
   config: MediaGenConfig;
   updateConfig: (path: string, value: unknown) => void;
-}> = ({ prefix, config, updateConfig }) => {
+  enableLabel: string;
+  enabled: boolean;
+  onEnableChange: (v: boolean) => void;
+}> = ({ prefix, config, updateConfig, enableLabel, enabled, onEnableChange }) => {
   const provider: MediaProvider = config?.provider ?? 'azure';
 
   return (
-    <>
+    <fieldset className="rounded-lg border p-3 space-y-3">
+      <legend className="text-xs font-semibold px-1">Provider</legend>
+
+      <Toggle label={enableLabel} checked={enabled} onChange={onEnableChange} />
+
       {/* Provider Selector */}
       <div>
         <label className="text-[10px] text-muted-foreground block mb-0.5">Provider</label>
@@ -88,21 +95,21 @@ const ProviderConfigSection: FC<{
 
       {/* OpenAI Configuration */}
       {provider === 'openai' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">OpenAI Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">OpenAI Configuration</legend>
           <PasswordField
             label="API Key"
             value={config?.openai?.apiKey ?? ''}
             onChange={(v) => updateConfig(`${prefix}.openai.apiKey`, v)}
             placeholder="sk-..."
           />
-        </div>
+        </fieldset>
       )}
 
       {/* Azure Configuration */}
       {provider === 'azure' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Azure OpenAI Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Azure OpenAI Configuration</legend>
 
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Endpoint</label>
@@ -146,13 +153,13 @@ const ProviderConfigSection: FC<{
               placeholder="2024-02-15-preview"
             />
           </div>
-        </div>
+        </fieldset>
       )}
 
       {/* Custom Configuration */}
       {provider === 'custom' && (
-        <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Custom Provider Configuration</h4>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Custom Provider Configuration</legend>
 
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Base URL</label>
@@ -174,7 +181,7 @@ const ProviderConfigSection: FC<{
             onChange={(v) => updateConfig(`${prefix}.custom.apiKey`, v)}
             placeholder="Enter your API key (optional)"
           />
-        </div>
+        </fieldset>
       )}
 
       {/* Model */}
@@ -188,7 +195,7 @@ const ProviderConfigSection: FC<{
           placeholder={prefix.includes('image') ? 'gpt-image-2' : 'sora-2'}
         />
       </div>
-    </>
+    </fieldset>
   );
 };
 
@@ -198,8 +205,8 @@ const ImageOptions: FC<{
   config: MediaGenConfig;
   updateConfig: (path: string, value: unknown) => void;
 }> = ({ config, updateConfig }) => (
-  <div className="space-y-3 border-t border-border/50 pt-4">
-    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Image Options</h4>
+  <fieldset className="rounded-lg border p-3 space-y-3">
+    <legend className="text-xs font-semibold px-1">Image Options</legend>
 
     <div className="grid grid-cols-2 gap-3">
       <div>
@@ -250,7 +257,7 @@ const ImageOptions: FC<{
         min={5000}
       />
     </div>
-  </div>
+  </fieldset>
 );
 
 // ─── Video Options ───────────────────────────────────────────────────────────
@@ -259,8 +266,8 @@ const VideoOptions: FC<{
   config: MediaGenConfig;
   updateConfig: (path: string, value: unknown) => void;
 }> = ({ config, updateConfig }) => (
-  <div className="space-y-3 border-t border-border/50 pt-4">
-    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Video Options</h4>
+  <fieldset className="rounded-lg border p-3 space-y-3">
+    <legend className="text-xs font-semibold px-1">Video Options</legend>
 
     <div className="grid grid-cols-2 gap-3">
       <div>
@@ -297,14 +304,14 @@ const VideoOptions: FC<{
         min={5000}
       />
     </div>
-  </div>
+  </fieldset>
 );
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-const tabs: Array<{ key: MediaTab; label: string; description: string }> = [
-  { key: 'image', label: 'Image', description: 'Generate images using models like gpt-image-2.' },
-  { key: 'video', label: 'Video', description: 'Generate videos using models like Sora 2.' },
+const tabs: Array<{ key: MediaTab; label: string }> = [
+  { key: 'image', label: 'Image' },
+  { key: 'video', label: 'Video' },
 ];
 
 const configKeys: Record<MediaTab, string> = {
@@ -314,7 +321,6 @@ const configKeys: Record<MediaTab, string> = {
 
 export const MediaGenerationSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const [activeTab, setActiveTab] = useState<MediaTab>('image');
-  const tab = tabs.find((t) => t.key === activeTab)!;
   const prefix = configKeys[activeTab];
   const mediaConfig = (config as Record<string, unknown>)[prefix] as MediaGenConfig | undefined;
   const enabled = mediaConfig?.enabled ?? false;
@@ -325,50 +331,36 @@ export const MediaGenerationSettings: FC<SettingsProps> = ({ config, updateConfi
       <div>
         <h3 className="text-sm font-semibold">Media Generation</h3>
         <p className="text-xs text-muted-foreground mt-1">
-          Configure AI-powered image and video generation. Supports OpenAI, Azure OpenAI, and custom providers (e.g. ai-gateway proxy).
+          Configure AI-powered image and video generation.
         </p>
       </div>
 
       {/* Tab Bar */}
-      <div className="flex gap-1 rounded-xl border border-border/60 bg-muted/30 p-1">
-        {tabs.map((t) => {
-          const tabConfig = (config as Record<string, unknown>)[configKeys[t.key]] as MediaGenConfig | undefined;
-          const isEnabled = tabConfig?.enabled ?? false;
-          return (
+      <div className="flex gap-1 border-b border-border/60">
+        {tabs.map((t) => (
             <button
               key={t.key}
               type="button"
               onClick={() => setActiveTab(t.key)}
-              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
+              className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
                 activeTab === t.key
-                  ? 'bg-primary text-primary-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                  ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
               }`}
             >
               {t.label}
-              {isEnabled && (
-                <span className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              )}
             </button>
-          );
-        })}
+        ))}
       </div>
 
-      {/* Tab Description */}
-      <p className="text-xs text-muted-foreground">{tab.description}</p>
-
-      {/* Enable Toggle */}
-      <Toggle
-        label={`Enable ${tab.label.toLowerCase()} generation`}
-        checked={enabled}
-        onChange={(v) => updateConfig(`${prefix}.enabled`, v)}
-      />
-
-      {/* Provider Config */}
+      {/* Provider Config (includes enable toggle) */}
       <ProviderConfigSection
         prefix={prefix}
         config={mediaConfig ?? {}}
         updateConfig={updateConfig}
+        enableLabel={`Enable ${activeTab} generation`}
+        enabled={enabled}
+        onEnableChange={(v) => updateConfig(`${prefix}.enabled`, v)}
       />
 
       {/* Type-specific options */}

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { PuzzleIcon } from 'lucide-react';
+import { PackageIcon } from 'lucide-react';
 import * as LucideIcons from 'lucide-react';
 
 function lucideIconByName(name: string): ReactNode {
@@ -10,11 +10,11 @@ function lucideIconByName(name: string): ReactNode {
     .join('') + 'Icon';
   const Icon = (LucideIcons as Record<string, unknown>)[componentName] as React.ComponentType<{ className?: string }> | undefined;
   if (Icon) return <Icon className="h-4 w-4" />;
-  return <PuzzleIcon className="h-4 w-4" />;
+  return <PackageIcon className="h-4 w-4" />;
 }
 
 export function getPluginNavigationIcon(icon?: { lucide: string } | { svg: string }): ReactNode {
-  if (!icon) return <PuzzleIcon className="h-4 w-4" />;
+  if (!icon) return <PackageIcon className="h-4 w-4" />;
 
   if ('lucide' in icon) {
     return lucideIconByName(icon.lucide);
@@ -29,5 +29,5 @@ export function getPluginNavigationIcon(icon?: { lucide: string } | { svg: strin
     );
   }
 
-  return <PuzzleIcon className="h-4 w-4" />;
+  return <PackageIcon className="h-4 w-4" />;
 }

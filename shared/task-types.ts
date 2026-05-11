@@ -1,5 +1,5 @@
 /**
- * Types shared between main and renderer process for the Tasks kanban board.
+ * Types shared between main and renderer process for Tasks.
  */
 
 export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
@@ -25,15 +25,23 @@ export interface TaskFile {
   status: KaiTaskStatus;
   createdAt: string;
   updatedAt: string;
+  /** ISO timestamp set when the task first moves to in_progress. */
+  startedAt?: string;
+  /** ISO timestamp set when the task is marked done. */
+  completedAt?: string;
   sourceConversationId?: string;
   sourceToolCallId?: string;
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
   terminalSessionId?: string;
   metadata?: KaiTaskMetadata;
+  /** The agent assigned to work on this task. */
+  assignedAgentId?: string;
   /** The workspace this task belongs to. Undefined = legacy/unscoped. */
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */
   conversationHistory?: TaskConversationMessage[];
+  /** ISO timestamp set when the task is archived. Archived tasks are hidden from normal views. */
+  archivedAt?: string;
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */

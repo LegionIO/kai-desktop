@@ -138,7 +138,8 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 1. Dynamic SDK import
     // -----------------------------------------------------------------------
-    type SdkQueryFn = (params: { prompt: string; options?: SdkOptions }) => AsyncGenerator<SdkMessageAny, void>;
+    type SdkUserMessageInput = { type: 'user'; message: { role: 'user'; content: unknown }; parent_tool_use_id: null };
+    type SdkQueryFn = (params: { prompt: string | AsyncIterable<SdkUserMessageInput>; options?: SdkOptions }) => AsyncGenerator<SdkMessageAny, void>;
     type SdkCreateMcpServerFn = (opts: { name: string; version?: string; tools?: unknown[] }) => unknown;
     type SdkToolFn = (name: string, desc: string, schema: Record<string, unknown>, handler: (args: unknown, extra: unknown) => Promise<CallToolResult>) => unknown;
 
@@ -246,7 +247,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // Kai manages its own UX — bypass Claude Code's permission prompts entirely.
     // Without this, the SDK blocks on interactive approval for writes/bash/etc.
     const permissionMode = 'bypassPermissions';
-    const maxTurns = (sdkConfig.maxTurns as number) ?? 25;
+    const maxTurns = (agentConfig?.maxTurns as number) ?? (sdkConfig.maxTurns as number) ?? 25;
     const thinkingConfig = (sdkConfig.thinking as { type: string; budgetTokens?: number }) ?? { type: 'adaptive' };
 
     // Map reasoningEffort to SDK effort level
@@ -267,10 +268,45 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 6. Build prompt from messages
     // -----------------------------------------------------------------------
-    // The SDK takes a prompt string for the current turn.
-    // Extract the last user message as the prompt.
-    const prompt = extractLastUserPrompt(options.messages);
-    if (!prompt) {
+    // The SDK accepts either a plain string or AsyncIterable<SDKUserMessage>.
+    // We use the structured form so images survive — plain strings drop them.
+    const lastUserContent = extractLastUserContent(options.messages);
+    if (!lastUserContent) {
+      yield {
+        conversationId,
+        type: 'text-delta',
+        text: 'No user message found to send to Claude Agent SDK.',
+      };
+      yield { conversationId, type: 'done' };
+      return;
+    }
+
+    // If the content is purely text, send a plain string (simpler + more
+    // compatible with session-resume flows). Otherwise send a structured
+    // SDKUserMessage so image blocks reach the model intact.
+    const hasImages = Array.isArray(lastUserContent)
+      && lastUserContent.some((b: { type: string }) => b.type === 'image');
+
+    // When cross-runtime switch context is present, prepend it to the user prompt
+    // so it's visible as direct conversation context (not buried in system prompt).
+    const switchPrefix = options.switchContext ? `${options.switchContext}\n\n` : '';
+
+    const prompt: string | AsyncIterable<SdkUserMessageInput> = hasImages
+      ? (async function* () {
+          yield {
+            type: 'user' as const,
+            message: { role: 'user' as const, content: lastUserContent },
+            parent_tool_use_id: null,
+          };
+        })()
+      : (typeof lastUserContent === 'string'
+          ? `${switchPrefix}${lastUserContent}`
+          : `${switchPrefix}${(lastUserContent as Array<{ type: string; text?: string }>)
+              .filter((b) => b.type === 'text')
+              .map((b) => b.text ?? '')
+              .join('\n')}`);
+
+    if (!prompt && !hasImages) {
       yield {
         conversationId,
         type: 'text-delta',
@@ -294,14 +330,31 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
     // Check if we have a prior SDK session for this conversation.
     // If so, pass `resume` so the SDK replays its stored history.
-    const existingSessionId = this.sessionMap.get(conversationId);
+    // On app restart the in-memory sessionMap is empty, so fall back to the
+    // persisted claudeSdkSessionId from the conversation's metadata (written to disk
+    // when the enrichment event arrived in the previous session).
+    //
+    // When switch context is present, skip session resume — the prior session was
+    // from a different runtime, so resuming it would fail or produce stale context.
+    let existingSessionId: string | undefined;
+    if (options.switchContext) {
+      debugLog(`[SESSION] Skipping session resume — cross-runtime switch active`);
+      existingSessionId = undefined;
+    } else {
+      const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
+      if (persistedSessionId && !this.sessionMap.has(conversationId)) {
+        debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
+        this.sessionMap.set(conversationId, persistedSessionId);
+      }
+      existingSessionId = this.sessionMap.get(conversationId);
+    }
 
     // Use pre-resolved auth from the model-runtime compatibility layer.
     // This ensures Kai is always in control of which model + endpoint is used,
     // rather than silently falling back to ~/.claude/settings.json.
     const auth = options.claudeAuth ?? null;
 
-    debugLog(`[STREAM] conversationId=${conversationId} prompt=${JSON.stringify(prompt).slice(0, 200)}`);
+    debugLog(`[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`);
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
     debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`);
 
@@ -506,24 +559,54 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Extract the last user prompt from messages
+// Helper: Extract the last user message content (text + image blocks)
 // ---------------------------------------------------------------------------
 
-function extractLastUserPrompt(messages: unknown[]): string | null {
+type AnthropicContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+/**
+ * Extract the last user message and return it as Anthropic content blocks,
+ * preserving image parts so vision models can see attached screenshots.
+ */
+function extractLastUserContent(
+  messages: unknown[],
+): string | AnthropicContentBlock[] | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as { role?: string; content?: unknown } | undefined;
-    if (!msg) continue;
+    if (!msg || msg.role !== 'user') continue;
 
-    if (msg.role === 'user') {
-      if (typeof msg.content === 'string') return msg.content;
-      if (Array.isArray(msg.content)) {
-        // Extract text parts
-        const textParts = (msg.content as Array<{ type?: string; text?: string }>)
-          .filter((p) => p.type === 'text' && p.text)
-          .map((p) => p.text)
-          .join('\n');
-        if (textParts) return textParts;
+    if (typeof msg.content === 'string') return msg.content;
+
+    if (Array.isArray(msg.content)) {
+      const blocks: AnthropicContentBlock[] = [];
+
+      for (const p of msg.content as Array<{ type?: string; text?: string; image?: string; mimeType?: string }>) {
+        if (p.type === 'text' && p.text) {
+          blocks.push({ type: 'text', text: p.text });
+          continue;
+        }
+
+        if (p.type === 'image' && p.image) {
+          // image is a data URL: "data:<mime>;base64,<data>"
+          const dataUrl = p.image;
+          const commaIdx = dataUrl.indexOf(',');
+          if (commaIdx === -1) continue;
+
+          const header = dataUrl.slice(0, commaIdx); // "data:image/png;base64"
+          const data = dataUrl.slice(commaIdx + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const media_type = mimeMatch ? mimeMatch[1] : (p.mimeType ?? 'image/png');
+
+          blocks.push({
+            type: 'image',
+            source: { type: 'base64', media_type, data },
+          });
+        }
       }
+
+      if (blocks.length > 0) return blocks;
     }
   }
   return null;
@@ -735,6 +818,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           conversationId,
           type: 'error',
           error: rewriteSdkError(rawError),
+          ...(msg.subtype === 'error_max_turns' ? { errorCategory: 'max_turns' } : {}),
         });
       }
 
@@ -769,7 +853,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
             conversationId,
             type: 'enrichment',
             data: {
-              sdkSessionId: sessionId,
+              claudeSdkSessionId: sessionId,
               sdkModel: msg.model as string | undefined,
               sdkTools: msg.tools as string[] | undefined,
               sdkVersion: msg.claude_code_version as string | undefined,

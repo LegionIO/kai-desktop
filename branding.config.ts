@@ -43,7 +43,7 @@ export const branding = {
   sidebarSectionThreads: 'Chats',
   /** Sidebar section label for the plugins/extensions tab. */
   sidebarSectionPlugins: 'Plugins',
-  /** Sidebar section label for the tasks/kanban tab. */
+  /** Sidebar section label for the tasks/queue tab. */
   sidebarSectionTasks: 'Tasks',
 
   // ── Protocol & machine IDs ────────────────────────────────────────────

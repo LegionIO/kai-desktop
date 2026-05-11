@@ -25,7 +25,7 @@ export const Tooltip: FC<TooltipProps> = ({
       <TooltipPrimitive.Content
         side={side}
         sideOffset={sideOffset}
-        className={contentClassName ?? "z-50 rounded-lg bg-foreground/90 px-2.5 py-1 text-xs font-medium text-background shadow-lg backdrop-blur-sm animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"}
+        className={contentClassName ?? "z-50 rounded-lg bg-popover px-2.5 py-1 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"}
       >
         {content}
       </TooltipPrimitive.Content>

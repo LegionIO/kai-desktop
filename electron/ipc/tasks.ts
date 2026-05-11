@@ -5,35 +5,9 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
+import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
-
-const TASK_PLAN_SYSTEM_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
-
-Write the plan as clear, actionable markdown with this structure:
-
-## Objective
-One sentence summarizing the goal.
-
-## Steps
-1. First step — specific and actionable
-2. Second step — with enough detail to execute
-3. Continue as needed...
-
-## Acceptance Criteria
-- [ ] Criterion 1
-- [ ] Criterion 2
-
-## Notes
-Any additional context, risks, or dependencies.
-
-Rules:
-- Be specific and actionable, not vague
-- Include technical details where relevant
-- Use markdown checkboxes for criteria
-- Keep the plan concise but complete
-- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
-- Always output the complete updated plan, never just a diff or partial update`;
 
 /** Active plan generation streams, keyed by taskId. */
 const activeTaskStreams = new Map<string, { abort: () => void }>();
@@ -69,7 +43,7 @@ function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
   }
 }
 
-function listAllTasks(appHome: string): TaskFile[] {
+export function listAllTasks(appHome: string): TaskFile[] {
   const dir = getTasksDir(appHome);
   let files: string[];
   try {
@@ -91,7 +65,7 @@ function listAllTasks(appHome: string): TaskFile[] {
         return null;
       }
     })
-    .filter((t): t is TaskFile => t !== null)
+    .filter((t): t is TaskFile => t !== null && !t.archivedAt)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
@@ -102,6 +76,27 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle('tasks:list', () => {
     return listAllTasks(appHome);
+  });
+
+  ipcMain.handle('tasks:list-all', () => {
+    // Returns every task including archived — used by the archived filter view.
+    const dir = getTasksDir(appHome);
+    let files: string[];
+    try { files = readdirSync(dir); } catch { return []; }
+    return files
+      .filter((f) => f.endsWith('.json') && f !== 'order.json')
+      .map((f) => {
+        try {
+          const raw = readFileSync(join(dir, f), 'utf-8');
+          const parsed = JSON.parse(raw) as TaskFile;
+          if (!parsed.id || !parsed.title || !parsed.status) return null;
+          return parsed;
+        } catch {
+          return null;
+        }
+      })
+      .filter((t): t is TaskFile => t !== null)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   });
 
   ipcMain.handle('tasks:get', (_e, id: string) => {
@@ -144,17 +139,44 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     }
     try {
       const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      // Don't bump updatedAt for operational/bookkeeping-only fields.
+      // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
+      const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
+        'terminalSessionId',
+        'startedAt',
+        'completedAt',
+        'archivedAt',
+      ];
+      const isMeaningful = Object.keys(updates).some(
+        (k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile),
+      );
       const updated: TaskFile = {
         ...existing,
         ...updates,
         id, // prevent ID mutation
-        updatedAt: new Date().toISOString(),
+        ...(isMeaningful && { updatedAt: new Date().toISOString() }),
       };
       writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
       broadcastTaskChange(appHome);
       return updated;
     } catch {
       return { error: `Failed to update task ${id}` };
+    }
+  });
+
+  ipcMain.handle('tasks:unarchive', (_e, id: string) => {
+    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+    const filePath = join(getTasksDir(appHome), `${id}.json`);
+    if (!existsSync(filePath)) return { error: `Task ${id} not found` };
+    try {
+      const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const { archivedAt: _removed, ...rest } = existing as TaskFile & { archivedAt?: string };
+      const updated = { ...rest, updatedAt: new Date().toISOString() };
+      writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+      broadcastTaskChange(appHome);
+      return updated;
+    } catch (err) {
+      return { error: String(err) };
     }
   });
 
@@ -260,7 +282,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
           const result = streamText({
             model,
-            system: TASK_PLAN_SYSTEM_PROMPT,
+            system: config.systemPrompts?.taskPlan?.trim() || TASK_PLAN_SYSTEM_PROMPT,
             messages,
             abortSignal: controller.signal,
           });

@@ -1,5 +1,5 @@
 /**
- * TaskProvider — React Context + useReducer store for the kanban board.
+ * TaskProvider — React Context + useReducer store for the task queue.
  *
  * Manages task state in the renderer and syncs with the main process via IPC.
  * Follows the same Context pattern as PlanPanelProvider and ConfigProvider.
@@ -135,6 +135,9 @@ interface TaskContextValue {
   /** Delete a task. */
   deleteTask: (id: string) => Promise<void>;
 
+  /** Archive a task (hidden from normal views, not deleted). */
+  archiveTask: (id: string) => Promise<void>;
+
   /** Select a task (for detail panel). */
   selectTask: (id: string | null) => void;
 
@@ -201,6 +204,20 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           }
           dispatch({ type: 'SET_ORDER', order: cleanOrder });
           if (pruned) void app.tasks.saveOrder(cleanOrder);
+        } else if (tasks.length > 0) {
+          // No order.json — initialize order from current tasks
+          const initialOrder: KaiTaskOrder = {
+            todo: [],
+            in_progress: [],
+            ai_review: [],
+            human_review: [],
+            done: [],
+          };
+          for (const task of tasks) {
+            initialOrder[task.status]?.push(task.id);
+          }
+          dispatch({ type: 'SET_ORDER', order: initialOrder });
+          void app.tasks.saveOrder(initialOrder);
         }
       } catch (err) {
         console.error('[TaskProvider] Failed to load tasks:', err);
@@ -237,7 +254,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           description: data.description,
           status: data.status ?? 'todo',
           metadata: data.metadata,
-          workspaceId: activeWorkspaceId ?? undefined,
+          workspaceId: activeWorkspaceId || undefined,
         }));
         // No optimistic ADD_TASK dispatch — the IPC broadcast from main
         // process triggers SET_TASKS which includes the new task.
@@ -266,7 +283,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           sourceConversationId: opts.sourceConversationId,
           sourceToolCallId: opts.sourceToolCallId,
           metadata: opts.planFileName ? { planFileName: opts.planFileName } : undefined,
-          workspaceId: activeWorkspaceId ?? undefined,
+          workspaceId: activeWorkspaceId || undefined,
         }));
         // No optimistic ADD_TASK dispatch — broadcast handles it.
         return task;
@@ -293,14 +310,22 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const updateTaskStatus = useCallback(
     async (id: string, status: KaiTaskStatus) => {
+      const now = new Date().toISOString();
+      const task = state.tasks.find((t) => t.id === id);
       // Kill terminal when marking as done
       if (status === 'done') {
-        const task = state.tasks.find((t) => t.id === id);
         if (task?.terminalSessionId) {
           void app.tasks.terminalKill(task.terminalSessionId);
-          await updateTask(id, { status, terminalSessionId: undefined });
+          await updateTask(id, { status, terminalSessionId: undefined, completedAt: now });
           return;
         }
+        await updateTask(id, { status, completedAt: now });
+        return;
+      }
+      // Stamp startedAt on first transition to in_progress
+      if (status === 'in_progress' && !task?.startedAt) {
+        await updateTask(id, { status, startedAt: now });
+        return;
       }
       await updateTask(id, { status });
     },
@@ -318,6 +343,17 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     }
   }, []);
 
+  const archiveTask = useCallback(async (id: string) => {
+    try {
+      dispatch({ type: 'DELETE_TASK', id }); // remove from active list optimistically
+      await app.tasks.update(id, { archivedAt: new Date().toISOString() });
+    } catch (err) {
+      console.error('[TaskProvider] Failed to archive task:', err);
+      const tasks = (await app.tasks.list());
+      dispatch({ type: 'SET_TASKS', tasks });
+    }
+  }, []);
+
   const selectTask = useCallback((id: string | null) => {
     dispatch({ type: 'SELECT_TASK', id });
   }, []);
@@ -325,7 +361,21 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const reorderTasks = useCallback(
     (status: KaiTaskStatus, activeId: string, overId: string) => {
       const currentOrder = { ...state.taskOrder };
-      const column = [...(currentOrder[status] ?? [])];
+      let column = [...(currentOrder[status] ?? [])];
+
+      // If the order array is empty or missing task IDs, rebuild from current tasks
+      const tasksInStatus = state.tasks.filter((t) => t.status === status);
+      if (column.length === 0) {
+        column = tasksInStatus
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((t) => t.id);
+      } else {
+        // Ensure any tasks not yet in the order array get appended
+        const columnSet = new Set(column);
+        for (const t of tasksInStatus) {
+          if (!columnSet.has(t.id)) column.push(t.id);
+        }
+      }
 
       const activeIdx = column.indexOf(activeId);
       const overIdx = column.indexOf(overId);
@@ -338,7 +388,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       dispatch({ type: 'SET_ORDER', order: currentOrder });
       void app.tasks.saveOrder(currentOrder);
     },
-    [state.taskOrder],
+    [state.taskOrder, state.tasks],
   );
 
   const moveTaskToColumn = useCallback(
@@ -416,9 +466,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     try {
       // Create a placeholder task
       const task = (await app.tasks.create({
-        title: 'Generating…',
+        title: 'New Task',
         description: '',
         status: 'todo',
+        workspaceId: activeWorkspaceId || undefined,
         metadata,
       }));
       if (!task || !task.id) return;
@@ -439,7 +490,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       console.error('[TaskProvider] Failed to start AI task creation:', err);
       dispatch({ type: 'CANCEL_AI_CREATE' });
     }
-  }, []);
+  }, [activeWorkspaceId]);
 
   const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
     try {
@@ -480,6 +531,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       updateTask,
       updateTaskStatus,
       deleteTask,
+      archiveTask,
       selectTask,
       reorderTasks,
       moveTaskToColumn,
@@ -495,6 +547,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       updateTask,
       updateTaskStatus,
       deleteTask,
+      archiveTask,
       selectTask,
       reorderTasks,
       moveTaskToColumn,

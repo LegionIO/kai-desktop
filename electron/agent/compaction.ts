@@ -6,6 +6,7 @@ import {
 } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { createLanguageModelFromConfig } from './language-model.js';
+import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
 export type ChatMessage = {
   id?: string;
@@ -14,14 +15,6 @@ export type ChatMessage = {
   tool_calls?: Array<{ id: string; [key: string]: unknown }>;
   tool_call_id?: string;
 };
-
-const COMPACTION_SYSTEM_PROMPT = [
-  'You compact prior chat history for continuation.',
-  'Summarize only durable, high-value context needed for future turns.',
-  'Preserve facts, constraints, decisions, unresolved questions, and identifiers.',
-  'Do not invent details.',
-  'Return plain text only.',
-].join(' ');
 
 function extractToolCallIds(message: ChatMessage): Set<string> {
   const ids = new Set<string>();

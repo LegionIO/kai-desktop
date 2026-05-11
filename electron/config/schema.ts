@@ -165,12 +165,6 @@ const subAgentConfigSchema = z.object({
   defaultModel: z.string().optional(),
 });
 
-const titleGenerationSchema = z.object({
-  enabled: z.boolean(),
-  retitleIntervalMessages: z.number().positive(),
-  retitleEagerUntilMessage: z.number().nonnegative(),
-});
-
 const profileConfigSchema = z.object({
   key: z.string(),
   name: z.string(),
@@ -187,8 +181,14 @@ const profileConfigSchema = z.object({
 const systemPromptsConfigSchema = z.object({
   chat: z.string().optional(),
   plan: z.string().optional(),
-  implement: z.string().optional(),
   computerUse: z.string().optional(),
+  taskPlan: z.string().optional(),
+});
+
+const titleGenerationConfigSchema = z.object({
+  enabled: z.boolean(),
+  retitleIntervalMessages: z.number().positive(),
+  retitleEagerUntilMessage: z.number().nonnegative(),
 });
 
 const fallbackConfigSchema = z.object({
@@ -410,6 +410,8 @@ const codexSdkConfigSchema = z.object({
 
 const agentConfigSchema = z.object({
   runtime: z.enum(['auto', 'mastra', 'claude-agent-sdk', 'codex-sdk']),
+  maxTurns: z.number().positive().optional(),
+  autoContinueOnMaxTurns: z.boolean().optional(),
   claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
   codexSdk: codexSdkConfigSchema.optional(),
 });
@@ -485,6 +487,7 @@ export const appConfigSchema = z.object({
   }),
   systemPrompt: z.string(),
   systemPrompts: systemPromptsConfigSchema.optional(),
+  titleGeneration: titleGenerationConfigSchema.optional(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
   marketplace: marketplaceConfigSchema.optional(),
@@ -492,6 +495,8 @@ export const appConfigSchema = z.object({
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),
+    fullWidthContent: z.boolean().default(false),
+    splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
     composer: z.object({
@@ -508,7 +513,6 @@ export const appConfigSchema = z.object({
     maxRetries: z.number().nonnegative(),
     useResponsesApi: z.boolean(),
   }),
-  titleGeneration: titleGenerationSchema,
   profiles: z.array(profileConfigSchema).optional(),
   defaultProfileKey: z.string().optional(),
   fallback: fallbackConfigSchema.optional(),

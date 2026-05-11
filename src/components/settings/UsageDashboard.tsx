@@ -10,7 +10,7 @@ import { UsageModalityBreakdown } from './usage/UsageModalityBreakdown';
 
 type Period = 'daily' | 'weekly' | 'monthly';
 
-export const UsageDashboard: FC<SettingsProps> = () => {
+export const UsageDashboard: FC<SettingsProps & { hideTitle?: boolean }> = ({ hideTitle }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
@@ -127,8 +127,8 @@ export const UsageDashboard: FC<SettingsProps> = () => {
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold">Usage</h3>
-        <div className="flex items-center gap-2">
+        {!hideTitle && <h3 className="text-sm font-semibold">Usage</h3>}
+        <div className={`flex items-center gap-2${hideTitle ? ' ml-auto' : ''}`}>
           <button
             type="button"
             onClick={handleExport}

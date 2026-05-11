@@ -44,7 +44,7 @@ const typeLabels: Record<string, string> = {
   composite: 'Composite',
 };
 
-export const SkillSettings: FC<SettingsProps> = ({ config, updateConfig: _updateConfig }) => {
+export const SkillSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig: _updateConfig, hideTitle }) => {
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
@@ -98,7 +98,7 @@ export const SkillSettings: FC<SettingsProps> = ({ config, updateConfig: _update
   if (loading) {
     return (
       <div className="space-y-4">
-        <h3 className="text-sm font-semibold">Skills</h3>
+        {!hideTitle && <h3 className="text-sm font-semibold">Skills</h3>}
         <p className="text-xs text-muted-foreground">Loading skills...</p>
       </div>
     );
@@ -106,7 +106,7 @@ export const SkillSettings: FC<SettingsProps> = ({ config, updateConfig: _update
 
   return (
     <div className="space-y-4">
-      <h3 className="text-sm font-semibold">Skills</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">Skills</h3>}
       <p className="text-xs text-muted-foreground">
         Skills are reusable tools stored in <code className="bg-muted rounded px-1">~/.{__BRAND_APP_SLUG}/skills/</code>.
         The AI can create new skills during conversations, or you can add them manually.

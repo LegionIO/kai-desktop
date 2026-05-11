@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { createLanguageModelFromConfig } from './language-model.js';
+import { OBSERVER_SYSTEM_PROMPT } from './prompts.js';
 
 export type ToolObserverConfig = {
   enabled: boolean;
@@ -89,23 +90,6 @@ type ToolObserverManagerOptions = {
 
 const MAX_ACTIONS_PER_TICK = 6;
 const MAX_DYNAMIC_CONTEXT_CHARS = 6000;
-
-const OBSERVER_SYSTEM_PROMPT = [
-  'You are a runtime tool observer for a local coding assistant.',
-  'You observe all currently-running tool calls together and return ONLY structured actions.',
-  'Available actions:',
-  '- continue: no operation.',
-  '- send_message: publish a short user-facing progress update.',
-  '- cancel_tool: request cancellation for a specific running toolCallId.',
-  '- launch_tool: start a new tool call with toolName+args when it materially helps.',
-  '- message_sub_agent: send a follow-up message to a running sub_agent tool (use the sub-agent\'s toolCallId).',
-  'Rules:',
-  '- Prefer continue by default.',
-  '- Cancel only on clear error/risk/mismatch.',
-  '- Never fabricate toolCallIds; pick from the provided running tools.',
-  '- Keep send_message text <= 220 chars.',
-  '- Use message_sub_agent to guide running sub-agents, ask for updates, or redirect their work.',
-].join(' ');
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
 

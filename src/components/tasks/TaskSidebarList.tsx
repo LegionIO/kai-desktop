@@ -1,39 +1,28 @@
 /**
  * TaskSidebarList — task list shown in the sidebar when the "Tasks" tab is active.
  *
- * Matches ConversationList patterns: pin, context menu, triple-dot, bulk delete,
- * search, and animated removal.
+ * Matches ConversationList patterns: pin, context menu, triple-dot.
  */
 
-import { useState, useMemo, useCallback, useEffect, useRef, type FC } from 'react';
+import { useState, useMemo, useCallback, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import {
   SearchIcon,
   Trash2Icon,
   XIcon,
   ClipboardListIcon,
-  CircleDotIcon,
   PinIcon,
   EllipsisVerticalIcon,
-  LoaderIcon,
-  ListFilterIcon,
-  LayoutDashboardIcon,
+  PlusIcon,
+  FilePlusIcon,
+  PencilIcon,
+  ArchiveRestoreIcon,
 } from 'lucide-react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
-import type { TaskFile, KaiTaskStatus } from '@/types/task';
+import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { CreateTaskDialog } from './CreateTaskDialog';
-
-// Status colors for the task icon
-const STATUS_DOT_COLORS: Record<KaiTaskStatus, string> = {
-  todo: 'text-muted-foreground',
-  in_progress: 'text-blue-500',
-  ai_review: 'text-amber-500',
-  human_review: 'text-purple-400',
-  done: 'text-emerald-500',
-};
 
 function formatRelativeTime(timestamp: string): string {
   const diffMs = Date.now() - new Date(timestamp).getTime();
@@ -49,9 +38,9 @@ const PIN_EVENT = 'pinned-tasks-changed';
 
 interface TaskSidebarListProps {
   onSelectTask?: (taskId: string) => void;
-  /** When provided, "Create Task" opens the AI creation view instead of the dialog. */
+  /** When provided, "New Task" opens the AI creation view instead of the dialog. */
   onCreateTask?: () => void;
-  /** Navigate to the kanban board view in the main panel. */
+  /** Navigate to the task queue view in the main panel. */
   onViewBoard?: () => void;
   /** Whether the board view is currently shown in the main panel. */
   isBoardActive?: boolean;
@@ -61,12 +50,11 @@ interface TaskSidebarListProps {
 
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
-  onCreateTask: _onCreateTask,
+  onCreateTask,
   onViewBoard,
-  isBoardActive,
   workspaceId,
 }) => {
-  const { state, selectTask, deleteTask } = useTasks();
+  const { state, selectTask, archiveTask } = useTasks();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -119,50 +107,19 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
   }, [contextMenu]);
 
-  // ── Delete animation state ─────────────────────────────────────────────
-  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
-  const removingIdsRef = useRef<Set<string>>(new Set());
-
-  const handleDeleteSingle = useCallback(async (id: string) => {
-    setRemovingIds((prev) => {
-      const next = new Set(prev);
-      next.add(id);
-      removingIdsRef.current = next;
-      return next;
-    });
-    setTimeout(() => {
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        removingIdsRef.current = next;
-        return next;
-      });
-    }, 300);
-    await deleteTask(id);
-  }, [deleteTask]);
-
-  // ── Bulk delete state ──────────────────────────────────────────────────
-  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
-  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
-
   // ── Sort and filter tasks ──────────────────────────────────────────────
-  const isSearchActive = searchQuery.trim().length > 0;
 
   const sortedTasks = useMemo(() => {
     let tasks = [...state.tasks];
 
-    // Workspace scoping — show only tasks belonging to the active workspace
-    // (or legacy/unscoped tasks that have no workspaceId)
     if (workspaceId) {
-      tasks = tasks.filter((t) => t.workspaceId === workspaceId || !t.workspaceId);
+      tasks = tasks.filter((t) => t.workspaceId === workspaceId);
     }
 
     const query = searchQuery.toLowerCase().trim();
     if (query) {
       tasks = tasks.filter(
-        (t) =>
-          t.title.toLowerCase().includes(query) ||
-          t.description.toLowerCase().includes(query),
+        (t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query),
       );
     }
     tasks.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -184,66 +141,25 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     onSelectTask?.(taskId);
   };
 
-  const confirmBulkDelete = async () => {
-    setIsBulkDeleting(true);
-    for (const task of sortedTasks) {
-      await deleteTask(task.id);
-    }
-    setIsBulkDeleting(false);
-    setBulkDeleteOpen(false);
-  };
-
   return (
     <div className="flex flex-col h-full">
-      {/* TASKS heading row — label + options dropdown + View Board pill */}
+      {/* TASKS heading row */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => onViewBoard?.()}
+          className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+        >
           Tasks
-        </span>
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
-            >
-              <ListFilterIcon className="h-3.5 w-3.5" />
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-              <DropdownMenu.Item
-                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                disabled={sortedTasks.length === 0}
-                onSelect={() => setBulkDeleteOpen(true)}
-              >
-                <Trash2Icon size={14} />
-                {isSearchActive
-                  ? `Delete ${sortedTasks.length} shown`
-                  : 'Delete all'}
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        </button>
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => {
-            if (onViewBoard) {
-              onViewBoard();
-            }
-          }}
-          className={cn(
-            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
-            isBoardActive && 'border-primary/40 bg-primary/10 text-primary',
-          )}
+          onClick={(e) => { e.stopPropagation(); onCreateTask?.(); }}
+          className="flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
-          <LayoutDashboardIcon className="h-3 w-3" />
-          View Board
+          <FilePlusIcon className="h-3 w-3" />
+          New Task
         </button>
       </div>
 
@@ -281,15 +197,9 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
               </div>
             )}
             {section.items.map((task) => {
-              const isRemoving = removingIds.has(task.id);
               const isPinned = pinnedIds.has(task.id);
               return (
-                <div
-                  key={task.id}
-                  className={`overflow-hidden transition-all duration-300 ease-in-out ${
-                    isRemoving ? 'max-h-0 opacity-0 mb-0' : 'max-h-24 opacity-100 mb-1.5'
-                  }`}
-                >
+                <div key={task.id} className="mb-1.5">
                   <div
                     role="button"
                     tabIndex={0}
@@ -307,18 +217,36 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
                     <ClipboardListIcon
                       className={cn(
                         'mt-0.5 h-4 w-4 shrink-0',
-                        state.selectedTaskId === task.id ? 'text-primary' : STATUS_DOT_COLORS[task.status],
+                        state.selectedTaskId === task.id ? 'text-primary' : 'text-muted-foreground',
                       )}
                     />
-                    <div className="flex-1 min-w-0">
-                      <span className="line-clamp-2 text-sm font-medium text-sidebar-foreground/95">
-                        {task.title}
-                      </span>
-                      <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
-                        {KAI_TASK_STATUS_LABELS[task.status]}
-                        <span className="mx-1">·</span>
-                        {formatRelativeTime(task.updatedAt)}
-                      </span>
+                    <div className="flex flex-col flex-1 min-w-0">
+                      {(() => {
+                        const isPending = task.title === 'New Task';
+                        return (
+                          <>
+                            <span className={cn(
+                              'line-clamp-2 text-sm font-medium',
+                              isPending ? 'italic text-muted-foreground/50' : 'text-sidebar-foreground/95',
+                            )}>
+                              {task.title}
+                            </span>
+                            <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
+                              {KAI_TASK_STATUS_LABELS[task.status]}
+                              <span className="mx-1">·</span>
+                              {task.status === 'in_progress' ? (
+                                <div className="flex items-center gap-0.5 px-1">
+                                  <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+                                  <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+                                  <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+                                </div>
+                              ) : (
+                                formatRelativeTime(task.updatedAt)
+                              )}
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
                     <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
                       {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}
@@ -339,10 +267,29 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           </div>
         ))}
 
-        {sortedTasks.length === 0 && (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <CircleDotIcon className="h-6 w-6 opacity-40" />
-            <span>{searchQuery ? 'No tasks match your search' : 'No tasks yet'}</span>
+        {!state.isLoading && sortedTasks.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <ClipboardListIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              {searchQuery ? 'No tasks match your search' : 'No tasks yet'}
+            </h3>
+            {!searchQuery && (
+              <>
+                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                  Create tasks to track your work. Organize them on the board and assign them to agents.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onCreateTask?.()}
+                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <PlusIcon size={13} />
+                  Create Your First Task
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -366,60 +313,25 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           >
             <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedIds.has(contextMenu.taskId) ? 'Unpin' : 'Pin'}
           </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-rename', { detail: contextMenu.taskId })); setContextMenu(null); }}
+          >
+            <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { void archiveTask(contextMenu.taskId); setContextMenu(null); }}
+          >
+            <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Archive
+          </button>
           <div className="my-1 h-px bg-border/60" />
           <button
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-            onClick={() => { void handleDeleteSingle(contextMenu.taskId); setContextMenu(null); }}
+            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-delete', { detail: contextMenu.taskId })); setContextMenu(null); }}
           >
             <Trash2Icon className="h-4 w-4" /> Delete
           </button>
-        </div>,
-        document.body,
-      )}
-
-      {/* Bulk delete confirmation modal */}
-      {bulkDeleteOpen && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-sm font-semibold text-foreground">Delete tasks</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {isSearchActive
-                ? `This will permanently delete ${sortedTasks.length} shown task${sortedTasks.length === 1 ? '' : 's'}. This cannot be undone.`
-                : `This will permanently delete all ${sortedTasks.length} task${sortedTasks.length === 1 ? '' : 's'}. This cannot be undone.`}
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBulkDeleteOpen(false)}
-                disabled={isBulkDeleting}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { void confirmBulkDelete(); }}
-                disabled={isBulkDeleting}
-                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {isBulkDeleting ? (
-                  <>
-                    <LoaderIcon className="h-3 w-3 animate-spin" />
-                    Deleting...
-                  </>
-                ) : (
-                  <>
-                    <Trash2Icon className="h-3 w-3" />
-                    Delete
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
         </div>,
         document.body,
       )}

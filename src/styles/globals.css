@@ -348,6 +348,14 @@
   background-color: #1e1e1e;
 }
 
+/* Mini inline code preview (Write/Edit tool calls — VS Code extension style) */
+:root {
+  --mini-preview-bg: #f5f5f5;
+}
+.dark {
+  --mini-preview-bg: #1e1e1e;
+}
+
 /* (System prompt uses contentEditable — no overlay CSS needed) */
 
 /* contentEditable placeholder — data-placeholder attr is only set when isEmpty.
@@ -360,7 +368,9 @@
   content: attr(data-placeholder);
   position: absolute;
   inset: 0;
-  padding-left: 0.35rem;
+  padding: inherit;
+  display: flex;
+  align-items: center;
   color: var(--muted-foreground);
   pointer-events: none;
   white-space: pre-wrap;

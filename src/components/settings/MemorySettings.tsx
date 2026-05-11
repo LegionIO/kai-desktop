@@ -142,7 +142,7 @@ const TestEmbeddingButton: FC = () => {
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const memory = config.memory as {
     enabled: boolean;
     workingMemory: { enabled: boolean; scope: string };
@@ -161,7 +161,7 @@ export const MemorySettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Memory</h3>
+      {!hideTitle && <h3 className="text-sm font-semibold">Memory</h3>}
 
       <Toggle label="Enable Mastra memory" checked={memory.enabled} onChange={(v) => updateConfig('memory.enabled', v)} />
 

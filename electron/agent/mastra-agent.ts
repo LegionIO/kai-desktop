@@ -15,6 +15,7 @@ import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
+import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -780,7 +781,7 @@ async function* generateWithSyntheticEvents(
       const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
       const generateOptions = {
-        maxSteps: config.advanced.maxSteps,
+        maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
         abortSignal: options?.abortSignal,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
@@ -958,7 +959,7 @@ async function* streamWithRealEvents(
         const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
         const streamOptions = {
-          maxSteps: config.advanced.maxSteps,
+          maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
           abortSignal: options?.abortSignal,
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),
@@ -1390,7 +1391,7 @@ function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): str
   const chatPrompt = prompts?.chat?.trim() || config.systemPrompt;
 
   if (executionMode === 'plan-first') {
-    return prompts?.plan?.trim() || chatPrompt;
+    return prompts?.plan?.trim() || DEFAULT_PLAN_PROMPT;
   }
 
   return chatPrompt;

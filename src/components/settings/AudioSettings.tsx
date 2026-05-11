@@ -179,7 +179,7 @@ const VoicePreviewButton: FC<{
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const audio = (config as Record<string, unknown>).audio as AudioConfig | undefined;
   const provider: AudioProvider = audio?.provider ?? 'native';
   const azure = audio?.azure;
@@ -275,26 +275,31 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h3 className="text-sm font-semibold">Audio</h3>
-        <p className="text-xs text-muted-foreground mt-1">
-          Configure text-to-speech and voice recording. Choose between your OS&apos;s
-          built-in speech services or Azure AI Speech Service.
-        </p>
-      </div>
+      {!hideTitle && (
+        <div>
+          <h3 className="text-sm font-semibold">Audio</h3>
+          <p className="text-xs text-muted-foreground mt-1">
+            Configure text-to-speech and voice recording. Choose between your OS&apos;s
+            built-in speech services or Azure AI Speech Service.
+          </p>
+        </div>
+      )}
 
       {/* ── Provider Selector ── */}
-      <div>
-        <label className="text-[10px] text-muted-foreground block mb-0.5">Speech Provider</label>
-        <select
-          className={settingsSelectClass}
-          value={provider}
-          onChange={(e) => updateConfig('audio.provider', e.target.value)}
-        >
-          <option value="native">OS Native (Web Speech API)</option>
-          <option value="azure">Azure AI Speech Service</option>
-        </select>
-      </div>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Provider</legend>
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Speech Provider</label>
+          <select
+            className={settingsSelectClass}
+            value={provider}
+            onChange={(e) => updateConfig('audio.provider', e.target.value)}
+          >
+            <option value="native">OS Native (Web Speech API)</option>
+            <option value="azure">Azure AI Speech Service</option>
+          </select>
+        </div>
+      </fieldset>
 
       {/* ── Azure Configuration ── */}
       {provider === 'azure' && (
@@ -302,8 +307,8 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       )}
 
       {/* ── Text-to-Speech ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Text-to-Speech</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Text-to-Speech</legend>
 
         <Toggle
           label="Enable text-to-speech"
@@ -353,11 +358,11 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
             />
           </div>
         )}
-      </div>
+      </fieldset>
 
       {/* ── Voice Recording ── */}
-      <div className="space-y-3 border-t border-border/50 pt-4">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Voice Recording</h4>
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Voice Recording</legend>
 
         <Toggle
           label="Enable voice recording"
@@ -436,7 +441,7 @@ export const AudioSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
             )}
           </div>
         )}
-      </div>
+      </fieldset>
     </div>
   );
 };
@@ -482,17 +487,19 @@ const AzureConfigPanel: FC<{
   const hasKey = Boolean(azure?.subscriptionKey);
 
   return (
-    <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-      <div className="flex items-center gap-2">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Azure AI Configuration</h4>
-        <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
-          hasKey
-            ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-            : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-        }`}>
-          {hasKey ? '✓ Key set' : '⚠ Key missing'}
+    <fieldset className="rounded-lg border p-3 space-y-3">
+      <legend className="text-xs font-semibold px-1">
+        <span className="inline-flex items-center gap-2">
+          Azure AI Configuration
+          <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
+            hasKey
+              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+          }`}>
+            {hasKey ? '✓ Key set' : '⚠ Key missing'}
+          </span>
         </span>
-      </div>
+      </legend>
 
       {!hasKey && (
         <p className="text-[10px] text-amber-600/80 dark:text-amber-400/80">
@@ -599,7 +606,7 @@ const AzureConfigPanel: FC<{
           e.g. en-US, en-GB, es-ES, fr-FR, de-DE, ja-JP, zh-CN
         </span>
       </div>
-    </div>
+    </fieldset>
   );
 };
 

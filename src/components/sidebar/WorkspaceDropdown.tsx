@@ -105,10 +105,10 @@ const WorkspaceRow: FC<{
               </DropdownMenu.Item>
               <DropdownMenu.Item
                 className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                onSelect={(e) => {
-                  e.preventDefault();
-                  setOverflowOpen(false);
-                  onRequestDelete(workspace);
+                onSelect={() => {
+                  // Let Radix close the dropdown naturally (cleans up body pointer-events)
+                  // then open the delete dialog after the close completes
+                  setTimeout(() => onRequestDelete(workspace), 0);
                 }}
               >
                 <Trash2Icon size={13} />

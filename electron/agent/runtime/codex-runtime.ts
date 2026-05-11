@@ -22,6 +22,9 @@ import {
   buildCodexMcpServerConfig,
   CodexMcpBridge,
 } from './codex-mcp-bridge.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 // ---------------------------------------------------------------------------
 // Capabilities
@@ -69,12 +72,15 @@ type CodexClass = new (options?: {
   }): ThreadInstance;
 };
 
+type CodexUserInput = { type: 'text'; text: string } | { type: 'local_image'; path: string };
+type CodexInput = string | CodexUserInput[];
+
 type ThreadInstance = {
   id: string | null;
-  runStreamed(input: string, options?: { signal?: AbortSignal }): Promise<{
+  runStreamed(input: CodexInput, options?: { signal?: AbortSignal }): Promise<{
     events: AsyncGenerator<ThreadEventAny>;
   }>;
-  run(input: string, options?: { signal?: AbortSignal }): Promise<{
+  run(input: CodexInput, options?: { signal?: AbortSignal }): Promise<{
     items: ThreadItemAny[];
     finalResponse: string;
     usage: { input_tokens: number; cached_input_tokens: number; output_tokens: number } | null;
@@ -180,8 +186,8 @@ export class CodexRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 3. Extract prompt from messages
     // -----------------------------------------------------------------------
-    const prompt = extractLastUserPrompt(options.messages);
-    if (!prompt) {
+    const { textPrompt, imagePaths, tempImageDir } = extractLastUserInput(options.messages);
+    if (!textPrompt && imagePaths.length === 0) {
       yield {
         conversationId,
         type: 'text-delta',
@@ -236,8 +242,14 @@ export class CodexRuntime implements AgentRuntime {
       skipGitRepoCheck: true,
     };
 
-    // Resume or start new thread
-    const resumeId = (sdkConfig.resumeThreadId as string) ?? undefined;
+    // Resume or start new thread.
+    // `codexSdkThreadId` is written to conversation.metadata when the `thread.started`
+    // enrichment event is persisted by the renderer — see RuntimeProvider applyEnrichments.
+    // This makes context persist across both turns within a session and app restarts.
+    const resumeId =
+      (options.conversationMetadata?.codexSdkThreadId as string | undefined) ??
+      (sdkConfig.resumeThreadId as string | undefined) ??
+      undefined;
     const thread = resumeId
       ? codex.resumeThread(resumeId, threadOptions)
       : codex.startThread(threadOptions);
@@ -246,11 +258,25 @@ export class CodexRuntime implements AgentRuntime {
     // 6. Stream and translate events
     // -----------------------------------------------------------------------
     try {
-      const codexPrompt = bridgeUrl && customTools
-        ? buildCodexMcpPrompt(prompt, customTools)
-        : prompt;
+      // Build the effective text (with MCP tool hints if needed)
+      let effectiveText = bridgeUrl && customTools
+        ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
+        : (textPrompt ?? '');
 
-      const { events } = await thread.runStreamed(codexPrompt, {
+      // Inject prior context on runtime switch (Codex has no system prompt API)
+      if (options.switchContext) {
+        effectiveText = `${options.switchContext}\n\n${effectiveText}`;
+      }
+
+      // If there are images, use structured input; otherwise plain string
+      const codexInput: CodexInput = imagePaths.length > 0
+        ? [
+            ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+            ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+          ]
+        : effectiveText;
+
+      const { events } = await thread.runStreamed(codexInput, {
         signal: abortSignal,
       });
 
@@ -270,6 +296,59 @@ export class CodexRuntime implements AgentRuntime {
         return;
       }
 
+      // If resume failed (thread expired/deleted), retry with a fresh thread
+      const isThreadNotFound = resumeId &&
+        err instanceof Error &&
+        (err.message.includes('not found') ||
+         err.message.includes('expired') ||
+         err.message.includes('No thread') ||
+         err.message.includes('invalid_thread'));
+
+      if (isThreadNotFound) {
+        console.warn(`[codex-runtime] Thread resume failed (id=${resumeId}), retrying with fresh thread`);
+        try {
+          const freshThread = codex.startThread(threadOptions);
+
+          const effectiveText = bridgeUrl && customTools
+            ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
+            : (textPrompt ?? '');
+
+          const codexInput: CodexInput = imagePaths.length > 0
+            ? [
+                ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+                ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+              ]
+            : effectiveText;
+
+          const { events: retryEvents } = await freshThread.runStreamed(codexInput, {
+            signal: abortSignal,
+          });
+
+          for await (const event of retryEvents) {
+            if (abortSignal?.aborted) break;
+
+            const translated = translateCodexEvent(conversationId, event);
+            for (const evt of translated) {
+              yield evt;
+            }
+          }
+
+          yield { conversationId, type: 'done' };
+        } catch (retryErr) {
+          if (abortSignal?.aborted) {
+            yield { conversationId, type: 'done' };
+            return;
+          }
+          yield {
+            conversationId,
+            type: 'error',
+            error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+          };
+          yield { conversationId, type: 'done' };
+        }
+        return;
+      }
+
       yield {
         conversationId,
         type: 'error',
@@ -277,6 +356,9 @@ export class CodexRuntime implements AgentRuntime {
       };
       yield { conversationId, type: 'done' };
     } finally {
+      if (tempImageDir) {
+        try { rmSync(tempImageDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
       // -----------------------------------------------------------------------
       // 7. Cleanup: stop the MCP bridge
       // -----------------------------------------------------------------------
@@ -297,26 +379,70 @@ export class CodexRuntime implements AgentRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Extract the last user prompt
+// Helper: Extract the last user prompt and any image attachments
 // ---------------------------------------------------------------------------
 
-function extractLastUserPrompt(messages: unknown[]): string | null {
+/**
+ * Extract the last user message as a text prompt + temp file paths for images.
+ * The Codex SDK accepts `local_image` inputs via file path, so we write each
+ * base64 data URL to a temp file and return the paths. The caller is
+ * responsible for deleting them after the stream completes.
+ */
+function extractLastUserInput(
+  messages: unknown[],
+): { textPrompt: string | null; imagePaths: string[]; tempImageDir: string | null } {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as { role?: string; content?: unknown } | undefined;
-    if (!msg) continue;
+    if (!msg || msg.role !== 'user') continue;
 
-    if (msg.role === 'user') {
-      if (typeof msg.content === 'string') return msg.content;
-      if (Array.isArray(msg.content)) {
-        const textParts = (msg.content as Array<{ type?: string; text?: string }>)
-          .filter((p) => p.type === 'text' && p.text)
-          .map((p) => p.text)
-          .join('\n');
-        if (textParts) return textParts;
+    if (typeof msg.content === 'string') {
+      return { textPrompt: msg.content, imagePaths: [], tempImageDir: null };
+    }
+
+    if (Array.isArray(msg.content)) {
+      let textPrompt: string | null = null;
+      const imagePaths: string[] = [];
+      let tempImageDir: string | null = null;
+
+      try {
+        for (const p of msg.content as Array<{ type?: string; text?: string; image?: string; mimeType?: string }>) {
+          if (p.type === 'text' && p.text) {
+            textPrompt = (textPrompt ?? '') + (textPrompt ? '\n' : '') + p.text;
+            continue;
+          }
+
+          if (p.type === 'image' && p.image) {
+            // Parse data URL: "data:<mime>;base64,<data>"
+            const dataUrl = p.image;
+            const commaIdx = dataUrl.indexOf(',');
+            if (commaIdx === -1) continue;
+
+            const header = dataUrl.slice(0, commaIdx);
+            const base64Data = dataUrl.slice(commaIdx + 1);
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mime = mimeMatch ? mimeMatch[1] : (p.mimeType ?? 'image/png');
+            const ext = mime.split('/')[1]?.replace('jpeg', 'jpg') ?? 'png';
+
+            // Write to a per-turn temp directory — Codex SDK requires local paths.
+            tempImageDir ??= mkdtempSync(join(tmpdir(), 'kai-codex-images-'));
+            const tmpPath = join(tempImageDir, `img-${imagePaths.length}.${ext}`);
+            writeFileSync(tmpPath, Buffer.from(base64Data, 'base64'));
+            imagePaths.push(tmpPath);
+          }
+        }
+      } catch (error) {
+        if (tempImageDir) {
+          try { rmSync(tempImageDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+        }
+        throw error;
+      }
+
+      if (textPrompt !== null || imagePaths.length > 0) {
+        return { textPrompt, imagePaths, tempImageDir };
       }
     }
   }
-  return null;
+  return { textPrompt: null, imagePaths: [], tempImageDir: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +477,7 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
         events.push({
           conversationId,
           type: 'enrichment',
-          data: { codexThreadId: event.thread_id },
+          data: { codexSdkThreadId: event.thread_id },
         });
       }
       break;

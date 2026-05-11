@@ -1,10 +1,12 @@
-import { useState, type FC } from 'react';
+import { useState, useEffect, useRef, type FC } from 'react';
 import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 import { ProfileSettings } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
+import { MastraRuntimeSettings } from './MastraRuntimeSettings';
+import { UsageDashboard } from './UsageDashboard';
 
 export type Provider = {
   type: string;
@@ -35,37 +37,86 @@ type CatalogEntry = {
   preferredTarget?: 'isolated-browser' | 'local-macos';
 };
 
+type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts' | 'usage';
+
 export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const [activeTab, setActiveTab] = useState<ModelTab>('profiles');
+
+  const tabs: Array<{ key: ModelTab; label: string }> = [
+    { key: 'profiles', label: 'Profiles' },
+    { key: 'runtimes', label: 'Runtimes' },
+    { key: 'providers', label: 'Providers' },
+    { key: 'catalog', label: 'Catalog' },
+    { key: 'prompts', label: 'Prompts' },
+    { key: 'usage', label: 'Usage' },
+  ];
+
   return (
     <div className="space-y-6">
-      <h3 className="text-sm font-semibold">Model Config</h3>
+      <div>
+        <h3 className="text-sm font-semibold">Models</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Configure model profiles, agent runtimes, API providers, and the model catalog.
+        </p>
+      </div>
 
-      {/* Model Profiles */}
-      <ProfileSettings config={config} updateConfig={updateConfig} embedded />
+      {/* Tab Bar */}
+      <div className="flex gap-1 border-b border-border/60">
+        {tabs.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => setActiveTab(tab.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
+              activeTab === tab.key
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-      {/* Agent Runtime */}
-      <RuntimeSettings config={config} updateConfig={updateConfig} embedded />
+      {/* Content */}
+      {activeTab === 'profiles' && <ProfileSettings config={config} updateConfig={updateConfig} embedded />}
+      {activeTab === 'runtimes' && (
+        <div className="space-y-6">
+          <RuntimeSettings config={config} updateConfig={updateConfig} embedded />
+          <MastraRuntimeSettings config={config} updateConfig={updateConfig} />
+        </div>
+      )}
+      {activeTab === 'providers' && <ProvidersContent config={config} updateConfig={updateConfig} />}
+      {activeTab === 'catalog' && <CatalogContent config={config} updateConfig={updateConfig} />}
+      {activeTab === 'prompts' && <PromptsContent config={config} updateConfig={updateConfig} />}
+      {activeTab === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} hideTitle />}
     </div>
   );
 };
 
-/* ── Model Providers (standalone tab) ── */
+/* ── Providers Content ── */
 
-type ProviderSubTab = 'providers' | 'catalog';
+const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const models = config.models as { providers: Record<string, Provider> };
 
-export const ModelProviderSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  return (
+    <div className="space-y-3">
+      {Object.entries(models.providers).map(([key, provider]) => (
+        <ProviderCard key={key} name={key} provider={provider} updateConfig={updateConfig} />
+      ))}
+    </div>
+  );
+};
+
+/* ── Catalog Content ── */
+
+const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   const models = config.models as {
     providers: Record<string, Provider>;
     catalog: CatalogEntry[];
   };
 
   const providerKeys = Object.keys(models.providers);
-  const [activeSubTab, setActiveSubTab] = useState<ProviderSubTab>('providers');
-
-  const subTabs: Array<{ key: ProviderSubTab; label: string }> = [
-    { key: 'providers', label: 'Providers' },
-    { key: 'catalog', label: 'Models' },
-  ];
 
   const updateCatalog = (newCatalog: CatalogEntry[]) => updateConfig('models.catalog', newCatalog);
 
@@ -84,52 +135,141 @@ export const ModelProviderSettings: FC<SettingsProps> = ({ config, updateConfig 
   };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h3 className="text-sm font-semibold">Model Providers</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Configure API endpoints, credentials, and available models for each provider.
-        </p>
-      </div>
+    <ModelCatalog
+      catalog={models.catalog}
+      providerKeys={providerKeys}
+      providers={models.providers}
+      onAdd={addModel}
+      onUpdate={updateModel}
+      onDelete={deleteModel}
+    />
+  );
+};
 
-      {/* Sub-tab navigation */}
-      <div className="flex w-fit gap-1 rounded-xl border border-border/70 bg-card/60 p-1">
-        {subTabs.map((tab) => (
-          <button
-            key={tab.key}
-            type="button"
-            onClick={() => setActiveSubTab(tab.key)}
-            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-              activeSubTab === tab.key
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+/* ── Prompts Content ── */
 
-      {/* Sub-tab content */}
-      {activeSubTab === 'providers' && (
-        <div className="space-y-3">
-          {Object.entries(models.providers).map(([key, provider]) => (
-            <ProviderCard key={key} name={key} provider={provider} updateConfig={updateConfig} />
-          ))}
-        </div>
-      )}
+type PromptKey = 'chat' | 'plan' | 'taskPlan' | 'computerUse' | 'realtimeInstructions';
 
-      {activeSubTab === 'catalog' && (
-        <ModelCatalog
-          catalog={models.catalog}
-          providerKeys={providerKeys}
-          providers={models.providers}
-          onAdd={addModel}
-          onUpdate={updateModel}
-          onDelete={deleteModel}
-        />
-      )}
+const DEFAULT_CHAT_PROMPT = 'You are Kai, a powerful local AI assistant with access to the user\'s computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you\'re doing and why.';
+
+const DEFAULT_PLAN_PROMPT = 'You are a thorough planning assistant. Explore the codebase, understand the architecture, and create detailed implementation plans. Use only read-only tools to investigate. Ask the user to clarify requirements or preferences you cannot resolve from code alone. When your plan is ready, call exit_plan_mode with the full plan as markdown.';
+
+const DEFAULT_COMPUTER_USE_PROMPT = 'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
+
+// Note: this string is duplicated from electron/agent/prompts.ts (TASK_PLAN_SYSTEM_PROMPT).
+// Renderer code cannot import from Node/Electron modules — keep in sync manually.
+const DEFAULT_TASK_PLAN_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
+
+Write the plan as clear, actionable markdown with this structure:
+
+## Objective
+One sentence summarizing the goal.
+
+## Steps
+1. First step — specific and actionable
+2. Second step — with enough detail to execute
+3. Continue as needed...
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Any additional context, risks, or dependencies.
+
+Rules:
+- Be specific and actionable, not vague
+- Include technical details where relevant
+- Use markdown checkboxes for criteria
+- Keep the plan concise but complete
+- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
+- Always output the complete updated plan, never just a diff or partial update`;
+
+const promptFields: Array<{ key: PromptKey; label: string; placeholder: string; configPath: string }> = [
+  { key: 'chat', label: 'New Chat', placeholder: DEFAULT_CHAT_PROMPT, configPath: 'systemPrompt' },
+  { key: 'realtimeInstructions', label: 'Voice Chat', placeholder: 'You are a helpful assistant. Respond concisely and naturally in conversation.', configPath: 'realtime.instructions' },
+  { key: 'plan', label: 'Create Plan', placeholder: DEFAULT_PLAN_PROMPT, configPath: 'systemPrompts.plan' },
+  { key: 'taskPlan', label: 'Create Task', placeholder: DEFAULT_TASK_PLAN_PROMPT, configPath: 'systemPrompts.taskPlan' },
+  { key: 'computerUse', label: 'Computer Use', placeholder: DEFAULT_COMPUTER_USE_PROMPT, configPath: 'systemPrompts.computerUse' },
+];
+
+const PromptsContent: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const configPrompt = (config as { systemPrompt?: string }).systemPrompt ?? '';
+  const configPrompts = (config as { systemPrompts?: Partial<Record<string, string>> }).systemPrompts ?? {};
+  const realtimeInstructions = ((config as Record<string, unknown>).realtime as { instructions?: string } | undefined)?.instructions ?? '';
+
+  return (
+    <div className="space-y-4">
+      {promptFields.map((field) => {
+        let value: string;
+        if (field.key === 'chat') {
+          value = configPrompts.chat?.trim() ? configPrompts.chat : configPrompt;
+        } else if (field.key === 'realtimeInstructions') {
+          value = realtimeInstructions;
+        } else {
+          value = configPrompts[field.key] ?? '';
+        }
+
+        return (
+          <PromptFieldset
+            key={field.key}
+            label={field.label}
+            value={value}
+            placeholder={field.placeholder}
+            onChange={(v) => {
+              if (field.key === 'chat') {
+                void updateConfig('systemPrompt', v);
+                void updateConfig('systemPrompts.chat', v);
+              } else {
+                void updateConfig(field.configPath, v);
+              }
+            }}
+          />
+        );
+      })}
     </div>
+  );
+};
+
+const PromptFieldset: FC<{
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+}> = ({ label, value, placeholder, onChange }) => {
+  const [draft, setDraft] = useState(value);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isFocusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!isFocusedRef.current) setDraft(value);
+  }, [value]);
+
+  const flush = (v: string) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    if (v !== value) onChange(v);
+  };
+
+  const handleChange = (v: string) => {
+    setDraft(v);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => flush(v), 800);
+  };
+
+  return (
+    <fieldset className="rounded-lg border p-3 space-y-3">
+      <legend className="text-xs font-semibold px-1">{label}</legend>
+      <textarea
+        className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none min-h-[100px] resize-y"
+        value={draft}
+        onFocus={() => { isFocusedRef.current = true; }}
+        onBlur={() => { isFocusedRef.current = false; flush(draft); }}
+        onChange={(e) => handleChange(e.target.value)}
+        placeholder={placeholder}
+        rows={5}
+      />
+    </fieldset>
   );
 };
 
@@ -440,13 +580,10 @@ const ProviderCard: FC<{
   const isOpenAICompatible = provider.type === 'openai-compatible' && !isOllama;
 
   return (
-    <div className="rounded-lg border p-3 space-y-2">
-      <div className="flex items-center gap-2">
-        <span className="text-xs font-mono font-medium">{name}</span>
-        <span className="text-[10px] text-muted-foreground px-1.5 py-0.5 rounded bg-muted">
-          {getProviderTypeLabel(provider.type)}
-        </span>
-      </div>
+    <fieldset className="rounded-lg border p-3 space-y-3">
+      <legend className="text-xs font-semibold px-1">
+        {name} <span className="font-normal text-muted-foreground">[{getProviderTypeLabel(provider.type)}]</span>
+      </legend>
 
       <Toggle
         label="Enabled"
@@ -487,7 +624,7 @@ const ProviderCard: FC<{
       {isBedrock && (
         <BedrockCredentials prefix={prefix} provider={provider} updateConfig={updateConfig} />
       )}
-    </div>
+    </fieldset>
   );
 };
 

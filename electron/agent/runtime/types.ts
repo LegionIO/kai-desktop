@@ -134,6 +134,26 @@ export type StreamOptions = {
     baseUrl: string;
     apiKey: string;
   };
+
+  /**
+   * Persisted metadata from the conversation record.
+   * Runtimes use this to resume prior sessions:
+   *   - `claudeSdkSessionId` (Claude Code SDK): resume the Claude Code session
+   *   - `codexSdkThreadId` (Codex SDK): resume the Codex thread
+   */
+  conversationMetadata?: Record<string, unknown>;
+
+  /**
+   * Injected prior conversation context for cross-runtime switch.
+   * When present, indicates the runtime is being used for the first time in this
+   * conversation (switched from a different runtime). The context contains a
+   * transcript or summary of prior turns.
+   *
+   * - Claude Code SDK: skip session resume (prior session is from another runtime)
+   * - Codex SDK: prepend to the user prompt (Codex has no system prompt API)
+   * - Mastra: not used (Mastra already receives full message history)
+   */
+  switchContext?: string;
 };
 
 // ---------------------------------------------------------------------------

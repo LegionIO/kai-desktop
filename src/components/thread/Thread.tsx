@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext, type FC, type PropsWithChildren } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ThreadPrimitive,
   ComposerPrimitive,
@@ -37,10 +38,10 @@ import {
   ArrowUpIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { refocusComposer } from '@/lib/utils';
+import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
-import { useBranchNav, useCurrentWorkingDirectory, type TokenUsageData } from '@/providers/RuntimeProvider';
+import { useBranchNav, useCurrentWorkingDirectory, useRuntimeConversationId, type TokenUsageData } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { MarkdownText } from './MarkdownText';
@@ -48,6 +49,7 @@ import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
+import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
 import { ComposerInput } from './ComposerInput';
@@ -62,6 +64,7 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { CallOverlay } from './CallOverlay';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
@@ -99,10 +102,26 @@ export const Thread: FC<{
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- hook must run for reactivity
-  const _activeConversationId = useActiveConversationId();
+  const fullWidth = useFullWidthContent();
+  // useRuntimeConversationId updates in the same React batch as setTree/setHeadId,
+  // so the scroll fires only after the new thread's messages are already in the DOM.
+  const runtimeConversationId = useRuntimeConversationId();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
+
+  // Scroll to the bottom whenever the active conversation changes.
+  // We key off runtimeConversationId (not the IPC-driven useActiveConversationId)
+  // because it updates only after the new thread's tree has been loaded into state.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // rAF lets the browser finish painting the new messages before we scroll
+    const raf = requestAnimationFrame(() => {
+      viewport.scrollTop = viewport.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  // intentional: only scroll when the active conversation changes, not on every dep update
+  }, [runtimeConversationId]);
   // Track whether the splash should hide instantly (loading existing thread)
   // vs fade out gradually (user just sent first message in new thread).
   const [splashInstantHide, setSplashInstantHide] = useState(false);
@@ -143,7 +162,7 @@ export const Thread: FC<{
 
   return (
     <ThreadMetaContext.Provider value={threadMeta}>
-    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col" id="kai-chat-viewport">
       <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
       <div
         className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
@@ -161,7 +180,7 @@ export const Thread: FC<{
           <PinnedUserMessage viewportRef={viewportRef} />
           <div className="flex min-h-full flex-col">
             <div className="flex-1">
-              <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20">
+              <div className={cn('relative z-10 mx-auto flex w-full flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20', !fullWidth && 'max-w-3xl')}>
                 <ThreadPrimitive.Messages
                   components={{
                     UserMessage,
@@ -264,13 +283,14 @@ function getActiveComputerSession(
 const ComputerTabSurface: FC = () => {
   const activeConversationId = useActiveConversationId();
   const { sessionsByConversation } = useComputerUse();
+  const fullWidth = useFullWidthContent();
   const activeComputerSession = getActiveComputerSession(activeConversationId, sessionsByConversation);
 
   if (!activeComputerSession) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-          <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
+          <div className={cn('mx-auto flex w-full min-h-0 flex-col', !fullWidth && 'max-w-3xl')}>
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
@@ -291,7 +311,7 @@ const ComputerTabSurface: FC = () => {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="px-3 pb-4 pt-16 md:px-6 md:pb-6 md:pt-20">
-        <div className="mx-auto flex w-full max-w-3xl min-h-0 flex-col">
+        <div className={cn('mx-auto flex w-full min-h-0 flex-col', !fullWidth && 'max-w-3xl')}>
           <ComputerSessionPanel session={activeComputerSession} stickyTopClassName="top-12 md:top-14" />
         </div>
       </div>
@@ -460,6 +480,7 @@ const GuidanceComposer: FC<{ sessionId: string; onReturnToChat: () => void }> = 
  */
 const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null> }> = ({ viewportRef }) => {
   const threadRuntime = useThreadRuntime();
+  const fullWidth = useFullWidthContent();
   const [lastUserMessage, setLastUserMessage] = useState<{
     text: string;
     imageCount: number;
@@ -585,7 +606,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
           : 'h-0 overflow-hidden opacity-0'
       }`}
     >
-      <div className="mx-auto flex w-full max-w-3xl justify-end px-3 pr-5 md:px-6 md:pr-8">
+      <div className={cn('mx-auto flex w-full justify-end px-3 pr-5 md:px-6 md:pr-8', !fullWidth && 'max-w-3xl')}>
         <div className="max-w-[88%] md:max-w-[72%]">
           <div
             className="pointer-events-auto ml-auto flex w-fit max-w-full items-stretch rounded-xl border text-foreground shadow-lg backdrop-blur-md"
@@ -602,7 +623,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
             )}
 
             {/* Action buttons — always anchored right, never move */}
-            <div className="flex shrink-0 items-center gap-0.5 px-2 py-2">
+            <div className="flex shrink-0 items-start gap-0.5 px-2 py-2">
               <button
                 type="button"
                 onClick={() => setExpanded((e) => !e)}
@@ -736,7 +757,7 @@ const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClo
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[100] flex cursor-pointer items-center justify-center bg-black/80 backdrop-blur-sm"
       onClick={onClose}
@@ -758,7 +779,8 @@ const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClo
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };
 
@@ -804,7 +826,7 @@ const ToolFallback: FC<{
         ? 'bg-red-500'
         : 'bg-emerald-500';
 
-  // Bridge: create kanban task when a plan is approved
+  // Bridge: create task queue entry when a plan is approved
   const taskCtx = useTasksOptional();
   const handlePlanApproved = useCallback(async (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => {
     const task = await taskCtx?.createTaskFromPlan({
@@ -1009,8 +1031,30 @@ const AssistantMessage: FC = () => {
 
   // Detect "thinking between tool calls" — model is running, content exists,
   // but there's no actively-executing tool (all tool calls have results).
+  // Rules:
+  //  - A regular tool is "done" when result !== undefined AND finishedAt !== undefined.
+  //  - A sub_agent tool is always treated as "handled" — it has its own inline UI and
+  //    streams partial results early, so we never want it to suppress the parent spinner.
   const allToolsDone = isRunning && hasContent && content.every(
-    (p: { type: string; result?: unknown }) => p.type !== 'tool-call' || p.result !== undefined,
+    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+      p.type !== 'tool-call' ||
+      p.toolName === 'sub_agent' || p.toolName === 'agent' ||
+      (p.result !== undefined && p.finishedAt !== undefined),
+  );
+
+  // A sub_agent (or SDK 'agent') is actively running when it has no result yet (or result but no finishedAt)
+  const hasRunnningSubAgent = isRunning && content.some(
+    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+      p.type === 'tool-call' && (p.toolName === 'sub_agent' || p.toolName === 'agent') && p.finishedAt === undefined,
+  );
+
+  // Any regular tool (non-agent) is actively executing when it has no result yet and isn't pending approval
+  const hasRunningTool = isRunning && content.some(
+    (p: { type: string; toolName?: string; result?: unknown; approvalStatus?: string }) =>
+      p.type === 'tool-call' &&
+      p.toolName !== 'sub_agent' && p.toolName !== 'agent' &&
+      p.result === undefined &&
+      p.approvalStatus !== 'pending',
   );
 
   // Detect paused-for-input — a tool is awaiting user approval/answer
@@ -1029,6 +1073,10 @@ const AssistantMessage: FC = () => {
     | { type: 'enrichments'; enrichments: PipelineEnrichments }
     | undefined;
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
+
+  // Extract max-turns-reached content parts for interactive continue card
+  const maxTurnsParts = (content.filter((p: { type: string }) => p.type === 'max-turns-reached') as unknown) as
+    Array<{ type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }>;
 
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1075,7 +1123,7 @@ const AssistantMessage: FC = () => {
   });
 
   return (
-    <MessagePrimitive.Root className="group mb-8 flex justify-start">
+    <MessagePrimitive.Root className={`group flex justify-start ${message.isLast && isRunning ? 'mb-2' : 'mb-8'}`}>
       <div className="w-full max-w-4xl">
         <div ref={contentRef} className="aui-assistant-content relative overflow-hidden pr-4 pt-3 text-foreground">
           {isEmpty ? (
@@ -1100,15 +1148,19 @@ const AssistantMessage: FC = () => {
               <div className="aui-typing-dots">
                 <ThinkingSpinner />
               </div>
-              {/* Between-tool-calls spinner: all tools finished but model is still running */}
-              {allToolsDone && (
-                <div className="mt-5 mb-2 timeline-detached">
+              {/* Thinking spinner: shown when model is running with content but no active tool output,
+                  when a sub-agent is working, or when a regular tool is actively executing */}
+              {(allToolsDone || hasRunnningSubAgent || hasRunningTool) && (
+                <div className="mt-5 timeline-detached">
                   <ThinkingSpinner />
                 </div>
               )}
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
+          {maxTurnsParts.map((part, i) => (
+            <MaxTurnsContinueCard key={`max-turns-${i}`} part={part} messageId={message.id} />
+          ))}
         </div>
         <div className={`flex items-center gap-1 mt-1.5 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />
@@ -1406,7 +1458,7 @@ const StopButton: FC = () => {
         // Force-clear the composer so it doesn't restore the previous message text
         composerRuntime.setText('');
       }}
-      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive transition-colors hover:bg-destructive/20"
     >
       <StopCircleIcon className="h-4 w-4" />
     </button>
@@ -1431,6 +1483,7 @@ const Composer: FC<{
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
+  const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
@@ -1643,7 +1696,7 @@ const Composer: FC<{
   }
 
   return (
-    <div className="relative z-20 mx-auto w-full max-w-3xl px-4 pb-4 pt-4 md:pb-5 md:pt-5">
+    <div className={cn('relative z-20 mx-auto w-full px-5 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input

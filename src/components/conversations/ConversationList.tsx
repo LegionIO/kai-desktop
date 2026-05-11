@@ -1,16 +1,13 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, Trash2Icon, ArchiveIcon, MessageSquareIcon, LoaderIcon, XIcon, SlidersHorizontalIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, ListFilterIcon, SquarePenIcon, CheckIcon, ArrowUpDownIcon } from 'lucide-react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import { Trash2Icon, ArchiveIcon, MessageSquareIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, SquarePenIcon, PlusIcon, SearchIcon, XIcon, SlidersHorizontalIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import type { ComputerSession } from '../../../shared/computer-use';
-import { useConversationPreferences } from './useConversationPreferences';
-import { SortPopover } from './SortPopover';
-import { FilterPopover } from './FilterPopover';
 import { ExportDialog } from './ExportDialog';
+import { RenameChatModal } from './RenameChatModal';
 import { ThreadSettingsModal } from './ThreadSettingsModal';
 
 type ConversationSummary = Pick<
@@ -28,6 +25,7 @@ type ConversationListProps = {
   onSwitchConversation: (id: string) => void;
   onNewConversation: () => Promise<void> | void;
   onDeleteConversation?: (id: string) => Promise<void> | void;
+  onNavigateToChatsPage?: () => void;
   /** When set, only conversations matching this workspace (or unscoped legacy conversations) are shown. */
   workspaceId?: string | null;
 };
@@ -88,11 +86,11 @@ export const ConversationList: FC<ConversationListProps> = ({
   onSwitchConversation,
   onNewConversation,
   onDeleteConversation: _onDeleteConversation,
+  onNavigateToChatsPage,
   workspaceId,
 }) => {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
   const [, setDeletingId] = useState<string | null>(null);
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const removingIdsRef = useRef<Set<string>>(new Set());
@@ -100,14 +98,9 @@ export const ConversationList: FC<ConversationListProps> = ({
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
   });
   const { sessionsByConversation } = useComputerUse();
-  const [sortOpen, setSortOpen] = useState(false);
-  const [filterOpen, setFilterOpen] = useState(false);
-  const moreButtonRef = useRef<HTMLButtonElement>(null);
-  const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters, isDefaultSort } = useConversationPreferences();
-  const [showArchived, setShowArchived] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const [threadSettingsConvId, setThreadSettingsConvId] = useState<string | null>(null);
 
@@ -197,72 +190,37 @@ export const ConversationList: FC<ConversationListProps> = ({
     return () => { cancelled = true; unsub(); };
   }, [loadConversations]);
 
-  const isSearchActive = searchQuery.trim().length > 0;
-  const hasActiveFilters = activeFilterCount > 0;
-
   const processedConversations = useMemo(() => {
     let result = [...conversations];
 
-    // Stage 0: Workspace scoping — show only conversations belonging to the active workspace
+    // Workspace scoping — show only conversations belonging to the active workspace
     // (or legacy/unscoped conversations that have no workspaceId)
     if (workspaceId) {
       result = result.filter((conv) => conv.workspaceId === workspaceId || !conv.workspaceId);
     }
 
-    result = result.filter((conv) => showArchived ? Boolean(conv.archived) : !conv.archived);
+    result = result.filter((conv) => !conv.archived);
 
-    // Hide empty threads (no messages, no title) — they only appear after the user sends a message
+    // Hide empty threads (no messages, no title)
     result = result.filter((conv) => conv.messageCount > 0 || Boolean(conv.title?.trim() || conv.fallbackTitle?.trim()));
 
-    // Stage 1: Apply filters
-    if (hasActiveFilters) {
-      result = result.filter((conv) => {
-        if (filter.hasToolCalls === true && !conv.hasToolCalls) return false;
-        if (filter.hasComputerUse === true && !sessionsByConversation.has(conv.id)) return false;
-        if (filter.messageCountMin != null && conv.messageCount < filter.messageCountMin) return false;
-        if (filter.messageCountMax != null && conv.messageCount > filter.messageCountMax) return false;
-        if (filter.createdAfter && conv.createdAt.slice(0, 10) < filter.createdAfter) return false;
-        if (filter.createdBefore && conv.createdAt.slice(0, 10) > filter.createdBefore) return false;
-        const effectiveUpdated = conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt;
-        if (filter.updatedAfter && (effectiveUpdated ?? '').slice(0, 10) < filter.updatedAfter) return false;
-        if (filter.updatedBefore && (effectiveUpdated ?? '').slice(0, 10) > filter.updatedBefore) return false;
-        return true;
-      });
-    }
-
-    // Stage 2: Apply text search
-    if (isSearchActive) {
+    // Text search
+    if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       result = result.filter((c) =>
         getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q),
       );
     }
 
-    // Stage 3: Apply sort
+    // Default sort: newest-first by last assistant update
     result.sort((a, b) => {
-      let cmp = 0;
-      switch (sort.field) {
-        case 'latest-updated': {
-          const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
-          const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
-          cmp = aAt.localeCompare(bAt);
-          break;
-        }
-        case 'first-created':
-          cmp = a.createdAt.localeCompare(b.createdAt);
-          break;
-        case 'alphabetical': {
-          const aTitle = getDisplayTitle(a, sessionsByConversation.get(a.id)).toLowerCase();
-          const bTitle = getDisplayTitle(b, sessionsByConversation.get(b.id)).toLowerCase();
-          cmp = aTitle.localeCompare(bTitle);
-          break;
-        }
-      }
-      return sort.direction === 'desc' ? -cmp : cmp;
+      const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
+      const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
+      return bAt.localeCompare(aAt);
     });
 
     return result;
-  }, [conversations, filter, hasActiveFilters, searchQuery, isSearchActive, sort, sessionsByConversation, showArchived, workspaceId]);
+  }, [conversations, searchQuery, sessionsByConversation, workspaceId]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
@@ -314,11 +272,11 @@ export const ConversationList: FC<ConversationListProps> = ({
 
   const handleRename = async (id: string, newTitle: string) => {
     const trimmed = newTitle.trim();
-    if (!trimmed) { setRenamingId(null); return; }
+    if (!trimmed) { setRenameModal(null); return; }
     const conv = await app.conversations.get(id) as ConversationRecord | null;
-    if (!conv) { setRenamingId(null); return; }
+    if (!conv) { setRenameModal(null); return; }
     await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
-    setRenamingId(null);
+    setRenameModal(null);
     await loadConversations();
   };
 
@@ -342,20 +300,6 @@ export const ConversationList: FC<ConversationListProps> = ({
     return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
   }, [contextMenu]);
 
-  const handleDeleteBulk = async () => {
-    const idsToDelete = processedConversations.map((c) => c.id);
-
-    for (const id of idsToDelete) {
-      await app.conversations.delete(id);
-    }
-
-    if (activeConversationId && idsToDelete.includes(activeConversationId)) {
-      await onNewConversation();
-    }
-
-    await loadConversations();
-  };
-
   const handleClearUnread = async (id: string) => {
     const conv = await app.conversations.get(id) as ConversationRecord | null;
     // Don't clear hasUnread when the conversation is awaiting approval —
@@ -367,88 +311,19 @@ export const ConversationList: FC<ConversationListProps> = ({
     onSwitchConversation(id);
   };
 
-  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
-  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
-
-  const confirmBulkDelete = async () => {
-    setIsBulkDeleting(true);
-    await handleDeleteBulk();
-    setIsBulkDeleting(false);
-    setBulkDeleteOpen(false);
-  };
-
   const isNewChat = hasLoaded && !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
 
   return (
     <div className="flex flex-col h-full">
-      {/* CHATS heading row — label + options dropdown + New Chat pill */}
+      {/* CHATS heading row — label + New Chat pill */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => onNavigateToChatsPage?.()}
+          className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+        >
           Chats
-        </span>
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              ref={moreButtonRef}
-              type="button"
-              className="relative rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
-            >
-              <ListFilterIcon className="h-3.5 w-3.5" />
-              {/* Activity dot — visible when sort, filter, or archive is non-default */}
-              {(!isDefaultSort || activeFilterCount > 0 || showArchived) && (
-                <span className="pointer-events-none absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary" />
-              )}
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-                <DropdownMenu.Item
-                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                  onSelect={() => { setSortOpen(true); setFilterOpen(false); }}
-                >
-                  <ArrowUpDownIcon size={14} className="text-muted-foreground" />
-                  Sort chats
-                  {!isDefaultSort && <CheckIcon size={13} className="ml-auto text-primary" />}
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                  onSelect={() => { setFilterOpen(true); setSortOpen(false); }}
-                >
-                  <SlidersHorizontalIcon size={14} className="text-muted-foreground" />
-                  Filter chats
-                  {activeFilterCount > 0 && (
-                    <span className="ml-auto flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
-                      {activeFilterCount > 9 ? '9+' : activeFilterCount}
-                    </span>
-                  )}
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                  onSelect={() => setShowArchived((p) => !p)}
-                >
-                  <ArchiveIcon size={14} className="text-muted-foreground" />
-                  {showArchived ? 'Show active' : 'Show archived'}
-                  {showArchived && <CheckIcon size={13} className="ml-auto text-primary" />}
-                </DropdownMenu.Item>
-                <DropdownMenu.Separator className="my-1 h-px bg-border/50" />
-                <DropdownMenu.Item
-                  className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                  disabled={processedConversations.length === 0}
-                  onSelect={() => setBulkDeleteOpen(true)}
-                >
-                  <Trash2Icon size={14} />
-                  {isSearchActive || hasActiveFilters
-                    ? `Delete ${processedConversations.length} shown`
-                    : 'Delete all'}
-                </DropdownMenu.Item>
-              </DropdownMenu.Content>
-            </DropdownMenu.Portal>
-          </DropdownMenu.Root>
+        </button>
         <div className="flex-1" />
         <button
           type="button"
@@ -462,24 +337,9 @@ export const ConversationList: FC<ConversationListProps> = ({
           New Chat
         </button>
       </div>
-      {/* Sort/Filter popovers — anchored to the ··· button */}
-      {sortOpen && (
-        <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={moreButtonRef} />
-      )}
-      {filterOpen && (
-        <FilterPopover
-          filter={filter}
-          onFilterChange={setFilter}
-          activeFilterCount={activeFilterCount}
-          onClear={clearFilters}
-          onClose={() => setFilterOpen(false)}
-          anchorRef={moreButtonRef}
-        />
-      )}
-
-      <div className="px-3 pb-3">
+      <div className="px-3 pb-2">
         <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/60 bg-sidebar-accent/50 px-3 py-2">
-          <SearchIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+          <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <input
             type="text"
             placeholder="Search..."
@@ -491,15 +351,14 @@ export const ConversationList: FC<ConversationListProps> = ({
             <button
               type="button"
               onClick={() => setSearchQuery('')}
-              className="shrink-0 p-0.5 rounded hover:bg-sidebar-accent transition-colors"
+              className="shrink-0 rounded p-0.5 transition-colors hover:bg-sidebar-accent"
             >
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           )}
         </div>
       </div>
-
-      <div className="flex-1 overflow-y-auto px-3">
+      <div className="flex-1 overflow-y-auto px-3 pt-1">
         {(() => {
           const pinned = processedConversations.filter((c) => pinnedIds.has(c.id));
           const unpinned = processedConversations.filter((c) => !pinnedIds.has(c.id));
@@ -544,32 +403,20 @@ export const ConversationList: FC<ConversationListProps> = ({
                     `}
                     style={isActive ? { backgroundColor: 'var(--app-active-item)' } : undefined}
                   >
-                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${isActive ? 'text-primary' : hasUnread ? 'text-primary' : 'text-muted-foreground'}`} {...(isActive ? { fill: 'currentColor' } : {})} />
-                    <div className="flex-1 min-w-0">
-                      {renamingId === conv.id ? (
-                        <input
-                          autoFocus
-                          className="w-full rounded bg-sidebar-accent/80 px-1 py-0.5 text-sm font-medium text-sidebar-foreground outline-none ring-1 ring-primary/50"
-                          value={renameValue}
-                          onChange={(e) => setRenameValue(e.target.value)}
-                          onBlur={() => handleRename(conv.id, renameValue)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') { e.preventDefault(); void handleRename(conv.id, renameValue); }
-                            if (e.key === 'Escape') setRenamingId(null);
-                          }}
-                          onClick={(e) => e.stopPropagation()}
-                        />
-                      ) : (
+                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${isActive ? 'text-primary' : hasUnread ? 'text-primary' : 'text-muted-foreground'}`} />
+                    <div className="flex flex-col flex-1 min-w-0">
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
                         {getDisplayTitle(conv, sessionsByConversation.get(conv.id)) || (
-                          <span className="italic text-muted-foreground">New Chat</span>
+                          <span className="italic text-muted-foreground/50">New Chat</span>
                         )}
                       </span>
-                      )}
-                      <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
-                        {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
-                        {conv.messageCount > 0 && ` · ${conv.messageCount} msgs`}
-                      </span>
+                      <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
+                        <>
+                          {conv.messageCount > 0 && <>{conv.messageCount} msgs</>}
+                          {conv.messageCount > 0 && <span className="mx-1">·</span>}
+                          {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
+                        </>
+                      </div>
                     </div>
                     <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
                       {isAwaitingApproval && !isActive && <div className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_10px_var(--color-amber-400)]" />}
@@ -596,59 +443,36 @@ export const ConversationList: FC<ConversationListProps> = ({
           ));
         })()}
 
-        {processedConversations.length === 0 && (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <MessageSquareIcon className="h-6 w-6 opacity-40" />
-            <span>{searchQuery || hasActiveFilters ? 'No chats match your search' : 'No chats yet'}</span>
+        {hasLoaded && processedConversations.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <MessageSquareIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              No chats yet
+            </h3>
+            <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+              Start a conversation with Kai. Your chat history will appear here for easy access.
+            </p>
+            <button
+              type="button"
+              onClick={() => { void onNewConversation(); }}
+              className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              <PlusIcon size={13} />
+              Start Your First Chat
+            </button>
           </div>
         )}
       </div>
 
-      {/* Bulk delete confirmation modal */}
-      {bulkDeleteOpen && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-sm font-semibold text-foreground">Delete chats</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {isSearchActive || hasActiveFilters
-                ? `This will permanently delete ${processedConversations.length} shown chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`
-                : `This will permanently delete all ${processedConversations.length} chat${processedConversations.length === 1 ? '' : 's'}. This cannot be undone.`}
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBulkDeleteOpen(false)}
-                disabled={isBulkDeleting}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { void confirmBulkDelete(); }}
-                disabled={isBulkDeleting}
-                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {isBulkDeleting ? (
-                  <>
-                    <LoaderIcon className="h-3 w-3 animate-spin" />
-                    Deleting...
-                  </>
-                ) : (
-                  <>
-                    <Trash2Icon className="h-3 w-3" />
-                    Delete
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body,
+      {/* Rename modal */}
+      {renameModal && (
+        <RenameChatModal
+          initialValue={renameModal.value}
+          onSave={(title) => void handleRename(renameModal.id, title)}
+          onClose={() => setRenameModal(null)}
+        />
       )}
 
       {contextMenu && createPortal(
@@ -667,8 +491,7 @@ export const ConversationList: FC<ConversationListProps> = ({
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
             onClick={() => {
               const conv = conversations.find((c) => c.id === contextMenu.convId);
-              setRenameValue(conv?.title || conv?.fallbackTitle || '');
-              setRenamingId(contextMenu.convId);
+              setRenameModal({ id: contextMenu.convId, value: conv?.title || conv?.fallbackTitle || '' });
               setContextMenu(null);
             }}
           >

@@ -1,7 +1,6 @@
-import { useState, useEffect, useCallback, type FC } from 'react';
+import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PuzzleIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, Settings2Icon, DownloadIcon, ListFilterIcon } from 'lucide-react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, DownloadIcon, PlusIcon, Settings2Icon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
@@ -17,6 +16,7 @@ type PluginListEntry = {
   description: string;
   state: string;
   brandRequired: boolean;
+  icon?: { lucide: string } | { svg: string };
   error?: string;
 };
 
@@ -29,6 +29,8 @@ interface InstalledPluginsListProps {
   onOpenMarketplace: () => void;
   onOpenPlugins: () => void;
   onOpenPluginError: (pluginName: string) => void;
+  onOpenPluginSettings: (pluginName: string) => void;
+  pluginBrandRequired: Set<string>;
 }
 
 const PINNED_PLUGINS_KEY = __BRAND_APP_SLUG + ':pinned-plugins';
@@ -41,21 +43,28 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onOpenMarketplace,
   onOpenPlugins,
   onOpenPluginError,
+  onOpenPluginSettings,
+  pluginBrandRequired,
 }) => {
   const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [pinnedNames, setPinnedNames] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(PINNED_PLUGINS_KEY) || '[]')); } catch { return new Set(); }
   });
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; pluginName: string } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<string | null>(null);
   const [isUninstalling, setIsUninstalling] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     app.plugins.list().then((list) => {
-      if (!cancelled) setPlugins(list);
+      if (!cancelled) {
+        setPlugins(list);
+        setHasLoaded(true);
+      }
     });
     return () => { cancelled = true; };
   }, [uiState]);
@@ -107,13 +116,21 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     setContextMenu({ x: rect.left, y: rect.bottom + 4, pluginName });
   }, []);
 
-  // Close context menu on outside click
+  // Close context menu on outside click — use capture so we intercept before
+  // the event reaches any clickable element underneath (e.g. sidebar nav items).
   useEffect(() => {
     if (!contextMenu) return;
-    const close = () => setContextMenu(null);
-    window.addEventListener('click', close);
-    window.addEventListener('contextmenu', close);
-    return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
+    const close = (e: MouseEvent) => {
+      if (contextMenuRef.current?.contains(e.target as Node)) return;
+      e.stopPropagation();
+      setContextMenu(null);
+    };
+    window.addEventListener('click', close, { capture: true });
+    window.addEventListener('contextmenu', close, { capture: true });
+    return () => {
+      window.removeEventListener('click', close, { capture: true });
+      window.removeEventListener('contextmenu', close, { capture: true });
+    };
   }, [contextMenu]);
 
   const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
@@ -179,7 +196,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
             'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center',
             isActive ? 'text-primary' : 'text-muted-foreground',
           )}>
-            {navItem ? getPluginNavigationIcon(navItem.icon) : <PuzzleIcon className="h-4 w-4" />}
+            {getPluginNavigationIcon(plugin.icon ?? navItem?.icon)}
           </span>
 
           {/* Text content */}
@@ -221,37 +238,15 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* PLUGINS heading row — label + options dropdown + Install pill */}
+      {/* PLUGINS heading row */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        <button
+          type="button"
+          onClick={onOpenPlugins}
+          className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+        >
           Plugins
-        </span>
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
-            >
-              <ListFilterIcon className="h-3.5 w-3.5" />
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-              <DropdownMenu.Item
-                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                onSelect={onOpenPlugins}
-              >
-                <Settings2Icon size={14} className="text-muted-foreground" />
-                Manage plugins
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        </button>
         <div className="flex-1" />
         <button
           type="button"
@@ -262,7 +257,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
           )}
         >
           <DownloadIcon className="h-3 w-3" />
-          Install Plugins
+          New Plugin
         </button>
       </div>
 
@@ -291,18 +286,28 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
       {/* Plugin list */}
       <div className="flex-1 overflow-y-auto px-3">
-        {filteredPlugins.length === 0 ? (
-          <div className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-muted-foreground">
-            <PuzzleIcon className="h-6 w-6 opacity-40" />
-            <span>{isSearchActive ? 'No plugins match your search' : 'No plugins installed'}</span>
+        {!hasLoaded ? null : filteredPlugins.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
+              <PackageIcon size={24} strokeWidth={1.3} />
+            </div>
+            <h3 className="mb-1 text-sm font-medium text-foreground/80">
+              {isSearchActive ? 'No plugins match your search' : 'No plugins installed'}
+            </h3>
             {!isSearchActive && (
-              <button
-                type="button"
-                onClick={onOpenMarketplace}
-                className="mt-1 text-primary hover:underline text-xs"
-              >
-                Browse Marketplace
-              </button>
+              <>
+                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                  Extend Kai with plugins for extra tools, integrations, and custom workflows.
+                </p>
+                <button
+                  type="button"
+                  onClick={onOpenMarketplace}
+                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  <PlusIcon size={13} />
+                  Install Your First Plugin
+                </button>
+              </>
             )}
           </div>
         ) : (
@@ -323,9 +328,10 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
       {/* Context menu */}
       {contextMenu && (() => {
-        const ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
+        const _ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
         return createPortal(
           <div
+            ref={contextMenuRef}
             className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(e) => e.stopPropagation()}
@@ -336,7 +342,13 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
             >
               <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedNames.has(contextMenu.pluginName) ? 'Unpin' : 'Pin'}
             </button>
-            {ctxPlugin && !ctxPlugin.brandRequired && (
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+              onClick={() => { onOpenPluginSettings(contextMenu.pluginName); setContextMenu(null); }}
+            >
+              <Settings2Icon className="h-4 w-4 text-muted-foreground" /> Settings
+            </button>
+            {!pluginBrandRequired.has(contextMenu.pluginName) && (
               <>
                 <div className="my-1 h-px bg-border/60" />
                 <button

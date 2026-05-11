@@ -189,9 +189,6 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
         'maxSteps',
         'maxRetries',
         'useResponsesApi',
-        'titleGeneration.enabled',
-        'titleGeneration.retitleIntervalMessages',
-        'titleGeneration.retitleEagerUntilMessage',
         'ui.theme',
       ]).optional().describe('Field to set (required for "set")'),
       value: z.any().optional().describe('New value (required for "set")'),
@@ -202,18 +199,13 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
       if (action === 'get') {
         return {
           advanced: config.advanced,
-          titleGeneration: config.titleGeneration,
           ui: config.ui,
         };
       }
       if (!field || value === undefined) return { error: 'Field and value required for "set".' };
 
       let previous: unknown;
-      if (field.startsWith('titleGeneration.')) {
-        const subField = field.replace('titleGeneration.', '');
-        previous = getNested(config.titleGeneration as unknown as Record<string, unknown>, subField);
-        setNested(config.titleGeneration as unknown as Record<string, unknown>, subField, value);
-      } else if (field.startsWith('ui.')) {
+      if (field.startsWith('ui.')) {
         const subField = field.replace('ui.', '');
         previous = getNested(config.ui as unknown as Record<string, unknown>, subField);
         setNested(config.ui as unknown as Record<string, unknown>, subField, value);
@@ -232,14 +224,14 @@ export function createAdvancedSettingsTool(appHome: string): ToolDefinition {
 export function createSystemPromptTool(appHome: string): ToolDefinition {
   return {
     name: 'system_prompt',
-    description: 'View or update ' + __BRAND_PRODUCT_NAME + ' system prompts. Use "get" to read, "set" to replace a prompt for chat, plan, implement, or computer-use mode.',
+    description: 'View or update ' + __BRAND_PRODUCT_NAME + ' system prompts. Use "get" to read, "set" to replace a prompt for chat, plan, or computer-use mode.',
     inputSchema: z.object({
       action: z.enum(['get', 'set']).describe('Read or write the system prompt'),
-      mode: z.enum(['chat', 'plan', 'implement', 'computerUse']).optional().describe('Prompt mode. Defaults to chat.'),
+      mode: z.enum(['chat', 'plan', 'computerUse']).optional().describe('Prompt mode. Defaults to chat.'),
       prompt: z.string().optional().describe('The new system prompt text (required for "set")'),
     }),
     execute: async (input) => {
-      const { action, mode = 'chat', prompt } = input as { action: string; mode?: 'chat' | 'plan' | 'implement' | 'computerUse'; prompt?: string };
+      const { action, mode = 'chat', prompt } = input as { action: string; mode?: 'chat' | 'plan' | 'computerUse'; prompt?: string };
       const config = readConfig(appHome);
       if (action === 'get') return { systemPrompt: config.systemPrompt, systemPrompts: config.systemPrompts };
       if (prompt === undefined) return { error: 'Prompt text required for "set".' };
