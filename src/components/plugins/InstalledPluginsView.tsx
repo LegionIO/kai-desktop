@@ -181,6 +181,13 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             </button>
           </Tooltip>
         </div>
+        {plugins.length > 0 && (
+          <div className="mx-auto max-w-3xl px-1 pt-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Scrollable content with fade at top */}
@@ -229,9 +236,6 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
               </div>
             ) : (
               <>
-                <p className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-                  Installed ({filteredPlugins.length})
-                </p>
                 {filteredPlugins.map((plugin) => {
                   const catalogEntry = catalogMap.get(plugin.name);
                   const hasUpdate =

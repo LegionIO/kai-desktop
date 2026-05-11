@@ -153,6 +153,13 @@ export const PluginMarketplace: FC = () => {
             </button>
           </Tooltip>
         </div>
+        {availablePlugins.length > 0 && (
+          <div className="mx-auto max-w-3xl px-1 pt-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              Available ({availablePlugins.length})
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Scrollable content with fade at top */}
@@ -201,11 +208,6 @@ export const PluginMarketplace: FC = () => {
             )}
 
             {/* Plugin cards */}
-            {availablePlugins.length > 0 && (
-              <p className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-                Available ({availablePlugins.length})
-              </p>
-            )}
             {availablePlugins.map((entry) => {
               const parsedAuthor = parseAuthor(entry.author);
               return (
