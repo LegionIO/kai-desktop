@@ -162,10 +162,12 @@ type AppAPI = {
   };
   tasks: {
     list: () => Promise<TaskFile[]>;
+    listAll: () => Promise<TaskFile[]>;
     get: (id: string) => Promise<TaskFile | null>;
     create: (taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => Promise<TaskFile>;
     update: (id: string, updates: Partial<TaskFile>) => Promise<TaskFile>;
     delete: (id: string) => Promise<{ ok: boolean }>;
+    unarchive: (id: string) => Promise<TaskFile>;
     getOrder: () => Promise<KaiTaskOrder | null>;
     saveOrder: (order: KaiTaskOrder) => Promise<{ ok: boolean }>;
     onChanged: (callback: (tasks: TaskFile[]) => void) => () => void;

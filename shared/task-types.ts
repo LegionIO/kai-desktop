@@ -25,6 +25,10 @@ export interface TaskFile {
   status: KaiTaskStatus;
   createdAt: string;
   updatedAt: string;
+  /** ISO timestamp set when the task first moves to in_progress. */
+  startedAt?: string;
+  /** ISO timestamp set when the task is marked done. */
+  completedAt?: string;
   sourceConversationId?: string;
   sourceToolCallId?: string;
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
@@ -36,6 +40,8 @@ export interface TaskFile {
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */
   conversationHistory?: TaskConversationMessage[];
+  /** ISO timestamp set when the task is archived. Archived tasks are hidden from normal views. */
+  archivedAt?: string;
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */

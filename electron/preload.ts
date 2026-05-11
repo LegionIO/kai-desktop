@@ -270,10 +270,12 @@ const appAPI = {
 
   tasks: {
     list: () => ipcRenderer.invoke('tasks:list'),
+    listAll: () => ipcRenderer.invoke('tasks:list-all'),
     get: (id: string) => ipcRenderer.invoke('tasks:get', id),
     create: (taskData: unknown) => ipcRenderer.invoke('tasks:create', taskData),
     update: (id: string, updates: unknown) => ipcRenderer.invoke('tasks:update', id, updates),
     delete: (id: string) => ipcRenderer.invoke('tasks:delete', id),
+    unarchive: (id: string) => ipcRenderer.invoke('tasks:unarchive', id),
     getOrder: () => ipcRenderer.invoke('tasks:get-order'),
     saveOrder: (order: unknown) => ipcRenderer.invoke('tasks:save-order', order),
     onChanged: (callback: (tasks: unknown[]) => void) => {

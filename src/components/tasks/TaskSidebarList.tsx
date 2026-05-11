@@ -1,8 +1,7 @@
 /**
  * TaskSidebarList — task list shown in the sidebar when the "Tasks" tab is active.
  *
- * Matches ConversationList patterns: pin, context menu, triple-dot, bulk delete,
- * search, and animated removal.
+ * Matches ConversationList patterns: pin, context menu, triple-dot.
  */
 
 import { useState, useMemo, useCallback, useEffect, type FC } from 'react';
@@ -16,21 +15,14 @@ import {
   EllipsisVerticalIcon,
   PlusIcon,
   FilePlusIcon,
+  PencilIcon,
+  ArchiveRestoreIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
-import type { TaskFile, KaiTaskStatus } from '@/types/task';
+import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { CreateTaskDialog } from './CreateTaskDialog';
-
-// Status colors for the task icon — matches TaskQueueRow label colors
-const STATUS_DOT_COLORS: Record<KaiTaskStatus, string> = {
-  todo: 'text-sky-500',
-  in_progress: 'text-amber-500',
-  ai_review: 'text-rose-500',
-  human_review: 'text-purple-400',
-  done: 'text-emerald-500',
-};
 
 function formatRelativeTime(timestamp: string): string {
   const diffMs = Date.now() - new Date(timestamp).getTime();
@@ -62,7 +54,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onViewBoard,
   workspaceId,
 }) => {
-  const { state, selectTask, deleteTask } = useTasks();
+  const { state, selectTask, archiveTask } = useTasks();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -115,15 +107,11 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
   }, [contextMenu]);
 
-  // ── Delete animation state ─────────────────────────────────────────────
-  const [removingIds] = useState<Set<string>>(new Set());
-
   // ── Sort and filter tasks ──────────────────────────────────────────────
 
   const sortedTasks = useMemo(() => {
     let tasks = [...state.tasks];
 
-    // Workspace scoping — only show tasks belonging to the active workspace
     if (workspaceId) {
       tasks = tasks.filter((t) => t.workspaceId === workspaceId);
     }
@@ -131,9 +119,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     const query = searchQuery.toLowerCase().trim();
     if (query) {
       tasks = tasks.filter(
-        (t) =>
-          t.title.toLowerCase().includes(query) ||
-          t.description.toLowerCase().includes(query),
+        (t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query),
       );
     }
     tasks.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -211,15 +197,9 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
               </div>
             )}
             {section.items.map((task) => {
-              const isRemoving = removingIds.has(task.id);
               const isPinned = pinnedIds.has(task.id);
               return (
-                <div
-                  key={task.id}
-                  className={`overflow-hidden transition-all duration-300 ease-in-out ${
-                    isRemoving ? 'max-h-0 opacity-0 mb-0' : 'max-h-24 opacity-100 mb-1.5'
-                  }`}
-                >
+                <div key={task.id} className="mb-1.5">
                   <div
                     role="button"
                     tabIndex={0}
@@ -237,7 +217,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
                     <ClipboardListIcon
                       className={cn(
                         'mt-0.5 h-4 w-4 shrink-0',
-                        state.selectedTaskId === task.id ? 'text-primary' : STATUS_DOT_COLORS[task.status],
+                        state.selectedTaskId === task.id ? 'text-primary' : 'text-muted-foreground',
                       )}
                     />
                     <div className="flex-1 min-w-0">
@@ -315,6 +295,18 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
           >
             <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedIds.has(contextMenu.taskId) ? 'Unpin' : 'Pin'}
           </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-rename', { detail: contextMenu.taskId })); setContextMenu(null); }}
+          >
+            <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => { void archiveTask(contextMenu.taskId); setContextMenu(null); }}
+          >
+            <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Archive
+          </button>
           <div className="my-1 h-px bg-border/60" />
           <button
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
@@ -325,7 +317,6 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         </div>,
         document.body,
       )}
-
     </div>
   );
 };

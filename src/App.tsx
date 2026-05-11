@@ -24,7 +24,7 @@ import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ArchiveRestoreIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { IconRail } from '@/components/sidebar/IconRail';
 import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
@@ -1046,6 +1046,35 @@ function AppShell() {
     return () => window.removeEventListener('kai:request-task-delete', handler);
   }, [tasksCtx]);
 
+  // Handle "Rename Task" requests from sidebar context menu
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const taskId = (e as CustomEvent<string>).detail;
+      if (taskId && tasksCtx) {
+        const task = tasksCtx.state.tasks.find((t) => t.id === taskId);
+        if (task) {
+          tasksCtx.selectTask(taskId);
+          setTaskRenameValue(task.title);
+          setRenamingTask(true);
+        }
+      }
+    };
+    window.addEventListener('kai:request-task-rename', handler);
+    return () => window.removeEventListener('kai:request-task-rename', handler);
+  }, [tasksCtx]);
+
+  // Handle "Archive Task" requests from sidebar context menu
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const taskId = (e as CustomEvent<string>).detail;
+      if (taskId && tasksCtx) {
+        void tasksCtx.archiveTask(taskId);
+      }
+    };
+    window.addEventListener('kai:request-task-archive', handler);
+    return () => window.removeEventListener('kai:request-task-archive', handler);
+  }, [tasksCtx]);
+
   // Sync pinned-tasks from other components (sidebar context menu, etc.)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -1639,6 +1668,13 @@ function AppShell() {
                                 >
                                   <PencilIcon className="h-4 w-4 text-muted-foreground" />
                                   <span>Rename</span>
+                                </DropdownMenu.Item>
+                                <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                  onSelect={() => void tasksCtx?.archiveTask(selectedTask.id)}
+                                >
+                                  <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" />
+                                  <span>Archive</span>
                                 </DropdownMenu.Item>
                                 <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
                                 <DropdownMenu.Item

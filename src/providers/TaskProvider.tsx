@@ -135,6 +135,9 @@ interface TaskContextValue {
   /** Delete a task. */
   deleteTask: (id: string) => Promise<void>;
 
+  /** Archive a task (hidden from normal views, not deleted). */
+  archiveTask: (id: string) => Promise<void>;
+
   /** Select a task (for detail panel). */
   selectTask: (id: string | null) => void;
 
@@ -307,14 +310,22 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const updateTaskStatus = useCallback(
     async (id: string, status: KaiTaskStatus) => {
+      const now = new Date().toISOString();
+      const task = state.tasks.find((t) => t.id === id);
       // Kill terminal when marking as done
       if (status === 'done') {
-        const task = state.tasks.find((t) => t.id === id);
         if (task?.terminalSessionId) {
           void app.tasks.terminalKill(task.terminalSessionId);
-          await updateTask(id, { status, terminalSessionId: undefined });
+          await updateTask(id, { status, terminalSessionId: undefined, completedAt: now });
           return;
         }
+        await updateTask(id, { status, completedAt: now });
+        return;
+      }
+      // Stamp startedAt on first transition to in_progress
+      if (status === 'in_progress' && !task?.startedAt) {
+        await updateTask(id, { status, startedAt: now });
+        return;
       }
       await updateTask(id, { status });
     },
@@ -327,6 +338,17 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       await app.tasks.delete(id);
     } catch (err) {
       console.error('[TaskProvider] Failed to delete task:', err);
+      const tasks = (await app.tasks.list());
+      dispatch({ type: 'SET_TASKS', tasks });
+    }
+  }, []);
+
+  const archiveTask = useCallback(async (id: string) => {
+    try {
+      dispatch({ type: 'DELETE_TASK', id }); // remove from active list optimistically
+      await app.tasks.update(id, { archivedAt: new Date().toISOString() });
+    } catch (err) {
+      console.error('[TaskProvider] Failed to archive task:', err);
       const tasks = (await app.tasks.list());
       dispatch({ type: 'SET_TASKS', tasks });
     }
@@ -508,6 +530,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       updateTask,
       updateTaskStatus,
       deleteTask,
+      archiveTask,
       selectTask,
       reorderTasks,
       moveTaskToColumn,
@@ -523,6 +546,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       updateTask,
       updateTaskStatus,
       deleteTask,
+      archiveTask,
       selectTask,
       reorderTasks,
       moveTaskToColumn,
