@@ -14,6 +14,7 @@ import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSideb
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
 import { ExportDialog } from '@/components/conversations/ExportDialog';
+import { RenameChatModal } from '@/components/conversations/RenameChatModal';
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginModalHost } from '@/components/plugins/PluginModalHost';
@@ -1233,37 +1234,12 @@ function AppShell() {
             onClose={() => setPluginSettingsOpen(null)}
           />
         )}
-        {renamingTitle && activeConversationId && createPortal(
-          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTitle(false)}>
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
-              <input
-                ref={renameInputRef}
-                value={renameValue}
-                onChange={(e) => setRenameValue(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') void handleRename(activeConversationId, renameValue); if (e.key === 'Escape') setRenamingTitle(false); }}
-                className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
-              />
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setRenamingTitle(false)}
-                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleRename(activeConversationId, renameValue)}
-                  className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
-                >
-                  Save
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
+        {renamingTitle && activeConversationId && (
+          <RenameChatModal
+            initialValue={renameValue}
+            onSave={(title) => void handleRename(activeConversationId, title)}
+            onClose={() => setRenamingTitle(false)}
+          />
         )}
         {confirmingDelete && activeConversationId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingDelete(false)}>
@@ -1450,11 +1426,12 @@ function AppShell() {
                     <>
                       <div className="min-h-0 flex-1 overflow-y-auto">
                         <ConversationList
-                          activeConversationId={activeConversationId}
+                          activeConversationId={activeView === CHAT_LIST_VIEW ? null : activeConversationId}
                           activeThreadMode={threadMode}
                           onSwitchConversation={handleSwitchConversation}
                           onNewConversation={handleNewConversation}
                           onDeleteConversation={handleDeleteConversation}
+                          onNavigateToChatsPage={() => setActiveView(CHAT_LIST_VIEW)}
                           workspaceId={activeWorkspaceId}
                         />
                       </div>
@@ -1553,11 +1530,17 @@ function AppShell() {
               <div className="titlebar-no-drag min-w-0 flex-1 flex items-center justify-between">
               <div className="min-w-0">
                 {activeView === SETTINGS_VIEW ? (
-                  <span className="text-sm font-medium text-foreground">Settings</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Settings</div>
+                  </div>
                 ) : activeView === MARKETPLACE_VIEW ? (
-                  <span className="text-sm font-medium text-foreground">Plugin Marketplace</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugin Marketplace</div>
+                  </div>
                 ) : activeView === PLUGINS_VIEW ? (
-                  <span className="text-sm font-medium text-foreground">Plugin Hub</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugin Hub</div>
+                  </div>
                 ) : activeView === AGENTS_VIEW ? (
                   (() => {
                     const selectedAgentId = agentsCtx.state.selectedAgentId;
@@ -1603,7 +1586,7 @@ function AppShell() {
                         </div>
                       );
                     }
-                    return <span className="text-sm font-medium text-foreground">Agents</span>;
+                    return <div className="flex items-center gap-1.5"><div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Agents</div></div>;
                   })()
                 ) : activeView === TASKS_VIEW ? (
                   (() => {
@@ -1666,7 +1649,7 @@ function AppShell() {
                         </div>
                       );
                     }
-                    return <span className="text-sm font-medium text-foreground">Tasks</span>;
+                    return <div className="flex items-center gap-1.5"><div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Tasks</div></div>;
                   })()
                 ) : activeErrorPluginName ? (
                   <div className="flex items-center gap-1.5">
@@ -1774,6 +1757,12 @@ function AppShell() {
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
                   </div>
+                ) : activeView === CHAT_LIST_VIEW ? (
+                  <div className="flex items-center gap-1.5">
+                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                      Chats
+                    </div>
+                  </div>
                 ) : activeConversationId && activeConversationTitle ? (
                   <div className="flex items-center gap-1.5">
                     <button
@@ -1843,7 +1832,7 @@ function AppShell() {
                   <span className="block whitespace-nowrap text-sm font-medium text-foreground">
                     {activeConversationTitle}
                   </span>
-                ) : <span className="text-sm font-medium text-foreground">Chats</span>}
+                ) : null}
               </div>
               <WorkspaceSelector
                 workspaces={workspaces}

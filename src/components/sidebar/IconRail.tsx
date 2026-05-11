@@ -45,7 +45,6 @@ const IconRailButton: FC<{
     content={label}
     side="right"
     sideOffset={6}
-    contentClassName="z-50 rounded-md bg-popover px-2 py-1 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
   >
     <button
       type="button"
@@ -111,7 +110,6 @@ export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, se
         content={themeButton.title}
         side="right"
         sideOffset={6}
-        contentClassName="z-50 rounded-md bg-popover px-2 py-1 text-xs font-medium text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95"
       >
         <button
           type="button"
