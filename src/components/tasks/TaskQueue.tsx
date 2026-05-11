@@ -164,8 +164,8 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Fixed toolbar */}
-      <div className="shrink-0 px-4 pt-6 pb-3">
-        <div className="mx-auto max-w-3xl flex items-center gap-2">
+      <div className="shrink-0 pt-6 pb-2">
+        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2">
           {/* Search */}
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -263,7 +263,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
       {/* Scrollable lanes */}
       <div className="relative flex-1 min-h-0">
         {/* Fade overlay */}
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
 
         <div className="h-full overflow-y-auto">
           <DndContext
@@ -272,7 +272,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
           >
-            <div className="mx-auto max-w-3xl flex flex-col gap-4 px-4 pt-4 pb-6">
+            <div className="mx-auto max-w-3xl flex flex-col gap-4 px-4 pt-10 pb-6">
               {KAI_TASK_STATUS_COLUMNS.map((status) => (
                 <TaskQueueRow
                   key={status}

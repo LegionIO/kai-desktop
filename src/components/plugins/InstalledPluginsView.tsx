@@ -154,8 +154,8 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Search + marketplace button — fixed above scroll */}
-      <div className="shrink-0 px-4 pt-6 pb-3">
-        <div className="mx-auto max-w-3xl flex items-center gap-2">
+      <div className="shrink-0 pt-6 pb-2">
+        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2">
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
@@ -188,7 +188,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
           </Tooltip>
         </div>
         {plugins.length > 0 && (
-          <div className="mx-auto max-w-3xl px-1 pt-3">
+          <div className="mx-auto max-w-3xl px-4 pt-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
               Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
             </p>
@@ -199,10 +199,10 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
       {/* Scrollable content with fade at top */}
       <div className="relative flex-1 min-h-0">
         {/* Fade overlay */}
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
 
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pt-4 pb-6 space-y-3">
+          <div className="mx-auto max-w-3xl px-4 pt-10 pb-6 space-y-3">
             {/* Error banner */}
             {error && (
               <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3">
