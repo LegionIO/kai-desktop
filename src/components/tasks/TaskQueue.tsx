@@ -44,18 +44,17 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Poll until the search input is in the DOM (loading state may delay its render)
-    let attempts = 0;
+    let cancelled = false;
     const tryFocus = () => {
+      if (cancelled) return;
+      console.warn('[TaskQueue] tryFocus — ref:', searchRef.current, 'isLoading:', state.isLoading);
       if (searchRef.current) {
         searchRef.current.focus();
-      } else if (attempts < 20) {
-        attempts++;
-        setTimeout(tryFocus, 50);
+        console.warn('[TaskQueue] focus() called, activeElement:', document.activeElement);
       }
     };
-    const t = setTimeout(tryFocus, 50);
-    return () => clearTimeout(t);
+    const t = setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(tryFocus)), 50);
+    return () => { cancelled = true; clearTimeout(t); };
   }, []);
 
   const sensors = useSensors(
