@@ -410,6 +410,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             systemPrompt: effectiveSystemPrompt,
             reasoningEffort,
             abortSignal: controller.signal,
+            // Forward host-registered tools, filtered by execution mode (plan-first
+            // strips mutating tools). Mirrors the standard runtime path at the
+            // `runtime.stream(...)` call below. Without this, the LLM behind a
+            // plugin inference provider has no awareness of any tools.
+            tools: toolsForExecutionMode(registeredTools, effectiveExecutionMode),
           });
 
           for await (const event of providerStream) {

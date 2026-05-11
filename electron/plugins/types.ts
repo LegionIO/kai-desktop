@@ -581,6 +581,16 @@ export type PluginInferenceStreamOptions = {
   systemPrompt: string;
   reasoningEffort?: string;
   abortSignal?: AbortSignal;
+  /**
+   * Tool definitions available to this conversation. Plugins acting as
+   * inference providers should forward these to their underlying LLM so
+   * the model can invoke them. The host filters by execution mode before
+   * passing (e.g. plan-first mode strips mutating tools).
+   *
+   * Optional for backward compatibility with existing plugins; omitted
+   * means no tools are available for this turn.
+   */
+  tools?: ToolDefinition[];
 };
 
 export type PluginInferenceProvider = {
