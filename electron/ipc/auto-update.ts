@@ -56,6 +56,15 @@ function broadcast(status: UpdateStatus): void {
 const execFileAsync = promisify(execFile);
 
 /**
+ * Escape a string for safe interpolation inside a POSIX single-quoted shell argument.
+ * Single quotes cannot appear inside single-quoted strings, so we close the quote,
+ * insert an escaped quote, then reopen the quote: ' → '\''
+ */
+function shellEscape(s: string): string {
+  return s.replace(/'/g, "'\\''");
+}
+
+/**
  * Attempt to install the downloaded update by manually extracting the zip
  * and replacing the app bundle via osascript with administrator privileges.
  *
@@ -115,11 +124,11 @@ async function attemptInstall(): Promise<boolean> {
     const script = [
       `do shell script "`,
       // Rename current app to backup
-      `mv '${appDir}/${appName}' '${appDir}/${appName}.old' && `,
+      `mv '${shellEscape(appDir)}/${shellEscape(appName)}' '${shellEscape(appDir)}/${shellEscape(appName)}.old' && `,
       // Move new app into place
-      `mv '${extractedApp}' '${appDir}/${appName}' && `,
+      `mv '${shellEscape(extractedApp)}' '${shellEscape(appDir)}/${shellEscape(appName)}' && `,
       // Remove backup on success
-      `rm -rf '${appDir}/${appName}.old'`,
+      `rm -rf '${shellEscape(appDir)}/${shellEscape(appName)}.old'`,
       `" with administrator privileges`,
     ].join('');
 
@@ -142,7 +151,7 @@ async function attemptInstall(): Promise<boolean> {
         try {
           await execFileAsync('osascript', [
             '-e',
-            `do shell script "mv '${backupPath}' '${appDir}/${appName}'" with administrator privileges`,
+            `do shell script "mv '${shellEscape(backupPath)}' '${shellEscape(appDir)}/${shellEscape(appName)}'" with administrator privileges`,
           ]);
           console.info('[auto-update] Restored app from backup after failed install');
         } catch {

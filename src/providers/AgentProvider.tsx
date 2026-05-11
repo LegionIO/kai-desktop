@@ -16,7 +16,7 @@ import {
   type PropsWithChildren,
 } from 'react';
 import { app } from '@/lib/ipc-client';
-import type { AgentFile, HireAgentPayload } from '../../shared/agent-types';
+import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 
 // ── State & Actions ──────────────────────────────────────────────────────
 
@@ -73,11 +73,11 @@ function agentReducer(state: AgentState, action: AgentAction): AgentState {
 interface AgentContextValue {
   state: AgentState;
 
-  /** Create a new agent ("hire"). */
-  hireAgent: (payload: HireAgentPayload) => Promise<AgentFile | null>;
+  /** Create a new agent. */
+  createAgent: (payload: CreateAgentPayload) => Promise<AgentFile | null>;
 
-  /** Delete an agent ("fire"). */
-  fireAgent: (id: string) => Promise<void>;
+  /** Permanently delete an agent. */
+  deleteAgent: (id: string) => Promise<void>;
 
   /** Update an existing agent's config or metadata. */
   updateAgent: (id: string, updates: Partial<AgentFile>) => Promise<void>;
@@ -139,26 +139,26 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
 
   // ── Actions ──────────────────────────────────────────────────────────
 
-  const hireAgent = useCallback(
-    async (payload: HireAgentPayload): Promise<AgentFile | null> => {
+  const createAgent = useCallback(
+    async (payload: CreateAgentPayload): Promise<AgentFile | null> => {
       try {
         const agent = await app.agents.create(payload);
         // Broadcast from main process triggers SET_AGENTS
         return agent;
       } catch (err) {
-        console.error('[AgentProvider] Failed to hire agent:', err);
+        console.error('[AgentProvider] Failed to create agent:', err);
         return null;
       }
     },
     [],
   );
 
-  const fireAgent = useCallback(async (id: string) => {
+  const deleteAgent = useCallback(async (id: string) => {
     try {
       await app.agents.delete(id);
       // Broadcast handles state update
     } catch (err) {
-      console.error('[AgentProvider] Failed to fire agent:', err);
+      console.error('[AgentProvider] Failed to delete agent:', err);
     }
   }, []);
 
@@ -223,8 +223,8 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
   const value = useMemo<AgentContextValue>(
     () => ({
       state,
-      hireAgent,
-      fireAgent,
+      createAgent,
+      deleteAgent,
       updateAgent,
       selectAgent,
       assignTask,
@@ -232,7 +232,7 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
       startAgent,
       stopAgent,
     }),
-    [state, hireAgent, fireAgent, updateAgent, selectAgent, assignTask, unassignTask, startAgent, stopAgent],
+    [state, createAgent, deleteAgent, updateAgent, selectAgent, assignTask, unassignTask, startAgent, stopAgent],
   );
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

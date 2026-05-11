@@ -17,14 +17,13 @@ import {
   Trash2Icon,
   LinkIcon,
   UnlinkIcon,
-  TrashIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import { AgentStatusBadge } from './AgentStatusBadge';
-import { HireAgentDialog } from './HireAgentDialog';
+import { CreateAgentDialog } from './CreateAgentDialog';
 import { TaskTerminal } from '@/components/tasks/TaskTerminal';
 import type { AgentFile, AgentRuntime, AgentRole } from '../../../shared/agent-types';
 
@@ -42,12 +41,12 @@ const ROLE_LABELS: Record<AgentRole, string> = {
 };
 
 export const AgentSwarmView: FC = () => {
-  const { state, selectAgent, startAgent, stopAgent, fireAgent } = useAgents();
+  const { state, selectAgent, startAgent, stopAgent, deleteAgent } = useAgents();
   const { state: taskState } = useTasks();
   const fullWidth = useFullWidthContent();
   const { agents, selectedAgentId } = state;
 
-  const [hireDialogOpen, setHireDialogOpen] = useState(false);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [expandedAgentId, setExpandedAgentId] = useState<string | null>(null);
 
   const getTaskForAgent = (agent: AgentFile) =>
@@ -74,13 +73,13 @@ export const AgentSwarmView: FC = () => {
             <h1 className="text-xl font-semibold text-foreground">Agents</h1>
             <p className="mt-0.5 text-sm text-muted-foreground">
               {agents.length === 0
-                ? 'Hire agents to automate your workflow'
+                ? 'Create agents to automate your workflow'
                 : `${agents.length} agent${agents.length === 1 ? '' : 's'} · ${agents.filter((a) => a.status === 'running').length} running`}
             </p>
           </div>
           <button
             type="button"
-            onClick={() => setHireDialogOpen(true)}
+            onClick={() => setCreateDialogOpen(true)}
             className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
           >
             <BotIcon size={15} />
@@ -90,7 +89,7 @@ export const AgentSwarmView: FC = () => {
 
         {/* Agent Grid */}
         {agents.length === 0 ? (
-          <EmptySwarm onHire={() => setHireDialogOpen(true)} />
+          <EmptySwarm onCreate={() => setCreateDialogOpen(true)} />
         ) : (
           <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3">
             {agents.map((agent) => (
@@ -105,7 +104,7 @@ export const AgentSwarmView: FC = () => {
                 onSelect={() => selectAgent(agent.id)}
                 onStart={() => void startAgent(agent.id)}
                 onStop={() => void stopAgent(agent.id)}
-                onFire={() => void fireAgent(agent.id)}
+                onDelete={() => void deleteAgent(agent.id)}
               />
             ))}
           </div>
@@ -113,7 +112,7 @@ export const AgentSwarmView: FC = () => {
         </div>
       </div>
 
-      <HireAgentDialog open={hireDialogOpen} onOpenChange={setHireDialogOpen} />
+      <CreateAgentDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} />
     </div>
   );
 };
@@ -128,7 +127,7 @@ interface SwarmCardProps {
   onSelect: () => void;
   onStart: () => void;
   onStop: () => void;
-  onFire: () => void;
+  onDelete: () => void;
 }
 
 const SwarmCard: FC<SwarmCardProps> = ({
@@ -139,11 +138,11 @@ const SwarmCard: FC<SwarmCardProps> = ({
   onSelect,
   onStart,
   onStop,
-  onFire,
+  onDelete,
 }) => {
   const runtime = RUNTIME_META[agent.runtime];
   const RuntimeIcon = runtime.icon;
-  const [confirmFire, setConfirmFire] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   return (
     <div
@@ -257,18 +256,18 @@ const SwarmCard: FC<SwarmCardProps> = ({
 
         <div className="flex-1" />
 
-        {confirmFire ? (
+        {confirmDelete ? (
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => { onFire(); setConfirmFire(false); }}
+              onClick={() => { onDelete(); setConfirmDelete(false); }}
               className="rounded-md px-2 py-1 text-[10px] font-medium text-red-600 dark:text-red-400 bg-red-500/10 hover:bg-red-500/20 transition-colors"
             >
               Confirm
             </button>
             <button
               type="button"
-              onClick={() => setConfirmFire(false)}
+              onClick={() => setConfirmDelete(false)}
               className="rounded-md px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted/50 transition-colors"
             >
               Cancel
@@ -277,10 +276,10 @@ const SwarmCard: FC<SwarmCardProps> = ({
         ) : (
           <button
             type="button"
-            onClick={() => setConfirmFire(true)}
+            onClick={() => setConfirmDelete(true)}
             disabled={agent.status === 'running'}
             className="rounded-md p-1.5 text-muted-foreground/40 transition-colors hover:text-red-500 hover:bg-red-500/10 disabled:opacity-30 disabled:cursor-not-allowed"
-            title="Fire agent"
+            title="Delete agent"
           >
             <Trash2Icon size={13} />
           </button>
@@ -300,11 +299,16 @@ const SwarmCard: FC<SwarmCardProps> = ({
 // ── Agent Detail Panel (full-width, shown when an agent is selected) ────
 
 const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
-  const { startAgent, stopAgent, fireAgent, unassignTask, selectAgent } = useAgents();
+  const { startAgent, stopAgent, deleteAgent, unassignTask, selectAgent } = useAgents();
+  const { state: taskState } = useTasks();
   const fullWidth = useFullWidthContent();
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
-  const [confirmFire, setConfirmFire] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const assignedTask = agent.currentTaskId
+    ? taskState.tasks.find((t) => t.id === agent.currentTaskId) ?? null
+    : null;
 
   const runtime = RUNTIME_META[agent.runtime];
   const RuntimeIcon = runtime.icon;
@@ -330,10 +334,10 @@ const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
     }
   }, [agent.id, stopAgent]);
 
-  const handleFire = useCallback(async () => {
-    await fireAgent(agent.id);
+  const handleDelete = useCallback(async () => {
+    await deleteAgent(agent.id);
     selectAgent(null);
-  }, [agent.id, fireAgent, selectAgent]);
+  }, [agent.id, deleteAgent, selectAgent]);
 
   const handleUnassign = useCallback(async () => {
     await unassignTask(agent.id);
@@ -404,7 +408,7 @@ const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
             {agent.currentTaskId ? (
               <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2 text-sm">
                 <LinkIcon size={12} className="text-muted-foreground shrink-0" />
-                <span className="truncate text-foreground/80">Task assigned</span>
+                <span className="truncate text-foreground/80">{assignedTask?.title ?? 'Task assigned'}</span>
               </div>
             ) : (
               <p className="text-sm text-muted-foreground/60 italic">
@@ -464,19 +468,19 @@ const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
           {/* Danger Zone */}
           <div className="rounded-xl border border-red-500/20 bg-card p-4">
             <span className="text-sm font-medium text-foreground block mb-3">Danger Zone</span>
-            {confirmFire ? (
+            {confirmDelete ? (
               <div className="flex items-center gap-3">
-                <span className="text-sm text-red-500">Are you sure you want to fire this agent?</span>
+                <span className="text-sm text-red-500">Are you sure you want to delete this agent?</span>
                 <button
                   type="button"
-                  onClick={() => void handleFire()}
+                  onClick={() => void handleDelete()}
                   className="rounded-lg bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-500/20 transition-colors"
                 >
-                  Yes, fire
+                  Yes, delete
                 </button>
                 <button
                   type="button"
-                  onClick={() => setConfirmFire(false)}
+                  onClick={() => setConfirmDelete(false)}
                   className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 transition-colors"
                 >
                   Cancel
@@ -485,12 +489,12 @@ const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
             ) : (
               <button
                 type="button"
-                onClick={() => setConfirmFire(true)}
+                onClick={() => setConfirmDelete(true)}
                 disabled={agent.status === 'running'}
                 className="flex items-center gap-1.5 text-sm text-muted-foreground/60 hover:text-red-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
               >
-                <TrashIcon size={13} />
-                Fire agent
+                <Trash2Icon size={13} />
+                Delete agent
               </button>
             )}
           </div>
@@ -502,23 +506,23 @@ const AgentDetailPanel: FC<{ agent: AgentFile }> = ({ agent }) => {
 
 // ── Empty State ──────────────────────────────────────────────────────────
 
-const EmptySwarm: FC<{ onHire: () => void }> = ({ onHire }) => (
+const EmptySwarm: FC<{ onCreate: () => void }> = ({ onCreate }) => (
   <div className="flex flex-col items-center justify-center py-24 text-center">
     <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted/30 text-muted-foreground">
       <BotIcon size={32} strokeWidth={1.2} />
     </div>
-    <h2 className="mb-1.5 text-lg font-semibold text-foreground/80">Your swarm is empty</h2>
+    <h2 className="mb-1.5 text-lg font-semibold text-foreground/80">No agents yet</h2>
     <p className="mb-6 max-w-sm text-sm text-muted-foreground leading-relaxed">
-      Hire agents to build your swarm. Each agent has a dedicated runtime and can work on tasks
+      Create agents to build your swarm. Each agent has a dedicated runtime and can work on tasks
       from your board autonomously.
     </p>
     <button
       type="button"
-      onClick={onHire}
+      onClick={onCreate}
       className="flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
     >
       <PlusIcon size={16} />
-      Hire Your First Agent
+      Create Your First Agent
     </button>
   </div>
 );

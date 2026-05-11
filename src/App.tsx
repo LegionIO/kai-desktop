@@ -1609,10 +1609,10 @@ function AppShell() {
                               >
                                 <DropdownMenu.Item
                                   className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                  onSelect={() => { agentsCtx.fireAgent(selectedAgent.id); agentsCtx.selectAgent(null); }}
+                                  onSelect={() => { void agentsCtx.deleteAgent(selectedAgent.id); agentsCtx.selectAgent(null); }}
                                 >
                                   <Trash2Icon className="h-4 w-4" />
-                                  <span>Fire Agent</span>
+                                  <span>Delete Agent</span>
                                 </DropdownMenu.Item>
                               </DropdownMenu.Content>
                             </DropdownMenu.Portal>

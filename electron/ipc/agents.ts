@@ -10,9 +10,10 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import type { AgentFile, HireAgentPayload } from '../../shared/agent-types.js';
+import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { listAllTasks } from './tasks.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -106,23 +107,7 @@ function broadcastAgentChange(appHome: string): void {
 
 function broadcastTaskChange(appHome: string): void {
   try {
-    const dir = getTasksDir(appHome);
-    let files: string[];
-    try {
-      files = readdirSync(dir);
-    } catch {
-      return;
-    }
-    const tasks = files
-      .filter((f) => f.endsWith('.json') && f !== 'order.json')
-      .map((f) => {
-        try {
-          return JSON.parse(readFileSync(join(dir, f), 'utf-8')) as TaskFile;
-        } catch {
-          return null;
-        }
-      })
-      .filter((t): t is TaskFile => t !== null);
+    const tasks = listAllTasks(appHome);
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send('tasks:changed', tasks);
     }
@@ -149,7 +134,7 @@ export function registerAgentHandlers(
     return readAgent(appHome, id);
   });
 
-  ipcMain.handle('agents:create', (_e, payload: HireAgentPayload) => {
+  ipcMain.handle('agents:create', (_e, payload: CreateAgentPayload) => {
     try {
       const id = randomUUID();
       const now = new Date().toISOString();

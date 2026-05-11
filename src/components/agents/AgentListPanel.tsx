@@ -5,7 +5,7 @@
  * "New Agent" button. Matches the layout patterns of TaskSidebarList.
  */
 
-import { type FC, useState, useMemo, useCallback } from 'react';
+import { type FC, useState, useMemo } from 'react';
 import {
   PlusIcon,
   BotIcon,
@@ -14,19 +14,14 @@ import {
 } from 'lucide-react';
 import { useAgents } from '@/providers/AgentProvider';
 import { AgentCard } from './AgentCard';
-import { AgentDetailSheet } from './AgentDetailSheet';
-import { HireAgentDialog } from './HireAgentDialog';
+import { CreateAgentDialog } from './CreateAgentDialog';
 
 export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ onNavigateToAgentsPage }) => {
   const { state, selectAgent } = useAgents();
   const { agents, selectedAgentId, isLoading } = state;
 
-  const [hireDialogOpen, setHireDialogOpen] = useState(false);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-
-  const selectedAgent = selectedAgentId
-    ? agents.find((a) => a.id === selectedAgentId) ?? null
-    : null;
 
   // Filter agents by search
   const filteredAgents = useMemo(() => {
@@ -40,16 +35,6 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         (a.description?.toLowerCase().includes(query) ?? false),
     );
   }, [agents, searchQuery]);
-
-  // If an agent is selected, show its detail sheet
-  if (selectedAgent) {
-    return (
-      <AgentDetailSheet
-        agent={selectedAgent}
-        onClose={() => selectAgent(null)}
-      />
-    );
-  }
 
   return (
     <div className="flex h-full flex-col">
@@ -65,7 +50,7 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => setHireDialogOpen(true)}
+          onClick={() => setCreateDialogOpen(true)}
           className="flex items-center gap-1 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
           <BotIcon size={12} />
@@ -109,7 +94,7 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
               <span>No agents match your search</span>
             </div>
           ) : (
-            <EmptyState onHire={() => setHireDialogOpen(true)} />
+            <EmptyState onCreate={() => setCreateDialogOpen(true)} />
           )
         ) : (
           <div className="space-y-0.5">
@@ -125,10 +110,10 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         )}
       </div>
 
-      {/* Hire Dialog */}
-      <HireAgentDialog
-        open={hireDialogOpen}
-        onOpenChange={setHireDialogOpen}
+      {/* Create Agent Dialog */}
+      <CreateAgentDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
       />
 
     </div>
@@ -137,23 +122,23 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
 
 // ── Empty State ──────────────────────────────────────────────────────────
 
-const EmptyState: FC<{ onHire: () => void }> = ({ onHire }) => (
+const EmptyState: FC<{ onCreate: () => void }> = ({ onCreate }) => (
   <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
     <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-muted/40 text-muted-foreground">
       <BotIcon size={24} strokeWidth={1.3} />
     </div>
     <h3 className="mb-1 text-sm font-medium text-foreground/80">No agents yet</h3>
     <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
-      Hire agents to work on your tasks. Each agent has a dedicated runtime and can be
+      Create agents to work on your tasks. Each agent has a dedicated runtime and can be
       assigned tasks from the board.
     </p>
     <button
       type="button"
-      onClick={onHire}
+      onClick={onCreate}
       className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
     >
       <PlusIcon size={13} />
-      Hire Your First Agent
+      Create Your First Agent
     </button>
   </div>
 );

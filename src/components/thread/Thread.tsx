@@ -120,7 +120,7 @@ export const Thread: FC<{
       viewport.scrollTop = viewport.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // intentional: only scroll when the active conversation changes, not on every dep update
   }, [runtimeConversationId]);
   // Track whether the splash should hide instantly (loading existing thread)
   // vs fade out gradually (user just sent first message in new thread).

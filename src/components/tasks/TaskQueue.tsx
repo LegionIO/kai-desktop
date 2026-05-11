@@ -116,7 +116,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   // Refresh when tasks broadcast changes (e.g. after unarchiving)
   useEffect(() => {
     if (filterMode === 'archived') void loadArchivedTasks();
-  }, [state.tasks]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [state.tasks]); // intentional: re-run when task list changes, not when filterMode changes
 
   // ── Bulk selection (archived view) ────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());

@@ -328,7 +328,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
       {/* Context menu */}
       {contextMenu && (() => {
-        const ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
+        const _ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
         return createPortal(
           <div
             ref={contextMenuRef}

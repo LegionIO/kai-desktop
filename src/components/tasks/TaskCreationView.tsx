@@ -195,7 +195,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       <div className="flex-1" />
 
       {/* Composer at bottom */}
-      <div className={cn('relative z-20 mx-auto w-full px-4 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
+      <div className={cn('relative z-20 mx-auto w-full px-5 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
         {/* Hidden file input for web bridge */}
         {isWebBridge && (
           <input

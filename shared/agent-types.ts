@@ -51,8 +51,8 @@ export interface AgentFile {
   workspaceId?: string;
 }
 
-/** Payload for creating a new agent ("hiring"). */
-export interface HireAgentPayload {
+/** Payload for creating a new agent. */
+export interface CreateAgentPayload {
   name: string;
   role: AgentRole;
   runtime: AgentRuntime;

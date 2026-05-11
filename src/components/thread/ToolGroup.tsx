@@ -131,7 +131,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const isGlobToolName = part.toolName === 'glob' || part.toolName === 'Glob'
     || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search';
   const isRuntimeSwitch = part.toolName === 'runtime_switch';
-  const bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
+  const _bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
   const isPlanApproval = part.toolName === 'exit_plan_mode';
@@ -1480,68 +1480,6 @@ function useModalPortalTarget(): HTMLElement {
   return useMemo(() => document.body, []);
 }
 
-/* ── File Content Modal (for Read tool) ── */
-
-const FileContentModal: FC<{ part: ToolCallPart; onClose: () => void }> = ({ part, onClose }) => {
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const smartResult = detectSmartResult(part);
-  const fileData = smartResult?.type === 'file_read' ? smartResult.data : null;
-  const portalTarget = useModalPortalTarget();
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.stopPropagation(); onClose(); }
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
-
-  return createPortal(
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
-    >
-      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/50 bg-background shadow-2xl overflow-hidden">
-        {/* Modal header */}
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-border/30 shrink-0">
-          <FileTextIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-          {fileData ? (
-            <ClickablePath path={fileData.path} className="text-sm text-foreground/80 min-w-0" />
-          ) : (
-            <span className="text-sm text-foreground/80">File contents</span>
-          )}
-          {fileData?.totalLines != null && (
-            <span className="text-[10px] text-muted-foreground ml-auto shrink-0">
-              {fileData.totalLines} lines{fileData.truncated ? ' (truncated)' : ''}
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={onClose}
-            className="ml-auto shrink-0 p-1 text-muted-foreground hover:text-foreground transition-colors"
-            aria-label="Close"
-          >
-            <XIcon className="h-4 w-4" />
-          </button>
-        </div>
-        {/* Content */}
-        <div className="overflow-y-auto flex-1 p-4">
-          {fileData ? (
-            <FileReadResultView data={fileData} />
-          ) : (
-            <CodeBlock
-              code={formatResult(part.result)}
-              language="text"
-            />
-          )}
-        </div>
-      </div>
-    </div>,
-    portalTarget,
-  );
-};
-
 /* ── Bash Inline Terminal View ── */
 
 const BashOutputModal: FC<{ command: string; shData: ShData; onClose: () => void }> = ({ command, shData, onClose }) => {
@@ -2520,9 +2458,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
     : typeof args.content === 'string' ? args.content
     : null;
 
-  const language = langFromPath(rawPath);
-
-  // Build an interleaved diff using a simple LCS-based Myers diff
+  const _language = langFromPath(rawPath);
   const diffLines: DiffLine[] = useMemo(() => {
     if (isWriteTool && newStr != null) {
       return newStr.split('\n').map((text) => ({ text, type: 'added' as const }));
@@ -3052,14 +2988,6 @@ const MiniCodePreview: FC<{ lines: MiniPreviewLine[]; language: string }> = ({ l
     </div>
   );
 };
-
-function formatArgs(args: unknown): string {
-  try {
-    return JSON.stringify(args, null, 2);
-  } catch {
-    return String(args);
-  }
-}
 
 function formatResult(result: unknown): string {
   const sanitized = sanitizeResultForDisplay(result);

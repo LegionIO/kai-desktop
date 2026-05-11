@@ -21,7 +21,6 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
-import { useComputerUse } from '@/providers/ComputerUseProvider';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
@@ -109,7 +108,6 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const { sessionsByConversation } = useComputerUse();
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try {
       return new Set(
@@ -165,7 +163,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     });
   }, []);
 
-  const handleArchive = async (id: string) => {
+  const handleArchive = useCallback(async (id: string) => {
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return;
     await app.conversations.put({ ...conv, archived: !conv.archived });
@@ -175,9 +173,9 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       return next;
     });
     await loadConversations();
-  };
+  }, [loadConversations]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = useCallback(async (id: string) => {
     await app.conversations.delete(id);
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -185,9 +183,9 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       return next;
     });
     await loadConversations();
-  };
+  }, [loadConversations]);
 
-  const handleRename = async (id: string, newTitle: string) => {
+  const handleRename = useCallback(async (id: string, newTitle: string) => {
     const trimmed = newTitle.trim();
     if (!trimmed) { setRenameModal(null); return; }
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
@@ -195,7 +193,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
     setRenameModal(null);
     await loadConversations();
-  };
+  }, [loadConversations]);
 
   const handleMoreClick = useCallback(
     (e: React.MouseEvent<HTMLButtonElement>, convId: string) => {
@@ -301,7 +299,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     });
 
     return result;
-  }, [conversations, workspaceId, searchQuery, filterMode, sortMode, pinnedIds, sessionsByConversation]);
+  }, [conversations, workspaceId, searchQuery, filterMode, sortMode, pinnedIds]);
 
   const isSelecting = selectedIds.size > 0;
   const allSelected = isSelecting && processed.length > 0 && processed.every((c) => selectedIds.has(c.id));

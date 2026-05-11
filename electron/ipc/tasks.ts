@@ -43,7 +43,7 @@ function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
   }
 }
 
-function listAllTasks(appHome: string): TaskFile[] {
+export function listAllTasks(appHome: string): TaskFile[] {
   const dir = getTasksDir(appHome);
   let files: string[];
   try {

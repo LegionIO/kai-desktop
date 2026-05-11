@@ -1,5 +1,5 @@
 /**
- * HireAgentDialog — dialog for creating a new agent ("hiring").
+ * CreateAgentDialog — dialog for creating a new agent.
  */
 
 import { type FC, useState } from 'react';
@@ -16,37 +16,44 @@ const ROLE_OPTIONS: { id: AgentRole; label: string }[] = [
   { id: 'researcher', label: 'Researcher' },
 ];
 
-interface HireAgentDialogProps {
+interface CreateAgentDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
-export const HireAgentDialog: FC<HireAgentDialogProps> = ({ open, onOpenChange }) => {
-  const { hireAgent } = useAgents();
+export const CreateAgentDialog: FC<CreateAgentDialogProps> = ({ open, onOpenChange }) => {
+  const { createAgent } = useAgents();
 
   const [name, setName] = useState('');
   const [role, setRole] = useState<AgentRole>('engineer');
   const [runtime, setRuntime] = useState<AgentRuntime>('claude-code');
   const [description, setDescription] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const canSubmit = name.trim().length > 0 && !isSubmitting;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
     setIsSubmitting(true);
+    setSubmitError(null);
     try {
-      await hireAgent({
+      const result = await createAgent({
         name: name.trim(),
         role,
         runtime,
         description: description.trim() || undefined,
       });
+      if (!result) {
+        setSubmitError('Failed to create agent. Please try again.');
+        return;
+      }
       // Reset form and close
       setName('');
       setRole('engineer');
       setRuntime('claude-code');
       setDescription('');
+      setSubmitError(null);
       onOpenChange(false);
     } finally {
       setIsSubmitting(false);
@@ -54,7 +61,7 @@ export const HireAgentDialog: FC<HireAgentDialogProps> = ({ open, onOpenChange }
   };
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <Dialog.Root open={open} onOpenChange={(v) => { if (!v) setSubmitError(null); onOpenChange(v); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm animate-in fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:pointer-events-none" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border/70 bg-popover p-6 shadow-2xl animate-in fade-in-0 zoom-in-95 slide-in-from-left-1/2 slide-in-from-top-[48%] data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:pointer-events-none">
@@ -136,18 +143,23 @@ export const HireAgentDialog: FC<HireAgentDialogProps> = ({ open, onOpenChange }
           </div>
 
           {/* Actions */}
-          <div className="mt-6 flex items-center justify-end gap-2">
-            <Dialog.Close className="rounded-lg px-3 py-1.5 text-sm font-medium text-muted-foreground hover:bg-muted/50 transition-colors">
-              Cancel
-            </Dialog.Close>
-            <button
-              type="button"
-              disabled={!canSubmit}
-              onClick={() => void handleSubmit()}
-              className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isSubmitting ? 'Hiring...' : 'Hire'}
-            </button>
+          <div className="mt-6 flex flex-col gap-2">
+            {submitError && (
+              <p className="text-xs text-destructive">{submitError}</p>
+            )}
+            <div className="flex items-center justify-end gap-2">
+              <Dialog.Close className="rounded-lg px-3 py-1.5 text-sm font-medium text-muted-foreground hover:bg-muted/50 transition-colors">
+                Cancel
+              </Dialog.Close>
+              <button
+                type="button"
+                disabled={!canSubmit}
+                onClick={() => void handleSubmit()}
+                className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isSubmitting ? 'Creating...' : 'Create'}
+              </button>
+            </div>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

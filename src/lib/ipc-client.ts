@@ -6,7 +6,7 @@ import type {
   ComputerUseSurface,
 } from '../../shared/computer-use';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
-import type { AgentFile, HireAgentPayload } from '../../shared/agent-types';
+import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 
 type AppAPI = {
   config: {
@@ -186,7 +186,7 @@ type AppAPI = {
   agents: {
     list: () => Promise<AgentFile[]>;
     get: (id: string) => Promise<AgentFile | null>;
-    create: (payload: HireAgentPayload) => Promise<AgentFile>;
+    create: (payload: CreateAgentPayload) => Promise<AgentFile>;
     update: (id: string, updates: Partial<AgentFile>) => Promise<AgentFile>;
     delete: (id: string) => Promise<{ ok: boolean }>;
     assignTask: (agentId: string, taskId: string) => Promise<{ ok: boolean; error?: string }>;

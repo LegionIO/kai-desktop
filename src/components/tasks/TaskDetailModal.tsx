@@ -13,7 +13,6 @@ import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
 import { useAgents } from '@/providers/AgentProvider';
-import { app } from '@/lib/ipc-client';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
