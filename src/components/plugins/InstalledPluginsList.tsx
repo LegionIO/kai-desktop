@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, DownloadIcon, PlusIcon } from 'lucide-react';
+import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, DownloadIcon, PlusIcon, Settings2Icon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
@@ -29,6 +29,8 @@ interface InstalledPluginsListProps {
   onOpenMarketplace: () => void;
   onOpenPlugins: () => void;
   onOpenPluginError: (pluginName: string) => void;
+  onOpenPluginSettings: (pluginName: string) => void;
+  pluginBrandRequired: Set<string>;
 }
 
 const PINNED_PLUGINS_KEY = __BRAND_APP_SLUG + ':pinned-plugins';
@@ -41,6 +43,8 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onOpenMarketplace,
   onOpenPlugins,
   onOpenPluginError,
+  onOpenPluginSettings,
+  pluginBrandRequired,
 }) => {
   const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
@@ -338,7 +342,14 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
             >
               <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedNames.has(contextMenu.pluginName) ? 'Unpin' : 'Pin'}
             </button>
-            {ctxPlugin && !ctxPlugin.brandRequired && (
+            <div className="my-1 h-px bg-border/60" />
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+              onClick={() => { onOpenPluginSettings(contextMenu.pluginName); setContextMenu(null); }}
+            >
+              <Settings2Icon className="h-4 w-4 text-muted-foreground" /> Settings
+            </button>
+            {!pluginBrandRequired.has(contextMenu.pluginName) && (
               <>
                 <div className="my-1 h-px bg-border/60" />
                 <button

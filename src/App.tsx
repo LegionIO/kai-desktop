@@ -475,6 +475,7 @@ function AppShell() {
   const [sidebarSection, setSidebarSection] = useState<SidebarTab>('chats');
   const lastPluginViewRef = useRef<string>(MARKETPLACE_VIEW);
   const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
+  const [pluginBrandRequired, setPluginBrandRequired] = useState<Set<string>>(new Set());
   const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
@@ -554,13 +555,16 @@ function AppShell() {
   // Build a name→displayName map from the plugin list (refreshed when pluginUIState changes)
   useEffect(() => {
     let cancelled = false;
-    app.plugins.list().then((list: Array<{ name: string; displayName: string }>) => {
+    app.plugins.list().then((list: Array<{ name: string; displayName: string; brandRequired?: boolean }>) => {
       if (cancelled) return;
       const map = new Map<string, string>();
+      const required = new Set<string>();
       for (const p of list) {
         if (p.displayName) map.set(p.name, p.displayName);
+        if (p.brandRequired) required.add(p.name);
       }
       setPluginDisplayNames(map);
+      setPluginBrandRequired(required);
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [pluginUIState]);
@@ -1477,6 +1481,8 @@ function AppShell() {
                         onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
                         onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
                         onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                        onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
+                        pluginBrandRequired={pluginBrandRequired}
                       />
                     </div>
                   }
@@ -1691,14 +1697,18 @@ function AppShell() {
                             <span>Settings</span>
                           </DropdownMenu.Item>
                         )}
-                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                          onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
-                        >
-                          <Trash2Icon className="h-4 w-4" />
-                          <span>Uninstall</span>
-                        </DropdownMenu.Item>
+                        {!pluginBrandRequired.has(activeErrorPluginName) && (
+                          <>
+                            <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                            <DropdownMenu.Item
+                              className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                              onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
+                            >
+                              <Trash2Icon className="h-4 w-4" />
+                              <span>Uninstall</span>
+                            </DropdownMenu.Item>
+                          </>
+                        )}
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
@@ -1744,14 +1754,18 @@ function AppShell() {
                             <span>Settings</span>
                           </DropdownMenu.Item>
                         )}
-                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                          onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
-                        >
-                          <Trash2Icon className="h-4 w-4" />
-                          <span>Uninstall</span>
-                        </DropdownMenu.Item>
+                        {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
+                          <>
+                            <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                            <DropdownMenu.Item
+                              className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                              onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
+                            >
+                              <Trash2Icon className="h-4 w-4" />
+                              <span>Uninstall</span>
+                            </DropdownMenu.Item>
+                          </>
+                        )}
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
