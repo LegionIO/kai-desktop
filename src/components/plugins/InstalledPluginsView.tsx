@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
+import { createPortal } from 'react-dom';
 import {
   PackageIcon,
   LoaderIcon,
@@ -7,8 +8,11 @@ import {
   TrashIcon,
   ShieldIcon,
   StoreIcon,
+  SearchIcon,
+  XIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { Tooltip } from '@/components/ui/Tooltip';
 
 /* ── Types ────────────────────────────────────────────── */
 
@@ -47,8 +51,10 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
   const [uninstallingPlugins, setUninstallingPlugins] = useState<Set<string>>(new Set());
+  const [confirmUninstall, setConfirmUninstall] = useState<InstalledPlugin | null>(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -102,6 +108,16 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
     }
   };
 
+  const filteredPlugins = searchQuery.trim()
+    ? plugins.filter((p) => {
+        const q = searchQuery.toLowerCase();
+        return (
+          (p.displayName || p.name).toLowerCase().includes(q) ||
+          p.description.toLowerCase().includes(q)
+        );
+      })
+    : plugins;
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-20">
@@ -112,13 +128,48 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Header */}
-      <div>
-        <h3 className="text-sm font-semibold">Installed Plugins</h3>
-        <p className="text-xs text-muted-foreground">
-          Manage your currently installed plugins
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold">Installed Plugins</h3>
+          <p className="text-xs text-muted-foreground">
+            Manage your currently installed plugins
+          </p>
+        </div>
+      </div>
+
+      {/* Search + marketplace button */}
+      <div className="flex items-center gap-2">
+        <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
+          <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <input
+            type="text"
+            placeholder="Search plugins…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
+            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="shrink-0 rounded p-0.5 hover:bg-muted transition-colors"
+            >
+              <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            </button>
+          )}
+        </div>
+        <Tooltip content="Browse Marketplace" side="left">
+          <button
+            type="button"
+            onClick={onOpenMarketplace}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-border/60 bg-muted/30 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+          >
+            <StoreIcon className="h-4 w-4" />
+          </button>
+        </Tooltip>
       </div>
 
       {/* Error banner */}
@@ -140,9 +191,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
       {plugins.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
           <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
-          <p className="mt-4 text-sm text-muted-foreground">
-            No plugins installed yet
-          </p>
+          <p className="mt-4 text-sm text-muted-foreground">No plugins installed yet</p>
           <p className="mt-1 text-xs text-muted-foreground/70">
             Discover and install plugins from the marketplace
           </p>
@@ -155,9 +204,14 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             Browse Marketplace
           </button>
         </div>
+      ) : filteredPlugins.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
+          <PackageIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
+          <p className="mt-3 text-sm text-muted-foreground">No plugins match your search</p>
+        </div>
       ) : (
         <div className="space-y-2">
-          {plugins.map((plugin) => {
+          {filteredPlugins.map((plugin) => {
             const catalogEntry = catalogMap.get(plugin.name);
             const hasUpdate =
               catalogEntry &&
@@ -174,30 +228,17 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-semibold">
-                      {plugin.displayName}
-                    </span>
+                    <span className="text-xs font-semibold">{plugin.displayName}</span>
                     {plugin.state === 'active' && (
-                      <span
-                        className="h-1.5 w-1.5 rounded-full bg-green-500"
-                        title="Active"
-                      />
+                      <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
                     )}
                     {plugin.state === 'error' && (
-                      <span
-                        className="h-1.5 w-1.5 rounded-full bg-red-500"
-                        title="Error"
-                      />
+                      <span className="h-1.5 w-1.5 rounded-full bg-red-500" title="Error" />
                     )}
                     {plugin.state === 'disabled' && (
-                      <span
-                        className="h-1.5 w-1.5 rounded-full bg-yellow-500"
-                        title="Disabled"
-                      />
+                      <span className="h-1.5 w-1.5 rounded-full bg-yellow-500" title="Disabled" />
                     )}
-                    <span className="text-[10px] text-muted-foreground">
-                      v{plugin.version}
-                    </span>
+                    <span className="text-[10px] text-muted-foreground">v{plugin.version}</span>
                     {hasUpdate && (
                       <span className="flex items-center gap-1 rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold text-blue-400">
                         <ArrowUpCircleIcon className="h-2.5 w-2.5" />
@@ -211,13 +252,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                       </span>
                     )}
                   </div>
-                  <p className="line-clamp-2 text-[11px] text-muted-foreground">
-                    {plugin.description}
-                  </p>
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">{plugin.description}</p>
                   {plugin.error && (
-                    <p className="mt-1 text-[10px] text-red-400">
-                      {plugin.error}
-                    </p>
+                    <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
                   )}
                 </div>
                 <div className="flex shrink-0 gap-2">
@@ -233,15 +270,13 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                       ) : (
                         <ArrowUpCircleIcon className="h-3 w-3" />
                       )}
-                      {installingPlugins.has(plugin.name)
-                        ? 'Updating...'
-                        : 'Update'}
+                      {installingPlugins.has(plugin.name) ? 'Updating...' : 'Update'}
                     </button>
                   )}
                   {!plugin.brandRequired && (
                     <button
                       type="button"
-                      onClick={() => handleUninstall(plugin.name)}
+                      onClick={() => setConfirmUninstall(plugin)}
                       disabled={uninstallingPlugins.has(plugin.name)}
                       className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >
@@ -250,28 +285,59 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                       ) : (
                         <TrashIcon className="h-3 w-3" />
                       )}
-                      {uninstallingPlugins.has(plugin.name)
-                        ? 'Removing...'
-                        : 'Uninstall'}
+                      {uninstallingPlugins.has(plugin.name) ? 'Removing...' : 'Uninstall'}
                     </button>
                   )}
                 </div>
               </div>
             );
           })}
-
-          {/* Link to marketplace at bottom */}
-          <div className="pt-2 text-center">
-            <button
-              type="button"
-              onClick={onOpenMarketplace}
-              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-primary transition-colors"
-            >
-              <StoreIcon className="h-3.5 w-3.5" />
-              Browse Marketplace for more plugins
-            </button>
-          </div>
         </div>
+      )}
+
+      {/* Uninstall confirmation modal */}
+      {confirmUninstall && createPortal(
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          onClick={() => setConfirmUninstall(null)}
+        >
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              This will uninstall{' '}
+              <span className="font-medium text-foreground">{confirmUninstall.displayName}</span>.
+              This cannot be undone.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmUninstall(null)}
+                disabled={uninstallingPlugins.has(confirmUninstall.name)}
+                className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const name = confirmUninstall.name;
+                  setConfirmUninstall(null);
+                  void handleUninstall(name);
+                }}
+                disabled={uninstallingPlugins.has(confirmUninstall.name)}
+                className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+              >
+                <TrashIcon className="h-3.5 w-3.5" />
+                Uninstall
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

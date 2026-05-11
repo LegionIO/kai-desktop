@@ -6,29 +6,23 @@
  */
 
 import { type FC, useState, useMemo, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import {
   PlusIcon,
   BotIcon,
   SearchIcon,
   XIcon,
-  ListFilterIcon,
-  Trash2Icon,
 } from 'lucide-react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { useAgents } from '@/providers/AgentProvider';
 import { AgentCard } from './AgentCard';
 import { AgentDetailSheet } from './AgentDetailSheet';
 import { HireAgentDialog } from './HireAgentDialog';
 
-export const AgentListPanel: FC = () => {
-  const { state, selectAgent, fireAgent } = useAgents();
+export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ onNavigateToAgentsPage }) => {
+  const { state, selectAgent } = useAgents();
   const { agents, selectedAgentId, isLoading } = state;
 
   const [hireDialogOpen, setHireDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
-  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
 
   const selectedAgent = selectedAgentId
     ? agents.find((a) => a.id === selectedAgentId) ?? null
@@ -47,20 +41,6 @@ export const AgentListPanel: FC = () => {
     );
   }, [agents, searchQuery]);
 
-  const isSearchActive = searchQuery.trim().length > 0;
-
-  const confirmBulkDelete = useCallback(async () => {
-    setIsBulkDeleting(true);
-    for (const agent of filteredAgents) {
-      // Only delete agents that are not currently running
-      if (agent.status !== 'running') {
-        await fireAgent(agent.id);
-      }
-    }
-    setIsBulkDeleting(false);
-    setBulkDeleteOpen(false);
-  }, [filteredAgents, fireAgent]);
-
   // If an agent is selected, show its detail sheet
   if (selectedAgent) {
     return (
@@ -73,40 +53,15 @@ export const AgentListPanel: FC = () => {
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header row — label + options dropdown + New Agent button */}
+      {/* Header row */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => onNavigateToAgentsPage?.()}
+          className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+        >
           Agents
-        </span>
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
-            >
-              <ListFilterIcon className="h-3.5 w-3.5" />
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-              <DropdownMenu.Item
-                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                disabled={filteredAgents.length === 0}
-                onSelect={() => setBulkDeleteOpen(true)}
-              >
-                <Trash2Icon size={14} />
-                {isSearchActive
-                  ? `Delete ${filteredAgents.length} shown`
-                  : 'Delete all'}
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        </button>
         <div className="flex-1" />
         <button
           type="button"
@@ -176,42 +131,6 @@ export const AgentListPanel: FC = () => {
         onOpenChange={setHireDialogOpen}
       />
 
-      {/* Bulk delete confirmation modal */}
-      {bulkDeleteOpen && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-sm font-semibold text-foreground">Delete agents</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {isSearchActive
-                ? `This will permanently delete ${filteredAgents.filter((a) => a.status !== 'running').length} agent${filteredAgents.filter((a) => a.status !== 'running').length === 1 ? '' : 's'}. Running agents will be skipped.`
-                : `This will permanently delete all ${filteredAgents.filter((a) => a.status !== 'running').length} agent${filteredAgents.filter((a) => a.status !== 'running').length === 1 ? '' : 's'}. Running agents will be skipped.`}
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBulkDeleteOpen(false)}
-                disabled={isBulkDeleting}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void confirmBulkDelete()}
-                disabled={isBulkDeleting}
-                className="rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {isBulkDeleting ? 'Deleting...' : 'Delete'}
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body,
-      )}
     </div>
   );
 };

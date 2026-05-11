@@ -1465,7 +1465,7 @@ function AppShell() {
                   }
                   agentsContent={
                     <div className="min-h-0 flex-1 overflow-y-auto">
-                      <AgentListPanel />
+                      <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
                     </div>
                   }
                   pluginsContent={
@@ -1539,7 +1539,7 @@ function AppShell() {
                   </div>
                 ) : activeView === PLUGINS_VIEW ? (
                   <div className="flex items-center gap-1.5">
-                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugin Hub</div>
+                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugins</div>
                   </div>
                 ) : activeView === AGENTS_VIEW ? (
                   (() => {
@@ -1658,7 +1658,7 @@ function AppShell() {
                       onClick={() => setActiveView(PLUGINS_VIEW)}
                       className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                     >
-                      Plugin Hub
+                      Plugins
                     </button>
                     <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
@@ -1711,7 +1711,7 @@ function AppShell() {
                       onClick={() => setActiveView(PLUGINS_VIEW)}
                       className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                     >
-                      Plugin Hub
+                      Plugins
                     </button>
                     <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                   <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>

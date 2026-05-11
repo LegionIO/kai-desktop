@@ -14,12 +14,9 @@ import {
   ClipboardListIcon,
   PinIcon,
   EllipsisVerticalIcon,
-  LoaderIcon,
-  ListFilterIcon,
   PlusIcon,
   FilePlusIcon,
 } from 'lucide-react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
@@ -62,6 +59,7 @@ interface TaskSidebarListProps {
 export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
   onCreateTask,
+  onViewBoard,
   workspaceId,
 }) => {
   const { state, selectTask, deleteTask } = useTasks();
@@ -120,12 +118,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   // ── Delete animation state ─────────────────────────────────────────────
   const [removingIds] = useState<Set<string>>(new Set());
 
-  // ── Bulk delete state ──────────────────────────────────────────────────
-  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
-  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
-
   // ── Sort and filter tasks ──────────────────────────────────────────────
-  const isSearchActive = searchQuery.trim().length > 0;
 
   const sortedTasks = useMemo(() => {
     let tasks = [...state.tasks];
@@ -162,51 +155,17 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     onSelectTask?.(taskId);
   };
 
-  const confirmBulkDelete = async () => {
-    setIsBulkDeleting(true);
-    for (const task of sortedTasks) {
-      await deleteTask(task.id);
-    }
-    setIsBulkDeleting(false);
-    setBulkDeleteOpen(false);
-  };
-
   return (
     <div className="flex flex-col h-full">
-      {/* TASKS heading row — label + options dropdown + View Board pill */}
+      {/* TASKS heading row */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => onViewBoard?.()}
+          className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+        >
           Tasks
-        </span>
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-sidebar-accent/80 hover:text-sidebar-foreground"
-            >
-              <ListFilterIcon className="h-3.5 w-3.5" />
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              className="z-[9999] min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-              <DropdownMenu.Item
-                className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                disabled={sortedTasks.length === 0}
-                onSelect={() => setBulkDeleteOpen(true)}
-              >
-                <Trash2Icon size={14} />
-                {isSearchActive
-                  ? `Delete ${sortedTasks.length} shown`
-                  : 'Delete all'}
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        </button>
         <div className="flex-1" />
         <button
           type="button"
@@ -367,52 +326,6 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         document.body,
       )}
 
-      {/* Bulk delete confirmation modal */}
-      {bulkDeleteOpen && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-sm font-semibold text-foreground">Delete tasks</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {isSearchActive
-                ? `This will permanently delete ${sortedTasks.length} shown task${sortedTasks.length === 1 ? '' : 's'}. This cannot be undone.`
-                : `This will permanently delete all ${sortedTasks.length} task${sortedTasks.length === 1 ? '' : 's'}. This cannot be undone.`}
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBulkDeleteOpen(false)}
-                disabled={isBulkDeleting}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { void confirmBulkDelete(); }}
-                disabled={isBulkDeleting}
-                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {isBulkDeleting ? (
-                  <>
-                    <LoaderIcon className="h-3 w-3 animate-spin" />
-                    Deleting...
-                  </>
-                ) : (
-                  <>
-                    <Trash2Icon className="h-3 w-3" />
-                    Delete
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body,
-      )}
     </div>
   );
 };

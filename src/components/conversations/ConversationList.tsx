@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { Trash2Icon, ArchiveIcon, MessageSquareIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, SquarePenIcon, PlusIcon } from 'lucide-react';
+import { Trash2Icon, ArchiveIcon, MessageSquareIcon, MonitorIcon, PinIcon, PencilIcon, DownloadIcon, EllipsisVerticalIcon, SquarePenIcon, PlusIcon, SearchIcon, XIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
@@ -98,6 +98,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   });
   const { sessionsByConversation } = useComputerUse();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
 
@@ -201,6 +202,14 @@ export const ConversationList: FC<ConversationListProps> = ({
     // Hide empty threads (no messages, no title)
     result = result.filter((conv) => conv.messageCount > 0 || Boolean(conv.title?.trim() || conv.fallbackTitle?.trim()));
 
+    // Text search
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter((c) =>
+        getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q),
+      );
+    }
+
     // Default sort: newest-first by last assistant update
     result.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
@@ -209,7 +218,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, sessionsByConversation, workspaceId]);
+  }, [conversations, searchQuery, sessionsByConversation, workspaceId]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
@@ -325,6 +334,27 @@ export const ConversationList: FC<ConversationListProps> = ({
           <SquarePenIcon className="h-3 w-3" />
           New Chat
         </button>
+      </div>
+      <div className="px-3 pb-2">
+        <div className="flex items-center gap-2 rounded-xl border border-sidebar-border/60 bg-sidebar-accent/50 px-3 py-2">
+          <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <input
+            type="text"
+            placeholder="Search..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 bg-transparent text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="shrink-0 rounded p-0.5 transition-colors hover:bg-sidebar-accent"
+            >
+              <XIcon className="h-3 w-3 text-muted-foreground" />
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto px-3 pt-1">
         {(() => {
