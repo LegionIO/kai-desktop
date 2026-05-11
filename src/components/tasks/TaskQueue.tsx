@@ -31,9 +31,11 @@ import { TaskDetailModal } from './TaskDetailModal';
 interface TaskQueueProps {
   /** Active workspace ID — only tasks belonging to this workspace (or unscoped) are shown */
   workspaceId?: string | null;
+  /** Increment this each time the tasks view is navigated to, to re-focus the search bar */
+  focusTrigger?: number;
 }
 
-export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
+export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId, focusTrigger }) => {
   const { state, reorderTasks, selectTask } =
     useTasks();
 
@@ -43,7 +45,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
+  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, [focusTrigger]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),

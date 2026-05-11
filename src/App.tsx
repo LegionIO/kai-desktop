@@ -477,6 +477,7 @@ function AppShell() {
   const lastChatsViewRef = useRef<string>(CHAT_LIST_VIEW);
   const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
   const [pluginBrandRequired, setPluginBrandRequired] = useState<Set<string>>(new Set());
+  const [searchFocusTrigger, setSearchFocusTrigger] = useState(0);
   const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
@@ -516,6 +517,17 @@ function AppShell() {
       lastChatsViewRef.current = activeView;
     }
   }, [activeView, activeConversationId]);
+
+  // Increment search focus trigger whenever a search-enabled view becomes active
+  const prevActiveViewRef = useRef<string>('');
+  useEffect(() => {
+    const prev = prevActiveViewRef.current;
+    prevActiveViewRef.current = activeView;
+    const searchViews = [CHAT_LIST_VIEW, PLUGINS_VIEW, TASKS_VIEW];
+    if (searchViews.includes(activeView) && prev !== activeView) {
+      setSearchFocusTrigger((n) => n + 1);
+    }
+  }, [activeView]);
 
   // Restore the last active conversation when switching workspaces
   const prevWorkspaceIdRef = useRef<string | null | undefined>(undefined);
@@ -1868,6 +1880,7 @@ function AppShell() {
                     onNavigate={handlePluginNavigationItem}
                     onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
                     onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
+                    focusTrigger={searchFocusTrigger}
                   />
                 </div>
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
@@ -1900,6 +1913,7 @@ function AppShell() {
                     return handleNewConversation();
                   }}
                   workspaceId={activeWorkspaceId}
+                  focusTrigger={searchFocusTrigger}
                 />
               ) : activeView === TASKS_VIEW ? (
                 isCreatingTask ? (
@@ -1914,7 +1928,7 @@ function AppShell() {
                   />
                 ) : (
                   <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                    <TaskQueue workspaceId={activeWorkspaceId} />
+                    <TaskQueue workspaceId={activeWorkspaceId} focusTrigger={searchFocusTrigger} />
                   </div>
                 )
               ) : activeView === AGENTS_VIEW ? (
