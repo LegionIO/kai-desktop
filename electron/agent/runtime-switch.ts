@@ -18,6 +18,7 @@ import { estimateToolTokens } from './compaction.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { RUNTIME_LABELS } from './runtime/types.js';
+import { SWITCH_SUMMARY_PROMPT } from './prompts.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -25,13 +26,6 @@ import { RUNTIME_LABELS } from './runtime/types.js';
 
 /** Default token threshold: below this, inject raw transcript; above, summarize. */
 const DEFAULT_TOKEN_THRESHOLD = 4000;
-
-const SWITCH_SUMMARY_PROMPT = [
-  'You are summarizing a conversation that will be continued by a different AI assistant.',
-  'Preserve all key context: facts, decisions, constraints, user preferences, unresolved questions, code snippets, file paths, and identifiers.',
-  'Be concise but comprehensive — the new assistant has no other context.',
-  'Do not invent details. Return plain text only.',
-].join(' ');
 
 // ---------------------------------------------------------------------------
 // Detection

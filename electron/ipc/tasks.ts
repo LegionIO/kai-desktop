@@ -5,35 +5,9 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
+import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
-
-const TASK_PLAN_SYSTEM_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
-
-Write the plan as clear, actionable markdown with this structure:
-
-## Objective
-One sentence summarizing the goal.
-
-## Steps
-1. First step — specific and actionable
-2. Second step — with enough detail to execute
-3. Continue as needed...
-
-## Acceptance Criteria
-- [ ] Criterion 1
-- [ ] Criterion 2
-
-## Notes
-Any additional context, risks, or dependencies.
-
-Rules:
-- Be specific and actionable, not vague
-- Include technical details where relevant
-- Use markdown checkboxes for criteria
-- Keep the plan concise but complete
-- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
-- Always output the complete updated plan, never just a diff or partial update`;
 
 /** Active plan generation streams, keyed by taskId. */
 const activeTaskStreams = new Map<string, { abort: () => void }>();
@@ -260,7 +234,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
           const result = streamText({
             model,
-            system: TASK_PLAN_SYSTEM_PROMPT,
+            system: config.systemPrompts?.taskPlan?.trim() || TASK_PLAN_SYSTEM_PROMPT,
             messages,
             abortSignal: controller.signal,
           });

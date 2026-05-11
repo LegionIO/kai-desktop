@@ -183,6 +183,7 @@ const systemPromptsConfigSchema = z.object({
   plan: z.string().optional(),
   implement: z.string().optional(),
   computerUse: z.string().optional(),
+  taskPlan: z.string().optional(),
 });
 
 const fallbackConfigSchema = z.object({

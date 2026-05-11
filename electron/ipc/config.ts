@@ -110,6 +110,7 @@ function getDefaultConfig() {
       plan: '',
       implement: '',
       computerUse: '',
+      taskPlan: '',
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,

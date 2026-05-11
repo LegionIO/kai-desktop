@@ -148,7 +148,7 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
 
 /* ── Prompts Content ── */
 
-type PromptKey = 'chat' | 'plan' | 'computerUse' | 'realtimeInstructions';
+type PromptKey = 'chat' | 'plan' | 'taskPlan' | 'computerUse' | 'realtimeInstructions';
 
 const DEFAULT_CHAT_PROMPT = 'You are Kai, a powerful local AI assistant with access to the user\'s computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you\'re doing and why.';
 
@@ -156,10 +156,40 @@ const DEFAULT_PLAN_PROMPT = 'You are a thorough planning assistant. Explore the 
 
 const DEFAULT_COMPUTER_USE_PROMPT = 'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
 
+// Note: this string is duplicated from electron/agent/prompts.ts (TASK_PLAN_SYSTEM_PROMPT).
+// Renderer code cannot import from Node/Electron modules — keep in sync manually.
+const DEFAULT_TASK_PLAN_PROMPT = `You are a task planning assistant. When a user describes work they want done, create a structured task plan.
+
+Write the plan as clear, actionable markdown with this structure:
+
+## Objective
+One sentence summarizing the goal.
+
+## Steps
+1. First step — specific and actionable
+2. Second step — with enough detail to execute
+3. Continue as needed...
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Any additional context, risks, or dependencies.
+
+Rules:
+- Be specific and actionable, not vague
+- Include technical details where relevant
+- Use markdown checkboxes for criteria
+- Keep the plan concise but complete
+- When the user sends follow-up messages, regenerate the FULL plan incorporating their feedback
+- Always output the complete updated plan, never just a diff or partial update`;
+
 const promptFields: Array<{ key: PromptKey; label: string; placeholder: string; configPath: string }> = [
   { key: 'chat', label: 'New Chat', placeholder: DEFAULT_CHAT_PROMPT, configPath: 'systemPrompt' },
   { key: 'realtimeInstructions', label: 'Voice Chat', placeholder: 'You are a helpful assistant. Respond concisely and naturally in conversation.', configPath: 'realtime.instructions' },
   { key: 'plan', label: 'Create Plan', placeholder: DEFAULT_PLAN_PROMPT, configPath: 'systemPrompts.plan' },
+  { key: 'taskPlan', label: 'Create Task', placeholder: DEFAULT_TASK_PLAN_PROMPT, configPath: 'systemPrompts.taskPlan' },
   { key: 'computerUse', label: 'Computer Use', placeholder: DEFAULT_COMPUTER_USE_PROMPT, configPath: 'systemPrompts.computerUse' },
 ];
 
