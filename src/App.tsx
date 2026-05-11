@@ -1914,11 +1914,7 @@ function AppShell() {
                   />
                 ) : (
                   <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                    <div className="flex-1 overflow-y-auto">
-                      <div className={cn('mx-auto', !fullWidth && 'max-w-3xl')}>
-                        <TaskQueue workspaceId={activeWorkspaceId} />
-                      </div>
-                    </div>
+                    <TaskQueue workspaceId={activeWorkspaceId} />
                   </div>
                 )
               ) : activeView === AGENTS_VIEW ? (
