@@ -474,6 +474,7 @@ function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarSection, setSidebarSection] = useState<SidebarTab>('chats');
   const lastPluginViewRef = useRef<string>(MARKETPLACE_VIEW);
+  const lastChatsViewRef = useRef<string>(CHAT_LIST_VIEW);
   const [pluginDisplayNames, setPluginDisplayNames] = useState<Map<string, string>>(new Map());
   const [pluginBrandRequired, setPluginBrandRequired] = useState<Set<string>>(new Set());
   const isMobile = useIsMobile();
@@ -507,12 +508,14 @@ function AppShell() {
     }
   }, [config]);
 
-  // Track the last plugin-related view so we can restore it when switching back
+  // Track the last plugin/chats view so we can restore it when switching back
   useEffect(() => {
     if (isPluginView(activeView)) {
       lastPluginViewRef.current = activeView;
+    } else if (activeView === CHAT_LIST_VIEW || activeView === CHAT_VIEW || activeView === activeConversationId) {
+      lastChatsViewRef.current = activeView;
     }
-  }, [activeView]);
+  }, [activeView, activeConversationId]);
 
   // Restore the last active conversation when switching workspaces
   const prevWorkspaceIdRef = useRef<string | null | undefined>(undefined);
@@ -1159,7 +1162,7 @@ function AppShell() {
         e.preventDefault();
         const tab = tabShortcuts[e.key];
         setSidebarSection(tab);
-        if (tab === 'chats') setActiveView(CHAT_VIEW);
+        if (tab === 'chats') setActiveView(lastChatsViewRef.current);
         else if (tab === 'tasks') setActiveView(TASKS_VIEW);
         else if (tab === 'agents') setActiveView(AGENTS_VIEW);
         else if (tab === 'plugins') setActiveView(lastPluginViewRef.current);
@@ -1411,7 +1414,7 @@ function AppShell() {
                   if (tab === 'plugins') {
                     setActiveView(lastPluginViewRef.current);
                   } else if (tab === 'chats') {
-                    setActiveView(CHAT_VIEW);
+                    setActiveView(lastChatsViewRef.current);
                   } else if (tab === 'tasks') {
                     setActiveView(TASKS_VIEW);
                   } else if (tab === 'agents') {
