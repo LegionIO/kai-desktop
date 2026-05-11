@@ -244,7 +244,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
           )}
         >
           <DownloadIcon className="h-3 w-3" />
-          Install Plugins
+          New Plugin
         </button>
       </div>
 

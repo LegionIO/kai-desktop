@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type FC } from 'react';
+import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import {
   PackageIcon,
@@ -55,6 +55,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { searchRef.current?.focus(); }, []);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
@@ -154,6 +157,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
+              ref={searchRef}
               type="text"
               placeholder="Search plugins…"
               value={searchQuery}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type FC } from 'react';
+import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { RefreshCwIcon, DownloadIcon, PackageIcon, LoaderIcon, AlertCircleIcon, SearchIcon, XIcon, CheckIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -30,6 +30,9 @@ export const PluginMarketplace: FC = () => {
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { searchRef.current?.focus(); }, []);
   const [refreshing, setRefreshing] = useState(false);
   const [justRefreshed, setJustRefreshed] = useState(false);
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
@@ -115,8 +118,9 @@ export const PluginMarketplace: FC = () => {
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
+              ref={searchRef}
               type="text"
-              placeholder="Search marketplace…"
+              placeholder="Search plugin marketplace…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
