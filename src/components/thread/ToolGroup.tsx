@@ -647,7 +647,7 @@ const QuestionnaireView: FC<{
                       : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
-                  {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-violet-500" />}
+                  {isAnswered && <CheckIcon className="h-2.5 w-2.5 text-emerald-500" />}
                   {q.header}
                 </button>
               );
@@ -933,7 +933,7 @@ function detectTodoItems(part: ToolCallPart): TodoItem[] | null {
 }
 
 const TodoItemIcon: FC<{ status: TodoItem['status'] }> = ({ status }) => {
-  if (status === 'completed') return <CheckIcon className="h-3.5 w-3.5 shrink-0 text-violet-500" />;
+  if (status === 'completed') return <CheckIcon className="h-3.5 w-3.5 shrink-0 text-emerald-500" />;
   if (status === 'in_progress') return <AsteriskIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />;
   return <SquareIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />;
 };
