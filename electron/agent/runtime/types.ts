@@ -144,7 +144,7 @@ export type StreamOptions = {
   conversationMetadata?: Record<string, unknown>;
 
   /**
-   * Injected prior conversation context for cross-runtime handoff.
+   * Injected prior conversation context for cross-runtime switch.
    * When present, indicates the runtime is being used for the first time in this
    * conversation (switched from a different runtime). The context contains a
    * transcript or summary of prior turns.
@@ -153,7 +153,7 @@ export type StreamOptions = {
    * - Codex SDK: prepend to the user prompt (Codex has no system prompt API)
    * - Mastra: not used (Mastra already receives full message history)
    */
-  handoffContext?: string;
+  switchContext?: string;
 };
 
 // ---------------------------------------------------------------------------

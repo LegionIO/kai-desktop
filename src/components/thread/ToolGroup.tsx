@@ -34,6 +34,7 @@ import {
   HelpCircleIcon,
   ListTodoIcon,
   SparklesIcon,
+  ArrowRightLeftIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -129,6 +130,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
     || part.toolName === 'mastra_workspace_grep' || part.toolName === 'grep_search';
   const isGlobToolName = part.toolName === 'glob' || part.toolName === 'Glob'
     || part.toolName === 'mastra_workspace_glob' || part.toolName === 'glob_search';
+  const isRuntimeSwitch = part.toolName === 'runtime_switch';
   const bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
@@ -188,7 +190,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   // Use result shape to drive rendering — works regardless of tool name
   // isEdit takes priority: a plain-string result from edit tools would otherwise
   // match the sh shape detector (detectShResult accepts any non-empty string).
-  const isBash = !isEditTool && !isReadTool && !isGrepToolName && !isGlobToolName && (smartResult?.type === 'sh' || isBashTool);
+  const isBash = !isEditTool && !isReadTool && !isGrepToolName && !isGlobToolName && !isRuntimeSwitch && (smartResult?.type === 'sh' || isBashTool);
   const isEdit = isEditTool;
   const isFileRead = isReadTool || smartResult?.type === 'file_read';
   const isGrepTool = isGrepToolName;
@@ -368,6 +370,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         <GrepInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
       ) : isGlobTool ? (
         <GlobInlineView part={part} isRunning={isRunning} isError={Boolean(isError)} />
+      ) : isRuntimeSwitch ? (
+        <RuntimeSwitchInlineView part={part} isRunning={isRunning} />
       ) : isAskUser && isError ? (
         <AskUserErrorView result={part.result} />
       ) : isAskUser && hasResult && !isError ? (
@@ -2249,6 +2253,136 @@ const GlobInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   );
 };
 
+const RuntimeSwitchInlineView: FC<{ part: ToolCallPart; isRunning: boolean }> = ({ part, isRunning }) => {
+  const resultText = typeof part.result === 'string' ? part.result : '';
+  const args = part.args as Record<string, unknown>;
+  const fromRuntime = getRuntimeDisplayName(args.fromRuntime as string | undefined);
+  const toRuntime = getRuntimeDisplayName(args.toRuntime as string | undefined);
+
+  const displayLines = useMemo(() => {
+    return resultText.split('\n').filter((line, i, arr) => {
+      // Remove leading/trailing empty lines
+      if (i === 0 && line.trim() === '') return false;
+      if (i === arr.length - 1 && line.trim() === '') return false;
+      return true;
+    });
+  }, [resultText]);
+
+  const PREVIEW_LINES = 3;
+  const previewLines = displayLines.slice(0, PREVIEW_LINES);
+  const hasMore = displayLines.length > PREVIEW_LINES;
+  const [modalOpen, setModalOpen] = useState(false);
+
+  return (
+    <>
+      <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
+        {/* Header */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/50 dark:border-white/10 bg-muted/50 dark:bg-white/[0.03]">
+          <span className="text-foreground/80 font-semibold truncate flex-1">Prior context</span>
+          {isRunning ? (
+            <span className="shrink-0 flex items-center gap-1 text-cyan-400">
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            </span>
+          ) : displayLines.length > 0 ? (
+            <span className="shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">{fromRuntime} → {toRuntime}</span>
+          ) : null}
+        </div>
+        {/* Preview lines */}
+        {!isRunning && previewLines.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse table-fixed">
+              <tbody>
+                {previewLines.map((line, i) => (
+                  <tr key={i} className="border-b border-border/20 dark:border-white/[0.04] last:border-0">
+                    <td className="select-none w-8 pl-2 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 dark:border-white/[0.06]">{i + 1}</td>
+                    <td className="pl-3 pr-3 py-px leading-5 w-full max-w-0 truncate text-foreground/75">{line || ' '}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {/* Click to expand */}
+        {hasMore && !isRunning && (
+          <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
+            <span className="text-muted-foreground/40 text-[10px] tabular-nums">{displayLines.length - PREVIEW_LINES} more line{displayLines.length - PREVIEW_LINES !== 1 ? 's' : ''}</span>
+            <button
+              type="button"
+              onClick={() => setModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-medium bg-background/90 hover:bg-background border border-border/50 text-foreground/70 hover:text-foreground px-2.5 py-1 rounded-full shadow-sm transition-colors"
+            >
+              <ExternalLinkIcon className="h-2.5 w-2.5" />
+              <span>Click to expand</span>
+            </button>
+          </div>
+        )}
+        {isRunning && (
+          <div className="px-3 py-2 flex items-center gap-2">
+            <LoaderIcon className="h-3 w-3 animate-spin text-cyan-500" />
+            <span className="text-cyan-600 dark:text-cyan-400 text-[11px]">Transferring context…</span>
+          </div>
+        )}
+        {!isRunning && displayLines.length === 0 && (
+          <div className="px-3 py-2 text-muted-foreground/40 italic">No prior context to transfer</div>
+        )}
+      </div>
+      {modalOpen && (
+        <RuntimeSwitchModal
+          fromRuntime={fromRuntime}
+          toRuntime={toRuntime}
+          lines={displayLines}
+          onClose={() => setModalOpen(false)}
+        />
+      )}
+    </>
+  );
+};
+
+const RuntimeSwitchModal: FC<{ fromRuntime: string; toRuntime: string; lines: string[]; onClose: () => void }> = ({ fromRuntime, toRuntime, lines, onClose }) => {
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const portalTarget = useModalPortalTarget();
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => { if (e.target === overlayRef.current) onClose(); }}
+    >
+      <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
+        {/* Header */}
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
+          <ArrowRightLeftIcon className="h-3.5 w-3.5 text-cyan-500 shrink-0" />
+          <span className="font-semibold text-foreground/90 truncate flex-1">Prior context</span>
+          <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">{fromRuntime} → {toRuntime}</span>
+          <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
+            <XIcon className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {/* Content */}
+        <div className="overflow-y-auto overflow-x-auto flex-1">
+          <table className="w-full border-collapse table-fixed">
+            <tbody>
+              {lines.map((line, i) => (
+                <tr key={i}>
+                  <td className="select-none w-10 pl-3 pr-3 text-right text-[10px] text-muted-foreground/30 tabular-nums border-r border-border/20 shrink-0">{i + 1}</td>
+                  <td className="pl-3 pr-4 py-px whitespace-pre leading-5 text-foreground/80">{line || ' '}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>,
+    portalTarget,
+  );
+};
+
 const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]; onClose: () => void }> = ({ pattern, searchPath, files, onClose }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const portalTarget = useModalPortalTarget();
@@ -2633,6 +2767,18 @@ function isErrorResult(result: unknown): boolean {
   return Boolean(r.error) || r.isError === true || (r.exitCode !== undefined && r.exitCode !== 0);
 }
 
+/** Map runtime IDs to short, user-friendly display names for the runtime switch UI. */
+const SWITCH_RUNTIME_NAMES: Record<string, string> = {
+  mastra: 'Mastra',
+  'claude-agent-sdk': 'Claude Code',
+  'codex-sdk': 'Codex',
+};
+
+function getRuntimeDisplayName(runtimeId: string | undefined): string {
+  if (!runtimeId) return 'Unknown';
+  return SWITCH_RUNTIME_NAMES[runtimeId] ?? runtimeId;
+}
+
 const toolLabels: Record<string, string> = {
   sh: 'Run',
   bash: 'Run',
@@ -2668,6 +2814,7 @@ const toolLabels: Record<string, string> = {
   ask_user: 'Question',
   enter_plan_mode: 'Enter Plan Mode',
   exit_plan_mode: 'Exit Plan Mode',
+  runtime_switch: 'Runtime Switch',
 };
 
 function getToolLabel(toolName: string): string {
@@ -2696,6 +2843,7 @@ function getToolIcon(toolName: string): LucideIcon {
   if (toolName === 'agent' || toolName === 'agent_lattice_chat' || toolName === 'sub_agent') return BotIcon;
   if (toolName === 'generate_image') return ImageIcon;
   if (toolName === 'generate_video') return VideoIcon;
+  if (toolName === 'runtime_switch') return ArrowRightLeftIcon;
   return SparklesIcon;
 }
 
@@ -2720,11 +2868,18 @@ function getToolIconColor(toolName: string): string {
     return 'bg-pink-500/15 text-pink-500';
   if (toolName === 'generate_image' || toolName === 'generate_video')
     return 'bg-rose-500/15 text-rose-500';
+  if (toolName === 'runtime_switch')
+    return 'bg-cyan-500/15 text-cyan-500';
   return 'bg-muted text-muted-foreground';
 }
 
 function getToolSummary(part: ToolCallPart): string {
   const args = part.args as Record<string, unknown>;
+  if (part.toolName === 'runtime_switch') {
+    const from = getRuntimeDisplayName(args.fromRuntime as string | undefined);
+    const to = getRuntimeDisplayName(args.toRuntime as string | undefined);
+    return `${from} → ${to}`;
+  }
   if ((part.toolName === 'sh' || part.toolName === 'bash' || part.toolName === 'mastra_workspace_execute_command') && args.command) {
     // Strip common shell wrappers like /bin/zsh -lc '...' or /bin/bash -c '...'
     const raw = String(args.command);

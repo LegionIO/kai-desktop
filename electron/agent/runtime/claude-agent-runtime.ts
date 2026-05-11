@@ -287,6 +287,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     const hasImages = Array.isArray(lastUserContent)
       && lastUserContent.some((b: { type: string }) => b.type === 'image');
 
+    // When cross-runtime switch context is present, prepend it to the user prompt
+    // so it's visible as direct conversation context (not buried in system prompt).
+    const switchPrefix = options.switchContext ? `${options.switchContext}\n\n` : '';
+
     const prompt: string | AsyncIterable<SdkUserMessageInput> = hasImages
       ? (async function* () {
           yield {
@@ -296,11 +300,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
           };
         })()
       : (typeof lastUserContent === 'string'
-          ? lastUserContent
-          : (lastUserContent as Array<{ type: string; text?: string }>)
+          ? `${switchPrefix}${lastUserContent}`
+          : `${switchPrefix}${(lastUserContent as Array<{ type: string; text?: string }>)
               .filter((b) => b.type === 'text')
               .map((b) => b.text ?? '')
-              .join('\n'));
+              .join('\n')}`);
 
     if (!prompt && !hasImages) {
       yield {
@@ -330,11 +334,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // persisted claudeSdkSessionId from the conversation's metadata (written to disk
     // when the enrichment event arrived in the previous session).
     //
-    // When handoff context is present, skip session resume — the prior session was
+    // When switch context is present, skip session resume — the prior session was
     // from a different runtime, so resuming it would fail or produce stale context.
     let existingSessionId: string | undefined;
-    if (options.handoffContext) {
-      debugLog(`[SESSION] Skipping session resume — cross-runtime handoff active`);
+    if (options.switchContext) {
+      debugLog(`[SESSION] Skipping session resume — cross-runtime switch active`);
       existingSessionId = undefined;
     } else {
       const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;

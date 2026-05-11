@@ -8,7 +8,7 @@ import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { readConversationStore } from './conversations.js';
-import { detectRuntimeSwitch, generateHandoffContext } from '../agent/runtime-handoff.js';
+import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1074,24 +1074,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
 
         // -----------------------------------------------------------------------
-        // Cross-runtime handoff: detect runtime switch and inject prior context
+        // Cross-runtime switch: detect runtime change and inject prior context
         // -----------------------------------------------------------------------
-        let handoffContext: string | undefined;
-        // Skip handoff for Mastra — it already receives the full message history natively.
+        let switchContext: string | undefined;
+        // Skip for Mastra — it already receives the full message history natively.
         if (runtime.id !== 'mastra') {
           const previousRuntimeId = detectRuntimeSwitch(messages, runtime.id);
           if (previousRuntimeId && modelEntry) {
-            const handoffToolCallId = `handoff-${Date.now()}`;
+            const switchToolCallId = `switch-${Date.now()}`;
             broadcastStreamEvent({
               conversationId,
               type: 'tool-call',
-              toolCallId: handoffToolCallId,
-              toolName: 'runtime_handoff',
+              toolCallId: switchToolCallId,
+              toolName: 'runtime_switch',
               args: { fromRuntime: previousRuntimeId, toRuntime: runtime.id },
               startedAt: new Date().toISOString(),
             });
 
-            const generatedContext = await generateHandoffContext(
+            const generatedContext = await generateSwitchContext(
               messages,
               modelEntry.modelConfig,
               { abortSignal: controller.signal },
@@ -1100,19 +1100,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             broadcastStreamEvent({
               conversationId,
               type: 'tool-result',
-              toolCallId: handoffToolCallId,
-              toolName: 'runtime_handoff',
+              toolCallId: switchToolCallId,
+              toolName: 'runtime_switch',
               result: generatedContext
-                ? `Context transferred (${generatedContext.length} chars)`
+                ? generatedContext
                 : 'No prior context to transfer',
               finishedAt: new Date().toISOString(),
             });
 
             if (generatedContext && !controller.signal.aborted) {
-              handoffContext = generatedContext;
+              // Wrap the raw context in XML tags for LLM injection
+              const wrappedContext = wrapSwitchContext(generatedContext, previousRuntimeId);
+              switchContext = wrappedContext;
               effectiveSystemPrompt = effectiveSystemPrompt
-                ? `${generatedContext}\n\n${effectiveSystemPrompt}`
-                : generatedContext;
+                ? `${wrappedContext}\n\n${effectiveSystemPrompt}`
+                : wrappedContext;
               if (streamConfig) {
                 streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
               }
@@ -1133,7 +1135,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           primaryModel: modelEntry,
           claudeAuth: resolution.claudeAuth,
           conversationMetadata: convMetadata,
-          handoffContext,
+          switchContext,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
@@ -1213,11 +1215,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
             }
           }
-          if (event.type === 'text-delta' && activeSourceModel) {
+          if (event.type === 'text-delta') {
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
-              sourceModel: activeSourceModel,
-              sourceModelDisplayName: activeModelDisplayName,
+              ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
+              ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
               reasoningEffort: reasoningEffort ?? null,
               runtimeId: runtime.id,
             };

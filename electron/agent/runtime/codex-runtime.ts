@@ -264,8 +264,8 @@ export class CodexRuntime implements AgentRuntime {
         : (textPrompt ?? '');
 
       // Inject prior context on runtime switch (Codex has no system prompt API)
-      if (options.handoffContext) {
-        effectiveText = `${options.handoffContext}\n\n${effectiveText}`;
+      if (options.switchContext) {
+        effectiveText = `${options.switchContext}\n\n${effectiveText}`;
       }
 
       // If there are images, use structured input; otherwise plain string

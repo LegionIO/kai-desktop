@@ -1,5 +1,5 @@
 /**
- * Cross-runtime conversation handoff.
+ * Cross-runtime conversation switch.
  *
  * When a user switches runtimes mid-conversation (e.g. Claude Code SDK → Codex),
  * the new runtime has no knowledge of prior turns. This module:
@@ -26,7 +26,7 @@ import { RUNTIME_LABELS } from './runtime/types.js';
 /** Default token threshold: below this, inject raw transcript; above, summarize. */
 const DEFAULT_TOKEN_THRESHOLD = 4000;
 
-const HANDOFF_SUMMARY_PROMPT = [
+const SWITCH_SUMMARY_PROMPT = [
   'You are summarizing a conversation that will be continued by a different AI assistant.',
   'Preserve all key context: facts, decisions, constraints, user preferences, unresolved questions, code snippets, file paths, and identifiers.',
   'Be concise but comprehensive — the new assistant has no other context.',
@@ -76,7 +76,7 @@ export function detectRuntimeSwitch(
 // Context generation
 // ---------------------------------------------------------------------------
 
-export type HandoffOptions = {
+export type SwitchOptions = {
   abortSignal?: AbortSignal;
   /** Token threshold for raw transcript vs. summarization (default: 4000). */
   tokenThreshold?: number;
@@ -90,10 +90,10 @@ export type HandoffOptions = {
  *
  * @returns Formatted context string wrapped in XML tags, or null if no history.
  */
-export async function generateHandoffContext(
+export async function generateSwitchContext(
   messages: unknown[],
   modelConfig: LLMModelConfig,
-  options?: HandoffOptions,
+  options?: SwitchOptions,
 ): Promise<string | null> {
   const threshold = options?.tokenThreshold ?? DEFAULT_TOKEN_THRESHOLD;
 
@@ -101,12 +101,6 @@ export async function generateHandoffContext(
   // (that's the new prompt — don't duplicate it in the context)
   const transcript = buildTranscript(messages);
   if (!transcript) return null;
-
-  // Find the prior runtime name for the context header
-  const priorRuntimeId = findPriorRuntimeId(messages);
-  const priorRuntimeLabel = priorRuntimeId
-    ? (RUNTIME_LABELS[priorRuntimeId as keyof typeof RUNTIME_LABELS] ?? priorRuntimeId)
-    : 'a previous runtime';
 
   // Estimate token count
   const tokenCount = estimateToolTokens(transcript, modelConfig.modelName);
@@ -127,6 +121,16 @@ export async function generateHandoffContext(
     contextBody = summary;
   }
 
+  return contextBody;
+}
+
+/**
+ * Wrap raw context in XML tags for injection into the system/user prompt.
+ * @param contextBody - The raw transcript or summary text.
+ * @param priorRuntimeId - The runtime ID of the previous runtime (resolved to a label internally).
+ */
+export function wrapSwitchContext(contextBody: string, priorRuntimeId: string): string {
+  const priorRuntimeLabel = RUNTIME_LABELS[priorRuntimeId as keyof typeof RUNTIME_LABELS] ?? priorRuntimeId;
   return [
     '<prior-conversation-context>',
     `The following is the context from the prior conversation conducted with ${priorRuntimeLabel}.`,
@@ -140,22 +144,6 @@ export async function generateHandoffContext(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Find the runtimeId from the most recent assistant message.
- */
-function findPriorRuntimeId(messages: unknown[]): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as {
-      role?: string;
-      messageMeta?: Record<string, unknown>;
-    } | undefined;
-    if (msg?.role === 'assistant' && msg.messageMeta?.runtimeId) {
-      return msg.messageMeta.runtimeId as string;
-    }
-  }
-  return null;
-}
 
 /**
  * Build a human-readable transcript from the message history.
@@ -236,9 +224,9 @@ async function summarizeTranscript(
 
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
     const agent = new Agent({
-      id: `handoff-summary-${Date.now()}`,
-      name: 'handoff-summarizer',
-      instructions: HANDOFF_SUMMARY_PROMPT,
+      id: `switch-summary-${Date.now()}`,
+      name: 'switch-summarizer',
+      instructions: SWITCH_SUMMARY_PROMPT,
       model: model as AgentConfig['model'],
     });
 
@@ -258,7 +246,7 @@ async function summarizeTranscript(
     const summaryText = typeof result.text === 'string' ? result.text.trim() : null;
     return summaryText || null;
   } catch (err) {
-    console.warn('[runtime-handoff] Summarization failed:', err);
+    console.warn('[runtime-switch] Summarization failed:', err);
     return null;
   }
 }
