@@ -1121,10 +1121,7 @@ function AppShell() {
 
   const handlePluginNavigationItem = useCallback((pluginName: string, target: { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown }) => {
     if (target.type === 'panel' && target.panelId) {
-      setActiveView((current) => {
-        const next = getPluginPanelViewKey(pluginName, target.panelId!);
-        return current === next ? CHAT_VIEW : next;
-      });
+      setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
       return;
     }
 
