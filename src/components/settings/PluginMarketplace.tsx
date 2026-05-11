@@ -113,8 +113,8 @@ export const PluginMarketplace: FC = () => {
   return (
     <div className="relative flex flex-col h-full min-h-0">
       {/* Fixed search + refresh bar */}
-      <div className="relative z-10 shrink-0 px-4 pt-6 pb-3 bg-background/60 backdrop-blur-md">
-        <div className="mx-auto max-w-3xl flex items-center gap-2">
+      <div className="relative z-10 shrink-0 px-4 pt-6 pb-3">
+        <div className="mx-auto max-w-3xl rounded-2xl bg-background/60 backdrop-blur-md px-4 py-3 flex flex-col gap-3">
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
@@ -158,17 +158,15 @@ export const PluginMarketplace: FC = () => {
           </Tooltip>
         </div>
         {availablePlugins.length > 0 && (
-          <div className="mx-auto max-w-3xl px-1 pt-3">
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-              Available ({availablePlugins.length})
-            </p>
-          </div>
+          <p className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+            Available ({availablePlugins.length})
+          </p>
         )}
       </div>
 
       {/* Scrollable content with fade at top */}
       <div className="relative z-10 flex-1 min-h-0">
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background/60 to-transparent" />
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-8 bg-gradient-to-b from-background/20 to-transparent" />
 
         <div className="h-full overflow-y-auto">
           <div className="mx-auto max-w-3xl px-4 pt-4 pb-6 space-y-3">
