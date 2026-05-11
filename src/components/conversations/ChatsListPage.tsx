@@ -336,8 +336,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     <div className="flex flex-col h-full min-h-0 pt-12 md:pt-14">
 
       {/* Fixed toolbar: search + filter + sort */}
-      <div className="shrink-0 px-4 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl space-y-2">
+      <div className="shrink-0 pt-6 pb-2">
+        <div className="mx-auto max-w-3xl px-4 space-y-2">
           <div className="flex items-center gap-2">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
               <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -486,7 +486,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
           </div>
         </div>
         {/* Always-present h-8 placeholder for selection bar — prevents layout jump */}
-        <div className="mx-auto max-w-3xl h-8 flex items-center">
+        <div className="mx-auto max-w-3xl px-4 mt-2 h-8 flex items-center">
           {isSelecting && (
             <>
               <button
