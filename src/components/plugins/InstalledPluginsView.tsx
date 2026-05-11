@@ -129,16 +129,6 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold">Installed Plugins</h3>
-          <p className="text-xs text-muted-foreground">
-            Manage your currently installed plugins
-          </p>
-        </div>
-      </div>
-
       {/* Search + marketplace button */}
       <div className="flex items-center gap-2">
         <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
@@ -221,13 +211,13 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             return (
               <div
                 key={plugin.name}
-                className="flex items-start gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3"
+                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3 min-h-[80px]"
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                   <PackageIcon className="h-4 w-4 text-primary" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-semibold">{plugin.displayName}</span>
                     {plugin.state === 'active' && (
                       <span className="h-1.5 w-1.5 rounded-full bg-green-500" title="Active" />
@@ -257,36 +247,39 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                     <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
                   )}
                 </div>
-                <div className="flex shrink-0 gap-2">
+                <div className="flex shrink-0 items-center gap-2">
                   {hasUpdate && (
-                    <button
-                      type="button"
-                      onClick={() => handleInstall(plugin.name)}
-                      disabled={installingPlugins.has(plugin.name)}
-                      className="flex items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
-                    >
-                      {installingPlugins.has(plugin.name) ? (
-                        <LoaderIcon className="h-3 w-3 animate-spin" />
-                      ) : (
-                        <ArrowUpCircleIcon className="h-3 w-3" />
-                      )}
-                      {installingPlugins.has(plugin.name) ? 'Updating...' : 'Update'}
-                    </button>
+                    <Tooltip content={`Update to v${catalogEntry.version}`} side="left">
+                      <button
+                        type="button"
+                        onClick={() => handleInstall(plugin.name)}
+                        disabled={installingPlugins.has(plugin.name)}
+                        className="flex items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
+                      >
+                        {installingPlugins.has(plugin.name) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <ArrowUpCircleIcon className="h-3 w-3" />
+                        )}
+                        {installingPlugins.has(plugin.name) ? 'Updating…' : 'Update'}
+                      </button>
+                    </Tooltip>
                   )}
                   {!plugin.brandRequired && (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmUninstall(plugin)}
-                      disabled={uninstallingPlugins.has(plugin.name)}
-                      className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                    >
-                      {uninstallingPlugins.has(plugin.name) ? (
-                        <LoaderIcon className="h-3 w-3 animate-spin" />
-                      ) : (
-                        <TrashIcon className="h-3 w-3" />
-                      )}
-                      {uninstallingPlugins.has(plugin.name) ? 'Removing...' : 'Uninstall'}
-                    </button>
+                    <Tooltip content="Uninstall" side="left">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmUninstall(plugin)}
+                        disabled={uninstallingPlugins.has(plugin.name)}
+                        className="flex items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 p-1.5 text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                      >
+                        {uninstallingPlugins.has(plugin.name) ? (
+                          <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <TrashIcon className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    </Tooltip>
                   )}
                 </div>
               </div>
