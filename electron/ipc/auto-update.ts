@@ -2,6 +2,11 @@ import { app, dialog, type IpcMain } from 'electron';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { existsSync, mkdtempSync, rmSync, readdirSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, dirname, basename } from 'path';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
@@ -48,27 +53,138 @@ function broadcast(status: UpdateStatus): void {
   broadcastToAllWindows('auto-update:status', status);
 }
 
+const execFileAsync = promisify(execFile);
+
 /**
- * Quit-and-install.
+ * Attempt to install the downloaded update by manually extracting the zip
+ * and replacing the app bundle via osascript with administrator privileges.
  *
- * On macOS the updater (Squirrel.Mac / ShipIt) may need to prompt for an
- * admin password when the app lives in /Applications.  The previous approach
- * called `autoUpdater.quitAndInstall()` and then force-killed the process
- * after 3 s — but that kills the app *before* the user can finish typing
- * their password, so the install silently fails and loops.
+ * On macOS, writing to /Applications requires admin authorization. Rather than
+ * using Squirrel's fire-and-forget quitAndInstall (which quits the app before
+ * the user can enter their password), we trigger the admin prompt ourselves
+ * via osascript. This blocks until the user authorizes or cancels, giving us
+ * definitive success/failure feedback.
  *
- * Instead we rely on `autoInstallOnAppQuit = true` (set in
- * registerAutoUpdateHandlers) and simply quit the app.  electron-updater
- * hooks into the quit lifecycle and runs the installer itself, which keeps
- * the authorization dialog alive until the user completes it.
+ * Returns true if install succeeded, false if user cancelled or it failed.
  */
-export function performQuitAndInstall(): void {
-  broadcast({ state: 'restarting' });
-  // Give the renderer a moment to show "Restarting..." UI, then quit.
-  // autoInstallOnAppQuit + autoRunAppAfterInstall handle the rest.
-  setTimeout(() => {
-    app.quit();
-  }, 300);
+async function attemptInstall(): Promise<boolean> {
+  // Resolve the current .app bundle path
+  // app.getPath('exe') returns something like /Applications/Kai.app/Contents/MacOS/Kai
+  const exePath = app.getPath('exe');
+  const appPath = exePath.replace(/\/Contents\/MacOS\/.*$/, '');
+  const appName = basename(appPath); // e.g. "Kai.app"
+  const appDir = dirname(appPath); // e.g. "/Applications"
+
+  // Locate the downloaded update zip in electron-updater's cache
+  // Cache path: ~/Library/Caches/<appName>/pending/update.zip
+  const homedir = app.getPath('home');
+  const cacheName = app.getName(); // "Kai" (from package.json name or productName)
+  const cachePath = join(homedir, 'Library', 'Caches', cacheName, 'pending');
+  const zipPath = join(cachePath, 'update.zip');
+
+  if (!existsSync(zipPath)) {
+    console.error('[auto-update] Cannot find downloaded update at:', zipPath);
+    return false;
+  }
+
+  // Create a temp directory for extraction
+  const tempDir = mkdtempSync(join(tmpdir(), 'kai-update-'));
+
+  try {
+    // Extract the zip
+    await execFileAsync('ditto', ['-xk', zipPath, tempDir]);
+
+    // Find the .app bundle in the extracted contents
+    // It should match the current app name, but also handle slight variations
+    let extractedApp = join(tempDir, appName);
+    if (!existsSync(extractedApp)) {
+      // Search for any .app bundle in the extracted directory
+      const entries = readdirSync(tempDir).filter(e => e.endsWith('.app'));
+      if (entries.length === 1) {
+        extractedApp = join(tempDir, entries[0]);
+      } else {
+        console.error('[auto-update] Could not find .app bundle in extracted update. Found:', entries);
+        return false;
+      }
+    }
+
+    // Use osascript to replace the app with admin privileges.
+    // This triggers the macOS password prompt and BLOCKS until the user responds.
+    // Strategy: rename current app to .old backup, move new app in, delete backup on success.
+    // If the move fails, attempt to restore from backup.
+    const script = [
+      `do shell script "`,
+      // Rename current app to backup
+      `mv '${appDir}/${appName}' '${appDir}/${appName}.old' && `,
+      // Move new app into place
+      `mv '${extractedApp}' '${appDir}/${appName}' && `,
+      // Remove backup on success
+      `rm -rf '${appDir}/${appName}.old'`,
+      `" with administrator privileges`,
+    ].join('');
+
+    await execFileAsync('osascript', ['-e', script]);
+
+    // If we get here, install succeeded
+    console.info('[auto-update] Install succeeded via manual osascript approach');
+    return true;
+  } catch (err: unknown) {
+    const error = err as { code?: number; killed?: boolean; stderr?: string; message?: string };
+    // osascript exits with code 1 and stderr containing "User canceled" when user clicks Cancel
+    const msg = error.stderr || error.message || '';
+    if (msg.includes('User canceled') || msg.includes('user canceled')) {
+      console.info('[auto-update] User cancelled admin authorization — will retry when ready');
+    } else {
+      console.error('[auto-update] Install failed:', msg);
+      // Attempt to restore from backup if it exists
+      const backupPath = join(appDir, `${appName}.old`);
+      if (existsSync(backupPath) && !existsSync(join(appDir, appName))) {
+        try {
+          await execFileAsync('osascript', [
+            '-e',
+            `do shell script "mv '${backupPath}' '${appDir}/${appName}'" with administrator privileges`,
+          ]);
+          console.info('[auto-update] Restored app from backup after failed install');
+        } catch {
+          console.error('[auto-update] Could not restore backup — user may need to reinstall from DMG');
+        }
+      }
+    }
+    return false;
+  } finally {
+    // Cleanup temp directory
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch { /* ignore cleanup errors */ }
+  }
+}
+
+/**
+ * Attempt to install the update, keeping the app running until we get
+ * definitive success/failure feedback.
+ *
+ * On success: relaunches the app on the new version.
+ * On failure: returns to 'downloaded' state so the user can retry
+ * (e.g. after enabling admin privileges via their corporate tool).
+ */
+export async function performQuitAndInstall(): Promise<void> {
+  broadcast({ state: 'installing', version: downloadedVersion });
+
+  const success = await attemptInstall();
+
+  if (success) {
+    broadcast({ state: 'restarting', version: downloadedVersion });
+    // Disable autoInstallOnAppQuit since we already installed manually —
+    // prevents Squirrel from trying to install again during the quit/relaunch.
+    autoUpdater.autoInstallOnAppQuit = false;
+    setTimeout(() => {
+      app.relaunch();
+      app.exit(0);
+    }, 300);
+  } else {
+    // Install failed or was cancelled — return to downloaded state so user can retry
+    broadcast({ state: 'downloaded', version: downloadedVersion });
+  }
 }
 
 /**
@@ -98,7 +214,7 @@ export function checkForUpdatesInteractive(): void {
       cancelId: 1,
     }).then(({ response }) => {
       if (response === 0) {
-        performQuitAndInstall();
+        void performQuitAndInstall();
       }
     });
     return;
@@ -206,8 +322,8 @@ export function registerAutoUpdateHandlers(
     }
   });
 
-  ipcMain.handle('auto-update:install', () => {
-    performQuitAndInstall();
+  ipcMain.handle('auto-update:install', async () => {
+    await performQuitAndInstall();
   });
 
   // Automatic update checks (only in packaged builds or test mode)

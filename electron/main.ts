@@ -190,9 +190,9 @@ let updateDownloaded = false;
 function buildMenu(): void {
   const updateMenuItem: Electron.MenuItemConstructorOptions = updateDownloaded
     ? {
-        label: 'Restart to Update',
+        label: 'Install Update…',
         click: () => {
-          performQuitAndInstall();
+          void performQuitAndInstall();
         },
       }
     : {
