@@ -1928,7 +1928,7 @@ function AppShell() {
                   />
                 ) : (
                   <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                    <TaskQueue workspaceId={activeWorkspaceId} focusTrigger={searchFocusTrigger} />
+                    <TaskQueue workspaceId={activeWorkspaceId} />
                   </div>
                 )
               ) : activeView === AGENTS_VIEW ? (
