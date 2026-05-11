@@ -115,7 +115,7 @@ export const PluginMarketplace: FC = () => {
       <div className="flex-1 min-h-0 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-4 pt-6 pb-6">
           {/* Glass card wrapping everything */}
-          <div className="rounded-2xl border border-border/40 bg-background/60 backdrop-blur-md overflow-hidden">
+          <div className="rounded-2xl border border-border/40 bg-background/85 backdrop-blur-xl overflow-hidden">
 
             {/* Search + refresh */}
             <div className="flex items-center gap-2 px-4 py-3 border-b border-border/40">
