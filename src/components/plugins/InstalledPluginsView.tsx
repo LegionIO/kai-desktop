@@ -13,6 +13,8 @@ import {
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { usePlugins } from '@/providers/PluginProvider';
+import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 
 /* ── Types ────────────────────────────────────────────── */
 
@@ -44,9 +46,12 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
 
 interface InstalledPluginsViewProps {
   onOpenMarketplace: () => void;
+  onNavigate: (pluginName: string, target: PluginNavigationTarget) => void;
+  onOpenPluginError: (pluginName: string) => void;
 }
 
-export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace }) => {
+export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError }) => {
+  const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -75,6 +80,20 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   useEffect(() => { loadData(); }, [loadData]);
 
   const catalogMap = new Map(catalog.map((e) => [e.name, e]));
+  const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
+
+  const handlePluginClick = useCallback((plugin: InstalledPlugin) => {
+    if (plugin.state === 'error') {
+      onOpenPluginError(plugin.name);
+      return;
+    }
+    const navItem = navigationItems.find((n) => n.pluginName === plugin.name);
+    if (navItem) {
+      onNavigate(navItem.pluginName, navItem.target);
+    } else {
+      onNavigate(plugin.name, { type: 'panel', panelId: 'default' });
+    }
+  }, [navigationItems, onNavigate, onOpenPluginError]);
 
   const handleInstall = async (pluginName: string) => {
     setInstallingPlugins((prev) => new Set([...prev, pluginName]));
@@ -211,7 +230,11 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             return (
               <div
                 key={plugin.name}
-                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3 min-h-[80px]"
+                role="button"
+                tabIndex={0}
+                onClick={() => handlePluginClick(plugin)}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handlePluginClick(plugin); }}
+                className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3 min-h-[80px] cursor-pointer transition-colors hover:bg-card/80 hover:border-border"
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
                   <PackageIcon className="h-4 w-4 text-primary" />
@@ -252,7 +275,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                     <Tooltip content={`Update to v${catalogEntry.version}`} side="left">
                       <button
                         type="button"
-                        onClick={() => handleInstall(plugin.name)}
+                        onClick={(e) => { e.stopPropagation(); void handleInstall(plugin.name); }}
                         disabled={installingPlugins.has(plugin.name)}
                         className="flex items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
                       >
@@ -269,7 +292,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                     <Tooltip content="Uninstall" side="left">
                       <button
                         type="button"
-                        onClick={() => setConfirmUninstall(plugin)}
+                        onClick={(e) => { e.stopPropagation(); setConfirmUninstall(plugin); }}
                         disabled={uninstallingPlugins.has(plugin.name)}
                         className="flex items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 p-1.5 text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                       >
