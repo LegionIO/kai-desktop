@@ -334,11 +334,11 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
   return (
     <div className="flex flex-col h-full min-h-0 pt-12 md:pt-14">
-      <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-8 py-6">
 
-          {/* Toolbar: search + filter + sort — always visible */}
-          <div className="mb-3 flex items-center gap-2">
+      {/* Fixed toolbar: search + filter + sort */}
+      <div className="shrink-0 px-8 pt-6 pb-2">
+        <div className="mx-auto max-w-3xl space-y-2">
+          <div className="flex items-center gap-2">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
               <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <input
@@ -483,10 +483,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
             </DropdownMenu.Root>
           </div>
 
-          {/* Selection bar — always reserves space, content visible when selecting */}
-          <div className="mb-3 flex items-center h-8">
+          {/* Selection bar — only visible when selecting */}
+          <div className="flex items-center h-8">
             {isSelecting && (<>
-              {/* Select-all toggle — w-7 matches the per-row checkbox column width */}
+              {/* Select-all toggle */}
               <button
                 type="button"
                 onClick={toggleSelectAll}
@@ -541,10 +541,20 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
               </div>
             </>)}
           </div>
+        </div>
+      </div>
 
-          {/* Conversation rows */}
-          <div className="flex flex-col">
-            {hasLoaded && processed.length === 0 ? (
+      {/* Scrollable content with fade at top */}
+      <div className="relative flex-1 min-h-0">
+        {/* Fade overlay */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
+
+        <div className="h-full overflow-y-auto">
+          <div className="mx-auto max-w-3xl px-8 pb-6">
+
+            {/* Conversation rows */}
+            <div className="flex flex-col">
+              {hasLoaded && processed.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-24 text-center">
                 <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted/40 text-muted-foreground">
                   <MessageSquareIcon size={26} strokeWidth={1.3} />
@@ -665,9 +675,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                 );
               })
             )}
-          </div>
-        </div>
-      </div>
+          </div>{/* end flex flex-col rows */}
+          </div>{/* end max-w-3xl pb-6 */}
+        </div>{/* end overflow-y-auto */}
+      </div>{/* end relative flex-1 */}
 
       {/* Bulk delete confirmation modal */}
       {bulkDeleteOpen && createPortal(

@@ -1853,15 +1853,11 @@ function AppShell() {
                 </div>
               ) : activeView === PLUGINS_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
-                  <div className="flex-1 overflow-y-auto">
-                    <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
-                      <InstalledPluginsView
-                        onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                        onNavigate={handlePluginNavigationItem}
-                        onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
-                      />
-                    </div>
-                  </div>
+                  <InstalledPluginsView
+                    onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                    onNavigate={handlePluginNavigationItem}
+                    onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                  />
                 </div>
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
                 <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
