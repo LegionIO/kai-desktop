@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type FC } from 'react';
+import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, DownloadIcon, PlusIcon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
@@ -50,6 +50,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     try { return new Set(JSON.parse(localStorage.getItem(PINNED_PLUGINS_KEY) || '[]')); } catch { return new Set(); }
   });
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; pluginName: string } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<string | null>(null);
   const [isUninstalling, setIsUninstalling] = useState(false);
 
@@ -111,13 +112,21 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     setContextMenu({ x: rect.left, y: rect.bottom + 4, pluginName });
   }, []);
 
-  // Close context menu on outside click
+  // Close context menu on outside click — use capture so we intercept before
+  // the event reaches any clickable element underneath (e.g. sidebar nav items).
   useEffect(() => {
     if (!contextMenu) return;
-    const close = () => setContextMenu(null);
-    window.addEventListener('click', close);
-    window.addEventListener('contextmenu', close);
-    return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
+    const close = (e: MouseEvent) => {
+      if (contextMenuRef.current?.contains(e.target as Node)) return;
+      e.stopPropagation();
+      setContextMenu(null);
+    };
+    window.addEventListener('click', close, { capture: true });
+    window.addEventListener('contextmenu', close, { capture: true });
+    return () => {
+      window.removeEventListener('click', close, { capture: true });
+      window.removeEventListener('contextmenu', close, { capture: true });
+    };
   }, [contextMenu]);
 
   const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
@@ -318,6 +327,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
         const ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
         return createPortal(
           <div
+            ref={contextMenuRef}
             className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(e) => e.stopPropagation()}
