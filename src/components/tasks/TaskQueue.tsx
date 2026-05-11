@@ -26,6 +26,7 @@ import { KAI_TASK_STATUS_COLUMNS, KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { TaskQueueRow } from './TaskQueueRow';
 import { TaskCard } from './TaskCard';
 import { TaskDetailPanel } from './TaskDetailPanel';
+import { TaskDetailModal } from './TaskDetailModal';
 
 interface TaskQueueProps {
   /** Active workspace ID — only tasks belonging to this workspace (or unscoped) are shown */
@@ -39,6 +40,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilters, setStatusFilters] = useState<Set<KaiTaskStatus>>(new Set());
+  const [modalTaskId, setModalTaskId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const sensors = useSensors(
@@ -122,6 +124,14 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     [selectTask],
   );
 
+  const handleOpenFullView = useCallback(
+    (taskId: string) => {
+      setModalTaskId(null);
+      selectTask(taskId);
+    },
+    [selectTask],
+  );
+
   const selectedTask = useMemo(
     () => state.tasks.find((t) => t.id === state.selectedTaskId) ?? null,
     [state.tasks, state.selectedTaskId],
@@ -133,6 +143,11 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     const t = setTimeout(() => searchRef.current?.focus({ preventScroll: true }), 50);
     return () => clearTimeout(t);
   }, [isQueueVisible]);
+
+  const modalTask = useMemo(
+    () => (modalTaskId ? state.tasks.find((t) => t.id === modalTaskId) ?? null : null),
+    [state.tasks, modalTaskId],
+  );
 
   // ── Loading state ───────────────────────────────────────────────────
 
@@ -284,6 +299,14 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
           </DndContext>
         </div>
       </div>
+
+      {/* Read-only task preview modal */}
+      <TaskDetailModal
+        task={modalTask}
+        open={!!modalTask}
+        onOpenChange={(open) => { if (!open) setModalTaskId(null); }}
+        onOpenFullView={handleOpenFullView}
+      />
     </div>
   );
 };
