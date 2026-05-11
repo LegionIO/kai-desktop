@@ -43,8 +43,6 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
-
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, {
@@ -138,6 +136,13 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     () => state.tasks.find((t) => t.id === state.selectedTaskId) ?? null,
     [state.tasks, state.selectedTaskId],
   );
+  const isQueueVisible = !state.isLoading && !selectedTask;
+
+  useEffect(() => {
+    if (!isQueueVisible) return;
+    const t = setTimeout(() => searchRef.current?.focus({ preventScroll: true }), 50);
+    return () => clearTimeout(t);
+  }, [isQueueVisible]);
 
   const modalTask = useMemo(
     () => (modalTaskId ? state.tasks.find((t) => t.id === modalTaskId) ?? null : null),
