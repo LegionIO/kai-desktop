@@ -189,7 +189,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
         <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
 
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pb-6 space-y-3">
+          <div className="mx-auto max-w-3xl px-4 pt-4 pb-6 space-y-3">
             {/* Error banner */}
             {error && (
               <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3">
