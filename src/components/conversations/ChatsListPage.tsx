@@ -336,7 +336,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     <div className="flex flex-col h-full min-h-0 pt-12 md:pt-14">
 
       {/* Fixed toolbar: search + filter + sort */}
-      <div className="relative shrink-0 px-4 pt-6 pb-2">
+      <div className="shrink-0 px-4 pt-6 pb-2">
         <div className="mx-auto max-w-3xl space-y-2">
           <div className="flex items-center gap-2">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
@@ -484,10 +484,11 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
           </div>
-
-          {/* Selection bar — fixed, only takes space when selecting */}
+        </div>
+        {/* Always-present h-8 placeholder for selection bar — prevents layout jump */}
+        <div className="mx-auto max-w-3xl h-8 flex items-center">
           {isSelecting && (
-            <div className="flex items-center h-8">
+            <>
               <button
                 type="button"
                 onClick={toggleSelectAll}
@@ -538,15 +539,14 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                   </button>
                 </Tooltip>
               </div>
-            </div>
+            </>
           )}
         </div>
-        {/* Fade — anchored to bottom of search row, bleeds over selection bar + first row */}
-        <div className="pointer-events-none absolute inset-x-0 top-full z-10 h-10 bg-gradient-to-b from-background to-transparent" />
       </div>
 
-      {/* Scrollable content */}
+      {/* Scrollable content with fade at top */}
       <div className="relative flex-1 min-h-0">
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
         <div className="h-full overflow-y-auto">
           <div className="mx-auto max-w-3xl px-4 pb-6">
 
