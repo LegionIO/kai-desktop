@@ -239,20 +239,16 @@ export const PluginMarketplace: FC = () => {
                           )}
                         </span>
                       )}
+                      {entry.tags && entry.tags.length > 0 && entry.tags.map((tag) => (
+                        <span
+                          key={tag}
+                          className="rounded-full bg-muted/50 px-2 py-0.5 text-[9px] text-muted-foreground"
+                        >
+                          {tag}
+                        </span>
+                      ))}
                     </div>
                     <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
-                    {entry.tags && entry.tags.length > 0 && (
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {entry.tags.map((tag) => (
-                          <span
-                            key={tag}
-                            className="rounded-full bg-muted/50 px-2 py-0.5 text-[9px] text-muted-foreground"
-                          >
-                            {tag}
-                          </span>
-                        ))}
-                      </div>
-                    )}
                   </div>
                   <button
                     type="button"
