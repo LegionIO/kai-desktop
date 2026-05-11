@@ -28,7 +28,8 @@ const appAPI = {
       fallbackEnabled?: boolean,
       cwd?: string,
       executionMode?: 'auto' | 'plan-first',
-    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd, executionMode),
+      threadOverrides?: { temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null },
+    ) => ipcRenderer.invoke('agent:stream', conversationId, messages, modelKey, reasoningEffort, profileKey, fallbackEnabled, cwd, executionMode, threadOverrides),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
@@ -470,6 +471,11 @@ const appAPI = {
     const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
     ipcRenderer.on('agent:execution-mode-changed', handler);
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
+  },
+
+  partitions: {
+    list: () => ipcRenderer.invoke('partitions:list') as Promise<Array<{ name: string; sizeBytes: number }>>,
+    delete: (names: string[]) => ipcRenderer.invoke('partitions:delete', names) as Promise<{ success?: boolean; deleted?: string[]; error?: string }>,
   },
 
   debug: {

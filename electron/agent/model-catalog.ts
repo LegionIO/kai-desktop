@@ -131,12 +131,21 @@ export function resolveStreamConfig(
     threadProfileKey: string | null;
     reasoningEffort?: ReasoningEffort;
     fallbackEnabled: boolean;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
   },
 ): ResolvedStreamConfig | null {
   const catalog = resolveModelCatalog(config);
 
   // 1. Find active profile: conversation → global default → synthesize from defaultModelKey
-  const profileKey = opts.threadProfileKey ?? config.defaultProfileKey ?? null;
+  //    Special sentinel '__none__' means explicitly skip all profiles.
+  const skipProfile = opts.threadProfileKey === '__none__';
+  const profileKey = skipProfile ? null : (opts.threadProfileKey ?? config.defaultProfileKey ?? null);
   let profile = profileKey
     ? (config.profiles ?? []).find((p) => p.key === profileKey)
     : undefined;
@@ -165,14 +174,15 @@ export function resolveStreamConfig(
     .map((k) => catalog.byKey.get(k))
     .filter((e): e is ModelCatalogEntry => e != null);
 
-  // 4. Merge parameters: profile overrides → global
-  const temperature = profile.temperature ?? config.advanced.temperature;
-  const maxSteps = profile.maxSteps ?? config.agent?.maxTurns ?? config.advanced.maxSteps;
-  const maxRetries = profile.maxRetries ?? config.advanced.maxRetries;
+  // 4. Merge parameters: thread overrides → profile overrides → global
+  const threadOvr = opts.threadOverrides;
+  const temperature = threadOvr?.temperature ?? profile.temperature ?? config.advanced.temperature;
+  const maxSteps = threadOvr?.maxSteps ?? profile.maxSteps ?? config.advanced.maxSteps;
+  const maxRetries = threadOvr?.maxRetries ?? profile.maxRetries ?? config.advanced.maxRetries;
   const profileUseResponsesApi = profile.useResponsesApi;
   const useResponsesApi = profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
   const globalSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
-  const systemPrompt = profile.systemPrompt?.trim() || globalSystemPrompt;
+  const systemPrompt = threadOvr?.systemPromptOverride?.trim() || profile.systemPrompt?.trim() || globalSystemPrompt;
   const reasoningEffort = opts.reasoningEffort ?? profile.reasoningEffort as ReasoningEffort | undefined;
 
   // 5. Apply merged parameters to model configs (cloned so we don't mutate catalog)

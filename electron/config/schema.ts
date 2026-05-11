@@ -493,6 +493,9 @@ export const appConfigSchema = z.object({
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
+    composer: z.object({
+      showModelProfileSelector: z.boolean(),
+    }).default({ showModelProfileSelector: false }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

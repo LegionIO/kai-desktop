@@ -148,6 +148,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       const result = await app.dialog.openDirectory();
       if (!result.canceled && result.directoryPath) {
         await setCurrentWorkingDirectory(result.directoryPath);
+        // Persist to task metadata so the terminal spawns in this directory
+        void updateTask(task.id, {
+          metadata: { ...task.metadata, cwd: result.directoryPath },
+        });
       }
     } catch (err) {
       console.error('Attach directory failed:', err);
@@ -224,8 +228,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     setIsStartingAgent(true);
     try {
       const result = await app.tasks.terminalCreate(task.id, {
-        runtime,
-        cwd: task.metadata?.cwd,
+        runtime: selectedRuntime,
+        cwd: task.metadata?.cwd ?? currentWorkingDirectory ?? undefined,
       });
       if (result.sessionId) {
         setTerminalSessionId(result.sessionId);
@@ -239,7 +243,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     } finally {
       setIsStartingAgent(false);
     }
-  }, [task.id, task.agentRuntime, task.metadata?.cwd, task.startedAt, updateTask]);
+  }, [task.id, task.metadata?.cwd, currentWorkingDirectory, selectedRuntime, updateTask]);
 
   const handleStopAgent = useCallback(() => {
     if (terminalSessionId) {

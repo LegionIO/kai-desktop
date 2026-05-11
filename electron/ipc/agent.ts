@@ -288,6 +288,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       fallbackEnabled?: boolean,
       cwd?: string,
       executionMode?: ExecutionMode,
+      threadOverrides?: { temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null },
     ) => {
     const effectiveCwd = normalizeAgentCwd(cwd);
     const effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
@@ -321,6 +322,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       threadProfileKey: profileKey ?? null,
       reasoningEffort,
       fallbackEnabled: fallbackEnabled ?? false,
+      threadOverrides: threadOverrides ?? undefined,
     });
     const modelEntry = streamConfig?.primaryModel ?? null;
     let effectiveSystemPrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
@@ -368,7 +370,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Resolve runtime using model-aware logic:
     //   - auto mode: picks the best runtime for the model's provider type
     //   - explicit mode: validates compatibility, returns a warning on mismatch
-    const { runtime, resolution } = await resolveRuntimeForStream(config, modelEntry);
+    // Thread-level runtimeOverride takes precedence over global config.
+    const runtimeConfig = threadOverrides?.runtimeOverride
+      ? { ...config, agent: { ...config.agent, runtime: threadOverrides.runtimeOverride } } as AppConfig
+      : config;
+    const { runtime, resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
     ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} claudeAuth=${resolution.claudeAuth ? `model=${resolution.claudeAuth.modelName} baseUrl=${resolution.claudeAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
 
     // If the user has an explicitly-set runtime that is incompatible with the

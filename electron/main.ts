@@ -26,6 +26,7 @@ import { CodexRuntime } from './agent/runtime/codex-runtime.js';
 import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
+import { registerPartitionHandlers } from './ipc/partitions.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
 import { registerAgentHandlers as registerAgentEntityHandlers } from './ipc/agents.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
@@ -649,6 +650,7 @@ if (gotSingleInstanceLock) {
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
+    registerPartitionHandlers(ipcMain);
     registerTaskHandlers(ipcMain, APP_HOME);
     registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     const taskTerminalManager = new TaskTerminalManager();
