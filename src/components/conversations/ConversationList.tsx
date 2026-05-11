@@ -55,10 +55,10 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
 }
 
 const TypingBubble: FC = () => (
-  <div className="flex items-center gap-[3px]">
-    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:0ms]" />
-    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:150ms]" />
-    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:300ms]" />
+  <div className="flex items-center gap-0.5 px-1">
+    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
+    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
+    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
   </div>
 );
 
