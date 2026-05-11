@@ -642,7 +642,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     <DropdownMenu.Root>
                       <Tooltip content="Add files" side="top" sideOffset={8}>
                         <DropdownMenu.Trigger asChild>
-                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
+                          <button type="button" disabled={!terminalSessionId} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground disabled:opacity-40 disabled:cursor-not-allowed">
                             <PlusIcon className="h-4 w-4" />
                           </button>
                         </DropdownMenu.Trigger>
@@ -680,18 +680,20 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                           <button
                             type="button"
                             onClick={() => { void handleAttachDirectory(); }}
-                            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${currentWorkingDirectory ? 'hover:bg-primary/15 text-primary' : 'hover:bg-muted/50 text-muted-foreground'}`}
+                            disabled={!terminalSessionId}
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${currentWorkingDirectory ? 'hover:bg-primary/15 text-primary' : 'hover:bg-muted/50 text-muted-foreground'}`}
                           >
                             <FolderOpenIcon className="h-4 w-4" />
                           </button>
                         </Tooltip>
                         {currentWorkingDirectory && (
-                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'}`}>
+                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${cwdExpanded && terminalSessionId ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'}`}>
                             <Tooltip content="Directory settings" side="top" sideOffset={8}>
                               <button
                                 type="button"
                                 onClick={() => setCwdPopoverOpen((o) => !o)}
-                                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
+                                disabled={!terminalSessionId}
+                                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary disabled:opacity-40 disabled:cursor-not-allowed"
                               >
                                 <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
                               </button>
@@ -725,7 +727,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   {/* Right: recording + send/stop */}
                   <div className="flex items-center gap-1.5 md:gap-2">
                     {recordingEnabled && (
-                      <RecordingButton onStart={startRecording} />
+                      <RecordingButton onStart={startRecording} disabled={!terminalSessionId} />
                     )}
                     {terminalSessionId ? (
                       <Tooltip content="Stop agent" side="top" sideOffset={8}>

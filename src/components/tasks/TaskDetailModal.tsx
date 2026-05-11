@@ -2,13 +2,13 @@
  * TaskDetailModal — task preview modal with Plan and Agent tabs.
  *
  * Plan tab: shows the task description/plan.
- * Agent tab: shows assigned agent, terminal (always visible), and a steering composer.
+ * Agent tab: always-visible terminal with dark idle overlay.
  * Provides a button to navigate to the full TaskDetailPanel view.
  */
 
-import { type FC, useState, useEffect, useRef, useCallback } from 'react';
+import { type FC, useState, useEffect, useCallback } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { ExternalLinkIcon, FileCodeIcon, TerminalIcon, PlayIcon, StopCircleIcon } from 'lucide-react';
+import { ExternalLinkIcon, FileCodeIcon, TerminalIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
@@ -31,9 +31,6 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
 
   const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
   const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
-  const [isStartingAgent, setIsStartingAgent] = useState(false);
-  const [agentInput, setAgentInput] = useState('');
-  const agentTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Sync terminal session from task
   useEffect(() => {
@@ -52,66 +49,11 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
     if (open) setActiveTab('plan');
   }, [open]);
 
-  // Auto-resize agent textarea
-  useEffect(() => {
-    const el = agentTextareaRef.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-  }, [agentInput]);
-
-  const handleStartAgent = useCallback(async () => {
-    if (!task) return;
-    const runtime = task.agentRuntime ?? 'claude-code';
-    setIsStartingAgent(true);
-    try {
-      const result = await app.tasks.terminalCreate(task.id, {
-        runtime,
-        cwd: task.metadata?.cwd,
-      });
-      if (result.sessionId) {
-        setTerminalSessionId(result.sessionId);
-        void updateTask(task.id, {
-          terminalSessionId: result.sessionId,
-          agentRuntime: runtime,
-          status: 'in_progress',
-        });
-      }
-    } finally {
-      setIsStartingAgent(false);
-    }
-  }, [task, updateTask]);
-
-  const handleStopAgent = useCallback(() => {
-    if (!task || !terminalSessionId) return;
-    void app.tasks.terminalKill(terminalSessionId);
-    setTerminalSessionId(null);
-    void updateTask(task.id, { terminalSessionId: undefined });
-  }, [task, terminalSessionId, updateTask]);
-
   const handleTerminalExit = useCallback(() => {
     if (!task) return;
     setTerminalSessionId(null);
     void updateTask(task.id, { terminalSessionId: undefined });
   }, [task, updateTask]);
-
-  const handleAgentSubmit = useCallback(() => {
-    const text = agentInput.trim();
-    if (!text || !terminalSessionId) return;
-    setAgentInput('');
-    void app.tasks.terminalWrite(terminalSessionId, text + '\n');
-    agentTextareaRef.current?.focus();
-  }, [agentInput, terminalSessionId]);
-
-  const handleAgentKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        handleAgentSubmit();
-      }
-    },
-    [handleAgentSubmit],
-  );
 
   if (!task) return null;
 
@@ -155,7 +97,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
         <Dialog.Overlay className="fixed inset-0 z-[9998] bg-black/40 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:pointer-events-none" />
         <Dialog.Content
           className="fixed left-1/2 top-1/2 z-[9999] flex w-full max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-border/70 bg-popover shadow-2xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:pointer-events-none"
-          style={{ maxHeight: 'min(85vh, 720px)' }}
+          style={{ height: 'min(90vh, 860px)' }}
         >
           <Dialog.Title className="sr-only">{task.title}</Dialog.Title>
           <Dialog.Description className="sr-only">
@@ -238,72 +180,40 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
           {/* Tab content */}
           {activeTab === 'plan' ? (
             /* Plan tab */
-            <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
-              {task.description ? (
-                <div className="prose-sm text-sm text-foreground/90">
-                  <MarkdownText text={task.description} />
-                </div>
-              ) : (
-                <p className="text-sm italic text-muted-foreground">No description</p>
-              )}
+            <div className="relative min-h-0 flex-1">
+              <div className="pointer-events-none absolute inset-x-0 -top-px z-20 h-10 bg-gradient-to-b from-popover to-transparent" />
+              <div className="h-full overflow-y-auto px-6 py-5">
+                {task.description ? (
+                  <div className="prose-sm text-sm text-foreground/90">
+                    <MarkdownText text={task.description} />
+                  </div>
+                ) : (
+                  <p className="text-sm italic text-muted-foreground">No description</p>
+                )}
+              </div>
             </div>
           ) : (
             /* Agent tab */
-            <div className="flex min-h-0 flex-1 flex-col">
-              {terminalSessionId ? (
-                <>
-                  {/* Terminal */}
-                  <div className="min-h-0 flex-1 px-6 pt-4">
-                    <TaskTerminal
-                      sessionId={terminalSessionId}
-                      onExit={handleTerminalExit}
-                      className="h-full rounded-xl"
-                    />
-                  </div>
-                  {/* Steering composer */}
-                  <div className="shrink-0 px-6 pb-5 pt-3">
-                    <div className="flex flex-col gap-0 rounded-2xl border border-border/70 bg-muted/20 px-3 py-2">
-                      <textarea
-                        ref={agentTextareaRef}
-                        value={agentInput}
-                        onChange={(e) => setAgentInput(e.target.value)}
-                        onKeyDown={handleAgentKeyDown}
-                        placeholder="Send instructions to the agent…"
-                        rows={1}
-                        className="min-h-[36px] max-h-[120px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none"
-                      />
-                      <div className="flex items-center justify-end">
-                        <button
-                          type="button"
-                          onClick={handleStopAgent}
-                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive transition-colors hover:bg-destructive/20"
-                        >
-                          <StopCircleIcon className="h-3.5 w-3.5" />
-                        </button>
+            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5">
+              {/* Terminal — always rendered; dark overlay when no session */}
+              <div className="relative min-h-0 flex-1">
+                {terminalSessionId ? (
+                  <TaskTerminal
+                    sessionId={terminalSessionId}
+                    onExit={handleTerminalExit}
+                    className="h-full rounded-xl"
+                  />
+                ) : (
+                  <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border/50 bg-[#1a1a2e]">
+                    <div className="flex flex-1 items-center justify-center">
+                      <div className="flex flex-col items-center gap-2 text-center">
+                        <TerminalIcon className="h-8 w-8 text-white/20" />
+                        <p className="text-sm text-white/40">No agent running</p>
                       </div>
                     </div>
                   </div>
-                </>
-              ) : (
-                /* No terminal — show start button */
-                <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-8 text-center">
-                  <TerminalIcon className="h-10 w-10 text-muted-foreground/30" />
-                  <p className="text-sm text-muted-foreground">
-                    {assignedAgent
-                      ? `Start ${assignedAgent.name} to see the terminal here.`
-                      : 'Start an agent to see the terminal here.'}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleStartAgent}
-                    disabled={isStartingAgent}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50"
-                  >
-                    <PlayIcon className="h-3.5 w-3.5" />
-                    {isStartingAgent ? 'Starting…' : 'Start'}
-                  </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
           )}
         </Dialog.Content>
