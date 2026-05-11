@@ -114,7 +114,7 @@ export const PluginMarketplace: FC = () => {
     <div className="flex flex-col h-full min-h-0">
       {/* Fixed search + refresh bar */}
       <div className="shrink-0 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2">
+        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2 rounded-2xl bg-background/60 backdrop-blur-md py-3">
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
