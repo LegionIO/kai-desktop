@@ -45,7 +45,8 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId, focusTrigger }) => 
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, [focusTrigger]);
+  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 200); return () => clearTimeout(t); }, [focusTrigger]);
+  useEffect(() => { if (!state.isLoading) { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); } }, [state.isLoading]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
