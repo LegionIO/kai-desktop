@@ -170,7 +170,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             </button>
           )}
         </div>
-        <Tooltip content="Browse Marketplace" side="left">
+        <Tooltip content="Browse Marketplace" side="bottom">
           <button
             type="button"
             onClick={onOpenMarketplace}
@@ -272,7 +272,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   {hasUpdate && (
-                    <Tooltip content={`Update to v${catalogEntry.version}`} side="left">
+                    <Tooltip content={`Update to v${catalogEntry.version}`} side="bottom">
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); void handleInstall(plugin.name); }}
@@ -289,7 +289,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                     </Tooltip>
                   )}
                   {!plugin.brandRequired && (
-                    <Tooltip content="Uninstall" side="left">
+                    <Tooltip content="Uninstall" side="bottom">
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); setConfirmUninstall(plugin); }}
