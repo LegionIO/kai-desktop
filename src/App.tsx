@@ -15,6 +15,7 @@ import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
 import { ExportDialog } from '@/components/conversations/ExportDialog';
 import { RenameChatModal } from '@/components/conversations/RenameChatModal';
+import { ThreadSettingsModal } from '@/components/conversations/ThreadSettingsModal';
 import { PluginProvider } from '@/providers/PluginProvider';
 import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginModalHost } from '@/components/plugins/PluginModalHost';
@@ -24,7 +25,7 @@ import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ArchiveRestoreIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArchiveIcon, ArchiveRestoreIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
 import { IconRail } from '@/components/sidebar/IconRail';
 import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
@@ -461,6 +462,7 @@ function AppShell() {
   }, []);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
+  const [threadSettingsOpen, setThreadSettingsOpen] = useState(false);
   const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
@@ -1306,6 +1308,12 @@ function AppShell() {
         <PermissionConsentModal />
         <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
         <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
+        <ThreadSettingsModal
+          open={threadSettingsOpen}
+          conversationId={activeConversationId}
+          onClose={() => setThreadSettingsOpen(false)}
+          isActiveConversation={true}
+        />
         {activeView === SETTINGS_VIEW && createPortal(
           <div
             className="fixed inset-0 z-50 flex items-center justify-center"
@@ -1964,6 +1972,13 @@ function AppShell() {
                         >
                           <DownloadIcon className="h-4 w-4 text-muted-foreground" />
                           <span>Export</span>
+                        </DropdownMenu.Item>
+                        <DropdownMenu.Item
+                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                          onSelect={() => setThreadSettingsOpen(true)}
+                        >
+                          <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
+                          <span>Thread Settings</span>
                         </DropdownMenu.Item>
                         <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
                         <DropdownMenu.Item
