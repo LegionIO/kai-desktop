@@ -111,7 +111,7 @@ export const PluginMarketplace: FC = () => {
     );
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="relative z-20 flex flex-col h-full min-h-0">
       <div className="flex-1 min-h-0 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-4 pt-6 pb-6">
           {/* Glass card wrapping everything */}
