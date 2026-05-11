@@ -1048,6 +1048,15 @@ const AssistantMessage: FC = () => {
       p.type === 'tool-call' && (p.toolName === 'sub_agent' || p.toolName === 'agent') && p.finishedAt === undefined,
   );
 
+  // Any regular tool (non-agent) is actively executing when it has no result yet and isn't pending approval
+  const hasRunningTool = isRunning && content.some(
+    (p: { type: string; toolName?: string; result?: unknown; approvalStatus?: string }) =>
+      p.type === 'tool-call' &&
+      p.toolName !== 'sub_agent' && p.toolName !== 'agent' &&
+      p.result === undefined &&
+      p.approvalStatus !== 'pending',
+  );
+
   // Detect paused-for-input — a tool is awaiting user approval/answer
   const isAwaitingInput = isRunning && content.some(
     (p: { type: string; approvalStatus?: string; result?: unknown }) =>
@@ -1139,9 +1148,9 @@ const AssistantMessage: FC = () => {
               <div className="aui-typing-dots">
                 <ThinkingSpinner />
               </div>
-              {/* Between-tool-calls spinner: all tools finished but model is still running,
-                  OR a sub-agent is actively working (parent model is blocked waiting on it) */}
-              {(allToolsDone || hasRunnningSubAgent) && (
+              {/* Thinking spinner: shown when model is running with content but no active tool output,
+                  when a sub-agent is working, or when a regular tool is actively executing */}
+              {(allToolsDone || hasRunnningSubAgent || hasRunningTool) && (
                 <div className="mt-5 timeline-detached">
                   <ThinkingSpinner />
                 </div>

@@ -629,7 +629,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     onKeyDown={handleKeyDown}
                     placeholder={isActivelyStreaming ? 'Waiting for plan to finish...' : 'Refine the plan...'}
                     rows={1}
-                    className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]"
+                    className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', input.includes('\n') && 'pb-3')}
                   />
                   <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
                     {/* Left side: add files + working directory */}
@@ -773,7 +773,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     onKeyDown={handleAgentKeyDown}
                     placeholder="Send instructions to the agent..."
                     rows={1}
-                    className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]"
+                    className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', agentInput.includes('\n') && 'pb-3')}
                   />
                   <div className="flex items-center justify-end">
                     <Tooltip content="Send to agent" side="top" sideOffset={8}>

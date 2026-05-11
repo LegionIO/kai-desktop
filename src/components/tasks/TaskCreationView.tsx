@@ -242,7 +242,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
               onKeyDown={handleKeyDown}
               placeholder="Describe what you want to accomplish..."
               rows={1}
-              className="min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]"
+              className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', input.includes('\n') && 'pb-3')}
             />
             <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
               {/* Left side: add files + working directory */}

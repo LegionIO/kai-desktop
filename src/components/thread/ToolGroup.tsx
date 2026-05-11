@@ -196,8 +196,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const isGrepTool = isGrepToolName;
   const isGlobTool = isGlobToolName;
 
-  const ToolIcon = getToolIcon(part.toolName);
-  const iconColor = getToolIconColor(part.toolName);
+  const ToolIcon = getToolIcon(part.toolName, part.args as Record<string, unknown>);
+  const iconColor = getToolIconColor(part.toolName, part.args as Record<string, unknown>);
 
   return (
     <div className="text-sm min-w-0 flex-1">
@@ -213,7 +213,7 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
         </span>
 
         {/* Tool name */}
-        <span className="font-medium text-xs text-foreground whitespace-nowrap shrink-0">{getToolLabel(part.toolName)}</span>
+        <span className="font-medium text-xs text-foreground whitespace-nowrap shrink-0">{getToolLabel(part.toolName, part.args as Record<string, unknown>)}</span>
 
         {/* Separator dot */}
         {summary && <span className="text-muted-foreground/30 text-[10px] shrink-0">·</span>}
@@ -2435,7 +2435,7 @@ const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]
 
 type DiffLine = { text: string; type: 'added' | 'removed' | 'context' };
 
-const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLine[]; addedCount: number; removedCount: number; onClose: () => void }> = ({ fileName, filePath, diffLines, addedCount, removedCount, onClose }) => {
+const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLine[]; addedCount: number; removedCount: number; isWrite?: boolean; onClose: () => void }> = ({ fileName, filePath, diffLines, addedCount, removedCount, isWrite, onClose }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
   const portalTarget = useModalPortalTarget();
   const shortStat = [
@@ -2459,7 +2459,10 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
       <div className="relative flex flex-col w-full max-w-3xl max-h-[80vh] rounded-xl border border-border/40 bg-background shadow-2xl overflow-hidden font-mono text-xs">
         {/* Modal header */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 bg-muted/30 shrink-0">
-          <FilePenIcon className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+          {isWrite
+            ? <FileIcon className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
+            : <FilePenIcon className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+          }
           <span className="font-semibold text-foreground/90 truncate flex-1">{fileName}</span>
           <span className="text-[11px] shrink-0 tabular-nums">{shortStat}</span>
           <button type="button" onClick={onClose} className="shrink-0 p-1 text-muted-foreground/50 hover:text-foreground transition-colors">
@@ -2677,6 +2680,7 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
           diffLines={diffLines}
           addedCount={addedCount}
           removedCount={removedCount}
+          isWrite={isWriteTool}
           onClose={() => setDiffModalOpen(false)}
         />
       )}
@@ -2817,7 +2821,17 @@ const toolLabels: Record<string, string> = {
   runtime_switch: 'Runtime Switch',
 };
 
-function getToolLabel(toolName: string): string {
+function isBashGrep(toolName: string, args?: Record<string, unknown>): boolean {
+  if (toolName !== 'bash' && toolName !== 'sh' && toolName !== 'mastra_workspace_execute_command') return false;
+  const cmd = args?.command;
+  if (typeof cmd !== 'string') return false;
+  // Unwrap shell wrappers like /bin/zsh -lc '...' or /bin/bash -c '...'
+  const unwrapped = cmd.match(/^\/bin\/(?:zsh|bash|sh)\s+-\w+\s+'(.+)'$/s)?.[1] ?? cmd;
+  return /^\s*grep\b/.test(unwrapped);
+}
+
+function getToolLabel(toolName: string, args?: Record<string, unknown>): string {
+  if (isBashGrep(toolName, args)) return 'Search';
   if (toolLabels[toolName]) return toolLabels[toolName];
   // Split PascalCase (e.g. UpdateWorkingMemory → Update Working Memory),
   // then handle snake_case, and title-case any remaining words.
@@ -2829,7 +2843,8 @@ function getToolLabel(toolName: string): string {
 
 type LucideIcon = FC<{ className?: string }>;
 
-function getToolIcon(toolName: string): LucideIcon {
+function getToolIcon(toolName: string, args?: Record<string, unknown>): LucideIcon {
+  if (isBashGrep(toolName, args)) return SearchIcon;
   if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command') return TerminalIcon;
   if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file') return FileTextIcon;
   if (toolName === 'file_write' || toolName === 'mastra_workspace_write_file' || toolName === 'write' || toolName === 'Write') return FileIcon;
@@ -2847,7 +2862,8 @@ function getToolIcon(toolName: string): LucideIcon {
   return SparklesIcon;
 }
 
-function getToolIconColor(toolName: string): string {
+function getToolIconColor(toolName: string, args?: Record<string, unknown>): string {
+  if (isBashGrep(toolName, args)) return 'bg-sky-500/15 text-sky-500';
   if (toolName === 'sh' || toolName === 'bash' || toolName === 'mastra_workspace_execute_command')
     return 'bg-violet-500/15 text-violet-500';
   if (toolName === 'file_read' || toolName === 'read' || toolName === 'Read' || toolName === 'mastra_workspace_read_file')
