@@ -194,10 +194,10 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
             <DropdownMenu.Trigger asChild>
               <button
                 type="button"
-                className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition-colors ${
+                className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors ${
                   statusFilters.size > 0
-                    ? 'border-primary/40 bg-primary/10 text-primary'
-                    : 'border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
                 }`}
                 aria-label="Filter by status"
               >

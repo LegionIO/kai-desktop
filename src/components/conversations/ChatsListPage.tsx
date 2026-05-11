@@ -395,10 +395,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                   <button
                     type="button"
                     className={cn(
-                      'relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border transition-colors',
+                      'relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
                       isFilterActive
-                        ? 'border-primary/40 bg-primary/10 text-primary'
-                        : 'border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
                     )}
                   >
                     <SlidersHorizontalIcon className="h-4 w-4" />
@@ -443,10 +443,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                   <button
                     type="button"
                     className={cn(
-                      'relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border transition-colors',
+                      'relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
                       isSortActive
-                        ? 'border-primary/40 bg-primary/10 text-primary'
-                        : 'border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
                     )}
                   >
                     <ArrowUpDownIcon className="h-4 w-4" />
