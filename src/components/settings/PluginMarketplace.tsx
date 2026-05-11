@@ -111,9 +111,9 @@ export const PluginMarketplace: FC = () => {
     );
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="relative flex flex-col h-full min-h-0">
       {/* Fixed search + refresh bar */}
-      <div className="shrink-0 px-4 pt-6 pb-3">
+      <div className="relative z-10 shrink-0 px-4 pt-6 pb-3 bg-background/60 backdrop-blur-md">
         <div className="mx-auto max-w-3xl flex items-center gap-2">
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -167,8 +167,8 @@ export const PluginMarketplace: FC = () => {
       </div>
 
       {/* Scrollable content with fade at top */}
-      <div className="relative flex-1 min-h-0">
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
+      <div className="relative z-10 flex-1 min-h-0">
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background/60 to-transparent" />
 
         <div className="h-full overflow-y-auto">
           <div className="mx-auto max-w-3xl px-4 pt-4 pb-6 space-y-3">
@@ -217,7 +217,7 @@ export const PluginMarketplace: FC = () => {
               return (
                 <div
                   key={entry.name}
-                  className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3 min-h-[80px]"
+                  className="flex items-center gap-3 rounded-xl border border-border/70 bg-card px-4 py-3 min-h-[80px]"
                 >
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/50">
                     <PackageIcon className="h-4 w-4 text-muted-foreground" />
