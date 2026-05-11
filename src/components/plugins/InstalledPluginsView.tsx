@@ -10,6 +10,7 @@ import {
   StoreIcon,
   SearchIcon,
   XIcon,
+  Settings2Icon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -48,9 +49,10 @@ interface InstalledPluginsViewProps {
   onOpenMarketplace: () => void;
   onNavigate: (pluginName: string, target: PluginNavigationTarget) => void;
   onOpenPluginError: (pluginName: string) => void;
+  onOpenPluginSettings: (pluginName: string) => void;
 }
 
-export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError }) => {
+export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError, onOpenPluginSettings }) => {
   const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
@@ -305,6 +307,17 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                                 <ArrowUpCircleIcon className="h-3 w-3" />
                               )}
                               {installingPlugins.has(plugin.name) ? 'Updating…' : 'Update'}
+                            </button>
+                          </Tooltip>
+                        )}
+                        {uiState?.settingsSections?.some((s) => s.pluginName === plugin.name) && (
+                          <Tooltip content="Settings" side="bottom">
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); onOpenPluginSettings(plugin.name); }}
+                              className="flex items-center justify-center rounded-lg border border-border/60 bg-muted/30 p-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                            >
+                              <Settings2Icon className="h-3.5 w-3.5" />
                             </button>
                           </Tooltip>
                         )}

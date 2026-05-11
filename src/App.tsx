@@ -1867,6 +1867,7 @@ function AppShell() {
                     onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
                     onNavigate={handlePluginNavigationItem}
                     onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                    onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
                   />
                 </div>
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
@@ -1886,11 +1887,6 @@ function AppShell() {
                     panel={activePluginPanel}
                     onClose={() => setActiveView(CHAT_VIEW)}
                     displayName={pluginDisplayName(activePluginPanel.pluginName)}
-                    onOpenSettings={
-                      pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName)
-                        ? () => setPluginSettingsOpen(activePluginPanel.pluginName)
-                        : undefined
-                    }
                   />
                 </div>
               ) : activeView === CHAT_LIST_VIEW ? (
