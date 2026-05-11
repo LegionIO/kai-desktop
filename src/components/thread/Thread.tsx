@@ -49,6 +49,7 @@ import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
+import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
 import { ComposerInput } from './ComposerInput';
@@ -1064,6 +1065,10 @@ const AssistantMessage: FC = () => {
     | undefined;
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
 
+  // Extract max-turns-reached content parts for interactive continue card
+  const maxTurnsParts = (content.filter((p: { type: string }) => p.type === 'max-turns-reached') as unknown) as
+    Array<{ type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }>;
+
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1144,6 +1149,9 @@ const AssistantMessage: FC = () => {
             </>
           )}
           {pipelineEnrichments && <PipelineInsights enrichments={pipelineEnrichments} />}
+          {maxTurnsParts.map((part, i) => (
+            <MaxTurnsContinueCard key={`max-turns-${i}`} part={part} messageId={message.id} />
+          ))}
         </div>
         <div className={`flex items-center gap-1 mt-1.5 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
           <AssistantActionBar />

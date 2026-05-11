@@ -76,7 +76,7 @@ export function resolveModelCatalog(config: AppConfig): {
       maxInputTokens: model.maxInputTokens,
       providerTools: normalizeProviderTools(providerConfig.providerTools, model.providerTools),
       temperature: config.advanced.temperature,
-      maxSteps: config.advanced.maxSteps,
+      maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
       maxRetries: config.advanced.maxRetries,
     };
 
@@ -167,7 +167,7 @@ export function resolveStreamConfig(
 
   // 4. Merge parameters: profile overrides → global
   const temperature = profile.temperature ?? config.advanced.temperature;
-  const maxSteps = profile.maxSteps ?? config.advanced.maxSteps;
+  const maxSteps = profile.maxSteps ?? config.agent?.maxTurns ?? config.advanced.maxSteps;
   const maxRetries = profile.maxRetries ?? config.advanced.maxRetries;
   const profileUseResponsesApi = profile.useResponsesApi;
   const useResponsesApi = profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;

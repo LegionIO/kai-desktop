@@ -404,6 +404,8 @@ const codexSdkConfigSchema = z.object({
 
 const agentConfigSchema = z.object({
   runtime: z.enum(['auto', 'mastra', 'claude-agent-sdk', 'codex-sdk']),
+  maxTurns: z.number().positive().optional(),
+  autoContinueOnMaxTurns: z.boolean().optional(),
   claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
   codexSdk: codexSdkConfigSchema.optional(),
 });

@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { settingsSelectClass, type SettingsProps } from './shared';
+import { settingsSelectClass, Toggle, NumberField, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
 type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string };
 
 type AgentConfig = {
   runtime: 'auto' | 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
+  maxTurns?: number;
+  autoContinueOnMaxTurns?: boolean;
 };
 
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
@@ -138,6 +140,26 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           )}
         </fieldset>
       )}
+
+      {/* Turn Limits */}
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Turn Limits</legend>
+        <NumberField
+          label="Max turns"
+          value={agentConfig.maxTurns ?? 25}
+          onChange={(v) => void updateConfig('agent.maxTurns', v > 0 ? v : undefined)}
+          min={1}
+          max={200}
+        />
+        <Toggle
+          label="Auto-continue when max turns reached"
+          checked={agentConfig.autoContinueOnMaxTurns ?? false}
+          onChange={(v) => void updateConfig('agent.autoContinueOnMaxTurns', v)}
+        />
+        <p className="text-[10px] text-muted-foreground/80">
+          When auto-continue is enabled, the agent will automatically resume after hitting the turn limit instead of prompting you.
+        </p>
+      </fieldset>
     </div>
   );
 };

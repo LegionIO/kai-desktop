@@ -53,6 +53,7 @@ import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import { AgentListPanel } from '@/components/agents/AgentListPanel';
 import { AgentSwarmView } from '@/components/agents/AgentSwarmView';
+import { ChatsListPage } from '@/components/conversations/ChatsListPage';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 export default function App() {
@@ -360,6 +361,7 @@ type ConversationsStore = {
 type AppView = string;
 
 const CHAT_VIEW = 'chat';
+const CHAT_LIST_VIEW = 'chat-list';
 const SETTINGS_VIEW = 'settings';
 const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
@@ -1776,7 +1778,7 @@ function AppShell() {
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
-                      onClick={() => { setActiveConversationId(null); setActiveConversationTitle(null); }}
+                      onClick={() => { setActiveView(CHAT_LIST_VIEW); }}
                       className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
                     >
                       Chats
@@ -1892,6 +1894,18 @@ function AppShell() {
                     }
                   />
                 </div>
+              ) : activeView === CHAT_LIST_VIEW ? (
+                <ChatsListPage
+                  onOpenConversation={(id) => {
+                    setActiveView(CHAT_VIEW);
+                    void handleSwitchConversation(id);
+                  }}
+                  onNewConversation={() => {
+                    setActiveView(CHAT_VIEW);
+                    return handleNewConversation();
+                  }}
+                  workspaceId={activeWorkspaceId}
+                />
               ) : activeView === TASKS_VIEW ? (
                 isCreatingTask ? (
                   <TaskCreationView

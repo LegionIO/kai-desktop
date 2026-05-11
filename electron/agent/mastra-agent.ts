@@ -780,7 +780,7 @@ async function* generateWithSyntheticEvents(
       const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
       const generateOptions = {
-        maxSteps: config.advanced.maxSteps,
+        maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
         abortSignal: options?.abortSignal,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
@@ -958,7 +958,7 @@ async function* streamWithRealEvents(
         const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
         const streamOptions = {
-          maxSteps: config.advanced.maxSteps,
+          maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
           abortSignal: options?.abortSignal,
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),
