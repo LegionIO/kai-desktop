@@ -187,19 +187,21 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
             </button>
           </Tooltip>
         </div>
-        {plugins.length > 0 && (
-          <div className="mx-auto max-w-3xl px-4 pt-3">
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-              Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
-            </p>
-          </div>
-        )}
       </div>
 
       {/* Scrollable content with fade at top */}
       <div className="relative flex-1 min-h-0">
         {/* Fade overlay */}
         <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
+
+        {/* "Installed (N)" label floats above the fade */}
+        {plugins.length > 0 && (
+          <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-10 flex items-center">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
+            </p>
+          </div>
+        )}
 
         <div className="h-full overflow-y-auto">
           <div className="mx-auto max-w-3xl px-4 pt-10 pb-6 space-y-3">
