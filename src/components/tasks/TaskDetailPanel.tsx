@@ -337,7 +337,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   return (
     <div className="relative flex h-full w-full flex-col bg-background">
       {/* ─── Header ─── */}
-      <div className={cn('relative z-10 shrink-0 mx-auto w-full px-5 pt-3 pb-0 md:px-8', !fullWidth && 'max-w-3xl')}>
+      <div className={cn('relative z-10 shrink-0 mx-auto w-full px-5 pt-3 pb-0', !fullWidth && 'max-w-3xl')}>
         {/* Metadata: two columns */}
         <div className="flex gap-8">
           {/* Left col: Status + Agent */}
@@ -400,10 +400,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       {/* ─── Tab content ─── */}
       {activeTab === 'plan' ? (
         /* ═══ PLAN TAB ═══ */
-        <div className="relative min-h-0 flex-1 overflow-y-auto">
+        <div className="relative min-h-0 flex-1">
+          {/* Fade at top */}
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-12 bg-gradient-to-b from-background to-transparent" />
+          <div className="h-full overflow-y-auto">
           <div ref={scrollRef} className="flex min-h-full flex-col">
             <div className="flex-1">
-              <div className={cn('relative z-10 mx-auto px-5 pb-5 pt-5 md:px-8', !fullWidth && 'max-w-3xl')}>
+              <div className={cn('mx-auto px-8 pb-5 pt-4', !fullWidth && 'max-w-3xl')}>
                 {displayText ? (
                   <MarkdownText text={displayText} />
                 ) : isActivelyStreaming ? (
@@ -419,7 +422,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
             {/* Sticky plan composer */}
             <div className="sticky bottom-0 z-20">
               <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />
-              <div className={cn('relative z-20 mx-auto w-full px-4 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
+              <div className={cn('relative z-20 mx-auto w-full px-5 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
                 {/* Hidden file input for web bridge */}
                 {isWebBridge && (
                   <input
@@ -584,76 +587,173 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 </div>
               </div>
             </div>
-          </div>
+          </div>{/* end scrollRef */}
+          </div>{/* end overflow-y-auto */}
         </div>
       ) : (
         /* ═══ AGENT TAB ═══ */
         <div className="flex min-h-0 flex-1 flex-col">
-          {terminalSessionId ? (
-            <>
-              {/* Terminal fills available space */}
-              <div className="min-h-0 flex-1 px-5 pt-4 md:px-8">
+          <div className={cn('flex min-h-0 flex-1 flex-col gap-3 mx-auto w-full px-5 pt-4 pb-4 md:pb-5', !fullWidth && 'max-w-3xl')}>
+            {/* Terminal — always rendered; overlay when no session */}
+            <div className="relative min-h-0 flex-1">
+              {terminalSessionId ? (
                 <TaskTerminal
                   sessionId={terminalSessionId}
                   onExit={handleTerminalExit}
                   className="h-full rounded-xl"
                 />
-              </div>
-              {/* Agent steering composer */}
-              <div className="shrink-0 px-5 pb-4 pt-3 md:px-8 md:pb-5 space-y-2">
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={handleStopAgent}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
-                  >
-                    <StopCircleIcon className="h-3.5 w-3.5" />
-                    Stop
-                  </button>
-                </div>
-                <div className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
-                  <textarea
-                    ref={agentTextareaRef}
-                    value={agentInput}
-                    onChange={(e) => setAgentInput(e.target.value)}
-                    onKeyDown={handleAgentKeyDown}
-                    placeholder="Send instructions to the agent..."
-                    rows={1}
-                    className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', agentInput.includes('\n') && 'pb-3')}
-                  />
-                  <div className="flex items-center justify-end">
-                    <Tooltip content="Send to agent" side="top" sideOffset={8}>
+              ) : (
+                <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border/50 bg-[#1a1a2e]">
+                  <div className="flex flex-1 items-center justify-center">
+                    <div className="flex flex-col items-center gap-3 text-center">
+                      <TerminalIcon className="h-8 w-8 text-white/20" />
+                      <p className="text-sm text-white/40">No agent running</p>
                       <button
                         type="button"
-                        onClick={handleAgentSubmit}
-                        disabled={!agentInput.trim()}
-                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                        onClick={handleStartAgent}
+                        disabled={isStartingAgent}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
                       >
-                        <SendHorizonalIcon className="h-4 w-4" />
+                        <PlayIcon className="h-3.5 w-3.5" />
+                        {isStartingAgent ? 'Starting…' : (assignedAgent ? `Start ${assignedAgent.name}` : 'Assign Agent')}
                       </button>
-                    </Tooltip>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Steering composer — always visible */}
+            <div className="shrink-0">
+              <div className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
+                <textarea
+                  ref={agentTextareaRef}
+                  value={agentInput}
+                  onChange={(e) => setAgentInput(e.target.value)}
+                  onKeyDown={handleAgentKeyDown}
+                  placeholder="Send instructions to the agent…"
+                  disabled={!terminalSessionId}
+                  rows={1}
+                  className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none disabled:opacity-40 md:text-[15px]', agentInput.includes('\n') && 'pb-3')}
+                />
+                <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
+                  {/* Left: add files + working directory */}
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5 md:gap-2">
+                    <DropdownMenu.Root>
+                      <Tooltip content="Add files" side="top" sideOffset={8}>
+                        <DropdownMenu.Trigger asChild>
+                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
+                            <PlusIcon className="h-4 w-4" />
+                          </button>
+                        </DropdownMenu.Trigger>
+                      </Tooltip>
+                      <DropdownMenu.Portal>
+                        <DropdownMenu.Content
+                          align="start"
+                          sideOffset={8}
+                          className="z-50 min-w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                        >
+                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }]); }}>
+                            <ImageIcon className="h-4 w-4 text-muted-foreground" />
+                            <span>Image</span>
+                          </DropdownMenu.Item>
+                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'PDF', extensions: ['pdf'] }]); }}>
+                            <FileIcon className="h-4 w-4 text-muted-foreground" />
+                            <span>PDF</span>
+                          </DropdownMenu.Item>
+                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Documents', extensions: ['txt', 'md', 'json', 'csv', 'html', 'htm', 'js', 'jsx', 'ts', 'tsx', 'css', 'scss', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'hpp', 'sh', 'yaml', 'yml', 'toml', 'xml'] }]); }}>
+                            <FileTextIcon className="h-4 w-4 text-muted-foreground" />
+                            <span>Text / Document</span>
+                          </DropdownMenu.Item>
+                          <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles(); }}>
+                            <FileIcon className="h-4 w-4 text-muted-foreground" />
+                            <span>Any File</span>
+                          </DropdownMenu.Item>
+                        </DropdownMenu.Content>
+                      </DropdownMenu.Portal>
+                    </DropdownMenu.Root>
+                    {/* Working directory split button */}
+                    <div ref={cwdRootRef} {...cwdContainerProps} className="relative flex items-center">
+                      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${currentWorkingDirectory ? 'border-primary/50 bg-primary/10' : 'border-border/50 bg-muted/40'}`}>
+                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Working directory'} side="top" sideOffset={8}>
+                          <button
+                            type="button"
+                            onClick={() => { void handleAttachDirectory(); }}
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${currentWorkingDirectory ? 'hover:bg-primary/15 text-primary' : 'hover:bg-muted/50 text-muted-foreground'}`}
+                          >
+                            <FolderOpenIcon className="h-4 w-4" />
+                          </button>
+                        </Tooltip>
+                        {currentWorkingDirectory && (
+                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'}`}>
+                            <Tooltip content="Directory settings" side="top" sideOffset={8}>
+                              <button
+                                type="button"
+                                onClick={() => setCwdPopoverOpen((o) => !o)}
+                                className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
+                              >
+                                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
+                              </button>
+                            </Tooltip>
+                          </div>
+                        )}
+                      </div>
+                      {cwdPopoverOpen && currentWorkingDirectory && (
+                        <div ref={cwdPopover.ref} style={cwdPopover.style} className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+                          <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+                            <FolderOpenIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Working Directory</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>{cwdName}</p>
+                            <p className="mt-0.5 text-[10px] text-muted-foreground truncate" title={currentWorkingDirectory}>{currentWorkingDirectory}</p>
+                          </div>
+                          <div className="border-t border-border/50 mx-1.5 mt-0.5" />
+                          <button
+                            type="button"
+                            onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                            className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                          >
+                            <XIcon className="h-3.5 w-3.5" />
+                            <span>Clear directory</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  {/* Right: recording + send/stop */}
+                  <div className="flex items-center gap-1.5 md:gap-2">
+                    {recordingEnabled && (
+                      <RecordingButton onStart={startRecording} />
+                    )}
+                    {terminalSessionId ? (
+                      <Tooltip content="Stop agent" side="top" sideOffset={8}>
+                        <button
+                          type="button"
+                          onClick={handleStopAgent}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive transition-colors hover:bg-destructive/20"
+                        >
+                          <StopCircleIcon className="h-4 w-4" />
+                        </button>
+                      </Tooltip>
+                    ) : (
+                      <Tooltip content="Send to agent" side="top" sideOffset={8}>
+                        <button
+                          type="button"
+                          onClick={handleAgentSubmit}
+                          disabled={!agentInput.trim()}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                        >
+                          <SendHorizonalIcon className="h-4 w-4" />
+                        </button>
+                      </Tooltip>
+                    )}
                   </div>
                 </div>
               </div>
-            </>
-          ) : (
-            /* No terminal running — empty state */
-            <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-              <TerminalIcon className="h-10 w-10 text-muted-foreground/30" />
-              <p className="text-sm text-muted-foreground">
-                Start an agent to see the terminal here.
-              </p>
-              <button
-                type="button"
-                onClick={handleStartAgent}
-                disabled={isStartingAgent}
-                className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50"
-              >
-                <PlayIcon className="h-3.5 w-3.5" />
-                {isStartingAgent ? 'Starting…' : 'Start Agent'}
-              </button>
             </div>
-          )}
+          </div>
         </div>
       )}
     </div>

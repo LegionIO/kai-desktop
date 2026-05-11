@@ -8,7 +8,8 @@
 
 import { type FC, useState, useEffect, useRef, useCallback } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { ExternalLinkIcon, FileCodeIcon, TerminalIcon, PlayIcon, StopCircleIcon, SendHorizonalIcon } from 'lucide-react';import { cn } from '@/lib/utils';
+import { ExternalLinkIcon, FileCodeIcon, TerminalIcon, PlayIcon, StopCircleIcon } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
 import { useAgents } from '@/providers/AgentProvider';
@@ -259,18 +260,8 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                       className="h-full rounded-xl"
                     />
                   </div>
-                  {/* Stop + steering composer */}
-                  <div className="shrink-0 px-6 pb-5 pt-3 space-y-2">
-                    <div className="flex justify-end">
-                      <button
-                        type="button"
-                        onClick={handleStopAgent}
-                        className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
-                      >
-                        <StopCircleIcon className="h-3.5 w-3.5" />
-                        Stop
-                      </button>
-                    </div>
+                  {/* Steering composer */}
+                  <div className="shrink-0 px-6 pb-5 pt-3">
                     <div className="flex flex-col gap-0 rounded-2xl border border-border/70 bg-muted/20 px-3 py-2">
                       <textarea
                         ref={agentTextareaRef}
@@ -284,11 +275,10 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                       <div className="flex items-center justify-end">
                         <button
                           type="button"
-                          onClick={handleAgentSubmit}
-                          disabled={!agentInput.trim()}
-                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                          onClick={handleStopAgent}
+                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive transition-colors hover:bg-destructive/20"
                         >
-                          <SendHorizonalIcon className="h-3.5 w-3.5" />
+                          <StopCircleIcon className="h-3.5 w-3.5" />
                         </button>
                       </div>
                     </div>

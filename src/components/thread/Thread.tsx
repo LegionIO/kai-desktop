@@ -1458,7 +1458,7 @@ const StopButton: FC = () => {
         // Force-clear the composer so it doesn't restore the previous message text
         composerRuntime.setText('');
       }}
-      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive transition-colors hover:bg-destructive/20"
     >
       <StopCircleIcon className="h-4 w-4" />
     </button>
@@ -1696,7 +1696,7 @@ const Composer: FC<{
   }
 
   return (
-    <div className={cn('relative z-20 mx-auto w-full px-4 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
+    <div className={cn('relative z-20 mx-auto w-full px-5 pb-4 pt-4 md:pb-5 md:pt-5', !fullWidth && 'max-w-3xl')}>
       {/* Hidden file input for web bridge */}
       {isWebBridge && (
         <input
