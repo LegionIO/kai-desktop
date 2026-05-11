@@ -5,7 +5,7 @@
  * simplified for Kai's 5-lane workflow.
  */
 
-import { useState, useMemo, useCallback, type FC } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect, type FC } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -41,6 +41,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilters, setStatusFilters] = useState<Set<KaiTaskStatus>>(new Set());
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -159,122 +162,135 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   }
 
   return (
-    <div className="flex flex-col">
-      {/* Board toolbar */}
-      <div className="flex shrink-0 items-center gap-3 px-4 py-2.5">
-        {/* Search */}
-        <div className="relative flex-1">
-          <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search tasks…"
-            className="h-8 w-full rounded-lg border border-border/70 bg-card pl-8 pr-7 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
-          />
-          {searchQuery && (
-            <button
-              type="button"
-              onClick={() => setSearchQuery('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-            >
-              <XIcon className="h-3 w-3" />
-            </button>
-          )}
-        </div>
+    <div className="flex flex-col h-full min-h-0">
+      {/* Fixed toolbar */}
+      <div className="shrink-0 px-4 pt-6 pb-3">
+        <div className="mx-auto max-w-3xl flex items-center gap-2">
+          {/* Search */}
+          <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
+            <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <input
+              ref={searchRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
+              placeholder="Search tasks…"
+              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="shrink-0 rounded p-0.5 hover:bg-muted transition-colors"
+              >
+                <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              </button>
+            )}
+          </div>
 
-        {/* Status filter dropdown */}
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              className={`relative rounded-lg p-1.5 transition-colors hover:bg-muted/60 ${
-                statusFilters.size > 0 ? 'text-primary' : 'text-muted-foreground'
-              }`}
-              aria-label="Filter by status"
-            >
-              <FilterIcon className="h-4 w-4" />
-              {statusFilters.size > 0 && (
-                <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-primary-foreground">
-                  {statusFilters.size}
-                </span>
-              )}
-            </button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              sideOffset={6}
-              className="z-[9999] min-w-[160px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
-            >
-              {KAI_TASK_STATUS_COLUMNS.map((status) => (
-                <DropdownMenu.CheckboxItem
-                  key={status}
-                  checked={statusFilters.has(status)}
-                  onSelect={(e) => e.preventDefault()}
-                  onCheckedChange={(checked) => {
-                    setStatusFilters((prev) => {
-                      const next = new Set(prev);
-                      if (checked) next.add(status);
-                      else next.delete(status);
-                      return next;
-                    });
-                  }}
-                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
-                >
-                  <DropdownMenu.ItemIndicator className="inline-flex h-3.5 w-3.5 items-center justify-center">
-                    <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
-                      <path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </DropdownMenu.ItemIndicator>
-                  <span className={statusFilters.has(status) ? '' : 'ml-5'}>
-                    {KAI_TASK_STATUS_LABELS[status]}
+          {/* Status filter dropdown */}
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <button
+                type="button"
+                className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition-colors ${
+                  statusFilters.size > 0
+                    ? 'border-primary/40 bg-primary/10 text-primary'
+                    : 'border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+                }`}
+                aria-label="Filter by status"
+              >
+                <FilterIcon className="h-4 w-4" />
+                {statusFilters.size > 0 && (
+                  <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-primary-foreground">
+                    {statusFilters.size}
                   </span>
-                </DropdownMenu.CheckboxItem>
-              ))}
-              {statusFilters.size > 0 && (
-                <>
-                  <DropdownMenu.Separator className="my-1 h-px bg-border/50" />
-                  <DropdownMenu.Item
-                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                    onSelect={() => setStatusFilters(new Set())}
+                )}
+              </button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="end"
+                sideOffset={6}
+                className="z-[9999] min-w-[160px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+              >
+                {KAI_TASK_STATUS_COLUMNS.map((status) => (
+                  <DropdownMenu.CheckboxItem
+                    key={status}
+                    checked={statusFilters.has(status)}
+                    onSelect={(e) => e.preventDefault()}
+                    onCheckedChange={(checked) => {
+                      setStatusFilters((prev) => {
+                        const next = new Set(prev);
+                        if (checked) next.add(status);
+                        else next.delete(status);
+                        return next;
+                      });
+                    }}
+                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
                   >
-                    Clear filters
-                  </DropdownMenu.Item>
-                </>
-              )}
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+                    <DropdownMenu.ItemIndicator className="inline-flex h-3.5 w-3.5 items-center justify-center">
+                      <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
+                        <path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </DropdownMenu.ItemIndicator>
+                    <span className={statusFilters.has(status) ? '' : 'ml-5'}>
+                      {KAI_TASK_STATUS_LABELS[status]}
+                    </span>
+                  </DropdownMenu.CheckboxItem>
+                ))}
+                {statusFilters.size > 0 && (
+                  <>
+                    <DropdownMenu.Separator className="my-1 h-px bg-border/50" />
+                    <DropdownMenu.Item
+                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                      onSelect={() => setStatusFilters(new Set())}
+                    >
+                      Clear filters
+                    </DropdownMenu.Item>
+                  </>
+                )}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        </div>
       </div>
 
-      {/* Columns */}
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-      >
-        <div className="flex flex-col gap-4 p-4">
-          {KAI_TASK_STATUS_COLUMNS.map((status) => (
-            <TaskQueueRow
-              key={status}
-              status={status}
-              tasks={tasksByStatus[status]}
-              selectedTaskId={state.selectedTaskId}
-              onTaskClick={handleTaskClick}
-            />
-          ))}
-        </div>
+      {/* Scrollable lanes */}
+      <div className="relative flex-1 min-h-0">
+        {/* Fade overlay */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
 
-        <DragOverlay dropAnimation={null}>
-          {activeTask && (
-            <div className="w-[180px] scale-105 rotate-1 opacity-90 shadow-lg shadow-black/20">
-              <TaskCard task={activeTask} onClick={() => {}} />
+        <div className="h-full overflow-y-auto">
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+          >
+            <div className="mx-auto max-w-3xl flex flex-col gap-4 px-4 pt-4 pb-6">
+              {KAI_TASK_STATUS_COLUMNS.map((status) => (
+                <TaskQueueRow
+                  key={status}
+                  status={status}
+                  tasks={tasksByStatus[status]}
+                  selectedTaskId={state.selectedTaskId}
+                  onTaskClick={handleTaskClick}
+                />
+              ))}
             </div>
-          )}
-        </DragOverlay>
-      </DndContext>
+
+            <DragOverlay dropAnimation={null}>
+              {activeTask && (
+                <div className="w-[180px] scale-105 rotate-1 opacity-90 shadow-lg shadow-black/20">
+                  <TaskCard task={activeTask} onClick={() => {}} />
+                </div>
+              )}
+            </DragOverlay>
+          </DndContext>
+        </div>
+      </div>
 
       {/* Read-only task preview modal */}
       <TaskDetailModal
