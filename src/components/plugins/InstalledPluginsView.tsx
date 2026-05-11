@@ -229,6 +229,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
               </div>
             ) : (
               <>
+                <p className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+                  Installed ({filteredPlugins.length})
+                </p>
                 {filteredPlugins.map((plugin) => {
                   const catalogEntry = catalogMap.get(plugin.name);
                   const hasUpdate =
