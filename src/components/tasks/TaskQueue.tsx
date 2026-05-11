@@ -43,8 +43,20 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 200); return () => clearTimeout(t); }, []);
-  useEffect(() => { if (!state.isLoading) { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); } }, [state.isLoading]);
+  useEffect(() => {
+    // Poll until the search input is in the DOM (loading state may delay its render)
+    let attempts = 0;
+    const tryFocus = () => {
+      if (searchRef.current) {
+        searchRef.current.focus();
+      } else if (attempts < 20) {
+        attempts++;
+        setTimeout(tryFocus, 50);
+      }
+    };
+    const t = setTimeout(tryFocus, 50);
+    return () => clearTimeout(t);
+  }, []);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
