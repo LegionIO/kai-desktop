@@ -119,9 +119,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
   const handleTaskClick = useCallback(
     (task: TaskFile) => {
-      setModalTaskId(task.id);
+      selectTask(task.id);
     },
-    [],
+    [selectTask],
   );
 
   const handleOpenFullView = useCallback(
