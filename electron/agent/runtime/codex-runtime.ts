@@ -259,9 +259,14 @@ export class CodexRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     try {
       // Build the effective text (with MCP tool hints if needed)
-      const effectiveText = bridgeUrl && customTools
+      let effectiveText = bridgeUrl && customTools
         ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
         : (textPrompt ?? '');
+
+      // Inject prior context on runtime switch (Codex has no system prompt API)
+      if (options.handoffContext) {
+        effectiveText = `${options.handoffContext}\n\n${effectiveText}`;
+      }
 
       // If there are images, use structured input; otherwise plain string
       const codexInput: CodexInput = imagePaths.length > 0

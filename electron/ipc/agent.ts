@@ -8,6 +8,7 @@ import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import { readConversationStore } from './conversations.js';
+import { detectRuntimeSwitch, generateHandoffContext } from '../agent/runtime-handoff.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1072,6 +1073,53 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const convStore = readConversationStore(appHome);
         const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
 
+        // -----------------------------------------------------------------------
+        // Cross-runtime handoff: detect runtime switch and inject prior context
+        // -----------------------------------------------------------------------
+        let handoffContext: string | undefined;
+        // Skip handoff for Mastra — it already receives the full message history natively.
+        if (runtime.id !== 'mastra') {
+          const previousRuntimeId = detectRuntimeSwitch(messages, runtime.id);
+          if (previousRuntimeId && modelEntry) {
+            const handoffToolCallId = `handoff-${Date.now()}`;
+            broadcastStreamEvent({
+              conversationId,
+              type: 'tool-call',
+              toolCallId: handoffToolCallId,
+              toolName: 'runtime_handoff',
+              args: { fromRuntime: previousRuntimeId, toRuntime: runtime.id },
+              startedAt: new Date().toISOString(),
+            });
+
+            const generatedContext = await generateHandoffContext(
+              messages,
+              modelEntry.modelConfig,
+              { abortSignal: controller.signal },
+            );
+
+            broadcastStreamEvent({
+              conversationId,
+              type: 'tool-result',
+              toolCallId: handoffToolCallId,
+              toolName: 'runtime_handoff',
+              result: generatedContext
+                ? `Context transferred (${generatedContext.length} chars)`
+                : 'No prior context to transfer',
+              finishedAt: new Date().toISOString(),
+            });
+
+            if (generatedContext && !controller.signal.aborted) {
+              handoffContext = generatedContext;
+              effectiveSystemPrompt = effectiveSystemPrompt
+                ? `${generatedContext}\n\n${effectiveSystemPrompt}`
+                : generatedContext;
+              if (streamConfig) {
+                streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
+              }
+            }
+          }
+        }
+
         const stream = runtime.stream({
           conversationId,
           messages,
@@ -1085,6 +1133,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           primaryModel: modelEntry,
           claudeAuth: resolution.claudeAuth,
           conversationMetadata: convMetadata,
+          handoffContext,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,

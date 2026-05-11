@@ -329,12 +329,21 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // On app restart the in-memory sessionMap is empty, so fall back to the
     // persisted claudeSdkSessionId from the conversation's metadata (written to disk
     // when the enrichment event arrived in the previous session).
-    const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
-    if (persistedSessionId && !this.sessionMap.has(conversationId)) {
-      debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
-      this.sessionMap.set(conversationId, persistedSessionId);
+    //
+    // When handoff context is present, skip session resume — the prior session was
+    // from a different runtime, so resuming it would fail or produce stale context.
+    let existingSessionId: string | undefined;
+    if (options.handoffContext) {
+      debugLog(`[SESSION] Skipping session resume — cross-runtime handoff active`);
+      existingSessionId = undefined;
+    } else {
+      const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
+      if (persistedSessionId && !this.sessionMap.has(conversationId)) {
+        debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
+        this.sessionMap.set(conversationId, persistedSessionId);
+      }
+      existingSessionId = this.sessionMap.get(conversationId);
     }
-    const existingSessionId = this.sessionMap.get(conversationId);
 
     // Use pre-resolved auth from the model-runtime compatibility layer.
     // This ensures Kai is always in control of which model + endpoint is used,

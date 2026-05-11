@@ -142,6 +142,18 @@ export type StreamOptions = {
    *   - `codexSdkThreadId` (Codex SDK): resume the Codex thread
    */
   conversationMetadata?: Record<string, unknown>;
+
+  /**
+   * Injected prior conversation context for cross-runtime handoff.
+   * When present, indicates the runtime is being used for the first time in this
+   * conversation (switched from a different runtime). The context contains a
+   * transcript or summary of prior turns.
+   *
+   * - Claude Code SDK: skip session resume (prior session is from another runtime)
+   * - Codex SDK: prepend to the user prompt (Codex has no system prompt API)
+   * - Mastra: not used (Mastra already receives full message history)
+   */
+  handoffContext?: string;
 };
 
 // ---------------------------------------------------------------------------
