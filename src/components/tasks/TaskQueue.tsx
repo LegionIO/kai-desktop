@@ -47,11 +47,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     let cancelled = false;
     const tryFocus = () => {
       if (cancelled) return;
-      console.warn('[TaskQueue] tryFocus — ref:', searchRef.current, 'isLoading:', state.isLoading);
-      if (searchRef.current) {
-        searchRef.current.focus();
-        console.warn('[TaskQueue] focus() called, activeElement:', document.activeElement);
-      }
+      if (searchRef.current) searchRef.current.focus();
     };
     const t = setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(tryFocus)), 50);
     return () => { cancelled = true; clearTimeout(t); };
