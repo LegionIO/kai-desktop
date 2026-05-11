@@ -18,7 +18,7 @@ import {
   type DragEndEvent,
 } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
-import { SearchIcon, FilterIcon, XIcon } from 'lucide-react';
+import { SearchIcon, SlidersHorizontalIcon, XIcon } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
@@ -201,7 +201,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                 }`}
                 aria-label="Filter by status"
               >
-                <FilterIcon className="h-4 w-4" />
+                <SlidersHorizontalIcon className="h-4 w-4" />
                 {statusFilters.size > 0 && (
                   <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-primary-foreground">
                     {statusFilters.size}
