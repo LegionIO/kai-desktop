@@ -108,9 +108,13 @@ function getDefaultConfig() {
     systemPrompts: {
       chat: '',
       plan: '',
-      implement: '',
       computerUse: '',
       taskPlan: '',
+    },
+    titleGeneration: {
+      enabled: true,
+      retitleIntervalMessages: 5,
+      retitleEagerUntilMessage: 3,
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
@@ -713,6 +717,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     skills: config.skills,
     systemPrompt: config.systemPrompt,
     systemPrompts: config.systemPrompts,
+    titleGeneration: config.titleGeneration,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
     marketplace: config.marketplace,

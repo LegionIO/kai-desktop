@@ -336,6 +336,7 @@ const appAPI = {
   },
 
   computerUse: {
+    startSession: (goal: string, options: unknown) => ipcRenderer.invoke('computer-use:start-session', goal, options),
     pauseSession: (sessionId: string) => ipcRenderer.invoke('computer-use:pause-session', sessionId),
     resumeSession: (sessionId: string) => ipcRenderer.invoke('computer-use:resume-session', sessionId),
     stopSession: (sessionId: string) => ipcRenderer.invoke('computer-use:stop-session', sessionId),

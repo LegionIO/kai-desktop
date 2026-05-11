@@ -65,6 +65,52 @@ function shellEscape(s: string): string {
 }
 
 /**
+ * Locate the staged update artifact on disk.
+ *
+ * Preferred source: the `downloadedFile` path captured from the
+ * `update-downloaded` event — that is the exact, authoritative path
+ * electron-updater wrote the artifact to.
+ *
+ * Fallback: scan both possible cache directories for a .zip artifact.
+ * electron-updater places pending artifacts under
+ * `~/Library/Caches/<updaterCacheDirName>/pending/`, where
+ * `updaterCacheDirName` comes from `app-update.yml` (for this app,
+ * "kai-updater"). Older assumptions pointed at `app.getName()` ("Kai")
+ * with a hardcoded `update.zip` filename — both of which are wrong on a
+ * real notarized build, which is why Install Update was silently failing.
+ * We try the correct path first, then the legacy guess, before giving up.
+ */
+function resolveDownloadedUpdatePath(): string | null {
+  if (downloadedFilePath && existsSync(downloadedFilePath)) {
+    return downloadedFilePath;
+  }
+
+  const homedir = app.getPath('home');
+  const candidateDirs = [
+    // Correct location per app-update.yml (updaterCacheDirName: kai-updater).
+    join(homedir, 'Library', 'Caches', 'kai-updater', 'pending'),
+    // Legacy guess we used to hardcode — kept only as a last-ditch fallback.
+    join(homedir, 'Library', 'Caches', app.getName(), 'pending'),
+  ];
+
+  for (const dir of candidateDirs) {
+    if (!existsSync(dir)) continue;
+    try {
+      const entries = readdirSync(dir);
+      // Prefer the real release artifact (e.g. "Kai-1.0.68-arm64.zip");
+      // fall back to the old hardcoded filename if present.
+      const zips = entries.filter((e) => e.endsWith('.zip'));
+      const preferred = zips.find((e) => e !== 'update.zip') ?? zips.find((e) => e === 'update.zip');
+      if (preferred) return join(dir, preferred);
+    } catch {
+      /* ignore and try next candidate */
+    }
+  }
+
+  return null;
+}
+
+/**
  * Attempt to install the downloaded update by manually extracting the zip
  * and replacing the app bundle via osascript with administrator privileges.
  *
@@ -84,17 +130,12 @@ async function attemptInstall(): Promise<boolean> {
   const appName = basename(appPath); // e.g. "Kai.app"
   const appDir = dirname(appPath); // e.g. "/Applications"
 
-  // Locate the downloaded update zip in electron-updater's cache
-  // Cache path: ~/Library/Caches/<appName>/pending/update.zip
-  const homedir = app.getPath('home');
-  const cacheName = app.getName(); // "Kai" (from package.json name or productName)
-  const cachePath = join(homedir, 'Library', 'Caches', cacheName, 'pending');
-  const zipPath = join(cachePath, 'update.zip');
-
-  if (!existsSync(zipPath)) {
-    console.error('[auto-update] Cannot find downloaded update at:', zipPath);
+  const zipPath = resolveDownloadedUpdatePath();
+  if (!zipPath) {
+    console.error('[auto-update] Cannot find downloaded update artifact. Checked downloadedFile event payload and both ~/Library/Caches/kai-updater/pending/ and ~/Library/Caches/Kai/pending/.');
     return false;
   }
+  console.info('[auto-update] Installing from artifact:', zipPath);
 
   // Create a temp directory for extraction
   const tempDir = mkdtempSync(join(tmpdir(), 'kai-update-'));
@@ -277,6 +318,7 @@ export function checkForUpdatesInteractive(): void {
 
 let downloaded = false;
 let downloadedVersion: string | undefined;
+let downloadedFilePath: string | undefined;
 let pendingVersion: string | undefined;
 
 export function registerAutoUpdateHandlers(
@@ -312,6 +354,13 @@ export function registerAutoUpdateHandlers(
   autoUpdater.on('update-downloaded', (info) => {
     downloaded = true;
     downloadedVersion = info.version;
+    // electron-updater sets `downloadedFile` to the absolute path of the
+    // staged artifact. Capture it so attemptInstall() can use it directly
+    // instead of guessing the cache location + filename.
+    const maybeFile = (info as { downloadedFile?: unknown }).downloadedFile;
+    if (typeof maybeFile === 'string' && maybeFile.length > 0) {
+      downloadedFilePath = maybeFile;
+    }
     broadcast({ state: 'downloaded', version: info.version });
     onUpdateDownloaded?.();
   });

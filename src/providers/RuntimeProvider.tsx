@@ -930,6 +930,36 @@ async function persistConversation(
 
 // --- Title generation logic ---
 
+// Retitle cadence defaults (used when config.titleGeneration is absent).
+// Intent: eagerly refine early (topic usually crystallizes in the first few
+// turns), then refresh periodically.
+const DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE = 3;
+const DEFAULT_RETITLE_INTERVAL_MESSAGES = 5;
+
+type TitleGenerationSettings = {
+  enabled: boolean;
+  retitleIntervalMessages: number;
+  retitleEagerUntilMessage: number;
+};
+
+async function getTitleGenerationSettings(): Promise<TitleGenerationSettings> {
+  try {
+    const config = await app.config.get() as { titleGeneration?: Partial<TitleGenerationSettings> } | null;
+    const tg = config?.titleGeneration ?? {};
+    return {
+      enabled: tg.enabled ?? true,
+      retitleIntervalMessages: Math.max(1, tg.retitleIntervalMessages ?? DEFAULT_RETITLE_INTERVAL_MESSAGES),
+      retitleEagerUntilMessage: Math.max(0, tg.retitleEagerUntilMessage ?? DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE),
+    };
+  } catch {
+    return {
+      enabled: true,
+      retitleIntervalMessages: DEFAULT_RETITLE_INTERVAL_MESSAGES,
+      retitleEagerUntilMessage: DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE,
+    };
+  }
+}
+
 // Track last retitle count per conversation to avoid duplicate title gen
 const lastRetitleCount = new Map<string, number>();
 const titleGenInFlight = new Set<string>();
@@ -947,14 +977,25 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
     if (!conv) return;
 
-    const userMessageCount = messages.filter((m) => m.role === 'user').length;
+    // Don't clobber a user-renamed conversation. Rename sites
+    // (src/App.tsx, src/components/conversations/*) set titleStatus='manual'.
+    if (conv.titleStatus === 'manual') return;
 
-    // Always attempt on the first user message.
-    // On subsequent messages, retry only if the conversation still has no title
-    // (both title and fallbackTitle are empty), which means prior generation failed.
-    const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
-    if (userMessageCount !== 1 && !hasNoTitle) return;
+    const settings = await getTitleGenerationSettings();
+    if (!settings.enabled) return;
+
+    const userMessageCount = messages.filter((m) => m.role === 'user').length;
     if (userMessageCount < 1) return;
+
+    // Retitle cadence:
+    //   - always run on the first user message,
+    //   - eagerly refine for the first few messages (quick topic drift),
+    //   - then every N user messages thereafter,
+    //   - plus a retry if generation failed and no title/fallbackTitle landed.
+    const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
+    const isEager = userMessageCount <= settings.retitleEagerUntilMessage;
+    const isOnInterval = userMessageCount % settings.retitleIntervalMessages === 0;
+    if (!isEager && !isOnInterval && !hasNoTitle) return;
 
     // Dedup: don't regenerate if we already did for this exact user message count
     const lastCount = lastRetitleCount.get(conversationId);
@@ -1837,6 +1878,7 @@ export function RuntimeProvider({
             cfg.fallbackEnabled ?? false,
             currentWorkingDirectoryRef.current ?? undefined,
             executionMode ?? 'auto',
+            cfg.threadOverrides ?? undefined,
           );
           return;
         }
@@ -2288,6 +2330,7 @@ export function RuntimeProvider({
         cfg.fallbackEnabled ?? false,
         currentWorkingDirectoryRef.current ?? undefined,
         executionMode ?? 'auto',
+        cfg.threadOverrides ?? undefined,
       );
       return updated;
     });

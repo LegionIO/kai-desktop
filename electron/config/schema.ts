@@ -181,9 +181,14 @@ const profileConfigSchema = z.object({
 const systemPromptsConfigSchema = z.object({
   chat: z.string().optional(),
   plan: z.string().optional(),
-  implement: z.string().optional(),
   computerUse: z.string().optional(),
   taskPlan: z.string().optional(),
+});
+
+const titleGenerationConfigSchema = z.object({
+  enabled: z.boolean(),
+  retitleIntervalMessages: z.number().positive(),
+  retitleEagerUntilMessage: z.number().nonnegative(),
 });
 
 const fallbackConfigSchema = z.object({
@@ -482,6 +487,7 @@ export const appConfigSchema = z.object({
   }),
   systemPrompt: z.string(),
   systemPrompts: systemPromptsConfigSchema.optional(),
+  titleGeneration: titleGenerationConfigSchema.optional(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
   marketplace: marketplaceConfigSchema.optional(),

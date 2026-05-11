@@ -1,10 +1,24 @@
 import { type FC, useState, useEffect, useCallback } from 'react';
 import { Trash2Icon, LoaderIcon, CheckCircle2Icon, AlertTriangleIcon, HardDriveIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
+import { Toggle, NumberField, settingsSelectClass, type SettingsProps } from './shared';
 
 export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
-  const ui = config.ui as { theme: string; sidebarWidth: number; fullWidthContent?: boolean; splashBackground?: string };
+  const ui = config.ui as {
+    theme: string;
+    sidebarWidth: number;
+    fullWidthContent?: boolean;
+    splashBackground?: string;
+    composer?: { showModelProfileSelector?: boolean };
+  };
+  const titleGen = (config.titleGeneration as {
+    enabled?: boolean;
+    retitleIntervalMessages?: number;
+    retitleEagerUntilMessage?: number;
+  } | undefined) ?? {};
+  const titleGenEnabled = titleGen.enabled ?? true;
+  const titleInterval = titleGen.retitleIntervalMessages ?? 5;
+  const titleEager = titleGen.retitleEagerUntilMessage ?? 3;
 
   return (
     <div className="space-y-6">
@@ -55,6 +69,49 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
             onChange={(v) => updateConfig('ui.fullWidthContent', v)}
           />
         </div>
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Chat Titles</legend>
+        <Toggle
+          label="Auto-generate chat titles"
+          checked={titleGenEnabled}
+          onChange={(v) => updateConfig('titleGeneration.enabled', v)}
+        />
+        <p className="text-[10px] text-muted-foreground -mt-2">
+          Use AI to title and refresh conversations automatically. Manually renamed chats are never overwritten.
+        </p>
+        {titleGenEnabled && (
+          <>
+            <NumberField
+              label="Refresh every N user messages"
+              value={titleInterval}
+              onChange={(v) => updateConfig('titleGeneration.retitleIntervalMessages', Math.max(1, v || 1))}
+              min={1}
+            />
+            <NumberField
+              label="Eagerly refresh for the first N messages"
+              value={titleEager}
+              onChange={(v) => updateConfig('titleGeneration.retitleEagerUntilMessage', Math.max(0, v || 0))}
+              min={0}
+            />
+            <p className="text-[10px] text-muted-foreground -mt-2">
+              Eager refresh catches early topic drift; interval refresh keeps long chats titled sensibly.
+            </p>
+          </>
+        )}
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Advanced</legend>
+        <Toggle
+          label="Show model & profile selector in composer"
+          checked={!!ui.composer?.showModelProfileSelector}
+          onChange={(v) => updateConfig('ui.composer.showModelProfileSelector', v)}
+        />
+        <p className="text-[10px] text-muted-foreground -mt-2">
+          Display inline model and profile dropdowns in the chat composer toolbar.
+        </p>
       </fieldset>
 
       <PartitionManager />
