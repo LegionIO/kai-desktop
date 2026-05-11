@@ -111,67 +111,70 @@ export const PluginMarketplace: FC = () => {
     );
 
   return (
-    <div className="relative flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0">
       {/* Fixed search + refresh bar */}
-      <div className="relative z-10 shrink-0 px-4 pt-6 pb-3">
-        <div className="mx-auto max-w-3xl rounded-2xl bg-background/60 backdrop-blur-md px-4 py-3 flex flex-col gap-3">
-          {/* Search row */}
-          <div className="flex items-center gap-2">
-            <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
-              <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <input
-                ref={searchRef}
-                type="text"
-                placeholder="Search marketplace…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
-                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery('')}
-                  className="shrink-0 rounded p-0.5 hover:bg-muted transition-colors"
-                >
-                  <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                </button>
-              )}
-            </div>
-            <Tooltip content={justRefreshed ? 'Up to date' : 'Refresh catalog'} side="bottom">
+      <div className="shrink-0 pt-6 pb-2">
+        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2">
+          <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
+            <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <input
+              ref={searchRef}
+              type="text"
+              placeholder="Search marketplace…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
+              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+            />
+            {searchQuery && (
               <button
                 type="button"
-                onClick={handleRefresh}
-                disabled={refreshing || justRefreshed}
-                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition-colors disabled:opacity-50 ${
-                  justRefreshed
-                    ? 'border-green-500/30 bg-green-500/10 text-green-400'
-                    : 'border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/60 hover:text-foreground'
-                }`}
+                onClick={() => setSearchQuery('')}
+                className="shrink-0 rounded p-0.5 hover:bg-muted transition-colors"
               >
-                {refreshing ? (
-                  <RefreshCwIcon className="h-4 w-4 animate-spin" />
-                ) : justRefreshed ? (
-                  <CheckIcon className="h-4 w-4" />
-                ) : (
-                  <RefreshCwIcon className="h-4 w-4" />
-                )}
+                <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
-            </Tooltip>
+            )}
           </div>
-          {/* Count label inside the glass panel */}
-          {availablePlugins.length > 0 && (
-            <p className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-              Available ({availablePlugins.length})
-            </p>
-          )}
+          <Tooltip content={justRefreshed ? 'Up to date' : 'Refresh catalog'} side="bottom">
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={refreshing || justRefreshed}
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors disabled:opacity-50 ${
+                justRefreshed
+                  ? 'text-green-400'
+                  : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+              }`}
+            >
+              {refreshing ? (
+                <RefreshCwIcon className="h-4 w-4 animate-spin" />
+              ) : justRefreshed ? (
+                <CheckIcon className="h-4 w-4" />
+              ) : (
+                <RefreshCwIcon className="h-4 w-4" />
+              )}
+            </button>
+          </Tooltip>
         </div>
       </div>
 
-      {/* Scrollable content — no fade line, splash provides separation */}
-      <div className="relative z-10 flex-1 min-h-0">
+      {/* Scrollable content with fade at top */}
+      <div className="relative flex-1 min-h-0">
+        {/* Fade overlay */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
+
+        {/* "Available (N)" label floats above the fade */}
+        {availablePlugins.length > 0 && (
+          <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-10 flex items-center">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              Available ({availablePlugins.length})
+            </p>
+          </div>
+        )}
+
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pt-4 pb-6 space-y-3">
+          <div className="mx-auto max-w-3xl px-4 pt-10 pb-6 space-y-3">
 
             {/* Error banner */}
             {error && (
