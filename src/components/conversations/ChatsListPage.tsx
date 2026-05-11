@@ -335,9 +335,9 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   return (
     <div className="flex flex-col h-full min-h-0 pt-12 md:pt-14">
 
-      {/* Fixed toolbar: search + filter + sort */}
+      {/* Fixed toolbar: search + filter + sort only */}
       <div className="shrink-0 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl px-4 space-y-2">
+        <div className="mx-auto max-w-3xl px-4">
           <div className="flex items-center gap-2">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
               <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -485,70 +485,71 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
             </DropdownMenu.Root>
           </div>
         </div>
-        {/* Always-present h-8 placeholder for selection bar — prevents layout jump */}
-        <div className="mx-auto max-w-3xl px-4 mt-2 h-8 flex items-center">
-          {isSelecting && (
-            <>
-              <button
-                type="button"
-                onClick={toggleSelectAll}
-                className="flex h-8 w-7 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-muted/60"
-                aria-label={allSelected ? 'Deselect all' : 'Select all'}
-              >
-                {allSelected ? (
-                  <div className="flex h-4 w-4 items-center justify-center rounded bg-[var(--brand-accent)]">
-                    <CheckIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
-                  </div>
-                ) : someSelected ? (
-                  <div className="flex h-4 w-4 items-center justify-center rounded bg-[var(--brand-accent)]">
-                    <MinusIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
-                  </div>
-                ) : (
-                  <div className="h-4 w-4 rounded border-2 border-muted-foreground/40" />
-                )}
-              </button>
-              <span className="flex-1 ml-2 text-sm font-medium text-foreground">
-                {selectedIds.size} selected
-              </span>
-              <div className="flex items-center gap-2">
-                <Tooltip content={filterMode === 'archived' ? 'Unarchive selected' : 'Archive selected'} side="bottom">
-                  <button
-                    type="button"
-                    onClick={() => void handleBulkArchive()}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
-                  >
-                    <ArchiveIcon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
-                <Tooltip content="Delete selected" side="bottom">
-                  <button
-                    type="button"
-                    onClick={() => setBulkDeleteOpen(true)}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                  >
-                    <Trash2Icon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
-                <Tooltip content="Cancel selection" side="bottom">
-                  <button
-                    type="button"
-                    onClick={() => setSelectedIds(new Set())}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                  >
-                    <XIcon className="h-4 w-4" />
-                  </button>
-                </Tooltip>
-              </div>
-            </>
-          )}
-        </div>
       </div>
 
-      {/* Scrollable content with fade at top */}
+      {/* Scrollable content with fade + floating selection bar */}
       <div className="relative flex-1 min-h-0">
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
+        {/* Fade starts right below the search bar */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
+
+        {/* Selection bar floats above the list */}
+        {isSelecting && (
+          <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-8 flex items-center">
+            <button
+              type="button"
+              onClick={toggleSelectAll}
+              className="flex h-8 w-7 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-muted/60"
+              aria-label={allSelected ? 'Deselect all' : 'Select all'}
+            >
+              {allSelected ? (
+                <div className="flex h-4 w-4 items-center justify-center rounded bg-[var(--brand-accent)]">
+                  <CheckIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
+                </div>
+              ) : someSelected ? (
+                <div className="flex h-4 w-4 items-center justify-center rounded bg-[var(--brand-accent)]">
+                  <MinusIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
+                </div>
+              ) : (
+                <div className="h-4 w-4 rounded border-2 border-muted-foreground/40" />
+              )}
+            </button>
+            <span className="flex-1 ml-2 text-sm font-medium text-foreground">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              <Tooltip content={filterMode === 'archived' ? 'Unarchive selected' : 'Archive selected'} side="bottom">
+                <button
+                  type="button"
+                  onClick={() => void handleBulkArchive()}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
+                >
+                  <ArchiveIcon className="h-4 w-4" />
+                </button>
+              </Tooltip>
+              <Tooltip content="Delete selected" side="bottom">
+                <button
+                  type="button"
+                  onClick={() => setBulkDeleteOpen(true)}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <Trash2Icon className="h-4 w-4" />
+                </button>
+              </Tooltip>
+              <Tooltip content="Cancel selection" side="bottom">
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds(new Set())}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                >
+                  <XIcon className="h-4 w-4" />
+                </button>
+              </Tooltip>
+            </div>
+          </div>
+        )}
+
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pb-6">
+          <div className="mx-auto max-w-3xl px-4 pt-10 pb-6">
 
             {/* Conversation rows */}
             <div className="flex flex-col">
