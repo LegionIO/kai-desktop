@@ -390,8 +390,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
             {/* Filter dropdown */}
             <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <Tooltip content="Filter" side="bottom">
+              <Tooltip content="Filter" side="bottom">
+                <DropdownMenu.Trigger asChild>
                   <button
                     type="button"
                     className={cn(
@@ -406,8 +406,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                       <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-primary" />
                     )}
                   </button>
-                </Tooltip>
-              </DropdownMenu.Trigger>
+                </DropdownMenu.Trigger>
+              </Tooltip>
               <DropdownMenu.Portal>
                 <DropdownMenu.Content
                   align="end"
@@ -438,8 +438,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
             {/* Sort dropdown */}
             <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <Tooltip content="Sort" side="bottom">
+              <Tooltip content="Sort" side="bottom">
+                <DropdownMenu.Trigger asChild>
                   <button
                     type="button"
                     className={cn(
@@ -454,8 +454,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                       <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-primary" />
                     )}
                   </button>
-                </Tooltip>
-              </DropdownMenu.Trigger>
+                </DropdownMenu.Trigger>
+              </Tooltip>
               <DropdownMenu.Portal>
                 <DropdownMenu.Content
                   align="end"
