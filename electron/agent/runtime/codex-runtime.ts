@@ -291,6 +291,59 @@ export class CodexRuntime implements AgentRuntime {
         return;
       }
 
+      // If resume failed (thread expired/deleted), retry with a fresh thread
+      const isThreadNotFound = resumeId &&
+        err instanceof Error &&
+        (err.message.includes('not found') ||
+         err.message.includes('expired') ||
+         err.message.includes('No thread') ||
+         err.message.includes('invalid_thread'));
+
+      if (isThreadNotFound) {
+        console.warn(`[codex-runtime] Thread resume failed (id=${resumeId}), retrying with fresh thread`);
+        try {
+          const freshThread = codex.startThread(threadOptions);
+
+          const effectiveText = bridgeUrl && customTools
+            ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
+            : (textPrompt ?? '');
+
+          const codexInput: CodexInput = imagePaths.length > 0
+            ? [
+                ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+                ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+              ]
+            : effectiveText;
+
+          const { events: retryEvents } = await freshThread.runStreamed(codexInput, {
+            signal: abortSignal,
+          });
+
+          for await (const event of retryEvents) {
+            if (abortSignal?.aborted) break;
+
+            const translated = translateCodexEvent(conversationId, event);
+            for (const evt of translated) {
+              yield evt;
+            }
+          }
+
+          yield { conversationId, type: 'done' };
+        } catch (retryErr) {
+          if (abortSignal?.aborted) {
+            yield { conversationId, type: 'done' };
+            return;
+          }
+          yield {
+            conversationId,
+            type: 'error',
+            error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+          };
+          yield { conversationId, type: 'done' };
+        }
+        return;
+      }
+
       yield {
         conversationId,
         type: 'error',
