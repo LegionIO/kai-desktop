@@ -2,8 +2,8 @@
  * Types shared between main and renderer process for the Agents feature.
  */
 
-export type AgentRuntime = 'claude-code' | 'codex' | 'mastra';
-export type AgentStatus = 'idle' | 'running' | 'paused' | 'error';
+export type AgentRuntime = 'auto' | 'claude-code' | 'codex' | 'mastra';
+export type AgentStatus = 'idle' | 'running' | 'error';
 export type AgentRole = 'general' | 'engineer' | 'reviewer' | 'researcher';
 
 export interface AgentRuntimeConfig {
@@ -39,6 +39,10 @@ export interface AgentFile {
   icon?: string;
   /** What this agent specializes in. */
   description?: string;
+  /** System prompt / instructions for this agent. */
+  instructions?: string;
+  /** ID of the matched role template from the catalog. */
+  matchedRoleId?: string;
   /** ID of the task currently assigned to this agent. */
   currentTaskId?: string;
   /** Active PTY session ID (set when running). */
@@ -53,11 +57,12 @@ export interface AgentFile {
 
 /** Payload for creating a new agent. */
 export interface CreateAgentPayload {
-  name: string;
+  name?: string;
   role: AgentRole;
   runtime: AgentRuntime;
   icon?: string;
   description?: string;
+  instructions?: string;
   config?: Partial<AgentRuntimeConfig>;
   workspaceId?: string;
 }

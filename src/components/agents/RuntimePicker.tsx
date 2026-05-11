@@ -3,7 +3,7 @@
  */
 
 import type { FC } from 'react';
-import { TerminalIcon, BrainIcon, ZapIcon } from 'lucide-react';
+import { TerminalIcon, BrainIcon, ZapIcon, SparklesIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AgentRuntime } from '../../../shared/agent-types';
 
@@ -16,15 +16,21 @@ interface RuntimeOption {
 
 const RUNTIME_OPTIONS: RuntimeOption[] = [
   {
+    id: 'auto',
+    label: 'Auto',
+    description: 'Inherit from your preferred runtime setting',
+    icon: SparklesIcon,
+  },
+  {
     id: 'claude-code',
     label: 'Claude Code',
-    description: 'Anthropic\'s agentic coding CLI',
+    description: "Anthropic's agentic coding CLI",
     icon: TerminalIcon,
   },
   {
     id: 'codex',
     label: 'Codex',
-    description: 'OpenAI\'s coding agent CLI',
+    description: "OpenAI's coding agent CLI",
     icon: BrainIcon,
   },
   {

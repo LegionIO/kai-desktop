@@ -220,15 +220,33 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
                         state.selectedTaskId === task.id ? 'text-primary' : 'text-muted-foreground',
                       )}
                     />
-                    <div className="flex-1 min-w-0">
-                      <span className="line-clamp-2 text-sm font-medium text-sidebar-foreground/95">
-                        {task.title}
-                      </span>
-                      <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
-                        {KAI_TASK_STATUS_LABELS[task.status]}
-                        <span className="mx-1">·</span>
-                        {formatRelativeTime(task.updatedAt)}
-                      </span>
+                    <div className="flex flex-col flex-1 min-w-0">
+                      {(() => {
+                        const isPending = task.title === 'New Task';
+                        return (
+                          <>
+                            <span className={cn(
+                              'line-clamp-2 text-sm font-medium',
+                              isPending ? 'italic text-muted-foreground/50' : 'text-sidebar-foreground/95',
+                            )}>
+                              {task.title}
+                            </span>
+                            <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
+                              {KAI_TASK_STATUS_LABELS[task.status]}
+                              <span className="mx-1">·</span>
+                              {task.status === 'in_progress' ? (
+                                <div className="flex items-center gap-[3px]">
+                                  <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:0ms]" />
+                                  <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:150ms]" />
+                                  <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:300ms]" />
+                                </div>
+                              ) : (
+                                formatRelativeTime(task.updatedAt)
+                              )}
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
                     <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
                       {isPinned && <PinIcon className="h-3 w-3 text-muted-foreground" />}

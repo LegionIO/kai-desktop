@@ -19,12 +19,6 @@ const STATUS_CONFIG: Record<AgentStatus, { label: string; dotColor: string; bgCo
     bgColor: 'bg-emerald-500/10',
     textColor: 'text-emerald-600 dark:text-emerald-400',
   },
-  paused: {
-    label: 'Paused',
-    dotColor: 'bg-amber-500',
-    bgColor: 'bg-amber-500/10',
-    textColor: 'text-amber-600 dark:text-amber-400',
-  },
   error: {
     label: 'Error',
     dotColor: 'bg-red-500',

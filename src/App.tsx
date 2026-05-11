@@ -55,6 +55,8 @@ import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import { AgentListPanel } from '@/components/agents/AgentListPanel';
 import { AgentSwarmView } from '@/components/agents/AgentSwarmView';
+import { AgentRenameModal } from '@/components/agents/AgentRenameModal';
+import { DeleteAgentModal } from '@/components/agents/DeleteAgentModal';
 import { ChatsListPage } from '@/components/conversations/ChatsListPage';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
@@ -427,6 +429,7 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 function AppShell() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [activeConversationTitle, setActiveConversationTitle] = useState<string | null>(null);
+  const [activeConversationHasMessages, setActiveConversationHasMessages] = useState(false);
   const [activeView, setActiveView] = useState<AppView>('chat');
   const [threadMode, setThreadMode] = useState<ThreadMode>('chat');
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
@@ -463,6 +466,8 @@ function AppShell() {
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
   const [taskTitleMenuOpen, setTaskTitleMenuOpen] = useState(false);
   const [agentTitleMenuOpen, setAgentTitleMenuOpen] = useState(false);
+  const [agentRenameModal, setAgentRenameModal] = useState<{ id: string; value: string } | null>(null);
+  const [agentDeleteModal, setAgentDeleteModal] = useState<{ id: string; name: string } | null>(null);
   const [renamingTask, setRenamingTask] = useState(false);
   const [taskRenameValue, setTaskRenameValue] = useState('');
   const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
@@ -588,6 +593,7 @@ function AppShell() {
         conversation,
         resolvedActiveId ? cuSessionsByConversation.get(resolvedActiveId) : undefined,
       ));
+      setActiveConversationHasMessages((conversation as { messageCount?: number } | null)?.messageCount ? ((conversation as { messageCount: number }).messageCount > 0) : false);
     };
 
     const loadActiveConversation = async () => {
@@ -805,6 +811,7 @@ function AppShell() {
       setActiveView(CHAT_VIEW);
       setActiveConversationId(newId);
       setActiveConversationTitle(null);
+      setActiveConversationHasMessages(false);
       setSelectedModelKey(null);
       setSelectedProfileKey(null);
       setFallbackEnabled(false);
@@ -1577,11 +1584,15 @@ function AppShell() {
                   </div>
                 ) : activeView === AGENTS_VIEW ? (
                   (() => {
+                    if (agentsCtx.state.isCreatingAgent) {
+                      return null;
+                    }
                     const selectedAgentId = agentsCtx.state.selectedAgentId;
                     const selectedAgent = selectedAgentId
                       ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
                       : null;
                     if (selectedAgent) {
+                      const agentIsPending = selectedAgent.name === 'New Agent';
                       return (
                         <div className="flex items-center gap-1.5">
                           <button
@@ -1595,10 +1606,10 @@ function AppShell() {
                           <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
                             <DropdownMenu.Trigger asChild>
                               <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                                <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                                  {selectedAgent.name}
+                                <span className={`whitespace-nowrap text-sm font-medium ${agentIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
+                                  {agentIsPending ? 'Generating…' : selectedAgent.name}
                                 </span>
-                                <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                {!agentIsPending && <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />}
                               </button>
                             </DropdownMenu.Trigger>
                             <DropdownMenu.Portal>
@@ -1608,8 +1619,16 @@ function AppShell() {
                                 className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                               >
                                 <DropdownMenu.Item
+                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                  onSelect={() => { setAgentRenameModal({ id: selectedAgent.id, value: selectedAgent.name }); setAgentTitleMenuOpen(false); }}
+                                >
+                                  <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                  <span>Rename</span>
+                                </DropdownMenu.Item>
+                                <div className="my-1 h-px bg-border/60" />
+                                <DropdownMenu.Item
                                   className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                  onSelect={() => { void agentsCtx.deleteAgent(selectedAgent.id); agentsCtx.selectAgent(null); }}
+                                  onSelect={() => { setAgentDeleteModal({ id: selectedAgent.id, name: selectedAgent.name }); setAgentTitleMenuOpen(false); }}
                                 >
                                   <Trash2Icon className="h-4 w-4" />
                                   <span>Delete Agent</span>
@@ -1630,6 +1649,7 @@ function AppShell() {
                     const selectedTaskId = tasksCtx?.state.selectedTaskId;
                     const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
                     if (selectedTask) {
+                      const taskIsPending = selectedTask.title === 'New Task';
                       return (
                         <div className="flex items-center gap-1.5">
                           <button
@@ -1643,10 +1663,10 @@ function AppShell() {
                           <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
                             <DropdownMenu.Trigger asChild>
                               <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                                <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                <span className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
                                   {selectedTask.title}
                                 </span>
-                                <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                {!taskIsPending && <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />}
                               </button>
                             </DropdownMenu.Trigger>
                             <DropdownMenu.Portal>
@@ -1812,6 +1832,20 @@ function AppShell() {
                       Chats
                     </div>
                   </div>
+                ) : activeConversationId && !activeConversationTitle && activeConversationHasMessages ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => { setActiveView(CHAT_LIST_VIEW); }}
+                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                    >
+                      Chats
+                    </button>
+                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                    <span className="whitespace-nowrap rounded-lg px-2 py-1 text-sm font-medium italic text-muted-foreground/50">
+                      New Chat
+                    </span>
+                  </div>
                 ) : activeConversationId && activeConversationTitle ? (
                   <div className="flex items-center gap-1.5">
                     <button
@@ -1956,6 +1990,20 @@ function AppShell() {
               ) : activeView === AGENTS_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0">
                   <AgentSwarmView />
+                  {agentRenameModal && (
+                    <AgentRenameModal
+                      initialValue={agentRenameModal.value}
+                      onSave={(name) => { void agentsCtx.updateAgent(agentRenameModal.id, { name }); setAgentRenameModal(null); }}
+                      onClose={() => setAgentRenameModal(null)}
+                    />
+                  )}
+                  {agentDeleteModal && (
+                    <DeleteAgentModal
+                      agentName={agentDeleteModal.name}
+                      onConfirm={() => { void agentsCtx.deleteAgent(agentDeleteModal.id); agentsCtx.selectAgent(null); }}
+                      onClose={() => setAgentDeleteModal(null)}
+                    />
+                  )}
                 </div>
               ) : (
                 <PlanPanelProvider onOpenPlan={handleOpenPlan}>

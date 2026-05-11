@@ -54,10 +54,10 @@ function getDisplayTitle(conv: ConversationSummary, computerSessions?: ComputerS
 }
 
 const TypingBubble: FC = () => (
-  <div className="flex items-center gap-0.5 px-1">
-    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:0ms]" />
-    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:150ms]" />
-    <div className="h-1 w-1 rounded-full bg-primary animate-bounce [animation-delay:300ms]" />
+  <div className="flex items-center gap-[3px]">
+    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:0ms]" />
+    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:150ms]" />
+    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:300ms]" />
   </div>
 );
 
@@ -401,17 +401,20 @@ export const ConversationList: FC<ConversationListProps> = ({
                     `}
                     style={isActive ? { backgroundColor: 'var(--app-active-item)' } : undefined}
                   >
-                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${isActive ? 'text-primary' : hasUnread ? 'text-primary' : 'text-muted-foreground'}`} {...(isActive ? { fill: 'currentColor' } : {})} />
-                    <div className="flex-1 min-w-0">
+                    <MessageSquareIcon className={`mt-0.5 h-4 w-4 shrink-0 ${isActive ? 'text-primary' : hasUnread ? 'text-primary' : 'text-muted-foreground'}`} />
+                    <div className="flex flex-col flex-1 min-w-0">
                       <span className={`line-clamp-2 text-sm ${hasUnread ? 'font-semibold text-sidebar-foreground' : 'font-medium text-sidebar-foreground/95'}`}>
                         {getDisplayTitle(conv, sessionsByConversation.get(conv.id)) || (
-                          <span className="italic text-muted-foreground">New Chat</span>
+                          <span className="italic text-muted-foreground/50">New Chat</span>
                         )}
                       </span>
-                      <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
-                        {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
-                        {conv.messageCount > 0 && ` · ${conv.messageCount} msgs`}
-                      </span>
+                      <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
+                        <>
+                          {conv.messageCount > 0 && <>{conv.messageCount} msgs</>}
+                          {conv.messageCount > 0 && <span className="mx-1">·</span>}
+                          {isRunning ? <TypingBubble /> : formatRelativeTime(conv.lastAssistantUpdateAt ?? conv.lastMessageAt)}
+                        </>
+                      </div>
                     </div>
                     <div className="ml-1 flex shrink-0 self-stretch items-center gap-1">
                       {isAwaitingApproval && !isActive && <div className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_10px_var(--color-amber-400)]" />}

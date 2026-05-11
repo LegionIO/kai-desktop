@@ -587,7 +587,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                   conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt,
                 );
                 const metaStr = conv.messageCount > 0
-                  ? `${tsStr} · ${conv.messageCount} msgs`
+                  ? `${conv.messageCount} msgs · ${tsStr}`
                   : tsStr;
                 const isPinned = pinnedIds.has(conv.id);
 

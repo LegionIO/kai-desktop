@@ -466,7 +466,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     try {
       // Create a placeholder task
       const task = (await app.tasks.create({
-        title: 'Generating…',
+        title: 'New Task',
         description: '',
         status: 'todo',
         workspaceId: activeWorkspaceId || undefined,

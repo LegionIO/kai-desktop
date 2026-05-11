@@ -14,6 +14,7 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js'
 import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { listAllTasks } from './tasks.js';
+import { readEffectiveConfig } from './config.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -140,12 +141,13 @@ export function registerAgentHandlers(
       const now = new Date().toISOString();
       const agent: AgentFile = {
         id,
-        name: payload.name,
+        name: payload.name ?? `Agent ${id.slice(0, 6)}`,
         role: payload.role,
         runtime: payload.runtime,
         status: 'idle',
         icon: payload.icon,
         description: payload.description,
+        instructions: payload.instructions,
         config: {
           cwd: payload.config?.cwd,
           maxSessionSeconds: payload.config?.maxSessionSeconds,
@@ -296,12 +298,24 @@ export function registerAgentHandlers(
     const task = readTask(appHome, agent.currentTaskId);
     if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };
 
+    // Resolve effective runtime (auto → user's preferred runtime from config)
+    let effectiveRuntime = agent.runtime;
+    if (effectiveRuntime === 'auto') {
+      const config = readEffectiveConfig(appHome);
+      const configRuntime = config?.agent?.runtime;
+      // Map config runtime IDs to agent runtime IDs
+      if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
+      else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
+      else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
+      else effectiveRuntime = 'claude-code'; // fallback
+    }
+
     // Determine working directory
     const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
 
     try {
       const sessionId = await terminalManager.create(agent.currentTaskId, {
-        runtime: agent.runtime,
+        runtime: effectiveRuntime,
         cwd,
         cols: 120,
         rows: 30,
@@ -319,7 +333,7 @@ export function registerAgentHandlers(
         task.status = 'in_progress';
       }
       task.terminalSessionId = sessionId;
-      task.agentRuntime = agent.runtime;
+      task.agentRuntime = effectiveRuntime;
       task.updatedAt = new Date().toISOString();
       writeTask(appHome, task);
 
@@ -327,7 +341,7 @@ export function registerAgentHandlers(
       broadcastTaskChange(appHome);
 
       // If task has a description, feed it as the initial prompt after a small delay
-      if (task.description && (agent.runtime === 'claude-code' || agent.runtime === 'codex')) {
+      if (task.description && (effectiveRuntime === 'claude-code' || effectiveRuntime === 'codex')) {
         setTimeout(() => {
           const prompt = task.description.trim() + '\n';
           terminalManager.write(sessionId, prompt);
@@ -371,6 +385,62 @@ export function registerAgentHandlers(
 
     broadcastAgentChange(appHome);
     return { ok: true };
+  });
+
+  // ── Prompt Synthesis (background, after creation) ─────────────────────
+
+  ipcMain.handle('agents:synthesize-prompt', async (_e, agentId: string, userDescription: string) => {
+    if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
+
+    try {
+      const config = readEffectiveConfig(appHome);
+
+      // Step 1: Match role AND generate a thematic name using Haiku (single call)
+      const { matchAgentRole } = await import('../agent/agent-role-matching.js');
+      const existingNames = listAllAgents(appHome)
+        .filter((a) => a.id !== agentId)
+        .map((a) => a.name);
+      const { role: matchedRole, name: generatedName } = await matchAgentRole(userDescription, config, existingNames);
+
+      // Step 2: Apply name immediately — don't wait for the slower synthesis steps
+      if (generatedName) {
+        const agentForName = readAgent(appHome, agentId);
+        if (agentForName) {
+          agentForName.name = generatedName;
+          agentForName.matchedRoleId = matchedRole?.id;
+          agentForName.updatedAt = new Date().toISOString();
+          writeAgent(appHome, agentForName);
+          broadcastAgentChange(appHome);
+        }
+      }
+
+      // Step 3: Fetch role template from GitHub (if matched)
+      let roleTemplate: string | null = null;
+      if (matchedRole) {
+        const { fetchRoleTemplate } = await import('../agent/agent-role-fetching.js');
+        roleTemplate = await fetchRoleTemplate(matchedRole.id);
+      }
+
+      // Step 4: Synthesize system prompt using profile model
+      const { synthesizeAgentPrompt } = await import('../agent/agent-prompt-synthesis.js');
+      const synthesizedInstructions = await synthesizeAgentPrompt(roleTemplate, userDescription, config);
+
+      // Step 5: Update agent with synthesized instructions (name already written above)
+      const agent = readAgent(appHome, agentId);
+      if (!agent) return { error: 'Agent not found' };
+
+      agent.instructions = synthesizedInstructions;
+      agent.updatedAt = new Date().toISOString();
+      writeAgent(appHome, agent);
+
+      // Step 6: Broadcast final state with synthesized instructions
+      broadcastAgentChange(appHome);
+
+      return { ok: true, matchedRole: matchedRole?.name ?? null, name: generatedName || null };
+    } catch (error) {
+      console.error('[agents] Prompt synthesis failed:', error);
+      return { error: String(error) };
+    }
   });
 
   // ── Terminal exit listener ─────────────────────────────────────────

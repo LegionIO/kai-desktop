@@ -1,73 +1,104 @@
 /**
- * AgentCard — compact card displaying agent info in the sidebar list.
+ * AgentCard — sidebar item for agents, matching the ConversationList item pattern.
+ *
+ * Styled consistently with chat and task sidebar items: same padding,
+ * hover/active states, group-hover triple-dots button, right-click support.
  */
 
-import type { FC } from 'react';
-import { BotIcon, TerminalIcon, BrainIcon, ZapIcon } from 'lucide-react';
+import type { FC, MouseEvent } from 'react';
+import { BotIcon, EllipsisVerticalIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AgentStatusBadge } from './AgentStatusBadge';
-import type { AgentFile, AgentRuntime } from '../../../shared/agent-types';
+import type { AgentFile } from '../../../shared/agent-types';
 
-const RUNTIME_ICONS: Record<AgentRuntime, FC<{ size?: number; className?: string }>> = {
-  'claude-code': TerminalIcon,
-  codex: BrainIcon,
-  mastra: ZapIcon,
-};
-
-const RUNTIME_LABELS: Record<AgentRuntime, string> = {
-  'claude-code': 'Claude Code',
-  codex: 'Codex',
-  mastra: 'Mastra',
-};
+function formatRelativeTime(timestamp: string | undefined): string {
+  if (!timestamp) return '';
+  const diffMs = Date.now() - new Date(timestamp).getTime();
+  if (diffMs < 60_000) return 'just now';
+  if (diffMs < 3_600_000) return `${Math.floor(diffMs / 60_000)}m ago`;
+  if (diffMs < 86_400_000) return `${Math.floor(diffMs / 3_600_000)}h ago`;
+  if (diffMs < 604_800_000) return `${Math.floor(diffMs / 86_400_000)}d ago`;
+  return `${Math.floor(diffMs / 604_800_000)}w ago`;
+}
 
 interface AgentCardProps {
   agent: AgentFile;
   isSelected: boolean;
   onClick: () => void;
+  onContextMenu?: (e: MouseEvent) => void;
+  onMoreClick?: (e: MouseEvent) => void;
 }
 
-export const AgentCard: FC<AgentCardProps> = ({ agent, isSelected, onClick }) => {
-  const RuntimeIcon = RUNTIME_ICONS[agent.runtime] ?? TerminalIcon;
+export const AgentCard: FC<AgentCardProps> = ({ agent, isSelected, onClick, onContextMenu, onMoreClick }) => {
+  const isPending = agent.name === 'New Agent';
 
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onClick}
+      onContextMenu={onContextMenu}
+      onKeyDown={(e) => { if (e.key === 'Enter') onClick(); }}
       className={cn(
-        'group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors',
+        'group flex w-full items-start gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm cursor-pointer transition-all',
         isSelected
-          ? 'bg-sidebar-accent/80 shadow-[inset_0_1px_2px_rgba(0,0,0,0.08)]'
-          : 'hover:bg-sidebar-accent/40',
+          ? 'shadow-[inset_0_0_0_1px_var(--app-active-item-ring)]'
+          : 'hover:bg-sidebar-accent/65',
       )}
+      style={isSelected ? { backgroundColor: 'var(--app-active-item)' } : undefined}
     >
-      {/* Avatar */}
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground">
-        {agent.icon ? (
-          <span className="text-base">{agent.icon}</span>
-        ) : (
-          <BotIcon size={16} strokeWidth={1.6} />
+      {/* Icon */}
+      <BotIcon
+        className={cn(
+          'mt-0.5 h-4 w-4 shrink-0',
+          isSelected ? 'text-primary' : 'text-muted-foreground',
         )}
-      </div>
+      />
 
       {/* Content */}
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium text-sidebar-foreground">
-            {agent.name}
-          </span>
-          <AgentStatusBadge status={agent.status} />
-        </div>
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <RuntimeIcon size={11} />
-          <span>{RUNTIME_LABELS[agent.runtime]}</span>
-          {agent.currentTaskId && (
-            <>
-              <span className="text-border">·</span>
-              <span className="truncate">Working on task</span>
-            </>
-          )}
+      <div className="flex flex-col flex-1 min-w-0">
+        <span className={cn(
+          'line-clamp-2 text-sm font-medium',
+          isPending
+            ? 'italic text-sidebar-foreground/50'
+            : 'text-sidebar-foreground/95',
+        )}>
+          {agent.name}
+        </span>
+        <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
+          <AgentStatusBadge status={agent.status} className="!px-0 !py-0 !bg-transparent !text-[12px] !font-normal !text-muted-foreground !tracking-normal !normal-case" />
+          {(() => {
+            const ts = agent.stats?.lastRunAt ?? agent.updatedAt;
+            const rel = formatRelativeTime(ts);
+            if (!rel) return null;
+            return (
+              <>
+                <span className="mx-1">·</span>
+                {agent.status === 'running' ? (
+                  <div className="flex items-center gap-[3px]">
+                    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:0ms]" />
+                    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:150ms]" />
+                    <div className="h-1.5 w-1.5 rounded-full bg-amber-400/70 animate-bounce [animation-delay:300ms]" />
+                  </div>
+                ) : rel}
+              </>
+            );
+          })()}
         </div>
       </div>
-    </button>
+
+      {/* Right actions: triple-dots */}
+      <div className="ml-1 flex shrink-0 self-stretch items-center">
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onMoreClick?.(e); }}
+          className="shrink-0 rounded p-0.5 opacity-0 transition-all group-hover:opacity-100 hover:bg-sidebar-accent"
+          title="More options"
+          aria-label="More options"
+        >
+          <EllipsisVerticalIcon className="h-4 w-4 text-muted-foreground" />
+        </button>
+      </div>
+    </div>
   );
 };

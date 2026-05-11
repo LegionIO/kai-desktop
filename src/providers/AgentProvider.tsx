@@ -23,7 +23,10 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 interface AgentState {
   agents: AgentFile[];
   selectedAgentId: string | null;
+  isCreatingAgent: boolean;
   isLoading: boolean;
+  /** Agent IDs currently undergoing background prompt synthesis. */
+  synthesizingIds: Set<string>;
 }
 
 type AgentAction =
@@ -32,12 +35,16 @@ type AgentAction =
   | { type: 'UPDATE_AGENT'; id: string; updates: Partial<AgentFile> }
   | { type: 'DELETE_AGENT'; id: string }
   | { type: 'SELECT_AGENT'; id: string | null }
-  | { type: 'SET_LOADING'; loading: boolean };
+  | { type: 'SET_CREATING'; creating: boolean }
+  | { type: 'SET_LOADING'; loading: boolean }
+  | { type: 'SET_SYNTHESIZING'; id: string; synthesizing: boolean };
 
 const initialState: AgentState = {
   agents: [],
   selectedAgentId: null,
+  isCreatingAgent: false,
   isLoading: true,
+  synthesizingIds: new Set(),
 };
 
 function agentReducer(state: AgentState, action: AgentAction): AgentState {
@@ -61,8 +68,16 @@ function agentReducer(state: AgentState, action: AgentAction): AgentState {
       };
     case 'SELECT_AGENT':
       return { ...state, selectedAgentId: action.id };
+    case 'SET_CREATING':
+      return { ...state, isCreatingAgent: action.creating };
     case 'SET_LOADING':
       return { ...state, isLoading: action.loading };
+    case 'SET_SYNTHESIZING': {
+      const next = new Set(state.synthesizingIds);
+      if (action.synthesizing) next.add(action.id);
+      else next.delete(action.id);
+      return { ...state, synthesizingIds: next };
+    }
     default:
       return state;
   }
@@ -85,6 +100,9 @@ interface AgentContextValue {
   /** Select an agent (for detail view). */
   selectAgent: (id: string | null) => void;
 
+  /** Toggle creation mode. */
+  setCreatingAgent: (creating: boolean) => void;
+
   /** Assign a task to an agent. */
   assignTask: (agentId: string, taskId: string) => Promise<{ ok: boolean; error?: string }>;
 
@@ -96,6 +114,9 @@ interface AgentContextValue {
 
   /** Stop the agent (kill terminal). */
   stopAgent: (agentId: string) => Promise<void>;
+
+  /** Synthesize a system prompt for an agent in the background. */
+  synthesizePrompt: (agentId: string, userDescription: string) => void;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -174,6 +195,10 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
     dispatch({ type: 'SELECT_AGENT', id });
   }, []);
 
+  const setCreatingAgent = useCallback((creating: boolean) => {
+    dispatch({ type: 'SET_CREATING', creating });
+  }, []);
+
   const assignTask = useCallback(
     async (agentId: string, taskId: string): Promise<{ ok: boolean; error?: string }> => {
       try {
@@ -218,6 +243,13 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
     }
   }, []);
 
+  const synthesizePrompt = useCallback((agentId: string, userDescription: string) => {
+    dispatch({ type: 'SET_SYNTHESIZING', id: agentId, synthesizing: true });
+    void app.agents.synthesizePrompt(agentId, userDescription).finally(() => {
+      dispatch({ type: 'SET_SYNTHESIZING', id: agentId, synthesizing: false });
+    });
+  }, []);
+
   // ── Memoized context value ─────────────────────────────────────────
 
   const value = useMemo<AgentContextValue>(
@@ -227,12 +259,14 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
       deleteAgent,
       updateAgent,
       selectAgent,
+      setCreatingAgent,
       assignTask,
       unassignTask,
       startAgent,
       stopAgent,
+      synthesizePrompt,
     }),
-    [state, createAgent, deleteAgent, updateAgent, selectAgent, assignTask, unassignTask, startAgent, stopAgent],
+    [state, createAgent, deleteAgent, updateAgent, selectAgent, setCreatingAgent, assignTask, unassignTask, startAgent, stopAgent, synthesizePrompt],
   );
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

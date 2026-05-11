@@ -1,27 +1,47 @@
 /**
  * AgentListPanel — main sidebar panel for the Agents tab.
  *
- * Shows a searchable list of agents with options (delete all) and a
- * "New Agent" button. Matches the layout patterns of TaskSidebarList.
+ * Shows a searchable list of agents with context menu (right-click + triple-dots)
+ * for rename and delete. "New Agent" button triggers creation view.
+ * Matches the layout patterns of ConversationList and TaskSidebarList.
  */
 
-import { type FC, useState, useMemo } from 'react';
+import { type FC, type MouseEvent, useState, useMemo, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   PlusIcon,
   BotIcon,
   SearchIcon,
   XIcon,
+  PencilIcon,
+  Trash2Icon,
 } from 'lucide-react';
 import { useAgents } from '@/providers/AgentProvider';
 import { AgentCard } from './AgentCard';
-import { CreateAgentDialog } from './CreateAgentDialog';
+import { AgentRenameModal } from './AgentRenameModal';
+import { DeleteAgentModal } from './DeleteAgentModal';
 
 export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ onNavigateToAgentsPage }) => {
-  const { state, selectAgent } = useAgents();
+  const { state, selectAgent, deleteAgent, updateAgent, setCreatingAgent } = useAgents();
   const { agents, selectedAgentId, isLoading } = state;
 
-  const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [contextMenu, setContextMenu] = useState<{ agentId: string; x: number; y: number } | null>(null);
+  const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Close context menu on click-outside
+  const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handler = (e: PointerEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setContextMenu(null);
+      }
+    };
+    window.addEventListener('pointerdown', handler);
+    return () => window.removeEventListener('pointerdown', handler);
+  }, [contextMenu]);
 
   // Filter agents by search
   const filteredAgents = useMemo(() => {
@@ -32,9 +52,39 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         a.name.toLowerCase().includes(query) ||
         a.role.toLowerCase().includes(query) ||
         a.runtime.toLowerCase().includes(query) ||
-        (a.description?.toLowerCase().includes(query) ?? false),
+        (a.description?.toLowerCase().includes(query) ?? false) ||
+        (a.instructions?.toLowerCase().includes(query) ?? false),
     );
   }, [agents, searchQuery]);
+
+  // Context menu handlers
+  const handleContextMenu = (e: MouseEvent, agentId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ agentId, x: e.clientX, y: e.clientY });
+  };
+
+  const handleMoreClick = (e: MouseEvent, agentId: string) => {
+    e.stopPropagation();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setContextMenu({ agentId, x: rect.left, y: rect.bottom + 4 });
+  };
+
+  const handleRename = async (id: string, newName: string) => {
+    await updateAgent(id, { name: newName });
+    setRenameModal(null);
+  };
+
+  const handleDelete = async (id: string) => {
+    await deleteAgent(id);
+    setContextMenu(null);
+  };
+
+  const handleNewAgent = () => {
+    setCreatingAgent(true);
+    selectAgent(null);
+    onNavigateToAgentsPage?.();
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -42,7 +92,7 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
         <button
           type="button"
-          onClick={() => onNavigateToAgentsPage?.()}
+          onClick={() => { selectAgent(null); onNavigateToAgentsPage?.(); }}
           className="rounded-md px-1.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:bg-[var(--brand-accent)]/15 hover:text-[var(--brand-accent)]"
         >
           Agents
@@ -50,10 +100,10 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => setCreateDialogOpen(true)}
+          onClick={handleNewAgent}
           className="flex items-center gap-1 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
         >
-          <BotIcon size={12} />
+          <PlusIcon size={12} />
           New Agent
         </button>
       </div>
@@ -82,7 +132,7 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
       </div>
 
       {/* Agent list */}
-      <div className="flex-1 overflow-y-auto px-1.5">
+      <div className="flex-1 overflow-y-auto px-3">
         {isLoading ? (
           <div className="flex items-center justify-center py-12 text-xs text-muted-foreground">
             Loading agents...
@@ -94,28 +144,74 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
               <span>No agents match your search</span>
             </div>
           ) : (
-            <EmptyState onCreate={() => setCreateDialogOpen(true)} />
+            <EmptyState onCreate={handleNewAgent} />
           )
         ) : (
-          <div className="space-y-0.5">
+          <div>
             {filteredAgents.map((agent) => (
-              <AgentCard
-                key={agent.id}
-                agent={agent}
-                isSelected={selectedAgentId === agent.id}
-                onClick={() => selectAgent(agent.id)}
-              />
+              <div key={agent.id} className="mb-1.5">
+                <AgentCard
+                  agent={agent}
+                  isSelected={selectedAgentId === agent.id}
+                  onClick={() => { setCreatingAgent(false); selectAgent(agent.id); }}
+                  onContextMenu={(e) => handleContextMenu(e, agent.id)}
+                  onMoreClick={(e) => handleMoreClick(e, agent.id)}
+                />
+              </div>
             ))}
           </div>
         )}
       </div>
 
-      {/* Create Agent Dialog */}
-      <CreateAgentDialog
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-      />
+      {/* Context Menu (portal) */}
+      {contextMenu && createPortal(
+        <div
+          ref={menuRef}
+          className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+            onClick={() => {
+              const agent = agents.find((a) => a.id === contextMenu.agentId);
+              setRenameModal({ id: contextMenu.agentId, value: agent?.name ?? '' });
+              setContextMenu(null);
+            }}
+          >
+            <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
+          </button>
+          <div className="my-1 h-px bg-border/60" />
+          <button
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+            onClick={() => { setConfirmDeleteId(contextMenu.agentId); setContextMenu(null); }}
+          >
+            <Trash2Icon className="h-4 w-4" /> Delete
+          </button>
+        </div>,
+        document.body,
+      )}
 
+      {/* Rename modal */}
+      {renameModal && (
+        <AgentRenameModal
+          initialValue={renameModal.value}
+          onSave={(name) => void handleRename(renameModal.id, name)}
+          onClose={() => setRenameModal(null)}
+        />
+      )}
+
+      {/* Delete confirmation modal */}
+      {confirmDeleteId && (() => {
+        const agentToDelete = agents.find((a) => a.id === confirmDeleteId);
+        return (
+          <DeleteAgentModal
+            agentName={agentToDelete?.name ?? 'this agent'}
+            onConfirm={() => void handleDelete(confirmDeleteId)}
+            onClose={() => setConfirmDeleteId(null)}
+          />
+        );
+      })()}
     </div>
   );
 };
@@ -129,8 +225,7 @@ const EmptyState: FC<{ onCreate: () => void }> = ({ onCreate }) => (
     </div>
     <h3 className="mb-1 text-sm font-medium text-foreground/80">No agents yet</h3>
     <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
-      Create agents to work on your tasks. Each agent has a dedicated runtime and can be
-      assigned tasks from the board.
+      Create agents to help with your tasks. Each agent has dedicated instructions and a runtime.
     </p>
     <button
       type="button"

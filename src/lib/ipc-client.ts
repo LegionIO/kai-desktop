@@ -193,6 +193,7 @@ type AppAPI = {
     unassignTask: (agentId: string) => Promise<{ ok: boolean; error?: string }>;
     start: (agentId: string) => Promise<{ sessionId?: string; error?: string }>;
     stop: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
+    synthesizePrompt: (agentId: string, userDescription: string) => Promise<{ ok?: boolean; matchedRole?: string | null; error?: string }>;
     onChanged: (callback: (agents: AgentFile[]) => void) => () => void;
   };
   platform: {

@@ -326,6 +326,7 @@ const appAPI = {
     unassignTask: (agentId: string) => ipcRenderer.invoke('agents:unassign-task', agentId),
     start: (agentId: string) => ipcRenderer.invoke('agents:start', agentId) as Promise<{ sessionId?: string; error?: string }>,
     stop: (agentId: string) => ipcRenderer.invoke('agents:stop', agentId),
+    synthesizePrompt: (agentId: string, userDescription: string) => ipcRenderer.invoke('agents:synthesize-prompt', agentId, userDescription),
     onChanged: (callback: (agents: unknown[]) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, agents: unknown[]) => callback(agents);
       ipcRenderer.on('agents:changed', handler);
