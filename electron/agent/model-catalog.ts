@@ -76,7 +76,7 @@ export function resolveModelCatalog(config: AppConfig): {
       maxInputTokens: model.maxInputTokens,
       providerTools: normalizeProviderTools(providerConfig.providerTools, model.providerTools),
       temperature: config.advanced.temperature,
-      maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
+      maxSteps: config.advanced.maxSteps,
       maxRetries: config.advanced.maxRetries,
     };
 
