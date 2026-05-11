@@ -35,6 +35,7 @@ import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList'
 import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
 import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
+import { SplashBackground } from '@/components/SplashBackground';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
@@ -1842,7 +1843,8 @@ function AppShell() {
             </div>
             <div className="min-h-0 flex-1 flex flex-col">
               {activeView === MARKETPLACE_VIEW ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                <div className="relative flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <SplashBackground visible storageKey="__marketplace_bg_last_index" />
                   <PluginMarketplace />
                 </div>
               ) : activeView === PLUGINS_VIEW ? (
