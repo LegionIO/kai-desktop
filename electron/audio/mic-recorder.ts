@@ -34,6 +34,39 @@ window._mic = {
   recorder: null,
   chunks: [],
   stream: null,
+  _recordingMonitor: null,
+  _recordingMonitorKeys: [],
+
+  _createMonitor(stream, fftSize) {
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = fftSize || 256;
+    source.connect(analyser);
+    return { stream, ctx, source, analyser };
+  },
+
+  _stopMonitor(mon, stopTracks) {
+    if (!mon) return;
+    try { mon.source.disconnect(); } catch {}
+    try { mon.ctx.close(); } catch {}
+    if (stopTracks) mon.stream.getTracks().forEach(t => t.stop());
+  },
+
+  _sampleMonitor(mon) {
+    if (!mon || !mon.analyser) return 0;
+    const buf = new Float32Array(mon.analyser.fftSize);
+    mon.analyser.getFloatTimeDomainData(buf);
+    let max = 0;
+    for (let i = 0; i < buf.length; i++) { const a = Math.abs(buf[i]); if (a > max) max = a; }
+    return max;
+  },
+
+  stopRecordingMonitor() {
+    this._stopMonitor(this._recordingMonitor, false);
+    this._recordingMonitor = null;
+    this._recordingMonitorKeys = [];
+  },
 
   async listDevices() {
     try {
@@ -67,19 +100,14 @@ window._mic = {
       const settings = tracks[0]?.getSettings?.() || {};
       console.log('[MicRecorder] Track: ' + tracks[0]?.label + ' sampleRate=' + settings.sampleRate + ' channelCount=' + settings.channelCount);
 
-      // Level check — 500ms sample
-      const ctx = new AudioContext();
-      const src = ctx.createMediaStreamSource(this.stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
-      src.connect(analyser);
-      const buf = new Float32Array(analyser.fftSize);
+      this.stopRecordingMonitor();
+      this._recordingMonitor = this._createMonitor(this.stream, 2048);
+      this._recordingMonitorKeys = Array.from(new Set([deviceId || 'default', settings.deviceId].filter(Boolean)));
+
+      // Level check — 500ms sample. Keep this analyser alive so the overlay
+      // meter can read the already-open recording stream on cold startup.
       await new Promise(r => setTimeout(r, 500));
-      analyser.getFloatTimeDomainData(buf);
-      let max = 0;
-      for (let i = 0; i < buf.length; i++) { const a = Math.abs(buf[i]); if (a > max) max = a; }
-      src.disconnect();
-      await ctx.close();
+      const max = this._sampleMonitor(this._recordingMonitor);
       const silent = max < 0.001;
       console.log('[MicRecorder] Level: max=' + max.toFixed(6) + (silent ? ' ⚠️ SILENT' : ' ✓ has audio'));
 
@@ -108,6 +136,7 @@ window._mic = {
     return new Promise((resolve) => {
       recorder.onstop = async () => {
         console.log('[MicRecorder] Stopped, chunks=' + chunks.length);
+        this.stopRecordingMonitor();
         if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
         this.recorder = null;
         if (chunks.length === 0) { resolve({ error: 'No audio chunks recorded' }); return; }
@@ -177,6 +206,7 @@ window._mic = {
       this.recorder.stop();
     }
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+    this.stopRecordingMonitor();
     this.recorder = null;
     this.chunks = [];
   },
@@ -189,15 +219,14 @@ window._mic = {
     const results = {};
     for (const id of deviceIds) {
       try {
+        if (this._recordingMonitor && this._recordingMonitorKeys.includes(id)) {
+          results[id] = { ok: true };
+          continue;
+        }
         const constraints = { audio: { channelCount: 1 } };
         if (id && id !== 'default') constraints.audio.deviceId = { exact: id };
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        const ctx = new AudioContext();
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        this._monitors[id] = { stream, ctx, source, analyser };
+        this._monitors[id] = this._createMonitor(stream, 256);
         results[id] = { ok: true };
       } catch (err) {
         results[id] = { error: err.message };
@@ -208,13 +237,13 @@ window._mic = {
 
   getAllLevels() {
     const levels = {};
-    const buf = new Float32Array(256);
+    if (this._recordingMonitor) {
+      const recordingLevel = this._sampleMonitor(this._recordingMonitor);
+      for (const key of this._recordingMonitorKeys) levels[key] = recordingLevel;
+    }
     for (const [id, mon] of Object.entries(this._monitors)) {
       if (!mon || !mon.analyser) { levels[id] = 0; continue; }
-      mon.analyser.getFloatTimeDomainData(buf);
-      let max = 0;
-      for (let i = 0; i < buf.length; i++) { const a = Math.abs(buf[i]); if (a > max) max = a; }
-      levels[id] = max;
+      levels[id] = this._sampleMonitor(mon);
     }
     return levels;
   },
@@ -287,10 +316,7 @@ window._mic = {
 
   stopMonitorAll() {
     for (const mon of Object.values(this._monitors)) {
-      if (!mon) continue;
-      try { mon.source.disconnect(); } catch {}
-      try { mon.ctx.close(); } catch {}
-      mon.stream.getTracks().forEach(t => t.stop());
+      this._stopMonitor(mon, true);
     }
     this._monitors = {};
   }

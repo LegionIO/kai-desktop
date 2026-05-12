@@ -191,7 +191,7 @@ interface WhisperCredentials {
   headers: Record<string, string>;
   /** Model name for the form data (e.g. 'whisper-1' or deployment name) */
   model: string;
-  /** Multipart field name for the audio file ('file' for OpenAI, 'audio' for some gateways) */
+  /** Multipart field name for the audio upload. OpenAI-compatible transcription endpoints expect 'file'. */
   fileField: string;
 }
 
@@ -200,8 +200,8 @@ interface WhisperCredentials {
  *
  * The LLM gateway plugin configures audio + realtime as Azure-protocol
  * endpoints pointing at the gateway. The gateway hosts a `speech-to-text`
- * deployment that speaks the Azure OpenAI transcription API:
- *   POST {endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version=...
+ * deployment behind an OpenAI-compatible transcription API:
+ *   POST {endpoint}/v1/audio/transcriptions
  *
  * Priority:
  *   1. Audio azure config (set by the gateway plugin) — Azure OpenAI protocol
@@ -223,7 +223,7 @@ function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null
       url: `${base}/v1/audio/transcriptions`,
       headers: { 'api-key': audio.azure.subscriptionKey },
       model: DEFAULT_STT_DEPLOYMENT,
-      fileField: 'audio',
+      fileField: 'file',
     };
   }
 
@@ -235,7 +235,7 @@ function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null
       url: `${base}/v1/audio/transcriptions`,
       headers: { 'api-key': rt.azure.apiKey },
       model: DEFAULT_STT_DEPLOYMENT,
-      fileField: 'audio',
+      fileField: 'file',
     };
   }
 
