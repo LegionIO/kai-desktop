@@ -26,6 +26,12 @@ import {
   destroyDictationOverlay,
   sendToOverlay,
 } from './dictation-overlay.js';
+import {
+  planDictationTextPatch,
+  type DictationPatchOperation,
+  type DictationPatchPhase,
+} from './text-patch-planner.js';
+import { DictationQueuedPartialGate } from './typing-revision-gate.js';
 
 export type DictationState = 'idle' | 'starting' | 'active' | 'stopping';
 
@@ -56,8 +62,8 @@ let sessionStartTime: number = 0;
 let sessionGeneration: number = 0;
 
 // Partial typing state (for live partials mode)
-let partialTypedLength: number = 0;
 let partialTypedText: string = '';
+const queuedPartialGate = new DictationQueuedPartialGate();
 
 // Hold mode state
 let holdMonitor: LocalMacosTakeoverMonitorHandle | null = null;
@@ -257,8 +263,8 @@ async function cleanupSession(): Promise<void> {
   stopHoldMonitor();
   await stopStt();
   await stopMicCapture();
-  partialTypedLength = 0;
   partialTypedText = '';
+  queuedPartialGate.invalidateQueuedPartials();
 }
 
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
@@ -563,17 +569,6 @@ function stopAudioPolling(): void {
 // ─── Text Handling ──────────────────────────────────────────────────────────
 
 /**
- * Returns the length of the longest common prefix between two strings.
- * Used to minimize backspace/retype operations during partial updates.
- */
-function commonPrefixLength(a: string, b: string): number {
-  const max = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < max && a[i] === b[i]) i++;
-  return i;
-}
-
-/**
  * Serializes all typing operations to prevent race conditions.
  * Each operation (backspace + retype) must complete before the next starts.
  */
@@ -599,24 +594,15 @@ function handlePartial(text: string): void {
   if (!config?.livePartials) return;
 
   const generation = sessionGeneration;
-  // Smart partial update: only backspace and retype from the divergence point.
-  // This looks like autocomplete correcting text rather than full-line flashing.
+  const partialRevision = queuedPartialGate.nextPartialRevision();
   enqueueTyping(generation, async () => {
-    const commonLen = commonPrefixLength(partialTypedText, text);
-    const backspaceCount = partialTypedLength - commonLen;
-    const newSuffix = text.slice(commonLen);
+    if (!queuedPartialGate.isCurrent(partialRevision)) return;
 
-    if (backspaceCount > 0) {
-      await typeBackspaces(backspaceCount);
-    }
+    const applied = await applyDictationPatch(partialTypedText, text, 'partial');
     if (!isCurrentTypingSession(generation)) return;
-    if (newSuffix) {
-      await typeText(newSuffix);
-    }
-    if (!isCurrentTypingSession(generation)) return;
+    if (!applied) return;
 
     partialTypedText = text;
-    partialTypedLength = text.length;
   });
 }
 
@@ -625,50 +611,82 @@ function handleFinal(text: string): void {
   sendToOverlay('dictation:final', text);
 
   const generation = sessionGeneration;
+  queuedPartialGate.invalidateQueuedPartials();
   enqueueTyping(generation, async () => {
-    if (config?.livePartials && partialTypedLength > 0) {
-      // Smart update: only backspace from the divergence point between
-      // what was typed (partial) and the corrected final text.
+    let applied = true;
+    if (config?.livePartials && partialTypedText.length > 0) {
       const finalWithSpace = text + ' ';
-      const commonLen = commonPrefixLength(partialTypedText, finalWithSpace);
-      const backspaceCount = partialTypedLength - commonLen;
-      const newSuffix = finalWithSpace.slice(commonLen);
-
-      if (backspaceCount > 0) {
-        await typeBackspaces(backspaceCount);
-      }
-      if (!isCurrentTypingSession(generation)) return;
-      if (newSuffix) {
-        await typeText(newSuffix);
-      }
+      applied = await applyDictationPatch(partialTypedText, finalWithSpace, 'final');
     } else {
       if (!isCurrentTypingSession(generation)) return;
-      await typeText(text + ' ');
+      applied = await typeText(text + ' ');
     }
     if (!isCurrentTypingSession(generation)) return;
+    if (!applied) return;
     partialTypedText = '';
-    partialTypedLength = 0;
   });
+}
+
+async function applyDictationPatch(
+  currentText: string,
+  targetText: string,
+  phase: DictationPatchPhase,
+): Promise<boolean> {
+  const plan = planDictationTextPatch(currentText, targetText, phase);
+
+  switch (plan.kind) {
+    case 'none':
+      return true;
+    case 'append':
+      return typeText(plan.text);
+    case 'patch':
+      return applyTextPatch(plan.operations);
+    case 'tailRewrite': {
+      if (plan.backspaceCount > 0 && !await typeBackspaces(plan.backspaceCount)) {
+        return false;
+      }
+      if (plan.text && !await typeText(plan.text)) {
+        return false;
+      }
+      return true;
+    }
+  }
 }
 
 // ─── Text Insertion via CGEvents ─────────────────────────────────────────────
 
-async function typeText(text: string): Promise<void> {
-  if (!text) return;
+async function typeText(text: string): Promise<boolean> {
+  if (!text) return true;
   const encoded = Buffer.from(text, 'utf-8').toString('base64');
   try {
     await runLocalMacMouseCommand(['postText', encoded]);
+    return true;
   } catch (err) {
     console.error('[Dictation] typeText failed:', err);
+    return false;
   }
 }
 
-async function typeBackspaces(count: number): Promise<void> {
-  if (count <= 0) return;
+async function typeBackspaces(count: number): Promise<boolean> {
+  if (count <= 0) return true;
   try {
     await runLocalMacMouseCommand(['deleteBack', String(count)]);
+    return true;
   } catch (err) {
     console.error('[Dictation] typeBackspaces failed:', err);
+    return false;
+  }
+}
+
+async function applyTextPatch(operations: DictationPatchOperation[]): Promise<boolean> {
+  if (operations.length === 0) return true;
+  const encoded = Buffer.from(JSON.stringify(operations), 'utf-8').toString('base64');
+  try {
+    await runLocalMacMouseCommand(['applyTextPatch', encoded]);
+    return true;
+  } catch (err) {
+    console.error('[Dictation] applyTextPatch failed:', err);
+    return false;
   }
 }
 

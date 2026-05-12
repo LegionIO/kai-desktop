@@ -296,6 +296,37 @@ func postUnicodeText(_ text: String, flags: CGEventFlags = []) {
   keyUp.post(tap: .cghidEventTap)
 }
 
+func postUnicodeTextInChunks(_ text: String, chunkSize: Int = 20, delayMs: Int = 5) {
+  let chars = Array(text)
+  var offset = 0
+  while offset < chars.count {
+    let end = min(offset + chunkSize, chars.count)
+    let chunk = String(chars[offset..<end])
+    postUnicodeText(chunk)
+    _ = sleepMillis(delayMs)
+    offset = end
+  }
+}
+
+func pressKeyRepeated(keyCode: CGKeyCode, count: Int, delayMs: Int = 2) {
+  if count <= 0 { return }
+  for _ in 0..<count {
+    postKeyboardEvent(keyCode: keyCode, keyDown: true)
+    postKeyboardEvent(keyCode: keyCode, keyDown: false)
+    _ = sleepMillis(delayMs)
+  }
+}
+
+func operationCount(_ operation: [String: Any]) -> Int? {
+  if let count = operation["count"] as? Int {
+    return count
+  }
+  if let number = operation["count"] as? NSNumber {
+    return number.intValue
+  }
+  return nil
+}
+
 func typeCharacterByCharacter(_ text: String, delayMs: Int) {
   let pause = max(0, delayMs)
   for character in text {
@@ -578,16 +609,7 @@ case "postText":
     printJson(["ok": false, "error": "Invalid base64 text"])
     exit(1)
   }
-  let postChunkSize = 20
-  let chars = Array(decoded)
-  var offset = 0
-  while offset < chars.count {
-    let end = min(offset + postChunkSize, chars.count)
-    let chunk = String(chars[offset..<end])
-    postUnicodeText(chunk)
-    _ = sleepMillis(5)
-    offset = end
-  }
+  postUnicodeTextInChunks(decoded)
   printJson(["ok": true])
 
 case "deleteBack":
@@ -602,6 +624,59 @@ case "deleteBack":
     postKeyboardEvent(keyCode: 51, keyDown: true)
     postKeyboardEvent(keyCode: 51, keyDown: false)
     _ = sleepMillis(3)
+  }
+  printJson(["ok": true])
+
+case "applyTextPatch":
+  // Batched cursor/text operations for dictation correction patches.
+  // Keeps small rewrites in one helper invocation so apps do not visibly blank
+  // and then refill the whole line for punctuation or capitalization changes.
+  guard args.count >= 3 else {
+    printJson(["ok": false, "error": "Expected base64 JSON operations"])
+    exit(1)
+  }
+  guard let decoded = decodeBase64String(args[2]),
+        let data = decoded.data(using: .utf8),
+        let operations = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+    printJson(["ok": false, "error": "Invalid patch operations"])
+    exit(1)
+  }
+
+  for operation in operations {
+    guard let kind = operation["kind"] as? String else {
+      printJson(["ok": false, "error": "Patch operation missing kind"])
+      exit(1)
+    }
+
+    switch kind {
+    case "moveLeft":
+      guard let count = operationCount(operation) else {
+        printJson(["ok": false, "error": "moveLeft missing count"])
+        exit(1)
+      }
+      pressKeyRepeated(keyCode: 123, count: count)
+    case "moveRight":
+      guard let count = operationCount(operation) else {
+        printJson(["ok": false, "error": "moveRight missing count"])
+        exit(1)
+      }
+      pressKeyRepeated(keyCode: 124, count: count)
+    case "deleteForward":
+      guard let count = operationCount(operation) else {
+        printJson(["ok": false, "error": "deleteForward missing count"])
+        exit(1)
+      }
+      pressKeyRepeated(keyCode: 117, count: count)
+    case "insertText":
+      guard let text = operation["text"] as? String else {
+        printJson(["ok": false, "error": "insertText missing text"])
+        exit(1)
+      }
+      postUnicodeTextInChunks(text)
+    default:
+      printJson(["ok": false, "error": "Unknown patch operation: \(kind)"])
+      exit(1)
+    }
   }
   printJson(["ok": true])
 

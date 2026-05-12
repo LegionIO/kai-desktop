@@ -72,10 +72,10 @@ export function createDictationOverlay(): void {
   const primaryDisplay = screen.getPrimaryDisplay();
   const workArea = primaryDisplay.workArea;
 
-  // Position: top-right, 8px below work area top (below menu bar), 16px from right
+  // Position: top-center, 8px below work area top (below menu bar)
   const width = 280;
   const height = 52;
-  const x = workArea.x + workArea.width - width - 16;
+  const x = workArea.x + Math.round((workArea.width - width) / 2);
   const y = workArea.y + 8;
 
   overlayWindow = new BrowserWindow({
@@ -201,7 +201,7 @@ function repositionOverlay(): void {
   const workArea = primaryDisplay.workArea;
   const bounds = overlayWindow.getBounds();
 
-  const x = workArea.x + workArea.width - bounds.width - 16;
+  const x = workArea.x + Math.round((workArea.width - bounds.width) / 2);
   const y = workArea.y + 8;
 
   overlayWindow.setPosition(x, y);
