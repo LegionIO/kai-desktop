@@ -28,7 +28,7 @@ if (isUpdateTestMode) {
     } as Parameters<typeof autoUpdater.setFeedURL>[0]);
     console.info(`[auto-update] TEST MODE: faking version ${DEV_TEST_VERSION}, url ${updateUrl}`);
   } else {
-    const repo = process.env.KAI_UPDATE_REPO ?? 'your-org/kai-desktop';
+    const repo = process.env.KAI_UPDATE_REPO ?? 'legionio/kai-desktop';
     const [owner, repoName] = repo.split('/');
     autoUpdater.setFeedURL({ provider: 'github', owner, repo: repoName });
     console.info(`[auto-update] TEST MODE: faking version ${DEV_TEST_VERSION}, repo ${repo}`);
