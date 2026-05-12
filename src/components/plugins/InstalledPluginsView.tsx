@@ -13,8 +13,10 @@ import {
   Settings2Icon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlugins } from '@/providers/PluginProvider';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 
 /* ── Types ────────────────────────────────────────────── */
@@ -54,6 +56,7 @@ interface InstalledPluginsViewProps {
 
 export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError, onOpenPluginSettings }) => {
   const { uiState } = usePlugins();
+  const fullWidth = useFullWidthContent();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -155,7 +158,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
     <div className="flex flex-col h-full min-h-0">
       {/* Search + marketplace button — fixed above scroll */}
       <div className="shrink-0 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl px-4 flex items-center gap-2">
+        <div className={cn('mx-auto w-full px-4 flex items-center gap-2', !fullWidth && 'max-w-3xl')}>
           <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
             <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
@@ -196,7 +199,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
 
         {/* "Installed (N)" label floats above the fade */}
         {plugins.length > 0 && (
-          <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-10 flex items-center">
+          <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-10 flex items-center', !fullWidth && 'max-w-3xl')}>
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
               Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
             </p>
@@ -204,7 +207,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
         )}
 
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pt-10 pb-6 space-y-3">
+          <div className={cn('mx-auto w-full px-4 pt-10 pb-6 space-y-3', !fullWidth && 'max-w-3xl')}>
             {/* Error banner */}
             {error && (
               <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3">

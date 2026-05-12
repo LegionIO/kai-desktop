@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useTasks } from '@/providers/TaskProvider';
 import { app } from '@/lib/ipc-client';
 import type { TaskFile, KaiTaskStatus } from '@/types/task';
@@ -73,6 +74,7 @@ interface TaskQueueProps {
 
 export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const { state, reorderTasks, selectTask, deleteTask } = useTasks();
+  const fullWidth = useFullWidthContent();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -268,7 +270,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
       {/* Fixed toolbar */}
       <div className="shrink-0 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl px-4">
+        <div className={cn('mx-auto w-full px-4', !fullWidth && 'max-w-3xl')}>
           <div className="flex items-center gap-2">
             {/* Search */}
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
@@ -363,7 +365,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
           {/* Floating selection bar */}
           {isSelecting && (
-            <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-8 flex items-center">
+            <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center', !fullWidth && 'max-w-3xl')}>
               <button
                 type="button"
                 onClick={toggleSelectAll}
@@ -418,7 +420,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
           )}
 
           <div className="h-full overflow-y-auto">
-            <div className="mx-auto max-w-3xl px-4 pt-10 pb-6">
+            <div className={cn('mx-auto w-full px-4 pt-10 pb-6', !fullWidth && 'max-w-3xl')}>
               {archivedLoading ? (
                 <div className="flex items-center justify-center py-24">
                   <div className="h-5 w-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground" />
@@ -608,7 +610,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
               onDragStart={handleDragStart}
               onDragEnd={handleDragEnd}
             >
-              <div className="mx-auto max-w-3xl flex flex-col gap-4 px-4 pt-10 pb-6">
+              <div className={cn('mx-auto w-full flex flex-col gap-4 px-4 pt-10 pb-6', !fullWidth && 'max-w-3xl')}>
                 {KAI_TASK_STATUS_COLUMNS.map((status) => (
                   <TaskQueueRow
                     key={status}

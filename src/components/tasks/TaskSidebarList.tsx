@@ -44,6 +44,8 @@ interface TaskSidebarListProps {
   onViewBoard?: () => void;
   /** Whether the board view is currently shown in the main panel. */
   isBoardActive?: boolean;
+  /** Whether the task creation view is currently shown. */
+  isCreatingTask?: boolean;
   /** When set, only tasks matching this workspace (or unscoped legacy tasks) are shown. */
   workspaceId?: string | null;
 }
@@ -52,6 +54,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   onSelectTask,
   onCreateTask,
   onViewBoard,
+  isCreatingTask,
   workspaceId,
 }) => {
   const { state, selectTask, archiveTask } = useTasks();
@@ -156,7 +159,10 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onCreateTask?.(); }}
-          className="flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
+          className={cn(
+            'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
+            isCreatingTask && 'border-primary/40 bg-primary/10 text-primary',
+          )}
         >
           <FilePlusIcon className="h-3 w-3" />
           New Task

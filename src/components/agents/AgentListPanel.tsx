@@ -17,13 +17,14 @@ import {
   Trash2Icon,
 } from 'lucide-react';
 import { useAgents } from '@/providers/AgentProvider';
+import { cn } from '@/lib/utils';
 import { AgentCard } from './AgentCard';
 import { AgentRenameModal } from './AgentRenameModal';
 import { DeleteAgentModal } from './DeleteAgentModal';
 
 export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ onNavigateToAgentsPage }) => {
   const { state, selectAgent, deleteAgent, updateAgent, setCreatingAgent } = useAgents();
-  const { agents, selectedAgentId, isLoading } = state;
+  const { agents, selectedAgentId, isLoading, isCreatingAgent } = state;
 
   const [searchQuery, setSearchQuery] = useState('');
   const [contextMenu, setContextMenu] = useState<{ agentId: string; x: number; y: number } | null>(null);
@@ -101,7 +102,10 @@ export const AgentListPanel: FC<{ onNavigateToAgentsPage?: () => void }> = ({ on
         <button
           type="button"
           onClick={handleNewAgent}
-          className="flex items-center gap-1 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60"
+          className={cn(
+            'flex items-center gap-1 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
+            isCreatingAgent && 'border-primary/40 bg-primary/10 text-primary',
+          )}
         >
           <PlusIcon size={12} />
           New Agent

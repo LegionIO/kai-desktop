@@ -1580,6 +1580,7 @@ function AppShell() {
                           setActiveView(TASKS_VIEW);
                         }}
                         isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
+                        isCreatingTask={isCreatingTask}
                         workspaceId={activeWorkspaceId}
                       />
                     </div>

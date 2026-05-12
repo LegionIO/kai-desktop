@@ -311,7 +311,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     onSwitchConversation(id);
   };
 
-  const isNewChat = hasLoaded && !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
+  const isNewChat = !!activeConversationId && !processedConversations.some((c) => c.id === activeConversationId);
 
   return (
     <div className="flex flex-col h-full">
