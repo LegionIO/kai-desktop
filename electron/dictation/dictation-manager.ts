@@ -17,6 +17,10 @@ import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
 import type { AppConfig } from '../config/schema.js';
 import { runLocalMacMouseCommand } from '../computer-use/permissions.js';
 import {
+  startLocalMacosTakeoverMonitor,
+  type LocalMacosTakeoverMonitorHandle,
+} from '../computer-use/harnesses/local-macos.js';
+import {
   showDictationOverlay,
   hideDictationOverlay,
   destroyDictationOverlay,
@@ -52,6 +56,26 @@ let sessionStartTime: number = 0;
 
 // Partial typing state (for live partials mode)
 let partialTypedLength: number = 0;
+let partialTypedText: string = '';
+
+// Hold mode state
+let holdMonitor: LocalMacosTakeoverMonitorHandle | null = null;
+let holdSafetyTimeout: ReturnType<typeof setTimeout> | null = null;
+
+/** macOS virtual key codes for modifier keys */
+const MODIFIER_KEYCODES: Record<string, number> = {
+  command: 55,
+  cmd: 55,
+  shift: 56,
+  // right shift = 60, but globalShortcut doesn't differentiate
+  option: 58,
+  alt: 58,
+  control: 59,
+  ctrl: 59,
+};
+
+/** Maximum hold duration before auto-stop (5 minutes) */
+const HOLD_SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Initialize the dictation manager. Call once after app is ready.
@@ -124,10 +148,24 @@ export function getDictationState(): { state: DictationState; elapsed: number } 
 function registerHotkey(hotkey: string): void {
   try {
     const success = globalShortcut.register(hotkey, () => {
-      void toggleDictation();
+      if (config?.mode === 'hold') {
+        // Hold mode: key-down starts dictation, key-up stops it.
+        // globalShortcut only fires on key-down, so we start here
+        // and use a native monitor to detect modifier release.
+        if (state === 'idle') {
+          void startDictation().then(() => {
+            if (state === 'active') {
+              startHoldMonitor(hotkey);
+            }
+          });
+        }
+      } else {
+        // Toggle mode: press to start, press again to stop.
+        void toggleDictation();
+      }
     });
     if (success) {
-      console.info('[Dictation] Global hotkey registered: %s', hotkey);
+      console.info('[Dictation] Global hotkey registered: %s (mode=%s)', hotkey, config?.mode ?? 'toggle');
     } else {
       console.warn('[Dictation] Failed to register hotkey: %s (already in use?)', hotkey);
     }
@@ -212,9 +250,88 @@ async function stopDictation(): Promise<void> {
 
 async function cleanupSession(): Promise<void> {
   stopAudioPolling();
+  stopHoldMonitor();
   await stopStt();
   await stopMicCapture();
   partialTypedLength = 0;
+  partialTypedText = '';
+}
+
+// ─── Hold Mode Monitor ──────────────────────────────────────────────────────
+
+/**
+ * Parse an Electron accelerator string (e.g. "Command+Shift+D") into the set
+ * of macOS virtual key codes for its modifier keys.
+ */
+function parseHotkeyModifierCodes(hotkey: string): Set<number> {
+  const codes = new Set<number>();
+  const parts = hotkey.split('+').map(p => p.trim().toLowerCase());
+  // Last part is the primary key; everything before is a modifier
+  for (const part of parts.slice(0, -1)) {
+    // Handle "commandorcontrol" → both command and control
+    const normalized = part.replace('commandorcontrol', 'command');
+    const code = MODIFIER_KEYCODES[normalized];
+    if (code !== undefined) codes.add(code);
+  }
+  return codes;
+}
+
+/**
+ * Start monitoring for key release to stop dictation in hold mode.
+ * Uses the existing native CGEventTap monitor that emits flagsChanged events
+ * with keyCode when modifier keys are pressed or released.
+ */
+function startHoldMonitor(hotkey: string): void {
+  stopHoldMonitor(); // Clean up any existing monitor
+
+  const modifierCodes = parseHotkeyModifierCodes(hotkey);
+  if (modifierCodes.size === 0) {
+    // No modifiers to watch — can't detect release, fall back to toggle behavior
+    console.warn('[Dictation] Hold mode: no modifier keys in hotkey, cannot detect release');
+    return;
+  }
+
+  console.info('[Dictation] Hold mode: watching for modifier release (keyCodes: %s)', [...modifierCodes].join(','));
+
+  holdMonitor = startLocalMacosTakeoverMonitor({
+    onEvent: (event) => {
+      // flagsChanged fires when any modifier key is pressed or released.
+      // If the keyCode matches one of our hotkey modifiers, the user released it.
+      if (event.eventType === 'flagsChanged' && event.keyCode !== undefined) {
+        if (modifierCodes.has(event.keyCode)) {
+          console.info('[Dictation] Hold mode: modifier released (keyCode=%d), stopping', event.keyCode);
+          void stopDictation();
+        }
+      }
+    },
+    onError: (message) => {
+      console.warn('[Dictation] Hold monitor error:', message);
+      // If monitor fails, stop dictation to prevent stuck state
+      if (state === 'active') {
+        void stopDictation();
+      }
+    },
+  });
+
+  // Safety timeout: auto-stop if held for too long (prevents stuck dictation)
+  holdSafetyTimeout = setTimeout(() => {
+    console.warn('[Dictation] Hold mode: safety timeout reached, stopping');
+    void stopDictation();
+  }, HOLD_SAFETY_TIMEOUT_MS);
+}
+
+/**
+ * Stop the hold mode monitor and clear safety timeout.
+ */
+function stopHoldMonitor(): void {
+  if (holdMonitor) {
+    holdMonitor.stop();
+    holdMonitor = null;
+  }
+  if (holdSafetyTimeout) {
+    clearTimeout(holdSafetyTimeout);
+    holdSafetyTimeout = null;
+  }
 }
 
 // ─── Mic Capture ─────────────────────────────────────────────────────────────
@@ -442,6 +559,17 @@ function stopAudioPolling(): void {
 // ─── Text Handling ──────────────────────────────────────────────────────────
 
 /**
+ * Returns the length of the longest common prefix between two strings.
+ * Used to minimize backspace/retype operations during partial updates.
+ */
+function commonPrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i++;
+  return i;
+}
+
+/**
  * Serializes all typing operations to prevent race conditions.
  * Each operation (backspace + retype) must complete before the next starts.
  */
@@ -458,13 +586,21 @@ function handlePartial(text: string): void {
 
   if (!config?.livePartials) return;
 
-  // Live partials mode: type the partial text, backspacing the previous partial first.
-  // Note: if the user manually moves the cursor mid-partial, backspacing will corrupt text.
+  // Smart partial update: only backspace and retype from the divergence point.
+  // This looks like autocomplete correcting text rather than full-line flashing.
   enqueueTyping(async () => {
-    if (partialTypedLength > 0) {
-      await typeBackspaces(partialTypedLength);
+    const commonLen = commonPrefixLength(partialTypedText, text);
+    const backspaceCount = partialTypedLength - commonLen;
+    const newSuffix = text.slice(commonLen);
+
+    if (backspaceCount > 0) {
+      await typeBackspaces(backspaceCount);
     }
-    await typeText(text);
+    if (newSuffix) {
+      await typeText(newSuffix);
+    }
+
+    partialTypedText = text;
     partialTypedLength = text.length;
   });
 }
@@ -474,10 +610,23 @@ function handleFinal(text: string): void {
 
   enqueueTyping(async () => {
     if (config?.livePartials && partialTypedLength > 0) {
-      // Erase the last partial before typing the corrected final
-      await typeBackspaces(partialTypedLength);
+      // Smart update: only backspace from the divergence point between
+      // what was typed (partial) and the corrected final text.
+      const finalWithSpace = text + ' ';
+      const commonLen = commonPrefixLength(partialTypedText, finalWithSpace);
+      const backspaceCount = partialTypedLength - commonLen;
+      const newSuffix = finalWithSpace.slice(commonLen);
+
+      if (backspaceCount > 0) {
+        await typeBackspaces(backspaceCount);
+      }
+      if (newSuffix) {
+        await typeText(newSuffix);
+      }
+    } else {
+      await typeText(text + ' ');
     }
-    await typeText(text + ' ');
+    partialTypedText = '';
     partialTypedLength = 0;
   });
 }

@@ -29,6 +29,9 @@ function ensureIpcHandlers(): void {
     if (!win || win.isDestroyed()) return;
     if (interactive) {
       win.setIgnoreMouseEvents(false);
+      // Ensure the overlay stays non-focusable and at panel level so clicking
+      // it does not activate the Electron app or bring the main window forward.
+      win.setFocusable(false);
     } else {
       win.setIgnoreMouseEvents(true, { forward: true });
     }
@@ -82,7 +85,7 @@ export function createDictationOverlay(): void {
     },
   });
 
-  overlayWindow.setAlwaysOnTop(true, 'floating');
+  overlayWindow.setAlwaysOnTop(true, 'pop-up-menu');
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   // Start with click-through — renderer will toggle on hover
@@ -96,6 +99,13 @@ export function createDictationOverlay(): void {
 
   overlayWindow.on('closed', () => {
     overlayWindow = null;
+  });
+
+  // Safety: if the overlay ever receives focus (shouldn't with focusable:false),
+  // immediately blur it to prevent the Electron app from activating and stealing
+  // focus from the user's foreground app.
+  overlayWindow.on('focus', () => {
+    overlayWindow?.blur();
   });
 }
 
