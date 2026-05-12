@@ -53,6 +53,7 @@ let levelPollInterval: ReturnType<typeof setInterval> | null = null;
 
 // Session timing
 let sessionStartTime: number = 0;
+let sessionGeneration: number = 0;
 
 // Partial typing state (for live partials mode)
 let partialTypedLength: number = 0;
@@ -206,12 +207,13 @@ async function startDictation(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
   state = 'starting';
+  sessionGeneration += 1;
   broadcastState();
   sessionStartTime = Date.now();
 
   try {
     // 1. Show overlay
-    showDictationOverlay();
+    await showDictationOverlay();
 
     // 2. Start mic capture
     await startMicCapture(config.inputDeviceId ?? undefined);
@@ -228,6 +230,7 @@ async function startDictation(): Promise<void> {
   } catch (err) {
     console.error('[Dictation] Start failed:', err);
     state = 'idle';
+    sessionGeneration += 1;
     broadcastState();
     await cleanupSession();
     broadcastError(err instanceof Error ? err.message : String(err));
@@ -238,6 +241,7 @@ async function stopDictation(): Promise<void> {
   if (state === 'idle' || state === 'stopping') return;
 
   state = 'stopping';
+  sessionGeneration += 1;
   broadcastState();
 
   await cleanupSession();
@@ -575,20 +579,29 @@ function commonPrefixLength(a: string, b: string): number {
  */
 let typingQueue: Promise<void> = Promise.resolve();
 
-function enqueueTyping(fn: () => Promise<void>): void {
-  typingQueue = typingQueue.then(fn).catch((err) => {
+function isCurrentTypingSession(generation: number): boolean {
+  return state === 'active' && generation === sessionGeneration;
+}
+
+function enqueueTyping(generation: number, fn: () => Promise<void>): void {
+  typingQueue = typingQueue.then(async () => {
+    if (!isCurrentTypingSession(generation)) return;
+    await fn();
+  }).catch((err) => {
     console.error('[Dictation] Typing queue error:', err);
   });
 }
 
 function handlePartial(text: string): void {
+  if (state !== 'active') return;
   sendToOverlay('dictation:partial', text);
 
   if (!config?.livePartials) return;
 
+  const generation = sessionGeneration;
   // Smart partial update: only backspace and retype from the divergence point.
   // This looks like autocomplete correcting text rather than full-line flashing.
-  enqueueTyping(async () => {
+  enqueueTyping(generation, async () => {
     const commonLen = commonPrefixLength(partialTypedText, text);
     const backspaceCount = partialTypedLength - commonLen;
     const newSuffix = text.slice(commonLen);
@@ -596,9 +609,11 @@ function handlePartial(text: string): void {
     if (backspaceCount > 0) {
       await typeBackspaces(backspaceCount);
     }
+    if (!isCurrentTypingSession(generation)) return;
     if (newSuffix) {
       await typeText(newSuffix);
     }
+    if (!isCurrentTypingSession(generation)) return;
 
     partialTypedText = text;
     partialTypedLength = text.length;
@@ -606,9 +621,11 @@ function handlePartial(text: string): void {
 }
 
 function handleFinal(text: string): void {
+  if (state !== 'active') return;
   sendToOverlay('dictation:final', text);
 
-  enqueueTyping(async () => {
+  const generation = sessionGeneration;
+  enqueueTyping(generation, async () => {
     if (config?.livePartials && partialTypedLength > 0) {
       // Smart update: only backspace from the divergence point between
       // what was typed (partial) and the corrected final text.
@@ -620,12 +637,15 @@ function handleFinal(text: string): void {
       if (backspaceCount > 0) {
         await typeBackspaces(backspaceCount);
       }
+      if (!isCurrentTypingSession(generation)) return;
       if (newSuffix) {
         await typeText(newSuffix);
       }
     } else {
+      if (!isCurrentTypingSession(generation)) return;
       await typeText(text + ' ');
     }
+    if (!isCurrentTypingSession(generation)) return;
     partialTypedText = '';
     partialTypedLength = 0;
   });

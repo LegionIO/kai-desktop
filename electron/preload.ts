@@ -490,6 +490,7 @@ const appAPI = {
     setDevice: (deviceId: string) => ipcRenderer.invoke('dictation:set-device', deviceId),
     setOverlayInteractive: (interactive: boolean) => ipcRenderer.send('dictation:overlay-set-interactive', interactive),
     resizeOverlay: (height: number) => ipcRenderer.send('dictation:overlay-resize', height),
+    restoreOverlayFocus: () => ipcRenderer.send('dictation:overlay-restore-focus'),
     onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number }) => callback(state);
       ipcRenderer.on('dictation:state', handler);

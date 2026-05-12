@@ -100,11 +100,16 @@ export const DictationOverlay: FC = () => {
     app.dictation.setOverlayInteractive(false);
   }, []);
 
+  const handleClickCapture = useCallback(() => {
+    setTimeout(() => app.dictation.restoreOverlayFocus(), 0);
+  }, []);
+
   return (
     <div
       className="h-screen w-screen select-none"
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
+      onClickCapture={handleClickCapture}
     >
       <div
         className="flex flex-col rounded-2xl border border-white/10 bg-black/80 backdrop-blur-xl shadow-2xl overflow-hidden"

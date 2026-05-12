@@ -42,7 +42,7 @@ import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
-import { createPaddedDockIcon } from './utils/dock-icon.js';
+import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
 
@@ -283,9 +283,7 @@ const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
 
 function setMacDockIcon(): void {
-  if (!IS_MAC || !app.dock) return;
-  const padded = createPaddedDockIcon(APP_ICON);
-  if (padded) app.dock.setIcon(padded);
+  setPaddedMacDockIcon(APP_ICON);
 }
 
 function restoreMacDockIconAfterRendererIconUpdates(): void {

@@ -289,6 +289,7 @@ type AppAPI = {
     setDevice: (deviceId: string) => Promise<{ ok: boolean }>;
     setOverlayInteractive: (interactive: boolean) => void;
     resizeOverlay: (height: number) => void;
+    restoreOverlayFocus: () => void;
     onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => () => void;
     onLevel: (callback: (level: number) => void) => () => void;
     onPartial: (callback: (text: string) => void) => () => void;

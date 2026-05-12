@@ -12,10 +12,15 @@
  *   via IPC so that clicks work when hovering but don't interfere otherwise
  */
 
-import { BrowserWindow, ipcMain, screen, app } from 'electron';
+import { BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
-import { createPaddedDockIcon } from '../utils/dock-icon.js';
+import { setPaddedMacDockIcon } from '../utils/dock-icon.js';
+import {
+  beginDictationFocusSession,
+  refreshDictationTargetFocus,
+  restoreDictationTargetFocusSoon,
+} from './focus-preserver.js';
 
 const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 
@@ -29,9 +34,12 @@ function ensureIpcHandlers(): void {
   // Toggle mouse events — renderer sends this on mouseenter/mouseleave
   ipcMain.on('dictation:overlay-set-interactive', (event, interactive: boolean) => {
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
     if (interactive) {
+      refreshDictationTargetFocus();
+      win.setFocusable(false);
       win.setIgnoreMouseEvents(false);
+      win.setFocusable(false);
     } else {
       win.setIgnoreMouseEvents(true, { forward: true });
     }
@@ -40,9 +48,16 @@ function ensureIpcHandlers(): void {
   // Resize request from renderer (e.g., when device picker expands)
   ipcMain.on('dictation:overlay-resize', (event, height: number) => {
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
     const bounds = win.getBounds();
     win.setBounds({ ...bounds, height: Math.max(52, Math.min(height, 400)) });
+    restoreDictationTargetFocusSoon();
+  });
+
+  ipcMain.on('dictation:overlay-restore-focus', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
+    restoreDictationTargetFocusSoon();
   });
 }
 
@@ -87,7 +102,10 @@ export function createDictationOverlay(): void {
   });
 
   overlayWindow.setAlwaysOnTop(true, 'floating');
-  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.setVisibleOnAllWorkspaces(true, {
+    visibleOnFullScreen: true,
+    skipTransformProcessType: true,
+  });
 
   // Start with click-through — renderer will toggle on hover
   overlayWindow.setIgnoreMouseEvents(true, { forward: true });
@@ -113,16 +131,17 @@ export function createDictationOverlay(): void {
 /**
  * Show the overlay (dictation started).
  */
-export function showDictationOverlay(): void {
+export async function showDictationOverlay(): Promise<void> {
+  await beginDictationFocusSession();
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     createDictationOverlay();
   }
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     // Reposition in case display changed
     repositionOverlay();
+    setPaddedMacDockIcon(APP_ICON);
     overlayWindow.showInactive();
-    // Panel-type windows can cause the dock icon to hide on macOS — keep it visible
-    ensureDockVisible();
+    restoreDictationTargetFocusSoon();
   }
 }
 
@@ -131,7 +150,9 @@ export function showDictationOverlay(): void {
  */
 export function hideDictationOverlay(): void {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.setIgnoreMouseEvents(true, { forward: true });
     overlayWindow.hide();
+    restoreDictationTargetFocusSoon();
   }
 }
 
@@ -194,28 +215,4 @@ function loadOverlayRoute(win: BrowserWindow): void {
   }
 
   void win.loadFile(rendererHtmlPath, { query });
-}
-
-/**
- * Ensure the app dock icon stays visible on macOS.
- * Panel-type windows can cause macOS to hide the dock icon when no
- * normal-level windows are in the foreground.
- */
-function ensureDockVisible(): void {
-  try {
-    const dock = process.platform === 'darwin' ? app.dock : undefined;
-    if (!dock) return;
-
-    const icon = createPaddedDockIcon(APP_ICON);
-    if (icon) dock.setIcon(icon);
-
-    void dock.show().then(() => {
-      if (icon) dock.setIcon(icon);
-      setTimeout(() => {
-        if (icon) dock.setIcon(icon);
-      }, 200);
-    });
-  } catch {
-    // Dock API may not be available in all environments
-  }
 }
