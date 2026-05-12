@@ -120,7 +120,7 @@ export class MarketplaceService {
     }
 
     // Check if the repo remote URL in the config has an embedded token
-    // (like the LegionIO repos use ghp_ tokens in remote URLs)
+    // (some private repos embed ghp_ tokens directly in remote URLs)
     try {
       const checkUrl = `https://api.github.com/repos/${repo}`;
       const publicCheck = await net.fetch(checkUrl, { method: 'HEAD' });

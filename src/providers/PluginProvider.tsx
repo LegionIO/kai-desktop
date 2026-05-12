@@ -129,6 +129,15 @@ export type PluginNotificationDescriptor = {
   target?: PluginNavigationTarget;
 };
 
+export type PluginContributedCliTool = {
+  name: string;
+  binary: string;
+  extraBinaries?: string[];
+  description: string;
+  prefix?: string;
+  pluginName: string;
+};
+
 export type PluginUIState = {
   banners: PluginBannerDescriptor[];
   modals: PluginModalDescriptor[];
@@ -147,6 +156,7 @@ export type PluginUIState = {
   notifications: PluginNotificationDescriptor[];
   requiredPluginsReady: boolean;
   brandRequiredPluginNames: string[];
+  contributedCliTools?: PluginContributedCliTool[];
 };
 
 type ModalCallbackData = {

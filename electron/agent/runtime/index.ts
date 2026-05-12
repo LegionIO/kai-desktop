@@ -14,6 +14,7 @@
 import type { AgentRuntime, RuntimeId } from './types.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
+import type { PluginRuntimeContribution } from '../../plugins/types.js';
 import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-compat.js';
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,14 @@ import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-
 // ---------------------------------------------------------------------------
 
 const runtimes = new Map<RuntimeId, AgentRuntime>();
+
+// Plugin-contributed runtimes (set by plugin manager, read by getAvailableRuntimes)
+let pluginRuntimesSource: (() => PluginRuntimeContribution[]) | null = null;
+
+/** Wire up plugin runtime contributions. Called once by main.ts after plugin manager is ready. */
+export function setPluginRuntimesSource(fn: () => PluginRuntimeContribution[]): void {
+  pluginRuntimesSource = fn;
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -129,12 +138,15 @@ export async function resolveRuntimeForStream(
 
 /**
  * Returns a list of all registered runtimes with their availability status.
+ * Merges hardcoded runtimes with plugin-contributed runtimes.
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }>
+  Array<{ id: string; name: string; available: boolean; reason?: string }>
 > {
-  const results: Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }> = [];
+  const results: Array<{ id: string; name: string; available: boolean; reason?: string }> = [];
+
+  // Built-in runtimes
   for (const [, runtime] of runtimes) {
     const available = await runtime.isAvailable();
     results.push({
@@ -150,6 +162,15 @@ export async function getAvailableRuntimes(): Promise<
             : undefined,
     });
   }
+
+  // Plugin-contributed runtimes (merged in, no duplicates)
+  const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+  for (const pr of pluginRuntimes) {
+    if (results.some((r) => r.id === pr.id)) continue; // already present
+    const available = pr.isAvailable();
+    results.push({ id: pr.id, name: pr.name, available });
+  }
+
   return results;
 }
 

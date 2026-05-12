@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from './types.js';
+import type { PluginCliToolContribution } from '../plugins/types.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { runToolExecution } from './execution.js';
 import { isCommandAllowed } from './shell.js';
@@ -78,15 +79,28 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
   };
 }
 
-export function buildCliTools(getConfig: () => AppConfig): ToolDefinition[] {
+export function buildCliTools(
+  getConfig: () => AppConfig,
+  pluginContributions: PluginCliToolContribution[] = [],
+): ToolDefinition[] {
   const config = getConfig();
   const specs = config.cliTools ?? [];
   const tools: ToolDefinition[] = [];
 
+  // Built-in / user-configured CLI tools
   for (const spec of specs) {
     if (spec.enabled === false) continue;
     if (binaryExists(spec.binary)) {
       tools.push(createCliTool(spec, getConfig));
+    }
+  }
+
+  // Plugin-contributed CLI tools (merged, no duplicates with built-ins)
+  const builtinNames = new Set(tools.map((t) => t.name));
+  for (const contrib of pluginContributions) {
+    if (builtinNames.has(contrib.name)) continue; // don't override built-ins
+    if (binaryExists(contrib.binary)) {
+      tools.push(createCliTool(contrib, getConfig));
     }
   }
 

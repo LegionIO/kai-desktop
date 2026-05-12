@@ -1903,6 +1903,16 @@ export function RuntimeProvider({
       } else if (e.type === 'error') {
         console.warn(`[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`);
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
+        // Apply messageMeta (e.g. runtimeId) from error events so the popover
+        // shows the correct runtime even when the response is an error.
+        if (e.messageMeta && Object.keys(e.messageMeta).length > 0) {
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          const last = branch[branch.length - 1];
+          if (last?.role === 'assistant') {
+            const idx = acc.messages.findIndex((m) => m.id === last.id);
+            if (idx >= 0) acc.messages[idx] = applyAssistantMessageMeta(acc.messages[idx], e.messageMeta);
+          }
+        }
         finalizeAssistantResponse(acc);
         const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
