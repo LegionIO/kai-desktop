@@ -1228,9 +1228,15 @@ const MessageInfoIndicator: FC = () => {
   const persistedEffort = meta?.reasoningEffort as string | undefined;
   const persistedRuntimeId = meta?.runtimeId as string | undefined;
 
-  // Model: persisted display name > catalog lookup > formatted raw key
+  // Model: persisted display name > catalog lookup > formatted raw key.
+  // When the message was handled by a plugin inference provider (persistedRuntimeId
+  // is set from messageMeta), the provider manages its own model routing — don't
+  // show the Kai UI model selection since it doesn't reflect what was actually used.
+  // Only show a model if the daemon explicitly reports one via sourceModelDisplayName.
   const sourceModel = meta?.sourceModel as string | undefined;
-  const modelKey = selectedModelKey ?? (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ?? sourceModel ?? null;
+  const modelKey = persistedRuntimeId
+    ? (sourceModel ?? null)  // inference provider: only show if daemon reported it
+    : (selectedModelKey ?? (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ?? sourceModel ?? null);
 
   // Runtime
   const effectiveRuntimeId = persistedRuntimeId ?? resolvedRuntime;
