@@ -12,9 +12,12 @@
  *   via IPC so that clicks work when hovering but don't interfere otherwise
  */
 
-import { BrowserWindow, ipcMain, screen } from 'electron';
+import { BrowserWindow, ipcMain, screen, app } from 'electron';
 import { join } from 'node:path';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
+import { createPaddedDockIcon } from '../utils/dock-icon.js';
+
+const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 
 let overlayWindow: BrowserWindow | null = null;
 let ipcRegistered = false;
@@ -29,9 +32,6 @@ function ensureIpcHandlers(): void {
     if (!win || win.isDestroyed()) return;
     if (interactive) {
       win.setIgnoreMouseEvents(false);
-      // Ensure the overlay stays non-focusable and at panel level so clicking
-      // it does not activate the Electron app or bring the main window forward.
-      win.setFocusable(false);
     } else {
       win.setIgnoreMouseEvents(true, { forward: true });
     }
@@ -68,6 +68,7 @@ export function createDictationOverlay(): void {
     height,
     x,
     y,
+    type: 'panel',
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -85,7 +86,7 @@ export function createDictationOverlay(): void {
     },
   });
 
-  overlayWindow.setAlwaysOnTop(true, 'pop-up-menu');
+  overlayWindow.setAlwaysOnTop(true, 'floating');
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   // Start with click-through — renderer will toggle on hover
@@ -120,6 +121,8 @@ export function showDictationOverlay(): void {
     // Reposition in case display changed
     repositionOverlay();
     overlayWindow.showInactive();
+    // Panel-type windows can cause the dock icon to hide on macOS — keep it visible
+    ensureDockVisible();
   }
 }
 
@@ -191,4 +194,28 @@ function loadOverlayRoute(win: BrowserWindow): void {
   }
 
   void win.loadFile(rendererHtmlPath, { query });
+}
+
+/**
+ * Ensure the app dock icon stays visible on macOS.
+ * Panel-type windows can cause macOS to hide the dock icon when no
+ * normal-level windows are in the foreground.
+ */
+function ensureDockVisible(): void {
+  try {
+    const dock = process.platform === 'darwin' ? app.dock : undefined;
+    if (!dock) return;
+
+    const icon = createPaddedDockIcon(APP_ICON);
+    if (icon) dock.setIcon(icon);
+
+    void dock.show().then(() => {
+      if (icon) dock.setIcon(icon);
+      setTimeout(() => {
+        if (icon) dock.setIcon(icon);
+      }, 200);
+    });
+  } catch {
+    // Dock API may not be available in all environments
+  }
 }
