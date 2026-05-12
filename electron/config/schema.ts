@@ -507,6 +507,14 @@ export const appConfigSchema = z.object({
   audio: audioConfigSchema,
   realtime: realtimeConfigSchema,
   computerUse: computerUseConfigSchema,
+  dictation: z.object({
+    enabled: z.boolean(),
+    hotkey: z.string(),
+    mode: z.enum(['toggle', 'hold']),
+    inputDeviceId: z.string().nullable().optional(),
+    language: z.string().optional(),
+    livePartials: z.boolean().optional(),
+  }).optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
     maxSteps: z.number().positive(),

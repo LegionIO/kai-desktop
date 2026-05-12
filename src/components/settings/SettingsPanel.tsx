@@ -11,6 +11,7 @@ import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
+import { DictationSettings } from './DictationSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
@@ -18,6 +19,7 @@ type SettingsSection =
   | 'tools'
   | 'general'
   | 'audio-voice'
+  | 'dictation'
   | 'computer-use'
   | 'media-generation'
   | 'web-server';
@@ -27,6 +29,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'tools', label: 'Tools' },
   { key: 'general', label: 'Application' },
   { key: 'audio-voice', label: 'Audio & Voice' },
+  { key: 'dictation', label: 'Dictation' },
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'web-server', label: 'Web UI' },
@@ -87,6 +90,7 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'tools' && <CombinedToolsSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'audio-voice' && <AudioVoiceSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'dictation' && <DictationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}

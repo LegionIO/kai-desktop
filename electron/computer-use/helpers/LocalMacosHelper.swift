@@ -565,6 +565,45 @@ case "typeText":
   typeCharacterByCharacter(decoded, delayMs: delayMs)
   printJson(["ok": true])
 
+case "postText":
+  // Bulk text insertion via CGEvent.keyboardSetUnicodeString in chunks.
+  // Faster than typeCharacterByCharacter — no per-char delay.
+  // Used by dictation for instant text output.
+  guard args.count >= 3 else {
+    printJson(["ok": false, "error": "Expected base64Text"])
+    exit(1)
+  }
+  guard let decoded = decodeBase64String(args[2]) else {
+    printJson(["ok": false, "error": "Invalid base64 text"])
+    exit(1)
+  }
+  let postChunkSize = 20
+  let chars = Array(decoded)
+  var offset = 0
+  while offset < chars.count {
+    let end = min(offset + postChunkSize, chars.count)
+    let chunk = String(chars[offset..<end])
+    postUnicodeText(chunk)
+    _ = sleepMillis(5)
+    offset = end
+  }
+  printJson(["ok": true])
+
+case "deleteBack":
+  // Delete N characters backwards (backspace key).
+  // Used by dictation to erase partial text before retyping corrected final.
+  guard args.count >= 3 else {
+    printJson(["ok": false, "error": "Expected count"])
+    exit(1)
+  }
+  let deleteCount = Int(args[2]) ?? 0
+  for _ in 0..<deleteCount {
+    postKeyboardEvent(keyCode: 51, keyDown: true)
+    postKeyboardEvent(keyCode: 51, keyDown: false)
+    _ = sleepMillis(3)
+  }
+  printJson(["ok": true])
+
 case "pressKeys":
   guard args.count >= 3 else {
     printJson(["ok": false, "error": "Expected base64 JSON key list [delayMs]"])

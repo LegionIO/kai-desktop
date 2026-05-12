@@ -282,6 +282,19 @@ type AppAPI = {
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
   onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
+  dictation: {
+    toggle: () => Promise<{ state: string; elapsed: number }>;
+    stop: () => Promise<{ state: string; elapsed: number }>;
+    getState: () => Promise<{ state: string; elapsed: number }>;
+    setDevice: (deviceId: string) => Promise<{ ok: boolean }>;
+    setOverlayInteractive: (interactive: boolean) => void;
+    resizeOverlay: (height: number) => void;
+    onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => () => void;
+    onLevel: (callback: (level: number) => void) => () => void;
+    onPartial: (callback: (text: string) => void) => () => void;
+    onFinal: (callback: (text: string) => void) => () => void;
+    onError: (callback: (message: string) => void) => () => void;
+  };
 };
 
 declare global {

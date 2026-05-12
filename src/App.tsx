@@ -24,6 +24,7 @@ import { PermissionConsentModal } from '@/components/plugins/PermissionConsentMo
 import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
+import { DictationOverlay } from '@/components/dictation/DictationOverlay';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { ArchiveIcon, ArchiveRestoreIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
@@ -86,10 +87,15 @@ function AppRoot() {
   const search = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
   const isOperatorWindow = search?.get('operator') === '1';
   const isOverlayWindow = search?.get('overlay') === '1';
+  const isDictationOverlay = search?.get('dictationOverlay') === '1';
   const isComputerSetupWindow = isOperatorWindow && search?.get('setup') === '1';
   const operatorSessionId = isOperatorWindow && !isComputerSetupWindow ? search.get('sessionId') : null;
   const operatorConversationId = isComputerSetupWindow ? search?.get('conversationId') : null;
   const overlaySessionId = isOverlayWindow ? search?.get('sessionId') ?? null : null;
+
+  if (isDictationOverlay) {
+    return <DictationOverlay />;
+  }
 
   if (overlaySessionId) {
     return <OverlayShell sessionId={overlaySessionId} />;

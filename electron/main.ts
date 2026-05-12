@@ -32,6 +32,7 @@ import { registerAgentHandlers as registerAgentEntityHandlers } from './ipc/agen
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
+import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
 import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
@@ -619,6 +620,9 @@ if (gotSingleInstanceLock) {
       // Plugin config change forwarding
       pluginManager.onConfigChanged(config);
 
+      // Dictation hotkey hot-reload
+      updateDictationConfig(config);
+
       // Launch at login
       const newLaunchAtLoginFp = JSON.stringify(config.launchAtLogin ?? false);
       if (newLaunchAtLoginFp !== lastLaunchAtLoginFp) {
@@ -637,6 +641,9 @@ if (gotSingleInstanceLock) {
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
     registerBatchTranscribeHandlers(ipcMain, getConfig);
+
+    // Initialize dictation system (global hotkey + STT + text insertion)
+    initDictation(getConfig());
 
     // Debug logging: renderer can write to debug-logs/ via IPC
     const debugLogDir = join(process.cwd(), 'debug-logs');
@@ -1042,6 +1049,7 @@ app.on('before-quit', () => {
     console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);
   });
   cleanupMicRecorder();
+  cleanupDictation();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
 });

@@ -482,6 +482,40 @@ const appAPI = {
   debug: {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
   },
+
+  dictation: {
+    toggle: () => ipcRenderer.invoke('dictation:toggle'),
+    stop: () => ipcRenderer.invoke('dictation:stop'),
+    getState: () => ipcRenderer.invoke('dictation:get-state'),
+    setDevice: (deviceId: string) => ipcRenderer.invoke('dictation:set-device', deviceId),
+    setOverlayInteractive: (interactive: boolean) => ipcRenderer.send('dictation:overlay-set-interactive', interactive),
+    resizeOverlay: (height: number) => ipcRenderer.send('dictation:overlay-resize', height),
+    onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number }) => callback(state);
+      ipcRenderer.on('dictation:state', handler);
+      return () => ipcRenderer.removeListener('dictation:state', handler);
+    },
+    onLevel: (callback: (level: number) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, level: number) => callback(level);
+      ipcRenderer.on('dictation:level', handler);
+      return () => ipcRenderer.removeListener('dictation:level', handler);
+    },
+    onPartial: (callback: (text: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, text: string) => callback(text);
+      ipcRenderer.on('dictation:partial', handler);
+      return () => ipcRenderer.removeListener('dictation:partial', handler);
+    },
+    onFinal: (callback: (text: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, text: string) => callback(text);
+      ipcRenderer.on('dictation:final', handler);
+      return () => ipcRenderer.removeListener('dictation:final', handler);
+    },
+    onError: (callback: (message: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, message: string) => callback(message);
+      ipcRenderer.on('dictation:error', handler);
+      return () => ipcRenderer.removeListener('dictation:error', handler);
+    },
+  },
 };
 
 contextBridge.exposeInMainWorld('app', appAPI);

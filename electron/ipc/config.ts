@@ -223,6 +223,14 @@ function getDefaultConfig() {
         opacity: 0.75,
       },
     },
+    dictation: {
+      enabled: false,
+      hotkey: 'CommandOrControl+Shift+D',
+      mode: 'toggle' as const,
+      inputDeviceId: null as string | null,
+      language: undefined as string | undefined,
+      livePartials: false,
+    },
     advanced: {
       temperature: 0.4,
       maxSteps: 10,
@@ -727,6 +735,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     audio: config.audio,
     realtime: config.realtime,
     computerUse: config.computerUse,
+    dictation: config.dictation,
     advanced: config.advanced,
     profiles: config.profiles,
     defaultProfileKey: config.defaultProfileKey,
