@@ -44,6 +44,11 @@ interface DictationConfig {
   livePartials?: boolean;
 }
 
+type AxDictationSpan = {
+  location: number;
+  typedUtf16Length: number;
+};
+
 let state: DictationState = 'idle';
 let config: DictationConfig | null = null;
 let fullConfig: AppConfig | null = null;
@@ -64,6 +69,7 @@ let sessionGeneration: number = 0;
 // Partial typing state (for live partials mode)
 let partialTypedText: string = '';
 const queuedPartialGate = new DictationQueuedPartialGate();
+let axDictationSpan: AxDictationSpan | null = null;
 
 // Hold mode state
 let holdMonitor: LocalMacosTakeoverMonitorHandle | null = null;
@@ -218,6 +224,8 @@ async function startDictation(): Promise<void> {
   sessionStartTime = Date.now();
 
   try {
+    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+
     // 1. Show overlay
     await showDictationOverlay();
 
@@ -265,6 +273,7 @@ async function cleanupSession(): Promise<void> {
   await stopMicCapture();
   partialTypedText = '';
   queuedPartialGate.invalidateQueuedPartials();
+  axDictationSpan = null;
 }
 
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
@@ -603,6 +612,7 @@ function handlePartial(text: string): void {
     if (!applied) return;
 
     partialTypedText = text;
+    updateAxDictationSpanLength(text);
   });
 }
 
@@ -624,6 +634,7 @@ function handleFinal(text: string): void {
     if (!isCurrentTypingSession(generation)) return;
     if (!applied) return;
     partialTypedText = '';
+    axDictationSpan = null;
   });
 }
 
@@ -632,6 +643,10 @@ async function applyDictationPatch(
   targetText: string,
   phase: DictationPatchPhase,
 ): Promise<boolean> {
+  if (currentText && await replaceDictatedTextViaAx(targetText)) {
+    return true;
+  }
+
   const plan = planDictationTextPatch(currentText, targetText, phase);
 
   switch (plan.kind) {
@@ -651,6 +666,45 @@ async function applyDictationPatch(
       return true;
     }
   }
+}
+
+async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpan | null> {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const result = await runLocalMacMouseCommand(['focusedTextSelection']);
+    const location = result.selectedTextRangeLocation;
+    const length = result.selectedTextRangeLength;
+    if (typeof location !== 'number' || typeof length !== 'number' || location < 0 || length < 0) {
+      return null;
+    }
+    return { location, typedUtf16Length: 0 };
+  } catch {
+    return null;
+  }
+}
+
+async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
+  if (!axDictationSpan) return false;
+  const encoded = Buffer.from(targetText, 'utf-8').toString('base64');
+  try {
+    await runLocalMacMouseCommand([
+      'replaceFocusedTextRange',
+      String(axDictationSpan.location),
+      String(axDictationSpan.typedUtf16Length),
+      encoded,
+    ]);
+    updateAxDictationSpanLength(targetText);
+    return true;
+  } catch (err) {
+    axDictationSpan = null;
+    console.info('[Dictation] AX text range replacement unavailable, falling back:', err);
+    return false;
+  }
+}
+
+function updateAxDictationSpanLength(text: string): void {
+  if (!axDictationSpan) return;
+  axDictationSpan.typedUtf16Length = text.length;
 }
 
 // ─── Text Insertion via CGEvents ─────────────────────────────────────────────

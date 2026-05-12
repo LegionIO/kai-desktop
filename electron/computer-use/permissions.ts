@@ -127,6 +127,8 @@ export type LocalMacosHelperResponse = {
   desktopHeight?: number;
   pointerX?: number;
   pointerY?: number;
+  selectedTextRangeLocation?: number;
+  selectedTextRangeLength?: number;
   imageBase64?: string;
   width?: number;
   height?: number;
