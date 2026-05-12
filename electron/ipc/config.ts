@@ -125,7 +125,7 @@ function getDefaultConfig() {
     ui: {
       theme: 'system' as const,
       sidebarWidth: 280,
-      fullWidthContent: false,
+      fullWidthContent: true,
       splashBackground: 'random' as const,
       workspaces: [] as Array<{
         id: string;
