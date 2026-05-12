@@ -7,9 +7,9 @@
  * Key behavior: The overlay must be clickable (for stop/expand/device picker)
  * but must NOT steal focus from the user's active app. We achieve this by:
  * - Setting `focusable: false` on the BrowserWindow
- * - Using `setIgnoreMouseEvents(true, { forward: true })` as default
- * - The renderer detects mouseenter/mouseleave and toggles mouse acceptance
- *   via IPC so that clicks work when hovering but don't interfere otherwise
+ * - Resetting mouse acceptance every time the hidden window is shown
+ * - The renderer detects mouseenter/mouseleave and keeps click-through state
+ *   in sync while the overlay is visible.
  */
 
 import { BrowserWindow, ipcMain, screen } from 'electron';
@@ -107,7 +107,9 @@ export function createDictationOverlay(): void {
     skipTransformProcessType: true,
   });
 
-  // Start with click-through — renderer will toggle on hover
+  // Hidden windows start click-through. showDictationOverlay() makes the reused
+  // window interactive again before showing, because the renderer may not emit a
+  // new mouseenter if the window was hidden while hovered.
   overlayWindow.setIgnoreMouseEvents(true, { forward: true });
 
   // Apply brand user agent
@@ -140,6 +142,9 @@ export async function showDictationOverlay(): Promise<void> {
     // Reposition in case display changed
     repositionOverlay();
     setPaddedMacDockIcon(APP_ICON);
+    overlayWindow.setFocusable(false);
+    overlayWindow.setIgnoreMouseEvents(false);
+    overlayWindow.setFocusable(false);
     overlayWindow.showInactive();
     restoreDictationTargetFocusSoon();
   }
