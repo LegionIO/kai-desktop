@@ -24,6 +24,9 @@ import type {
   PreSendHookResult,
   PostReceiveHookArgs,
   PostReceiveHookResult,
+  PreUpdateHookArgs,
+  PreUpdateHookResult,
+  PostUpdateHookArgs,
   PluginAPI,
   PluginPermission,
   PluginInferenceProvider,
@@ -330,6 +333,8 @@ export class PluginManager {
       registeredTools: [],
       preSendHooks: [],
       postReceiveHooks: [],
+      preUpdateHooks: [],
+      postUpdateHooks: [],
       uiBanners: [],
       uiModals: [],
       uiSettingsSections: [],
@@ -708,6 +713,36 @@ export class PluginManager {
     }
 
     return result;
+  }
+
+  /* ── Lifecycle Hooks ── */
+
+  async runPreUpdateHooks(args: PreUpdateHookArgs): Promise<PreUpdateHookResult> {
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.preUpdateHooks) {
+        try {
+          const result = await hook(args);
+          if (result?.abort) return result;
+        } catch (err) {
+          console.error(`[PluginManager] Pre-update hook error in "${instance.manifest.name}":`, err);
+        }
+      }
+    }
+    return {};
+  }
+
+  async runPostUpdateHooks(args: PostUpdateHookArgs): Promise<void> {
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.postUpdateHooks) {
+        try {
+          await hook(args);
+        } catch (err) {
+          console.error(`[PluginManager] Post-update hook error in "${instance.manifest.name}":`, err);
+        }
+      }
+    }
   }
 
   /* ── UI State ── */

@@ -55,6 +55,19 @@ function broadcast(status: UpdateStatus): void {
 
 const execFileAsync = promisify(execFile);
 
+/* ── Plugin Lifecycle Hook Runner ── */
+
+export type UpdateHookRunner = {
+  runPreUpdateHooks: (args: { version: string; artifactPath: string }) => Promise<{ abort?: boolean; abortReason?: string }>;
+  runPostUpdateHooks: (args: { version: string; success: boolean }) => Promise<void>;
+};
+
+let hookRunner: UpdateHookRunner | null = null;
+
+export function setUpdateHookRunner(runner: UpdateHookRunner): void {
+  hookRunner = runner;
+}
+
 /**
  * Escape a string for safe interpolation inside a POSIX single-quoted shell argument.
  * Single quotes cannot appear inside single-quoted strings, so we close the quote,
@@ -111,14 +124,14 @@ function resolveDownloadedUpdatePath(): string | null {
 }
 
 /**
- * Attempt to install the downloaded update by manually extracting the zip
- * and replacing the app bundle via osascript with administrator privileges.
+ * Attempt to install the downloaded update by extracting the zip and replacing
+ * the app bundle.
  *
- * On macOS, writing to /Applications requires admin authorization. Rather than
- * using Squirrel's fire-and-forget quitAndInstall (which quits the app before
- * the user can enter their password), we trigger the admin prompt ourselves
- * via osascript. This blocks until the user authorizes or cancels, giving us
- * definitive success/failure feedback.
+ * Strategy:
+ * 1. Try a plain shell move (works if user is already elevated to admin via
+ *    Privileges.app or similar).
+ * 2. If that fails with a permission error, fall back to osascript with
+ *    administrator privileges (triggers the macOS password prompt).
  *
  * Returns true if install succeeded, false if user cancelled or it failed.
  */
@@ -158,49 +171,75 @@ async function attemptInstall(): Promise<boolean> {
       }
     }
 
-    // Use osascript to replace the app with admin privileges.
-    // This triggers the macOS password prompt and BLOCKS until the user responds.
-    // Strategy: rename current app to .old backup, move new app in, delete backup on success.
-    // If the move fails, attempt to restore from backup.
-    const script = [
-      `do shell script "`,
-      // Rename current app to backup
-      `mv '${shellEscape(appDir)}/${shellEscape(appName)}' '${shellEscape(appDir)}/${shellEscape(appName)}.old' && `,
-      // Move new app into place
-      `mv '${shellEscape(extractedApp)}' '${shellEscape(appDir)}/${shellEscape(appName)}' && `,
-      // Remove backup on success
+    // The shell commands to replace the app bundle:
+    // 1. Rename current app to backup
+    // 2. Move new app into place
+    // 3. Remove backup on success
+    const moveCommands = [
+      `mv '${shellEscape(appDir)}/${shellEscape(appName)}' '${shellEscape(appDir)}/${shellEscape(appName)}.old'`,
+      `mv '${shellEscape(extractedApp)}' '${shellEscape(appDir)}/${shellEscape(appName)}'`,
       `rm -rf '${shellEscape(appDir)}/${shellEscape(appName)}.old'`,
-      `" with administrator privileges`,
-    ].join('');
+    ].join(' && ');
 
-    await execFileAsync('osascript', ['-e', script]);
-
-    // If we get here, install succeeded
-    console.info('[auto-update] Install succeeded via manual osascript approach');
-    return true;
-  } catch (err: unknown) {
-    const error = err as { code?: number; killed?: boolean; stderr?: string; message?: string };
-    // osascript exits with code 1 and stderr containing "User canceled" when user clicks Cancel
-    const msg = error.stderr || error.message || '';
-    if (msg.includes('User canceled') || msg.includes('user canceled')) {
-      console.info('[auto-update] User cancelled admin authorization — will retry when ready');
-    } else {
-      console.error('[auto-update] Install failed:', msg);
-      // Attempt to restore from backup if it exists
-      const backupPath = join(appDir, `${appName}.old`);
-      if (existsSync(backupPath) && !existsSync(join(appDir, appName))) {
-        try {
-          await execFileAsync('osascript', [
-            '-e',
-            `do shell script "mv '${shellEscape(backupPath)}' '${shellEscape(appDir)}/${shellEscape(appName)}'" with administrator privileges`,
-          ]);
-          console.info('[auto-update] Restored app from backup after failed install');
-        } catch {
-          console.error('[auto-update] Could not restore backup — user may need to reinstall from DMG');
-        }
+    // --- Phase 1: Try plain shell (works if user is already admin) ---
+    try {
+      await execFileAsync('/bin/sh', ['-c', moveCommands]);
+      console.info('[auto-update] Install succeeded via plain shell (user already has write access)');
+      return true;
+    } catch (plainErr: unknown) {
+      const plainError = plainErr as { stderr?: string; message?: string };
+      const plainMsg = plainError.stderr || plainError.message || '';
+      // Only fall through to osascript if this looks like a permission error
+      if (!plainMsg.includes('Permission denied') && !plainMsg.includes('Operation not permitted') && !plainMsg.includes('Read-only file system')) {
+        // Some other error — attempt restore and bail
+        console.error('[auto-update] Plain install failed (non-permission):', plainMsg);
+        await attemptRestore(appDir, appName);
+        return false;
       }
+      console.info('[auto-update] Plain shell failed with permission error, falling back to osascript');
     }
-    return false;
+
+    // --- Phase 2: Fall back to osascript with administrator privileges ---
+    // Re-check state: if Phase 1 partially ran (moved to .old but failed on second mv),
+    // we need to restore before retrying with admin.
+    const backupExists = existsSync(join(appDir, `${appName}.old`));
+    const appExists = existsSync(join(appDir, appName));
+    let adminCommands: string;
+    if (backupExists && !appExists) {
+      // Phase 1 partially succeeded: .old exists but app doesn't. Restore first, then redo all.
+      adminCommands = [
+        `mv '${shellEscape(appDir)}/${shellEscape(appName)}.old' '${shellEscape(appDir)}/${shellEscape(appName)}'`,
+        moveCommands,
+      ].join(' && ');
+    } else if (backupExists && appExists) {
+      // Phase 1 rename succeeded but second mv failed — the original is at .old, something is at the app path.
+      // Clean up and redo.
+      adminCommands = [
+        `rm -rf '${shellEscape(appDir)}/${shellEscape(appName)}'`,
+        `mv '${shellEscape(appDir)}/${shellEscape(appName)}.old' '${shellEscape(appDir)}/${shellEscape(appName)}'`,
+        moveCommands,
+      ].join(' && ');
+    } else {
+      adminCommands = moveCommands;
+    }
+
+    const script = `do shell script "${adminCommands}" with administrator privileges`;
+
+    try {
+      await execFileAsync('osascript', ['-e', script]);
+      console.info('[auto-update] Install succeeded via osascript admin fallback');
+      return true;
+    } catch (err: unknown) {
+      const error = err as { stderr?: string; message?: string };
+      const msg = error.stderr || error.message || '';
+      if (msg.includes('User canceled') || msg.includes('user canceled')) {
+        console.info('[auto-update] User cancelled admin authorization — will retry when ready');
+      } else {
+        console.error('[auto-update] osascript install failed:', msg);
+        await attemptRestore(appDir, appName);
+      }
+      return false;
+    }
   } finally {
     // Cleanup temp directory
     try {
@@ -210,17 +249,70 @@ async function attemptInstall(): Promise<boolean> {
 }
 
 /**
+ * Attempt to restore the app bundle from its .old backup after a failed install.
+ */
+async function attemptRestore(appDir: string, appName: string): Promise<void> {
+  const backupPath = join(appDir, `${appName}.old`);
+  if (existsSync(backupPath) && !existsSync(join(appDir, appName))) {
+    try {
+      await execFileAsync('osascript', [
+        '-e',
+        `do shell script "mv '${shellEscape(backupPath)}' '${shellEscape(appDir)}/${shellEscape(appName)}'" with administrator privileges`,
+      ]);
+      console.info('[auto-update] Restored app from backup after failed install');
+    } catch {
+      console.error('[auto-update] Could not restore backup — user may need to reinstall from DMG');
+    }
+  }
+}
+
+/**
  * Attempt to install the update, keeping the app running until we get
  * definitive success/failure feedback.
  *
- * On success: relaunches the app on the new version.
- * On failure: returns to 'downloaded' state so the user can retry
- * (e.g. after enabling admin privileges via their corporate tool).
+ * Flow:
+ * 1. Run pre-update hooks (e.g., elevate to admin via Privileges.app)
+ * 2. Attempt install (plain shell first, osascript fallback)
+ * 3. Run post-update hooks (e.g., revoke admin privileges)
+ * 4. On success: relaunch the app on the new version
+ * 5. On failure: return to 'downloaded' state so the user can retry
  */
 export async function performQuitAndInstall(): Promise<void> {
+  const artifactPath = resolveDownloadedUpdatePath();
+
+  // Run pre-update hooks (e.g., elevate to admin)
+  if (hookRunner && artifactPath) {
+    broadcast({ state: 'preparing', version: downloadedVersion });
+    try {
+      const result = await hookRunner.runPreUpdateHooks({
+        version: downloadedVersion ?? 'unknown',
+        artifactPath,
+      });
+      if (result.abort) {
+        console.info('[auto-update] Pre-update hook aborted install:', result.abortReason ?? '(no reason)');
+        broadcast({ state: 'downloaded', version: downloadedVersion });
+        return;
+      }
+    } catch (err) {
+      console.error('[auto-update] Pre-update hooks threw, continuing with install:', err);
+    }
+  }
+
   broadcast({ state: 'installing', version: downloadedVersion });
 
   const success = await attemptInstall();
+
+  // Run post-update hooks (e.g., revoke admin privileges)
+  if (hookRunner) {
+    try {
+      await hookRunner.runPostUpdateHooks({
+        version: downloadedVersion ?? 'unknown',
+        success,
+      });
+    } catch (err) {
+      console.error('[auto-update] Post-update hooks threw:', err);
+    }
+  }
 
   if (success) {
     broadcast({ state: 'restarting', version: downloadedVersion });

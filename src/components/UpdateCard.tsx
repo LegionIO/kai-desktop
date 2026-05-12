@@ -25,7 +25,7 @@ export const UpdateCard: FC = () => {
 
   // Trigger fade-in animation when card first becomes relevant
   useEffect(() => {
-    const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'installing';
+    const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'installing' || status.state === 'preparing';
     if (showable && !dismissed && !didAnimate.current) {
       didAnimate.current = true;
       requestAnimationFrame(() => setVisible(true));
@@ -39,7 +39,7 @@ export const UpdateCard: FC = () => {
     }
   }, [status.state, dismissed]);
 
-  const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'installing';
+  const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'installing' || status.state === 'preparing';
   if (!showable || dismissed) return null;
 
   const percent = Math.round(status.percent ?? 0);
@@ -52,7 +52,7 @@ export const UpdateCard: FC = () => {
     >
       <div className="flex items-start gap-4">
         <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-border/50 bg-muted/40">
-          {status.state === 'restarting' || status.state === 'installing' ? (
+          {status.state === 'restarting' || status.state === 'installing' || status.state === 'preparing' ? (
             <LoaderIcon className="h-5 w-5 animate-spin text-primary" />
           ) : (
             <DownloadIcon className="h-5 w-5 text-primary" />
@@ -62,23 +62,27 @@ export const UpdateCard: FC = () => {
           <h3 className="text-base font-semibold text-foreground">
             {status.state === 'downloading'
               ? 'Downloading update'
-              : status.state === 'installing'
-                ? 'Installing update…'
-                : status.state === 'restarting'
-                  ? 'Restarting…'
-                  : 'Update available'}
+              : status.state === 'preparing'
+                ? 'Preparing update…'
+                : status.state === 'installing'
+                  ? 'Installing update…'
+                  : status.state === 'restarting'
+                    ? 'Restarting…'
+                    : 'Update available'}
           </h3>
           <p className="mt-1 text-sm text-muted-foreground">
             {status.state === 'downloading'
               ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? '…'}) is being downloaded.`
-              : status.state === 'installing'
-                ? 'Authorize in the system dialog to complete the update. Cancel if you need to enable admin privileges first.'
-                : status.state === 'restarting'
-                  ? `Installing version ${status.version ?? 'new'}, please wait...`
-                  : `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) is now available to install.`}
+              : status.state === 'preparing'
+                ? 'Preparing for update, please wait…'
+                : status.state === 'installing'
+                  ? 'Authorize in the system dialog to complete the update. Cancel if you need to enable admin privileges first.'
+                  : status.state === 'restarting'
+                    ? `Installing version ${status.version ?? 'new'}, please wait...`
+                    : `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) is now available to install.`}
           </p>
         </div>
-        {status.state !== 'restarting' && status.state !== 'installing' && (
+        {status.state !== 'restarting' && status.state !== 'installing' && status.state !== 'preparing' && (
           <button
             type="button"
             onClick={() => setDismissed(true)}

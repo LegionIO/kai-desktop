@@ -28,7 +28,8 @@ export type PluginPermission =
   | 'exec:whitelisted'
   | 'tools:detect'
   | 'system:env'
-  | 'audit:log';
+  | 'audit:log'
+  | 'lifecycle:hook';
 
 export type PluginApprovalRecord = {
   hash: string;
@@ -123,6 +124,8 @@ export type PluginInstance = {
   registeredTools: ToolDefinition[];
   preSendHooks: PreSendHook[];
   postReceiveHooks: PostReceiveHook[];
+  preUpdateHooks: PreUpdateHook[];
+  postUpdateHooks: PostUpdateHook[];
   uiBanners: PluginBannerDescriptor[];
   uiModals: PluginModalDescriptor[];
   uiSettingsSections: PluginSettingsSectionDescriptor[];
@@ -187,6 +190,27 @@ export type PostReceiveHookResult = {
 };
 
 export type PostReceiveHook = (args: PostReceiveHookArgs) => Promise<PostReceiveHookResult> | PostReceiveHookResult;
+
+/* ── Lifecycle Hooks ── */
+
+export type PreUpdateHookArgs = {
+  version: string;
+  artifactPath: string;
+};
+
+export type PreUpdateHookResult = {
+  abort?: boolean;
+  abortReason?: string;
+};
+
+export type PreUpdateHook = (args: PreUpdateHookArgs) => Promise<PreUpdateHookResult> | PreUpdateHookResult;
+
+export type PostUpdateHookArgs = {
+  version: string;
+  success: boolean;
+};
+
+export type PostUpdateHook = (args: PostUpdateHookArgs) => Promise<void> | void;
 
 /* ── UI Descriptors (JSON-serializable across IPC) ── */
 
@@ -403,6 +427,11 @@ export type PluginAPI = {
   messages: {
     registerPreSendHook: (hook: PreSendHook) => void;
     registerPostReceiveHook: (hook: PostReceiveHook) => void;
+  };
+
+  lifecycle: {
+    registerPreUpdateHook: (hook: PreUpdateHook) => void;
+    registerPostUpdateHook: (hook: PostUpdateHook) => void;
   };
 
   ui: {

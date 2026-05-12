@@ -30,6 +30,8 @@ import type {
   PluginHttpResponse,
   PreSendHook,
   PostReceiveHook,
+  PreUpdateHook,
+  PostUpdateHook,
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
@@ -486,6 +488,18 @@ export function createPluginAPI(
       registerPostReceiveHook: (hook: PostReceiveHook) => {
         requirePermission('messages:hook');
         instance.postReceiveHooks.push(hook);
+      },
+    },
+
+    lifecycle: {
+      registerPreUpdateHook: (hook: PreUpdateHook) => {
+        requirePermission('lifecycle:hook');
+        instance.preUpdateHooks.push(hook);
+      },
+
+      registerPostUpdateHook: (hook: PostUpdateHook) => {
+        requirePermission('lifecycle:hook');
+        instance.postUpdateHooks.push(hook);
       },
     },
 

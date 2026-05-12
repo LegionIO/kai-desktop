@@ -34,7 +34,7 @@ import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/ta
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
+import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall, setUpdateHookRunner } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames, getBrandMarketplaceUrls } from './plugins/plugin-bootstrap.js';
@@ -709,6 +709,7 @@ if (gotSingleInstanceLock) {
     );
     registerPluginHandlers(ipcMain, pluginManager);
     pluginManagerRef = pluginManager;
+    setUpdateHookRunner(pluginManager);
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
