@@ -34,7 +34,7 @@ import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/ta
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall, setUpdateHookRunner } from './ipc/auto-update.js';
+import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall, setUpdateHookRunner, consumePostUpdateMarker } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames, getBrandMarketplaceUrls } from './plugins/plugin-bootstrap.js';
@@ -1000,6 +1000,19 @@ if (gotSingleInstanceLock) {
 
         await pluginManager.loadAll();
         console.info(`[${__BRAND_PRODUCT_NAME}] ${pluginManager.getPluginCount()} plugins loaded`);
+
+        // If this launch follows a successful update, fire post-update hooks
+        // (e.g., revoke admin privileges granted by pre-update hook).
+        const updateMarker = consumePostUpdateMarker();
+        if (updateMarker) {
+          console.info(`[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version}`);
+          pluginManager.runPostUpdateHooks({
+            version: updateMarker.version,
+            success: true,
+          }).catch((err) => {
+            console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
+          });
+        }
       } catch (err) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Plugin loading failed:`, err);
       }
