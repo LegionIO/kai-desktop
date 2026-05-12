@@ -118,6 +118,7 @@ function getDefaultConfig() {
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
+    pluginSystem: { compatibilityMode: 'warn' as const },
     marketplace: {
       installedPlugins: {} as Record<string, { name: string; repository: string; version: string; fileHash?: string; permissions?: string[]; installedAt: string; marketplaceUrl: string }>,
     },
@@ -728,6 +729,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     titleGeneration: config.titleGeneration,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
+    pluginSystem: config.pluginSystem,
     marketplace: config.marketplace,
     launchAtLogin: config.launchAtLogin,
     ui: config.ui,

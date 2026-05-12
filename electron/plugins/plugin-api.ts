@@ -52,6 +52,7 @@ import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
@@ -372,6 +373,12 @@ export function createPluginAPI(
   const api: PluginAPI = {
     pluginName: manifest.name,
     pluginDir: instance.dir,
+
+    host: {
+      apiVersion: () => getHostPluginApiVersion(),
+      capabilities: () => getHostCapabilities(),
+      hasCapability: (cap: string) => getHostCapabilities().includes(cap),
+    },
 
     config: {
       get: () => {

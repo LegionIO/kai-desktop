@@ -377,6 +377,11 @@ const marketplaceConfigSchema = z.object({
   installedPlugins: z.record(z.string(), marketplaceInstalledPluginSchema),
 });
 
+const pluginSystemSchema = z.object({
+  /** Controls behavior when a plugin's version/capability constraints don't match the host. */
+  compatibilityMode: z.enum(['strict', 'warn']).default('warn'),
+}).default({ compatibilityMode: 'warn' });
+
 const cliToolSchema = z.object({
   name: z.string(),
   binary: z.string(),
@@ -490,6 +495,7 @@ export const appConfigSchema = z.object({
   titleGeneration: titleGenerationConfigSchema.optional(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
+  pluginSystem: pluginSystemSchema,
   marketplace: marketplaceConfigSchema.optional(),
   launchAtLogin: z.boolean(),
   ui: z.object({

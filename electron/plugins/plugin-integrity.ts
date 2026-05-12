@@ -70,6 +70,10 @@ export function readPluginManifest(pluginDir: string, fallbackName?: string): Pl
       ? raw.configSchema as Record<string, unknown>
       : undefined,
     execScope: parseExecScope(raw.execScope),
+    engines: parseEngines(raw.engines),
+    capabilities: Array.isArray(raw.capabilities)
+      ? raw.capabilities.filter((v): v is string => typeof v === 'string')
+      : undefined,
   };
 }
 
@@ -96,6 +100,14 @@ export function arePermissionSetsEqual(left: readonly string[] = [], right: read
 }
 
 // ─── Scope Parsing Helpers ──────────────────────────────────────────────────
+
+function parseEngines(raw: unknown): { kai?: string } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const kai = typeof obj.kai === 'string' ? obj.kai : undefined;
+  if (!kai) return undefined;
+  return { kai };
+}
 
 const VALID_ALLOWED_BINARIES = new Set<string>([
   'claude', 'codex', 'node', 'npm', 'pip', 'pip3', 'python', 'python3', 'git', 'bash',

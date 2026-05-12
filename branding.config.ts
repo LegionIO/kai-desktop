@@ -92,6 +92,10 @@ export const branding = {
   localNetworkUsage:
     '{{productName}} connects to services on your local network.',
 
+  // ── Plugin API ─────────────────────────────────────────────────────────
+  /** Semver version of the plugin API surface. Bump minor for additive changes, major for breaking. */
+  pluginApiVersion: '1.0.0',
+
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */
   requiredPlugins: [] as ReadonlyArray<string>,

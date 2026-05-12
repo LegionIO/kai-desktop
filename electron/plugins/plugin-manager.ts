@@ -42,6 +42,7 @@ import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
+import { checkPluginCompatibility } from './plugin-compat.js';
 
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
@@ -366,6 +367,23 @@ export class PluginManager {
 
       this.ensurePluginConfigNormalized(manifest.name);
 
+      // Check plugin compatibility constraints (engines.kai + capabilities)
+      const compat = checkPluginCompatibility(manifest);
+      if (!compat.compatible) {
+        const mode = this.getConfig().pluginSystem?.compatibilityMode ?? 'warn';
+        if (mode === 'strict') {
+          instance.state = 'error';
+          instance.error = `Incompatible: ${compat.errors.join('; ')}`;
+          console.warn(`[PluginManager] Plugin "${manifest.name}" blocked (strict mode): ${compat.errors.join('; ')}`);
+          this.broadcastUIState();
+          this.notifyToolsChanged();
+          return;
+        }
+        // warn mode: store warning, continue loading
+        instance.compatWarning = compat;
+        console.warn(`[PluginManager] Plugin "${manifest.name}" compatibility warning: ${compat.errors.join('; ')}`);
+      }
+
       // Load backend entry point from backend.js
       const backendPath = join(dir, 'backend.js');
       if (!existsSync(backendPath)) {
@@ -428,6 +446,19 @@ export class PluginManager {
 
       instance.state = 'active';
       instance.error = undefined;
+
+      // Show compatibility warning banner if loaded in warn mode
+      if (instance.compatWarning) {
+        instance.uiBanners.push({
+          id: `compat-warning-${manifest.name}`,
+          pluginName: manifest.name,
+          text: `This plugin may be incompatible: ${instance.compatWarning.errors.join('; ')}`,
+          variant: 'warning',
+          dismissible: true,
+          visible: true,
+        });
+      }
+
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.info(`[PluginManager] Plugin "${manifest.name}" activated`);

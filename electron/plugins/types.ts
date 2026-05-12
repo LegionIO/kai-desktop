@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
+import type { CompatCheckResult } from './plugin-compat.js';
 
 /* ── Manifest ── */
 
@@ -108,6 +109,10 @@ export type PluginManifest = {
   permissions: PluginPermission[];
   configSchema?: Record<string, unknown>;
   execScope?: ExecScopeDeclaration;
+  /** npm-style semver range constraint on the host plugin API version. */
+  engines?: { kai?: string };
+  /** Host capabilities this plugin requires to function correctly. */
+  capabilities?: string[];
 };
 
 /* ── Plugin State ── */
@@ -120,6 +125,7 @@ export type PluginInstance = {
   fileHash: string;
   state: PluginState;
   error?: string;
+  compatWarning?: CompatCheckResult;
   module: PluginModule | null;
   registeredTools: ToolDefinition[];
   preSendHooks: PreSendHook[];
@@ -403,6 +409,16 @@ export type PluginConversationAppendMessage = {
 export type PluginAPI = {
   pluginName: string;
   pluginDir: string;
+
+  /** Host environment introspection (no permission required). */
+  host: {
+    /** Returns the host's plugin API semver version. */
+    apiVersion: () => string;
+    /** Returns the full list of capabilities this host exposes. */
+    capabilities: () => string[];
+    /** Check if a specific capability is available on this host. */
+    hasCapability: (cap: string) => boolean;
+  };
 
   config: {
     get: () => AppConfig;
