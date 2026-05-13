@@ -104,7 +104,19 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     const filePath = join(getTasksDir(appHome), `${id}.json`);
     if (!existsSync(filePath)) return null;
     try {
-      return JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      
+      // Validate common field naming mistakes
+      const raw = task as any;
+      if (raw.assignedAgent && !task.assignedAgentId) {
+        console.warn(
+          `[tasks] Task ${id} has deprecated field 'assignedAgent' but expected 'assignedAgentId'. ` +
+          `The task will not be properly assigned to an agent. ` +
+          `Please update the task JSON or reassign via the UI.`
+        );
+      }
+      
+      return task;
     } catch {
       return null;
     }

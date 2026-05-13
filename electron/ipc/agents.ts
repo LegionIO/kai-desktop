@@ -63,7 +63,19 @@ function readAgent(appHome: string, id: string): AgentFile | null {
   const filePath = join(getAgentsDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as AgentFile;
+    const agent = JSON.parse(readFileSync(filePath, 'utf-8')) as AgentFile;
+    
+    // Validate common field naming mistakes
+    const raw = agent as any;
+    if (raw.assignedTaskId && !agent.currentTaskId) {
+      console.warn(
+        `[agents] Agent ${id} has deprecated field 'assignedTaskId' but expected 'currentTaskId'. ` +
+        `The agent will not properly link to its assigned task. ` +
+        `Please update the agent JSON or reassign via the UI.`
+      );
+    }
+    
+    return agent;
   } catch {
     return null;
   }
@@ -81,7 +93,19 @@ function readTask(appHome: string, id: string): TaskFile | null {
   const filePath = join(getTasksDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+    
+    // Validate common field naming mistakes
+    const raw = task as any;
+    if (raw.assignedAgent && !task.assignedAgentId) {
+      console.warn(
+        `[agents] Task ${id} has deprecated field 'assignedAgent' but expected 'assignedAgentId'. ` +
+        `The task will not be properly assigned to an agent. ` +
+        `Please update the task JSON or reassign via the UI.`
+      );
+    }
+    
+    return task;
   } catch {
     return null;
   }
