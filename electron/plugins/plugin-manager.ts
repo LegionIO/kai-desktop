@@ -757,6 +757,7 @@ export class PluginManager {
           if (result?.abort) return result;
         } catch (err) {
           console.error(`[PluginManager] Pre-update hook error in "${instance.manifest.name}":`, err);
+          return { abort: true, abortReason: `Hook "${instance.manifest.name}" threw: ${err}` };
         }
       }
     }

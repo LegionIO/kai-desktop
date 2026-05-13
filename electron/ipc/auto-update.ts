@@ -118,7 +118,9 @@ export async function performQuitAndInstall(): Promise<void> {
         return;
       }
     } catch (err) {
-      console.error('[auto-update] Pre-update hooks threw, continuing with install:', err);
+      console.error('[auto-update] Pre-update hooks threw, aborting install:', err);
+      broadcast({ state: 'downloaded', version: downloadedVersion });
+      return;
     }
   }
 
@@ -220,7 +222,7 @@ export function registerAutoUpdateHandlers(
   onUpdateDownloaded?: () => void,
 ): void {
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
 
   autoUpdater.on('checking-for-update', () => {
