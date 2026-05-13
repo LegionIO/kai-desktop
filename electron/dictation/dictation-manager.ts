@@ -32,6 +32,7 @@ import {
   type DictationPatchPhase,
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
+import { parseHotkeyCodes } from './hotkey-codes.js';
 
 export type DictationState = 'idle' | 'starting' | 'active' | 'stopping';
 
@@ -74,18 +75,7 @@ let axDictationSpan: AxDictationSpan | null = null;
 // Hold mode state
 let holdMonitor: LocalMacosTakeoverMonitorHandle | null = null;
 let holdSafetyTimeout: ReturnType<typeof setTimeout> | null = null;
-
-/** macOS virtual key codes for modifier keys */
-const MODIFIER_KEYCODES: Record<string, number> = {
-  command: 55,
-  cmd: 55,
-  shift: 56,
-  // right shift = 60, but globalShortcut doesn't differentiate
-  option: 58,
-  alt: 58,
-  control: 59,
-  ctrl: 59,
-};
+let holdReleaseRequested = false;
 
 /** Maximum hold duration before auto-stop (5 minutes) */
 const HOLD_SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -164,11 +154,16 @@ function registerHotkey(hotkey: string): void {
       if (config?.mode === 'hold') {
         // Hold mode: key-down starts dictation, key-up stops it.
         // globalShortcut only fires on key-down, so we start here
-        // and use a native monitor to detect modifier release.
+        // and use a native monitor to detect release.
         if (state === 'idle') {
+          holdReleaseRequested = false;
+          startHoldMonitor(hotkey);
           void startDictation().then(() => {
-            if (state === 'active') {
-              startHoldMonitor(hotkey);
+            if (holdReleaseRequested && state === 'active') {
+              console.info('[Dictation] Hold mode: release happened during startup, stopping');
+              void stopDictation();
+            } else if (state !== 'active') {
+              stopHoldMonitor();
             }
           });
         }
@@ -279,56 +274,42 @@ async function cleanupSession(): Promise<void> {
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
 
 /**
- * Parse an Electron accelerator string (e.g. "Command+Shift+D") into the set
- * of macOS virtual key codes for its modifier keys.
- */
-function parseHotkeyModifierCodes(hotkey: string): Set<number> {
-  const codes = new Set<number>();
-  const parts = hotkey.split('+').map(p => p.trim().toLowerCase());
-  // Last part is the primary key; everything before is a modifier
-  for (const part of parts.slice(0, -1)) {
-    // Handle "commandorcontrol" → both command and control
-    const normalized = part.replace('commandorcontrol', 'command');
-    const code = MODIFIER_KEYCODES[normalized];
-    if (code !== undefined) codes.add(code);
-  }
-  return codes;
-}
-
-/**
  * Start monitoring for key release to stop dictation in hold mode.
- * Uses the existing native CGEventTap monitor that emits flagsChanged events
- * with keyCode when modifier keys are pressed or released.
+ * Uses the existing native CGEventTap monitor. Regular primary keys emit keyUp,
+ * while modifier keys emit flagsChanged.
  */
 function startHoldMonitor(hotkey: string): void {
   stopHoldMonitor(); // Clean up any existing monitor
 
-  const modifierCodes = parseHotkeyModifierCodes(hotkey);
-  if (modifierCodes.size === 0) {
-    // No modifiers to watch — can't detect release, fall back to toggle behavior
-    console.warn('[Dictation] Hold mode: no modifier keys in hotkey, cannot detect release');
+  const { modifierCodes, primaryCodes } = parseHotkeyCodes(hotkey);
+  if (modifierCodes.size === 0 && primaryCodes.size === 0) {
+    console.warn('[Dictation] Hold mode: no recognized keys in hotkey, cannot detect release');
     return;
   }
 
-  console.info('[Dictation] Hold mode: watching for modifier release (keyCodes: %s)', [...modifierCodes].join(','));
+  console.info(
+    '[Dictation] Hold mode: watching for release (modifiers=%s, primary=%s)',
+    [...modifierCodes].join(',') || 'none',
+    [...primaryCodes].join(',') || 'none',
+  );
 
   holdMonitor = startLocalMacosTakeoverMonitor({
     onEvent: (event) => {
-      // flagsChanged fires when any modifier key is pressed or released.
-      // If the keyCode matches one of our hotkey modifiers, the user released it.
-      if (event.eventType === 'flagsChanged' && event.keyCode !== undefined) {
-        if (modifierCodes.has(event.keyCode)) {
-          console.info('[Dictation] Hold mode: modifier released (keyCode=%d), stopping', event.keyCode);
-          void stopDictation();
-        }
+      if (event.keyCode === undefined) return;
+
+      if (event.eventType === 'keyUp' && primaryCodes.has(event.keyCode)) {
+        requestHoldStop(`primary key released (keyCode=${event.keyCode})`);
+        return;
+      }
+
+      if (event.eventType === 'flagsChanged' && modifierCodes.has(event.keyCode)) {
+        requestHoldStop(`modifier released (keyCode=${event.keyCode})`);
       }
     },
     onError: (message) => {
       console.warn('[Dictation] Hold monitor error:', message);
       // If monitor fails, stop dictation to prevent stuck state
-      if (state === 'active') {
-        void stopDictation();
-      }
+      requestHoldStop('hold monitor failed');
     },
   });
 
@@ -337,6 +318,18 @@ function startHoldMonitor(hotkey: string): void {
     console.warn('[Dictation] Hold mode: safety timeout reached, stopping');
     void stopDictation();
   }, HOLD_SAFETY_TIMEOUT_MS);
+}
+
+function requestHoldStop(reason: string): void {
+  if (holdReleaseRequested) return;
+
+  holdReleaseRequested = true;
+  console.info('[Dictation] Hold mode: %s, stopping', reason);
+  if (state === 'active') {
+    void stopDictation();
+  } else if (state === 'idle') {
+    stopHoldMonitor();
+  }
 }
 
 /**
