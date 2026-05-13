@@ -487,6 +487,7 @@ const appAPI = {
     toggle: () => ipcRenderer.invoke('dictation:toggle'),
     stop: () => ipcRenderer.invoke('dictation:stop'),
     getState: () => ipcRenderer.invoke('dictation:get-state'),
+    getTypingMode: () => ipcRenderer.invoke('dictation:get-typing-mode'),
     setDevice: (deviceId: string) => ipcRenderer.invoke('dictation:set-device', deviceId),
     setOverlayInteractive: (interactive: boolean) => ipcRenderer.send('dictation:overlay-set-interactive', interactive),
     resizeOverlay: (height: number) => ipcRenderer.send('dictation:overlay-resize', height),
@@ -515,6 +516,11 @@ const appAPI = {
       const handler = (_event: Electron.IpcRendererEvent, message: string) => callback(message);
       ipcRenderer.on('dictation:error', handler);
       return () => ipcRenderer.removeListener('dictation:error', handler);
+    },
+    onTypingMode: (callback: (mode: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
+      ipcRenderer.on('dictation:typing-mode', handler);
+      return () => ipcRenderer.removeListener('dictation:typing-mode', handler);
     },
   },
 };

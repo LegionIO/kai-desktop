@@ -18,6 +18,7 @@ export const DictationOverlay: FC = () => {
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const [typingMode, setTypingMode] = useState<string>('idle');
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // The normal app shell paints body with bg-background. In this transparent
@@ -49,6 +50,12 @@ export const DictationOverlay: FC = () => {
       setError(msg);
       setTimeout(() => setError(null), 5000);
     });
+    const unsubMode = app.dictation.onTypingMode((mode) => {
+      setTypingMode(mode);
+    });
+
+    // Fetch initial typing mode (may have been broadcast before we mounted)
+    app.dictation.getTypingMode().then((mode) => setTypingMode(mode)).catch(() => {});
 
     return () => {
       unsubState();
@@ -56,6 +63,7 @@ export const DictationOverlay: FC = () => {
       unsubPartial();
       unsubFinal();
       unsubError();
+      unsubMode();
     };
   }, []);
 
@@ -131,6 +139,17 @@ export const DictationOverlay: FC = () => {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
             <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
           </span>
+
+          {/* Typing mode indicator */}
+          {typingMode !== 'idle' && (
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+              typingMode === 'ax'
+                ? 'bg-emerald-500/20 text-emerald-300'
+                : 'bg-amber-500/20 text-amber-300'
+            }`}>
+              {typingMode === 'ax' ? 'AX' : 'KB'}
+            </span>
+          )}
 
           {/* Level bars */}
           <LevelBars level={level} />

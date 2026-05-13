@@ -91,6 +91,10 @@ export function clearDictationTargetFocus(): void {
   targetFocus = null;
 }
 
+export function getDictationTargetPid(): number | null {
+  return targetFocus?.pid ?? null;
+}
+
 export function restoreDictationTargetFocusSoon(): void {
   if (process.platform !== 'darwin') return;
 

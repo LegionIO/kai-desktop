@@ -336,8 +336,24 @@ func focusedAccessibilityElement() -> AXUIElement? {
   return (focusedValue as! AXUIElement)
 }
 
-func focusedSelectedTextRange() -> CFRange? {
-  guard let element = focusedAccessibilityElement() else {
+func focusedAccessibilityElementForPid(_ pid: pid_t) -> AXUIElement? {
+  let appElement = AXUIElementCreateApplication(pid)
+  var focusedValue: CFTypeRef?
+  let error = AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedValue)
+  guard error == .success, let focusedValue else {
+    return nil
+  }
+  return (focusedValue as! AXUIElement)
+}
+
+func focusedSelectedTextRange(pid: pid_t? = nil) -> CFRange? {
+  let element: AXUIElement?
+  if let pid = pid {
+    element = focusedAccessibilityElementForPid(pid)
+  } else {
+    element = focusedAccessibilityElement()
+  }
+  guard let element else {
     return nil
   }
   var rangeValue: CFTypeRef?
@@ -358,8 +374,14 @@ func focusedSelectedTextRange() -> CFRange? {
   return range
 }
 
-func setFocusedSelectedTextRange(location: Int, length: Int) -> Bool {
-  guard location >= 0, length >= 0, let element = focusedAccessibilityElement() else {
+func setFocusedSelectedTextRange(location: Int, length: Int, pid: pid_t? = nil) -> Bool {
+  let element: AXUIElement?
+  if let pid = pid {
+    element = focusedAccessibilityElementForPid(pid)
+  } else {
+    element = focusedAccessibilityElement()
+  }
+  guard location >= 0, length >= 0, let element else {
     return false
   }
   var range = CFRange(location: location, length: length)
@@ -656,7 +678,9 @@ case "postText":
   printJson(["ok": true])
 
 case "focusedTextSelection":
-  guard let range = focusedSelectedTextRange() else {
+  // Optional PID argument: focusedTextSelection [pid]
+  let ftsTargetPid: pid_t? = args.count >= 3 ? pid_t(args[2]) : nil
+  guard let range = focusedSelectedTextRange(pid: ftsTargetPid) else {
     printJson(["ok": false, "error": "Unable to read focused selected text range"])
     exit(1)
   }
@@ -669,6 +693,7 @@ case "focusedTextSelection":
 case "replaceFocusedTextRange":
   // Set the focused text element selection with Accessibility, then type text
   // over that selection. This avoids visible left/right cursor scans.
+  // Args: replaceFocusedTextRange location length base64Text [pid]
   guard args.count >= 5,
         let location = Int(args[2]),
         let length = Int(args[3]) else {
@@ -679,7 +704,8 @@ case "replaceFocusedTextRange":
     printJson(["ok": false, "error": "Invalid base64 text"])
     exit(1)
   }
-  guard setFocusedSelectedTextRange(location: location, length: length) else {
+  let rftTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
+  guard setFocusedSelectedTextRange(location: location, length: length, pid: rftTargetPid) else {
     printJson(["ok": false, "error": "Unable to set focused selected text range"])
     exit(1)
   }

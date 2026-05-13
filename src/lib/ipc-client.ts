@@ -286,6 +286,7 @@ type AppAPI = {
     toggle: () => Promise<{ state: string; elapsed: number }>;
     stop: () => Promise<{ state: string; elapsed: number }>;
     getState: () => Promise<{ state: string; elapsed: number }>;
+    getTypingMode: () => Promise<string>;
     setDevice: (deviceId: string) => Promise<{ ok: boolean }>;
     setOverlayInteractive: (interactive: boolean) => void;
     resizeOverlay: (height: number) => void;
@@ -295,6 +296,7 @@ type AppAPI = {
     onPartial: (callback: (text: string) => void) => () => void;
     onFinal: (callback: (text: string) => void) => () => void;
     onError: (callback: (message: string) => void) => () => void;
+    onTypingMode: (callback: (mode: string) => void) => () => void;
   };
 };
 

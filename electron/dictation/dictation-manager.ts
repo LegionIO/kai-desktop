@@ -32,6 +32,14 @@ import {
   type DictationPatchPhase,
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
+import { getDictationTargetPid } from './focus-preserver.js';
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const AX_DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/dictation-ax.log');
+function axDebug(msg: string): void {
+  try { appendFileSync(AX_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch { /* ignore */ }
+}
 import { parseHotkeyCodes } from './hotkey-codes.js';
 
 export type DictationState = 'idle' | 'starting' | 'active' | 'stopping';
@@ -48,7 +56,10 @@ interface DictationConfig {
 type AxDictationSpan = {
   location: number;
   typedUtf16Length: number;
+  pid: number | null;
 };
+
+type TypingMode = 'ax' | 'kb' | 'idle';
 
 let state: DictationState = 'idle';
 let config: DictationConfig | null = null;
@@ -71,6 +82,13 @@ let sessionGeneration: number = 0;
 let partialTypedText: string = '';
 const queuedPartialGate = new DictationQueuedPartialGate();
 let axDictationSpan: AxDictationSpan | null = null;
+
+// Typing mode broadcast (deduplicated)
+let lastBroadcastedMode: TypingMode = 'idle';
+
+// Throttle AX re-capture: don't retry if we failed recently
+let lastAxCaptureAttempt: number = 0;
+const AX_RECAPTURE_COOLDOWN_MS = 3000;
 
 // Hold mode state
 let holdMonitor: LocalMacosTakeoverMonitorHandle | null = null;
@@ -197,6 +215,10 @@ function registerIpcHandlers(): void {
     return getDictationState();
   });
 
+  ipcMain.handle('dictation:get-typing-mode', () => {
+    return lastBroadcastedMode;
+  });
+
   ipcMain.handle('dictation:set-device', async (_event, deviceId: string) => {
     if (config) {
       config.inputDeviceId = deviceId;
@@ -219,10 +241,19 @@ async function startDictation(): Promise<void> {
   sessionStartTime = Date.now();
 
   try {
-    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+    axDebug(`--- SESSION START ---`);
 
-    // 1. Show overlay
+    // 1. Show overlay (this also captures + restores focus to the target app)
     await showDictationOverlay();
+
+    // Wait for focus restoration to settle before querying AX
+    await new Promise(resolve => setTimeout(resolve, 350));
+
+    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+    axDebug(`startDictation: initial capture result=${axDictationSpan ? `loc=${axDictationSpan.location}` : 'null'}`);
+
+    // Broadcast typing mode after overlay is visible so it receives the message
+    broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
 
     // 2. Start mic capture
     await startMicCapture(config.inputDeviceId ?? undefined);
@@ -269,6 +300,8 @@ async function cleanupSession(): Promise<void> {
   partialTypedText = '';
   queuedPartialGate.invalidateQueuedPartials();
   axDictationSpan = null;
+  lastBroadcastedMode = 'idle';
+  lastAxCaptureAttempt = 0;
 }
 
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
@@ -628,6 +661,10 @@ function handleFinal(text: string): void {
     if (!applied) return;
     partialTypedText = '';
     axDictationSpan = null;
+
+    // Re-acquire AX span for the next utterance (cursor is now at new position)
+    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+    broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
   });
 }
 
@@ -636,10 +673,24 @@ async function applyDictationPatch(
   targetText: string,
   phase: DictationPatchPhase,
 ): Promise<boolean> {
+  // If AX span was lost (e.g. app switch, previous failure), try re-capture (throttled)
+  if (!axDictationSpan && Date.now() - lastAxCaptureAttempt > AX_RECAPTURE_COOLDOWN_MS) {
+    lastAxCaptureAttempt = Date.now();
+    axDebug(`applyPatch: axDictationSpan is null, attempting re-capture (phase=${phase})`);
+    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+    if (axDictationSpan && currentText.length > 0) {
+      // Account for text already typed via KB fallback in this partial sequence
+      axDictationSpan.typedUtf16Length = currentText.length;
+      axDebug(`applyPatch: re-captured, set typedLen=${currentText.length}`);
+    }
+    broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
+  }
+
   if (currentText && await replaceDictatedTextViaAx(targetText)) {
     return true;
   }
 
+  axDebug(`applyPatch: using KB fallback (phase=${phase} currentLen=${currentText.length} targetLen=${targetText.length})`);
   const plan = planDictationTextPatch(currentText, targetText, phase);
 
   switch (plan.kind) {
@@ -663,15 +714,25 @@ async function applyDictationPatch(
 
 async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpan | null> {
   if (process.platform !== 'darwin') return null;
+  const pid = getDictationTargetPid();
+  axDebug(`capture: targetPid=${pid}`);
   try {
-    const result = await runLocalMacMouseCommand(['focusedTextSelection']);
+    const args = pid != null
+      ? ['focusedTextSelection', String(pid)]
+      : ['focusedTextSelection'];
+    const result = await runLocalMacMouseCommand(args);
+    axDebug(`capture result=${JSON.stringify(result)}`);
     const location = result.selectedTextRangeLocation;
     const length = result.selectedTextRangeLength;
     if (typeof location !== 'number' || typeof length !== 'number' || location < 0 || length < 0) {
+      axDebug(`capture FAILED: invalid location=${location} length=${length}`);
       return null;
     }
-    return { location, typedUtf16Length: 0 };
-  } catch {
+    axDebug(`capture OK: location=${location} length=${length} pid=${pid}`);
+    return { location, typedUtf16Length: 0, pid };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    axDebug(`capture EXCEPTION: ${msg}`);
     return null;
   }
 }
@@ -679,17 +740,25 @@ async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpa
 async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
   if (!axDictationSpan) return false;
   const encoded = Buffer.from(targetText, 'utf-8').toString('base64');
+  axDebug(`replaceViaAx: location=${axDictationSpan.location} typedLen=${axDictationSpan.typedUtf16Length} targetLen=${targetText.length} pid=${axDictationSpan.pid}`);
   try {
-    await runLocalMacMouseCommand([
+    const args = [
       'replaceFocusedTextRange',
       String(axDictationSpan.location),
       String(axDictationSpan.typedUtf16Length),
       encoded,
-    ]);
+    ];
+    if (axDictationSpan.pid != null) {
+      args.push(String(axDictationSpan.pid));
+    }
+    await runLocalMacMouseCommand(args);
     updateAxDictationSpanLength(targetText);
+    axDebug(`replaceViaAx OK: newTypedLen=${axDictationSpan.typedUtf16Length}`);
     return true;
   } catch (err) {
     axDictationSpan = null;
+    broadcastTypingMode('kb');
+    axDebug(`replaceViaAx FAILED: ${err}`);
     console.info('[Dictation] AX text range replacement unavailable, falling back:', err);
     return false;
   }
@@ -758,6 +827,12 @@ function broadcastError(message: string): void {
       try { win.webContents.send('dictation:error', message); } catch { /* ignore */ }
     }
   }
+}
+
+function broadcastTypingMode(mode: TypingMode): void {
+  if (mode === lastBroadcastedMode) return;
+  lastBroadcastedMode = mode;
+  sendToOverlay('dictation:typing-mode', mode);
 }
 
 // ─── Recorder HTML (minimal, just for mic capture) ───────────────────────────
