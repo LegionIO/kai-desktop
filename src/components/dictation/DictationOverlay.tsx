@@ -20,6 +20,16 @@ export const DictationOverlay: FC = () => {
   const [error, setError] = useState<string | null>(null);
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // The normal app shell paints body with bg-background. In this transparent
+  // overlay window that becomes a square backdrop unless we clear it.
+  useEffect(() => {
+    document.documentElement.style.background = 'transparent';
+    document.body.style.background = 'transparent';
+    document.body.style.backgroundColor = 'transparent';
+    document.body.style.backgroundImage = 'none';
+    document.getElementById('root')?.style.setProperty('background', 'transparent');
+  }, []);
+
   // Subscribe to dictation events
   useEffect(() => {
     const unsubState = app.dictation.onStateChange((state) => {

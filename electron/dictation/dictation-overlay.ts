@@ -86,6 +86,12 @@ export function createDictationOverlay(): void {
     type: 'panel',
     frame: false,
     transparent: true,
+    backgroundColor: '#00000000',
+    // macOS panels can keep a hidden titlebar hit region when native rounded
+    // corners are enabled. That region activates Kai on click, which briefly
+    // raises the main window. CSS supplies the bubble rounding instead.
+    roundedCorners: false,
+    acceptFirstMouse: true,
     alwaysOnTop: true,
     skipTaskbar: true,
     focusable: false,
