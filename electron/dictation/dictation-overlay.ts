@@ -123,10 +123,11 @@ export function createDictationOverlay(): void {
   });
 
   // Safety: if the overlay ever receives focus (shouldn't with focusable:false),
-  // immediately blur it to prevent the Electron app from activating and stealing
-  // focus from the user's foreground app.
+  // immediately restore focus to the user's target app. We avoid calling blur()
+  // here because that activates the Electron app (bringing the main window
+  // forward briefly) before the AppleScript focus-restore can fire.
   overlayWindow.on('focus', () => {
-    overlayWindow?.blur();
+    restoreDictationTargetFocusSoon();
   });
 }
 
