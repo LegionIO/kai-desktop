@@ -83,6 +83,9 @@ let partialTypedText: string = '';
 const queuedPartialGate = new DictationQueuedPartialGate();
 let axDictationSpan: AxDictationSpan | null = null;
 
+// When AX fails mid-utterance, suppress further AX attempts until the next clean final
+let axSuppressedUntilNextFinal: boolean = false;
+
 // Typing mode broadcast (deduplicated)
 let lastBroadcastedMode: TypingMode = 'idle';
 
@@ -300,6 +303,7 @@ async function cleanupSession(): Promise<void> {
   partialTypedText = '';
   queuedPartialGate.invalidateQueuedPartials();
   axDictationSpan = null;
+  axSuppressedUntilNextFinal = false;
   lastBroadcastedMode = 'idle';
   lastAxCaptureAttempt = 0;
 }
@@ -638,7 +642,6 @@ function handlePartial(text: string): void {
     if (!applied) return;
 
     partialTypedText = text;
-    updateAxDictationSpanLength(text);
   });
 }
 
@@ -661,6 +664,7 @@ function handleFinal(text: string): void {
     if (!applied) return;
     partialTypedText = '';
     axDictationSpan = null;
+    axSuppressedUntilNextFinal = false;
 
     // Re-acquire AX span for the next utterance (cursor is now at new position)
     axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
@@ -673,21 +677,21 @@ async function applyDictationPatch(
   targetText: string,
   phase: DictationPatchPhase,
 ): Promise<boolean> {
-  // If AX span was lost (e.g. app switch, previous failure), try re-capture (throttled)
-  if (!axDictationSpan && Date.now() - lastAxCaptureAttempt > AX_RECAPTURE_COOLDOWN_MS) {
-    lastAxCaptureAttempt = Date.now();
-    axDebug(`applyPatch: axDictationSpan is null, attempting re-capture (phase=${phase})`);
-    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
-    if (axDictationSpan && currentText.length > 0) {
-      // Account for text already typed via KB fallback in this partial sequence
-      axDictationSpan.typedUtf16Length = currentText.length;
-      axDebug(`applyPatch: re-captured, set typedLen=${currentText.length}`);
+  // If AX was suppressed due to mid-utterance failure, skip AX entirely
+  if (!axSuppressedUntilNextFinal) {
+    // If AX span was lost (e.g. app switch, previous failure), try re-capture (throttled)
+    // Only attempt re-capture when currentText is empty (start of a new utterance)
+    // to avoid stale offset issues from mixed AX/KB operations
+    if (!axDictationSpan && currentText.length === 0 && Date.now() - lastAxCaptureAttempt > AX_RECAPTURE_COOLDOWN_MS) {
+      lastAxCaptureAttempt = Date.now();
+      axDebug(`applyPatch: axDictationSpan is null, attempting re-capture (phase=${phase})`);
+      axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+      broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
     }
-    broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
-  }
 
-  if (currentText && await replaceDictatedTextViaAx(targetText)) {
-    return true;
+    if (await replaceDictatedTextViaAx(targetText)) {
+      return true;
+    }
   }
 
   axDebug(`applyPatch: using KB fallback (phase=${phase} currentLen=${currentText.length} targetLen=${targetText.length})`);
@@ -757,8 +761,9 @@ async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
     return true;
   } catch (err) {
     axDictationSpan = null;
+    axSuppressedUntilNextFinal = true;
     broadcastTypingMode('kb');
-    axDebug(`replaceViaAx FAILED: ${err}`);
+    axDebug(`replaceViaAx FAILED (suppressing until next final): ${err}`);
     console.info('[Dictation] AX text range replacement unavailable, falling back:', err);
     return false;
   }
