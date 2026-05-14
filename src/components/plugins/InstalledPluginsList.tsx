@@ -7,6 +7,19 @@ import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 
+/* ── Throttled catalog refresh ─────────────────────── */
+
+const REFRESH_THROTTLE_MS = 30 * 60 * 1000; // 30 minutes
+let lastCatalogRefreshTime = 0;
+
+function maybeRefreshCatalog(): void {
+  const now = Date.now();
+  if (now - lastCatalogRefreshTime > REFRESH_THROTTLE_MS) {
+    lastCatalogRefreshTime = now;
+    app.plugins.marketplaceRefresh().catch(() => {});
+  }
+}
+
 /* ── Types ────────────────────────────────────────────── */
 
 type PluginListEntry = {
@@ -46,7 +59,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onOpenPluginSettings,
   pluginBrandRequired,
 }) => {
-  const { uiState } = usePlugins();
+  const { uiState, pluginUpdateCount } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -68,6 +81,11 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     });
     return () => { cancelled = true; };
   }, [uiState]);
+
+  // Refresh marketplace catalog in the background when the panel is shown (throttled to 30 min)
+  useEffect(() => {
+    maybeRefreshCatalog();
+  }, []);
 
   // Sync pin state from other components (e.g. title bar dropdown)
   useEffect(() => {
@@ -247,6 +265,11 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
         >
           Plugins
         </button>
+        {pluginUpdateCount > 0 && (
+          <span className="flex items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[9px] font-semibold text-blue-400">
+            {pluginUpdateCount} {pluginUpdateCount === 1 ? 'update' : 'updates'}
+          </span>
+        )}
         <div className="flex-1" />
         <button
           type="button"

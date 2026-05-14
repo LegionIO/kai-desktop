@@ -77,6 +77,16 @@ type PluginListEntry = {
   error?: string;
 };
 
+/** Compare two semver strings — returns true if catalogVersion is newer than installedVersion. */
+function isNewerVersion(catalogVersion: string, installedVersion: string): boolean {
+  const toNum = (v: string) => v.split('.').map(Number);
+  const [cMajor = 0, cMinor = 0, cPatch = 0] = toNum(catalogVersion);
+  const [iMajor = 0, iMinor = 0, iPatch = 0] = toNum(installedVersion);
+  if (cMajor !== iMajor) return cMajor > iMajor;
+  if (cMinor !== iMinor) return cMinor > iMinor;
+  return cPatch > iPatch;
+}
+
 export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
@@ -85,6 +95,8 @@ export class PluginManager {
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
+  private catalogRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private lastUpdateCount = 0;
 
   private brandRequiredPluginNamesSet: Set<string>;
 
@@ -474,6 +486,12 @@ export class PluginManager {
   /* ── Unloading ── */
 
   async unloadAll(): Promise<void> {
+    // Stop periodic catalog refresh
+    if (this.catalogRefreshTimer) {
+      clearInterval(this.catalogRefreshTimer);
+      this.catalogRefreshTimer = null;
+    }
+
     // Unload in reverse of load order: non-required plugins first (reverse alpha), then required plugins in reverse order
     const sorted = [...this.plugins.entries()].sort(([, a], [, b]) => {
       const aIdx = this.brandRequiredPluginNames.indexOf(a.manifest.name);
@@ -1037,6 +1055,50 @@ export class PluginManager {
     }));
   }
 
+  /* ── Plugin Update Detection ── */
+
+  /**
+   * Count how many installed plugins have a newer version available in the marketplace catalog.
+   */
+  getAvailableUpdateCount(): number {
+    const catalog = this.marketplaceService?.getCachedCatalog() ?? [];
+    let count = 0;
+    for (const entry of catalog) {
+      const instance = this.plugins.get(entry.name);
+      if (instance && isNewerVersion(entry.version, instance.manifest.version)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Start periodic catalog refresh (every 4 hours) and broadcast update count.
+   * Call after loadAll() and initMarketplace() have completed.
+   */
+  startCatalogRefresh(): void {
+    // Initial broadcast
+    this.broadcastUpdateCount();
+
+    // Periodic refresh every 4 hours (same cadence as app auto-updater)
+    const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+    this.catalogRefreshTimer = setInterval(() => {
+      this.refreshMarketplace()
+        .then(() => this.broadcastUpdateCount())
+        .catch((err) => {
+          console.warn('[PluginManager] Periodic catalog refresh failed:', err);
+        });
+    }, REFRESH_INTERVAL_MS);
+  }
+
+  private broadcastUpdateCount(): void {
+    const count = this.getAvailableUpdateCount();
+    if (count !== this.lastUpdateCount) {
+      this.lastUpdateCount = count;
+      broadcastToAllWindows('plugin:updates-available', { count });
+    }
+  }
+
   async installFromMarketplace(pluginName: string): Promise<void> {
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
@@ -1059,6 +1121,9 @@ export class PluginManager {
     if (newPlugin) {
       await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
     }
+
+    // Update count changed since we just installed/updated a plugin
+    this.broadcastUpdateCount();
   }
 
   async uninstallFromMarketplace(pluginName: string): Promise<void> {

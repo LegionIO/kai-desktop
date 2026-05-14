@@ -125,6 +125,8 @@ type AppAPI = {
       marketplaceUrl: string;
     }>>;
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
+    getAvailableUpdateCount: () => Promise<number>;
+    onUpdatesAvailable: (callback: (data: { count: number }) => void) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;
     onNavigateDirect: (callback: (data: unknown) => void) => () => void;

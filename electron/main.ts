@@ -999,6 +999,9 @@ if (gotSingleInstanceLock) {
         await pluginManager.loadAll();
         console.info(`[${__BRAND_PRODUCT_NAME}] ${pluginManager.getPluginCount()} plugins loaded`);
 
+        // Start periodic marketplace catalog refresh for plugin update detection
+        pluginManager.startCatalogRefresh();
+
         // If this launch follows a successful update, fire post-update hooks
         // (e.g., revoke admin privileges granted by pre-update hook).
         const updateMarker = consumePostUpdateMarker();
@@ -1040,8 +1043,14 @@ if (gotSingleInstanceLock) {
     });
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow();
+      const allWindows = BrowserWindow.getAllWindows();
+      if (allWindows.length === 0) {
+        const win = createWindow();
+        win.once('ready-to-show', () => {
+          win.show();
+        });
+      } else {
+        focusPrimaryWindow();
       }
     });
   });

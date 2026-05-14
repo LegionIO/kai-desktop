@@ -178,6 +178,13 @@ const appAPI = {
       ipcRenderer.on('plugin:ui-state-changed', handler);
       return () => ipcRenderer.removeListener('plugin:ui-state-changed', handler);
     },
+    getAvailableUpdateCount: () =>
+      ipcRenderer.invoke('plugin:available-update-count') as Promise<number>,
+    onUpdatesAvailable: (callback: (data: { count: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { count: number }) => callback(data);
+      ipcRenderer.on('plugin:updates-available', handler);
+      return () => ipcRenderer.removeListener('plugin:updates-available', handler);
+    },
     onEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('plugin:event', handler);

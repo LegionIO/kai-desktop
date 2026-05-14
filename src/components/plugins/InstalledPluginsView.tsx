@@ -17,6 +17,19 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlugins } from '@/providers/PluginProvider';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 
+/* ── Throttled catalog refresh ─────────────────────── */
+
+const REFRESH_THROTTLE_MS = 30 * 60 * 1000; // 30 minutes
+let lastCatalogRefreshTime = 0;
+
+function maybeRefreshCatalog(): void {
+  const now = Date.now();
+  if (now - lastCatalogRefreshTime > REFRESH_THROTTLE_MS) {
+    lastCatalogRefreshTime = now;
+    app.plugins.marketplaceRefresh().catch(() => {});
+  }
+}
+
 /* ── Types ────────────────────────────────────────────── */
 
 type InstalledPlugin = {
@@ -83,6 +96,11 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // Refresh marketplace catalog in the background when view is shown (throttled to 30 min)
+  useEffect(() => {
+    maybeRefreshCatalog();
+  }, []);
 
   const catalogMap = new Map(catalog.map((e) => [e.name, e]));
   const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
