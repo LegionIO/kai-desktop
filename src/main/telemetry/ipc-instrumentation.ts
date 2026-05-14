@@ -30,7 +30,7 @@ export function instrumentIPCMain() {
   const originalOn = ipcMain.on.bind(ipcMain);
 
   // Instrument ipcMain.handle
-  ipcMain.handle = function (channel: string, listener: Function) {
+  ipcMain.handle = function (channel: string, listener: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => unknown) {
     const wrappedListener = async (event: any, ...args: any[]) => {
       const tracer = trace.getTracer(TRACER_NAME);
       
@@ -81,7 +81,7 @@ export function instrumentIPCMain() {
   };
 
   // Instrument ipcMain.on
-  ipcMain.on = function (channel: string, listener: Function) {
+  ipcMain.on = function (channel: string, listener: (event: Electron.IpcMainEvent, ...args: unknown[]) => void) {
     const wrappedListener = (event: any, ...args: any[]) => {
       const tracer = trace.getTracer(TRACER_NAME);
       
