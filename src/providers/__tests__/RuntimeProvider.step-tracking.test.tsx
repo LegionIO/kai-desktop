@@ -458,19 +458,12 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      // Replace stream with a simple mock to bypass IPC Proxy issues in test env
-      mockStream.mockClear();
-      const directStreamSpy = vi.fn().mockResolvedValue(undefined);
-      if (window.app) {
-        (window.app as unknown as Record<string, Record<string, unknown>>).agent.stream = directStreamSpy;
-      }
-
       act(() => { screen.getByTestId('btn-continue').click(); });
 
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('false');
       });
-      expect(directStreamSpy).toHaveBeenCalledWith(
+      expect(mockStream).toHaveBeenCalledWith(
         ACTIVE_CONV_ID,
         expect.arrayContaining([
           expect.objectContaining({
@@ -480,13 +473,13 @@ describe('RuntimeProvider - Step Tracking', () => {
             ]),
           }),
         ]),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
+        undefined,
+        expect.any(String),
+        undefined,
+        expect.any(Boolean),
+        undefined,
+        expect.any(String),
+        undefined,
       );
     });
 
