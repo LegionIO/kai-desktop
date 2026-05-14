@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 import { branding } from './branding.config';
 import { resolveBranding } from './scripts/resolve-branding';
@@ -54,6 +55,11 @@ export const baseConfig = defineConfig({
     // Global setup: deterministic time/UUID, node-pty stub; msw is opt-in
     // (installed by individual suites that need it).
     setupFiles: ['./vitest.setup.ts'],
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
   },
   define: brandDefines,
 });

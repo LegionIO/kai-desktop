@@ -369,6 +369,27 @@ export function useCurrentWorkingDirectory(): CurrentWorkingDirectoryState {
   return useCtx(CurrentWorkingDirectoryContext);
 }
 
+// Step tracking context for Continue Task feature
+type StepTrackingState = {
+  stepInfo: { currentStep: number; maxSteps: number; hitLimit: boolean } | null;
+  showIncompleteTaskBanner: boolean;
+  onContinueTask: () => void;
+  onAdjustSettings: () => void;
+  onDismissBanner: () => void;
+};
+
+const StepTrackingContext = createCtx<StepTrackingState>({
+  stepInfo: null,
+  showIncompleteTaskBanner: false,
+  onContinueTask: () => {},
+  onAdjustSettings: () => {},
+  onDismissBanner: () => {},
+});
+
+export function useStepTracking(): StepTrackingState {
+  return useCtx(StepTrackingContext);
+}
+
 // Exposes the activeConversationId that is set in the same React batch as
 // setTree/setHeadId inside loadConversationState. Consumers that need to react
 // *after* the new thread's messages are in the tree (e.g. scroll-to-bottom)
@@ -1132,6 +1153,12 @@ export function RuntimeProvider({
   const [currentWorkingDirectory, setCurrentWorkingDirectoryState] = useState<string | null>(null);
   const [fallbackBanner, setFallbackBanner] = useState<FallbackBannerState>(null);
   const fallbackBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Step tracking state
+  const [stepInfo, setStepInfo] = useState<{ currentStep: number; maxSteps: number; hitLimit: boolean } | null>(null);
+  const [showIncompleteTaskBanner, setShowIncompleteTaskBanner] = useState(false);
+  const dismissedBannersRef = useRef<Set<string>>(new Set());
+
   const activeIdRef = useRef<string | null>(null);
   const treeRef = useRef<StoredMessage[]>([]);
   const headIdRef = useRef<string | null>(null);
@@ -1284,6 +1311,8 @@ export function RuntimeProvider({
     setActiveConversationId(id);
     setTree(t);
     setHeadId(h);
+    setStepInfo(null);
+    setShowIncompleteTaskBanner(false);
     currentWorkingDirectoryRef.current = conv.currentWorkingDirectory ?? null;
     setCurrentWorkingDirectoryState(conv.currentWorkingDirectory ?? null);
 
@@ -1437,6 +1466,13 @@ export function RuntimeProvider({
         parentToolCallId?: string;
         status?: string;
         summary?: string;
+        // Step tracking fields
+        stepInfo?: {
+          currentStep: number;
+          maxSteps: number;
+          hitLimit: boolean;
+          taskComplete: boolean;
+        };
       };
 
       // Debug: log every event received in renderer
@@ -1850,6 +1886,31 @@ export function RuntimeProvider({
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
+          }
+        }
+      } else if (e.type === 'step-progress') {
+        // Update step progress indicator
+        if (e.stepInfo && isActiveConv) {
+          setStepInfo({
+            currentStep: e.stepInfo.currentStep,
+            maxSteps: e.stepInfo.maxSteps,
+            hitLimit: e.stepInfo.hitLimit,
+          });
+        }
+      } else if (e.type === 'max-steps-reached') {
+        // Max steps reached — show incomplete task banner
+        console.warn(`[StreamEvent] MAX_STEPS conv=${convId.slice(0, 8)} steps=${e.stepInfo?.currentStep}/${e.stepInfo?.maxSteps}`);
+
+        if (e.stepInfo && isActiveConv) {
+          setStepInfo({
+            currentStep: e.stepInfo.currentStep,
+            maxSteps: e.stepInfo.maxSteps,
+            hitLimit: true,
+          });
+
+          // Show banner if not dismissed for this conversation
+          if (!dismissedBannersRef.current.has(convId)) {
+            setShowIncompleteTaskBanner(true);
           }
         }
       } else if (e.type === 'error' && e.errorCategory === 'max_turns') {
@@ -2312,7 +2373,21 @@ export function RuntimeProvider({
     onNew,
     onReload,
     onCancel,
-    convertMessage: (m: ThreadMessageLike) => m,
+    convertMessage: (m: ThreadMessageLike) => {
+      if (!Array.isArray(m.content)) return m;
+      const KNOWN_ASSISTANT_UI_TYPES = new Set(['text', 'image', 'tool-call', 'tool-result', 'audio']);
+      const stripped: string[] = [];
+      const known = (m.content as ContentPart[]).filter((p) => {
+        if (KNOWN_ASSISTANT_UI_TYPES.has(p.type)) return true;
+        stripped.push(p.type);
+        return false;
+      });
+      if (stripped.length > 0) {
+        console.warn(`[RuntimeProvider] Stripped unsupported content part type(s) before rendering: ${[...new Set(stripped)].join(', ')}`);
+      }
+      if (known.length === m.content.length) return m;
+      return { ...m, content: toStoredContent(known) };
+    },
     isRunning,
     adapters: {
       ...(speechAdapter ? { speech: speechAdapter } : {}),
@@ -2370,6 +2445,81 @@ export function RuntimeProvider({
     dismiss: dismissFallbackBanner,
   }), [fallbackBanner, dismissFallbackBanner]);
 
+  // Step tracking callbacks
+  const handleContinueTask = useCallback(() => {
+    const convId = activeIdRef.current;
+    if (!convId || isRunning) return;
+
+    console.info(`[RuntimeProvider] Continue task for conversation ${convId}`);
+
+    const cfg = streamHandlerRef.current;
+    const currentTree = treeRef.current;
+    const currentHead = headIdRef.current;
+
+    const continueMsg: StoredMessage = {
+      id: msgId(),
+      parentId: currentHead,
+      role: 'user',
+      content: toStoredContent([{ type: 'text', text: 'Please continue the previous task' }]),
+      createdAt: new Date(),
+    };
+    const newTree = [...currentTree, continueMsg];
+    const newHead = continueMsg.id;
+
+    setTree(newTree);
+    setHeadId(newHead);
+    setIsRunning(true);
+    setShowIncompleteTaskBanner(false);
+    setStepInfo(null);
+
+    streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming: createPendingAssistantTiming() });
+    const branch = getActiveBranch(newTree, newHead);
+    persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+    app.agent.stream(
+      convId, branch,
+      cfg.selectedModelKey ?? undefined,
+      cfg.reasoningEffort ?? 'medium',
+      cfg.selectedProfileKey ?? undefined,
+      cfg.fallbackEnabled ?? false,
+      currentWorkingDirectoryRef.current ?? undefined,
+      executionMode ?? 'auto',
+      cfg.threadOverrides ?? undefined,
+    );
+
+    console.info('[Analytics] step_limit_continue_clicked', { conversationId: convId });
+  }, [isRunning, executionMode]);
+
+  const handleAdjustSettings = useCallback(() => {
+    console.info('[RuntimeProvider] Adjust settings clicked');
+    setShowIncompleteTaskBanner(false);
+
+    window.dispatchEvent(new CustomEvent('kai:open-settings'));
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('kai:navigate-settings', {
+        detail: { section: 'advanced' }
+      }));
+    }, 100);
+
+    console.info('[Analytics] step_limit_adjust_settings_clicked');
+  }, []);
+
+  const handleDismissBanner = useCallback(() => {
+    const convId = activeIdRef.current;
+    if (convId) {
+      dismissedBannersRef.current.add(convId);
+    }
+    setShowIncompleteTaskBanner(false);
+    console.info('[RuntimeProvider] Incomplete task banner dismissed', { conversationId: convId });
+  }, []);
+
+  const stepTrackingState = useMemo<StepTrackingState>(() => ({
+    stepInfo,
+    showIncompleteTaskBanner,
+    onContinueTask: handleContinueTask,
+    onAdjustSettings: handleAdjustSettings,
+    onDismissBanner: handleDismissBanner,
+  }), [stepInfo, showIncompleteTaskBanner, handleContinueTask, handleAdjustSettings, handleDismissBanner]);
+
   return (
     <MaxTurnsContinueContext.Provider value={handleContinueAfterMaxTurns}>
       <FallbackBannerContext.Provider value={fallbackBannerActions}>
@@ -2378,11 +2528,13 @@ export function RuntimeProvider({
             <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
               <PromptHistoryContext.Provider value={promptHistory}>
                 <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                  <RuntimeConversationIdContext.Provider value={activeConversationId}>
-                    <AssistantRuntimeProvider runtime={runtime}>
-                      {children}
-                    </AssistantRuntimeProvider>
-                  </RuntimeConversationIdContext.Provider>
+                  <StepTrackingContext.Provider value={stepTrackingState}>
+                    <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                      <AssistantRuntimeProvider runtime={runtime}>
+                        {children}
+                      </AssistantRuntimeProvider>
+                    </RuntimeConversationIdContext.Provider>
+                  </StepTrackingContext.Provider>
                 </CurrentWorkingDirectoryContext.Provider>
               </PromptHistoryContext.Provider>
             </AssistantResponseTimingContext.Provider>
