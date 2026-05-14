@@ -478,6 +478,45 @@ func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid
   return ["method": "select_type", "cursorSet": true, "cursorPosition": location + newText.utf16.count]
 }
 
+/// Replace a text range by setting and verifying the AX selection, then typing
+/// with keyboard events. This avoids kAXValueAttribute writes but still requires
+/// an exact Accessibility range anchor.
+func replaceTextRangeWithVerifiedSelection(location: Int, length: Int, newText: String, pid: pid_t? = nil) -> [String: Any]? {
+  let element: AXUIElement?
+  if let pid = pid {
+    element = focusedAccessibilityElementForPid(pid)
+  } else {
+    element = focusedAccessibilityElement()
+  }
+  guard location >= 0, length >= 0, let element else { return nil }
+
+  var range = CFRange(location: location, length: length)
+  guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+
+  let setSelErr = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue)
+  guard setSelErr == .success else { return nil }
+
+  _ = sleepMillis(5)
+  var verifyValue: CFTypeRef?
+  let verifyErr = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &verifyValue)
+  guard verifyErr == .success,
+        let verifyValue,
+        CFGetTypeID(verifyValue) == AXValueGetTypeID() else {
+    return nil
+  }
+
+  var actualRange = CFRange(location: 0, length: 0)
+  guard AXValueGetValue(verifyValue as! AXValue, .cfRange, &actualRange),
+        actualRange.location == location,
+        actualRange.length == length else {
+    return nil
+  }
+
+  _ = sleepMillis(5)
+  postUnicodeTextInChunks(newText)
+  return ["method": "verified_select_type", "cursorSet": true, "cursorPosition": location + newText.utf16.count]
+}
+
 func typeCharacterByCharacter(_ text: String, delayMs: Int) {
   let pause = max(0, delayMs)
   for character in text {
@@ -823,6 +862,30 @@ case "replaceTextAtomically":
     response[key] = value
   }
   printJson(response)
+
+case "replaceTextRangeVerified":
+  // AX-verified keyboard replacement: set selected range, verify it, then type.
+  // Args: replaceTextRangeVerified location length base64Text [pid]
+  guard args.count >= 5,
+        let location = Int(args[2]),
+        let length = Int(args[3]) else {
+    printJson(["ok": false, "error": "Expected location length base64Text"])
+    exit(1)
+  }
+  guard let decoded = decodeBase64String(args[4]) else {
+    printJson(["ok": false, "error": "Invalid base64 text"])
+    exit(1)
+  }
+  let rtvTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
+  guard let result = replaceTextRangeWithVerifiedSelection(location: location, length: length, newText: decoded, pid: rtvTargetPid) else {
+    printJson(["ok": false, "error": "Unable to set and verify focused selected text range"])
+    exit(1)
+  }
+  var verifiedResponse: [String: Any] = ["ok": true]
+  for (key, value) in result {
+    verifiedResponse[key] = value
+  }
+  printJson(verifiedResponse)
 
 case "deleteBack":
   // Delete N characters backwards (backspace key).

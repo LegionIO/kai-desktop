@@ -109,6 +109,8 @@ export const DictationOverlay: FC = () => {
     app.dictation.resizeOverlay(next ? 280 : 52);
   }, []);
 
+  const isStopping = dictState === 'stopping';
+
   // Mouse enter/leave toggles click-through on the overlay window
   const handleMouseEnter = useCallback(() => {
     app.dictation.setOverlayInteractive(true);
@@ -176,10 +178,11 @@ export const DictationOverlay: FC = () => {
           <button
             type="button"
             onClick={handleStop}
-            className="flex items-center gap-1.5 rounded-lg bg-red-500/20 px-2 py-1 text-[10px] font-medium text-red-300 hover:bg-red-500/30 transition-colors"
+            disabled={isStopping}
+            className="flex items-center gap-1.5 rounded-lg bg-red-500/20 px-2 py-1 text-[10px] font-medium text-red-300 transition-colors hover:bg-red-500/30 disabled:cursor-default disabled:bg-white/10 disabled:text-white/45"
           >
             <SquareIcon className="h-2.5 w-2.5 fill-current" />
-            Stop
+            {isStopping ? 'Stopping' : 'Stop'}
           </button>
         </div>
 

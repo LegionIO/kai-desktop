@@ -520,6 +520,10 @@ export const appConfigSchema = z.object({
     inputDeviceId: z.string().nullable().optional(),
     language: z.string().optional(),
     livePartials: z.boolean().optional(),
+    partialTyping: z.object({
+      ax: z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']).optional(),
+      kb: z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']).optional(),
+    }).optional(),
   }).optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

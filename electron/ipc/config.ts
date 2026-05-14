@@ -231,6 +231,10 @@ function getDefaultConfig() {
       inputDeviceId: null as string | null,
       language: undefined as string | undefined,
       livePartials: false,
+      partialTyping: {
+        ax: 'disabled' as const,
+        kb: 'disabled' as const,
+      },
     },
     advanced: {
       temperature: 0.4,
