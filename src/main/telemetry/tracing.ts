@@ -5,8 +5,8 @@
  * custom instrumentation, and error tracking.
  */
 
-import { trace, context, Span, SpanStatusCode, SpanKind, Tracer } from '@opentelemetry/api';
-import type { Attributes, AttributeValue } from '@opentelemetry/api';
+import { trace, SpanStatusCode, SpanKind } from '@opentelemetry/api';
+import type { Span, Tracer, Attributes, AttributeValue } from '@opentelemetry/api';
 
 const DEFAULT_TRACER_NAME = 'kai-desktop';
 
@@ -144,63 +144,3 @@ export function getCurrentSpan(): Span | undefined {
   return trace.getActiveSpan();
 }
 
-/**
- * Decorator for tracing class methods
- */
-export function Trace(spanName?: string) {
-  return function (
-    target: any,
-    propertyKey: string,
-    descriptor: PropertyDescriptor
-  ) {
-    const originalMethod = descriptor.value;
-    const name = spanName || `${target.constructor.name}.${propertyKey}`;
-
-    descriptor.value = async function (...args: any[]) {
-      return traceAsync(
-        name,
-        async (span) => {
-          span.setAttribute('method', propertyKey);
-          span.setAttribute('class', target.constructor.name);
-          return originalMethod.apply(this, args);
-        },
-        { tracerName: target.constructor.name }
-      );
-    };
-
-    return descriptor;
-  };
-}
-
-/**
- * Create a span link to another trace
- */
-export function createSpanLink(traceId: string, spanId: string) {
-  return {
-    context: {
-      traceId,
-      spanId,
-      traceFlags: 1,
-    },
-  };
-}
-
-/**
- * Extract trace context from carrier (e.g., HTTP headers)
- */
-export function extractContext(carrier: Record<string, string>): any {
-  // This would use W3C Trace Context propagation
-  return context.active();
-}
-
-/**
- * Inject trace context into carrier (e.g., HTTP headers)
- */
-export function injectContext(carrier: Record<string, string>): void {
-  // This would use W3C Trace Context propagation
-  const span = trace.getActiveSpan();
-  if (span) {
-    const spanContext = span.spanContext();
-    carrier['traceparent'] = `00-${spanContext.traceId}-${spanContext.spanId}-01`;
-  }
-}
