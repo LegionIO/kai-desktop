@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback, type FC } from 'react';
-import { MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
+import { AlertTriangleIcon, MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 export const DictationOverlay: FC = () => {
@@ -20,6 +20,7 @@ export const DictationOverlay: FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [typingMode, setTypingMode] = useState<string>('idle');
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const errorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // The normal app shell paints body with bg-background. In this transparent
   // overlay window that becomes a square backdrop unless we clear it.
@@ -47,8 +48,12 @@ export const DictationOverlay: FC = () => {
       setPartialText('');
     });
     const unsubError = app.dictation.onError((msg) => {
+      if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
       setError(msg);
-      setTimeout(() => setError(null), 5000);
+      errorTimeoutRef.current = setTimeout(() => {
+        setError(null);
+        errorTimeoutRef.current = null;
+      }, 5000);
     });
     const unsubMode = app.dictation.onTypingMode((mode) => {
       setTypingMode(mode);
@@ -64,6 +69,10 @@ export const DictationOverlay: FC = () => {
       unsubFinal();
       unsubError();
       unsubMode();
+      if (errorTimeoutRef.current) {
+        clearTimeout(errorTimeoutRef.current);
+        errorTimeoutRef.current = null;
+      }
     };
   }, []);
 
@@ -105,9 +114,11 @@ export const DictationOverlay: FC = () => {
 
   const handleExpand = useCallback((next: boolean) => {
     setExpanded(next);
-    // Resize overlay window to fit expanded content
-    app.dictation.resizeOverlay(next ? 280 : 52);
   }, []);
+
+  useEffect(() => {
+    app.dictation.resizeOverlay(expanded ? (error ? 320 : 280) : (error ? 96 : 52));
+  }, [error, expanded]);
 
   const isStopping = dictState === 'stopping';
 
@@ -188,8 +199,9 @@ export const DictationOverlay: FC = () => {
 
         {/* Error message */}
         {error && (
-          <div className="px-3 py-1.5 text-[10px] text-red-300 bg-red-500/10 border-t border-white/5">
-            {error}
+          <div className="flex items-start gap-1.5 border-t border-red-400/15 bg-red-500/10 px-3 py-1.5 text-[10px] leading-snug text-red-200">
+            <AlertTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="max-h-12 min-w-0 overflow-y-auto break-words">{error}</span>
           </div>
         )}
 

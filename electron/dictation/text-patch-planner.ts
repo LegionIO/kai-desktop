@@ -25,7 +25,7 @@ type SegmenterConstructor = new (
 };
 
 const MAX_EDIT_HUNKS = 8;
-const MAX_CURSOR_MOVES = 260;
+const MAX_CURSOR_MOVES = 60;
 const MAX_INSERTED_GRAPHEMES = 80;
 const MAX_DIFF_CELLS = 120_000;
 

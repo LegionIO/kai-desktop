@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const APPLESCRIPT_TIMEOUT_MS = 1500;
 const MAX_FOCUS_SNAPSHOT_AGE_MS = 10 * 60 * 1000;
+const RECAPTURE_RETRY_DELAY_MS = 80;
 
 type FocusSnapshot = {
   appName: string;
@@ -16,7 +17,8 @@ let targetFocus: FocusSnapshot | null = null;
 let captureInFlight: Promise<void> | null = null;
 
 function appleString(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const sanitized = value.replace(/[\u0000-\u001F\u007F]/g, ' ');
+  return `"${sanitized.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 async function runAppleScript(script: string): Promise<string> {
@@ -61,6 +63,26 @@ end tell
   targetFocus = snapshot;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runFreshFocusCapture(): Promise<void> {
+  if (process.platform !== 'darwin') return;
+
+  const capture = captureFrontmostApp()
+    .catch(() => {
+      // Startup and mutation paths fail closed if a target cannot be identified.
+    })
+    .finally(() => {
+      if (captureInFlight === capture) {
+        captureInFlight = null;
+      }
+    });
+  captureInFlight = capture;
+  await capture;
+}
+
 export async function beginDictationFocusSession(): Promise<void> {
   targetFocus = null;
   await refreshDictationTargetFocusNow();
@@ -77,14 +99,25 @@ async function refreshDictationTargetFocusNow(): Promise<void> {
     return;
   }
 
-  captureInFlight = captureFrontmostApp()
-    .catch(() => {
-      // Accessibility/Automation may be unavailable; dictation should still work.
-    })
-    .finally(() => {
-      captureInFlight = null;
-    });
-  await captureInFlight;
+  await runFreshFocusCapture();
+}
+
+export async function recaptureDictationTargetFocus(): Promise<boolean> {
+  if (captureInFlight) {
+    await captureInFlight;
+  }
+
+  const previousTarget = targetFocus;
+  targetFocus = null;
+  await runFreshFocusCapture();
+
+  if (!targetFocus && previousTarget?.pid != null) {
+    await delay(RECAPTURE_RETRY_DELAY_MS);
+    await runFreshFocusCapture();
+  }
+
+  const snapshot = targetFocus as FocusSnapshot | null;
+  return snapshot?.pid != null;
 }
 
 export function clearDictationTargetFocus(): void {

@@ -13,6 +13,9 @@
     <!-- Outbound network connections (remote APIs + local network) -->
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- Apple Events for focus capture/restore during local Mac control and dictation -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
     <!-- Microphone access for voice dictation -->
     <key>com.apple.security.device.audio-input</key>
     <true/>

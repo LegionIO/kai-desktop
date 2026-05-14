@@ -489,11 +489,13 @@ const appAPI = {
     getState: () => ipcRenderer.invoke('dictation:get-state'),
     getTypingMode: () => ipcRenderer.invoke('dictation:get-typing-mode'),
     setDevice: (deviceId: string) => ipcRenderer.invoke('dictation:set-device', deviceId),
+    suspendHotkey: () => ipcRenderer.invoke('dictation:suspend-hotkey'),
+    resumeHotkey: () => ipcRenderer.invoke('dictation:resume-hotkey'),
     setOverlayInteractive: (interactive: boolean) => ipcRenderer.send('dictation:overlay-set-interactive', interactive),
     resizeOverlay: (height: number) => ipcRenderer.send('dictation:overlay-resize', height),
     restoreOverlayFocus: () => ipcRenderer.send('dictation:overlay-restore-focus'),
-    onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number }) => callback(state);
+    onStateChange: (callback: (state: { state: string; elapsed: number; hotkeyRegistered?: boolean; hotkeyError?: string | null }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number; hotkeyRegistered?: boolean; hotkeyError?: string | null }) => callback(state);
       ipcRenderer.on('dictation:state', handler);
       return () => ipcRenderer.removeListener('dictation:state', handler);
     },

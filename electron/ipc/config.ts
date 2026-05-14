@@ -230,6 +230,8 @@ function getDefaultConfig() {
       mode: 'toggle' as const,
       inputDeviceId: null as string | null,
       language: undefined as string | undefined,
+      vadSilenceDurationMs: 850,
+      finalCleanupEnabled: false,
       livePartials: false,
       partialTyping: {
         ax: 'disabled' as const,

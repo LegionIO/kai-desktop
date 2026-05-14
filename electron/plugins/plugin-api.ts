@@ -179,7 +179,7 @@ function configureSessionCookiePromotion(
       path: cookie.path,
       secure: cookie.secure,
       httpOnly: cookie.httpOnly,
-      sameSite: cookie.sameSite as any,
+      sameSite: cookie.sameSite,
       expirationDate,
     }).catch(() => { /* best-effort — ignore failures */ });
   });

@@ -19,6 +19,8 @@ const computerUseApprovalModeSchema = z.enum(['step', 'goal', 'autonomous']);
 
 const computerUseToolSurfaceSchema = z.enum(['both', 'only-calls', 'only-chat', 'none']);
 
+const partialTypingStrategySchema = z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']);
+
 const providerSchema = z.object({
   type: z.enum(['openai-compatible', 'anthropic', 'amazon-bedrock', 'google']),
   enabled: z.boolean().optional(),
@@ -519,10 +521,12 @@ export const appConfigSchema = z.object({
     mode: z.enum(['toggle', 'hold']),
     inputDeviceId: z.string().nullable().optional(),
     language: z.string().optional(),
+    vadSilenceDurationMs: z.number().min(300).max(5000).optional(),
+    finalCleanupEnabled: z.boolean().optional(),
     livePartials: z.boolean().optional(),
     partialTyping: z.object({
-      ax: z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']).optional(),
-      kb: z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']).optional(),
+      ax: partialTypingStrategySchema.optional(),
+      kb: partialTypingStrategySchema.optional(),
     }).optional(),
   }).optional(),
   advanced: z.object({

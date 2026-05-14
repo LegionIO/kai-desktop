@@ -5,6 +5,7 @@ import ScreenCaptureKit
 
 let syntheticEventTag: Int64 = 0x4C47494F
 let syntheticSource = CGEventSource(stateID: .privateState)
+let maxKeyboardRepeatCount = 120
 
 func printJson(_ value: Any) {
   if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
@@ -295,33 +296,99 @@ func postUnicodeText(_ text: String, flags: CGEventFlags = []) {
   keyUp.post(tap: .cghidEventTap)
 }
 
-func postUnicodeTextInChunks(_ text: String, chunkSize: Int = 20, delayMs: Int = 5) {
-  let chars = Array(text)
-  var offset = 0
-  while offset < chars.count {
-    let end = min(offset + chunkSize, chars.count)
-    let chunk = String(chars[offset..<end])
+func postUnicodeTextInChunks(
+  _ text: String,
+  chunkSize: Int = 16,
+  delayMs: Int = 5,
+  targetPid: pid_t? = nil,
+  expectedElementSignature: String? = nil
+) -> Bool {
+  let maxUtf16Units = max(1, chunkSize)
+  var chunk = ""
+  var chunkUnits = 0
+
+  func flushChunk() -> Bool {
+    if chunk.isEmpty { return true }
+    guard frontmostMatchesPid(targetPid) else { return false }
+    guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedElementSignature) else { return false }
     postUnicodeText(chunk)
     _ = sleepMillis(delayMs)
-    offset = end
+    chunk = ""
+    chunkUnits = 0
+    return true
   }
+
+  for character in text {
+    let characterText = String(character)
+    let characterUnits = characterText.utf16.count
+    if !chunk.isEmpty && chunkUnits + characterUnits > maxUtf16Units {
+      guard flushChunk() else { return false }
+    }
+    chunk += characterText
+    chunkUnits += characterUnits
+  }
+
+  return flushChunk()
 }
 
-func pressKeyRepeated(keyCode: CGKeyCode, count: Int, delayMs: Int = 2) {
-  if count <= 0 { return }
+func frontmostApplicationPid() -> pid_t? {
+  NSWorkspace.shared.frontmostApplication?.processIdentifier
+}
+
+func frontmostMatchesPid(_ pid: pid_t?) -> Bool {
+  guard let pid else { return true }
+  return frontmostApplicationPid() == pid
+}
+
+func pressKeyRepeated(
+  keyCode: CGKeyCode,
+  count: Int,
+  delayMs: Int = 2,
+  targetPid: pid_t? = nil,
+  expectedElementSignature: String? = nil
+) -> Bool {
+  if count <= 0 { return true }
   for _ in 0..<count {
+    guard frontmostMatchesPid(targetPid) else { return false }
+    guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedElementSignature) else { return false }
     postKeyboardEvent(keyCode: keyCode, keyDown: true)
     postKeyboardEvent(keyCode: keyCode, keyDown: false)
     _ = sleepMillis(delayMs)
   }
+  return true
 }
 
 func operationCount(_ operation: [String: Any]) -> Int? {
-  if let count = operation["count"] as? Int {
-    return count
+  let count: Int
+  if let rawCount = operation["count"] as? Int {
+    count = rawCount
+  } else if let number = operation["count"] as? NSNumber {
+    count = number.intValue
+  } else {
+    return nil
   }
-  if let number = operation["count"] as? NSNumber {
-    return number.intValue
+  guard count >= 0 && count <= maxKeyboardRepeatCount else { return nil }
+  return count
+}
+
+func validatePatchOperations(_ operations: [[String: Any]]) -> String? {
+  for operation in operations {
+    guard let kind = operation["kind"] as? String else {
+      return "Patch operation missing kind"
+    }
+
+    switch kind {
+    case "moveLeft", "moveRight", "deleteForward":
+      guard operationCount(operation) != nil else {
+        return "\(kind) missing, negative, or excessive count"
+      }
+    case "insertText":
+      guard operation["text"] as? String != nil else {
+        return "insertText missing text"
+      }
+    default:
+      return "Unknown patch operation: \(kind)"
+    }
   }
   return nil
 }
@@ -346,13 +413,182 @@ func focusedAccessibilityElementForPid(_ pid: pid_t) -> AXUIElement? {
   return (focusedValue as! AXUIElement)
 }
 
-func focusedSelectedTextRange(pid: pid_t? = nil) -> CFRange? {
-  let element: AXUIElement?
-  if let pid = pid {
-    element = focusedAccessibilityElementForPid(pid)
-  } else {
-    element = focusedAccessibilityElement()
+func focusedAccessibilityElement(pid: pid_t? = nil) -> AXUIElement? {
+  if let pid {
+    return focusedAccessibilityElementForPid(pid)
   }
+  return focusedAccessibilityElement()
+}
+
+func focusedTextTargetIsSecure(pid: pid_t? = nil) -> Bool {
+  guard let element = focusedAccessibilityElement(pid: pid) else {
+    return true
+  }
+
+  var subroleValue: CFTypeRef?
+  let subroleErr = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleValue)
+  if subroleErr == .success,
+     let subrole = subroleValue as? String,
+     subrole == (kAXSecureTextFieldSubrole as String) {
+    return true
+  }
+
+  var protectedValue: CFTypeRef?
+  let protectedErr = AXUIElementCopyAttributeValue(element, "AXProtectedContent" as CFString, &protectedValue)
+  if protectedErr == .success,
+     let protected = protectedValue as? Bool,
+     protected {
+    return true
+  }
+
+  return false
+}
+
+func focusedTextValue(pid: pid_t? = nil) -> String? {
+  guard let element = focusedAccessibilityElement(pid: pid) else {
+    return nil
+  }
+  var value: CFTypeRef?
+  let error = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
+  guard error == .success, let valueString = value as? String else {
+    return nil
+  }
+  return valueString
+}
+
+func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+  var value: CFTypeRef?
+  let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+  guard error == .success, let value else {
+    return nil
+  }
+  return value as? String
+}
+
+func pointAttribute(_ element: AXUIElement, _ attribute: String) -> CGPoint? {
+  var value: CFTypeRef?
+  let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+  guard error == .success,
+        let value,
+        CFGetTypeID(value) == AXValueGetTypeID() else {
+    return nil
+  }
+  let axValue = value as! AXValue
+  guard AXValueGetType(axValue) == .cgPoint else {
+    return nil
+  }
+  var point = CGPoint.zero
+  guard AXValueGetValue(axValue, .cgPoint, &point) else {
+    return nil
+  }
+  return point
+}
+
+func sizeAttribute(_ element: AXUIElement, _ attribute: String) -> CGSize? {
+  var value: CFTypeRef?
+  let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+  guard error == .success,
+        let value,
+        CFGetTypeID(value) == AXValueGetTypeID() else {
+    return nil
+  }
+  let axValue = value as! AXValue
+  guard AXValueGetType(axValue) == .cgSize else {
+    return nil
+  }
+  var size = CGSize.zero
+  guard AXValueGetValue(axValue, .cgSize, &size) else {
+    return nil
+  }
+  return size
+}
+
+func signatureComponent(_ value: String?) -> String {
+  guard let value else { return "" }
+  return Data(value.utf8).base64EncodedString()
+}
+
+func accessibilityElementSignature(_ element: AXUIElement) -> String? {
+  guard let role = stringAttribute(element, kAXRoleAttribute as String) else {
+    return nil
+  }
+
+  let subrole = stringAttribute(element, kAXSubroleAttribute as String)
+  let identifier = stringAttribute(element, "AXIdentifier")
+  let position = pointAttribute(element, kAXPositionAttribute as String)
+  let size = sizeAttribute(element, kAXSizeAttribute as String)
+
+  guard identifier != nil || (position != nil && size != nil) else {
+    return nil
+  }
+
+  var parts = [
+    "role=\(signatureComponent(role))",
+    "subrole=\(signatureComponent(subrole))",
+    "id=\(signatureComponent(identifier))",
+  ]
+
+  if let position {
+    parts.append("x=\(Int(position.x.rounded()))")
+    parts.append("y=\(Int(position.y.rounded()))")
+  }
+  if let size {
+    parts.append("w=\(Int(size.width.rounded()))")
+  }
+
+  return parts.joined(separator: "|")
+}
+
+func focusedTextElementSignature(pid: pid_t? = nil) -> String? {
+  guard let element = focusedAccessibilityElement(pid: pid) else {
+    return nil
+  }
+  return accessibilityElementSignature(element)
+}
+
+func expectedElementSignatureArg(_ args: [String], _ index: Int) -> String? {
+  guard args.count > index,
+        !args[index].isEmpty else {
+    return nil
+  }
+  return decodeBase64String(args[index])
+}
+
+func elementMatchesExpected(_ element: AXUIElement, expectedSignature: String?) -> Bool {
+  guard let expectedSignature else {
+    return true
+  }
+  return accessibilityElementSignature(element) == expectedSignature
+}
+
+func focusedTextElementMatchesExpected(pid: pid_t? = nil, expectedSignature: String?) -> Bool {
+  guard let expectedSignature else {
+    return true
+  }
+  guard let element = focusedAccessibilityElement(pid: pid) else {
+    return false
+  }
+  return elementMatchesExpected(element, expectedSignature: expectedSignature)
+}
+
+func utf16Slice(_ text: String, location: Int, length: Int) -> String? {
+  guard location >= 0, length >= 0 else { return nil }
+  let utf16View = text.utf16
+  let textLength = utf16View.count
+  guard location <= textLength, length <= textLength - location else {
+    return nil
+  }
+  let startUtf16 = utf16View.index(utf16View.startIndex, offsetBy: location)
+  let endUtf16 = utf16View.index(startUtf16, offsetBy: length)
+  guard let start = String.Index(startUtf16, within: text),
+        let end = String.Index(endUtf16, within: text) else {
+    return nil
+  }
+  return String(text[start..<end])
+}
+
+func focusedSelectedTextRange(pid: pid_t? = nil) -> CFRange? {
+  let element = focusedAccessibilityElement(pid: pid)
   guard let element else {
     return nil
   }
@@ -375,12 +611,7 @@ func focusedSelectedTextRange(pid: pid_t? = nil) -> CFRange? {
 }
 
 func setFocusedSelectedTextRange(location: Int, length: Int, pid: pid_t? = nil) -> Bool {
-  let element: AXUIElement?
-  if let pid = pid {
-    element = focusedAccessibilityElementForPid(pid)
-  } else {
-    element = focusedAccessibilityElement()
-  }
+  let element = focusedAccessibilityElement(pid: pid)
   guard location >= 0, length >= 0, let element else {
     return false
   }
@@ -398,14 +629,18 @@ func setFocusedSelectedTextRange(location: Int, length: Int, pid: pid_t? = nil) 
 ///   - "method": "value" if kAXValueAttribute was used successfully
 ///   - "method": "select_type" if fell back to selection + typing (with verification)
 ///   - nil if both methods failed
-func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid: pid_t? = nil) -> [String: Any]? {
-  let element: AXUIElement?
-  if let pid = pid {
-    element = focusedAccessibilityElementForPid(pid)
-  } else {
-    element = focusedAccessibilityElement()
-  }
+func replaceTextRangeAtomically(
+  location: Int,
+  length: Int,
+  newText: String,
+  pid: pid_t? = nil,
+  expectedElementSignature: String? = nil
+) -> [String: Any]? {
+  guard frontmostMatchesPid(pid) else { return nil }
+  guard !focusedTextTargetIsSecure(pid: pid) else { return nil }
+  let element = focusedAccessibilityElement(pid: pid)
   guard let element else { return nil }
+  guard elementMatchesExpected(element, expectedSignature: expectedElementSignature) else { return nil }
 
   // Strategy 1: Read full value, splice, set back (truly atomic, no cursor dance)
   var currentValue: CFTypeRef?
@@ -428,6 +663,14 @@ func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid
         // Set the full value atomically
         let setErr = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newFullText as CFTypeRef)
         if setErr == .success {
+          var verifyFullValue: CFTypeRef?
+          let verifyFullErr = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &verifyFullValue)
+          guard verifyFullErr == .success,
+                let verifiedString = verifyFullValue as? String,
+                verifiedString == newFullText else {
+            return nil
+          }
+
           // Position cursor at end of inserted text
           let cursorPos = location + newText.utf16.count
           var cursorRange = CFRange(location: cursorPos, length: 0)
@@ -438,9 +681,15 @@ func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid
               "method": "value",
               "cursorSet": cursorErr == .success,
               "cursorPosition": cursorPos,
+              "textUtf16Length": newText.utf16.count,
             ]
           }
-          return ["method": "value", "cursorSet": false, "cursorPosition": cursorPos]
+          return [
+            "method": "value",
+            "cursorSet": false,
+            "cursorPosition": cursorPos,
+            "textUtf16Length": newText.utf16.count,
+          ]
         }
       }
       // kAXValueAttribute not settable or index conversion failed — fall through to strategy 2
@@ -448,6 +697,7 @@ func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid
   }
 
   // Strategy 2: Set selection range, verify, then type over it
+  guard pid != nil else { return nil }
   guard location >= 0, length >= 0 else { return nil }
   var range = CFRange(location: location, length: length)
   guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
@@ -473,22 +723,34 @@ func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid
   }
 
   // Selection verified, type the replacement
+  guard frontmostMatchesPid(pid) else { return nil }
   _ = sleepMillis(5)
-  postUnicodeTextInChunks(newText)
-  return ["method": "select_type", "cursorSet": true, "cursorPosition": location + newText.utf16.count]
+  guard focusedTextElementMatchesExpected(pid: pid, expectedSignature: expectedElementSignature) else { return nil }
+  guard postUnicodeTextInChunks(newText, targetPid: pid, expectedElementSignature: expectedElementSignature) else { return nil }
+  return [
+    "method": "select_type",
+    "cursorSet": true,
+    "cursorPosition": location + newText.utf16.count,
+    "textUtf16Length": newText.utf16.count,
+  ]
 }
 
 /// Replace a text range by setting and verifying the AX selection, then typing
 /// with keyboard events. This avoids kAXValueAttribute writes but still requires
 /// an exact Accessibility range anchor.
-func replaceTextRangeWithVerifiedSelection(location: Int, length: Int, newText: String, pid: pid_t? = nil) -> [String: Any]? {
-  let element: AXUIElement?
-  if let pid = pid {
-    element = focusedAccessibilityElementForPid(pid)
-  } else {
-    element = focusedAccessibilityElement()
-  }
+func replaceTextRangeWithVerifiedSelection(
+  location: Int,
+  length: Int,
+  newText: String,
+  pid: pid_t? = nil,
+  expectedElementSignature: String? = nil
+) -> [String: Any]? {
+  guard pid != nil else { return nil }
+  guard frontmostMatchesPid(pid) else { return nil }
+  guard !focusedTextTargetIsSecure(pid: pid) else { return nil }
+  let element = focusedAccessibilityElement(pid: pid)
   guard location >= 0, length >= 0, let element else { return nil }
+  guard elementMatchesExpected(element, expectedSignature: expectedElementSignature) else { return nil }
 
   var range = CFRange(location: location, length: length)
   guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
@@ -513,8 +775,15 @@ func replaceTextRangeWithVerifiedSelection(location: Int, length: Int, newText: 
   }
 
   _ = sleepMillis(5)
-  postUnicodeTextInChunks(newText)
-  return ["method": "verified_select_type", "cursorSet": true, "cursorPosition": location + newText.utf16.count]
+  guard frontmostMatchesPid(pid) else { return nil }
+  guard focusedTextElementMatchesExpected(pid: pid, expectedSignature: expectedElementSignature) else { return nil }
+  guard postUnicodeTextInChunks(newText, targetPid: pid, expectedElementSignature: expectedElementSignature) else { return nil }
+  return [
+    "method": "verified_select_type",
+    "cursorSet": true,
+    "cursorPosition": location + newText.utf16.count,
+    "textUtf16Length": newText.utf16.count,
+  ]
 }
 
 func typeCharacterByCharacter(_ text: String, delayMs: Int) {
@@ -799,12 +1068,41 @@ case "postText":
     printJson(["ok": false, "error": "Invalid base64 text"])
     exit(1)
   }
-  postUnicodeTextInChunks(decoded)
+  let ptTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  guard frontmostMatchesPid(ptTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  guard !focusedTextTargetIsSecure(pid: ptTargetPid) else {
+    printJson(["ok": false, "error": "Refusing to type into secure text field"])
+    exit(1)
+  }
+  let ptExpectedSignature = expectedElementSignatureArg(args, 4)
+  guard focusedTextElementMatchesExpected(pid: ptTargetPid, expectedSignature: ptExpectedSignature) else {
+    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+    exit(1)
+  }
+  guard postUnicodeTextInChunks(decoded, targetPid: ptTargetPid, expectedElementSignature: ptExpectedSignature) else {
+    printJson(["ok": false, "error": "Frontmost application changed while typing"])
+    exit(1)
+  }
   printJson(["ok": true])
 
 case "focusedTextSelection":
   // Optional PID argument: focusedTextSelection [pid]
   let ftsTargetPid: pid_t? = args.count >= 3 ? pid_t(args[2]) : nil
+  guard frontmostMatchesPid(ftsTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  guard !focusedTextTargetIsSecure(pid: ftsTargetPid) else {
+    printJson(["ok": false, "error": "Focused target is a secure text field"])
+    exit(1)
+  }
+  guard let ftsElementSignature = focusedTextElementSignature(pid: ftsTargetPid) else {
+    printJson(["ok": false, "error": "Unable to identify focused text element"])
+    exit(1)
+  }
   guard let range = focusedSelectedTextRange(pid: ftsTargetPid) else {
     printJson(["ok": false, "error": "Unable to read focused selected text range"])
     exit(1)
@@ -813,6 +1111,46 @@ case "focusedTextSelection":
     "ok": true,
     "selectedTextRangeLocation": range.location,
     "selectedTextRangeLength": range.length,
+    "elementSignature": ftsElementSignature,
+  ])
+
+case "focusedTextRangeState":
+  // Args: focusedTextRangeState location length [pid]
+  guard args.count >= 4,
+        let location = Int(args[2]),
+        let length = Int(args[3]) else {
+    printJson(["ok": false, "error": "Expected location length [pid]"])
+    exit(1)
+  }
+  let ftrsTargetPid: pid_t? = args.count >= 5 ? pid_t(args[4]) : nil
+  guard frontmostMatchesPid(ftrsTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  guard !focusedTextTargetIsSecure(pid: ftrsTargetPid) else {
+    printJson(["ok": false, "error": "Focused target is a secure text field"])
+    exit(1)
+  }
+  guard let ftrsElementSignature = focusedTextElementSignature(pid: ftrsTargetPid) else {
+    printJson(["ok": false, "error": "Unable to identify focused text element"])
+    exit(1)
+  }
+  guard let range = focusedSelectedTextRange(pid: ftrsTargetPid) else {
+    printJson(["ok": false, "error": "Unable to read focused selected text range"])
+    exit(1)
+  }
+  guard let value = focusedTextValue(pid: ftrsTargetPid),
+        let rangeText = utf16Slice(value, location: location, length: length) else {
+    printJson(["ok": false, "error": "Unable to read focused text range"])
+    exit(1)
+  }
+  printJson([
+    "ok": true,
+    "selectedTextRangeLocation": range.location,
+    "selectedTextRangeLength": range.length,
+    "elementSignature": ftrsElementSignature,
+    "rangeText": rangeText,
+    "textUtf16Length": value.utf16.count,
   ])
 
 case "replaceFocusedTextRange":
@@ -830,12 +1168,28 @@ case "replaceFocusedTextRange":
     exit(1)
   }
   let rftTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
+  guard !focusedTextTargetIsSecure(pid: rftTargetPid) else {
+    printJson(["ok": false, "error": "Refusing to type into secure text field"])
+    exit(1)
+  }
+  guard frontmostMatchesPid(rftTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  let rftExpectedSignature = expectedElementSignatureArg(args, 6)
+  guard focusedTextElementMatchesExpected(pid: rftTargetPid, expectedSignature: rftExpectedSignature) else {
+    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+    exit(1)
+  }
   guard setFocusedSelectedTextRange(location: location, length: length, pid: rftTargetPid) else {
     printJson(["ok": false, "error": "Unable to set focused selected text range"])
     exit(1)
   }
   _ = sleepMillis(8)
-  postUnicodeTextInChunks(decoded)
+  guard postUnicodeTextInChunks(decoded, targetPid: rftTargetPid, expectedElementSignature: rftExpectedSignature) else {
+    printJson(["ok": false, "error": "Frontmost application changed while typing"])
+    exit(1)
+  }
   printJson(["ok": true])
 
 case "replaceTextAtomically":
@@ -853,7 +1207,14 @@ case "replaceTextAtomically":
     exit(1)
   }
   let ratTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
-  guard let result = replaceTextRangeAtomically(location: location, length: length, newText: decoded, pid: ratTargetPid) else {
+  let ratExpectedSignature = expectedElementSignatureArg(args, 6)
+  guard let result = replaceTextRangeAtomically(
+    location: location,
+    length: length,
+    newText: decoded,
+    pid: ratTargetPid,
+    expectedElementSignature: ratExpectedSignature
+  ) else {
     printJson(["ok": false, "error": "Both value-set and verified select-type failed"])
     exit(1)
   }
@@ -877,7 +1238,14 @@ case "replaceTextRangeVerified":
     exit(1)
   }
   let rtvTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
-  guard let result = replaceTextRangeWithVerifiedSelection(location: location, length: length, newText: decoded, pid: rtvTargetPid) else {
+  let rtvExpectedSignature = expectedElementSignatureArg(args, 6)
+  guard let result = replaceTextRangeWithVerifiedSelection(
+    location: location,
+    length: length,
+    newText: decoded,
+    pid: rtvTargetPid,
+    expectedElementSignature: rtvExpectedSignature
+  ) else {
     printJson(["ok": false, "error": "Unable to set and verify focused selected text range"])
     exit(1)
   }
@@ -894,11 +1262,29 @@ case "deleteBack":
     printJson(["ok": false, "error": "Expected count"])
     exit(1)
   }
-  let deleteCount = Int(args[2]) ?? 0
-  for _ in 0..<deleteCount {
-    postKeyboardEvent(keyCode: 51, keyDown: true)
-    postKeyboardEvent(keyCode: 51, keyDown: false)
-    _ = sleepMillis(3)
+  guard let deleteCount = Int(args[2]),
+        deleteCount >= 0,
+        deleteCount <= maxKeyboardRepeatCount else {
+    printJson(["ok": false, "error": "Invalid or excessive delete count"])
+    exit(1)
+  }
+  let dbTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  guard frontmostMatchesPid(dbTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  guard !focusedTextTargetIsSecure(pid: dbTargetPid) else {
+    printJson(["ok": false, "error": "Refusing to delete in secure text field"])
+    exit(1)
+  }
+  let dbExpectedSignature = expectedElementSignatureArg(args, 4)
+  guard focusedTextElementMatchesExpected(pid: dbTargetPid, expectedSignature: dbExpectedSignature) else {
+    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+    exit(1)
+  }
+  guard pressKeyRepeated(keyCode: 51, count: deleteCount, delayMs: 3, targetPid: dbTargetPid, expectedElementSignature: dbExpectedSignature) else {
+    printJson(["ok": false, "error": "Frontmost application changed while deleting"])
+    exit(1)
   }
   printJson(["ok": true])
 
@@ -916,6 +1302,24 @@ case "applyTextPatch":
     printJson(["ok": false, "error": "Invalid patch operations"])
     exit(1)
   }
+  let atpTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  guard frontmostMatchesPid(atpTargetPid) else {
+    printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
+    exit(1)
+  }
+  guard !focusedTextTargetIsSecure(pid: atpTargetPid) else {
+    printJson(["ok": false, "error": "Refusing to patch secure text field"])
+    exit(1)
+  }
+  let atpExpectedSignature = expectedElementSignatureArg(args, 4)
+  guard focusedTextElementMatchesExpected(pid: atpTargetPid, expectedSignature: atpExpectedSignature) else {
+    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+    exit(1)
+  }
+  if let validationError = validatePatchOperations(operations) {
+    printJson(["ok": false, "error": validationError])
+    exit(1)
+  }
 
   for operation in operations {
     guard let kind = operation["kind"] as? String else {
@@ -929,25 +1333,37 @@ case "applyTextPatch":
         printJson(["ok": false, "error": "moveLeft missing count"])
         exit(1)
       }
-      pressKeyRepeated(keyCode: 123, count: count)
+      guard pressKeyRepeated(keyCode: 123, count: count, targetPid: atpTargetPid, expectedElementSignature: atpExpectedSignature) else {
+        printJson(["ok": false, "error": "Frontmost application changed during moveLeft"])
+        exit(1)
+      }
     case "moveRight":
       guard let count = operationCount(operation) else {
         printJson(["ok": false, "error": "moveRight missing count"])
         exit(1)
       }
-      pressKeyRepeated(keyCode: 124, count: count)
+      guard pressKeyRepeated(keyCode: 124, count: count, targetPid: atpTargetPid, expectedElementSignature: atpExpectedSignature) else {
+        printJson(["ok": false, "error": "Frontmost application changed during moveRight"])
+        exit(1)
+      }
     case "deleteForward":
       guard let count = operationCount(operation) else {
         printJson(["ok": false, "error": "deleteForward missing count"])
         exit(1)
       }
-      pressKeyRepeated(keyCode: 117, count: count)
+      guard pressKeyRepeated(keyCode: 117, count: count, targetPid: atpTargetPid, expectedElementSignature: atpExpectedSignature) else {
+        printJson(["ok": false, "error": "Frontmost application changed during deleteForward"])
+        exit(1)
+      }
     case "insertText":
       guard let text = operation["text"] as? String else {
         printJson(["ok": false, "error": "insertText missing text"])
         exit(1)
       }
-      postUnicodeTextInChunks(text)
+      guard postUnicodeTextInChunks(text, targetPid: atpTargetPid, expectedElementSignature: atpExpectedSignature) else {
+        printJson(["ok": false, "error": "Frontmost application changed during insertText"])
+        exit(1)
+      }
     default:
       printJson(["ok": false, "error": "Unknown patch operation: \(kind)"])
       exit(1)

@@ -641,7 +641,7 @@ if (gotSingleInstanceLock) {
     registerBatchTranscribeHandlers(ipcMain, getConfig);
 
     // Initialize dictation system (global hotkey + STT + text insertion)
-    initDictation(getConfig());
+    initDictation(getConfig(), setConfig);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
     const debugLogDir = join(process.cwd(), 'debug-logs');

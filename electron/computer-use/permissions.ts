@@ -1,6 +1,6 @@
 import { app, shell, systemPreferences } from 'electron';
 import { execFile } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -45,6 +45,12 @@ export function resolveCompiledHelperBinary(): string | null {
   for (const candidate of candidates) {
     try {
       accessSync(candidate, fsConstants.X_OK);
+      if (!app.isPackaged) {
+        const sourcePath = join(process.cwd(), 'electron', 'computer-use', 'helpers', 'LocalMacosHelper.swift');
+        if (existsSync(sourcePath) && statSync(candidate).mtimeMs < statSync(sourcePath).mtimeMs) {
+          continue;
+        }
+      }
       return candidate;
     } catch {
       // Not found or not executable — try next
@@ -129,6 +135,8 @@ export type LocalMacosHelperResponse = {
   pointerY?: number;
   selectedTextRangeLocation?: number;
   selectedTextRangeLength?: number;
+  elementSignature?: string;
+  rangeText?: string;
   imageBase64?: string;
   width?: number;
   height?: number;
@@ -139,6 +147,8 @@ export type LocalMacosHelperResponse = {
   cursorSet?: boolean;
   /** Cursor position after replacement */
   cursorPosition?: number;
+  /** UTF-16 code unit length of the replacement text */
+  textUtf16Length?: number;
   /** Display index of the captured display */
   displayIndex?: number;
   /** Info for the captured display */
