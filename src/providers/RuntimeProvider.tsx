@@ -1897,6 +1897,7 @@ export function RuntimeProvider({
             hitLimit: e.stepInfo.hitLimit,
           });
         }
+        return;
       } else if (e.type === 'max-steps-reached') {
         // Max steps reached — show incomplete task banner
         console.warn(`[StreamEvent] MAX_STEPS conv=${convId.slice(0, 8)} steps=${e.stepInfo?.currentStep}/${e.stepInfo?.maxSteps}`);
@@ -1913,6 +1914,7 @@ export function RuntimeProvider({
             setShowIncompleteTaskBanner(true);
           }
         }
+        return;
       } else if (e.type === 'error' && e.errorCategory === 'max_turns') {
         // Max turns reached — auto-continue or show interactive continue card
         console.warn(`[StreamEvent] MAX_TURNS conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)}`);
