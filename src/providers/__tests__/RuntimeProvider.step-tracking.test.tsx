@@ -6,8 +6,9 @@ import { RuntimeProvider, useStepTracking, useRuntimeConversationId } from '../R
 import { AttachmentProvider } from '../AttachmentContext';
 
 // ---------------------------------------------------------------------------
-// Minimal mock for @/lib/ipc-client
-// We intercept window.app directly so the Proxy in ipc-client picks it up.
+// Shared mock state — used both by vi.mock('@/lib/ipc-client') and
+// buildWindowApp() so all IPC paths (module-level app Proxy and window.app)
+// resolve to the same controlled stubs.
 // ---------------------------------------------------------------------------
 
 type StreamEventCallback = (event: unknown) => void;
@@ -44,6 +45,60 @@ const mockList = vi.fn().mockResolvedValue([]);
 const mockConfigGet = vi.fn().mockResolvedValue({});
 const mockConfigOnChanged = vi.fn().mockReturnValue(() => {});
 const mockHomedir = vi.fn().mockResolvedValue('/home/test');
+
+// ---------------------------------------------------------------------------
+// Mock @/lib/ipc-client so the module-level `app` Proxy is replaced with a
+// controlled stub. This prevents persistConversation from calling getApp()
+// across async boundaries (e.g. after afterEach deletes window.app) and
+// emitting [Runtime] Failed to persist stderr noise.
+//
+// All functions delegate to the same module-level mocks above, so beforeEach
+// resets (mockGet.mockClear etc.) apply uniformly.
+// ---------------------------------------------------------------------------
+
+vi.mock('@/lib/ipc-client', () => ({
+  app: {
+    conversations: {
+      get: (...args: unknown[]) => mockGet(...args),
+      put: (...args: unknown[]) => mockPut(...args),
+      list: (...args: unknown[]) => mockList(...args),
+      delete: vi.fn().mockResolvedValue(undefined),
+      clear: vi.fn().mockResolvedValue(undefined),
+      getActiveId: (...args: unknown[]) => mockGetActiveId(...args),
+      setActiveId: (...args: unknown[]) => mockSetActiveId(...args),
+      onChanged: vi.fn().mockImplementation((cb: ConversationsChangedCallback) => {
+        _conversationsChangedCallback = cb;
+        return () => { _conversationsChangedCallback = null; };
+      }),
+    },
+    agent: {
+      stream: (...args: unknown[]) => mockStream(...args),
+      cancelStream: vi.fn().mockResolvedValue(undefined),
+      generateTitle: vi.fn().mockResolvedValue({ title: null }),
+      onStreamEvent: vi.fn().mockImplementation((cb: StreamEventCallback) => {
+        streamEventCallback = cb;
+        return () => { streamEventCallback = null; };
+      }),
+      sendSubAgentMessage: vi.fn().mockResolvedValue({ ok: true }),
+      stopSubAgent: vi.fn().mockResolvedValue({ ok: true }),
+      listSubAgents: vi.fn().mockResolvedValue({ ids: [] }),
+      approveToolCall: vi.fn().mockResolvedValue({ ok: true }),
+      rejectToolCall: vi.fn().mockResolvedValue({ ok: true }),
+      dismissToolCall: vi.fn().mockResolvedValue({ ok: true }),
+      answerToolQuestion: vi.fn().mockResolvedValue({ ok: true }),
+      getAvailableRuntimes: vi.fn().mockResolvedValue([]),
+      getActiveRuntime: vi.fn().mockResolvedValue('mastra'),
+    },
+    config: {
+      get: (...args: unknown[]) => mockConfigGet(...args),
+      set: vi.fn().mockResolvedValue({}),
+      onChanged: (...args: unknown[]) => mockConfigOnChanged(...args),
+    },
+    platform: {
+      homedir: (...args: unknown[]) => mockHomedir(...args),
+    },
+  },
+}));
 
 function buildWindowApp() {
   return {
