@@ -370,8 +370,8 @@ async function renderWithProviders(conversationId = ACTIVE_CONV_ID) {
 }
 
 /** Emit a stream event through the captured callback */
-function emitStreamEvent(event: Record<string, unknown>) {
-  act(() => {
+async function emitStreamEvent(event: Record<string, unknown>) {
+  await act(async () => {
     streamEventCallback?.(event);
   });
 }
@@ -417,7 +417,7 @@ describe('RuntimeProvider - Step Tracking', () => {
 
       expect(screen.getByTestId('current-step').textContent).toBe('null');
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'step-progress',
         stepInfo: { currentStep: 5, maxSteps: 25, hitLimit: false, taskComplete: false },
@@ -433,7 +433,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('only updates stepInfo for active conversation', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: 'some-other-conv-id',
         type: 'step-progress',
         stepInfo: { currentStep: 10, maxSteps: 25, hitLimit: false, taskComplete: false },
@@ -451,12 +451,11 @@ describe('RuntimeProvider - Step Tracking', () => {
 
       expect(screen.getByTestId('show-banner').textContent).toBe('false');
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
       });
-
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('true');
         expect(screen.getByTestId('hit-limit').textContent).toBe('true');
@@ -473,7 +472,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
 
       // Now receive max-steps-reached for the same conversation
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -488,7 +487,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       await renderWithProviders();
       const warnSpy = vi.spyOn(console, 'warn');
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -506,7 +505,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('sends continuation message', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -541,7 +540,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('hides banner and clears stepInfo', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -560,7 +559,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       await renderWithProviders();
 
       // Trigger a text-delta so isRunning becomes true via the stream handler
-      emitStreamEvent({ conversationId: ACTIVE_CONV_ID, type: 'text-delta', text: 'hello' });
+      await emitStreamEvent({ conversationId: ACTIVE_CONV_ID, type: 'text-delta', text: 'hello' });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('false'));
 
       const directStreamSpy = vi.fn().mockResolvedValue(undefined);
@@ -615,7 +614,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('hides banner when called', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -635,7 +634,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       await renderWithProviders();
 
       // Show banner, dismiss it, then verify a new max-steps-reached doesn't show it again
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -646,7 +645,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('false'));
 
       // A second max-steps-reached should NOT re-show the banner
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -659,7 +658,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('hides banner', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -692,7 +691,7 @@ describe('RuntimeProvider - Step Tracking', () => {
     it('provides stepInfo to consumers', async () => {
       await renderWithProviders();
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'step-progress',
         stepInfo: { currentStep: 3, maxSteps: 10, hitLimit: false, taskComplete: false },
@@ -709,7 +708,7 @@ describe('RuntimeProvider - Step Tracking', () => {
 
       expect(screen.getByTestId('show-banner').textContent).toBe('false');
 
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'max-steps-reached',
         stepInfo: { currentStep: 10, maxSteps: 10, hitLimit: true, taskComplete: false },
@@ -735,7 +734,7 @@ describe('Step Tracking - Integration', () => {
     await renderWithProviders();
 
     // 1. Receive max-steps-reached
-    emitStreamEvent({
+    await emitStreamEvent({
       conversationId: ACTIVE_CONV_ID,
       type: 'max-steps-reached',
       stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -759,7 +758,7 @@ describe('Step Tracking - Integration', () => {
     await renderWithProviders();
 
     // 1. Receive event, show banner
-    emitStreamEvent({
+    await emitStreamEvent({
       conversationId: ACTIVE_CONV_ID,
       type: 'max-steps-reached',
       stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -771,7 +770,7 @@ describe('Step Tracking - Integration', () => {
     await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('false'));
 
     // 3. Another event — banner must remain hidden
-    emitStreamEvent({
+    await emitStreamEvent({
       conversationId: ACTIVE_CONV_ID,
       type: 'max-steps-reached',
       stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
@@ -786,7 +785,7 @@ describe('Step Tracking - Integration', () => {
 
     // Simulate step-by-step progress events
     for (let step = 1; step <= 5; step++) {
-      emitStreamEvent({
+      await emitStreamEvent({
         conversationId: ACTIVE_CONV_ID,
         type: 'step-progress',
         stepInfo: { currentStep: step, maxSteps: 25, hitLimit: false, taskComplete: false },
