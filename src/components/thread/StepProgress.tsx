@@ -1,4 +1,4 @@
-import { FC } from 'react';
+import type { FC } from 'react';
 import { AlertTriangleIcon, CheckCircleIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 

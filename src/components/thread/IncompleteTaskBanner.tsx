@@ -1,4 +1,5 @@
-import { FC, useCallback, useEffect } from 'react';
+import { useCallback, useEffect } from 'react';
+import type { FC } from 'react';
 import { AlertTriangleIcon, SettingsIcon, XIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
