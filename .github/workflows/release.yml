@@ -43,6 +43,8 @@ jobs:
 
       - run: pnpm type-check
 
+      - run: pnpm test
+
       - run: pnpm build
 
   pr-mac-build:
