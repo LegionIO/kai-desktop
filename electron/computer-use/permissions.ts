@@ -133,6 +133,12 @@ export type LocalMacosHelperResponse = {
   width?: number;
   height?: number;
   error?: string;
+  /** AX replacement method used ('value' or 'select_type') */
+  method?: string;
+  /** Whether cursor was positioned after replacement */
+  cursorSet?: boolean;
+  /** Cursor position after replacement */
+  cursorPosition?: number;
   /** Display index of the captured display */
   displayIndex?: number;
   /** Info for the captured display */

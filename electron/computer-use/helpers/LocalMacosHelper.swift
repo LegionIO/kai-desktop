@@ -392,6 +392,92 @@ func setFocusedSelectedTextRange(location: Int, length: Int, pid: pid_t? = nil) 
   return error == .success
 }
 
+/// Atomically replace a text range by setting kAXValueAttribute on the focused element.
+/// This avoids the two-step "set selection then type" approach which races with the app.
+/// Returns a dictionary with result info:
+///   - "method": "value" if kAXValueAttribute was used successfully
+///   - "method": "select_type" if fell back to selection + typing (with verification)
+///   - nil if both methods failed
+func replaceTextRangeAtomically(location: Int, length: Int, newText: String, pid: pid_t? = nil) -> [String: Any]? {
+  let element: AXUIElement?
+  if let pid = pid {
+    element = focusedAccessibilityElementForPid(pid)
+  } else {
+    element = focusedAccessibilityElement()
+  }
+  guard let element else { return nil }
+
+  // Strategy 1: Read full value, splice, set back (truly atomic, no cursor dance)
+  var currentValue: CFTypeRef?
+  let readErr = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &currentValue)
+  if readErr == .success, let currentValue, let currentString = currentValue as? String {
+    // Validate range bounds against actual text length
+    let utf16View = currentString.utf16
+    let textLen = utf16View.count
+    if location >= 0 && location <= textLen && (location + length) <= textLen {
+      // Splice the replacement in using UTF-16 indices
+      let startIdx = utf16View.index(utf16View.startIndex, offsetBy: location)
+      let endIdx = utf16View.index(startIdx, offsetBy: length)
+      // Convert UTF-16 indices to String indices safely
+      if let startStringIdx = String.Index(startIdx, within: currentString),
+         let endStringIdx = String.Index(endIdx, within: currentString) {
+        let before = String(currentString[currentString.startIndex..<startStringIdx])
+        let after = String(currentString[endStringIdx..<currentString.endIndex])
+        let newFullText = before + newText + after
+
+        // Set the full value atomically
+        let setErr = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newFullText as CFTypeRef)
+        if setErr == .success {
+          // Position cursor at end of inserted text
+          let cursorPos = location + newText.utf16.count
+          var cursorRange = CFRange(location: cursorPos, length: 0)
+          if let rangeValue = AXValueCreate(.cfRange, &cursorRange) {
+            let cursorErr = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue)
+            // Even if cursor positioning fails, the text was set correctly
+            return [
+              "method": "value",
+              "cursorSet": cursorErr == .success,
+              "cursorPosition": cursorPos,
+            ]
+          }
+          return ["method": "value", "cursorSet": false, "cursorPosition": cursorPos]
+        }
+      }
+      // kAXValueAttribute not settable or index conversion failed — fall through to strategy 2
+    }
+  }
+
+  // Strategy 2: Set selection range, verify, then type over it
+  guard location >= 0, length >= 0 else { return nil }
+  var range = CFRange(location: location, length: length)
+  guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+
+  let setSelErr = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue)
+  guard setSelErr == .success else { return nil }
+
+  // Verify the selection was actually set correctly
+  _ = sleepMillis(5)
+  var verifyValue: CFTypeRef?
+  let verifyErr = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &verifyValue)
+  if verifyErr == .success, let verifyValue, CFGetTypeID(verifyValue) == AXValueGetTypeID() {
+    var actualRange = CFRange(location: 0, length: 0)
+    AXValueGetValue(verifyValue as! AXValue, .cfRange, &actualRange)
+    // Allow slight mismatch (some apps normalize ranges) but location must match
+    if actualRange.location != location || actualRange.length != length {
+      // Selection verification failed — the AX state is unreliable
+      return nil
+    }
+  } else {
+    // Couldn't even read back the selection — bail
+    return nil
+  }
+
+  // Selection verified, type the replacement
+  _ = sleepMillis(5)
+  postUnicodeTextInChunks(newText)
+  return ["method": "select_type", "cursorSet": true, "cursorPosition": location + newText.utf16.count]
+}
+
 func typeCharacterByCharacter(_ text: String, delayMs: Int) {
   let pause = max(0, delayMs)
   for character in text {
@@ -712,6 +798,31 @@ case "replaceFocusedTextRange":
   _ = sleepMillis(8)
   postUnicodeTextInChunks(decoded)
   printJson(["ok": true])
+
+case "replaceTextAtomically":
+  // Atomic text replacement: tries kAXValueAttribute first (full-text splice),
+  // then falls back to verified select+type. More reliable than replaceFocusedTextRange.
+  // Args: replaceTextAtomically location length base64Text [pid]
+  guard args.count >= 5,
+        let location = Int(args[2]),
+        let length = Int(args[3]) else {
+    printJson(["ok": false, "error": "Expected location length base64Text"])
+    exit(1)
+  }
+  guard let decoded = decodeBase64String(args[4]) else {
+    printJson(["ok": false, "error": "Invalid base64 text"])
+    exit(1)
+  }
+  let ratTargetPid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
+  guard let result = replaceTextRangeAtomically(location: location, length: length, newText: decoded, pid: ratTargetPid) else {
+    printJson(["ok": false, "error": "Both value-set and verified select-type failed"])
+    exit(1)
+  }
+  var response: [String: Any] = ["ok": true]
+  for (key, value) in result {
+    response[key] = value
+  }
+  printJson(response)
 
 case "deleteBack":
   // Delete N characters backwards (backspace key).

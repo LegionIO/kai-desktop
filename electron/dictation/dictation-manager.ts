@@ -677,18 +677,16 @@ async function applyDictationPatch(
   targetText: string,
   phase: DictationPatchPhase,
 ): Promise<boolean> {
-  // If AX was suppressed due to mid-utterance failure, skip AX entirely
+  // Try AX (Accessibility) atomic replacement first — it avoids visible cursor movement.
+  // Uses kAXValueAttribute (full-text splice) with fallback to verified select+type.
+  // If AX failed earlier in this utterance, we suppress until the next clean final
+  // to avoid corrupting text by mixing AX and KB state.
   if (!axSuppressedUntilNextFinal) {
-    // If AX span was lost (e.g. app switch, previous failure), try re-capture (throttled)
-    // Only attempt re-capture when currentText is empty (start of a new utterance)
-    // to avoid stale offset issues from mixed AX/KB operations
     if (!axDictationSpan && currentText.length === 0 && Date.now() - lastAxCaptureAttempt > AX_RECAPTURE_COOLDOWN_MS) {
       lastAxCaptureAttempt = Date.now();
-      axDebug(`applyPatch: axDictationSpan is null, attempting re-capture (phase=${phase})`);
       axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
       broadcastTypingMode(axDictationSpan ? 'ax' : 'kb');
     }
-
     if (await replaceDictatedTextViaAx(targetText)) {
       return true;
     }
@@ -746,8 +744,10 @@ async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
   const encoded = Buffer.from(targetText, 'utf-8').toString('base64');
   axDebug(`replaceViaAx: location=${axDictationSpan.location} typedLen=${axDictationSpan.typedUtf16Length} targetLen=${targetText.length} pid=${axDictationSpan.pid}`);
   try {
+    // Use the atomic replacement command which tries kAXValueAttribute first,
+    // then falls back to verified select+type. Both strategies validate state.
     const args = [
-      'replaceFocusedTextRange',
+      'replaceTextAtomically',
       String(axDictationSpan.location),
       String(axDictationSpan.typedUtf16Length),
       encoded,
@@ -755,16 +755,16 @@ async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
     if (axDictationSpan.pid != null) {
       args.push(String(axDictationSpan.pid));
     }
-    await runLocalMacMouseCommand(args);
+    const result = await runLocalMacMouseCommand(args);
     updateAxDictationSpanLength(targetText);
-    axDebug(`replaceViaAx OK: newTypedLen=${axDictationSpan.typedUtf16Length}`);
+    axDebug(`replaceViaAx OK: method=${result.method ?? 'unknown'} newTypedLen=${axDictationSpan.typedUtf16Length}`);
     return true;
   } catch (err) {
     axDictationSpan = null;
     axSuppressedUntilNextFinal = true;
     broadcastTypingMode('kb');
     axDebug(`replaceViaAx FAILED (suppressing until next final): ${err}`);
-    console.info('[Dictation] AX text range replacement unavailable, falling back:', err);
+    console.info('[Dictation] AX atomic replacement failed, falling back to KB:', err);
     return false;
   }
 }
