@@ -1,23 +1,24 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { StepProgress } from '../StepProgress';
 
 describe('StepProgress', () => {
   it('renders compact display when below 80% threshold', () => {
-    render(<StepProgress currentStep={10} maxSteps={25} />);
+    const { container } = render(<StepProgress currentStep={10} maxSteps={25} />);
     
     expect(screen.getByText(/Steps: 10\/25/)).toBeInTheDocument();
-    expect(screen.getByRole('img', { hidden: true })).toHaveClass('text-green-500');
+    const icon = container.querySelector('svg');
+    expect(icon).toHaveClass('text-green-500');
   });
 
   it('shows progress bar at 80% threshold', () => {
-    render(<StepProgress currentStep={20} maxSteps={25} />);
+    const { container } = render(<StepProgress currentStep={20} maxSteps={25} />);
     
     expect(screen.getByText(/Steps: 20\/25/)).toBeInTheDocument();
     expect(screen.getByText('80%')).toBeInTheDocument();
-    // Progress bar should be visible
-    const progressBar = screen.getByRole('progressbar', { hidden: true });
+    // Progress bar is a styled div — query by its fill class
+    const progressBar = container.querySelector('.bg-blue-500, .bg-amber-500');
     expect(progressBar).toBeInTheDocument();
   });
 
@@ -29,10 +30,11 @@ describe('StepProgress', () => {
   });
 
   it('shows alert styling when limit reached', () => {
-    render(<StepProgress currentStep={25} maxSteps={25} hitLimit={true} />);
+    const { container } = render(<StepProgress currentStep={25} maxSteps={25} hitLimit={true} />);
     
     expect(screen.getByText(/Step limit reached \(25\/25\)/)).toBeInTheDocument();
-    expect(screen.getByRole('img', { hidden: true })).toHaveClass('text-amber-500');
+    const icon = container.querySelector('svg');
+    expect(icon).toHaveClass('text-amber-500');
   });
 
   it('applies custom className', () => {

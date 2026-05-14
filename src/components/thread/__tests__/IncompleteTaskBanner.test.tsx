@@ -2,7 +2,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { TooltipProvider } from '@/components/ui/Tooltip';
 import { IncompleteTaskBanner } from '../IncompleteTaskBanner';
+
+function renderWithProviders(ui: React.ReactElement) {
+  return render(<TooltipProvider>{ui}</TooltipProvider>);
+}
 
 describe('IncompleteTaskBanner', () => {
   const mockOnContinue = vi.fn();
@@ -27,7 +32,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('renders all content correctly', () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     expect(screen.getByText('Task incomplete - step limit reached')).toBeInTheDocument();
     expect(screen.getByText(/I reached the maximum number of steps/)).toBeInTheDocument();
@@ -39,7 +44,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('calls onContinue when Continue button clicked', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const continueButton = screen.getByRole('button', { name: /Continue Task/i });
     await userEvent.click(continueButton);
@@ -48,7 +53,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('calls onAdjustSettings when Adjust Settings button clicked', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const adjustButton = screen.getByRole('button', { name: /Adjust Settings/i });
     await userEvent.click(adjustButton);
@@ -57,7 +62,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('calls onDismiss when Dismiss button clicked', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const dismissButton = screen.getByRole('button', { name: /Dismiss/i });
     await userEvent.click(dismissButton);
@@ -66,7 +71,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('handles Cmd+Enter keyboard shortcut', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     fireEvent.keyDown(window, { key: 'Enter', metaKey: true });
     
@@ -76,7 +81,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('handles Ctrl+Enter keyboard shortcut', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true });
     
@@ -86,7 +91,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('does not trigger on Enter without modifier keys', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     fireEvent.keyDown(window, { key: 'Enter' });
     
@@ -96,7 +101,7 @@ describe('IncompleteTaskBanner', () => {
   it('cleans up keyboard event listener on unmount', () => {
     const removeEventListenerSpy = vi.spyOn(window, 'removeEventListener');
     
-    const { unmount } = render(<IncompleteTaskBanner {...defaultProps} />);
+    const { unmount } = renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     unmount();
     
@@ -104,7 +109,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('has proper accessibility attributes', () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const banner = screen.getByRole('alert');
     expect(banner).toHaveAttribute('aria-live', 'polite');
@@ -113,7 +118,7 @@ describe('IncompleteTaskBanner', () => {
   it('logs console info when Continue clicked', async () => {
     const consoleSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
     
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const continueButton = screen.getByRole('button', { name: /Continue Task/i });
     await userEvent.click(continueButton);
@@ -126,7 +131,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('applies custom className', () => {
-    const { container } = render(
+    const { container } = renderWithProviders(
       <IncompleteTaskBanner {...defaultProps} className="custom-class" />
     );
     
@@ -134,13 +139,13 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('displays correct step counts', () => {
-    render(<IncompleteTaskBanner {...defaultProps} currentStep={30} maxSteps={50} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} currentStep={30} maxSteps={50} />);
     
     expect(screen.getByText(/\(30\/50\)/)).toBeInTheDocument();
   });
 
   it('prevents default behavior on keyboard shortcut', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const event = new KeyboardEvent('keydown', { 
       key: 'Enter', 
@@ -156,7 +161,7 @@ describe('IncompleteTaskBanner', () => {
   });
 
   it('has hover states on buttons', async () => {
-    render(<IncompleteTaskBanner {...defaultProps} />);
+    renderWithProviders(<IncompleteTaskBanner {...defaultProps} />);
     
     const continueButton = screen.getByRole('button', { name: /Continue Task/i });
     expect(continueButton).toHaveClass('hover:bg-amber-700');
