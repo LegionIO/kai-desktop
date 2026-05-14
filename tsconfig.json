@@ -17,7 +17,7 @@
     "paths": {
       "@/*": ["./src/*"]
     },
-    "types": ["node"]
+    "types": ["node", "@testing-library/jest-dom"]
   },
   "include": ["branding.d.ts", "electron/**/*.ts", "electron.vite.config.ts", "src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["out", "dist", "node_modules"]
