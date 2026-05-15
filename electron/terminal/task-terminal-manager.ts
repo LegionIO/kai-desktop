@@ -201,7 +201,13 @@ export class TaskTerminalManager {
     if (runtime === 'claude-code') {
       return {
         command: 'claude',
-        args: ['-p', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', prompt],
+        args: [
+          '-p',
+          '--verbose',
+          '--output-format', 'stream-json',
+          '--permission-mode', 'bypassPermissions',
+          prompt,
+        ],
       };
     }
     // codex

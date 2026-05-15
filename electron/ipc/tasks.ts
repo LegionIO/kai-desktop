@@ -109,6 +109,8 @@ function startExecutionLoop(
       cwd: cwd ?? directive.cwd ?? process.env.HOME ?? '/tmp',
       prompt,
       onComplete: async ({ exitCode, output, sessionId }) => {
+        console.info(`[tasks] Execution complete: task=${taskId} exit=${exitCode} cycle=${cycle} output=${output.slice(0, 200)}`);
+
         // Read current task state for assessment context
         let currentTask: TaskFile;
         try {
