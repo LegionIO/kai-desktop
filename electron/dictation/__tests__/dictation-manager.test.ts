@@ -52,6 +52,7 @@ const mocks = vi.hoisted(() => {
   const ipcMain = {
     handle: vi.fn(),
   };
+  const createDictationOverlay = vi.fn();
   const showDictationOverlay = vi.fn(async () => {});
   const hideDictationOverlay = vi.fn();
   const destroyDictationOverlay = vi.fn();
@@ -160,6 +161,7 @@ const mocks = vi.hoisted(() => {
     globalShortcut.register.mockClear().mockReturnValue(true);
     globalShortcut.unregister.mockClear();
     ipcMain.handle.mockClear();
+    createDictationOverlay.mockClear();
     showDictationOverlay.mockClear();
     hideDictationOverlay.mockClear();
     destroyDictationOverlay.mockClear();
@@ -177,6 +179,7 @@ const mocks = vi.hoisted(() => {
     BrowserWindow,
     globalShortcut,
     ipcMain,
+    createDictationOverlay,
     showDictationOverlay,
     hideDictationOverlay,
     destroyDictationOverlay,
@@ -236,6 +239,7 @@ vi.mock('../../computer-use/harnesses/local-macos.js', () => ({
   startLocalMacosTakeoverMonitor: mocks.startLocalMacosTakeoverMonitor,
 }));
 vi.mock('../dictation-overlay.js', () => ({
+  createDictationOverlay: mocks.createDictationOverlay,
   showDictationOverlay: mocks.showDictationOverlay,
   hideDictationOverlay: mocks.hideDictationOverlay,
   destroyDictationOverlay: mocks.destroyDictationOverlay,

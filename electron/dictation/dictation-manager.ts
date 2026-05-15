@@ -27,6 +27,7 @@ import {
   type LocalMacosTakeoverMonitorHandle,
 } from '../computer-use/harnesses/local-macos.js';
 import {
+  createDictationOverlay,
   showDictationOverlay,
   hideDictationOverlay,
   destroyDictationOverlay,
@@ -110,6 +111,9 @@ let recorderWindow: BrowserWindow | null = null;
 let micDrainInterval: ReturnType<typeof setInterval> | null = null;
 let levelPollInterval: ReturnType<typeof setInterval> | null = null;
 let micSampleRateHz = 16000;
+let micDrainInFlight = false;
+let levelPollInFlight = false;
+let audioPollingGeneration = 0;
 
 // Session timing
 let sessionStartTime: number = 0;
@@ -143,12 +147,14 @@ const FINAL_CLEANUP_TIMEOUT_MS = 12_000;
 const POST_FINAL_AX_RECAPTURE_DELAY_MS = 120;
 const KEYBOARD_PATCH_VERIFY_DELAY_MS = 35;
 const TARGET_REFRESH_INTERVAL_MS = 250;
-const TARGET_REFRESH_IDLE_POLL_MS = 1000;
+const TARGET_REFRESH_IDLE_POLL_MS = 5000;
 const START_TARGET_IDENTIFY_ATTEMPTS = 3;
 const START_TARGET_IDENTIFY_RETRY_MS = 80;
 const STOP_TYPING_QUEUE_TIMEOUT_MS = 1500;
 const STOP_MIC_TIMEOUT_MS = 1500;
 const STOP_STT_TIMEOUT_MS = 2500;
+const MIC_DRAIN_SLOW_LOG_MS = 250;
+const LEVEL_POLL_SLOW_LOG_MS = 250;
 const MAX_SAFE_BACKSPACES = 120;
 const HOTKEY_SUSPEND_TTL_MS = 20_000;
 const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
@@ -197,6 +203,7 @@ export function initDictation(appConfig: AppConfig, setConfig?: PersistConfigVal
   config = appConfig.dictation as DictationConfig | undefined ?? null;
   if (config?.enabled && config.hotkey) {
     registerHotkey(config.hotkey);
+    createDictationOverlay();
   }
   registerIpcHandlers();
 }
@@ -224,6 +231,11 @@ export function updateDictationConfig(appConfig: AppConfig): void {
       hotkeyRegistrationError = null;
       broadcastState();
     }
+  }
+  if (newConfig?.enabled) {
+    createDictationOverlay();
+  } else {
+    destroyDictationOverlay();
   }
 }
 
@@ -419,28 +431,55 @@ async function startDictation(): Promise<void> {
   state = 'starting';
   sessionGeneration += 1;
   const generation = sessionGeneration;
+  const initializationStartedAt = Date.now();
   broadcastState();
-  sessionStartTime = Date.now();
   dictationDebugLog('SESSION_START', { generation });
 
   try {
     axDebug(`--- SESSION START ---`);
 
     // 1. Show overlay (this also captures + restores focus to the target app)
+    let phaseStartedAt = Date.now();
     await showDictationOverlay();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'overlay-focus',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) return;
 
+    phaseStartedAt = Date.now();
     await ensureDictationTargetIdentified();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'target-identify',
+      durationMs: Date.now() - phaseStartedAt,
+      targetPid: getDictationTargetPid(),
+    });
     if (!isStartingSession(generation)) return;
 
+    phaseStartedAt = Date.now();
     await assertLocalMacosAccessibilityTrusted();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'permissions',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) return;
 
     if (process.platform === 'darwin' && getDictationTargetPid() == null) {
       throw new Error('Dictation could not identify the target app. Click into the field and try again.');
     }
 
+    phaseStartedAt = Date.now();
     axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'ax-capture',
+      durationMs: Date.now() - phaseStartedAt,
+      capturedAx: Boolean(axDictationSpan),
+      mode: getBroadcastTypingMode(),
+    });
     if (!isStartingSession(generation)) return;
     axDebug(`startDictation: initial capture result=${axDictationSpan ? `loc=${axDictationSpan.location}` : 'null'}`);
     if (!axDictationSpan && lastAxCaptureFailedBecauseSecureTarget()) {
@@ -457,14 +496,27 @@ async function startDictation(): Promise<void> {
     broadcastTypingMode(getActivePartialTypingMode());
 
     // 2. Start mic capture
+    phaseStartedAt = Date.now();
     await startMicCapture(config.inputDeviceId ?? undefined);
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'mic-start',
+      durationMs: Date.now() - phaseStartedAt,
+      sampleRateHz: micSampleRateHz,
+    });
     if (!isStartingSession(generation)) {
       await stopMicCapture();
       return;
     }
 
     // 3. Start STT
+    phaseStartedAt = Date.now();
     await startStt();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'stt-start',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) {
       await stopStt();
       await stopMicCapture();
@@ -472,7 +524,13 @@ async function startDictation(): Promise<void> {
     }
 
     // 4. Start polling mic audio and levels
+    phaseStartedAt = Date.now();
     startAudioPolling();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'audio-polling',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) {
       stopAudioPolling();
       await stopStt();
@@ -481,10 +539,16 @@ async function startDictation(): Promise<void> {
     }
 
     state = 'active';
+    sessionStartTime = Date.now();
     startTypingTargetTracking();
     broadcastState();
     playDictationSound('start');
-    dictationDebugLog('SESSION_ACTIVE', { generation, mode: getBroadcastTypingMode(), targetPid: getDictationTargetPid() });
+    dictationDebugLog('SESSION_ACTIVE', {
+      generation,
+      mode: getBroadcastTypingMode(),
+      targetPid: getDictationTargetPid(),
+      initializationMs: Date.now() - initializationStartedAt,
+    });
     console.info('[Dictation] Started');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -689,6 +753,9 @@ function resetSessionState(): void {
   blindKeyboardPatchTargetPid = null;
   lastAxCaptureFailureMessage = null;
   micSampleRateHz = AZURE_STT_SAMPLE_RATE_HZ;
+  micDrainInFlight = false;
+  levelPollInFlight = false;
+  audioPollingGeneration += 1;
   queuedPartialGate.invalidateQueuedPartials();
   axDictationSpan = null;
   axSuppressedUntilNextFinal = false;
@@ -1047,20 +1114,64 @@ function getAzureSttKeyFallback(): string {
 
 function startAudioPolling(): void {
   // Poll mic for audio chunks every 50ms and feed to STT
-  micDrainInterval = setInterval(async () => {
-    writeAudioChunksToStt(await drainMicChunks());
+  audioPollingGeneration += 1;
+  const pollingGeneration = audioPollingGeneration;
+  micDrainInFlight = false;
+  levelPollInFlight = false;
+  micDrainInterval = setInterval(() => {
+    if (micDrainInFlight) return;
+    micDrainInFlight = true;
+    const startedAt = Date.now();
+    void drainMicChunks()
+      .then((chunks) => {
+        writeAudioChunksToStt(chunks);
+        const durationMs = Date.now() - startedAt;
+        if (durationMs >= MIC_DRAIN_SLOW_LOG_MS) {
+          dictationDebugLog('MIC_DRAIN_SLOW', { durationMs, chunks: chunks.length });
+        }
+      })
+      .catch((err) => {
+        dictationDebugLog('MIC_DRAIN_FAILED', {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (pollingGeneration !== audioPollingGeneration) return;
+        micDrainInFlight = false;
+      });
   }, 50);
 
   // Poll mic level every 66ms (~15fps) for overlay waveform
-  levelPollInterval = setInterval(async () => {
-    const level = await getMicLevel();
-    sendToOverlay('dictation:level', level);
+  levelPollInterval = setInterval(() => {
+    if (levelPollInFlight) return;
+    levelPollInFlight = true;
+    const startedAt = Date.now();
+    void getMicLevel()
+      .then((level) => {
+        sendToOverlay('dictation:level', level);
+        const durationMs = Date.now() - startedAt;
+        if (durationMs >= LEVEL_POLL_SLOW_LOG_MS) {
+          dictationDebugLog('LEVEL_POLL_SLOW', { durationMs });
+        }
+      })
+      .catch((err) => {
+        dictationDebugLog('LEVEL_POLL_FAILED', {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (pollingGeneration !== audioPollingGeneration) return;
+        levelPollInFlight = false;
+      });
   }, 66);
 }
 
 function stopAudioPolling(): void {
+  audioPollingGeneration += 1;
   if (micDrainInterval) { clearInterval(micDrainInterval); micDrainInterval = null; }
   if (levelPollInterval) { clearInterval(levelPollInterval); levelPollInterval = null; }
+  micDrainInFlight = false;
+  levelPollInFlight = false;
 }
 
 // ─── Text Handling ──────────────────────────────────────────────────────────
@@ -1331,6 +1442,7 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
 
   const raw = text.trim();
   if (!raw) return text;
+  const startedAt = Date.now();
 
   try {
     const modelEntry = resolveModelCatalog(fullConfig).defaultEntry;
@@ -1358,10 +1470,21 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
     );
 
     const cleaned = normalizeCleanupResponse(result.text);
-    if (!isAcceptableCleanupResponse(raw, cleaned)) return text;
+    const accepted = isAcceptableCleanupResponse(raw, cleaned);
+    dictationDebugLog('FINAL_CLEANUP', {
+      durationMs: Date.now() - startedAt,
+      accepted,
+      rawLen: raw.length,
+      cleanedLen: cleaned.length,
+    });
+    if (!accepted) return text;
     return cleaned;
   } catch (err) {
     console.warn('[Dictation] Final transcript cleanup failed; using raw final:', err);
+    dictationDebugLog('FINAL_CLEANUP_FAILED', {
+      durationMs: Date.now() - startedAt,
+      message: err instanceof Error ? err.message : String(err),
+    });
     return text;
   }
 }

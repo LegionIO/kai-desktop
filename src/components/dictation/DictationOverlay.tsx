@@ -6,13 +6,13 @@
  */
 
 import { useState, useEffect, useRef, useCallback, type FC } from 'react';
-import { AlertTriangleIcon, MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
+import { AlertTriangleIcon, MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon, LoaderCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 export const DictationOverlay: FC = () => {
   const [level, setLevel] = useState(0);
   const [elapsed, setElapsed] = useState(0);
-  const [dictState, setDictState] = useState<string>('active');
+  const [dictState, setDictState] = useState<string>('starting');
   const [partialText, setPartialText] = useState('');
   const [expanded, setExpanded] = useState(false);
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
@@ -59,7 +59,11 @@ export const DictationOverlay: FC = () => {
       setTypingMode(mode);
     });
 
-    // Fetch initial typing mode (may have been broadcast before we mounted)
+    // Fetch initial state/mode; both may have been broadcast before we mounted.
+    app.dictation.getState().then((state) => {
+      setDictState(state.state);
+      setElapsed(state.elapsed);
+    }).catch(() => {});
     app.dictation.getTypingMode().then((mode) => setTypingMode(mode)).catch(() => {});
 
     return () => {
@@ -120,6 +124,8 @@ export const DictationOverlay: FC = () => {
     app.dictation.resizeOverlay(expanded ? (error ? 320 : 280) : (error ? 96 : 52));
   }, [error, expanded]);
 
+  const isStarting = dictState === 'starting';
+  const isActive = dictState === 'active';
   const isStopping = dictState === 'stopping';
 
   // Mouse enter/leave toggles click-through on the overlay window
@@ -147,10 +153,14 @@ export const DictationOverlay: FC = () => {
       >
         {/* Main bar */}
         <div className="flex items-center gap-2.5 px-3 py-2.5">
-          {/* Recording dot */}
+          {/* Recording status */}
           <span className="relative flex h-2.5 w-2.5 shrink-0">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
+            <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-70 ${
+              isActive ? 'bg-red-400' : isStarting ? 'bg-sky-300' : 'bg-white/30'
+            }`} />
+            <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+              isActive ? 'bg-red-500' : isStarting ? 'bg-sky-400' : 'bg-white/35'
+            }`} />
           </span>
 
           {/* Typing mode indicator */}
@@ -164,13 +174,22 @@ export const DictationOverlay: FC = () => {
             </span>
           )}
 
-          {/* Level bars */}
-          <LevelBars level={level} />
+          {isActive ? (
+            <>
+              {/* Level bars */}
+              <LevelBars level={level} />
 
-          {/* Elapsed time */}
-          <span className="text-[11px] font-mono text-white/70 tabular-nums min-w-[32px]">
-            {formatTime(elapsed)}
-          </span>
+              {/* Elapsed time */}
+              <span className="text-[11px] font-mono text-white/70 tabular-nums min-w-[32px]">
+                {formatTime(elapsed)}
+              </span>
+            </>
+          ) : (
+            <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-[11px] font-medium text-white/65">
+              {isStarting && <LoaderCircleIcon className="h-3 w-3 shrink-0 animate-spin text-sky-300" />}
+              <span className="truncate">{isStarting ? 'Initializing' : 'Stopping'}</span>
+            </span>
+          )}
 
           {/* Expand/collapse */}
           <button
