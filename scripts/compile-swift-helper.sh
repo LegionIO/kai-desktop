@@ -6,7 +6,7 @@
 # Usage:
 #   bash scripts/compile-swift-helper.sh
 #
-# Requires Xcode or Command Line Tools with swiftc available.
+# Requires macOS with Xcode or Command Line Tools and the macOS SDK.
 
 set -euo pipefail
 
@@ -28,6 +28,11 @@ FRAMEWORKS=(
 
 # Ensure output directory exists
 mkdir -p "$OUTPUT_DIR"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Skipping LocalMacosHelper.swift compile: macOS SDK is only available on Darwin."
+  exit 0
+fi
 
 echo "Compiling LocalMacosHelper.swift → build/bin/LocalMacosHelper"
 echo "  Swift: $(swiftc --version 2>&1 | head -1)"
