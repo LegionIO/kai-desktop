@@ -33,6 +33,7 @@ import type {
   PreUpdateHook,
   PostUpdateHook,
   PostTaskLifecycleHook,
+  PostExecutionHook,
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
@@ -518,6 +519,10 @@ export function createPluginAPI(
       registerPostLifecycleHook: (hook: PostTaskLifecycleHook) => {
         requirePermission('tasks:hook');
         instance.postTaskLifecycleHooks.push(hook);
+      },
+      registerPostExecutionHook: (hook: PostExecutionHook) => {
+        requirePermission('tasks:hook');
+        instance.postExecutionHooks.push(hook);
       },
     },
 

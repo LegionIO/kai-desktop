@@ -35,6 +35,9 @@ import type {
   TaskLifecycleHookArgs,
   TaskLifecycleHookResult,
   PostTaskLifecycleHook,
+  ExecutionCompleteArgs,
+  ExecutionCompleteResult,
+  PostExecutionHook,
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
@@ -355,6 +358,7 @@ export class PluginManager {
       preUpdateHooks: [],
       postUpdateHooks: [],
       postTaskLifecycleHooks: [],
+      postExecutionHooks: [],
       uiBanners: [],
       uiModals: [],
       uiSettingsSections: [],
@@ -865,10 +869,12 @@ export class PluginManager {
   /* ── Task Lifecycle Hooks ── */
 
   /**
-   * Runs all registered post-task-lifecycle hooks in parallel (fire-and-forget).
-   * Each hook has a 5-second timeout. Returns merged metadata patches (if any).
+   * Runs all registered post-task-lifecycle hooks in parallel.
+   * Each hook has a 90-second timeout to accommodate long-running operations
+   * like council deliberation. Returns merged metadata patches and the first
+   * execution directive (if any).
    */
-  async runPostTaskLifecycleHooks(args: TaskLifecycleHookArgs): Promise<Record<string, unknown> | null> {
+  async runPostTaskLifecycleHooks(args: TaskLifecycleHookArgs): Promise<TaskLifecycleHookResult | null> {
     const hooks: Array<{ hook: PostTaskLifecycleHook; pluginName: string }> = [];
 
     for (const instance of this.plugins.values()) {
@@ -880,8 +886,9 @@ export class PluginManager {
 
     if (hooks.length === 0) return null;
 
-    const HOOK_TIMEOUT_MS = 5_000;
+    const HOOK_TIMEOUT_MS = 90_000; // Council deliberation requires multiple LLM calls (30-60s)
     let mergedPatch: Record<string, unknown> | null = null;
+    let executeDirective: TaskLifecycleHookResult['execute'] | undefined;
 
     const results = await Promise.allSettled(
       hooks.map(async ({ hook, pluginName }) => {
@@ -900,12 +907,57 @@ export class PluginManager {
     );
 
     for (const result of results) {
-      if (result.status === 'fulfilled' && result.value?.metadataPatch) {
-        mergedPatch = { ...(mergedPatch ?? {}), ...result.value.metadataPatch };
+      if (result.status === 'fulfilled' && result.value) {
+        if (result.value.metadataPatch) {
+          mergedPatch = { ...(mergedPatch ?? {}), ...result.value.metadataPatch };
+        }
+        if (result.value.execute && !executeDirective) {
+          executeDirective = result.value.execute;
+        }
       }
     }
 
-    return mergedPatch;
+    if (!mergedPatch && !executeDirective) return null;
+    return { metadataPatch: mergedPatch ?? undefined, execute: executeDirective };
+  }
+
+  /* ── Post-Execution Hooks (assessment + continuation) ── */
+
+  /**
+   * Runs post-execution hooks sequentially. First hook that returns a result wins.
+   * Used after non-interactive CLI execution completes to assess results and
+   * decide continuation (auto-continue, replan, or hard-stop).
+   */
+  async runPostExecutionHooks(args: ExecutionCompleteArgs): Promise<ExecutionCompleteResult | null> {
+    const hooks: Array<{ hook: PostExecutionHook; pluginName: string }> = [];
+
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.postExecutionHooks) {
+        hooks.push({ hook, pluginName: instance.manifest.name });
+      }
+    }
+
+    if (hooks.length === 0) return null;
+
+    const HOOK_TIMEOUT_MS = 90_000; // Assessment may require LLM calls
+
+    // Run hooks sequentially — first one with a result wins
+    for (const { hook, pluginName } of hooks) {
+      try {
+        const result = await Promise.race([
+          Promise.resolve(hook(args)),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Hook timed out')), HOOK_TIMEOUT_MS),
+          ),
+        ]);
+        if (result) return result;
+      } catch (err) {
+        console.error(`[PluginManager] Post-execution hook error in "${pluginName}":`, err);
+      }
+    }
+
+    return null;
   }
 
   /* ── UI State ── */

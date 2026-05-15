@@ -137,6 +137,7 @@ export type PluginInstance = {
   preUpdateHooks: PreUpdateHook[];
   postUpdateHooks: PostUpdateHook[];
   postTaskLifecycleHooks: PostTaskLifecycleHook[];
+  postExecutionHooks: PostExecutionHook[];
   uiBanners: PluginBannerDescriptor[];
   uiModals: PluginModalDescriptor[];
   uiSettingsSections: PluginSettingsSectionDescriptor[];
@@ -248,14 +249,49 @@ export type TaskLifecycleHookArgs = {
   changedFields: string[];
 };
 
+/** Directive returned by hooks to trigger non-interactive CLI execution. */
+export type ExecutionDirective = {
+  prompt: string;
+  runtime?: 'claude-code' | 'codex';
+  cwd?: string;
+};
+
 export type TaskLifecycleHookResult = {
   /** Optional metadata to merge into the task file after all hooks run. */
   metadataPatch?: Record<string, unknown>;
+  /** If present, spawns a non-interactive CLI execution with this prompt. */
+  execute?: ExecutionDirective;
 };
 
 export type PostTaskLifecycleHook = (
   args: TaskLifecycleHookArgs,
 ) => Promise<TaskLifecycleHookResult | void> | TaskLifecycleHookResult | void;
+
+/* ── Post-Execution Hooks (assessment + continuation loop) ── */
+
+export type ExecutionCompleteArgs = {
+  taskId: string;
+  exitCode: number;
+  /** Last ~8000 chars of stdout+stderr from the execution. */
+  output: string;
+  sessionId: string;
+  cycle: number;
+  /** Full task with metadata (includes councilSessionId, councilPlan, etc). */
+  task: TaskFile;
+};
+
+export type ExecutionCompleteResult = {
+  /** Continue executing with a new prompt (Level 1/2 continuation). */
+  execute?: ExecutionDirective;
+  /** Metadata to merge into the task file. */
+  metadataPatch?: Record<string, unknown>;
+  /** If true, task moves to human_review (Level 3 hard-stop). */
+  awaitApproval?: boolean;
+};
+
+export type PostExecutionHook = (
+  args: ExecutionCompleteArgs,
+) => Promise<ExecutionCompleteResult | void> | ExecutionCompleteResult | void;
 
 /* ── UI Descriptors (JSON-serializable across IPC) ── */
 
@@ -492,6 +528,7 @@ export type PluginAPI = {
 
   tasks: {
     registerPostLifecycleHook: (hook: PostTaskLifecycleHook) => void;
+    registerPostExecutionHook: (hook: PostExecutionHook) => void;
   };
 
   ui: {

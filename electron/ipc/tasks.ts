@@ -7,7 +7,8 @@ import type { TaskFile, KaiTaskOrder, KaiTaskStatus, TaskConversationMessage, Ta
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
-import type { TaskLifecycleEvent, TaskLifecycleHookArgs } from '../plugins/types.js';
+import type { TaskLifecycleEvent, TaskLifecycleHookArgs, ExecutionDirective } from '../plugins/types.js';
+import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -87,9 +88,115 @@ function detectLifecycleEvent(
   return 'task_updated';
 }
 
+/**
+ * Start a non-interactive execution loop triggered by a hook's execute directive.
+ * Handles multi-cycle continuation via post-execution hooks.
+ */
+function startExecutionLoop(
+  appHome: string,
+  taskId: string,
+  directive: ExecutionDirective,
+  pluginManager: PluginManager,
+  terminalManager: TaskTerminalManager,
+): void {
+  let cycle = 1;
+  const tasksDir = getTasksDir(appHome);
+  const filePath = join(tasksDir, `${taskId}.json`);
+
+  const runCycle = (prompt: string, cwd?: string) => {
+    terminalManager.createNonInteractive(taskId, {
+      runtime: (directive.runtime ?? 'claude-code') as 'claude-code' | 'codex',
+      cwd: cwd ?? directive.cwd ?? process.env.HOME ?? '/tmp',
+      prompt,
+      onComplete: async ({ exitCode, output, sessionId }) => {
+        // Read current task state for assessment context
+        let currentTask: TaskFile;
+        try {
+          currentTask = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+        } catch {
+          console.error(`[tasks] Cannot read task ${taskId} for post-execution assessment`);
+          return;
+        }
+
+        // Run post-execution hooks (assessment + continuation decision)
+        const result = await pluginManager.runPostExecutionHooks({
+          taskId,
+          exitCode,
+          output,
+          sessionId,
+          cycle,
+          task: currentTask,
+        }).catch((err) => {
+          console.error('[tasks] Post-execution hook error:', err);
+          return null;
+        });
+
+        // Apply metadata patch if present
+        if (result?.metadataPatch) {
+          try {
+            const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            task.metadata = { ...(task.metadata ?? {}), ...result.metadataPatch };
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+          } catch (patchErr) {
+            console.error('[tasks] Failed to apply post-execution metadata patch:', patchErr);
+          }
+        }
+
+        if (result?.execute) {
+          // Level 1/2: Auto-continue with new prompt
+          cycle++;
+          console.info(`[tasks] Execution cycle ${cycle} starting for task ${taskId}`);
+          runCycle(result.execute.prompt, result.execute.cwd);
+        } else if (result?.awaitApproval) {
+          // Level 3: Hard stop — move to human_review
+          try {
+            const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            task.status = 'human_review';
+            task.terminalSessionId = undefined;
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+            broadcastTaskChange(appHome);
+          } catch { /* ignore */ }
+        } else {
+          // Default: move to human_review on success, keep in_progress on failure
+          try {
+            const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            task.status = exitCode === 0 ? 'human_review' : 'in_progress';
+            task.terminalSessionId = undefined;
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+            broadcastTaskChange(appHome);
+          } catch { /* ignore */ }
+        }
+      },
+    }).then((sessionId) => {
+      // Update task to in_progress with terminal session
+      try {
+        const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+        task.status = 'in_progress';
+        task.terminalSessionId = sessionId;
+        task.updatedAt = new Date().toISOString();
+        writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+        broadcastTaskChange(appHome);
+      } catch { /* ignore */ }
+      console.info(`[tasks] Non-interactive execution started: task=${taskId} session=${sessionId} cycle=${cycle}`);
+    }).catch((err) => {
+      console.error(`[tasks] Non-interactive execution failed for task ${taskId}:`, err);
+    });
+  };
+
+  runCycle(directive.prompt);
+}
+
 // ── Registration ─────────────────────────────────────────────────────────
 
-export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, pluginManager: PluginManager | null): void {
+export function registerTaskHandlers(
+  ipcMain: IpcMain,
+  appHome: string,
+  pluginManager: PluginManager | null,
+  terminalManager?: TaskTerminalManager,
+): void {
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('tasks:list', () => {
@@ -150,6 +257,27 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, pluginMa
             previousStatus: undefined,
             previousTask: undefined,
             changedFields: Object.keys(taskData),
+          }).then((hookResult) => {
+            if (!hookResult) return;
+            const filePath = join(getTasksDir(appHome), `${id}.json`);
+
+            // Apply metadata patch
+            if (hookResult.metadataPatch) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                current.metadata = { ...(current.metadata ?? {}), ...hookResult.metadataPatch };
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
+              } catch (patchErr) {
+                console.error('[tasks] Failed to apply hook metadata patch (create):', patchErr);
+              }
+            }
+
+            // Trigger non-interactive execution if directive present
+            if (hookResult.execute && terminalManager) {
+              startExecutionLoop(appHome, id, hookResult.execute, pluginManager, terminalManager);
+            }
           }).catch((err) => {
             console.error('[tasks] Task lifecycle hook error (create):', err);
           });
@@ -204,18 +332,25 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, pluginMa
             previousStatus: existing.status,
             previousTask: existing,
             changedFields: Object.keys(updates),
-          }).then((patch) => {
-            if (patch) {
+          }).then((hookResult) => {
+            if (!hookResult) return;
+
+            // Apply metadata patch
+            if (hookResult.metadataPatch) {
               try {
                 const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-                const patched: TaskFile = {
-                  ...current,
-                  metadata: { ...(current.metadata ?? {}), ...patch },
-                };
-                writeFileSync(filePath, JSON.stringify(patched, null, 2), 'utf-8');
+                current.metadata = { ...(current.metadata ?? {}), ...hookResult.metadataPatch };
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
               } catch (patchErr) {
                 console.error('[tasks] Failed to apply hook metadata patch:', patchErr);
               }
+            }
+
+            // Trigger non-interactive execution if directive present
+            if (hookResult.execute && terminalManager) {
+              startExecutionLoop(appHome, id, hookResult.execute, pluginManager, terminalManager);
             }
           }).catch((err) => {
             console.error('[tasks] Task lifecycle hook error (update):', err);

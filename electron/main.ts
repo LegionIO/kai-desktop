@@ -712,7 +712,7 @@ if (gotSingleInstanceLock) {
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
 
     // Register task handlers after pluginManager so lifecycle hooks are available
-    registerTaskHandlers(ipcMain, APP_HOME, pluginManager);
+    registerTaskHandlers(ipcMain, APP_HOME, pluginManager, taskTerminalManager);
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());
