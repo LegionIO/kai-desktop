@@ -448,6 +448,13 @@ export class PluginManager {
       });
       this.pluginAPIs.set(manifest.name, api);
 
+      // Clear hook arrays before activate to prevent duplicates on reload (issue #36)
+      instance.preSendHooks = [];
+      instance.postReceiveHooks = [];
+      instance.preUpdateHooks = [];
+      instance.postUpdateHooks = [];
+      instance.configChangeListeners = [];
+
       if (typeof mod.activate === 'function') {
         await mod.activate(api);
       }
@@ -548,6 +555,13 @@ export class PluginManager {
     } catch (err) {
       console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
     }
+
+    // Clear hook arrays to prevent dangling references from firing (issue #36)
+    instance.preSendHooks = [];
+    instance.postReceiveHooks = [];
+    instance.preUpdateHooks = [];
+    instance.postUpdateHooks = [];
+    instance.configChangeListeners = [];
 
     this.actionHandlers.delete(pluginName);
 
