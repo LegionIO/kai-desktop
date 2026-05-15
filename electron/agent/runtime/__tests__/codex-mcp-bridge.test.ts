@@ -12,8 +12,8 @@ import type { ToolDefinition } from '../../../tools/types.js';
 
 function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
-    name: overrides.name ?? 'plugin__rally__rally_list_user_story_tasks',
-    originalName: overrides.originalName ?? 'rally_list_user_story_tasks',
+    name: overrides.name ?? 'plugin__rally__list_user_story_tasks',
+    originalName: overrides.originalName ?? 'list_user_story_tasks',
     description: overrides.description ?? 'Get tasks under a Rally user story.',
     source: overrides.source ?? 'plugin',
     sourceId: overrides.sourceId ?? 'rally',
@@ -85,6 +85,7 @@ describe('CodexMcpBridge', () => {
     const prompt = buildCodexMcpPrompt('Can you read my Rally stories?', [createTool()]);
 
     expect(prompt).toContain('mcp__kai__rally_list_user_story_tasks');
+    expect(prompt).toContain('server "kai" and tool "<tool>"');
     expect(prompt).toContain('Do not call bare mcp__kai__');
     expect(prompt).toContain('Do not use list_mcp_resources');
     expect(prompt).toContain('use tool_search');
@@ -95,8 +96,8 @@ describe('CodexMcpBridge', () => {
     const config = buildCodexMcpServerConfig('http://127.0.0.1:12345/mcp', [
       createTool(),
       createTool({
-        name: 'plugin__rally__rally_get_feature_details',
-        originalName: 'rally_get_feature_details',
+        name: 'plugin__rally__get_feature_details',
+        originalName: 'get_feature_details',
       }),
     ]);
 
@@ -109,25 +110,64 @@ describe('CodexMcpBridge', () => {
     });
   });
 
+  it('qualifies short plugin tool names with the plugin id for Codex', () => {
+    const aithenaTool = createTool({
+      name: 'plugin__aithena__memory_stats',
+      originalName: 'memory_stats',
+      description: 'Get Aithena memory statistics.',
+      sourceId: 'aithena',
+      inputSchema: z.object({}),
+    });
+
+    const entries = getCodexMcpToolEntries([aithenaTool]);
+    expect(entries.map((entry) => entry.name)).toEqual(['aithena_memory_stats']);
+
+    const prompt = buildCodexMcpPrompt('Check memory stats', [aithenaTool]);
+    expect(prompt).toContain('mcp__kai__aithena_memory_stats');
+
+    const config = buildCodexMcpServerConfig('http://127.0.0.1:12345/mcp', [aithenaTool]);
+    expect(config).toMatchObject({
+      enabled_tools: ['aithena_memory_stats'],
+    });
+  });
+
+  it('does not double-qualify plugin tool names that are already prefixed', () => {
+    const entries = getCodexMcpToolEntries([
+      createTool({
+        name: 'plugin__outlook__outlook_list_emails',
+        originalName: 'outlook_list_emails',
+        sourceId: 'outlook',
+      }),
+    ]);
+
+    expect(entries.map((entry) => entry.name)).toEqual(['outlook_list_emails']);
+  });
+
   it('sanitizes and de-duplicates MCP-facing tool names', () => {
     const entries = getCodexMcpToolEntries([
       createTool({
-        name: 'plugin__unsafe__first',
+        name: 'mcp__unsafe__first',
         originalName: 'unsafe tool name',
+        source: 'mcp',
+        sourceId: 'unsafe',
       }),
       createTool({
-        name: 'plugin__unsafe__second',
+        name: 'mcp__unsafe__second',
         originalName: 'unsafe tool name',
+        source: 'mcp',
+        sourceId: 'unsafe',
       }),
       createTool({
-        name: 'plugin__unsafe__long',
+        name: 'mcp__unsafe__long',
         originalName: 'x'.repeat(80),
+        source: 'mcp',
+        sourceId: 'unsafe',
       }),
     ]);
 
     expect(entries.map((entry) => entry.name)).toEqual([
       'unsafe_tool_name',
-      'plugin__unsafe__second',
+      'mcp__unsafe__second',
       'x'.repeat(54),
     ]);
     expect(entries.every((entry) => /^[a-zA-Z0-9_-]+$/.test(entry.name))).toBe(true);

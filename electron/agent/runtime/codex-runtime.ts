@@ -25,6 +25,7 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import type { ToolDefinition } from '../../tools/types.js';
 
 // ---------------------------------------------------------------------------
 // Capabilities
@@ -61,6 +62,7 @@ type CodexClass = new (options?: {
     modelReasoningEffort?: string;
     approvalPolicy?: string;
     skipGitRepoCheck?: boolean;
+    networkAccessEnabled?: boolean;
   }): ThreadInstance;
   resumeThread(id: string, options?: {
     model?: string;
@@ -69,6 +71,7 @@ type CodexClass = new (options?: {
     modelReasoningEffort?: string;
     approvalPolicy?: string;
     skipGitRepoCheck?: boolean;
+    networkAccessEnabled?: boolean;
   }): ThreadInstance;
 };
 
@@ -115,6 +118,44 @@ type ThreadItemAny = {
   items?: Array<{ text: string; completed: boolean }>;
   message?: string;
 };
+
+export function buildCodexRuntimeConfig(
+  bridgeUrl: string,
+  tools: ToolDefinition[],
+): Record<string, unknown> {
+  return {
+    features: {
+      tool_search_always_defer_mcp_tools: false,
+    },
+    sandbox_workspace_write: {
+      network_access: true,
+    },
+    mcp_servers: {
+      kai: buildCodexMcpServerConfig(bridgeUrl, tools),
+    },
+  };
+}
+
+export function buildCodexThreadOptions(options: {
+  cwd?: string;
+  modelEffort: string;
+  approvalPolicy: string;
+  enableMcpBridgeNetwork: boolean;
+}): {
+  workingDirectory: string;
+  modelReasoningEffort: string;
+  approvalPolicy: string;
+  skipGitRepoCheck: boolean;
+  networkAccessEnabled?: boolean;
+} {
+  return {
+    workingDirectory: options.cwd ?? process.cwd(),
+    modelReasoningEffort: options.modelEffort,
+    approvalPolicy: options.approvalPolicy,
+    skipGitRepoCheck: true,
+    ...(options.enableMcpBridgeNetwork ? { networkAccessEnabled: true } : {}),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Runtime implementation
@@ -224,23 +265,16 @@ export class CodexRuntime implements AgentRuntime {
     const codex = new CodexCtor({
       ...(apiKey ? { apiKey } : {}),
       ...(bridgeUrl ? {
-        config: {
-          features: {
-            tool_search_always_defer_mcp_tools: false,
-          },
-          mcp_servers: {
-            kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? []),
-          },
-        },
+        config: buildCodexRuntimeConfig(bridgeUrl, customTools ?? []),
       } : {}),
     });
 
-    const threadOptions = {
-      workingDirectory: cwd ?? process.cwd(),
-      modelReasoningEffort: modelEffort,
+    const threadOptions = buildCodexThreadOptions({
+      cwd,
+      modelEffort,
       approvalPolicy,
-      skipGitRepoCheck: true,
-    };
+      enableMcpBridgeNetwork: Boolean(bridgeUrl),
+    });
 
     // Resume or start new thread.
     // `codexSdkThreadId` is written to conversation.metadata when the `thread.started`

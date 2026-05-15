@@ -243,6 +243,16 @@ function resolvePluginToolOriginalName(pluginName: string, tool: ToolDefinition)
   return tool.originalName ?? tool.name;
 }
 
+function buildPluginToolAliases(pluginName: string, tool: ToolDefinition, originalName: string): string[] {
+  return Array.from(new Set([
+    ...(tool.aliases ?? []),
+    tool.name,
+    `plugin:${pluginName}:${originalName}`,
+    `${pluginName}_${originalName}`,
+    `${pluginName}-${originalName}`,
+  ]));
+}
+
 function normalizePluginObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
@@ -451,11 +461,7 @@ export function createPluginAPI(
             source: 'plugin' as const,
             sourceId: manifest.name,
             originalName,
-            aliases: Array.from(new Set([
-              ...(tool.aliases ?? []),
-              tool.name,
-              `plugin:${manifest.name}:${originalName}`,
-            ])),
+            aliases: buildPluginToolAliases(manifest.name, tool, originalName),
           };
         });
         const newNames = new Set(prefixed.map((tool) => tool.name));

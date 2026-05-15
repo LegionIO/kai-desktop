@@ -64,9 +64,9 @@ export function getCodexMcpToolEntries(tools: ToolDefinition[]): CodexMcpToolEnt
   const seen = new Set<string>();
 
   for (const tool of tools) {
-    // Prefer originalName (e.g. "rally_list_user_story_tasks") over the scoped
-    // name (e.g. "plugin__rally__rally_list_user_story_tasks") for model use.
-    const preferredName = makeCodexMcpToolName(tool.originalName ?? tool.name);
+    // Prefer originalName (e.g. "list_user_story_tasks") over the scoped
+    // name (e.g. "plugin__rally__list_user_story_tasks") for model use.
+    const preferredName = makeCodexMcpToolName(getCodexMcpPreferredToolName(tool));
     const fallbackName = makeCodexMcpToolName(tool.name);
     const name = seen.has(preferredName)
       ? makeUniqueToolName(fallbackName, seen)
@@ -76,6 +76,25 @@ export function getCodexMcpToolEntries(tools: ToolDefinition[]): CodexMcpToolEnt
   }
 
   return entries;
+}
+
+function getCodexMcpPreferredToolName(tool: ToolDefinition): string {
+  const name = tool.originalName ?? tool.name;
+
+  if (tool.source === 'plugin' && tool.sourceId) {
+    const safeSource = makeSafeToolName(tool.sourceId, 'plugin');
+    const safeName = makeSafeToolName(name);
+    const isAlreadyPluginQualified =
+      safeName === safeSource ||
+      safeName.startsWith(`${safeSource}_`) ||
+      safeName.startsWith(`${safeSource}-`);
+
+    if (!isAlreadyPluginQualified) {
+      return `${safeSource}_${name}`;
+    }
+  }
+
+  return name;
 }
 
 function makeCodexMcpToolName(name: string): string {
@@ -98,17 +117,18 @@ export function buildCodexMcpPrompt(prompt: string, tools: ToolDefinition[]): st
   if (tools.length === 0) return prompt;
 
   const toolLines = getCodexMcpToolEntries(tools)
-    .map(({ name, tool }) => `- mcp__kai__${name}: ${tool.description ?? ''}`.slice(0, 280))
+    .map(({ name, tool }) => `- ${name} (Codex callable: mcp__kai__${name}): ${tool.description ?? ''}`.slice(0, 280))
     .join('\n');
 
   return [
     'Kai has exposed plugin, skill, and MCP tools as Codex-callable MCP tools for this turn.',
-    'When a user asks for an installed plugin such as Rally, call the matching tool name below.',
+    'The MCP server is named "kai"; call the matching tool name below on that server.',
+    'Codex may display these tools as mcp__kai__<tool>, while MCP events use server "kai" and tool "<tool>".',
     'Do not call bare mcp__kai__; that is only the server prefix and is not a tool.',
     'Do not use list_mcp_resources or list_mcp_resource_templates to discover Kai plugin tools; these are tools, not resources.',
-    'If a listed tool is not immediately callable, use tool_search for the exact mcp__kai__ tool name, then call the returned tool.',
+    'If a listed tool is not immediately callable, use tool_search for the exact tool name or mcp__kai__ tool name, then call the returned tool.',
     '',
-    'Available Kai MCP callable tool names:',
+    'Available Kai MCP tools:',
     toolLines,
     '',
     'User request:',
