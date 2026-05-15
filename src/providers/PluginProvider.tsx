@@ -186,6 +186,7 @@ type PluginContextValue = {
   pluginEvents: PluginEventRecord[];
   navigationRequests: PluginNavigationRequestRecord[];
   rendererLoadCount: number;
+  pluginUpdateCount: number;
   getPluginStatus: (pluginName: string) => 'loading' | 'active' | 'error' | 'disabled';
   getPluginError: (pluginName: string) => string | null;
   hasRendererScript: (pluginName: string) => boolean;
@@ -210,6 +211,7 @@ const PluginContext = createContext<PluginContextValue>({
   pluginEvents: [],
   navigationRequests: [],
   rendererLoadCount: 0,
+  pluginUpdateCount: 0,
   getPluginStatus: () => 'disabled',
   getPluginError: () => null,
   hasRendererScript: () => false,
@@ -312,6 +314,7 @@ export function PluginProvider({ children }: { children: ReactNode }) {
   const [pluginEvents, setPluginEvents] = useState<PluginEventRecord[]>([]);
   const [navigationRequests, setNavigationRequests] = useState<PluginNavigationRequestRecord[]>([]);
   const [rendererLoadCount, setRendererLoadCount] = useState(0);
+  const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
   const [rendererStatuses, setRendererStatuses] = useState<Record<string, PluginRendererStatus>>({});
   const [rendererErrors, setRendererErrors] = useState<Record<string, string | null>>({});
   const loadedRenderers = useRef(new Map<string, string>());
@@ -404,12 +407,21 @@ export function PluginProvider({ children }: { children: ReactNode }) {
       }
     });
 
+    // Plugin update count
+    app.plugins.getAvailableUpdateCount()
+      .then((count) => setPluginUpdateCount(count))
+      .catch(() => {});
+    const unsubUpdates = app.plugins.onUpdatesAvailable((data) => {
+      setPluginUpdateCount(data.count);
+    });
+
     return () => {
       unsubUI();
       unsubEvent();
       unsubNavigation();
       unsubCallback();
       unsubNavigateDirect?.();
+      unsubUpdates();
     };
   }, [onRendererLoaded, updateRendererStatus]);
 
@@ -541,6 +553,7 @@ export function PluginProvider({ children }: { children: ReactNode }) {
         pluginEvents,
         navigationRequests,
         rendererLoadCount,
+        pluginUpdateCount,
         getPluginStatus,
         getPluginError,
         hasRendererScript,

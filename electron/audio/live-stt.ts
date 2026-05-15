@@ -36,10 +36,7 @@ export function registerLiveSttHandlers(ipc: IpcMain): void {
     console.log('[LiveSTT]   endpoint=%s', config.endpoint ?? '(none — will use region)');
     console.log('[LiveSTT]   region=%s', config.region ?? '(none)');
     console.log('[LiveSTT]   language=%s', config.language);
-    console.log('[LiveSTT]   subscriptionKey=%s...%s (len=%d)',
-      config.subscriptionKey?.slice(0, 6) ?? '',
-      config.subscriptionKey?.slice(-4) ?? '',
-      config.subscriptionKey?.length ?? 0);
+    console.log('[LiveSTT]   subscriptionKeyConfigured=%s', Boolean(config.subscriptionKey));
 
     if (isRunning) return { error: 'Already running' };
 
@@ -97,12 +94,12 @@ export function registerLiveSttHandlers(ipc: IpcMain): void {
       };
 
       recognizer.canceled = (_sender, e) => {
-        console.log('[LiveSTT] Canceled: reason=%s errorCode=%s details="%s"',
+        console.log('[LiveSTT] Canceled: reason=%s errorCode=%s hasDetails=%s',
           sdk.CancellationReason[e.reason],
           sdk.CancellationErrorCode[e.errorCode],
-          e.errorDetails ?? '(none)');
+          Boolean(e.errorDetails));
         if (e.reason === sdk.CancellationReason.Error) {
-          broadcast('stt:error', e.errorDetails ?? 'Recognition error');
+          broadcast('stt:error', 'Speech recognition failed. Check Audio & Voice settings, microphone access, and network connectivity.');
         }
       };
 

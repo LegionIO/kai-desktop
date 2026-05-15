@@ -34,7 +34,7 @@ import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/ta
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall } from './ipc/auto-update.js';
+import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall, setUpdateHookRunner, consumePostUpdateMarker } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import { bootstrapBundledPlugins, getBrandRequiredPluginNames, getBrandMarketplaceUrls } from './plugins/plugin-bootstrap.js';
@@ -42,7 +42,7 @@ import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
-import { createPaddedDockIcon } from './utils/dock-icon.js';
+import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
 
@@ -283,9 +283,7 @@ const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
 
 function setMacDockIcon(): void {
-  if (!IS_MAC || !app.dock) return;
-  const padded = createPaddedDockIcon(APP_ICON);
-  if (padded) app.dock.setIcon(padded);
+  setPaddedMacDockIcon(APP_ICON);
 }
 
 function restoreMacDockIconAfterRendererIconUpdates(): void {
@@ -643,7 +641,7 @@ if (gotSingleInstanceLock) {
     registerBatchTranscribeHandlers(ipcMain, getConfig);
 
     // Initialize dictation system (global hotkey + STT + text insertion)
-    initDictation(getConfig());
+    initDictation(getConfig(), setConfig);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
     const debugLogDir = join(process.cwd(), 'debug-logs');
@@ -709,6 +707,7 @@ if (gotSingleInstanceLock) {
     );
     registerPluginHandlers(ipcMain, pluginManager);
     pluginManagerRef = pluginManager;
+    setUpdateHookRunner(pluginManager);
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
@@ -1012,6 +1011,22 @@ if (gotSingleInstanceLock) {
 
         await pluginManager.loadAll();
         console.info(`[${__BRAND_PRODUCT_NAME}] ${pluginManager.getPluginCount()} plugins loaded`);
+
+        // Start periodic marketplace catalog refresh for plugin update detection
+        pluginManager.startCatalogRefresh();
+
+        // If this launch follows a successful update, fire post-update hooks
+        // (e.g., revoke admin privileges granted by pre-update hook).
+        const updateMarker = consumePostUpdateMarker();
+        if (updateMarker) {
+          console.info(`[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version}`);
+          pluginManager.runPostUpdateHooks({
+            version: updateMarker.version,
+            success: true,
+          }).catch((err) => {
+            console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
+          });
+        }
       } catch (err) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Plugin loading failed:`, err);
       }
@@ -1041,8 +1056,14 @@ if (gotSingleInstanceLock) {
     });
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow();
+      const allWindows = BrowserWindow.getAllWindows();
+      if (allWindows.length === 0) {
+        const win = createWindow();
+        win.once('ready-to-show', () => {
+          win.show();
+        });
+      } else {
+        focusPrimaryWindow();
       }
     });
   });

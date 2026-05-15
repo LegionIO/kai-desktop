@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
-import { RefreshCwIcon, DownloadIcon, PackageIcon, LoaderIcon, AlertCircleIcon, SearchIcon, XIcon, CheckIcon } from 'lucide-react';
+import { RefreshCwIcon, DownloadIcon, PackageIcon, LoaderIcon, AlertCircleIcon, SearchIcon, XIcon, CheckIcon, ArrowUpCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -18,6 +18,17 @@ type MarketplaceEntry = {
   marketplaceUrl: string;
 };
 
+type MarketplaceTab = 'available' | 'updates';
+
+function isNewerVersion(catalogVersion: string, installedVersion: string): boolean {
+  const toNum = (v: string) => v.split('.').map(Number);
+  const [cMajor = 0, cMinor = 0, cPatch = 0] = toNum(catalogVersion);
+  const [iMajor = 0, iMinor = 0, iPatch = 0] = toNum(installedVersion);
+  if (cMajor !== iMajor) return cMajor > iMajor;
+  if (cMinor !== iMinor) return cMinor > iMinor;
+  return cPatch > iPatch;
+}
+
 // Parse author string like "Name <https://example.com>" into {name, url}
 function parseAuthor(author?: string): { name: string; url?: string } | null {
   if (!author) return null;
@@ -34,6 +45,7 @@ export const PluginMarketplace: FC = () => {
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const searchRef = useRef<HTMLInputElement>(null);
+  const [activeTab, setActiveTab] = useState<MarketplaceTab>('available');
 
   useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
   const [refreshing, setRefreshing] = useState(false);
@@ -103,15 +115,23 @@ export const PluginMarketplace: FC = () => {
   }
 
   const searchLower = searchQuery.toLowerCase();
+
+  const matchesSearch = (entry: MarketplaceEntry) =>
+    !searchLower ||
+    entry.displayName.toLowerCase().includes(searchLower) ||
+    entry.name.toLowerCase().includes(searchLower) ||
+    entry.description.toLowerCase().includes(searchLower) ||
+    entry.tags?.some((tag) => tag.toLowerCase().includes(searchLower));
+
   const availablePlugins = catalog
     .filter((entry) => !entry.installed && !installedNames.has(entry.name))
-    .filter((entry) =>
-      !searchLower ||
-      entry.displayName.toLowerCase().includes(searchLower) ||
-      entry.name.toLowerCase().includes(searchLower) ||
-      entry.description.toLowerCase().includes(searchLower) ||
-      entry.tags?.some((tag) => tag.toLowerCase().includes(searchLower))
-    );
+    .filter(matchesSearch);
+
+  const updatablePlugins = catalog
+    .filter((entry) => (entry.installed || installedNames.has(entry.name)) && entry.installedVersion && isNewerVersion(entry.version, entry.installedVersion))
+    .filter(matchesSearch);
+
+  const updateCount = updatablePlugins.length;
 
   return (
     <div className="relative z-20 flex flex-col h-full min-h-0">
@@ -165,15 +185,41 @@ export const PluginMarketplace: FC = () => {
               </Tooltip>
             </div>
 
+            {/* Tab bar */}
+            <div className="flex items-center gap-1 px-4 py-2 border-b border-border/40">
+              <button
+                type="button"
+                onClick={() => setActiveTab('available')}
+                className={cn(
+                  'rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+                  activeTab === 'available'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                )}
+              >
+                Available
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('updates')}
+                className={cn(
+                  'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+                  activeTab === 'updates'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                )}
+              >
+                Updates
+                {updateCount > 0 && (
+                  <span className="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-bold text-white">
+                    {updateCount}
+                  </span>
+                )}
+              </button>
+            </div>
+
             {/* Content */}
             <div className="p-3 space-y-2">
-
-              {/* Available label */}
-              {availablePlugins.length > 0 && (
-                <p className="px-1 pt-1 pb-0.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-                  Available ({availablePlugins.length})
-                </p>
-              )}
 
             {/* Error banner */}
             {error && (
@@ -190,88 +236,164 @@ export const PluginMarketplace: FC = () => {
               </div>
             )}
 
-            {/* No catalog configured */}
-            {catalog.length === 0 && !error && (
-              <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
-                <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
-                <p className="mt-4 text-sm text-muted-foreground">No marketplace configured</p>
-                <p className="mt-1 text-xs text-muted-foreground/70">
-                  Plugin marketplace URLs can be configured in the branding config.
-                </p>
-              </div>
-            )}
-
-            {/* No search results */}
-            {catalog.length > 0 && availablePlugins.length === 0 && (
-              <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
-                <PackageIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
-                <p className="mt-3 text-sm text-muted-foreground">
-                  {searchQuery
-                    ? `No plugins found matching "${searchQuery}"`
-                    : 'All available plugins are already installed'}
-                </p>
-              </div>
-            )}
-
-            {/* Plugin cards */}
-            {availablePlugins.map((entry) => {
-              const parsedAuthor = parseAuthor(entry.author);
-              return (
-                <div
-                  key={entry.name}
-                  className="flex items-center gap-3 rounded-xl border border-border/70 bg-card px-4 py-3 min-h-[80px]"
-                >
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/50">
-                    <PackageIcon className="h-4 w-4 text-muted-foreground" />
+            {/* ── Available Tab ── */}
+            {activeTab === 'available' && (
+              <>
+                {/* No catalog configured */}
+                {catalog.length === 0 && !error && (
+                  <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
+                    <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
+                    <p className="mt-4 text-sm text-muted-foreground">No marketplace configured</p>
+                    <p className="mt-1 text-xs text-muted-foreground/70">
+                      Plugin marketplace URLs can be configured in the branding config.
+                    </p>
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-semibold">{entry.displayName}</span>
-                      <span className="text-[10px] text-muted-foreground">v{entry.version}</span>
-                      {parsedAuthor && (
-                        <span className="text-[10px] text-muted-foreground">
-                          by{' '}
-                          {parsedAuthor.url ? (
-                            <a
-                              href={parsedAuthor.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-primary hover:underline"
-                            >
-                              {parsedAuthor.name}
-                            </a>
-                          ) : (
-                            parsedAuthor.name
+                )}
+
+                {/* No search results / all installed */}
+                {catalog.length > 0 && availablePlugins.length === 0 && (
+                  <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
+                    <PackageIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
+                    <p className="mt-3 text-sm text-muted-foreground">
+                      {searchQuery
+                        ? `No plugins found matching "${searchQuery}"`
+                        : 'All available plugins are already installed'}
+                    </p>
+                  </div>
+                )}
+
+                {/* Available plugin cards */}
+                {availablePlugins.map((entry) => {
+                  const parsedAuthor = parseAuthor(entry.author);
+                  return (
+                    <div
+                      key={entry.name}
+                      className="flex items-center gap-3 rounded-xl border border-border/70 bg-card px-4 py-3 min-h-[80px]"
+                    >
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/50">
+                        <PackageIcon className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-semibold">{entry.displayName}</span>
+                          <span className="text-[10px] text-muted-foreground">v{entry.version}</span>
+                          {parsedAuthor && (
+                            <span className="text-[10px] text-muted-foreground">
+                              by{' '}
+                              {parsedAuthor.url ? (
+                                <a
+                                  href={parsedAuthor.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-primary hover:underline"
+                                >
+                                  {parsedAuthor.name}
+                                </a>
+                              ) : (
+                                parsedAuthor.name
+                              )}
+                            </span>
                           )}
-                        </span>
-                      )}
-                      {entry.tags && entry.tags.length > 0 && entry.tags.map((tag) => (
-                        <span
-                          key={tag}
-                          className="rounded-full bg-muted/50 px-2 py-0.5 text-[9px] text-muted-foreground"
-                        >
-                          {tag}
-                        </span>
-                      ))}
+                          {entry.tags && entry.tags.length > 0 && entry.tags.map((tag) => (
+                            <span
+                              key={tag}
+                              className="rounded-full bg-muted/50 px-2 py-0.5 text-[9px] text-muted-foreground"
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                        <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleInstall(entry.name)}
+                        disabled={installingPlugins.has(entry.name)}
+                        className="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                      >
+                        {installingPlugins.has(entry.name) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <DownloadIcon className="h-3 w-3" />
+                        )}
+                        {installingPlugins.has(entry.name) ? 'Installing…' : 'Install'}
+                      </button>
                     </div>
-                    <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
+                  );
+                })}
+              </>
+            )}
+
+            {/* ── Updates Tab ── */}
+            {activeTab === 'updates' && (
+              <>
+                {updatablePlugins.length === 0 && (
+                  <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
+                    <CheckIcon className="mx-auto h-8 w-8 text-green-400/60" />
+                    <p className="mt-3 text-sm text-muted-foreground">
+                      {searchQuery
+                        ? `No updates found matching "${searchQuery}"`
+                        : 'All plugins are up to date'}
+                    </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => void handleInstall(entry.name)}
-                    disabled={installingPlugins.has(entry.name)}
-                    className="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-                  >
-                    {installingPlugins.has(entry.name) ? (
-                      <LoaderIcon className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <DownloadIcon className="h-3 w-3" />
-                    )}
-                    {installingPlugins.has(entry.name) ? 'Installing…' : 'Install'}
-                  </button>
-                </div>
-              );
-            })}
+                )}
+
+                {updatablePlugins.map((entry) => {
+                  const parsedAuthor = parseAuthor(entry.author);
+                  return (
+                    <div
+                      key={entry.name}
+                      className="flex items-center gap-3 rounded-xl border border-blue-500/30 bg-blue-500/5 px-4 py-3 min-h-[80px]"
+                    >
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/10">
+                        <ArrowUpCircleIcon className="h-4 w-4 text-blue-400" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-semibold">{entry.displayName}</span>
+                          <span className="flex items-center gap-1 text-[10px]">
+                            <span className="text-muted-foreground">v{entry.installedVersion}</span>
+                            <span className="text-muted-foreground/60">→</span>
+                            <span className="font-medium text-blue-400">v{entry.version}</span>
+                          </span>
+                          {parsedAuthor && (
+                            <span className="text-[10px] text-muted-foreground">
+                              by{' '}
+                              {parsedAuthor.url ? (
+                                <a
+                                  href={parsedAuthor.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-primary hover:underline"
+                                >
+                                  {parsedAuthor.name}
+                                </a>
+                              ) : (
+                                parsedAuthor.name
+                              )}
+                            </span>
+                          )}
+                        </div>
+                        <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleInstall(entry.name)}
+                        disabled={installingPlugins.has(entry.name)}
+                        className="flex shrink-0 items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
+                      >
+                        {installingPlugins.has(entry.name) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <ArrowUpCircleIcon className="h-3 w-3" />
+                        )}
+                        {installingPlugins.has(entry.name) ? 'Updating…' : 'Update'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </>
+            )}
 
             </div>{/* end content */}
           </div>{/* end glass card */}

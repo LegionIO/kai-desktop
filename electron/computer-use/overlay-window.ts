@@ -1,34 +1,15 @@
-import { app, BrowserWindow, ipcMain, screen } from 'electron';
+import { BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
 import type { ComputerDisplayLayout, ComputerOverlayState } from '../../shared/computer-use.js';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
-import { createPaddedDockIcon } from '../utils/dock-icon.js';
+import { showMacDockWithPaddedIcon } from '../utils/dock-icon.js';
 
 // Resolve the app icon once — same path as electron/main.ts
 const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 
 /** Ensure the app dock icon stays visible on macOS with the correct custom icon. */
 function ensureDockVisible(): void {
-  try {
-    const dock = process.platform === 'darwin' ? app.dock : undefined;
-    if (!dock) return;
-
-    const icon = createPaddedDockIcon(APP_ICON);
-
-    // Set icon before show() in case show() reads the current icon
-    if (icon) dock.setIcon(icon);
-
-    void dock.show().then(() => {
-      // dock.show() can reset the icon — re-apply after a short delay
-      // to ensure it sticks after the macOS dock animation completes
-      if (icon) dock.setIcon(icon);
-      setTimeout(() => {
-        if (icon) dock.setIcon(icon);
-      }, 200);
-    });
-  } catch {
-    // Dock API may not be available in all environments
-  }
+  showMacDockWithPaddedIcon(APP_ICON);
 }
 
 // IPC handler for overlay mouse region toggling.

@@ -508,6 +508,7 @@ function AppShell() {
     sendAction: sendPluginAction,
     consumeNavigationRequest,
     navigationRequests,
+    pluginUpdateCount,
   } = usePlugins();
 
   // ── Workspace state (derived from config) ──────────────────────────────
@@ -1539,6 +1540,7 @@ function AppShell() {
                 }}
                 settingsActive={activeView === SETTINGS_VIEW}
                 onSettingsClick={() => { void handleSettingsToggle(); }}
+                pluginUpdateCount={pluginUpdateCount}
               />
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                 <ContentPanel

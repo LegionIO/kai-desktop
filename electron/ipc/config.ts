@@ -116,6 +116,7 @@ function getDefaultConfig() {
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
+    pluginSystem: { compatibilityMode: 'warn' as const },
     marketplace: {
       installedPlugins: {} as Record<string, { name: string; repository: string; version: string; fileHash?: string; permissions?: string[]; installedAt: string; marketplaceUrl: string }>,
     },
@@ -123,7 +124,7 @@ function getDefaultConfig() {
     ui: {
       theme: 'system' as const,
       sidebarWidth: 280,
-      fullWidthContent: false,
+      fullWidthContent: true,
       splashBackground: 'random' as const,
       workspaces: [] as Array<{
         id: string;
@@ -227,7 +228,13 @@ function getDefaultConfig() {
       mode: 'toggle' as const,
       inputDeviceId: null as string | null,
       language: undefined as string | undefined,
+      vadSilenceDurationMs: 850,
+      finalCleanupEnabled: false,
       livePartials: false,
+      partialTyping: {
+        ax: 'disabled' as const,
+        kb: 'disabled' as const,
+      },
     },
     advanced: {
       temperature: 0.4,
@@ -726,6 +733,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     titleGeneration: config.titleGeneration,
     plugins: config.plugins,
     pluginApprovals: config.pluginApprovals,
+    pluginSystem: config.pluginSystem,
     marketplace: config.marketplace,
     launchAtLogin: config.launchAtLogin,
     ui: config.ui,

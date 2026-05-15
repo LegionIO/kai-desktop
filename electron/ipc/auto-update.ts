@@ -2,11 +2,8 @@ import { app, dialog, type IpcMain } from 'electron';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import { existsSync, mkdtempSync, rmSync, readdirSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname, basename } from 'path';
+import { existsSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { join } from 'path';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
@@ -53,188 +50,87 @@ function broadcast(status: UpdateStatus): void {
   broadcastToAllWindows('auto-update:status', status);
 }
 
-const execFileAsync = promisify(execFile);
+/* ── Plugin Lifecycle Hook Runner ── */
 
-/**
- * Escape a string for safe interpolation inside a POSIX single-quoted shell argument.
- * Single quotes cannot appear inside single-quoted strings, so we close the quote,
- * insert an escaped quote, then reopen the quote: ' → '\''
- */
-function shellEscape(s: string): string {
-  return s.replace(/'/g, "'\\''");
+export type UpdateHookRunner = {
+  runPreUpdateHooks: (args: { version: string; artifactPath: string }) => Promise<{ abort?: boolean; abortReason?: string }>;
+  runPostUpdateHooks: (args: { version: string; success: boolean }) => Promise<void>;
+};
+
+let hookRunner: UpdateHookRunner | null = null;
+
+export function setUpdateHookRunner(runner: UpdateHookRunner): void {
+  hookRunner = runner;
 }
 
-/**
- * Locate the staged update artifact on disk.
- *
- * Preferred source: the `downloadedFile` path captured from the
- * `update-downloaded` event — that is the exact, authoritative path
- * electron-updater wrote the artifact to.
- *
- * Fallback: scan both possible cache directories for a .zip artifact.
- * electron-updater places pending artifacts under
- * `~/Library/Caches/<updaterCacheDirName>/pending/`, where
- * `updaterCacheDirName` comes from `app-update.yml` (for this app,
- * "kai-updater"). Older assumptions pointed at `app.getName()` ("Kai")
- * with a hardcoded `update.zip` filename — both of which are wrong on a
- * real notarized build, which is why Install Update was silently failing.
- * We try the correct path first, then the legacy guess, before giving up.
- */
-function resolveDownloadedUpdatePath(): string | null {
-  if (downloadedFilePath && existsSync(downloadedFilePath)) {
-    return downloadedFilePath;
-  }
+/* ── Post-Update Marker ── */
 
-  const homedir = app.getPath('home');
-  const candidateDirs = [
-    // Correct location per app-update.yml (updaterCacheDirName: kai-updater).
-    join(homedir, 'Library', 'Caches', 'kai-updater', 'pending'),
-    // Legacy guess we used to hardcode — kept only as a last-ditch fallback.
-    join(homedir, 'Library', 'Caches', app.getName(), 'pending'),
-  ];
+const POST_UPDATE_MARKER = join(app.getPath('userData'), '.update-completed');
 
-  for (const dir of candidateDirs) {
-    if (!existsSync(dir)) continue;
-    try {
-      const entries = readdirSync(dir);
-      // Prefer the real release artifact (e.g. "Kai-1.0.68-arm64.zip");
-      // fall back to the old hardcoded filename if present.
-      const zips = entries.filter((e) => e.endsWith('.zip'));
-      const preferred = zips.find((e) => e !== 'update.zip') ?? zips.find((e) => e === 'update.zip');
-      if (preferred) return join(dir, preferred);
-    } catch {
-      /* ignore and try next candidate */
-    }
-  }
-
-  return null;
-}
-
-/**
- * Attempt to install the downloaded update by manually extracting the zip
- * and replacing the app bundle via osascript with administrator privileges.
- *
- * On macOS, writing to /Applications requires admin authorization. Rather than
- * using Squirrel's fire-and-forget quitAndInstall (which quits the app before
- * the user can enter their password), we trigger the admin prompt ourselves
- * via osascript. This blocks until the user authorizes or cancels, giving us
- * definitive success/failure feedback.
- *
- * Returns true if install succeeded, false if user cancelled or it failed.
- */
-async function attemptInstall(): Promise<boolean> {
-  // Resolve the current .app bundle path
-  // app.getPath('exe') returns something like /Applications/Kai.app/Contents/MacOS/Kai
-  const exePath = app.getPath('exe');
-  const appPath = exePath.replace(/\/Contents\/MacOS\/.*$/, '');
-  const appName = basename(appPath); // e.g. "Kai.app"
-  const appDir = dirname(appPath); // e.g. "/Applications"
-
-  const zipPath = resolveDownloadedUpdatePath();
-  if (!zipPath) {
-    console.error('[auto-update] Cannot find downloaded update artifact. Checked downloadedFile event payload and both ~/Library/Caches/kai-updater/pending/ and ~/Library/Caches/Kai/pending/.');
-    return false;
-  }
-  console.info('[auto-update] Installing from artifact:', zipPath);
-
-  // Create a temp directory for extraction
-  const tempDir = mkdtempSync(join(tmpdir(), 'kai-update-'));
-
+function writePostUpdateMarker(version: string): void {
   try {
-    // Extract the zip
-    await execFileAsync('ditto', ['-xk', zipPath, tempDir]);
+    writeFileSync(POST_UPDATE_MARKER, JSON.stringify({
+      version,
+      fromVersion: app.getVersion(),
+      timestamp: Date.now(),
+    }));
+  } catch { /* non-fatal */ }
+}
 
-    // Find the .app bundle in the extracted contents
-    // It should match the current app name, but also handle slight variations
-    let extractedApp = join(tempDir, appName);
-    if (!existsSync(extractedApp)) {
-      // Search for any .app bundle in the extracted directory
-      const entries = readdirSync(tempDir).filter(e => e.endsWith('.app'));
-      if (entries.length === 1) {
-        extractedApp = join(tempDir, entries[0]);
-      } else {
-        console.error('[auto-update] Could not find .app bundle in extracted update. Found:', entries);
-        return false;
-      }
-    }
-
-    // Use osascript to replace the app with admin privileges.
-    // This triggers the macOS password prompt and BLOCKS until the user responds.
-    // Strategy: rename current app to .old backup, move new app in, delete backup on success.
-    // If the move fails, attempt to restore from backup.
-    const script = [
-      `do shell script "`,
-      // Rename current app to backup
-      `mv '${shellEscape(appDir)}/${shellEscape(appName)}' '${shellEscape(appDir)}/${shellEscape(appName)}.old' && `,
-      // Move new app into place
-      `mv '${shellEscape(extractedApp)}' '${shellEscape(appDir)}/${shellEscape(appName)}' && `,
-      // Remove backup on success
-      `rm -rf '${shellEscape(appDir)}/${shellEscape(appName)}.old'`,
-      `" with administrator privileges`,
-    ].join('');
-
-    await execFileAsync('osascript', ['-e', script]);
-
-    // If we get here, install succeeded
-    console.info('[auto-update] Install succeeded via manual osascript approach');
-    return true;
-  } catch (err: unknown) {
-    const error = err as { code?: number; killed?: boolean; stderr?: string; message?: string };
-    // osascript exits with code 1 and stderr containing "User canceled" when user clicks Cancel
-    const msg = error.stderr || error.message || '';
-    if (msg.includes('User canceled') || msg.includes('user canceled')) {
-      console.info('[auto-update] User cancelled admin authorization — will retry when ready');
-    } else {
-      console.error('[auto-update] Install failed:', msg);
-      // Attempt to restore from backup if it exists
-      const backupPath = join(appDir, `${appName}.old`);
-      if (existsSync(backupPath) && !existsSync(join(appDir, appName))) {
-        try {
-          await execFileAsync('osascript', [
-            '-e',
-            `do shell script "mv '${shellEscape(backupPath)}' '${shellEscape(appDir)}/${shellEscape(appName)}'" with administrator privileges`,
-          ]);
-          console.info('[auto-update] Restored app from backup after failed install');
-        } catch {
-          console.error('[auto-update] Could not restore backup — user may need to reinstall from DMG');
-        }
-      }
-    }
-    return false;
-  } finally {
-    // Cleanup temp directory
-    try {
-      rmSync(tempDir, { recursive: true, force: true });
-    } catch { /* ignore cleanup errors */ }
+/**
+ * Consume the post-update marker file written before quitAndInstall().
+ * Returns the update metadata if a marker existed, null otherwise.
+ * Deletes the marker after reading.
+ */
+export function consumePostUpdateMarker(): { version: string; fromVersion: string } | null {
+  try {
+    if (!existsSync(POST_UPDATE_MARKER)) return null;
+    const data = JSON.parse(readFileSync(POST_UPDATE_MARKER, 'utf-8'));
+    unlinkSync(POST_UPDATE_MARKER);
+    return data;
+  } catch {
+    try { unlinkSync(POST_UPDATE_MARKER); } catch { /* */ }
+    return null;
   }
 }
 
 /**
- * Attempt to install the update, keeping the app running until we get
- * definitive success/failure feedback.
+ * Install the downloaded update.
  *
- * On success: relaunches the app on the new version.
- * On failure: returns to 'downloaded' state so the user can retry
- * (e.g. after enabling admin privileges via their corporate tool).
+ * Flow:
+ * 1. Run pre-update hooks (e.g., elevate to admin via Privileges.app)
+ * 2. Write a marker file so post-update hooks fire after relaunch
+ * 3. Delegate to autoUpdater.quitAndInstall() (Squirrel.Mac handles
+ *    extract + replace + relaunch atomically)
  */
 export async function performQuitAndInstall(): Promise<void> {
-  broadcast({ state: 'installing', version: downloadedVersion });
-
-  const success = await attemptInstall();
-
-  if (success) {
-    broadcast({ state: 'restarting', version: downloadedVersion });
-    // Disable autoInstallOnAppQuit since we already installed manually —
-    // prevents Squirrel from trying to install again during the quit/relaunch.
-    autoUpdater.autoInstallOnAppQuit = false;
-    setTimeout(() => {
-      app.relaunch();
-      app.exit(0);
-    }, 300);
-  } else {
-    // Install failed or was cancelled — return to downloaded state so user can retry
-    broadcast({ state: 'downloaded', version: downloadedVersion });
+  // Run pre-update hooks (e.g., elevate to admin)
+  if (hookRunner) {
+    broadcast({ state: 'preparing', version: downloadedVersion });
+    try {
+      const result = await hookRunner.runPreUpdateHooks({
+        version: downloadedVersion ?? 'unknown',
+        artifactPath: downloadedFilePath ?? '',
+      });
+      if (result.abort) {
+        console.info('[auto-update] Pre-update hook aborted install:', result.abortReason ?? '(no reason)');
+        broadcast({ state: 'downloaded', version: downloadedVersion });
+        return;
+      }
+    } catch (err) {
+      console.error('[auto-update] Pre-update hooks threw, aborting install:', err);
+      broadcast({ state: 'downloaded', version: downloadedVersion });
+      return;
+    }
   }
+
+  // Write marker so post-update hooks fire after relaunch
+  writePostUpdateMarker(downloadedVersion ?? 'unknown');
+
+  broadcast({ state: 'restarting', version: downloadedVersion });
+
+  // Let Squirrel.Mac handle extract + replace + relaunch
+  autoUpdater.quitAndInstall(false, true);
 }
 
 /**
@@ -326,7 +222,7 @@ export function registerAutoUpdateHandlers(
   onUpdateDownloaded?: () => void,
 ): void {
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
 
   autoUpdater.on('checking-for-update', () => {
@@ -355,8 +251,7 @@ export function registerAutoUpdateHandlers(
     downloaded = true;
     downloadedVersion = info.version;
     // electron-updater sets `downloadedFile` to the absolute path of the
-    // staged artifact. Capture it so attemptInstall() can use it directly
-    // instead of guessing the cache location + filename.
+    // staged artifact. Capture it so pre-update hooks can reference the path.
     const maybeFile = (info as { downloadedFile?: unknown }).downloadedFile;
     if (typeof maybeFile === 'string' && maybeFile.length > 0) {
       downloadedFilePath = maybeFile;

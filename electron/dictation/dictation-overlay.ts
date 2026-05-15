@@ -7,14 +7,22 @@
  * Key behavior: The overlay must be clickable (for stop/expand/device picker)
  * but must NOT steal focus from the user's active app. We achieve this by:
  * - Setting `focusable: false` on the BrowserWindow
- * - Using `setIgnoreMouseEvents(true, { forward: true })` as default
- * - The renderer detects mouseenter/mouseleave and toggles mouse acceptance
- *   via IPC so that clicks work when hovering but don't interfere otherwise
+ * - Resetting mouse acceptance every time the hidden window is shown
+ * - The renderer detects mouseenter/mouseleave and keeps click-through state
+ *   in sync while the overlay is visible.
  */
 
 import { BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
 import { applyBrandUserAgent } from '../utils/user-agent.js';
+import { setPaddedMacDockIcon } from '../utils/dock-icon.js';
+import {
+  beginDictationFocusSession,
+  refreshDictationTargetFocus,
+  restoreDictationTargetFocusSoon,
+} from './focus-preserver.js';
+
+const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 
 let overlayWindow: BrowserWindow | null = null;
 let ipcRegistered = false;
@@ -26,9 +34,12 @@ function ensureIpcHandlers(): void {
   // Toggle mouse events — renderer sends this on mouseenter/mouseleave
   ipcMain.on('dictation:overlay-set-interactive', (event, interactive: boolean) => {
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
     if (interactive) {
+      refreshDictationTargetFocus();
+      win.setFocusable(false);
       win.setIgnoreMouseEvents(false);
+      win.setFocusable(false);
     } else {
       win.setIgnoreMouseEvents(true, { forward: true });
     }
@@ -37,9 +48,16 @@ function ensureIpcHandlers(): void {
   // Resize request from renderer (e.g., when device picker expands)
   ipcMain.on('dictation:overlay-resize', (event, height: number) => {
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
     const bounds = win.getBounds();
     win.setBounds({ ...bounds, height: Math.max(52, Math.min(height, 400)) });
+    restoreDictationTargetFocusSoon();
+  });
+
+  ipcMain.on('dictation:overlay-restore-focus', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win !== overlayWindow) return;
+    restoreDictationTargetFocusSoon();
   });
 }
 
@@ -54,10 +72,10 @@ export function createDictationOverlay(): void {
   const primaryDisplay = screen.getPrimaryDisplay();
   const workArea = primaryDisplay.workArea;
 
-  // Position: top-right, 8px below work area top (below menu bar), 16px from right
+  // Position: top-center, 8px below work area top (below menu bar)
   const width = 280;
   const height = 52;
-  const x = workArea.x + workArea.width - width - 16;
+  const x = workArea.x + Math.round((workArea.width - width) / 2);
   const y = workArea.y + 8;
 
   overlayWindow = new BrowserWindow({
@@ -65,8 +83,15 @@ export function createDictationOverlay(): void {
     height,
     x,
     y,
+    type: 'panel',
     frame: false,
     transparent: true,
+    backgroundColor: '#00000000',
+    // macOS panels can keep a hidden titlebar hit region when native rounded
+    // corners are enabled. That region activates Kai on click, which briefly
+    // raises the main window. CSS supplies the bubble rounding instead.
+    roundedCorners: false,
+    acceptFirstMouse: true,
     alwaysOnTop: true,
     skipTaskbar: true,
     focusable: false,
@@ -83,9 +108,14 @@ export function createDictationOverlay(): void {
   });
 
   overlayWindow.setAlwaysOnTop(true, 'floating');
-  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.setVisibleOnAllWorkspaces(true, {
+    visibleOnFullScreen: true,
+    skipTransformProcessType: true,
+  });
 
-  // Start with click-through — renderer will toggle on hover
+  // Hidden windows start click-through. showDictationOverlay() makes the reused
+  // window interactive again before showing, because the renderer may not emit a
+  // new mouseenter if the window was hidden while hovered.
   overlayWindow.setIgnoreMouseEvents(true, { forward: true });
 
   // Apply brand user agent
@@ -97,19 +127,33 @@ export function createDictationOverlay(): void {
   overlayWindow.on('closed', () => {
     overlayWindow = null;
   });
+
+  // Safety: if the overlay ever receives focus (shouldn't with focusable:false),
+  // immediately restore focus to the user's target app. We avoid calling blur()
+  // here because that activates the Electron app (bringing the main window
+  // forward briefly) before the AppleScript focus-restore can fire.
+  overlayWindow.on('focus', () => {
+    restoreDictationTargetFocusSoon();
+  });
 }
 
 /**
  * Show the overlay (dictation started).
  */
-export function showDictationOverlay(): void {
+export async function showDictationOverlay(): Promise<void> {
+  await beginDictationFocusSession();
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     createDictationOverlay();
   }
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     // Reposition in case display changed
     repositionOverlay();
+    setPaddedMacDockIcon(APP_ICON);
+    overlayWindow.setFocusable(false);
+    overlayWindow.setIgnoreMouseEvents(false);
+    overlayWindow.setFocusable(false);
     overlayWindow.showInactive();
+    restoreDictationTargetFocusSoon();
   }
 }
 
@@ -118,7 +162,9 @@ export function showDictationOverlay(): void {
  */
 export function hideDictationOverlay(): void {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.setIgnoreMouseEvents(true, { forward: true });
     overlayWindow.hide();
+    restoreDictationTargetFocusSoon();
   }
 }
 
@@ -162,7 +208,7 @@ function repositionOverlay(): void {
   const workArea = primaryDisplay.workArea;
   const bounds = overlayWindow.getBounds();
 
-  const x = workArea.x + workArea.width - bounds.width - 16;
+  const x = workArea.x + Math.round((workArea.width - bounds.width) / 2);
   const y = workArea.y + 8;
 
   overlayWindow.setPosition(x, y);

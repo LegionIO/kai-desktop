@@ -5,6 +5,8 @@ import { net } from 'electron';
 import type { AppConfig } from '../config/schema.js';
 import { arePermissionSetsEqual, getPluginIntegrity, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 import type { PluginIntegrity } from './plugin-integrity.js';
+import { checkPluginCompatibility } from './plugin-compat.js';
+import type { CompatCheckResult } from './plugin-compat.js';
 
 /* ── Marketplace JSON types ── */
 
@@ -19,6 +21,10 @@ export type MarketplacePluginEntry = {
   author?: string;
   tags?: string[];
   icon?: string;
+  /** npm-style semver range constraint on the host plugin API version. */
+  engines?: { kai?: string };
+  /** Host capabilities this plugin requires. */
+  capabilities?: string[];
 };
 
 export type MarketplaceCatalog = {
@@ -246,6 +252,24 @@ export class MarketplaceService {
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
       throw err;
     }
+  }
+
+  /**
+   * Pre-check whether a marketplace entry is compatible with this host
+   * before downloading/installing. Returns the compat result so the UI
+   * can warn the user.
+   */
+  checkEntryCompatibility(entry: MarketplaceCatalogEntry): CompatCheckResult {
+    // Build a synthetic partial manifest from marketplace entry metadata
+    return checkPluginCompatibility({
+      name: entry.name,
+      displayName: entry.displayName,
+      version: entry.version,
+      description: entry.description,
+      permissions: [],
+      engines: entry.engines,
+      capabilities: entry.capabilities,
+    });
   }
 
   /* ── Plugin uninstall ── */

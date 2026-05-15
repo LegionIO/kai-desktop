@@ -125,6 +125,8 @@ type AppAPI = {
       marketplaceUrl: string;
     }>>;
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
+    getAvailableUpdateCount: () => Promise<number>;
+    onUpdatesAvailable: (callback: (data: { count: number }) => void) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;
     onNavigateDirect: (callback: (data: unknown) => void) => () => void;
@@ -283,18 +285,30 @@ type AppAPI = {
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
   onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
   dictation: {
-    toggle: () => Promise<{ state: string; elapsed: number }>;
-    stop: () => Promise<{ state: string; elapsed: number }>;
-    getState: () => Promise<{ state: string; elapsed: number }>;
+    toggle: () => Promise<DictationRuntimeState>;
+    stop: () => Promise<DictationRuntimeState>;
+    getState: () => Promise<DictationRuntimeState>;
+    getTypingMode: () => Promise<string>;
     setDevice: (deviceId: string) => Promise<{ ok: boolean }>;
+    suspendHotkey: () => Promise<{ ok: boolean }>;
+    resumeHotkey: () => Promise<{ ok: boolean }>;
     setOverlayInteractive: (interactive: boolean) => void;
     resizeOverlay: (height: number) => void;
-    onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => () => void;
+    restoreOverlayFocus: () => void;
+    onStateChange: (callback: (state: DictationRuntimeState) => void) => () => void;
     onLevel: (callback: (level: number) => void) => () => void;
     onPartial: (callback: (text: string) => void) => () => void;
     onFinal: (callback: (text: string) => void) => () => void;
     onError: (callback: (message: string) => void) => () => void;
+    onTypingMode: (callback: (mode: string) => void) => () => void;
   };
+};
+
+type DictationRuntimeState = {
+  state: string;
+  elapsed: number;
+  hotkeyRegistered?: boolean;
+  hotkeyError?: string | null;
 };
 
 declare global {

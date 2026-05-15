@@ -68,6 +68,10 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return catalog;
   });
 
+  ipcMain.handle('plugin:available-update-count', () => {
+    return pluginManager.getAvailableUpdateCount();
+  });
+
   // ── Permission Consent ──
 
   ipcMain.handle('plugin:approve-consent', async (_event, pluginName: string) => {

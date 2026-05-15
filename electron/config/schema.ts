@@ -19,6 +19,8 @@ const computerUseApprovalModeSchema = z.enum(['step', 'goal', 'autonomous']);
 
 const computerUseToolSurfaceSchema = z.enum(['both', 'only-calls', 'only-chat', 'none']);
 
+const partialTypingStrategySchema = z.enum(['disabled', 'full-replacement', 'ax-verified', 'tail-only', 'full-patch']);
+
 const providerSchema = z.object({
   type: z.enum(['openai-compatible', 'anthropic', 'amazon-bedrock', 'google']),
   enabled: z.boolean().optional(),
@@ -375,6 +377,11 @@ const marketplaceConfigSchema = z.object({
   installedPlugins: z.record(z.string(), marketplaceInstalledPluginSchema),
 });
 
+const pluginSystemSchema = z.object({
+  /** Controls behavior when a plugin's version/capability constraints don't match the host. */
+  compatibilityMode: z.enum(['strict', 'warn']).default('warn'),
+}).default({ compatibilityMode: 'warn' });
+
 const cliToolSchema = z.object({
   name: z.string(),
   binary: z.string(),
@@ -488,12 +495,13 @@ export const appConfigSchema = z.object({
   titleGeneration: titleGenerationConfigSchema.optional(),
   plugins: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   pluginApprovals: z.record(z.string(), pluginApprovalSchema),
+  pluginSystem: pluginSystemSchema,
   marketplace: marketplaceConfigSchema.optional(),
   launchAtLogin: z.boolean(),
   ui: z.object({
     theme: z.enum(['light', 'dark', 'system']),
     sidebarWidth: z.number().positive(),
-    fullWidthContent: z.boolean().default(false),
+    fullWidthContent: z.boolean().default(true),
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
@@ -511,7 +519,13 @@ export const appConfigSchema = z.object({
     mode: z.enum(['toggle', 'hold']),
     inputDeviceId: z.string().nullable().optional(),
     language: z.string().optional(),
+    vadSilenceDurationMs: z.number().min(300).max(5000).optional(),
+    finalCleanupEnabled: z.boolean().optional(),
     livePartials: z.boolean().optional(),
+    partialTyping: z.object({
+      ax: partialTypingStrategySchema.optional(),
+      kb: partialTypingStrategySchema.optional(),
+    }).optional(),
   }).optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

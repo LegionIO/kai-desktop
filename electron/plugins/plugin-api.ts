@@ -30,6 +30,8 @@ import type {
   PluginHttpResponse,
   PreSendHook,
   PostReceiveHook,
+  PreUpdateHook,
+  PostUpdateHook,
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
@@ -52,6 +54,7 @@ import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
@@ -178,7 +181,7 @@ function configureSessionCookiePromotion(
       path: cookie.path,
       secure: cookie.secure,
       httpOnly: cookie.httpOnly,
-      sameSite: cookie.sameSite as any,
+      sameSite: cookie.sameSite,
       expirationDate,
     }).catch(() => { /* best-effort — ignore failures */ });
   });
@@ -374,6 +377,12 @@ export function createPluginAPI(
     pluginName: manifest.name,
     pluginDir: instance.dir,
 
+    host: {
+      apiVersion: () => getHostPluginApiVersion(),
+      capabilities: () => getHostCapabilities(),
+      hasCapability: (cap: string) => getHostCapabilities().includes(cap),
+    },
+
     config: {
       get: () => {
         requirePermission('config:read');
@@ -489,6 +498,18 @@ export function createPluginAPI(
       registerPostReceiveHook: (hook: PostReceiveHook) => {
         requirePermission('messages:hook');
         instance.postReceiveHooks.push(hook);
+      },
+    },
+
+    lifecycle: {
+      registerPreUpdateHook: (hook: PreUpdateHook) => {
+        requirePermission('lifecycle:hook');
+        instance.preUpdateHooks.push(hook);
+      },
+
+      registerPostUpdateHook: (hook: PostUpdateHook) => {
+        requirePermission('lifecycle:hook');
+        instance.postUpdateHooks.push(hook);
       },
     },
 

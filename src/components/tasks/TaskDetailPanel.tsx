@@ -64,7 +64,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     task.terminalSessionId ?? null,
   );
   const [isStartingAgent, setIsStartingAgent] = useState(false);
-  const [selectedRuntime, setSelectedRuntime] = useState<string>(task.agentRuntime ?? 'claude-code');
+  const selectedRuntime = task.agentRuntime ?? 'claude-code';
 
   // ── Tab state ─────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');

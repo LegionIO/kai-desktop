@@ -39,8 +39,9 @@ const IconRailButton: FC<{
   label: string;
   isActive: boolean;
   dimmed?: boolean;
+  badge?: boolean;
   onClick: () => void;
-}> = ({ icon: Icon, label, isActive, dimmed, onClick }) => (
+}> = ({ icon: Icon, label, isActive, dimmed, badge, onClick }) => (
   <Tooltip
     content={label}
     side="right"
@@ -50,7 +51,7 @@ const IconRailButton: FC<{
       type="button"
       onClick={onClick}
       className={cn(
-        'flex h-8 w-8 items-center justify-center rounded-lg transition-colors',
+        'relative flex h-8 w-8 items-center justify-center rounded-lg transition-colors',
         isActive
           ? 'bg-[var(--brand-accent)]/20 text-[var(--brand-accent)] shadow-[inset_0_1px_2px_rgba(0,0,0,0.15)]'
           : dimmed
@@ -59,6 +60,9 @@ const IconRailButton: FC<{
       )}
     >
       <Icon size={17} strokeWidth={1.8} />
+      {badge && (
+        <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-blue-500" />
+      )}
     </button>
   </Tooltip>
 );
@@ -76,9 +80,11 @@ interface IconRailProps {
   onSettingsClick?: () => void;
   /** Theme toggle button config */
   themeButton?: ThemeButtonProps;
+  /** Number of available plugin updates (shows badge dot when > 0) */
+  pluginUpdateCount?: number;
 }
 
-export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, settingsActive, onSettingsClick, themeButton }) => (
+export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, settingsActive, onSettingsClick, themeButton, pluginUpdateCount }) => (
   <div className="flex w-[38px] shrink-0 flex-col items-center border-r border-sidebar-border/50 py-2 gap-0.5">
     {SCOPED_TABS.map((tab) => (
       <IconRailButton
@@ -98,6 +104,7 @@ export const IconRail: FC<IconRailProps> = ({ activeTab, onSelectTab, dimmed, se
         label={tab.label}
         isActive={activeTab === tab.id}
         dimmed={dimmed}
+        badge={tab.id === 'plugins' && (pluginUpdateCount ?? 0) > 0}
         onClick={() => onSelectTab(tab.id)}
       />
     ))}

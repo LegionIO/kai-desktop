@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback, type FC } from 'react';
-import { MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
+import { AlertTriangleIcon, MicIcon, SquareIcon, ChevronDownIcon, ChevronUpIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 export const DictationOverlay: FC = () => {
@@ -18,7 +18,19 @@ export const DictationOverlay: FC = () => {
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const [typingMode, setTypingMode] = useState<string>('idle');
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const errorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // The normal app shell paints body with bg-background. In this transparent
+  // overlay window that becomes a square backdrop unless we clear it.
+  useEffect(() => {
+    document.documentElement.style.background = 'transparent';
+    document.body.style.background = 'transparent';
+    document.body.style.backgroundColor = 'transparent';
+    document.body.style.backgroundImage = 'none';
+    document.getElementById('root')?.style.setProperty('background', 'transparent');
+  }, []);
 
   // Subscribe to dictation events
   useEffect(() => {
@@ -36,9 +48,19 @@ export const DictationOverlay: FC = () => {
       setPartialText('');
     });
     const unsubError = app.dictation.onError((msg) => {
+      if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
       setError(msg);
-      setTimeout(() => setError(null), 5000);
+      errorTimeoutRef.current = setTimeout(() => {
+        setError(null);
+        errorTimeoutRef.current = null;
+      }, 5000);
     });
+    const unsubMode = app.dictation.onTypingMode((mode) => {
+      setTypingMode(mode);
+    });
+
+    // Fetch initial typing mode (may have been broadcast before we mounted)
+    app.dictation.getTypingMode().then((mode) => setTypingMode(mode)).catch(() => {});
 
     return () => {
       unsubState();
@@ -46,6 +68,11 @@ export const DictationOverlay: FC = () => {
       unsubPartial();
       unsubFinal();
       unsubError();
+      unsubMode();
+      if (errorTimeoutRef.current) {
+        clearTimeout(errorTimeoutRef.current);
+        errorTimeoutRef.current = null;
+      }
     };
   }, []);
 
@@ -87,9 +114,13 @@ export const DictationOverlay: FC = () => {
 
   const handleExpand = useCallback((next: boolean) => {
     setExpanded(next);
-    // Resize overlay window to fit expanded content
-    app.dictation.resizeOverlay(next ? 280 : 52);
   }, []);
+
+  useEffect(() => {
+    app.dictation.resizeOverlay(expanded ? (error ? 320 : 280) : (error ? 96 : 52));
+  }, [error, expanded]);
+
+  const isStopping = dictState === 'stopping';
 
   // Mouse enter/leave toggles click-through on the overlay window
   const handleMouseEnter = useCallback(() => {
@@ -100,11 +131,16 @@ export const DictationOverlay: FC = () => {
     app.dictation.setOverlayInteractive(false);
   }, []);
 
+  const handleClickCapture = useCallback(() => {
+    setTimeout(() => app.dictation.restoreOverlayFocus(), 0);
+  }, []);
+
   return (
     <div
       className="h-screen w-screen select-none"
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
+      onClickCapture={handleClickCapture}
     >
       <div
         className="flex flex-col rounded-2xl border border-white/10 bg-black/80 backdrop-blur-xl shadow-2xl overflow-hidden"
@@ -116,6 +152,17 @@ export const DictationOverlay: FC = () => {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
             <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500" />
           </span>
+
+          {/* Typing mode indicator */}
+          {typingMode !== 'idle' && (
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+              typingMode === 'ax'
+                ? 'bg-emerald-500/20 text-emerald-300'
+                : 'bg-amber-500/20 text-amber-300'
+            }`}>
+              {typingMode === 'ax' ? 'AX' : 'KB'}
+            </span>
+          )}
 
           {/* Level bars */}
           <LevelBars level={level} />
@@ -142,17 +189,19 @@ export const DictationOverlay: FC = () => {
           <button
             type="button"
             onClick={handleStop}
-            className="flex items-center gap-1.5 rounded-lg bg-red-500/20 px-2 py-1 text-[10px] font-medium text-red-300 hover:bg-red-500/30 transition-colors"
+            disabled={isStopping}
+            className="flex items-center gap-1.5 rounded-lg bg-red-500/20 px-2 py-1 text-[10px] font-medium text-red-300 transition-colors hover:bg-red-500/30 disabled:cursor-default disabled:bg-white/10 disabled:text-white/45"
           >
             <SquareIcon className="h-2.5 w-2.5 fill-current" />
-            Stop
+            {isStopping ? 'Stopping' : 'Stop'}
           </button>
         </div>
 
         {/* Error message */}
         {error && (
-          <div className="px-3 py-1.5 text-[10px] text-red-300 bg-red-500/10 border-t border-white/5">
-            {error}
+          <div className="flex items-start gap-1.5 border-t border-red-400/15 bg-red-500/10 px-3 py-1.5 text-[10px] leading-snug text-red-200">
+            <AlertTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="max-h-12 min-w-0 overflow-y-auto break-words">{error}</span>
           </div>
         )}
 

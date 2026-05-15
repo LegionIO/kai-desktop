@@ -178,6 +178,13 @@ const appAPI = {
       ipcRenderer.on('plugin:ui-state-changed', handler);
       return () => ipcRenderer.removeListener('plugin:ui-state-changed', handler);
     },
+    getAvailableUpdateCount: () =>
+      ipcRenderer.invoke('plugin:available-update-count') as Promise<number>,
+    onUpdatesAvailable: (callback: (data: { count: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { count: number }) => callback(data);
+      ipcRenderer.on('plugin:updates-available', handler);
+      return () => ipcRenderer.removeListener('plugin:updates-available', handler);
+    },
     onEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('plugin:event', handler);
@@ -487,11 +494,15 @@ const appAPI = {
     toggle: () => ipcRenderer.invoke('dictation:toggle'),
     stop: () => ipcRenderer.invoke('dictation:stop'),
     getState: () => ipcRenderer.invoke('dictation:get-state'),
+    getTypingMode: () => ipcRenderer.invoke('dictation:get-typing-mode'),
     setDevice: (deviceId: string) => ipcRenderer.invoke('dictation:set-device', deviceId),
+    suspendHotkey: () => ipcRenderer.invoke('dictation:suspend-hotkey'),
+    resumeHotkey: () => ipcRenderer.invoke('dictation:resume-hotkey'),
     setOverlayInteractive: (interactive: boolean) => ipcRenderer.send('dictation:overlay-set-interactive', interactive),
     resizeOverlay: (height: number) => ipcRenderer.send('dictation:overlay-resize', height),
-    onStateChange: (callback: (state: { state: string; elapsed: number }) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number }) => callback(state);
+    restoreOverlayFocus: () => ipcRenderer.send('dictation:overlay-restore-focus'),
+    onStateChange: (callback: (state: { state: string; elapsed: number; hotkeyRegistered?: boolean; hotkeyError?: string | null }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, state: { state: string; elapsed: number; hotkeyRegistered?: boolean; hotkeyError?: string | null }) => callback(state);
       ipcRenderer.on('dictation:state', handler);
       return () => ipcRenderer.removeListener('dictation:state', handler);
     },
@@ -514,6 +525,11 @@ const appAPI = {
       const handler = (_event: Electron.IpcRendererEvent, message: string) => callback(message);
       ipcRenderer.on('dictation:error', handler);
       return () => ipcRenderer.removeListener('dictation:error', handler);
+    },
+    onTypingMode: (callback: (mode: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
+      ipcRenderer.on('dictation:typing-mode', handler);
+      return () => ipcRenderer.removeListener('dictation:typing-mode', handler);
     },
   },
 };

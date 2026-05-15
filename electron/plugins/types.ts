@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
+import type { CompatCheckResult } from './plugin-compat.js';
 
 /* ── Manifest ── */
 
@@ -30,7 +31,8 @@ export type PluginPermission =
   | 'exec:whitelisted'
   | 'tools:detect'
   | 'system:env'
-  | 'audit:log';
+  | 'audit:log'
+  | 'lifecycle:hook';
 
 export type PluginApprovalRecord = {
   hash: string;
@@ -109,6 +111,10 @@ export type PluginManifest = {
   permissions: PluginPermission[];
   configSchema?: Record<string, unknown>;
   execScope?: ExecScopeDeclaration;
+  /** npm-style semver range constraint on the host plugin API version. */
+  engines?: { kai?: string };
+  /** Host capabilities this plugin requires to function correctly. */
+  capabilities?: string[];
 };
 
 /* ── Plugin State ── */
@@ -121,10 +127,13 @@ export type PluginInstance = {
   fileHash: string;
   state: PluginState;
   error?: string;
+  compatWarning?: CompatCheckResult;
   module: PluginModule | null;
   registeredTools: ToolDefinition[];
   preSendHooks: PreSendHook[];
   postReceiveHooks: PostReceiveHook[];
+  preUpdateHooks: PreUpdateHook[];
+  postUpdateHooks: PostUpdateHook[];
   uiBanners: PluginBannerDescriptor[];
   uiModals: PluginModalDescriptor[];
   uiSettingsSections: PluginSettingsSectionDescriptor[];
@@ -191,6 +200,27 @@ export type PostReceiveHookResult = {
 };
 
 export type PostReceiveHook = (args: PostReceiveHookArgs) => Promise<PostReceiveHookResult> | PostReceiveHookResult;
+
+/* ── Lifecycle Hooks ── */
+
+export type PreUpdateHookArgs = {
+  version: string;
+  artifactPath: string;
+};
+
+export type PreUpdateHookResult = {
+  abort?: boolean;
+  abortReason?: string;
+};
+
+export type PreUpdateHook = (args: PreUpdateHookArgs) => Promise<PreUpdateHookResult> | PreUpdateHookResult;
+
+export type PostUpdateHookArgs = {
+  version: string;
+  success: boolean;
+};
+
+export type PostUpdateHook = (args: PostUpdateHookArgs) => Promise<void> | void;
 
 /* ── UI Descriptors (JSON-serializable across IPC) ── */
 
@@ -385,6 +415,16 @@ export type PluginAPI = {
   pluginName: string;
   pluginDir: string;
 
+  /** Host environment introspection (no permission required). */
+  host: {
+    /** Returns the host's plugin API semver version. */
+    apiVersion: () => string;
+    /** Returns the full list of capabilities this host exposes. */
+    capabilities: () => string[];
+    /** Check if a specific capability is available on this host. */
+    hasCapability: (cap: string) => boolean;
+  };
+
   config: {
     get: () => AppConfig;
     set: (path: string, value: unknown) => void;
@@ -408,6 +448,11 @@ export type PluginAPI = {
   messages: {
     registerPreSendHook: (hook: PreSendHook) => void;
     registerPostReceiveHook: (hook: PostReceiveHook) => void;
+  };
+
+  lifecycle: {
+    registerPreUpdateHook: (hook: PreUpdateHook) => void;
+    registerPostUpdateHook: (hook: PostUpdateHook) => void;
   };
 
   ui: {

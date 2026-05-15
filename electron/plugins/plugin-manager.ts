@@ -24,6 +24,9 @@ import type {
   PreSendHookResult,
   PostReceiveHookArgs,
   PostReceiveHookResult,
+  PreUpdateHookArgs,
+  PreUpdateHookResult,
+  PostUpdateHookArgs,
   PluginAPI,
   PluginPermission,
   PluginInferenceProvider,
@@ -41,6 +44,7 @@ import { MarketplaceService } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
+import { checkPluginCompatibility } from './plugin-compat.js';
 
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
@@ -75,6 +79,16 @@ type PluginListEntry = {
   error?: string;
 };
 
+/** Compare two semver strings — returns true if catalogVersion is newer than installedVersion. */
+function isNewerVersion(catalogVersion: string, installedVersion: string): boolean {
+  const toNum = (v: string) => v.split('.').map(Number);
+  const [cMajor = 0, cMinor = 0, cPatch = 0] = toNum(catalogVersion);
+  const [iMajor = 0, iMinor = 0, iPatch = 0] = toNum(installedVersion);
+  if (cMajor !== iMajor) return cMajor > iMajor;
+  if (cMinor !== iMinor) return cMinor > iMinor;
+  return cPatch > iPatch;
+}
+
 export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
@@ -84,6 +98,8 @@ export class PluginManager {
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
+  private catalogRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private lastUpdateCount = 0;
 
   private brandRequiredPluginNamesSet: Set<string>;
 
@@ -333,6 +349,8 @@ export class PluginManager {
       registeredTools: [],
       preSendHooks: [],
       postReceiveHooks: [],
+      preUpdateHooks: [],
+      postUpdateHooks: [],
       uiBanners: [],
       uiModals: [],
       uiSettingsSections: [],
@@ -365,6 +383,23 @@ export class PluginManager {
       }
 
       this.ensurePluginConfigNormalized(manifest.name);
+
+      // Check plugin compatibility constraints (engines.kai + capabilities)
+      const compat = checkPluginCompatibility(manifest);
+      if (!compat.compatible) {
+        const mode = this.getConfig().pluginSystem?.compatibilityMode ?? 'warn';
+        if (mode === 'strict') {
+          instance.state = 'error';
+          instance.error = `Incompatible: ${compat.errors.join('; ')}`;
+          console.warn(`[PluginManager] Plugin "${manifest.name}" blocked (strict mode): ${compat.errors.join('; ')}`);
+          this.broadcastUIState();
+          this.notifyToolsChanged();
+          return;
+        }
+        // warn mode: store warning, continue loading
+        instance.compatWarning = compat;
+        console.warn(`[PluginManager] Plugin "${manifest.name}" compatibility warning: ${compat.errors.join('; ')}`);
+      }
 
       // Load backend entry point from backend.js
       const backendPath = join(dir, 'backend.js');
@@ -429,6 +464,19 @@ export class PluginManager {
 
       instance.state = 'active';
       instance.error = undefined;
+
+      // Show compatibility warning banner if loaded in warn mode
+      if (instance.compatWarning) {
+        instance.uiBanners.push({
+          id: `compat-warning-${manifest.name}`,
+          pluginName: manifest.name,
+          text: `This plugin may be incompatible: ${instance.compatWarning.errors.join('; ')}`,
+          variant: 'warning',
+          dismissible: true,
+          visible: true,
+        });
+      }
+
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.info(`[PluginManager] Plugin "${manifest.name}" activated`);
@@ -444,6 +492,12 @@ export class PluginManager {
   /* ── Unloading ── */
 
   async unloadAll(): Promise<void> {
+    // Stop periodic catalog refresh
+    if (this.catalogRefreshTimer) {
+      clearInterval(this.catalogRefreshTimer);
+      this.catalogRefreshTimer = null;
+    }
+
     // Unload in reverse of load order: non-required plugins first (reverse alpha), then required plugins in reverse order
     const sorted = [...this.plugins.entries()].sort(([, a], [, b]) => {
       const aIdx = this.brandRequiredPluginNames.indexOf(a.manifest.name);
@@ -757,6 +811,37 @@ export class PluginManager {
     return result;
   }
 
+  /* ── Lifecycle Hooks ── */
+
+  async runPreUpdateHooks(args: PreUpdateHookArgs): Promise<PreUpdateHookResult> {
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.preUpdateHooks) {
+        try {
+          const result = await hook(args);
+          if (result?.abort) return result;
+        } catch (err) {
+          console.error(`[PluginManager] Pre-update hook error in "${instance.manifest.name}":`, err);
+          return { abort: true, abortReason: `Hook "${instance.manifest.name}" threw: ${err}` };
+        }
+      }
+    }
+    return {};
+  }
+
+  async runPostUpdateHooks(args: PostUpdateHookArgs): Promise<void> {
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.postUpdateHooks) {
+        try {
+          await hook(args);
+        } catch (err) {
+          console.error(`[PluginManager] Post-update hook error in "${instance.manifest.name}":`, err);
+        }
+      }
+    }
+  }
+
   /* ── UI State ── */
 
   getUIState(): PluginUIState {
@@ -1026,6 +1111,50 @@ export class PluginManager {
     }));
   }
 
+  /* ── Plugin Update Detection ── */
+
+  /**
+   * Count how many installed plugins have a newer version available in the marketplace catalog.
+   */
+  getAvailableUpdateCount(): number {
+    const catalog = this.marketplaceService?.getCachedCatalog() ?? [];
+    let count = 0;
+    for (const entry of catalog) {
+      const instance = this.plugins.get(entry.name);
+      if (instance && isNewerVersion(entry.version, instance.manifest.version)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Start periodic catalog refresh (every 4 hours) and broadcast update count.
+   * Call after loadAll() and initMarketplace() have completed.
+   */
+  startCatalogRefresh(): void {
+    // Initial broadcast
+    this.broadcastUpdateCount();
+
+    // Periodic refresh every 4 hours (same cadence as app auto-updater)
+    const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+    this.catalogRefreshTimer = setInterval(() => {
+      this.refreshMarketplace()
+        .then(() => this.broadcastUpdateCount())
+        .catch((err) => {
+          console.warn('[PluginManager] Periodic catalog refresh failed:', err);
+        });
+    }, REFRESH_INTERVAL_MS);
+  }
+
+  private broadcastUpdateCount(): void {
+    const count = this.getAvailableUpdateCount();
+    if (count !== this.lastUpdateCount) {
+      this.lastUpdateCount = count;
+      broadcastToAllWindows('plugin:updates-available', { count });
+    }
+  }
+
   async installFromMarketplace(pluginName: string): Promise<void> {
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
@@ -1048,6 +1177,9 @@ export class PluginManager {
     if (newPlugin) {
       await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
     }
+
+    // Update count changed since we just installed/updated a plugin
+    this.broadcastUpdateCount();
   }
 
   async uninstallFromMarketplace(pluginName: string): Promise<void> {
