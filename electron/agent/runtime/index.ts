@@ -46,6 +46,38 @@ export function getRuntime(id: RuntimeId): AgentRuntime | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin runtime capabilities — minimal pass-through for inference providers
+// ---------------------------------------------------------------------------
+
+/** All capabilities disabled — plugin runtimes route through inference providers, not AgentRuntime.stream */
+const PLUGIN_RUNTIME_CAPABILITIES = {
+  builtInTools: false,
+  mcpSupport: false,
+  toolObserver: false,
+  compaction: false,
+  memory: false,
+  fallback: false,
+  multiProvider: false,
+  subAgents: false,
+  sessions: false,
+  customTools: false,
+};
+
+/** Builds a synthetic AgentRuntime for a plugin-contributed runtime. */
+function buildPluginAgentRuntime(pr: PluginRuntimeContribution): AgentRuntime {
+  return {
+    id: pr.id as RuntimeId,
+    name: pr.name,
+    capabilities: PLUGIN_RUNTIME_CAPABILITIES,
+    isAvailable: () => Promise.resolve(pr.isAvailable()),
+    // stream is intentionally not implemented — plugin runtimes route through the inference provider path
+    async *stream() {
+      throw new Error(`Plugin runtime '${pr.id}' does not implement AgentRuntime.stream — use the inference provider path.`);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
 
@@ -65,9 +97,16 @@ export async function resolveRuntime(config: AppConfig): Promise<AgentRuntime> {
       : 'auto';
 
   if (preferred !== 'auto') {
+    // Check built-in runtimes first
     const runtime = runtimes.get(preferred);
     if (runtime && (await runtime.isAvailable())) {
       return runtime;
+    }
+    // Check plugin-contributed runtimes
+    const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+    const pluginRuntime = pluginRuntimes.find((r) => r.id === preferred);
+    if (pluginRuntime && pluginRuntime.isAvailable()) {
+      return buildPluginAgentRuntime(pluginRuntime);
     }
     console.warn(`[Runtime] Requested runtime '${preferred}' is not available, falling back to Mastra.`);
     return getMastraOrThrow();
@@ -118,18 +157,31 @@ export async function resolveRuntimeForStream(
       available.add(id);
     }
   }
+  // Include plugin-contributed runtimes in the available set
+  const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+  for (const pr of pluginRuntimes) {
+    if (pr.isAvailable()) {
+      available.add(pr.id as RuntimeId);
+    }
+  }
   // Mastra is always available
   available.add('mastra');
 
   const resolution = resolveRuntimeForModel(model, config, preferred, available);
 
-  // Look up the actual runtime instance
+  // Look up the actual runtime instance — check built-ins first, then plugin runtimes
   const runtime = runtimes.get(resolution.runtimeId);
-  if (!runtime) {
-    return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };
+  if (runtime) {
+    return { runtime, resolution };
   }
 
-  return { runtime, resolution };
+  // Check plugin-contributed runtimes
+  const pluginRuntime = pluginRuntimes.find((r) => r.id === resolution.runtimeId);
+  if (pluginRuntime) {
+    return { runtime: buildPluginAgentRuntime(pluginRuntime), resolution };
+  }
+
+  return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };
 }
 
 // ---------------------------------------------------------------------------
