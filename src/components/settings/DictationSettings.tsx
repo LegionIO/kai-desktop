@@ -107,9 +107,9 @@ const PARTIAL_STRATEGY_DETAILS = {
   },
   'full-patch': {
     label: 'Full patch',
-    summary: 'Uses the legacy diff plan: left/right movement, forward delete, backspace, and insertion.',
-    bestFor: 'Maximum live correction fidelity in simple fields where cursor events are reliable.',
-    tradeoff: 'Highest corruption risk in arbitrary apps or fields with existing text.',
+    summary: 'Uses cursor movement, forward delete, backspace, and insertion, even when AX cannot verify the text field.',
+    bestFor: 'Non-AX text fields and simple fields where cursor events are reliable.',
+    tradeoff: 'Highest corruption risk. In unreadable fields Kai cannot detect secure inputs or prove the cursor/text state.',
   },
 } as const;
 
@@ -197,7 +197,7 @@ function getStrategyModeNote(mode: PartialTypingMode, strategy: PartialTypingStr
     return 'Requires an AX range; otherwise it will skip live partial typing and wait for the final transcript.';
   }
   if (mode === 'kb' && strategy === 'full-patch') {
-    return 'Uses cursor movement in the target field and is limited to printable ASCII. This is the highest-risk keyboard fallback.';
+    return 'Uses cursor movement in the target field, can run without AX verification, and is limited to printable ASCII. This is the highest-risk keyboard fallback.';
   }
   if (mode === 'kb' && strategy === 'tail-only') {
     return 'Requires AX range verification before and after the keyboard rewrite.';

@@ -7,6 +7,7 @@ import ScreenCaptureKit
 let syntheticEventTag: Int64 = 0x4C47494F
 let syntheticSource = CGEventSource(stateID: .privateState)
 let maxKeyboardRepeatCount = 120
+let blindKeyboardTextChunkSize = 512
 
 func printJson(_ value: Any) {
   if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
@@ -336,6 +337,16 @@ func frontmostApplicationPid() -> pid_t? {
   NSWorkspace.shared.frontmostApplication?.processIdentifier
 }
 
+func frontmostApplicationInfo() -> [String: Any]? {
+  guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+  return [
+    "ok": true,
+    "pid": app.processIdentifier,
+    "name": app.localizedName ?? "",
+    "bundleId": app.bundleIdentifier ?? ""
+  ]
+}
+
 func frontmostMatchesPid(_ pid: pid_t?) -> Bool {
   guard let pid else { return true }
   return frontmostApplicationPid() == pid
@@ -423,7 +434,7 @@ func focusedAccessibilityElement(pid: pid_t? = nil) -> AXUIElement? {
 
 func focusedTextTargetIsSecure(pid: pid_t? = nil) -> Bool {
   guard let element = focusedAccessibilityElement(pid: pid) else {
-    return true
+    return false
   }
 
   var subroleValue: CFTypeRef?
@@ -553,6 +564,10 @@ func expectedElementSignatureArg(_ args: [String], _ index: Int) -> String? {
     return nil
   }
   return decodeBase64String(args[index])
+}
+
+func allowsUnverifiedKeyboardTarget(_ args: [String]) -> Bool {
+  args.contains("--allow-unverified-keyboard")
 }
 
 func elementMatchesExpected(_ element: AXUIElement, expectedSignature: String?) -> Bool {
@@ -951,6 +966,13 @@ guard args.count >= 2 else {
 }
 
 switch args[1] {
+case "frontmostApplication":
+  guard let info = frontmostApplicationInfo() else {
+    printJson(["ok": false, "error": "Unable to identify frontmost application"])
+    exit(1)
+  }
+  printJson(info)
+
 case "permissions":
   let result: [String: Any] = [
     "ok": true,
@@ -1070,20 +1092,28 @@ case "postText":
     exit(1)
   }
   let ptTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  let ptAllowUnverified = allowsUnverifiedKeyboardTarget(args)
   guard frontmostMatchesPid(ptTargetPid) else {
     printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
     exit(1)
   }
+  let ptExpectedSignature = expectedElementSignatureArg(args, 4)
   guard !focusedTextTargetIsSecure(pid: ptTargetPid) else {
     printJson(["ok": false, "error": "Refusing to type into secure text field"])
     exit(1)
   }
-  let ptExpectedSignature = expectedElementSignatureArg(args, 4)
-  guard focusedTextElementMatchesExpected(pid: ptTargetPid, expectedSignature: ptExpectedSignature) else {
-    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
-    exit(1)
+  if !ptAllowUnverified {
+    guard focusedTextElementMatchesExpected(pid: ptTargetPid, expectedSignature: ptExpectedSignature) else {
+      printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+      exit(1)
+    }
   }
-  guard postUnicodeTextInChunks(decoded, targetPid: ptTargetPid, expectedElementSignature: ptExpectedSignature) else {
+  guard postUnicodeTextInChunks(
+    decoded,
+    chunkSize: ptAllowUnverified ? blindKeyboardTextChunkSize : 16,
+    targetPid: ptTargetPid,
+    expectedElementSignature: ptExpectedSignature
+  ) else {
     printJson(["ok": false, "error": "Frontmost application changed while typing"])
     exit(1)
   }
@@ -1270,18 +1300,21 @@ case "deleteBack":
     exit(1)
   }
   let dbTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  let dbAllowUnverified = allowsUnverifiedKeyboardTarget(args)
   guard frontmostMatchesPid(dbTargetPid) else {
     printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
     exit(1)
   }
+  let dbExpectedSignature = expectedElementSignatureArg(args, 4)
   guard !focusedTextTargetIsSecure(pid: dbTargetPid) else {
     printJson(["ok": false, "error": "Refusing to delete in secure text field"])
     exit(1)
   }
-  let dbExpectedSignature = expectedElementSignatureArg(args, 4)
-  guard focusedTextElementMatchesExpected(pid: dbTargetPid, expectedSignature: dbExpectedSignature) else {
-    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
-    exit(1)
+  if !dbAllowUnverified {
+    guard focusedTextElementMatchesExpected(pid: dbTargetPid, expectedSignature: dbExpectedSignature) else {
+      printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+      exit(1)
+    }
   }
   guard pressKeyRepeated(keyCode: 51, count: deleteCount, delayMs: 3, targetPid: dbTargetPid, expectedElementSignature: dbExpectedSignature) else {
     printJson(["ok": false, "error": "Frontmost application changed while deleting"])
@@ -1304,18 +1337,21 @@ case "applyTextPatch":
     exit(1)
   }
   let atpTargetPid: pid_t? = args.count >= 4 ? pid_t(args[3]) : nil
+  let atpAllowUnverified = allowsUnverifiedKeyboardTarget(args)
   guard frontmostMatchesPid(atpTargetPid) else {
     printJson(["ok": false, "error": "Frontmost application no longer matches dictation target"])
     exit(1)
   }
+  let atpExpectedSignature = expectedElementSignatureArg(args, 4)
   guard !focusedTextTargetIsSecure(pid: atpTargetPid) else {
     printJson(["ok": false, "error": "Refusing to patch secure text field"])
     exit(1)
   }
-  let atpExpectedSignature = expectedElementSignatureArg(args, 4)
-  guard focusedTextElementMatchesExpected(pid: atpTargetPid, expectedSignature: atpExpectedSignature) else {
-    printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
-    exit(1)
+  if !atpAllowUnverified {
+    guard focusedTextElementMatchesExpected(pid: atpTargetPid, expectedSignature: atpExpectedSignature) else {
+      printJson(["ok": false, "error": "Focused text element no longer matches dictation target"])
+      exit(1)
+    }
   }
   if let validationError = validatePatchOperations(operations) {
     printJson(["ok": false, "error": validationError])
@@ -1361,7 +1397,12 @@ case "applyTextPatch":
         printJson(["ok": false, "error": "insertText missing text"])
         exit(1)
       }
-      guard postUnicodeTextInChunks(text, targetPid: atpTargetPid, expectedElementSignature: atpExpectedSignature) else {
+      guard postUnicodeTextInChunks(
+        text,
+        chunkSize: atpAllowUnverified ? blindKeyboardTextChunkSize : 16,
+        targetPid: atpTargetPid,
+        expectedElementSignature: atpExpectedSignature
+      ) else {
         printJson(["ok": false, "error": "Frontmost application changed during insertText"])
         exit(1)
       }
