@@ -53,6 +53,15 @@ type AppAPI = {
     testEmbedding: () =>
       Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>;
   };
+  aithena: {
+    health: () => Promise<{ ok: boolean; version?: string; environment?: string; error?: string }>;
+    stats: () => Promise<unknown>;
+    compileContext: (query: string, options?: unknown) => Promise<unknown>;
+    recall: (query: string, topK?: number) => Promise<unknown[]>;
+    learn: (input: { userMessage: string; assistantResponse: string; conversationId?: string; metadata?: Record<string, unknown> }) => Promise<void>;
+    remember: (input: { content: string; tier: string; category?: string; confidence?: number; metadata?: Record<string, unknown> }) => Promise<void>;
+    skillSearch: (query: string, topK?: number) => Promise<unknown[]>;
+  };
   mcp: {
     testConnection: (server: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }) =>
       Promise<{ status: string; toolCount: number; error?: string }>;

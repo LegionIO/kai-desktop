@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] - feat/aithena-memory-hooks
+
+### Added
+- **Aithena Lifecycle Hooks** (`electron/agent/aithena-hooks.ts`): Two-phase integration wiring cognitive memory into the conversation stream pipeline.
+  - `enrichWithAithenaContext()` — compiles recalled memories, RAG documents, and procedural hints into the system prompt before streaming starts.
+  - `learnFromTurn()` — fire-and-forget post-stream call that sends the user/assistant exchange to Aithena's LLM pipeline for episodic storage, semantic extraction, procedural detection, and identity observation.
+- **RAG integration**: Context enrichment now includes Aithena's knowledge base (ingested docs, runbooks, design docs) with `includeRag: true` and 4000 token budget.
+- **Instructional preamble in context block**: Formatted context injection now includes explicit guidance for the model to treat retrieved context as authoritative, cite knowledge base sources, and follow procedural hints when intent matches.
+- **Source attribution**: All Aithena API calls now emit `source_type: 'kai-desktop'` instead of `'external'`, enabling proper attribution in Aithena's telemetry and memory provenance tracking.
+
+### Changed
+- `electron/ipc/agent.ts`:
+  - Import and wire `enrichWithAithenaContext`, `learnFromTurn`, `extractLastUserMessage` from aithena-hooks.
+  - Context enrichment injected after plugin hooks, before runtime resolution.
+  - Text accumulator added to stream loop (`text-delta` events).
+  - `learnFromTurn()` called on stream `done` event (min 50 chars guard).
+- `electron/agent/aithena-memory.ts`:
+  - All `source_type` fields changed from `'external'` to `'kai-desktop'` across learn, remember (semantic/episodic/procedural encode), compileContext, recall, workflow events, skill search, and skill feedback.
+  - Learn endpoint now includes `source_type: 'kai-desktop'` in the request body.
+
+### Technical Notes
+- Context enrichment: max 8s compile timeout with retry, graceful degradation (returns original prompt on failure).
+- Learning: fire-and-forget, never blocks the stream pipeline. Minimum 50-char response length guard prevents learning from empty/error responses.
+- RAG results render as a `## Knowledge Base (Retrieved Documents)` section with title, source URL, and content snippet (up to 500 chars each).
+- System prompt injection order: base prompt → Aithena context block → working directory → project instructions (CLAUDE.md).
+
 ## [Unreleased] - feat/aithena-memory-adapter
 
 ### Added

@@ -20,6 +20,7 @@
  */
 
 import type { AppConfig } from '../config/schema.js';
+import { net } from 'electron';
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -216,6 +217,7 @@ export class AithenaMemoryAdapter {
       session_id: options?.sessionId ?? null,
       workspace_id: options?.workspaceId ?? null,
       workflow_run_id: options?.workflowRunId ?? null,
+      source_type: 'kai-desktop',
       include: {
         memory: true,
         rag: options?.includeRag ?? true,
@@ -249,6 +251,7 @@ export class AithenaMemoryAdapter {
       user_message: input.userMessage,
       assistant_response: input.assistantResponse,
       conversation_id: input.conversationId ?? null,
+      source_type: 'kai-desktop',
       metadata: input.metadata ?? null,
       enable: {
         episodic: true,
@@ -276,7 +279,7 @@ export class AithenaMemoryAdapter {
         fact: input.content,
         category: input.category ?? 'preference',
         confidence: input.confidence ?? 0.8,
-        source_type: 'external',
+        source_type: 'kai-desktop',
         metadata: input.metadata ?? null,
       };
     } else if (tier === 'episodic') {
@@ -284,7 +287,7 @@ export class AithenaMemoryAdapter {
       body = {
         user_message: input.content,
         assistant_response: input.content,
-        source_type: 'external',
+        source_type: 'kai-desktop',
         metadata: { ...(input.metadata ?? {}), category: input.category },
       };
     } else {
@@ -294,7 +297,7 @@ export class AithenaMemoryAdapter {
         trigger_pattern: input.content,
         steps: (input.metadata?.steps as unknown[]) ?? [],
         confidence: input.confidence ?? 0.8,
-        source_type: 'external',
+        source_type: 'kai-desktop',
         metadata: input.metadata ?? null,
       };
     }
@@ -309,6 +312,7 @@ export class AithenaMemoryAdapter {
     try {
       const result = await this.post('/v1/context/compile', {
         query,
+        source_type: 'kai-desktop',
         include: { memory: true, rag: false, procedural: false, entities: false, profile: false },
         token_budget: 4000,
         min_confidence: minConfidence,
@@ -338,6 +342,7 @@ export class AithenaMemoryAdapter {
       event_type: event.eventType,
       phase: event.phase ?? '',
       payload: event.payload ?? {},
+      source_type: 'kai-desktop',
     };
 
     this.post('/v1/workflows/events', body, this.timeoutMs).catch(() => {});
@@ -377,6 +382,7 @@ export class AithenaMemoryAdapter {
     try {
       const result = await this.post('/v1/context/compile', {
         query,
+        source_type: 'kai-desktop',
         include: { memory: false, rag: false, procedural: true, entities: false, profile: false },
         token_budget: 4000,
         min_confidence: 0.5,
@@ -403,6 +409,7 @@ export class AithenaMemoryAdapter {
       outcome,
       context: context ?? null,
       latency_ms: latencyMs ?? null,
+      source_type: 'kai-desktop',
     }, this.timeoutMs).catch(() => {});
   }
 
@@ -418,7 +425,7 @@ export class AithenaMemoryAdapter {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const res = await fetch(`${this.baseUrl}${path}`, {
+      const res = await net.fetch(`${this.baseUrl}${path}`, {
         method: 'GET',
         headers: this.headers(),
         signal: controller.signal,
@@ -444,7 +451,7 @@ export class AithenaMemoryAdapter {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const res = await fetch(`${this.baseUrl}${path}`, {
+      const res = await net.fetch(`${this.baseUrl}${path}`, {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify(body),
@@ -471,7 +478,7 @@ export class AithenaMemoryAdapter {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const res = await fetch(`${this.baseUrl}${path}`, {
+      const res = await net.fetch(`${this.baseUrl}${path}`, {
         method: 'PATCH',
         headers: this.headers(),
         body: JSON.stringify(body),
