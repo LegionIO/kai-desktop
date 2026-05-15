@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, type FC } from 'react';
 import { settingsSelectClass, Toggle, NumberField, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
-type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string };
+type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string; description?: string };
 
 type AgentConfig = {
   runtime: string;
@@ -111,12 +111,14 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           </select>
         </div>
 
-        {/* Runtime descriptions */}
-        {selectedRuntime !== 'auto' && RUNTIME_DESCRIPTIONS[selectedRuntime] && (
-          <p className="text-[10px] text-muted-foreground/80 italic">
-            {RUNTIME_DESCRIPTIONS[selectedRuntime]}
-          </p>
-        )}
+        {/* Runtime descriptions — built-ins use hardcoded copy, plugin runtimes use their own description */}
+        {selectedRuntime !== 'auto' && (() => {
+          const desc = RUNTIME_DESCRIPTIONS[selectedRuntime]
+            ?? runtimes.find((r) => r.id === selectedRuntime)?.description;
+          return desc ? (
+            <p className="text-[10px] text-muted-foreground/80 italic">{desc}</p>
+          ) : null;
+        })()}
       </fieldset>
 
       {/* Availability */}

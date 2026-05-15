@@ -619,6 +619,8 @@ export type PluginRuntimeContribution = {
   id: string;
   /** Human-readable name shown in the Runtimes tab. */
   name: string;
+  /** Optional one-line description shown below the dropdown when this runtime is selected. */
+  description?: string;
   /** Return true when this runtime is currently reachable/available. */
   isAvailable: () => boolean;
 };

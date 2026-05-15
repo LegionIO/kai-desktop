@@ -194,9 +194,9 @@ export async function resolveRuntimeForStream(
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: string; name: string; available: boolean; reason?: string }>
+  Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }>
 > {
-  const results: Array<{ id: string; name: string; available: boolean; reason?: string }> = [];
+  const results: Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }> = [];
 
   // Built-in runtimes
   for (const [, runtime] of runtimes) {
@@ -220,7 +220,7 @@ export async function getAvailableRuntimes(): Promise<
   for (const pr of pluginRuntimes) {
     if (results.some((r) => r.id === pr.id)) continue; // already present
     const available = pr.isAvailable();
-    results.push({ id: pr.id, name: pr.name, available });
+    results.push({ id: pr.id, name: pr.name, available, description: pr.description });
   }
 
   return results;
