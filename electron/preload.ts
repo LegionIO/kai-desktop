@@ -90,23 +90,6 @@ const appAPI = {
       ipcRenderer.invoke('memory:test-embedding') as Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>,
   },
 
-  aithena: {
-    health: () =>
-      ipcRenderer.invoke('aithena:health') as Promise<{ ok: boolean; version?: string; environment?: string; error?: string }>,
-    stats: () =>
-      ipcRenderer.invoke('aithena:stats') as Promise<Record<string, unknown>>,
-    compileContext: (query: string, options?: Record<string, unknown>) =>
-      ipcRenderer.invoke('aithena:compile-context', query, options),
-    recall: (query: string, topK?: number) =>
-      ipcRenderer.invoke('aithena:recall', query, topK) as Promise<Array<{ id: string; content: string; tier: string; score: number }>>,
-    learn: (input: { userMessage: string; assistantResponse: string; conversationId?: string; metadata?: Record<string, unknown> }) =>
-      ipcRenderer.invoke('aithena:learn', input) as Promise<void>,
-    remember: (input: { content: string; tier: string; category?: string; confidence?: number; metadata?: Record<string, unknown> }) =>
-      ipcRenderer.invoke('aithena:remember', input) as Promise<void>,
-    skillSearch: (query: string, topK?: number) =>
-      ipcRenderer.invoke('aithena:skill-search', query, topK) as Promise<Array<{ id: string; title: string; confidence_score: number; trust_tier: string }>>,
-  },
-
   mcp: {
     testConnection: (server: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }) =>
       ipcRenderer.invoke('mcp:test-connection', server) as Promise<{ status: string; toolCount: number; error?: string }>,

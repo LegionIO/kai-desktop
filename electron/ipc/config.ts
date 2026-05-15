@@ -751,7 +751,6 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     imageGeneration: config.imageGeneration,
     videoGeneration: config.videoGeneration,
     cliTools: config.cliTools,
-    aithena: config.aithena,
   };
 }
 

@@ -37,7 +37,6 @@ import {
 } from '../agent/tool-observer.js';
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
 import { recordUsageEvent } from './usage.js';
-import { enrichWithAithenaContext, learnFromTurn, extractLastUserMessage } from '../agent/aithena-hooks.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { HookMessage } from '../plugins/types.js';
 
@@ -365,15 +364,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (streamConfig) {
           streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
         }
-      }
-    }
-
-    // Aithena context enrichment — compile relevant memories into system prompt
-    {
-      const enrichment = await enrichWithAithenaContext(config, messages as Array<{ role?: string; content?: unknown }>, effectiveSystemPrompt, conversationId);
-      effectiveSystemPrompt = enrichment.systemPrompt;
-      if (streamConfig) {
-        streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
       }
     }
 
@@ -1163,8 +1153,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           augmentToolResult: streamOptions.augmentToolResult,
         });
 
-        let assistantTextAccumulator = '';
-
         for await (const event of stream) {
           // After a plan-related done event has been sent and the stream aborted,
           // ignore any trailing events (especially the generator's final plain done).
@@ -1225,14 +1213,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (event.type === 'done' && !controller.signal.aborted) {
             observerLaunchesEnabled = false;
             await waitForObserverToolExecutions();
-
-            // Aithena learning — fire-and-forget, never blocks stream
-            if (assistantTextAccumulator.length >= 50) {
-              const userMsg = extractLastUserMessage(messages as Array<{ role?: string; content?: unknown }>);
-              if (userMsg) {
-                learnFromTurn(config, userMsg, assistantTextAccumulator, conversationId);
-              }
-            }
           }
           if (event.type === 'model-fallback') {
             const fbData = event.data as { toModelKey?: string } | undefined;
@@ -1247,7 +1227,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           }
           if (event.type === 'text-delta') {
-            assistantTextAccumulator += (event as { text?: string }).text ?? '';
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
               ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),

@@ -12,7 +12,6 @@ import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
 import { DictationSettings } from './DictationSettings';
-import { AithenaSettings } from './AithenaSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
@@ -23,14 +22,12 @@ type SettingsSection =
   | 'dictation'
   | 'computer-use'
   | 'media-generation'
-  | 'web-server'
-  | 'aithena';
+  | 'web-server';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Models' },
   { key: 'tools', label: 'Tools' },
   { key: 'general', label: 'Application' },
-  { key: 'aithena', label: 'Aithena Memory' },
   { key: 'audio-voice', label: 'Audio & Voice' },
   { key: 'dictation', label: 'Dictation' },
   { key: 'computer-use', label: 'Autopilot' },
@@ -97,7 +94,6 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'aithena' && <AithenaSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} />}
       </div>
     </div>

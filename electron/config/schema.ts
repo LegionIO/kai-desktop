@@ -464,14 +464,6 @@ export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins';
 
 export const sidebarTabSchema = z.enum(['chats', 'tasks', 'messages', 'agents', 'plugins']);
 
-const aithenaConfigSchema = z.object({
-  enabled: z.boolean(),
-  gatewayUrl: z.string(),
-  apiKey: z.string(),
-  timeoutMs: z.number().positive().optional(),
-  compileTimeoutMs: z.number().positive().optional(),
-});
-
 export const appConfigSchema = z.object({
   agent: agentConfigSchema.optional(),
   models: modelsConfigSchema,
@@ -549,7 +541,6 @@ export const appConfigSchema = z.object({
   imageGeneration: imageGenerationConfigSchema.optional(),
   videoGeneration: videoGenerationConfigSchema.optional(),
   cliTools: z.array(cliToolSchema).optional(),
-  aithena: aithenaConfigSchema.optional(),
 });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;
