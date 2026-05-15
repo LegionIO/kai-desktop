@@ -9,6 +9,7 @@ import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
+import { registerAithenaHandlers } from './ipc/aithena.js';
 import { rebuildMcpTools } from './tools/mcp-client.js';
 import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
@@ -635,6 +636,7 @@ if (gotSingleInstanceLock) {
     registerConversationHandlers(ipcMain, APP_HOME, getConfig);
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
+    registerAithenaHandlers(ipcMain, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
