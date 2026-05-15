@@ -43,17 +43,12 @@ function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
 export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ config, updateConfig, embedded }) => {
   const agentConfig = (config.agent as AgentConfig | undefined) ?? { runtime: 'auto' };
   const [runtimes, setRuntimes] = useState<RuntimeInfo[]>([]);
-  const [activeRuntime, setActiveRuntime] = useState<string>('mastra');
   const [loading, setLoading] = useState(true);
 
   const fetchRuntimes = useCallback(async () => {
     try {
-      const [available, active] = await Promise.all([
-        app.agent.getAvailableRuntimes(),
-        app.agent.getActiveRuntime(),
-      ]);
+      const available = await app.agent.getAvailableRuntimes();
       setRuntimes(available);
-      setActiveRuntime(active);
       setLoading(false);
     } catch {
       setLoading(false);
@@ -128,13 +123,6 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       {!loading && (
         <fieldset className="rounded-lg border p-3 space-y-3">
           <legend className="text-xs font-semibold px-1">Availability</legend>
-
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground">Active:</span>
-            <span className="text-xs font-medium">
-              {(runtimes.find((r) => r.id === activeRuntime) ?? runtimes.find((r) => r.name === activeRuntime))?.name ?? activeRuntime}
-            </span>
-          </div>
 
           {sortedRuntimes.length > 0 && (
             <div className="space-y-1.5">
