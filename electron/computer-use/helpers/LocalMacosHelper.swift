@@ -958,6 +958,573 @@ func eventKind(_ type: CGEventType) -> String {
   }
 }
 
+func nowMillis() -> Int {
+  Int(Date().timeIntervalSince1970 * 1000)
+}
+
+func characterPrefixLength(_ lhs: String, _ rhs: String) -> Int {
+  var count = 0
+  var lhsIndex = lhs.startIndex
+  var rhsIndex = rhs.startIndex
+  while lhsIndex < lhs.endIndex && rhsIndex < rhs.endIndex {
+    if lhs[lhsIndex] != rhs[rhsIndex] { break }
+    count += 1
+    lhsIndex = lhs.index(after: lhsIndex)
+    rhsIndex = rhs.index(after: rhsIndex)
+  }
+  return count
+}
+
+func characterSuffix(_ text: String, droppingFirst count: Int) -> String {
+  if count <= 0 { return text }
+  if count >= text.count { return "" }
+  return String(text[text.index(text.startIndex, offsetBy: count)..<text.endIndex])
+}
+
+final class DictationSessionServer {
+  private let mainRunLoop: CFRunLoop
+  private let outputLock = NSLock()
+  private var targetPid: pid_t?
+  private var targetName = ""
+  private var targetBundleId: String?
+  private var targetCapturedAt = 0
+  private var axLocation: Int?
+  private var axTypedUtf16Length = 0
+  private var axElementSignature: String?
+  private var axSuppressed = false
+  private var partialText = ""
+  private var partialTypingModeUsed: String?
+  private var partialTypingStrategyUsed: String?
+  private var partialTyping: [String: String] = [:]
+  private var livePartials = false
+  private var allowBlindKeyboardFullPatch = false
+  private var ownPid: pid_t?
+  private var ownAppName = ""
+  private var monitorTap: CFMachPort?
+  private var monitorSource: CFRunLoopSource?
+
+  init() {
+    self.mainRunLoop = CFRunLoopGetCurrent()
+  }
+
+  func run() {
+    emit(["event": "ready", "protocolVersion": 1])
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      while let line = readLine() {
+        self?.handleLine(line)
+      }
+      if let runLoop = self?.mainRunLoop {
+        CFRunLoopStop(runLoop)
+      }
+    }
+    CFRunLoopRun()
+    stopTargetTracking()
+  }
+
+  private func emit(_ payload: [String: Any]) {
+    outputLock.lock()
+    printJson(payload)
+    outputLock.unlock()
+  }
+
+  private func respond(_ id: String, _ payload: [String: Any]) {
+    var response = payload
+    response["id"] = id
+    emit(response)
+  }
+
+  private func handleLine(_ line: String) {
+    guard let data = line.data(using: .utf8),
+          let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let id = raw["id"] as? String,
+          let method = raw["method"] as? String else {
+      emit(["ok": false, "event": "protocol-error", "error": "Invalid request"])
+      return
+    }
+    let params = raw["params"] as? [String: Any] ?? [:]
+
+    switch method {
+    case "beginSession":
+      respond(id, beginSession(params))
+    case "startTargetTracking":
+      respond(id, startTargetTracking())
+    case "stopTargetTracking":
+      stopTargetTracking()
+      respond(id, sessionResponse(["ok": true]))
+    case "refreshTarget":
+      respond(id, refreshTarget())
+    case "applyPartial":
+      respond(id, applyPartial(params))
+    case "applyFinal":
+      respond(id, applyFinal(params))
+    case "endSession":
+      stopTargetTracking()
+      respond(id, sessionResponse(["ok": true]))
+      CFRunLoopStop(mainRunLoop)
+    default:
+      respond(id, ["ok": false, "error": "Unknown method: \(method)", "errorCode": "unknown_method"])
+    }
+  }
+
+  private func sessionResponse(_ extra: [String: Any] = [:]) -> [String: Any] {
+    var response: [String: Any] = [
+      "ok": true,
+      "typingMode": typingMode(),
+      "capturedAx": hasAxSpan,
+      "partialText": partialText,
+      "capturedAt": targetCapturedAt,
+    ]
+    if let targetPid {
+      response["targetPid"] = Int(targetPid)
+    }
+    if !targetName.isEmpty {
+      response["targetName"] = targetName
+    }
+    if let targetBundleId {
+      response["targetBundleId"] = targetBundleId
+    }
+    if let partialTypingStrategyUsed {
+      response["strategy"] = partialTypingStrategyUsed
+    }
+    for (key, value) in extra {
+      response[key] = value
+    }
+    return response
+  }
+
+  private var hasAxSpan: Bool {
+    axLocation != nil && axElementSignature != nil && !axSuppressed
+  }
+
+  private func configuredStrategy(_ mode: String) -> String {
+    if let strategy = partialTyping[mode] {
+      return normalizeStrategy(mode, strategy)
+    }
+    if livePartials {
+      return mode == "ax" ? "full-replacement" : "disabled"
+    }
+    return "disabled"
+  }
+
+  private func normalizeStrategy(_ mode: String, _ strategy: String) -> String {
+    if mode == "ax" {
+      return ["disabled", "full-replacement", "ax-verified"].contains(strategy)
+        ? strategy
+        : "full-replacement"
+    }
+    return ["disabled", "ax-verified", "tail-only", "full-patch"].contains(strategy)
+      ? strategy
+      : "ax-verified"
+  }
+
+  private func hasEnabledPartialStrategy() -> Bool {
+    configuredStrategy("ax") != "disabled" || configuredStrategy("kb") != "disabled"
+  }
+
+  private func typingMode() -> String {
+    if hasAxSpan && configuredStrategy("ax") != "disabled" {
+      return "ax"
+    }
+    if configuredStrategy("kb") != "disabled" || (!hasAxSpan && allowBlindKeyboardFullPatch) {
+      return "kb"
+    }
+    if hasAxSpan {
+      return "ax"
+    }
+    return "idle"
+  }
+
+  private func partialMode() -> String {
+    if hasAxSpan && configuredStrategy("ax") != "disabled" {
+      return "ax"
+    }
+    if configuredStrategy("kb") != "disabled" {
+      return "kb"
+    }
+    return hasAxSpan ? "ax" : "kb"
+  }
+
+  private func beginSession(_ params: [String: Any]) -> [String: Any] {
+    partialTyping.removeAll()
+    if let rawPartialTyping = params["partialTyping"] as? [String: Any] {
+      if let ax = rawPartialTyping["ax"] as? String {
+        partialTyping["ax"] = normalizeStrategy("ax", ax)
+      }
+      if let kb = rawPartialTyping["kb"] as? String {
+        partialTyping["kb"] = normalizeStrategy("kb", kb)
+      }
+    }
+    livePartials = (params["livePartials"] as? Bool) ?? false
+    allowBlindKeyboardFullPatch = (params["allowBlindKeyboardFullPatch"] as? Bool) ?? false
+    if let rawPid = params["ownPid"] as? Int {
+      ownPid = pid_t(rawPid)
+    } else if let rawPid = params["ownPid"] as? NSNumber {
+      ownPid = pid_t(rawPid.intValue)
+    } else {
+      ownPid = nil
+    }
+    ownAppName = params["ownAppName"] as? String ?? ""
+    partialText = ""
+    partialTypingModeUsed = nil
+    partialTypingStrategyUsed = nil
+    axSuppressed = false
+    clearAxSpan()
+
+    guard AXIsProcessTrusted() else {
+      return ["ok": false, "error": "Dictation requires macOS Accessibility permission before it can type safely.", "errorCode": "accessibility"]
+    }
+    guard captureFrontmostTarget() else {
+      return ["ok": false, "error": "Dictation could not identify the target app. Click into the field and try again.", "errorCode": "target_app"]
+    }
+
+    let capture = captureAxSpan()
+    if capture.errorCode == "secure_field" {
+      return ["ok": false, "error": "Dictation will not type into secure text fields.", "errorCode": "secure_field"]
+    }
+    if !capture.ok && !allowBlindKeyboardFullPatch {
+      return ["ok": false, "error": "Dictation could not verify the target text cursor or selection. Click into a standard text field and try again.", "errorCode": "cursor_unverified"]
+    }
+
+    return sessionResponse(["ok": true, "applied": false])
+  }
+
+  private func captureFrontmostTarget() -> Bool {
+    guard let info = frontmostApplicationInfo() else { return false }
+    let pid: pid_t?
+    if let rawPid = info["pid"] as? pid_t {
+      pid = rawPid
+    } else if let rawPid = info["pid"] as? Int {
+      pid = pid_t(rawPid)
+    } else if let rawPid = info["pid"] as? NSNumber {
+      pid = pid_t(rawPid.intValue)
+    } else {
+      pid = nil
+    }
+    let appName = info["name"] as? String ?? ""
+    if let pid, let ownPid, pid == ownPid {
+      return false
+    }
+    if !ownAppName.isEmpty && appName.lowercased() == ownAppName.lowercased() {
+      return false
+    }
+    guard let pid else { return false }
+    targetPid = pid
+    targetName = appName
+    targetBundleId = info["bundleId"] as? String
+    targetCapturedAt = nowMillis()
+    return true
+  }
+
+  private func captureAxSpan() -> (ok: Bool, errorCode: String?) {
+    guard let targetPid else {
+      clearAxSpan()
+      return (false, "target_app")
+    }
+    guard frontmostMatchesPid(targetPid) else {
+      clearAxSpan()
+      return (false, "target_changed")
+    }
+    guard !focusedTextTargetIsSecure(pid: targetPid) else {
+      clearAxSpan()
+      return (false, "secure_field")
+    }
+    guard let signature = focusedTextElementSignature(pid: targetPid),
+          let range = focusedSelectedTextRange(pid: targetPid) else {
+      clearAxSpan()
+      return (false, "cursor_unverified")
+    }
+    axLocation = range.location
+    axTypedUtf16Length = range.length
+    axElementSignature = signature
+    axSuppressed = false
+    return (true, nil)
+  }
+
+  private func clearAxSpan() {
+    axLocation = nil
+    axTypedUtf16Length = 0
+    axElementSignature = nil
+  }
+
+  private func refreshTarget() -> [String: Any] {
+    if !partialText.isEmpty || partialTypingModeUsed != nil || partialTypingStrategyUsed != nil {
+      return sessionResponse(["ok": true, "applied": false, "skipped": "typing-started"])
+    }
+    guard captureFrontmostTarget() else {
+      clearAxSpan()
+      return ["ok": false, "error": "Dictation could not identify the target app.", "errorCode": "target_app"]
+    }
+    let capture = captureAxSpan()
+    if capture.errorCode == "secure_field" {
+      return ["ok": false, "error": "Dictation will not type into secure text fields.", "errorCode": "secure_field"]
+    }
+    return sessionResponse(["ok": true, "applied": false])
+  }
+
+  private func applyPartial(_ params: [String: Any]) -> [String: Any] {
+    guard let text = params["text"] as? String else {
+      return ["ok": false, "error": "Missing partial text", "errorCode": "invalid_request"]
+    }
+    guard hasEnabledPartialStrategy() else {
+      return sessionResponse(["ok": true, "applied": false])
+    }
+    let mode = partialMode()
+    let strategy = configuredStrategy(mode)
+    guard strategy != "disabled" else {
+      return sessionResponse(["ok": true, "applied": false])
+    }
+    let applied = applyStrategy(mode: mode, strategy: strategy, currentText: partialText, targetText: text, phase: "partial")
+    if applied {
+      partialText = text
+      partialTypingModeUsed = mode
+      partialTypingStrategyUsed = strategy
+      return sessionResponse(["ok": true, "applied": true])
+    }
+    return sessionResponse(["ok": true, "applied": false, "errorCode": "mutation_failed"])
+  }
+
+  private func applyFinal(_ params: [String: Any]) -> [String: Any] {
+    guard let text = params["text"] as? String else {
+      return ["ok": false, "error": "Missing final text", "errorCode": "invalid_request"]
+    }
+    let mode: String
+    let strategy: String
+    if !partialText.isEmpty, let usedMode = partialTypingModeUsed, let usedStrategy = partialTypingStrategyUsed {
+      mode = usedMode
+      strategy = usedStrategy
+    } else if hasAxSpan {
+      mode = "ax"
+      strategy = "full-replacement"
+    } else if allowBlindKeyboardFullPatch {
+      mode = "kb"
+      strategy = "full-patch"
+    } else {
+      return ["ok": false, "error": "Dictation could not safely type the final transcript because the target app, cursor, or selection could not be verified.", "errorCode": "mutation_failed"]
+    }
+
+    let applied = applyStrategy(mode: mode, strategy: strategy, currentText: partialText, targetText: text, phase: "final")
+    guard applied else {
+      return ["ok": false, "error": "Dictation could not safely type the final transcript because the target app, cursor, or selection could not be verified.", "errorCode": "mutation_failed"]
+    }
+
+    partialText = ""
+    partialTypingModeUsed = nil
+    partialTypingStrategyUsed = nil
+    clearAxSpan()
+    axSuppressed = false
+    return sessionResponse(["ok": true, "applied": true])
+  }
+
+  private func applyStrategy(
+    mode: String,
+    strategy: String,
+    currentText: String,
+    targetText: String,
+    phase: String
+  ) -> Bool {
+    if currentText == targetText { return true }
+    if mode == "ax" {
+      guard let location = axLocation,
+            let signature = axElementSignature,
+            let pid = targetPid else { return false }
+      let length = axTypedUtf16Length
+      let result: [String: Any]?
+      if strategy == "ax-verified" {
+        result = replaceTextRangeWithVerifiedSelection(
+          location: location,
+          length: length,
+          newText: targetText,
+          pid: pid,
+          expectedElementSignature: signature
+        )
+      } else {
+        result = replaceTextRangeAtomically(
+          location: location,
+          length: length,
+          newText: targetText,
+          pid: pid,
+          expectedElementSignature: signature
+        )
+      }
+      guard let result else {
+        axSuppressed = phase == "partial"
+        return false
+      }
+      axTypedUtf16Length = (result["textUtf16Length"] as? Int) ?? targetText.utf16.count
+      _ = refreshAxSignatureAfterMutation()
+      return true
+    }
+
+    if strategy == "ax-verified", hasAxSpan {
+      guard let location = axLocation,
+            let signature = axElementSignature,
+            let pid = targetPid,
+            let result = replaceTextRangeWithVerifiedSelection(
+              location: location,
+              length: axTypedUtf16Length,
+              newText: targetText,
+              pid: pid,
+              expectedElementSignature: signature
+            ) else {
+        return false
+      }
+      axTypedUtf16Length = (result["textUtf16Length"] as? Int) ?? targetText.utf16.count
+      _ = refreshAxSignatureAfterMutation()
+      return true
+    }
+
+    if strategy == "tail-only" {
+      guard targetText.hasPrefix(currentText) else { return false }
+      return postTextForKeyboardMutation(characterSuffix(targetText, droppingFirst: currentText.count))
+    }
+
+    return applyKeyboardPatch(currentText: currentText, targetText: targetText)
+  }
+
+  private func refreshAxSignatureAfterMutation() -> Bool {
+    guard let location = axLocation,
+          let pid = targetPid,
+          let range = focusedSelectedTextRange(pid: pid),
+          range.location == location + axTypedUtf16Length,
+          range.length == 0,
+          let signature = focusedTextElementSignature(pid: pid) else {
+      return false
+    }
+    axElementSignature = signature
+    return true
+  }
+
+  private func postTextForKeyboardMutation(_ text: String) -> Bool {
+    if text.isEmpty { return true }
+    let allowUnverified = !hasAxSpan && allowBlindKeyboardFullPatch
+    let expectedSignature = allowUnverified ? nil : axElementSignature
+    guard let targetPid else { return false }
+    guard frontmostMatchesPid(targetPid) else { return false }
+    guard !focusedTextTargetIsSecure(pid: targetPid) else { return false }
+    if !allowUnverified {
+      guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedSignature) else {
+        return false
+      }
+    }
+    return postUnicodeTextInChunks(
+      text,
+      chunkSize: allowUnverified ? blindKeyboardTextChunkSize : 16,
+      targetPid: targetPid,
+      expectedElementSignature: expectedSignature
+    )
+  }
+
+  private func deleteBackForKeyboardMutation(_ count: Int) -> Bool {
+    if count <= 0 { return true }
+    if count > maxKeyboardRepeatCount { return false }
+    let allowUnverified = !hasAxSpan && allowBlindKeyboardFullPatch
+    let expectedSignature = allowUnverified ? nil : axElementSignature
+    guard let targetPid else { return false }
+    guard frontmostMatchesPid(targetPid) else { return false }
+    guard !focusedTextTargetIsSecure(pid: targetPid) else { return false }
+    if !allowUnverified {
+      guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedSignature) else {
+        return false
+      }
+    }
+    return pressKeyRepeated(
+      keyCode: 51,
+      count: count,
+      delayMs: 3,
+      targetPid: targetPid,
+      expectedElementSignature: expectedSignature
+    )
+  }
+
+  private func applyKeyboardPatch(currentText: String, targetText: String) -> Bool {
+    if currentText == targetText { return true }
+    let commonLength = characterPrefixLength(currentText, targetText)
+    let deleteCount = currentText.count - commonLength
+    let insertText = characterSuffix(targetText, droppingFirst: commonLength)
+    guard deleteBackForKeyboardMutation(deleteCount) else { return false }
+    return postTextForKeyboardMutation(insertText)
+  }
+
+  private func startTargetTracking() -> [String: Any] {
+    if monitorTap != nil {
+      return sessionResponse(["ok": true])
+    }
+    let monitoredEventTypes: [CGEventType] = [
+      .mouseMoved,
+      .leftMouseDown,
+      .leftMouseUp,
+      .rightMouseDown,
+      .rightMouseUp,
+      .leftMouseDragged,
+      .rightMouseDragged,
+      .scrollWheel,
+      .keyDown,
+      .keyUp,
+      .flagsChanged,
+    ]
+    let mask = monitoredEventTypes.reduce(CGEventMask(0)) { partialResult, eventType in
+      partialResult | (CGEventMask(1) << Int(eventType.rawValue))
+    }
+    let userInfo = Unmanaged.passUnretained(self).toOpaque()
+    guard let tap = CGEvent.tapCreate(
+      tap: .cgSessionEventTap,
+      place: .headInsertEventTap,
+      options: .listenOnly,
+      eventsOfInterest: CGEventMask(mask),
+      callback: { _, type, event, refcon in
+        guard let refcon else { return Unmanaged.passUnretained(event) }
+        let server = Unmanaged<DictationSessionServer>.fromOpaque(refcon).takeUnretainedValue()
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+          server.emit([
+            "event": "monitor-disabled",
+            "reason": type == .tapDisabledByTimeout ? "timeout" : "user-input",
+          ])
+          return Unmanaged.passUnretained(event)
+        }
+
+        let sourcePid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        let sourceTag = event.getIntegerValueField(.eventSourceUserData)
+        if sourcePid == Int64(getpid()) || sourceTag == syntheticEventTag {
+          return Unmanaged.passUnretained(event)
+        }
+
+        var payload: [String: Any] = [
+          "event": "targetDirty",
+          "reason": "\(eventKind(type)):\(eventTypeName(type))",
+          "kind": eventKind(type),
+          "eventType": eventTypeName(type),
+        ]
+        if type == .keyDown || type == .keyUp || type == .flagsChanged {
+          payload["keyCode"] = event.getIntegerValueField(.keyboardEventKeycode)
+        }
+        server.emit(payload)
+        return Unmanaged.passUnretained(event)
+      },
+      userInfo: userInfo
+    ) else {
+      return ["ok": false, "error": "Unable to start dictation target monitor.", "errorCode": "input_monitoring"]
+    }
+
+    let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    CFRunLoopAddSource(mainRunLoop, source, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    monitorTap = tap
+    monitorSource = source
+    return sessionResponse(["ok": true])
+  }
+
+  private func stopTargetTracking() {
+    if let monitorTap {
+      CGEvent.tapEnable(tap: monitorTap, enable: false)
+    }
+    if let monitorSource {
+      CFRunLoopRemoveSource(mainRunLoop, monitorSource, .commonModes)
+    }
+    monitorTap = nil
+    monitorSource = nil
+  }
+}
+
 let args = CommandLine.arguments
 guard args.count >= 2 else {
   printJson(["ok": false, "error": "Missing command"])
@@ -965,6 +1532,10 @@ guard args.count >= 2 else {
 }
 
 switch args[1] {
+case "dictationSession":
+  let server = DictationSessionServer()
+  server.run()
+
 case "frontmostApplication":
   guard let info = frontmostApplicationInfo() else {
     printJson(["ok": false, "error": "Unable to identify frontmost application"])

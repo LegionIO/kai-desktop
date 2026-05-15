@@ -140,7 +140,7 @@ export function createDictationOverlay(): void {
 /**
  * Show the overlay (dictation started).
  */
-export async function showDictationOverlay(): Promise<void> {
+export async function showDictationOverlay(options?: { skipFocusCapture?: boolean }): Promise<void> {
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     createDictationOverlay();
   }
@@ -154,7 +154,9 @@ export async function showDictationOverlay(): Promise<void> {
     overlayWindow.showInactive();
     restoreDictationTargetFocusSoon();
   }
-  await beginDictationFocusSession();
+  if (!options?.skipFocusCapture) {
+    await beginDictationFocusSession();
+  }
 }
 
 /**

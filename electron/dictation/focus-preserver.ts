@@ -17,6 +17,7 @@ type FocusSnapshot = {
 
 let targetFocus: FocusSnapshot | null = null;
 let captureInFlight: Promise<void> | null = null;
+let externalFocusRefreshSuppressed = false;
 
 function appleString(value: string): string {
   const sanitized = value.replace(/[\u0000-\u001F\u007F]/g, ' ');
@@ -93,7 +94,19 @@ export async function beginDictationFocusSession(): Promise<void> {
   await refreshDictationTargetFocusNow();
 }
 
+export function setDictationTargetFocusSnapshot(snapshot: FocusSnapshot | null): void {
+  targetFocus = snapshot;
+}
+
+export function setDictationExternalFocusRefreshSuppressed(suppressed: boolean): void {
+  externalFocusRefreshSuppressed = suppressed;
+}
+
 export function refreshDictationTargetFocus(): void {
+  if (externalFocusRefreshSuppressed) {
+    dictationDebugLog('FOCUS_REFRESH_SUPPRESSED');
+    return;
+  }
   void refreshDictationTargetFocusNow();
 }
 

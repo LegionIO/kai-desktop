@@ -40,7 +40,12 @@ import {
   type DictationPatchPhase,
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
-import { getDictationTargetPid, recaptureDictationTargetFocus } from './focus-preserver.js';
+import {
+  getDictationTargetPid,
+  recaptureDictationTargetFocus,
+  setDictationExternalFocusRefreshSuppressed,
+  setDictationTargetFocusSnapshot,
+} from './focus-preserver.js';
 import {
   getPartialTypingStrategyForConfig,
   hasEnabledPartialTypingStrategy,
@@ -62,6 +67,12 @@ import {
   normalizeCleanupResponse,
 } from './dictation-safety.js';
 import { dictationDebugLog } from './debug-log.js';
+import {
+  DictationNativeSessionClient,
+  DictationNativeSessionError,
+  type DictationNativeSessionResponse,
+  type DictationNativeTypingMode,
+} from './native-session-client.js';
 
 const AX_DEBUG_ENABLED = process.env.KAI_DICTATION_AX_DEBUG === '1';
 function axDebug(msg: string): void {
@@ -187,9 +198,12 @@ let ipcHandlersRegistered = false;
 let sttCancellationStopRequested = false;
 let targetFocusMonitor: LocalMacosTakeoverMonitorHandle | null = null;
 let targetRefreshInterval: ReturnType<typeof setInterval> | null = null;
-let targetRefreshInFlight: Promise<void> | null = null;
+let targetRefreshQueued = false;
 let targetRefreshDirty = false;
+let targetRefreshReason: string | null = null;
 let lastTargetRefreshAt = 0;
+let nativeSession: DictationNativeSessionClient | null = null;
+let nativeSessionClosing = false;
 
 /** Maximum hold duration before auto-stop (5 minutes) */
 const HOLD_SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -425,6 +439,37 @@ function playDictationSound(kind: DictationSoundKind): void {
   }
 }
 
+function normalizeNativeTypingMode(mode: DictationNativeTypingMode | undefined): TypingMode {
+  return mode === 'ax' || mode === 'kb' || mode === 'idle' ? mode : 'idle';
+}
+
+function applyNativeSessionResponse(response: DictationNativeSessionResponse): void {
+  partialTypedText = typeof response.partialText === 'string' ? response.partialText : partialTypedText;
+  if (response.strategy === 'disabled' || response.strategy == null) {
+    if (!partialTypedText) {
+      partialTypingStrategyUsed = null;
+      partialTypingModeUsed = null;
+    }
+  } else {
+    partialTypingStrategyUsed = response.strategy;
+    partialTypingModeUsed = normalizeNativeTypingMode(response.typingMode) === 'idle'
+      ? null
+      : normalizeNativeTypingMode(response.typingMode) as PartialTypingMode;
+  }
+  axDictationSpan = response.capturedAx
+    ? axDictationSpan ?? { location: 0, typedUtf16Length: partialTypedText.length, pid: response.targetPid ?? null, elementSignature: 'native' }
+    : null;
+  axSuppressedUntilNextFinal = false;
+  broadcastTypingMode(normalizeNativeTypingMode(response.typingMode));
+}
+
+function handleNativeSessionExit(generation: number, message: string): void {
+  dictationDebugLog('NATIVE_SESSION_EXIT', { generation, message, state });
+  if (nativeSessionClosing || generation !== sessionGeneration || state === 'idle' || state === 'stopping') return;
+  broadcastError('Dictation native helper stopped unexpectedly. Dictation was stopped to avoid unsafe typing.');
+  void stopDictation();
+}
+
 async function startDictation(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
@@ -438,64 +483,49 @@ async function startDictation(): Promise<void> {
   try {
     axDebug(`--- SESSION START ---`);
 
-    // 1. Show overlay (this also captures + restores focus to the target app)
+    // 1. Start native dictation session before the overlay can affect focus.
     let phaseStartedAt = Date.now();
-    await showDictationOverlay();
+    nativeSessionClosing = false;
+    nativeSession = new DictationNativeSessionClient({
+      onTargetDirty: (reason) => scheduleTypingTargetRefresh(`native:${reason}`),
+      onProtocolError: (message) => dictationDebugLog('NATIVE_SESSION_PROTOCOL', { message }),
+      onExit: (message) => handleNativeSessionExit(generation, message),
+    });
+    await nativeSession.start();
+    const beginResponse = await nativeSession.beginSession({
+      partialTyping: config.partialTyping,
+      livePartials: config.livePartials,
+      allowBlindKeyboardFullPatch: canAllowBlindKeyboardFullPatchConfig(),
+      ownPid: process.pid,
+      ownAppName: __BRAND_PRODUCT_NAME,
+    });
+    applyNativeSessionResponse(beginResponse);
+    setDictationTargetFocusSnapshot(nativeSession.getTargetSnapshot(beginResponse));
+    setDictationExternalFocusRefreshSuppressed(true);
     dictationDebugLog('START_PHASE', {
       generation,
-      phase: 'overlay-focus',
+      phase: 'native-session',
       durationMs: Date.now() - phaseStartedAt,
+      targetPid: beginResponse.targetPid,
+      capturedAx: beginResponse.capturedAx,
+      mode: beginResponse.typingMode,
     });
     if (!isStartingSession(generation)) return;
 
+    // 2. Show overlay after native target capture; skip the old one-shot focus capture.
     phaseStartedAt = Date.now();
-    await ensureDictationTargetIdentified();
+    await showDictationOverlay({ skipFocusCapture: true });
     dictationDebugLog('START_PHASE', {
       generation,
-      phase: 'target-identify',
-      durationMs: Date.now() - phaseStartedAt,
-      targetPid: getDictationTargetPid(),
-    });
-    if (!isStartingSession(generation)) return;
-
-    phaseStartedAt = Date.now();
-    await assertLocalMacosAccessibilityTrusted();
-    dictationDebugLog('START_PHASE', {
-      generation,
-      phase: 'permissions',
+      phase: 'overlay',
       durationMs: Date.now() - phaseStartedAt,
     });
     if (!isStartingSession(generation)) return;
-
-    if (process.platform === 'darwin' && getDictationTargetPid() == null) {
-      throw new Error('Dictation could not identify the target app. Click into the field and try again.');
-    }
-
-    phaseStartedAt = Date.now();
-    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
-    dictationDebugLog('START_PHASE', {
-      generation,
-      phase: 'ax-capture',
-      durationMs: Date.now() - phaseStartedAt,
-      capturedAx: Boolean(axDictationSpan),
-      mode: getBroadcastTypingMode(),
-    });
-    if (!isStartingSession(generation)) return;
-    axDebug(`startDictation: initial capture result=${axDictationSpan ? `loc=${axDictationSpan.location}` : 'null'}`);
-    if (!axDictationSpan && lastAxCaptureFailedBecauseSecureTarget()) {
-      throw new Error('Dictation will not type into secure text fields.');
-    }
-    if (!axDictationSpan && !canUseBlindKeyboardFullPatch()) {
-      throw new Error('Dictation could not verify the target text cursor or selection. Click into a standard text field and try again.');
-    }
-    if (!axDictationSpan) {
-      axDebug('startDictation: proceeding with opt-in blind KX full-patch target');
-    }
 
     // Broadcast typing mode after overlay is visible so it receives the message
-    broadcastTypingMode(getActivePartialTypingMode());
+    broadcastTypingMode(normalizeNativeTypingMode(beginResponse.typingMode));
 
-    // 2. Start mic capture
+    // 3. Start mic capture
     phaseStartedAt = Date.now();
     await startMicCapture(config.inputDeviceId ?? undefined);
     dictationDebugLog('START_PHASE', {
@@ -509,7 +539,7 @@ async function startDictation(): Promise<void> {
       return;
     }
 
-    // 3. Start STT
+    // 4. Start STT
     phaseStartedAt = Date.now();
     await startStt();
     dictationDebugLog('START_PHASE', {
@@ -523,7 +553,7 @@ async function startDictation(): Promise<void> {
       return;
     }
 
-    // 4. Start polling mic audio and levels
+    // 5. Start polling mic audio and levels
     phaseStartedAt = Date.now();
     startAudioPolling();
     dictationDebugLog('START_PHASE', {
@@ -545,7 +575,7 @@ async function startDictation(): Promise<void> {
     playDictationSound('start');
     dictationDebugLog('SESSION_ACTIVE', {
       generation,
-      mode: getBroadcastTypingMode(),
+      mode: lastBroadcastedMode,
       targetPid: getDictationTargetPid(),
       initializationMs: Date.now() - initializationStartedAt,
     });
@@ -567,7 +597,7 @@ function isStartingSession(generation: number): boolean {
   return state === 'starting' && generation === sessionGeneration;
 }
 
-async function ensureDictationTargetIdentified(): Promise<void> {
+async function _ensureDictationTargetIdentified(): Promise<void> {
   if (process.platform !== 'darwin') return;
   for (let attempt = 0; attempt < START_TARGET_IDENTIFY_ATTEMPTS; attempt++) {
     if (getDictationTargetPid() != null) return;
@@ -632,23 +662,14 @@ function startTypingTargetTracking(): void {
   targetRefreshDirty = false;
 
   if (process.platform === 'darwin') {
-    try {
-      targetFocusMonitor = startLocalMacosTakeoverMonitor({
-        onEvent: (event) => {
-          if (event.kind === 'mouse' || event.kind === 'keyboard') {
-            scheduleTypingTargetRefresh(`${event.kind}:${event.eventType}${event.keyCode != null ? `:${event.keyCode}` : ''}`);
-          }
-        },
-        onError: (message) => {
-          dictationDebugLog('TARGET_MONITOR_ERROR', { message });
-        },
+    void nativeSession?.startTargetTracking()
+      .then(() => dictationDebugLog('TARGET_MONITOR_STARTED', { native: true }))
+      .catch((err) => {
+        dictationDebugLog('TARGET_MONITOR_START_FAILED', {
+          native: true,
+          message: err instanceof Error ? err.message : String(err),
+        });
       });
-      dictationDebugLog('TARGET_MONITOR_STARTED');
-    } catch (err) {
-      dictationDebugLog('TARGET_MONITOR_START_FAILED', {
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
   }
 
   targetRefreshInterval = setInterval(() => {
@@ -665,58 +686,75 @@ function stopTypingTargetTracking(): void {
     targetFocusMonitor.stop();
     targetFocusMonitor = null;
   }
+  void nativeSession?.stopTargetTracking().catch(() => {});
   if (targetRefreshInterval) {
     clearInterval(targetRefreshInterval);
     targetRefreshInterval = null;
   }
   targetRefreshDirty = false;
+  targetRefreshQueued = false;
+  targetRefreshReason = null;
 }
 
 function scheduleTypingTargetRefresh(reason: string): void {
   if (state !== 'active' && state !== 'starting') return;
   targetRefreshDirty = true;
-  if (targetRefreshInFlight) return;
+  targetRefreshReason = reason;
+  if (targetRefreshQueued) return;
 
-  targetRefreshInFlight = refreshTypingTargetSnapshot(reason)
-    .catch((err) => {
+  targetRefreshQueued = true;
+  const generation = sessionGeneration;
+  enqueueTyping(generation, 'target-refresh', async () => {
+    const refreshReason = targetRefreshReason ?? reason;
+    targetRefreshReason = null;
+    try {
+      if (targetRefreshDirty) {
+        await refreshTypingTargetSnapshot(refreshReason);
+      }
+    } catch (err) {
       dictationDebugLog('TARGET_REFRESH_ERROR', {
-        reason,
+        reason: refreshReason,
         message: err instanceof Error ? err.message : String(err),
       });
-    })
-    .finally(() => {
-      targetRefreshInFlight = null;
+    } finally {
+      targetRefreshQueued = false;
       if (targetRefreshDirty && (state === 'active' || state === 'starting')) {
         setTimeout(() => scheduleTypingTargetRefresh('queued-dirty'), 0);
       }
-    });
+    }
+  });
 }
 
 async function refreshTypingTargetSnapshot(reason: string): Promise<void> {
   targetRefreshDirty = false;
   const startedAt = Date.now();
-  const canApplyAxSnapshot = canRetargetBeforeFirstMutation('') && !axSuppressedUntilNextFinal;
-  const ok = await recaptureDictationTargetFocus();
-  let capturedAx = false;
-
-  if (ok && canApplyAxSnapshot) {
-    const span = await captureFocusedTextSelectionForAxRewrite();
-    axDictationSpan = span;
-    if (span) {
-      blindKeyboardPatchTargetPid = null;
-      capturedAx = true;
-    }
-    broadcastTypingMode(getBroadcastTypingMode());
+  if (!nativeSession || partialTypedText.length > 0 || partialTypingStrategyUsed || partialTypingModeUsed) {
+    lastTargetRefreshAt = Date.now();
+    dictationDebugLog('TARGET_REFRESH', {
+      reason,
+      ok: false,
+      pid: getDictationTargetPid(),
+      canApplyAxSnapshot: false,
+      capturedAx: false,
+      skipped: nativeSession ? 'typing-started' : 'no-native-session',
+      mode: lastBroadcastedMode,
+      durationMs: lastTargetRefreshAt - startedAt,
+    });
+    return;
   }
+
+  const response = await nativeSession.refreshTarget();
+  applyNativeSessionResponse(response);
+  setDictationTargetFocusSnapshot(nativeSession.getTargetSnapshot(response));
 
   lastTargetRefreshAt = Date.now();
   dictationDebugLog('TARGET_REFRESH', {
     reason,
-    ok,
+    ok: response.ok !== false,
     pid: getDictationTargetPid(),
-    canApplyAxSnapshot,
-    capturedAx,
-    mode: getBroadcastTypingMode(),
+    canApplyAxSnapshot: partialTypedText.length === 0,
+    capturedAx: response.capturedAx === true,
+    mode: response.typingMode,
     durationMs: lastTargetRefreshAt - startedAt,
   });
 }
@@ -730,6 +768,7 @@ async function finishSession(): Promise<void> {
   writeAudioChunksToStt(finalChunks);
   await stopStt();
   await waitForTypingQueueToSettle();
+  await endNativeSession();
   destroyRecorderWindow();
   resetSessionState();
 }
@@ -740,8 +779,25 @@ async function cleanupSession(): Promise<void> {
   stopTypingTargetTracking();
   await stopStt();
   await stopMicCapture();
+  await endNativeSession();
   destroyRecorderWindow();
   resetSessionState();
+}
+
+async function endNativeSession(): Promise<void> {
+  const session = nativeSession;
+  nativeSession = null;
+  if (!session) return;
+  nativeSessionClosing = true;
+  try {
+    await session.endSession();
+  } catch (err) {
+    dictationDebugLog('NATIVE_SESSION_END_FAILED', {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    nativeSessionClosing = false;
+  }
 }
 
 function resetSessionState(): void {
@@ -752,6 +808,9 @@ function resetSessionState(): void {
   keyboardPatchUnverifiedTargetText = null;
   blindKeyboardPatchTargetPid = null;
   lastAxCaptureFailureMessage = null;
+  targetRefreshQueued = false;
+  targetRefreshDirty = false;
+  targetRefreshReason = null;
   micSampleRateHz = AZURE_STT_SAMPLE_RATE_HZ;
   micDrainInFlight = false;
   levelPollInFlight = false;
@@ -762,6 +821,7 @@ function resetSessionState(): void {
   lastBroadcastedMode = 'idle';
   lastAxCaptureAttempt = 0;
   sttCancellationStopRequested = false;
+  setDictationExternalFocusRefreshSuppressed(false);
 }
 
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
@@ -1244,35 +1304,20 @@ function handlePartial(text: string): void {
   const enqueuedAt = Date.now();
   enqueueTyping(generation, 'partial', async () => {
     if (!queuedPartialGate.isCurrent(partialRevision)) return;
-    if (keyboardPatchStateUnverified) return;
-
-    if (!axSuppressedUntilNextFinal) {
-      await retargetCurrentTypingAnchorBeforeFirstMutation(partialTypedText);
-    }
+    if (!nativeSession) return;
     if (!queuedPartialGate.isCurrent(partialRevision)) return;
-
-    const mode = getActivePartialTypingMode();
-    const strategy = getPartialTypingStrategy(mode);
-    if (strategy === 'disabled') return;
     dictationDebugLog('PARTIAL_DEQUEUE', {
       revision: partialRevision,
       ageMs: Date.now() - enqueuedAt,
-      mode,
-      strategy,
+      mode: lastBroadcastedMode,
+      strategy: partialTypingStrategyUsed,
       currentLen: partialTypedText.length,
       targetLen: text.length,
     });
 
-    const applied = await applyPartialTypingStrategy(partialTypedText, text, 'partial', strategy, mode);
+    const response = await nativeSession.applyPartial(text);
     if (!isCurrentTypingSession(generation)) return;
-    if (!applied) {
-      handlePartialTypingFailure(mode, strategy);
-      return;
-    }
-
-    partialTypedText = text;
-    partialTypingStrategyUsed = strategy;
-    partialTypingModeUsed = mode;
+    applyNativeSessionResponse(response);
   });
 }
 
@@ -1305,28 +1350,22 @@ function handleFinal(text: string): void {
     }
 
     const finalWithSpace = finalText + ' ';
+    if (!nativeSession) return;
     let applied = true;
-    if (partialTypedText.length > 0 && partialTypingStrategyUsed && partialTypingModeUsed) {
-      applied = await applyPartialTypingStrategy(
-        partialTypedText,
-        finalWithSpace,
-        'final',
-        partialTypingStrategyUsed,
-        partialTypingModeUsed,
-      );
-      if (!applied) {
-        axDebug(`final strategy failed; refusing fallback strategy=${partialTypingStrategyUsed} mode=${partialTypingModeUsed}`);
-      }
-    } else {
-      if (!isCurrentTypingSession(generation)) return;
-      applied = await insertFinalTranscriptWithoutLivePartial(finalWithSpace);
+    let response: DictationNativeSessionResponse;
+    try {
+      response = await nativeSession.applyFinal(finalWithSpace);
+      applyNativeSessionResponse(response);
+    } catch (err) {
+      dictationDebugLog('FINAL_NATIVE_FAILED', {
+        message: err instanceof Error ? err.message : String(err),
+        errorCode: err instanceof DictationNativeSessionError ? err.errorCode : undefined,
+      });
+      applied = false;
+      response = {};
     }
     if (!isCurrentTypingSession(generation)) return;
-    if (!applied) {
-      if (keyboardPatchStateUnverified && await recoverUnverifiedKeyboardPatchState()) {
-        applied = true;
-      }
-    }
+    applied = applied && response.applied !== false;
     if (!applied) {
       clearUnverifiedKeyboardPatchState();
       resetPartialTypingProgress();
@@ -1334,9 +1373,6 @@ function handleFinal(text: string): void {
       broadcastFinalTypingFailure();
       return;
     }
-    partialTypedText = '';
-    partialTypingStrategyUsed = null;
-    partialTypingModeUsed = null;
     clearUnverifiedKeyboardPatchState();
     blindKeyboardPatchTargetPid = null;
     axDictationSpan = null;
@@ -1358,7 +1394,7 @@ function resetPartialTypingProgress(): void {
   broadcastTypingMode(getBroadcastTypingMode());
 }
 
-function handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTypingStrategy): void {
+function _handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTypingStrategy): void {
   axDebug(`partial strategy failed mode=${mode} strategy=${strategy}`);
   if (mode === 'kb' && strategy === 'full-patch' && keyboardPatchStateUnverified) {
     partialTypingStrategyUsed = strategy;
@@ -1367,7 +1403,7 @@ function handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTy
   }
 }
 
-async function insertFinalTranscriptWithoutLivePartial(finalText: string): Promise<boolean> {
+async function _insertFinalTranscriptWithoutLivePartial(finalText: string): Promise<boolean> {
   const hasTypingAnchor = await retargetCurrentTypingAnchor();
   if (hasTypingAnchor && axDictationSpan && await replaceDictatedTextViaAxWithCapture('', finalText, 'final')) {
     return true;
@@ -1524,7 +1560,7 @@ function getPartialTypingStrategy(mode: PartialTypingMode): PartialTypingStrateg
   return getPartialTypingStrategyForConfig(config, mode);
 }
 
-async function applyPartialTypingStrategy(
+async function _applyPartialTypingStrategy(
   currentText: string,
   targetText: string,
   phase: DictationPatchPhase,
@@ -1682,6 +1718,10 @@ async function applyTailOnlyDictationPatch(
 function canUseBlindKeyboardFullPatch(): boolean {
   return getPartialTypingStrategy('kb') === 'full-patch'
     && (process.platform !== 'darwin' || getDictationTargetPid() != null);
+}
+
+function canAllowBlindKeyboardFullPatchConfig(): boolean {
+  return getPartialTypingStrategy('kb') === 'full-patch';
 }
 
 function lastAxCaptureFailedBecauseSecureTarget(): boolean {
@@ -1891,7 +1931,7 @@ async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpa
   }
 }
 
-async function assertLocalMacosAccessibilityTrusted(): Promise<void> {
+async function _assertLocalMacosAccessibilityTrusted(): Promise<void> {
   if (process.platform !== 'darwin') return;
   try {
     const permissions = await runDictationHelperCommand(['permissions'], 'permissions');

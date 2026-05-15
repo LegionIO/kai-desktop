@@ -50,4 +50,29 @@ describe('dictation focus preserver', () => {
     expect(focusPreserver.getDictationTargetPid()).toBe(2222);
     expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledTimes(3);
   });
+
+  it('suppresses external overlay focus refresh while manager-owned refresh is active', async () => {
+    mocks.helperResults.push(
+      { ok: true, bundleId: 'com.apple.TextEdit', name: 'TextEdit', pid: 1111 },
+      { ok: true, bundleId: 'com.apple.Notes', name: 'Notes', pid: 2222 },
+    );
+
+    const focusPreserver = await import('../focus-preserver.js');
+    await focusPreserver.beginDictationFocusSession();
+
+    focusPreserver.setDictationExternalFocusRefreshSuppressed(true);
+    focusPreserver.refreshDictationTargetFocus();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(focusPreserver.getDictationTargetPid()).toBe(1111);
+    expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledTimes(1);
+
+    focusPreserver.setDictationExternalFocusRefreshSuppressed(false);
+    focusPreserver.refreshDictationTargetFocus();
+
+    await vi.waitFor(() => {
+      expect(focusPreserver.getDictationTargetPid()).toBe(2222);
+    });
+    expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledTimes(2);
+  });
 });
