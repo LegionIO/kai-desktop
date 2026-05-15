@@ -6,7 +6,6 @@ import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 import { ProfileSettings } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
 import { MastraRuntimeSettings } from './MastraRuntimeSettings';
-import { UsageDashboard } from './UsageDashboard';
 
 export type Provider = {
   type: string;
@@ -37,7 +36,7 @@ type CatalogEntry = {
   preferredTarget?: 'isolated-browser' | 'local-macos';
 };
 
-type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts' | 'usage';
+type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts';
 
 export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const [activeTab, setActiveTab] = useState<ModelTab>('profiles');
@@ -48,7 +47,6 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
     { key: 'providers', label: 'Providers' },
     { key: 'catalog', label: 'Catalog' },
     { key: 'prompts', label: 'Prompts' },
-    { key: 'usage', label: 'Usage' },
   ];
 
   return (
@@ -89,7 +87,6 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       {activeTab === 'providers' && <ProvidersContent config={config} updateConfig={updateConfig} />}
       {activeTab === 'catalog' && <CatalogContent config={config} updateConfig={updateConfig} />}
       {activeTab === 'prompts' && <PromptsContent config={config} updateConfig={updateConfig} />}
-      {activeTab === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} hideTitle />}
     </div>
   );
 };
