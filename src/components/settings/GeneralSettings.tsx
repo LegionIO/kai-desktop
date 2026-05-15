@@ -1,7 +1,7 @@
 import { type FC, useState, useEffect, useCallback } from 'react';
 import { Trash2Icon, LoaderIcon, CheckCircle2Icon, AlertTriangleIcon, HardDriveIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { Toggle, NumberField, settingsSelectClass, type SettingsProps } from './shared';
+import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
 export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const ui = config.ui as {
@@ -13,12 +13,8 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
   };
   const titleGen = (config.titleGeneration as {
     enabled?: boolean;
-    retitleIntervalMessages?: number;
-    retitleEagerUntilMessage?: number;
   } | undefined) ?? {};
   const titleGenEnabled = titleGen.enabled ?? true;
-  const titleInterval = titleGen.retitleIntervalMessages ?? 5;
-  const titleEager = titleGen.retitleEagerUntilMessage ?? 3;
 
   return (
     <div className="space-y-6">
@@ -81,25 +77,6 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
         <p className="text-[10px] text-muted-foreground -mt-2">
           Use AI to title and refresh conversations automatically. Manually renamed chats are never overwritten.
         </p>
-        {titleGenEnabled && (
-          <>
-            <NumberField
-              label="Refresh every N user messages"
-              value={titleInterval}
-              onChange={(v) => updateConfig('titleGeneration.retitleIntervalMessages', Math.max(1, v || 1))}
-              min={1}
-            />
-            <NumberField
-              label="Eagerly refresh for the first N messages"
-              value={titleEager}
-              onChange={(v) => updateConfig('titleGeneration.retitleEagerUntilMessage', Math.max(0, v || 0))}
-              min={0}
-            />
-            <p className="text-[10px] text-muted-foreground -mt-2">
-              Eager refresh catches early topic drift; interval refresh keeps long chats titled sensibly.
-            </p>
-          </>
-        )}
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">

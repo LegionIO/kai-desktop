@@ -1375,7 +1375,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       input,
       config,
       modelKey,
-      inferenceProvider: pluginManager?.getInferenceProvider() ?? null,
     });
 
     return { title };

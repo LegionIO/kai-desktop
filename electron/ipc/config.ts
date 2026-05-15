@@ -113,8 +113,6 @@ function getDefaultConfig() {
     },
     titleGeneration: {
       enabled: true,
-      retitleIntervalMessages: 5,
-      retitleEagerUntilMessage: 3,
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,

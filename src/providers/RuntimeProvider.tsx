@@ -930,16 +930,8 @@ async function persistConversation(
 
 // --- Title generation logic ---
 
-// Retitle cadence defaults (used when config.titleGeneration is absent).
-// Intent: eagerly refine early (topic usually crystallizes in the first few
-// turns), then refresh periodically.
-const DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE = 3;
-const DEFAULT_RETITLE_INTERVAL_MESSAGES = 5;
-
 type TitleGenerationSettings = {
   enabled: boolean;
-  retitleIntervalMessages: number;
-  retitleEagerUntilMessage: number;
 };
 
 async function getTitleGenerationSettings(): Promise<TitleGenerationSettings> {
@@ -948,14 +940,10 @@ async function getTitleGenerationSettings(): Promise<TitleGenerationSettings> {
     const tg = config?.titleGeneration ?? {};
     return {
       enabled: tg.enabled ?? true,
-      retitleIntervalMessages: Math.max(1, tg.retitleIntervalMessages ?? DEFAULT_RETITLE_INTERVAL_MESSAGES),
-      retitleEagerUntilMessage: Math.max(0, tg.retitleEagerUntilMessage ?? DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE),
     };
   } catch {
     return {
       enabled: true,
-      retitleIntervalMessages: DEFAULT_RETITLE_INTERVAL_MESSAGES,
-      retitleEagerUntilMessage: DEFAULT_RETITLE_EAGER_UNTIL_MESSAGE,
     };
   }
 }
@@ -966,18 +954,17 @@ const titleGenInFlight = new Set<string>();
 
 /** Update only specific fields on a conversation without overwriting message data.
  *  Reads the latest record from disk immediately before writing to minimize race windows. */
-async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
+async function updateConversation(
+  conversationId: string,
+  createPatch: (latest: ConversationRecord) => Partial<ConversationRecord>,
+): Promise<void> {
   const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
   if (!latest) return;
-  // If the patch doesn't touch runStatus and the latest value is 'idle', preserve
-  // 'idle' — don't let a stale read of 'running' clobber a done-handler's idle write.
-  const merged = { ...latest, ...patch };
-  if (!('runStatus' in patch) && latest.runStatus === 'running' && merged.runStatus === 'running') {
-    // Re-read to get the freshest runStatus rather than trusting the stale latest
-    const fresh = await app.conversations.get(conversationId) as ConversationRecord | null;
-    if (fresh && fresh.runStatus === 'idle') merged.runStatus = 'idle';
-  }
-  await app.conversations.put(merged);
+  await app.conversations.put({ ...latest, ...createPatch(latest) });
+}
+
+async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
+  await updateConversation(conversationId, () => patch);
 }
 
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
@@ -995,15 +982,10 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
     const userMessageCount = messages.filter((m) => m.role === 'user').length;
     if (userMessageCount < 1) return;
 
-    // Retitle cadence:
-    //   - always run on the first user message,
-    //   - eagerly refine for the first few messages (quick topic drift),
-    //   - then every N user messages thereafter,
-    //   - plus a retry if generation failed and no title/fallbackTitle landed.
+    // Only generate a title when the conversation has none yet.
+    // Never re-generate after the initial title is set.
     const hasNoTitle = !conv.title?.trim() && !conv.fallbackTitle?.trim();
-    const isEager = userMessageCount <= settings.retitleEagerUntilMessage;
-    const isOnInterval = userMessageCount % settings.retitleIntervalMessages === 0;
-    if (!isEager && !isOnInterval && !hasNoTitle) return;
+    if (!hasNoTitle) return;
 
     // Dedup: don't regenerate if we already did for this exact user message count
     const lastCount = lastRetitleCount.get(conversationId);
@@ -1792,16 +1774,15 @@ export function RuntimeProvider({
         if (claudeSdkSessionId || codexSdkThreadId) {
           // Merge into existing metadata rather than replacing it wholesale.
           void (async () => {
-            const latest = await app.conversations.get(convId) as ConversationRecord | null;
-            if (!latest) return;
-            const existingMeta = (latest.metadata ?? {}) as Record<string, unknown>;
-            await app.conversations.put({
-              ...latest,
-              metadata: {
-                ...existingMeta,
-                ...(claudeSdkSessionId ? { claudeSdkSessionId } : {}),
-                ...(codexSdkThreadId ? { codexSdkThreadId } : {}),
-              },
+            await updateConversation(convId, (latest) => {
+              const existingMeta = (latest.metadata ?? {}) as Record<string, unknown>;
+              return {
+                metadata: {
+                  ...existingMeta,
+                  ...(claudeSdkSessionId ? { claudeSdkSessionId } : {}),
+                  ...(codexSdkThreadId ? { codexSdkThreadId } : {}),
+                },
+              };
             });
           })();
         }

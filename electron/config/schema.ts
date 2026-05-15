@@ -187,8 +187,6 @@ const systemPromptsConfigSchema = z.object({
 
 const titleGenerationConfigSchema = z.object({
   enabled: z.boolean(),
-  retitleIntervalMessages: z.number().positive(),
-  retitleEagerUntilMessage: z.number().nonnegative(),
 });
 
 const fallbackConfigSchema = z.object({
