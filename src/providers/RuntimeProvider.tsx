@@ -969,7 +969,15 @@ const titleGenInFlight = new Set<string>();
 async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
   const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
   if (!latest) return;
-  await app.conversations.put({ ...latest, ...patch });
+  // If the patch doesn't touch runStatus and the latest value is 'idle', preserve
+  // 'idle' — don't let a stale read of 'running' clobber a done-handler's idle write.
+  const merged = { ...latest, ...patch };
+  if (!('runStatus' in patch) && latest.runStatus === 'running' && merged.runStatus === 'running') {
+    // Re-read to get the freshest runStatus rather than trusting the stale latest
+    const fresh = await app.conversations.get(conversationId) as ConversationRecord | null;
+    if (fresh && fresh.runStatus === 'idle') merged.runStatus = 'idle';
+  }
+  await app.conversations.put(merged);
 }
 
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
@@ -1956,6 +1964,16 @@ export function RuntimeProvider({
           return;
         }
         finalizeAssistantResponse(acc);
+        // Apply messageMeta from the done event (e.g. sourceModel reported by
+        // an inference provider) to the last assistant message before persisting.
+        if (e.messageMeta && Object.keys(e.messageMeta).length > 0) {
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          const last = branch[branch.length - 1];
+          if (last?.role === 'assistant') {
+            const idx = acc.messages.findIndex((m) => m.id === last.id);
+            if (idx >= 0) acc.messages[idx] = applyAssistantMessageMeta(acc.messages[idx], e.messageMeta);
+          }
+        }
         const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
