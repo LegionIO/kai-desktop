@@ -19,7 +19,7 @@ import { registerLiveSttHandlers } from './audio/live-stt.js';
 import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
 import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
-import { registerRuntime } from './agent/runtime/index.js';
+import { registerRuntime, setPluginRuntimesSource } from './agent/runtime/index.js';
 import { MastraRuntime } from './agent/runtime/mastra-runtime.js';
 import { ClaudeAgentRuntime } from './agent/runtime/claude-agent-runtime.js';
 import { CodexRuntime } from './agent/runtime/codex-runtime.js';
@@ -556,7 +556,7 @@ if (gotSingleInstanceLock) {
       if (newCliToolsFp !== lastCliToolsFingerprint) {
         lastCliToolsFingerprint = newCliToolsFp;
         void shellPathReady.then(() => {
-          const cliTools = buildCliTools(getConfig);
+          const cliTools = buildCliTools(getConfig, pluginManager.getPluginCliTools());
           updateCliTools(cliTools);
           syncRealtimeTools();
           console.info(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload: ${cliTools.length} tools`);
@@ -717,10 +717,23 @@ if (gotSingleInstanceLock) {
     registerRuntime(new ClaudeAgentRuntime());
     registerRuntime(new CodexRuntime());
 
+    // Wire plugin runtime contributions into the runtime registry
+    setPluginRuntimesSource(() => pluginManager.getPluginRuntimes());
+
     // Listen for plugin tool changes before plugin activation so early registrations are not missed
     pluginManager.onToolsChanged((pluginTools) => {
       updatePluginTools(pluginTools);
       syncRealtimeTools();
+    });
+
+    // Rebuild CLI tools when a plugin contributes a new CLI tool
+    pluginManager.onCliToolsChanged(() => {
+      void shellPathReady.then(() => {
+        const cliTools = buildCliTools(getConfig, pluginManager.getPluginCliTools());
+        updateCliTools(cliTools);
+        syncRealtimeTools();
+        console.info(`[${__BRAND_PRODUCT_NAME}] Plugin CLI tools updated: ${cliTools.length} tools`);
+      });
     });
 
     // File dialog handler

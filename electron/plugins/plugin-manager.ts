@@ -30,6 +30,8 @@ import type {
   PluginAPI,
   PluginPermission,
   PluginInferenceProvider,
+  PluginRuntimeContribution,
+  PluginCliToolContribution,
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
@@ -91,6 +93,7 @@ export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
+  private cliToolChangeCallback: (() => void) | null = null;
   private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> = new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
@@ -361,6 +364,8 @@ export class PluginManager {
       configChangeListeners: [],
       rendererBuild: null,
       inferenceProvider: null,
+      contributedRuntimes: [],
+      contributedCliTools: [],
     };
 
     this.plugins.set(manifest.name, instance);
@@ -433,6 +438,7 @@ export class PluginManager {
         },
         onUIStateChanged: () => this.broadcastUIState(),
         onToolsChanged: () => this.notifyToolsChanged(),
+        onCliToolsChanged: () => this.notifyCliToolsChanged(),
         registerActionHandler: (targetId, handler) => {
           this.registerActionHandler(manifest.name, targetId, handler);
         },
@@ -656,6 +662,17 @@ export class PluginManager {
     mkdirSync(dir, { recursive: true });
     writeFileSync(settingsPath, JSON.stringify(validated, null, 2), 'utf-8');
     this.broadcastUIState();
+
+    // Fire the plugin's own config-change listeners so api.config.onChanged
+    // callbacks are triggered when plugin settings change (not just app config).
+    const appConfig = this.getConfig();
+    for (const listener of instance.configChangeListeners) {
+      try {
+        listener(appConfig);
+      } catch (err) {
+        console.error(`[PluginManager] Error in plugin "${pluginName}" config listener:`, err);
+      }
+    }
   }
 
   /* ── Config Change Forwarding ── */
@@ -702,6 +719,14 @@ export class PluginManager {
     this.toolChangeCallback?.(this.getAllPluginTools());
   }
 
+  onCliToolsChanged(callback: () => void): void {
+    this.cliToolChangeCallback = callback;
+  }
+
+  private notifyCliToolsChanged(): void {
+    this.cliToolChangeCallback?.();
+  }
+
   /* ── Message Hooks ── */
 
   /* ── Inference Provider ── */
@@ -714,6 +739,28 @@ export class PluginManager {
       }
     }
     return null;
+  }
+
+  /* ── Plugin Runtime Contributions ── */
+
+  getPluginRuntimes(): PluginRuntimeContribution[] {
+    const result: PluginRuntimeContribution[] = [];
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      result.push(...instance.contributedRuntimes);
+    }
+    return result;
+  }
+
+  /* ── Plugin CLI Tool Contributions ── */
+
+  getPluginCliTools(): PluginCliToolContribution[] {
+    const result: PluginCliToolContribution[] = [];
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      result.push(...instance.contributedCliTools);
+    }
+    return result;
   }
 
   async runPreSendHooks(args: PreSendHookArgs): Promise<PreSendHookResult> {
@@ -884,6 +931,15 @@ export class PluginManager {
       notifications,
       requiredPluginsReady,
       brandRequiredPluginNames: [...this.brandRequiredPluginNames],
+      contributedCliTools: this.getPluginCliTools().map((tool) => {
+        // Find which plugin contributed this tool
+        for (const instance of this.plugins.values()) {
+          if (instance.contributedCliTools.some((t) => t.name === tool.name)) {
+            return { ...tool, pluginName: instance.manifest.name };
+          }
+        }
+        return { ...tool, pluginName: 'unknown' };
+      }),
     };
   }
 

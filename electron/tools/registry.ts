@@ -172,7 +172,7 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
   // Only included if the binary exists on the system
   if (config?.tools?.shell?.enabled !== false) {
     await primeResolvedShellPath();
-    tools.push(...buildCliTools(getConfig));
+    tools.push(...buildCliTools(getConfig, pluginManager?.getPluginCliTools() ?? []));
   }
 
   // NOTE: File tools (read, write, edit, grep, glob, list_directory) and shell (sh)

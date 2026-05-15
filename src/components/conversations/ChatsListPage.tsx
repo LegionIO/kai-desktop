@@ -21,6 +21,7 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
@@ -92,6 +93,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   onNewConversation,
   workspaceId,
 }) => {
+  const fullWidth = useFullWidthContent();
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -335,7 +337,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
       {/* Fixed toolbar: search + filter + sort only */}
       <div className="shrink-0 pt-6 pb-2">
-        <div className="mx-auto max-w-3xl px-4">
+        <div className={cn('mx-auto w-full px-4', !fullWidth && 'max-w-3xl')}>
           <div className="flex items-center gap-2">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
               <SearchIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -492,7 +494,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
         {/* Selection bar floats above the list */}
         {isSelecting && (
-          <div className="absolute inset-x-0 top-0 z-20 mx-auto max-w-3xl px-4 h-8 flex items-center">
+          <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center', !fullWidth && 'max-w-3xl')}>
             <button
               type="button"
               onClick={toggleSelectAll}
@@ -547,7 +549,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
         )}
 
         <div className="h-full overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-4 pt-10 pb-6">
+          <div className={cn('mx-auto w-full px-4 pt-10 pb-6', !fullWidth && 'max-w-3xl')}>
 
             {/* Conversation rows */}
             <div className="flex flex-col">

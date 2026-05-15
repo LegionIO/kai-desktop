@@ -433,8 +433,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           for await (const event of providerStream) {
             if (controller.signal.aborted && event.type !== 'done') continue;
             if (event.type === 'text-delta') emittedTextDelta = true;
-            broadcastStreamEvent({ ...event, conversationId });
-            if (event.type === 'done') break;
+
+            // Stamp runtimeId on every event so the UI popover shows the
+            // inference provider name regardless of whether the stream ends
+            // with a normal done, an error, or an early abort.
+            const eventWithMeta = (() => {
+              const ev = event as Record<string, unknown>;
+              const existingMeta = (ev.messageMeta as Record<string, unknown> | undefined) ?? {};
+              return { ...event, conversationId, messageMeta: { ...existingMeta, runtimeId: inferenceProvider.name } };
+            })();
+
+            if (event.type === 'done') {
+              broadcastStreamEvent(eventWithMeta as typeof event);
+              break;
+            }
+
+            broadcastStreamEvent(eventWithMeta as typeof event);
           }
 
           // Provider handled the request — clean up and exit
@@ -446,12 +460,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (emittedTextDelta) {
             // Already started streaming text — can't fall back mid-response
             console.error(`[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed after emitting text:`, providerError);
+            const meta = { runtimeId: inferenceProvider.name };
             broadcastStreamEvent({
               conversationId,
               type: 'error',
               error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
+              messageMeta: meta,
             });
-            broadcastStreamEvent({ conversationId, type: 'done' });
+            broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
             activeStreams.delete(conversationId);
             activeStreamModelKeys.delete(conversationId);
             activeObserverSessions.delete(conversationId);
@@ -1359,7 +1375,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       input,
       config,
       modelKey,
-      inferenceProvider: pluginManager?.getInferenceProvider() ?? null,
     });
 
     return { title };
@@ -1430,6 +1445,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   ipcMain.handle('agent:get-active-runtime', async () => {
     const { getActiveRuntimeId } = await import('../agent/runtime/index.js');
     try {
+      // If a plugin inference provider is active and available, it is the
+      // effective runtime from the user's perspective — report its name.
+      const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
+      if (inferenceProvider && inferenceProvider.isAvailable()) {
+        return inferenceProvider.name;
+      }
       const config = readEffectiveConfig(appHome);
       return getActiveRuntimeId(config);
     } catch {

@@ -1,14 +1,17 @@
 /**
  * Shared title generation logic used by both chat and task title generators.
  *
- * Supports plugin inference providers, Mastra Agent fallback, retry with backoff,
- * and configurable prompts/word limits for different use cases.
+ * Makes a direct language model call — bypasses all runtimes entirely.
+ * Title generation is a simple single-turn completion; it doesn't need
+ * tools, memory, or streaming.
+ *
+ * Fallback order: haiku-class model → thread model → first catalog entry.
  */
 
 import { resolveModelCatalog, resolveModelForThread, type ModelCatalogEntry } from './model-catalog.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import type { AppConfig } from '../config/schema.js';
-import type { PluginInferenceProvider } from '../plugins/types.js';
+import { generateText } from 'ai';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -25,8 +28,6 @@ export interface TitleGenerationOptions {
   config: AppConfig;
   /** Optional model key to prefer (e.g. the thread's model). */
   modelKey?: string | null;
-  /** Optional plugin inference provider (tried first before Mastra fallback). */
-  inferenceProvider?: PluginInferenceProvider | null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -36,23 +37,25 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Resolve the best model for title generation — prefers Haiku for speed,
- * falls back to the thread's model or catalog default.
+ * Resolve the best model for title generation.
+ *
+ * Priority: haiku-class model → thread model → first catalog entry.
  */
 export function resolveTitleModel(
   config: AppConfig,
   threadModelKey: string | null,
 ): ModelCatalogEntry | null {
   const catalog = resolveModelCatalog(config);
+
+  const haiku = catalog.entries.find((e) =>
+    e.modelConfig.modelName.toLowerCase().includes('haiku'),
+  );
+  if (haiku) return haiku;
+
   const threadEntry = resolveModelForThread(config, threadModelKey);
+  if (threadEntry) return threadEntry;
 
-  const matchingHaiku = catalog.entries.find((entry) => {
-    const modelName = entry.modelConfig.modelName.toLowerCase();
-    return modelName.includes('haiku');
-  });
-
-  if (matchingHaiku) return matchingHaiku;
-  return threadEntry;
+  return catalog.entries[0] ?? null;
 }
 
 /**
@@ -97,11 +100,12 @@ export function isRetryableTitleGenerationError(error: unknown): boolean {
 /**
  * Generate a short title from the given input text.
  *
- * Tries the plugin inference provider first (if available), then falls back
- * to a Mastra Agent with retry logic on transient errors.
+ * Calls the language model directly via the Vercel AI SDK — no runtime,
+ * no inference provider, no memory, no tools. Works identically regardless
+ * of which agent runtime is active for the conversation.
  */
 export async function generateTitle(opts: TitleGenerationOptions): Promise<string | null> {
-  const { systemPrompt, input, config, inferenceProvider } = opts;
+  const { systemPrompt, input, config } = opts;
   const maxWords = opts.maxWords ?? 4;
   const maxChars = opts.maxChars ?? 80;
 
@@ -110,49 +114,18 @@ export async function generateTitle(opts: TitleGenerationOptions): Promise<strin
   const modelEntry = resolveTitleModel(config, opts.modelKey ?? null);
   if (!modelEntry) return null;
 
-  // ── Try plugin inference provider first ──────────────────────────────
-  if (inferenceProvider) {
-    try {
-      let titleText = '';
-      const providerStream = inferenceProvider.stream({
-        conversationId: `title-gen-${Date.now()}`,
-        messages: [{ role: 'user', content: input }],
-        modelKey: modelEntry.key,
-        systemPrompt,
-        abortSignal: undefined,
-      });
-
-      for await (const event of providerStream) {
-        if (event.type === 'text-delta' && event.text) {
-          titleText += event.text;
-        }
-        if (event.type === 'done' || event.type === 'error') break;
-      }
-
-      const title = normalizeGeneratedTitle(titleText, maxWords, maxChars);
-      if (title) return title;
-    } catch (error) {
-      console.warn('[TitleGen] Plugin inference provider failed, falling back to Mastra:', error);
-    }
-  }
-
-  // ── Mastra Agent fallback with retry ────────────────────────────────
   try {
-    const { Agent } = await import('@mastra/core/agent');
     const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
-    type AgentConfig = ConstructorParameters<typeof Agent>[0];
-
-    const agent = new Agent({
-      id: `title-gen-${Date.now()}`,
-      name: 'title-generator',
-      instructions: systemPrompt,
-      model: model as AgentConfig['model'],
-    });
 
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const result = await agent.generate(input, { maxSteps: 1 });
+        const result = await generateText({
+          model,
+          system: systemPrompt,
+          prompt: input,
+          maxOutputTokens: 30,
+        });
         const rawTitle = typeof result.text === 'string' ? result.text : null;
         return normalizeGeneratedTitle(rawTitle, maxWords, maxChars);
       } catch (error) {

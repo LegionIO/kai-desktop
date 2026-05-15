@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { RefreshCwIcon, DownloadIcon, PackageIcon, LoaderIcon, AlertCircleIcon, SearchIcon, XIcon, CheckIcon, ArrowUpCircleIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
-import { Tooltip } from '@/components/ui/Tooltip';
 import { cn } from '@/lib/utils';
+import { Tooltip } from '@/components/ui/Tooltip';
+import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 
 type MarketplaceEntry = {
   name: string;
@@ -39,6 +40,7 @@ function parseAuthor(author?: string): { name: string; url?: string } | null {
 }
 
 export const PluginMarketplace: FC = () => {
+  const fullWidth = useFullWidthContent();
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
@@ -134,7 +136,7 @@ export const PluginMarketplace: FC = () => {
   return (
     <div className="relative z-20 flex flex-col h-full min-h-0">
       <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-4 pt-6 pb-6">
+        <div className={cn('mx-auto w-full px-4 pt-6 pb-6', !fullWidth && 'max-w-3xl')}>
           {/* Glass card wrapping everything */}
           <div className="rounded-2xl border border-border/40 bg-background/85 backdrop-blur-xl overflow-hidden">
 

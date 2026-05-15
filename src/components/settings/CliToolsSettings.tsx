@@ -7,10 +7,13 @@ import {
   CheckCircle2Icon,
   AlertCircleIcon,
   TerminalIcon,
+  PackageIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { EditableInput } from '@/components/EditableInput';
 import { Toggle, type SettingsProps } from './shared';
+import { usePlugins } from '@/providers/PluginProvider';
+import type { PluginContributedCliTool } from '@/providers/PluginProvider';
 
 type CliTool = {
   name: string;
@@ -27,6 +30,10 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   const [showAdd, setShowAdd] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
   const [binaryStatus, setBinaryStatus] = useState<Record<string, boolean>>({});
+  const [pluginBinaryStatus, setPluginBinaryStatus] = useState<Record<string, boolean>>({});
+
+  const { uiState } = usePlugins();
+  const contributedTools: PluginContributedCliTool[] = uiState?.contributedCliTools ?? [];
 
   useEffect(() => {
     const allBinaries = [...new Set(tools.flatMap((t) => [t.binary, ...(t.extraBinaries ?? [])]))];
@@ -34,6 +41,14 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       app.cliTools.checkBinaries(allBinaries).then(setBinaryStatus).catch(() => {});
     }
   }, [tools]);
+
+  useEffect(() => {
+    if (contributedTools.length === 0) return;
+    const allBinaries = [...new Set(contributedTools.flatMap((t) => [t.binary, ...(t.extraBinaries ?? [])]))];
+    if (allBinaries.length > 0 && app.cliTools?.checkBinaries) {
+      app.cliTools.checkBinaries(allBinaries).then(setPluginBinaryStatus).catch(() => {});
+    }
+  }, [contributedTools]);
 
   const updateTools = (newTools: CliTool[]) => updateConfig('cliTools', newTools);
 
@@ -120,6 +135,64 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           <PlusIcon className="h-3.5 w-3.5" />
           Add CLI Tool
         </button>
+      )}
+
+      {/* Plugin-contributed tools (read-only) */}
+      {contributedTools.length > 0 && (
+        <div className="space-y-2 pt-2">
+          <div className="flex items-center gap-1.5">
+            <PackageIcon className="h-3 w-3 text-muted-foreground" />
+            <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">Plugin Tools</span>
+          </div>
+          {contributedTools.map((tool) => (
+            <PluginToolCard
+              key={`${tool.pluginName}:${tool.name}`}
+              tool={tool}
+              binaryFound={pluginBinaryStatus[tool.binary] ?? false}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ── Plugin Tool Card (read-only, no edit/delete) ── */
+
+const PluginToolCard: FC<{
+  tool: PluginContributedCliTool;
+  binaryFound: boolean;
+}> = ({ tool, binaryFound }) => {
+  return (
+    <div className="rounded-lg border p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <div className={`h-2 w-2 rounded-full shrink-0 ${binaryFound ? 'bg-green-500' : 'bg-red-500'}`} />
+        <span className="text-xs font-mono font-semibold truncate">{tool.name}</span>
+
+        <span className="flex items-center gap-0.5 text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5">
+          <TerminalIcon className="h-2.5 w-2.5" /> {tool.binary}
+        </span>
+
+        {tool.extraBinaries && tool.extraBinaries.length > 0 && (
+          <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5">
+            +{tool.extraBinaries.join(', ')}
+          </span>
+        )}
+
+        <span className="text-[10px] text-muted-foreground/60 bg-muted/50 rounded px-1.5 py-0.5 ml-auto">
+          plugin
+        </span>
+      </div>
+
+      <div className="text-[10px] text-muted-foreground line-clamp-2">
+        {tool.description.split('\n')[0]}
+      </div>
+
+      {!binaryFound && (
+        <div className="flex items-center gap-1.5 text-[10px] text-red-500 dark:text-red-400">
+          <AlertCircleIcon className="h-3 w-3" />
+          Binary &quot;{tool.binary}&quot; not found on system
+        </div>
       )}
     </div>
   );

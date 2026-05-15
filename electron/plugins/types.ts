@@ -24,6 +24,8 @@ export type PluginPermission =
   | 'state:publish'
   | 'agent:generate'
   | 'agent:inference-provider'
+  | 'agent:register-runtime'
+  | 'agent:register-cli-tool'
   | 'safe-storage'
   | 'browser:window'
   | 'exec:whitelisted'
@@ -145,6 +147,8 @@ export type PluginInstance = {
   configChangeListeners: Array<(config: AppConfig) => void>;
   rendererBuild: PluginRendererBuild | null;
   inferenceProvider: PluginInferenceProvider | null;
+  contributedRuntimes: PluginRuntimeContribution[];
+  contributedCliTools: PluginCliToolContribution[];
 };
 
 /* ── Plugin Module (what dist/backend.js must export) ── */
@@ -362,6 +366,7 @@ export type PluginUIState = {
   notifications: PluginNotificationDescriptor[];
   requiredPluginsReady: boolean;
   brandRequiredPluginNames: string[];
+  contributedCliTools: (PluginCliToolContribution & { pluginName: string })[];
 };
 
 /* ── PluginAPI (given to each plugin's activate()) ── */
@@ -522,6 +527,9 @@ export type PluginAPI = {
     generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
     registerInferenceProvider: (provider: PluginInferenceProvider) => void;
     unregisterInferenceProvider: () => void;
+    registerRuntime: (runtime: PluginRuntimeContribution) => void;
+    unregisterRuntime: (runtimeId: string) => void;
+    registerCliTool: (tool: PluginCliToolContribution) => void;
   };
 
   onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
@@ -645,6 +653,38 @@ export type PluginInferenceProvider = {
   isAvailable: () => boolean;
   /** Stream inference. Yield PluginInferenceStreamEvent objects. */
   stream: (options: PluginInferenceStreamOptions) => AsyncGenerator<PluginInferenceStreamEvent>;
+};
+
+/**
+ * A runtime contributed by a plugin. Appears in the Runtimes tab alongside
+ * Claude Code, Codex, and Mastra. Availability is checked dynamically.
+ */
+export type PluginRuntimeContribution = {
+  /** Machine-readable id shown in the runtime selector (e.g. 'my-runtime'). */
+  id: string;
+  /** Human-readable name shown in the Runtimes tab. */
+  name: string;
+  /** Optional one-line description shown below the dropdown when this runtime is selected. */
+  description?: string;
+  /** Return true when this runtime is currently reachable/available. */
+  isAvailable: () => boolean;
+};
+
+/**
+ * A CLI tool contributed by a plugin. Appears in the Tools → CLI tab.
+ * The binary is checked for existence on PATH just like built-in CLI tools.
+ */
+export type PluginCliToolContribution = {
+  /** Display name (e.g. 'my-tool'). */
+  name: string;
+  /** Binary executable name (e.g. 'my-tool'). */
+  binary: string;
+  /** Optional additional binaries that should also be allowed. */
+  extraBinaries?: string[];
+  /** Description shown in the Tools UI. */
+  description: string;
+  /** Example usage prefix. */
+  prefix?: string;
 };
 
 /* ── Modal/Banner Actions (renderer → main via IPC) ── */

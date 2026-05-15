@@ -14,6 +14,7 @@
 import type { AgentRuntime, RuntimeId } from './types.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
+import type { PluginRuntimeContribution } from '../../plugins/types.js';
 import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-compat.js';
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,14 @@ import { resolveRuntimeForModel, type RuntimeResolution } from './model-runtime-
 // ---------------------------------------------------------------------------
 
 const runtimes = new Map<RuntimeId, AgentRuntime>();
+
+// Plugin-contributed runtimes (set by plugin manager, read by getAvailableRuntimes)
+let pluginRuntimesSource: (() => PluginRuntimeContribution[]) | null = null;
+
+/** Wire up plugin runtime contributions. Called once by main.ts after plugin manager is ready. */
+export function setPluginRuntimesSource(fn: () => PluginRuntimeContribution[]): void {
+  pluginRuntimesSource = fn;
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -34,6 +43,38 @@ export function registerRuntime(runtime: AgentRuntime): void {
 /** Retrieve a runtime by id (may be undefined). */
 export function getRuntime(id: RuntimeId): AgentRuntime | undefined {
   return runtimes.get(id);
+}
+
+// ---------------------------------------------------------------------------
+// Plugin runtime capabilities — minimal pass-through for inference providers
+// ---------------------------------------------------------------------------
+
+/** All capabilities disabled — plugin runtimes route through inference providers, not AgentRuntime.stream */
+const PLUGIN_RUNTIME_CAPABILITIES = {
+  builtInTools: false,
+  mcpSupport: false,
+  toolObserver: false,
+  compaction: false,
+  memory: false,
+  fallback: false,
+  multiProvider: false,
+  subAgents: false,
+  sessions: false,
+  customTools: false,
+};
+
+/** Builds a synthetic AgentRuntime for a plugin-contributed runtime. */
+function buildPluginAgentRuntime(pr: PluginRuntimeContribution): AgentRuntime {
+  return {
+    id: pr.id as RuntimeId,
+    name: pr.name,
+    capabilities: PLUGIN_RUNTIME_CAPABILITIES,
+    isAvailable: () => Promise.resolve(pr.isAvailable()),
+    // stream is intentionally not implemented — plugin runtimes route through the inference provider path
+    async *stream() {
+      throw new Error(`Plugin runtime '${pr.id}' does not implement AgentRuntime.stream — use the inference provider path.`);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -56,9 +97,16 @@ export async function resolveRuntime(config: AppConfig): Promise<AgentRuntime> {
       : 'auto';
 
   if (preferred !== 'auto') {
+    // Check built-in runtimes first
     const runtime = runtimes.get(preferred);
     if (runtime && (await runtime.isAvailable())) {
       return runtime;
+    }
+    // Check plugin-contributed runtimes
+    const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+    const pluginRuntime = pluginRuntimes.find((r) => r.id === preferred);
+    if (pluginRuntime && pluginRuntime.isAvailable()) {
+      return buildPluginAgentRuntime(pluginRuntime);
     }
     console.warn(`[Runtime] Requested runtime '${preferred}' is not available, falling back to Mastra.`);
     return getMastraOrThrow();
@@ -109,18 +157,31 @@ export async function resolveRuntimeForStream(
       available.add(id);
     }
   }
+  // Include plugin-contributed runtimes in the available set
+  const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+  for (const pr of pluginRuntimes) {
+    if (pr.isAvailable()) {
+      available.add(pr.id as RuntimeId);
+    }
+  }
   // Mastra is always available
   available.add('mastra');
 
   const resolution = resolveRuntimeForModel(model, config, preferred, available);
 
-  // Look up the actual runtime instance
+  // Look up the actual runtime instance — check built-ins first, then plugin runtimes
   const runtime = runtimes.get(resolution.runtimeId);
-  if (!runtime) {
-    return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };
+  if (runtime) {
+    return { runtime, resolution };
   }
 
-  return { runtime, resolution };
+  // Check plugin-contributed runtimes
+  const pluginRuntime = pluginRuntimes.find((r) => r.id === resolution.runtimeId);
+  if (pluginRuntime) {
+    return { runtime: buildPluginAgentRuntime(pluginRuntime), resolution };
+  }
+
+  return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };
 }
 
 // ---------------------------------------------------------------------------
@@ -129,12 +190,15 @@ export async function resolveRuntimeForStream(
 
 /**
  * Returns a list of all registered runtimes with their availability status.
+ * Merges hardcoded runtimes with plugin-contributed runtimes.
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }>
+  Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }>
 > {
-  const results: Array<{ id: RuntimeId; name: string; available: boolean; reason?: string }> = [];
+  const results: Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }> = [];
+
+  // Built-in runtimes
   for (const [, runtime] of runtimes) {
     const available = await runtime.isAvailable();
     results.push({
@@ -150,6 +214,15 @@ export async function getAvailableRuntimes(): Promise<
             : undefined,
     });
   }
+
+  // Plugin-contributed runtimes (merged in, no duplicates)
+  const pluginRuntimes = pluginRuntimesSource?.() ?? [];
+  for (const pr of pluginRuntimes) {
+    if (results.some((r) => r.id === pr.id)) continue; // already present
+    const available = pr.isAvailable();
+    results.push({ id: pr.id, name: pr.name, available, description: pr.description });
+  }
+
   return results;
 }
 

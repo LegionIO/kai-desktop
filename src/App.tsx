@@ -1582,6 +1582,7 @@ function AppShell() {
                           setActiveView(TASKS_VIEW);
                         }}
                         isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
+                        isCreatingTask={isCreatingTask}
                         workspaceId={activeWorkspaceId}
                       />
                     </div>
@@ -1986,7 +1987,7 @@ function AppShell() {
                           onSelect={() => setThreadSettingsOpen(true)}
                         >
                           <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>Thread Settings</span>
+                          <span>Settings</span>
                         </DropdownMenu.Item>
                         <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
                         <DropdownMenu.Item

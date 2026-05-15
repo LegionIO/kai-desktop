@@ -179,6 +179,11 @@ function resolveExplicitMode(
 
     case 'mastra':
     default:
+      // If this is a known plugin runtime (not a built-in), pass it through directly.
+      // Plugin runtimes handle their own model routing via the inference provider.
+      if (preferred !== 'mastra' && available.has(preferred)) {
+        return { runtimeId: preferred };
+      }
       // Mastra handles everything
       return { runtimeId: 'mastra' };
   }

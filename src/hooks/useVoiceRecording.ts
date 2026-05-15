@@ -153,17 +153,22 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     }
 
     try {
-      // Start recording and monitoring in parallel
-      const [result] = await Promise.all([
-        mic.startRecording(selectedDeviceId ?? undefined),
-        mic.startMonitor([deviceId]),
-      ]);
+      // Start recording before monitoring so the meter can attach to the
+      // already-open mic stream on first-run device warmup.
+      const result = await mic.startRecording(selectedDeviceId ?? undefined);
 
       if (result.error) {
         debugLog(`start error: ${result.error}`);
         cleanupTimers();
         setRecordingState('idle');
         return;
+      }
+
+      try {
+        await mic.startMonitor([deviceId]);
+      } catch (monitorErr) {
+        const message = monitorErr instanceof Error ? monitorErr.message : String(monitorErr);
+        debugLog(`monitor start error: ${message}`);
       }
 
       debugLog(`recording started, device=${deviceId}, language=${language}`);

@@ -6,30 +6,34 @@ import { ToolSettings } from './ToolSettings';
 import { CliToolsSettings } from './CliToolsSettings';
 import { McpSettings } from './McpSettings';
 import { SkillSettings } from './SkillSettings';
-import { AudioVoiceSettings } from './AudioVoiceSettings';
+import { AudioSettings } from './AudioSettings';
+import { RealtimeSettings } from './RealtimeSettings';
+import { DictationSettings } from './DictationSettings';
+import { UsageDashboard } from './UsageDashboard';
 import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
-import { DictationSettings } from './DictationSettings';
 import type { SettingsProps } from './shared';
 
 type SettingsSection =
   | 'models'
+  | 'usage'
   | 'tools'
   | 'general'
-  | 'audio-voice'
-  | 'dictation'
+  | 'audio'
+  | 'voice'
   | 'computer-use'
   | 'media-generation'
   | 'web-server';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Models' },
+  { key: 'usage', label: 'Usage' },
   { key: 'tools', label: 'Tools' },
   { key: 'general', label: 'Application' },
-  { key: 'audio-voice', label: 'Audio & Voice' },
-  { key: 'dictation', label: 'Dictation' },
+  { key: 'audio', label: 'Audio' },
+  { key: 'voice', label: 'Voice' },
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'web-server', label: 'Web UI' },
@@ -88,9 +92,10 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {activeSection === 'models' && <ModelSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'usage' && <UsageDashboard config={config} updateConfig={updateConfig} />}
         {activeSection === 'tools' && <CombinedToolsSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'audio-voice' && <AudioVoiceSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'dictation' && <DictationSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'voice' && <VoiceSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
@@ -144,6 +149,50 @@ const CombinedToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       {activeTab === 'cli' && <CliToolsSettings config={config} updateConfig={updateConfig} hideTitle />}
       {activeTab === 'skills' && <SkillSettings config={config} updateConfig={updateConfig} hideTitle />}
       {activeTab === 'mcp' && <McpSettings config={config} updateConfig={updateConfig} hideTitle />}
+    </div>
+  );
+};
+
+type VoiceTab = 'realtime' | 'dictation';
+
+const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const [activeTab, setActiveTab] = useState<VoiceTab>('realtime');
+
+  const tabs: Array<{ key: VoiceTab; label: string }> = [
+    { key: 'realtime', label: 'Voice Chat' },
+    { key: 'dictation', label: 'Dictation' },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className="text-sm font-semibold">Voice</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Configure live voice chat and dictation settings.
+        </p>
+      </div>
+
+      {/* Tab Bar */}
+      <div className="flex gap-1 border-b border-border/60">
+        {tabs.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => setActiveTab(tab.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
+              activeTab === tab.key
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Content */}
+      {activeTab === 'realtime' && <RealtimeSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'dictation' && <DictationSettings config={config} updateConfig={updateConfig} />}
     </div>
   );
 };

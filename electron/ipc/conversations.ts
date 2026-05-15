@@ -22,7 +22,7 @@ type ConversationRecord = {
   titleUpdatedAt: string | null;
   messageCount: number;
   userMessageCount: number;
-  runStatus: 'idle' | 'running' | 'error';
+  runStatus: 'idle' | 'running' | 'awaiting-approval' | 'error';
   hasUnread: boolean;
   lastAssistantUpdateAt: string | null;
   selectedModelKey: string | null;
@@ -72,6 +72,39 @@ export function broadcastConversationChange(store: ConversationsStore): void {
   broadcastToWebClients('conversations:changed', store);
 }
 
+function timestampMs(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isStaleRunningWrite(prev: ConversationRecord, next: ConversationRecord): boolean {
+  // Protect both terminal states ('idle' and 'awaiting-approval') from being
+  // clobbered by a stale debounced write that still carries runStatus:'running'.
+  if ((prev.runStatus !== 'idle' && prev.runStatus !== 'awaiting-approval') || next.runStatus !== 'running') return false;
+
+  // A new user turn is allowed to move an idle conversation back to running.
+  if (next.userMessageCount > prev.userMessageCount) return false;
+
+  // Stale async writes often carry an older updatedAt, or they were read before
+  // the done handler populated lastAssistantUpdateAt.
+  return timestampMs(next.updatedAt) <= timestampMs(prev.updatedAt)
+    || Boolean(prev.lastAssistantUpdateAt && !next.lastAssistantUpdateAt);
+}
+
+function preserveTerminalRunFields(prev: ConversationRecord, next: ConversationRecord): ConversationRecord {
+  if (!isStaleRunningWrite(prev, next)) return next;
+
+  return {
+    ...next,
+    runStatus: prev.runStatus,
+    hasUnread: prev.hasUnread,
+    lastAssistantUpdateAt: prev.lastAssistantUpdateAt,
+    lastMessageAt: prev.lastMessageAt,
+    updatedAt: timestampMs(prev.updatedAt) >= timestampMs(next.updatedAt) ? prev.updatedAt : next.updatedAt,
+  };
+}
+
 export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, getConfig?: () => AppConfig): void {
   ipcMain.handle('conversations:list', () => {
     const store = readConversationStore(appHome);
@@ -112,8 +145,10 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     // and only apply non-message field updates. This protects against stale-closure races
     // where title generation, settings persistence, or debounced persists write back
     // an older snapshot of the conversation.
+    let nextConversation = conversation;
+
     if (prev && prevTreeLen > 0 && tree.length < prevTreeLen) {
-      const guarded = {
+      nextConversation = {
         ...conversation,
         messages: prev.messages,
         messageTree: prev.messageTree,
@@ -121,13 +156,13 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
         messageCount: prev.messageCount,
         userMessageCount: prev.userMessageCount,
       };
-      store.conversations[conversation.id] = guarded;
-      writeConversationStore(appHome, store);
-      broadcastConversationChange(store);
-      return { ok: true };
     }
 
-    store.conversations[conversation.id] = conversation;
+    if (prev) {
+      nextConversation = preserveTerminalRunFields(prev, nextConversation);
+    }
+
+    store.conversations[conversation.id] = nextConversation;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
     return { ok: true };
