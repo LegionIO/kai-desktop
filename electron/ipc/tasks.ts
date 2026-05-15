@@ -3,9 +3,11 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
+import type { TaskFile, KaiTaskOrder, KaiTaskStatus, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
+import type { PluginManager } from '../plugins/plugin-manager.js';
+import type { TaskLifecycleEvent, TaskLifecycleHookArgs } from '../plugins/types.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -69,9 +71,25 @@ export function listAllTasks(appHome: string): TaskFile[] {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+// ── Lifecycle event detection ────────────────────────────────────────────
+
+function detectLifecycleEvent(
+  previousStatus: KaiTaskStatus | undefined,
+  newStatus: KaiTaskStatus,
+): TaskLifecycleEvent | null {
+  if (!previousStatus) return 'task_created';
+  if (previousStatus === newStatus) return null;
+  if (previousStatus === 'todo' && newStatus === 'in_progress') return 'task_started';
+  if (previousStatus === 'in_progress' && (newStatus === 'ai_review' || newStatus === 'human_review')) {
+    return 'task_review';
+  }
+  if (newStatus === 'done') return 'task_completed';
+  return 'task_updated';
+}
+
 // ── Registration ─────────────────────────────────────────────────────────
 
-export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
+export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, pluginManager: PluginManager | null): void {
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('tasks:list', () => {
@@ -123,6 +141,20 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
           'utf-8',
         );
         broadcastTaskChange(appHome);
+
+        // Fire task lifecycle hooks (non-blocking)
+        if (pluginManager) {
+          pluginManager.runPostTaskLifecycleHooks({
+            task,
+            event: 'task_created',
+            previousStatus: undefined,
+            previousTask: undefined,
+            changedFields: Object.keys(taskData),
+          }).catch((err) => {
+            console.error('[tasks] Task lifecycle hook error (create):', err);
+          });
+        }
+
         return task;
       } catch (err) {
         console.error('[tasks] Failed to create task:', err);
@@ -158,6 +190,39 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
       };
       writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
       broadcastTaskChange(appHome);
+
+      // Fire task lifecycle hooks (non-blocking)
+      if (pluginManager) {
+        const statusChanged = existing.status !== updated.status;
+        const event: TaskLifecycleEvent | null = statusChanged
+          ? detectLifecycleEvent(existing.status, updated.status)
+          : (isMeaningful ? 'task_updated' : null);
+        if (event) {
+          pluginManager.runPostTaskLifecycleHooks({
+            task: updated,
+            event,
+            previousStatus: existing.status,
+            previousTask: existing,
+            changedFields: Object.keys(updates),
+          }).then((patch) => {
+            if (patch) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                const patched: TaskFile = {
+                  ...current,
+                  metadata: { ...(current.metadata ?? {}), ...patch },
+                };
+                writeFileSync(filePath, JSON.stringify(patched, null, 2), 'utf-8');
+              } catch (patchErr) {
+                console.error('[tasks] Failed to apply hook metadata patch:', patchErr);
+              }
+            }
+          }).catch((err) => {
+            console.error('[tasks] Task lifecycle hook error (update):', err);
+          });
+        }
+      }
+
       return updated;
     } catch {
       return { error: `Failed to update task ${id}` };
@@ -184,10 +249,28 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     try {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
+      let deletedTask: TaskFile | null = null;
       if (existsSync(filePath)) {
+        try {
+          deletedTask = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+        } catch { /* proceed with delete even if read fails */ }
         unlinkSync(filePath);
       }
       broadcastTaskChange(appHome);
+
+      // Fire task lifecycle hooks (non-blocking)
+      if (pluginManager && deletedTask) {
+        pluginManager.runPostTaskLifecycleHooks({
+          task: deletedTask,
+          event: 'task_deleted',
+          previousStatus: deletedTask.status,
+          previousTask: deletedTask,
+          changedFields: [],
+        }).catch((err) => {
+          console.error('[tasks] Task lifecycle hook error (delete):', err);
+        });
+      }
+
       return { ok: true };
     } catch (err) {
       console.error(`[tasks] Failed to delete task ${id}:`, err);

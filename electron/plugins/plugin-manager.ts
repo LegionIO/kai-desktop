@@ -32,6 +32,9 @@ import type {
   PluginInferenceProvider,
   PluginRuntimeContribution,
   PluginCliToolContribution,
+  TaskLifecycleHookArgs,
+  TaskLifecycleHookResult,
+  PostTaskLifecycleHook,
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
@@ -351,6 +354,7 @@ export class PluginManager {
       postReceiveHooks: [],
       preUpdateHooks: [],
       postUpdateHooks: [],
+      postTaskLifecycleHooks: [],
       uiBanners: [],
       uiModals: [],
       uiSettingsSections: [],
@@ -447,6 +451,14 @@ export class PluginManager {
         openNavigationTarget: (target) => this.broadcastNavigationRequest(manifest.name, target),
       });
       this.pluginAPIs.set(manifest.name, api);
+
+      // Clear hook arrays before activate to prevent duplicates on reload (issue #36)
+      instance.preSendHooks = [];
+      instance.postReceiveHooks = [];
+      instance.preUpdateHooks = [];
+      instance.postUpdateHooks = [];
+      instance.postTaskLifecycleHooks = [];
+      instance.configChangeListeners = [];
 
       if (typeof mod.activate === 'function') {
         await mod.activate(api);
@@ -548,6 +560,14 @@ export class PluginManager {
     } catch (err) {
       console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
     }
+
+    // Clear hook arrays to prevent dangling references from firing
+    instance.preSendHooks = [];
+    instance.postReceiveHooks = [];
+    instance.preUpdateHooks = [];
+    instance.postUpdateHooks = [];
+    instance.postTaskLifecycleHooks = [];
+    instance.configChangeListeners = [];
 
     this.actionHandlers.delete(pluginName);
 
@@ -840,6 +860,52 @@ export class PluginManager {
         }
       }
     }
+  }
+
+  /* ── Task Lifecycle Hooks ── */
+
+  /**
+   * Runs all registered post-task-lifecycle hooks in parallel (fire-and-forget).
+   * Each hook has a 5-second timeout. Returns merged metadata patches (if any).
+   */
+  async runPostTaskLifecycleHooks(args: TaskLifecycleHookArgs): Promise<Record<string, unknown> | null> {
+    const hooks: Array<{ hook: PostTaskLifecycleHook; pluginName: string }> = [];
+
+    for (const instance of this.plugins.values()) {
+      if (instance.state !== 'active') continue;
+      for (const hook of instance.postTaskLifecycleHooks) {
+        hooks.push({ hook, pluginName: instance.manifest.name });
+      }
+    }
+
+    if (hooks.length === 0) return null;
+
+    const HOOK_TIMEOUT_MS = 5_000;
+    let mergedPatch: Record<string, unknown> | null = null;
+
+    const results = await Promise.allSettled(
+      hooks.map(async ({ hook, pluginName }) => {
+        try {
+          return await Promise.race([
+            Promise.resolve(hook(args)),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('Hook timed out')), HOOK_TIMEOUT_MS),
+            ),
+          ]);
+        } catch (err) {
+          console.error(`[PluginManager] Task lifecycle hook error in "${pluginName}":`, err);
+          return undefined;
+        }
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value?.metadataPatch) {
+        mergedPatch = { ...(mergedPatch ?? {}), ...result.value.metadataPatch };
+      }
+    }
+
+    return mergedPatch;
   }
 
   /* ── UI State ── */

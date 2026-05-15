@@ -1149,6 +1149,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
         }
 
+        // Accumulate assistant text for post-receive hooks (learning)
+        let postReceiveTextBuffer = '';
+
         const stream = runtime.stream({
           conversationId,
           messages,
@@ -1229,6 +1232,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (event.type === 'done' && !controller.signal.aborted) {
             observerLaunchesEnabled = false;
             await waitForObserverToolExecutions();
+
+            // Fire post-receive hooks (learning) — fire-and-forget
+            if (pluginManager && postReceiveTextBuffer.length > 0) {
+              pluginManager.runPostReceiveHooks({
+                response: { role: 'assistant', content: postReceiveTextBuffer },
+                messages: messages as HookMessage[],
+                config: configWithExecutionMode,
+              }).catch((err) => {
+                console.error('[Agent:stream] Post-receive hook error:', err);
+              });
+            }
           }
           if (event.type === 'model-fallback') {
             const fbData = event.data as { toModelKey?: string } | undefined;
@@ -1243,6 +1257,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           }
           if (event.type === 'text-delta') {
+            postReceiveTextBuffer += event.text ?? '';
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
               ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),

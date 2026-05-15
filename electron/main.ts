@@ -656,7 +656,6 @@ if (gotSingleInstanceLock) {
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerPartitionHandlers(ipcMain);
-    registerTaskHandlers(ipcMain, APP_HOME);
     registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
@@ -711,6 +710,9 @@ if (gotSingleInstanceLock) {
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+
+    // Register task handlers after pluginManager so lifecycle hooks are available
+    registerTaskHandlers(ipcMain, APP_HOME, pluginManager);
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());

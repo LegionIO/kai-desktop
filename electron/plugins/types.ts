@@ -1,6 +1,7 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { CompatCheckResult } from './plugin-compat.js';
+import type { TaskFile, KaiTaskStatus } from '../../shared/task-types.js';
 
 /* ── Manifest ── */
 
@@ -32,7 +33,8 @@ export type PluginPermission =
   | 'tools:detect'
   | 'system:env'
   | 'audit:log'
-  | 'lifecycle:hook';
+  | 'lifecycle:hook'
+  | 'tasks:hook';
 
 export type PluginApprovalRecord = {
   hash: string;
@@ -134,6 +136,7 @@ export type PluginInstance = {
   postReceiveHooks: PostReceiveHook[];
   preUpdateHooks: PreUpdateHook[];
   postUpdateHooks: PostUpdateHook[];
+  postTaskLifecycleHooks: PostTaskLifecycleHook[];
   uiBanners: PluginBannerDescriptor[];
   uiModals: PluginModalDescriptor[];
   uiSettingsSections: PluginSettingsSectionDescriptor[];
@@ -221,6 +224,38 @@ export type PostUpdateHookArgs = {
 };
 
 export type PostUpdateHook = (args: PostUpdateHookArgs) => Promise<void> | void;
+
+/* ── Task Lifecycle Hooks ── */
+
+export type TaskLifecycleEvent =
+  | 'task_created'
+  | 'task_started'       // todo → in_progress
+  | 'task_review'        // in_progress → ai_review | human_review
+  | 'task_completed'     // * → done
+  | 'task_deleted'
+  | 'task_updated';      // any other meaningful field change
+
+export type TaskLifecycleHookArgs = {
+  /** The task after the change has been applied. */
+  task: TaskFile;
+  /** The lifecycle event that triggered this hook. */
+  event: TaskLifecycleEvent;
+  /** Previous status (undefined for task_created). */
+  previousStatus?: KaiTaskStatus;
+  /** Previous task state (undefined for task_created). */
+  previousTask?: TaskFile;
+  /** Fields that changed (keys of the updates object). */
+  changedFields: string[];
+};
+
+export type TaskLifecycleHookResult = {
+  /** Optional metadata to merge into the task file after all hooks run. */
+  metadataPatch?: Record<string, unknown>;
+};
+
+export type PostTaskLifecycleHook = (
+  args: TaskLifecycleHookArgs,
+) => Promise<TaskLifecycleHookResult | void> | TaskLifecycleHookResult | void;
 
 /* ── UI Descriptors (JSON-serializable across IPC) ── */
 
@@ -453,6 +488,10 @@ export type PluginAPI = {
   lifecycle: {
     registerPreUpdateHook: (hook: PreUpdateHook) => void;
     registerPostUpdateHook: (hook: PostUpdateHook) => void;
+  };
+
+  tasks: {
+    registerPostLifecycleHook: (hook: PostTaskLifecycleHook) => void;
   };
 
   ui: {
