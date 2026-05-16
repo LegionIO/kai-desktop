@@ -91,6 +91,8 @@ export const branding = {
     '{{productName}} captures your screen to enable local Mac computer control and allow the AI to see what\'s on your display.',
   localNetworkUsage:
     '{{productName}} connects to services on your local network.',
+  contactsUsage:
+    '{{productName}} accesses your contacts to display names and photos for messaging plugins.',
 
   // ── Plugin API ─────────────────────────────────────────────────────────
   /** Semver version of the plugin API surface. Bump minor for additive changes, major for breaking. */

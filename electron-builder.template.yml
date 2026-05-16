@@ -38,6 +38,7 @@ mac:
     NSAppleEventsUsageDescription: "{{appleEventsUsage}}"
     NSScreenCaptureUsageDescription: "{{screenCaptureUsage}}"
     NSLocalNetworkUsageDescription: "{{localNetworkUsage}}"
+    NSContactsUsageDescription: "{{contactsUsage}}"
     NSAppTransportSecurity:
       NSAllowsLocalNetworking: true
   target:

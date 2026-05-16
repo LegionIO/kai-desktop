@@ -19,5 +19,8 @@
     <!-- Microphone access for voice dictation -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
+    <!-- Contacts access for plugins that read AddressBook data -->
+    <key>com.apple.security.personal-information.addressbook</key>
+    <true/>
   </dict>
 </plist>
