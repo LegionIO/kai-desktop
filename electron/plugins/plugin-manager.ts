@@ -1119,10 +1119,20 @@ export class PluginManager {
     const catalog = this.marketplaceService.getCachedCatalog() ?? [];
 
     // Annotate with current load status from PluginManager
-    return catalog.map((entry) => ({
-      ...entry,
-      installed: this.plugins.has(entry.name) || this.marketplaceService!.getInstalledPluginNames().includes(entry.name),
-    }));
+    return catalog.map((entry) => {
+      const installed =
+        this.plugins.has(entry.name) ||
+        this.marketplaceService!.getInstalledPluginNames().includes(entry.name);
+
+      // installedVersion may be absent when a plugin was installed manually (not via
+      // marketplace) or when the cache predates version tracking.  Fall back to the
+      // live manifest version so the Updates tab can detect newer catalog versions.
+      const installedVersion =
+        entry.installedVersion ??
+        (installed ? (this.plugins.get(entry.name)?.manifest.version ?? undefined) : undefined);
+
+      return { ...entry, installed, installedVersion };
+    });
   }
 
   /* ── Plugin Update Detection ── */
