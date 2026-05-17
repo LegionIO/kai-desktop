@@ -20,7 +20,8 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.2.2",
@@ -38,6 +39,8 @@
     "electron-builder": "^26.8.1",
     "electron-vite": "^5.0.0",
     "eslint": "^10.2.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.4",
     "sharp": "0.34.5",
     "tailwindcss": "^4.2.2",
     "tsx": "^4.21.0",
@@ -118,6 +121,11 @@
     "xml-formatter": "^3.7.0",
     "yaml": "^2.8.3",
     "zod": "^4.3.6"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "eslint --max-warnings=0"
+    ]
   },
   "packageManager": "pnpm@10.33.0",
   "pnpm": {
