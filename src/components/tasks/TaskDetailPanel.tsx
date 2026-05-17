@@ -945,7 +945,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   value={agentInput}
                   onChange={(e) => setAgentInput(e.target.value)}
                   onKeyDown={handleAgentKeyDown}
-                  placeholder="Send instructions to the agent…"
+                  placeholder={terminalSessionId ? "Steer the executing agent…" : "Agent runs after council approves the plan"}
                   disabled={!terminalSessionId}
                   rows={1}
                   className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none disabled:opacity-40 md:text-[15px]', agentInput.includes('\n') && 'pb-3')}
