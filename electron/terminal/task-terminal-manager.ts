@@ -35,6 +35,8 @@ interface NonInteractiveTerminal {
 export class TaskTerminalManager {
   private terminals = new Map<string, TaskTerminal>();
   private nonInteractiveProcs = new Map<string, NonInteractiveTerminal>();
+  private outputHistory = new Map<string, string[]>();
+  private readonly MAX_HISTORY_LINES = 500;
 
   async create(
     taskId: string,
@@ -60,6 +62,7 @@ export class TaskTerminalManager {
     });
 
     proc.onData((data: string) => {
+      this.appendHistory(sessionId, data);
       this.broadcast('tasks:terminal-data', { sessionId, data });
     });
 
@@ -131,10 +134,12 @@ export class TaskTerminalManager {
         for (const line of lines) {
           const formatted = formatStreamJsonLine(line);
           if (formatted) {
+            this.appendHistory(sessionId, formatted);
             this.broadcast('tasks:terminal-data', { sessionId, data: formatted });
           }
         }
       } else {
+        this.appendHistory(sessionId, text);
         this.broadcast('tasks:terminal-data', { sessionId, data: text });
       }
     });
@@ -146,7 +151,9 @@ export class TaskTerminalManager {
         outputBuffer = outputBuffer.slice(-MAX_BUFFER);
       }
       // stderr — show dimmed
-      this.broadcast('tasks:terminal-data', { sessionId, data: `\x1b[90m${text}\x1b[0m` });
+      const dimmed = `\x1b[90m${text}\x1b[0m`;
+      this.appendHistory(sessionId, dimmed);
+      this.broadcast('tasks:terminal-data', { sessionId, data: dimmed });
     });
 
     proc.on('close', (exitCode: number | null) => {
@@ -154,6 +161,7 @@ export class TaskTerminalManager {
       if (isClaude && lineBuffer.trim()) {
         const formatted = formatStreamJsonLine(lineBuffer);
         if (formatted) {
+          this.appendHistory(sessionId, formatted);
           this.broadcast('tasks:terminal-data', { sessionId, data: formatted });
         }
       }
@@ -184,6 +192,7 @@ export class TaskTerminalManager {
       niTerm.process.kill();
       this.nonInteractiveProcs.delete(sessionId);
     }
+    this.outputHistory.delete(sessionId);
   }
 
   /** Kill all terminals associated with a given task. */
@@ -220,6 +229,25 @@ export class TaskTerminalManager {
       }
     }
     this.nonInteractiveProcs.clear();
+    this.outputHistory.clear();
+  }
+
+  /** Get buffered output history for replay on remount. */
+  getOutputHistory(sessionId: string): string[] {
+    return this.outputHistory.get(sessionId) ?? [];
+  }
+
+  /** Append output data to the per-session history ring buffer. */
+  private appendHistory(sessionId: string, data: string): void {
+    let lines = this.outputHistory.get(sessionId);
+    if (!lines) {
+      lines = [];
+      this.outputHistory.set(sessionId, lines);
+    }
+    lines.push(data);
+    if (lines.length > this.MAX_HISTORY_LINES) {
+      lines.splice(0, lines.length - this.MAX_HISTORY_LINES);
+    }
   }
 
   private getNonInteractiveCommand(runtime: string, prompt: string): { command: string; args: string[] } {
@@ -434,5 +462,9 @@ export function registerTaskTerminalHandlers(
   ipcMain.handle('tasks:terminal-kill', (_e, sessionId: string) => {
     terminalManager.kill(sessionId);
     return { ok: true };
+  });
+
+  ipcMain.handle('tasks:terminal-history', (_e, sessionId: string) => {
+    return terminalManager.getOutputHistory(sessionId);
   });
 }

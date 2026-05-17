@@ -161,12 +161,17 @@ function startExecutionLoop(
             broadcastTaskChange(appHome);
           } catch { /* ignore */ }
         } else {
-          // Default: move to human_review on success, keep in_progress on failure
-          // Keep terminalSessionId so the output history remains visible
+          // Default: no hook result — always surface to user for manual decision.
+          // Previously exit code != 0 stayed in_progress, which caused permanently stuck tasks.
           try {
             const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-            task.status = exitCode === 0 ? 'human_review' : 'in_progress';
+            task.status = 'human_review';
             task.updatedAt = new Date().toISOString();
+            if (!task.metadata) task.metadata = {};
+            (task.metadata as Record<string, unknown>).executionExitCode = exitCode;
+            (task.metadata as Record<string, unknown>).executionNote = exitCode === 0
+              ? 'Execution completed successfully'
+              : `Execution failed (exit code ${exitCode}) — assessment unavailable`;
             writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
             broadcastTaskChange(appHome);
           } catch { /* ignore */ }

@@ -300,6 +300,8 @@ const appAPI = {
       ipcRenderer.invoke('tasks:terminal-resize', sessionId, cols, rows),
     terminalKill: (sessionId: string) =>
       ipcRenderer.invoke('tasks:terminal-kill', sessionId) as Promise<{ ok: boolean }>,
+    terminalHistory: (sessionId: string) =>
+      ipcRenderer.invoke('tasks:terminal-history', sessionId) as Promise<string[]>,
     onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: { sessionId: string; data: string }) => callback(data);
       ipcRenderer.on('tasks:terminal-data', handler);

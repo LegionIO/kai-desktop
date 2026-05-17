@@ -181,6 +181,7 @@ type AppAPI = {
     terminalWrite: (sessionId: string, data: string) => Promise<void>;
     terminalResize: (sessionId: string, cols: number, rows: number) => Promise<void>;
     terminalKill: (sessionId: string) => Promise<{ ok: boolean }>;
+    terminalHistory: (sessionId: string) => Promise<string[]>;
     onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
     onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
     // AI plan generation

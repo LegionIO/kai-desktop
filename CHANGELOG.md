@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.82] - 2026-05-17
+
+### Added
+- **Terminal output persistence** — Agent execution output is now buffered in main process and replayed when navigating back to a task. No more lost terminal history on tab/task switches.
+- **Workflow `executing` event** — Emits an `execution_started` workflow event immediately when council approves and execution begins, so the workflow dashboard shows the full lifecycle without gaps.
+- **Workspace cleanup** — After execution completes, non-standard `.md` files (agent-generated plans, triage reports, etc.) are automatically archived to `.kai-work/archive/<timestamp>/`. Standard docs (README, CHANGELOG, LICENSE, etc.) are always preserved.
+
+### Fixed
+- **Tasks stuck in `in_progress`** — When post-execution assessment is unavailable (hook timeout, network error), tasks now always move to `human_review` for manual decision instead of staying permanently stuck in `in_progress`.
+
+### Removed
+- **Agent steering composer** — Removed the "Send instructions to agent" composer from the Agent tab. Council handles all agent orchestration; the Agent tab is now a pure execution output viewer.
+
 ## [1.0.81] - 2026-05-17
 
 ### Added

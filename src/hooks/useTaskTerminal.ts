@@ -74,6 +74,15 @@ export function useTaskTerminal({ sessionId, onExit }: UseTaskTerminalOptions) {
   useEffect(() => {
     if (!sessionId) return;
 
+    // Replay historical output first (restores content after navigate away/back)
+    app.tasks.terminalHistory(sessionId).then((history) => {
+      if (history?.length && xtermRef.current) {
+        for (const line of history) {
+          xtermRef.current.write(line);
+        }
+      }
+    }).catch(() => {});
+
     // Receive data from PTY
     const unsubData = app.tasks.onTerminalData((event) => {
       if (event.sessionId === sessionId) {
