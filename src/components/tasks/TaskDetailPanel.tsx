@@ -26,6 +26,7 @@ import {
   Loader2Icon,
   AlertTriangleIcon,
   ZapIcon,
+  SparklesIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -869,6 +870,22 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           {/* Council composer — respond to advisor's clarification questions */}
           {task.status !== 'awaiting_approval' && task.status !== 'human_review' && task.status !== 'in_progress' && task.status !== 'done' && (
             <div className="shrink-0 border-t border-border/40 px-6 py-3">
+              {/* Quick-action hints when awaiting user input */}
+              {awaitingClarification && councilMessages.length >= 2 && (
+                <div className="mb-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void councilRespond(task.id, 'Let\'s plan this. Proceed with a detailed implementation plan.');
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-primary/20 bg-primary/5 px-3 py-1.5 text-[11px] font-medium text-primary transition-colors hover:bg-primary/10 hover:border-primary/40"
+                  >
+                    <SparklesIcon className="h-3 w-3" />
+                    Plan this
+                  </button>
+                  <span className="text-[10px] text-muted-foreground/50">or type below to continue chatting</span>
+                </div>
+              )}
               <div className="flex items-end gap-2">
                 <textarea
                   ref={councilTextareaRef}
