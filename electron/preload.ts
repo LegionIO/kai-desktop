@@ -330,6 +330,12 @@ const appAPI = {
     // Council respond (user answers advisor's clarification questions)
     councilRespond: (taskId: string, message: string) =>
       ipcRenderer.invoke('tasks:council-respond', taskId, message) as Promise<{ ok: boolean; error?: string }>,
+    // Stop execution — coordinated teardown (kill terminal, update status, emit workflow event)
+    stopExecution: (taskId: string) =>
+      ipcRenderer.invoke('tasks:stop-execution', taskId) as Promise<{ ok?: boolean; error?: string }>,
+    // Gather artifacts — council-driven deep gather via CLI runner
+    gatherArtifacts: (taskId: string, prompt: string, cwd: string) =>
+      ipcRenderer.invoke('tasks:gather-artifacts', taskId, prompt, cwd) as Promise<{ ok?: boolean; output?: string; error?: string }>,
   },
 
   agents: {

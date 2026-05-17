@@ -632,7 +632,38 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     }
     const unsub = app.plugins.onEvent((evt: unknown) => {
       const e = evt as { pluginName?: string; eventName?: string; data?: unknown };
-      if (e.eventName !== 'council:message' && e.eventName !== 'council:result') return;
+      if (e.eventName !== 'council:message' && e.eventName !== 'council:result' && e.eventName !== 'council:gather-request') return;
+
+      // Handle council:gather-request — council needs deeper artifact gathering via runner
+      if (e.eventName === 'council:gather-request') {
+        const { taskId: gatherTaskId, gatherPrompt, cwd } = (e.data ?? {}) as {
+          taskId?: string;
+          gatherPrompt?: string;
+          cwd?: string;
+          sessionId?: string;
+        };
+        if (!gatherTaskId || !gatherPrompt || !cwd) return;
+
+        dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId: gatherTaskId, phase: 'gathering_artifacts' });
+
+        // Spawn gather-only runner and feed results back to council
+        void (async () => {
+          try {
+            const result = await app.tasks.gatherArtifacts(gatherTaskId, gatherPrompt, cwd);
+            if (result.output) {
+              // Feed gathered artifacts back to council via councilRespond
+              await app.tasks.councilRespond(gatherTaskId, `## Gathered Artifacts\n\n${result.output}`);
+            } else if (result.error) {
+              await app.tasks.councilRespond(gatherTaskId, `Artifact gathering failed: ${result.error}`);
+            }
+          } catch (err) {
+            console.error('[TaskProvider] Gather artifacts failed:', err);
+            // Fall back to asking user
+            dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId: gatherTaskId, phase: 'awaiting_clarification' });
+          }
+        })();
+        return;
+      }
 
       // Handle council:result — apply status/title/description from re-deliberation
       if (e.eventName === 'council:result') {

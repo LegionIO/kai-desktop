@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.83] - 2026-05-17
+
+### Added
+- **Stop execution from council** — New "Stop" button in council tab during `in_progress` execution. Performs coordinated teardown: kills terminal process, moves task to `human_review`, emits `cancelled` workflow event to Aithena, and fires workspace cleanup.
+- **Gather artifacts IPC** — New `tasks:gather-artifacts` handler spawns a CLI runner in gather-only (read-only) mode for council-driven deep artifact collection.
+- **Gathering artifacts phase indicator** — When council requests deeper investigation, shows a dedicated "Gathering project artifacts" indicator with pulsing dot.
+
+### Changed
+- `handleStopAgent` now delegates to `tasks:stop-execution` for consistent coordinated teardown instead of just killing the terminal.
+
 ## [1.0.82] - 2026-05-17
 
 ### Added

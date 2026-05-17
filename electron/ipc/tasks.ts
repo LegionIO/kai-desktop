@@ -758,4 +758,74 @@ export function registerTaskHandlers(
       return { ok: false, error: String(err) };
     }
   });
+
+  // ── Stop execution — coordinated teardown ────────────────────────────
+  ipcMain.handle('tasks:stop-execution', async (_e, taskId: string) => {
+    if (!isValidTaskId(taskId)) return { error: 'Invalid task ID' };
+
+    // 1. Kill all terminal processes for this task
+    if (terminalManager) {
+      terminalManager.killByTask(taskId);
+    }
+
+    // 2. Update task: in_progress → human_review with cancellation metadata
+    const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+    if (!existsSync(filePath)) return { error: 'Task not found' };
+
+    try {
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const previousStatus = task.status;
+      task.status = 'human_review';
+      task.updatedAt = new Date().toISOString();
+      if (!task.metadata) task.metadata = {};
+      (task.metadata as Record<string, unknown>).executionCancelled = true;
+      (task.metadata as Record<string, unknown>).executionCancelledAt = new Date().toISOString();
+      (task.metadata as Record<string, unknown>).executionNote = 'Execution stopped by user';
+      writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+      broadcastTaskChange(appHome);
+
+      // 3. Fire task lifecycle hook → triggers workflow 'cancelled' event + cleanup in plugin
+      if (pluginManager) {
+        pluginManager.runPostTaskLifecycleHooks({
+          task,
+          event: 'task_review',
+          previousStatus,
+          previousTask: task,
+          changedFields: ['status', 'metadata'],
+        }).catch(() => {});
+      }
+
+      return { ok: true };
+    } catch {
+      return { error: 'Failed to stop execution' };
+    }
+  });
+
+  // ── Gather artifacts — council-driven deep gather via CLI runner ──────
+  ipcMain.handle('tasks:gather-artifacts', async (_e, taskId: string, prompt: string, cwd: string) => {
+    if (!isValidTaskId(taskId)) return { error: 'Invalid task ID' };
+    if (!terminalManager) return { error: 'Terminal manager not available' };
+
+    const gatherPrompt = [
+      '## GATHER-ONLY MODE — READ ONLY, DO NOT MODIFY FILES',
+      '',
+      prompt,
+      '',
+      'CRITICAL: Only read, fetch, and return data. Do NOT write, create, delete, or modify any files.',
+      'Return the gathered information in a structured markdown format.',
+    ].join('\n');
+
+    return new Promise<{ ok?: boolean; output?: string; exitCode?: number; sessionId?: string; error?: string }>((resolve) => {
+      terminalManager!.createNonInteractive(taskId, {
+        runtime: 'claude-code',
+        cwd,
+        prompt: gatherPrompt,
+        onComplete: ({ exitCode, output, sessionId }) => {
+          resolve({ ok: true, output: output.slice(-8000), exitCode, sessionId });
+        },
+      }).catch((err) => {
+        resolve({ error: String(err) });
+      });
+    });
+  });
 }

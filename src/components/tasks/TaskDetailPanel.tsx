@@ -25,6 +25,7 @@ import {
   AlertTriangleIcon,
   ZapIcon,
   SparklesIcon,
+  StopCircleIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -339,12 +340,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   }, [task.id, task.metadata?.cwd, currentWorkingDirectory, selectedRuntime, updateTask]);
 
   const handleStopAgent = useCallback(() => {
-    if (terminalSessionId) {
-      void app.tasks.terminalKill(terminalSessionId);
-      setTerminalSessionId(null);
-      void updateTask(task.id, { terminalSessionId: undefined });
-    }
-  }, [terminalSessionId, task.id, updateTask]);
+    void app.tasks.stopExecution(task.id);
+  }, [task.id]);
 
   const handleTerminalExit = useCallback(
     (_exitCode: number) => {
@@ -808,6 +805,35 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               >
                 Execute Now
               </button>
+            </div>
+          )}
+
+          {/* Execution in progress — stop button */}
+          {task.status === 'in_progress' && (
+            <div className="border-t border-border/40 bg-card/50 px-6 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">Execution in progress</p>
+                <p className="text-xs text-muted-foreground">Agent is executing the approved plan</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { void app.tasks.stopExecution(task.id); }}
+                className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/20"
+              >
+                <StopCircleIcon className="h-3.5 w-3.5" />
+                Stop
+              </button>
+            </div>
+          )}
+
+          {/* Gathering artifacts indicator — council requested deeper investigation */}
+          {councilPhase === 'gathering_artifacts' && task.status !== 'in_progress' && (
+            <div className="border-t border-border/40 bg-card/50 px-6 py-3 flex items-center gap-3">
+              <div className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
+              <div>
+                <p className="text-sm font-medium">Gathering project artifacts</p>
+                <p className="text-xs text-muted-foreground">Runner is collecting files and context for the council</p>
+              </div>
             </div>
           )}
 
