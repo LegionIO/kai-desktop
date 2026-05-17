@@ -188,6 +188,10 @@ type AppAPI = {
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
+    // Council approval
+    approveCouncil: (taskId: string) => Promise<{ ok: boolean; error?: string }>;
+    // Council respond (user answers advisor's clarification)
+    councilRespond: (taskId: string, message: string) => Promise<{ ok: boolean; error?: string }>;
   };
   agents: {
     list: () => Promise<AgentFile[]>;

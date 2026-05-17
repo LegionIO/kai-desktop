@@ -20,6 +20,12 @@ import {
   ChevronUpIcon,
   FileCodeIcon,
   TerminalIcon,
+  MessagesSquareIcon,
+  CheckIcon,
+  PauseIcon,
+  Loader2Icon,
+  AlertTriangleIcon,
+  ZapIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -38,6 +44,7 @@ import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { TaskTerminal } from './TaskTerminal';
+import { CouncilMessageBubble, CouncilTypingIndicator } from './CouncilMessageBubble';
 import type { TaskFile } from '@/types/task';
 import {
   KAI_TASK_STATUS_LABELS,
@@ -50,7 +57,7 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, refineTaskPlan } = useTasks();
+  const { state, updateTask, refineTaskPlan, approveCouncil, councilRespond, getCouncilMessages, isTaskDeliberating, getCouncilAgent, getCouncilPhase } = useTasks();
   const { state: agentState } = useAgents();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -66,8 +73,72 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const [isStartingAgent, setIsStartingAgent] = useState(false);
   const selectedRuntime = task.agentRuntime ?? 'claude-code';
 
-  // ── Tab state ─────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
+  // ── Council state ─────────────────────────────────────────────────────
+  const councilMessages = getCouncilMessages(task.id);
+  const deliberating = isTaskDeliberating(task.id);
+  const currentCouncilAgent = getCouncilAgent(task.id);
+  const councilPhase = getCouncilPhase(task.id);
+  const awaitingClarification = councilPhase === 'awaiting_clarification';
+
+  // ── Auto-approve discovery hint ──────────────────────────────────────
+  const [autoApproveHintDismissed, setAutoApproveHintDismissed] = useState(
+    () => localStorage.getItem('kai:autoApproveHintDismissed') === '1',
+  );
+  const [pluginAutoApproveEnabled, setPluginAutoApproveEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    // Fetch current sliceAutoApproval from plugin config
+    app.plugins?.getConfig?.('aithena')
+      .then((cfg: Record<string, unknown>) => {
+        setPluginAutoApproveEnabled(cfg?.sliceAutoApproval !== false); // defaults true
+      })
+      .catch(() => setPluginAutoApproveEnabled(null));
+  }, [task.status]); // re-check when task status changes (e.g. hits human_review)
+
+  const isAtApprovalGate = task.status === 'awaiting_approval' || task.status === 'human_review';
+  const showAutoApproveHint = isAtApprovalGate
+    && !autoApproveHintDismissed
+    && pluginAutoApproveEnabled === false;
+
+  const handleEnableAutoApprove = useCallback(() => {
+    app.plugins?.action?.('aithena', 'settings:SettingsView', 'save-settings', { sliceAutoApproval: true });
+    setAutoApproveHintDismissed(true);
+    setPluginAutoApproveEnabled(true);
+    localStorage.setItem('kai:autoApproveHintDismissed', '1');
+  }, []);
+
+  const handleDismissAutoApproveHint = useCallback(() => {
+    setAutoApproveHintDismissed(true);
+    localStorage.setItem('kai:autoApproveHintDismissed', '1');
+  }, []);
+
+  // ── Tab state — smart default based on task content ─────────────────────
+  const [activeTab, setActiveTab] = useState<'plan' | 'council' | 'agent'>(() => {
+    // If there are council messages or deliberation is active, default to council
+    if (councilMessages.length > 0 || deliberating || awaitingClarification) return 'council';
+    return 'plan';
+  });
+  const councilScrollRef = useRef<HTMLDivElement>(null);
+
+  // Reset tab to smart default when switching tasks or when messages arrive
+  const prevTaskId = useRef(task.id);
+  const hadMessages = useRef(councilMessages.length > 0);
+  useEffect(() => {
+    if (prevTaskId.current !== task.id) {
+      // Task changed — pick the right tab for the new task
+      prevTaskId.current = task.id;
+      hadMessages.current = councilMessages.length > 0;
+      if (councilMessages.length > 0 || deliberating || awaitingClarification) {
+        setActiveTab('council');
+      } else {
+        setActiveTab('plan');
+      }
+    } else if (!hadMessages.current && councilMessages.length > 0) {
+      // Messages just arrived (e.g. from fetch-history) — switch to council
+      hadMessages.current = true;
+      setActiveTab('council');
+    }
+  }, [task.id, councilMessages.length, deliberating, awaitingClarification]);
 
   // ── Composer state (plan tab) ─────────────────────────────────────────
   const [input, setInput] = useState('');
@@ -77,6 +148,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   // ── Agent composer state ──────────────────────────────────────────────
   const [agentInput, setAgentInput] = useState('');
   const agentTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── Council composer state ──────────────────────────────────────────────
+  const [councilInput, setCouncilInput] = useState('');
+  const councilTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Voice recording
   const { startRecording } = useVoiceRecording();
@@ -175,6 +250,27 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   }, [terminalSessionId]);
 
+  // Auto-switch to council tab when deliberation starts
+  useEffect(() => {
+    if (deliberating && activeTab === 'plan') {
+      setActiveTab('council');
+    }
+  }, [deliberating]);
+
+  // Auto-switch to council tab when advisor requests clarification
+  useEffect(() => {
+    if (awaitingClarification && activeTab !== 'council') {
+      setActiveTab('council');
+    }
+  }, [awaitingClarification]);
+
+  // Auto-scroll council messages
+  useEffect(() => {
+    if (councilScrollRef.current && (deliberating || councilMessages.length > 0)) {
+      councilScrollRef.current.scrollTop = councilScrollRef.current.scrollHeight;
+    }
+  }, [councilMessages.length, deliberating]);
+
   // Close on Escape (if onClose provided)
   useEffect(() => {
     if (!onClose) return;
@@ -207,6 +303,14 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 180) + 'px';
   }, [agentInput]);
+
+  // Auto-resize council textarea
+  useEffect(() => {
+    const el = councilTextareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+  }, [councilInput]);
 
   // Focus composer on mount and when task changes
   useEffect(() => {
@@ -256,10 +360,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const handleTerminalExit = useCallback(
     (_exitCode: number) => {
-      setTerminalSessionId(null);
-      void updateTask(task.id, { terminalSessionId: undefined });
+      // Keep terminalSessionId so the xterm buffer stays visible with output history.
+      // The terminal shows "[Process exited with code X]" — user can still scroll.
+      // Only clear the session on explicit "Stop" or task deletion.
     },
-    [task.id, updateTask],
+    [],
   );
 
   const handleComposerSubmit = useCallback(() => {
@@ -272,6 +377,45 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
   }, [input, task.id, refineTaskPlan, isActivelyStreaming]);
+
+  const handleApproveCouncil = useCallback(async () => {
+    const result = await approveCouncil(task.id);
+    if (!result.ok) {
+      console.error('[TaskDetailPanel] Council approval failed:', result.error);
+    }
+  }, [task.id, approveCouncil]);
+
+  const handleMarkDone = useCallback(async () => {
+    void updateTask(task.id, { status: 'done', completedAt: new Date().toISOString() });
+  }, [task.id, updateTask]);
+
+  const handleContinueExecution = useCallback(async () => {
+    // Move back to awaiting_approval so approveCouncil can re-trigger execution
+    void updateTask(task.id, { status: 'awaiting_approval' });
+    // Then auto-approve to start execution
+    const result = await approveCouncil(task.id);
+    if (!result.ok) {
+      console.error('[TaskDetailPanel] Continue execution failed:', result.error);
+    }
+  }, [task.id, updateTask, approveCouncil]);
+
+  const handleCouncilSubmit = useCallback(() => {
+    const text = councilInput.trim();
+    if (!text || (deliberating && !awaitingClarification)) return;
+    setCouncilInput('');
+    void councilRespond(task.id, text);
+    councilTextareaRef.current?.focus();
+  }, [councilInput, deliberating, awaitingClarification, task.id, councilRespond]);
+
+  const handleCouncilKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleCouncilSubmit();
+      }
+    },
+    [handleCouncilSubmit],
+  );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -385,6 +529,27 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab('council')}
+            className={cn(
+              'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
+              activeTab === 'council'
+                ? 'border-primary text-foreground'
+                : 'border-transparent text-muted-foreground hover:text-foreground/80',
+            )}
+          >
+            <MessagesSquareIcon className="h-3.5 w-3.5" />
+            Council
+            {deliberating && (
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+            )}
+            {!deliberating && councilMessages.length > 0 && (
+              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-muted px-1 text-[10px] font-medium text-muted-foreground">
+                {councilMessages.length}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('agent')}
             className={cn(
               'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
@@ -403,7 +568,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       </div>
 
       {/* ─── Tab content ─── */}
-      {activeTab === 'plan' ? (
+      {activeTab === 'plan' && (
         /* ═══ PLAN TAB ═══ */
         <div className="relative min-h-0 flex-1">
           {/* Fade at top */}
@@ -595,7 +760,141 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           </div>{/* end scrollRef */}
           </div>{/* end overflow-y-auto */}
         </div>
-      ) : (
+      )}
+
+      {activeTab === 'council' && (
+        /* ═══ COUNCIL TAB ═══ */
+        <div className="flex min-h-0 flex-1 flex-col">
+          {/* ─── Execution Progress Stepper ─── */}
+          {(councilMessages.length > 0 || deliberating) && (
+            <ExecutionProgressStepper task={task} councilPhase={councilPhase} deliberating={deliberating} />
+          )}
+
+          {/* ─── Auto-approve discovery hint ─── */}
+          {showAutoApproveHint && (
+            <div className="mx-6 mt-2 flex items-center gap-2 rounded-xl border border-violet-500/15 bg-violet-500/5 px-4 py-2 animate-in fade-in slide-in-from-bottom-1">
+              <ZapIcon size={12} className="text-violet-400 flex-shrink-0" />
+              <span className="text-[11px] text-muted-foreground">
+                Want Aithena to auto-approve?
+              </span>
+              <button
+                type="button"
+                onClick={handleEnableAutoApprove}
+                className="text-[11px] text-violet-400 hover:text-violet-300 font-medium transition-colors"
+              >
+                Enable
+              </button>
+              <button
+                type="button"
+                onClick={handleDismissAutoApproveHint}
+                className="text-[11px] text-muted-foreground/60 hover:text-muted-foreground transition-colors ml-1"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {/* Scrollable message list */}
+          <div ref={councilScrollRef} className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+            {councilMessages.length === 0 && !deliberating && (
+              <div className="flex h-full items-center justify-center">
+                <div className="flex flex-col items-center gap-3 text-center">
+                  <MessagesSquareIcon className="h-8 w-8 text-muted-foreground/20" />
+                  <div>
+                    <p className="text-sm text-muted-foreground/60">No council deliberation yet</p>
+                    <p className="mt-1 text-xs text-muted-foreground/40">
+                      The council will deliberate when this task is created or moved to planning
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+            {councilMessages.map((msg) => (
+              <CouncilMessageBubble key={msg.id} message={msg} />
+            ))}
+            {deliberating && !awaitingClarification && (
+              <CouncilTypingIndicator agent={currentCouncilAgent || 'aithena'} />
+            )}
+          </div>
+
+          {/* Approval banner (when awaiting_approval — fallback if auto-execute didn't trigger) */}
+          {task.status === 'awaiting_approval' && (
+            <div className="border-t border-border/40 bg-card/50 px-6 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">Plan approved by council</p>
+                <p className="text-xs text-muted-foreground">
+                  Starting execution...
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { void handleApproveCouncil(); }}
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+              >
+                Execute Now
+              </button>
+            </div>
+          )}
+
+          {/* Human review banner — execution finished, needs user decision */}
+          {task.status === 'human_review' && (
+            <div className="border-t border-border/40 bg-card/50 px-6 py-3">
+              <div className="mb-2">
+                <p className="text-sm font-medium">Execution complete — review required</p>
+                <p className="text-xs text-muted-foreground">
+                  {(task.metadata as Record<string, unknown>)?.sliceBlockReason
+                    ? `Paused: ${(task.metadata as Record<string, unknown>).sliceBlockReason}`
+                    : 'The agent has completed its work. Review the results and decide how to proceed.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { void handleMarkDone(); }}
+                  className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-700"
+                >
+                  Accept &amp; Done
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void handleContinueExecution(); }}
+                  className="rounded-lg border border-border/60 bg-muted/40 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/70"
+                >
+                  Continue Execution
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Council composer — respond to advisor's clarification questions */}
+          {task.status !== 'awaiting_approval' && task.status !== 'human_review' && task.status !== 'in_progress' && task.status !== 'done' && (
+            <div className="shrink-0 border-t border-border/40 px-6 py-3">
+              <div className="flex items-end gap-2">
+                <textarea
+                  ref={councilTextareaRef}
+                  value={councilInput}
+                  onChange={(e) => setCouncilInput(e.target.value)}
+                  onKeyDown={handleCouncilKeyDown}
+                  placeholder={deliberating && !awaitingClarification ? 'Council is deliberating...' : awaitingClarification ? 'Respond to the advisor...' : 'Respond to the council...'}
+                  disabled={deliberating && !awaitingClarification}
+                  rows={1}
+                  className="min-h-[40px] max-h-[120px] flex-1 resize-none overflow-y-auto rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary/50 focus:outline-none disabled:opacity-40"
+                />
+                <button
+                  type="button"
+                  onClick={handleCouncilSubmit}
+                  disabled={!councilInput.trim() || (deliberating && !awaitingClarification)}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                >
+                  <SendHorizonalIcon className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'agent' && (
         /* ═══ AGENT TAB ═══ */
         <div className="flex min-h-0 flex-1 flex-col">
           <div className={cn('flex min-h-0 flex-1 flex-col gap-3 mx-auto w-full px-5 pt-4 pb-4 md:pb-5', !fullWidth && 'max-w-3xl')}>
@@ -612,16 +911,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   <div className="flex flex-1 items-center justify-center">
                     <div className="flex flex-col items-center gap-3 text-center">
                       <TerminalIcon className="h-8 w-8 text-white/20" />
-                      <p className="text-sm text-white/40">No agent running</p>
-                      <button
-                        type="button"
-                        onClick={handleStartAgent}
-                        disabled={isStartingAgent}
-                        className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
-                      >
-                        <PlayIcon className="h-3.5 w-3.5" />
-                        {isStartingAgent ? 'Starting…' : (assignedAgent ? `Start ${assignedAgent.name}` : 'Assign Agent')}
-                      </button>
+                      <p className="text-sm text-white/40">
+                        {task.status === 'todo' ? 'Agent will run after council approval' : 'No execution output'}
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -761,6 +1053,241 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               </div>
             </div>
           </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── Execution Progress Stepper (Stateful) ─────────────────────────────────────
+
+const WORKFLOW_STEPS = [
+  { key: 'gathering', label: 'Gather' },
+  { key: 'planning', label: 'Plan' },
+  { key: 'reviewing', label: 'Review' },
+  { key: 'signoff', label: 'Sign-off' },
+  { key: 'executing', label: 'Execute' },
+  { key: 'done', label: 'Done' },
+] as const;
+
+type StepState = 'completed' | 'active' | 'paused' | 'blocked' | 'future';
+
+function resolveStepIndex(phase: string, taskStatus: string, deliberating: boolean): number {
+  if (taskStatus === 'done') return 5;
+  if (taskStatus === 'in_progress' || taskStatus === 'human_review') return 4;
+  if (taskStatus === 'awaiting_approval') return 4;
+
+  if (phase === 'complete' || phase === 'done') return 5;
+  if (phase === 'executing' || phase === 'execution') return 4;
+  if (phase === 'advisor_signoff' || phase === 'signoff') return 3;
+  if (phase === 'reviewing' || phase === 'review') return 2;
+  if (phase === 'planning') return 1;
+  if (phase === 'gathering' || phase === 'awaiting_clarification') return 0;
+
+  if (deliberating) return 0;
+  return -1;
+}
+
+function resolveStepState(
+  stepIdx: number,
+  currentIdx: number,
+  taskStatus: string,
+  councilPhase: string,
+  meta: Record<string, unknown>,
+): StepState {
+  if (stepIdx < currentIdx) return 'completed';
+  if (stepIdx > currentIdx) return 'future';
+
+  // Current step — determine sub-state
+  const action = meta.councilAction as string | undefined;
+  const blockReason = meta.sliceBlockReason as string | undefined;
+
+  if (action === 'blocked' || blockReason) return 'blocked';
+  if (taskStatus === 'human_review' || taskStatus === 'awaiting_approval') return 'paused';
+  if (councilPhase === 'awaiting_clarification') return 'paused';
+  if (taskStatus === 'in_progress') return 'active';
+  if (taskStatus === 'done') return 'completed';
+
+  return 'active'; // default during deliberation
+}
+
+function getStepAnnotation(
+  stepIdx: number,
+  currentIdx: number,
+  taskStatus: string,
+  councilPhase: string,
+  meta: Record<string, unknown>,
+  deliberating: boolean,
+): string | null {
+  if (stepIdx !== currentIdx) return null;
+
+  const slices = meta.councilSlices as Array<unknown> | undefined;
+  const sliceIdx = (meta.currentSliceIndex as number) ?? 0;
+  const cycles = (meta.executionCycles as number) ?? 0;
+  const executor = (meta.chosenExecutor as string) ?? '';
+  const blockReason = meta.sliceBlockReason as string | undefined;
+
+  // Execution step
+  if (stepIdx === 4) {
+    if (taskStatus === 'human_review') {
+      return blockReason ? blockReason.slice(0, 50) : 'Review required';
+    }
+    if (slices && slices.length > 1) {
+      return `Slice ${sliceIdx + 1}/${slices.length}${cycles ? ` · Cycle ${cycles}` : ''}${executor ? ` · ${executor.replace('claude-code', 'claude').replace('codex', 'codex')}` : ''}`;
+    }
+    if (cycles) {
+      return `Cycle ${cycles}${executor ? ` · ${executor.replace('claude-code', 'claude')}` : ''}`;
+    }
+    return executor ? executor.replace('claude-code', 'claude') : null;
+  }
+
+  // Done
+  if (stepIdx === 5) return 'Complete';
+
+  // Council phases
+  if (councilPhase === 'awaiting_clarification') return 'Awaiting response';
+  if (deliberating) {
+    if (stepIdx === 0) return 'Thinking…';
+    if (stepIdx === 1) return 'Planning…';
+    if (stepIdx === 2) return 'Reviewing…';
+    if (stepIdx === 3) return 'Signing off…';
+  }
+  return null;
+}
+
+function formatElapsed(startedAt: string | undefined, freeze: boolean): string {
+  if (!startedAt) return '';
+  const start = new Date(startedAt).getTime();
+  if (isNaN(start)) return '';
+  const now = freeze ? Date.now() : Date.now(); // both use now — freeze just stops the interval
+  const diff = Math.max(0, Math.floor((now - start) / 1000));
+  if (diff < 60) return `${diff}s`;
+  const m = Math.floor(diff / 60);
+  const s = diff % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+interface ExecutionProgressStepperProps {
+  task: TaskFile;
+  councilPhase: string;
+  deliberating: boolean;
+}
+
+const ExecutionProgressStepper: FC<ExecutionProgressStepperProps> = ({
+  task,
+  councilPhase,
+  deliberating,
+}) => {
+  const currentIdx = resolveStepIndex(councilPhase, task.status, deliberating);
+  if (currentIdx < 0) return null;
+
+  const meta = (task.metadata ?? {}) as Record<string, unknown>;
+  const slices = meta.councilSlices as Array<unknown> | undefined;
+  const sliceIdx = (meta.currentSliceIndex as number) ?? 0;
+  const shouldTick = task.status === 'in_progress';
+
+  // Elapsed time ticker
+  const [elapsed, setElapsed] = useState(() => formatElapsed(task.startedAt, !shouldTick));
+  useEffect(() => {
+    if (!task.startedAt) { setElapsed(''); return; }
+    setElapsed(formatElapsed(task.startedAt, false));
+    if (!shouldTick) return;
+    const id = setInterval(() => setElapsed(formatElapsed(task.startedAt, false)), 1000);
+    return () => clearInterval(id);
+  }, [task.startedAt, shouldTick]);
+
+  return (
+    <div className="shrink-0 border-b border-border/30 px-6 py-3">
+      {/* Step indicators */}
+      <div className="flex items-center justify-between">
+        {WORKFLOW_STEPS.map((step, idx) => {
+          const state = resolveStepState(idx, currentIdx, task.status, councilPhase, meta);
+          const annotation = getStepAnnotation(idx, currentIdx, task.status, councilPhase, meta, deliberating);
+
+          return (
+            <div key={step.key} className="flex items-center">
+              <div className="flex flex-col items-center gap-1">
+                {/* Circle indicator */}
+                <div
+                  className={cn(
+                    'flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-semibold transition-all',
+                    state === 'completed' && 'bg-emerald-500/20 text-emerald-400',
+                    state === 'active' && 'bg-primary/20 text-primary ring-2 ring-primary/40 animate-pulse',
+                    state === 'paused' && 'bg-amber-500/20 text-amber-400 ring-2 ring-amber-500/30',
+                    state === 'blocked' && 'bg-rose-500/20 text-rose-400 ring-2 ring-rose-500/30',
+                    state === 'future' && 'bg-muted/40 text-muted-foreground/40',
+                  )}
+                >
+                  {state === 'completed' && <CheckIcon className="h-3 w-3" />}
+                  {state === 'active' && <Loader2Icon className="h-3 w-3 animate-spin" />}
+                  {state === 'paused' && <PauseIcon className="h-3 w-3" />}
+                  {state === 'blocked' && <AlertTriangleIcon className="h-3 w-3" />}
+                  {state === 'future' && <span>{idx + 1}</span>}
+                </div>
+
+                {/* Label */}
+                <span
+                  className={cn(
+                    'text-[10px] font-medium leading-tight',
+                    state === 'completed' && 'text-emerald-400/80',
+                    state === 'active' && 'text-foreground',
+                    state === 'paused' && 'text-amber-400/80',
+                    state === 'blocked' && 'text-rose-400/80',
+                    state === 'future' && 'text-muted-foreground/40',
+                  )}
+                >
+                  {step.label}
+                </span>
+
+                {/* Annotation (only on current step) */}
+                {annotation && (
+                  <span
+                    className={cn(
+                      'text-[9px] leading-tight max-w-[80px] truncate',
+                      state === 'blocked' ? 'text-rose-400/60' : 'text-muted-foreground/50',
+                    )}
+                    title={annotation}
+                  >
+                    {annotation}
+                  </span>
+                )}
+              </div>
+
+              {/* Connector line */}
+              {idx < WORKFLOW_STEPS.length - 1 && (
+                <div
+                  className={cn(
+                    'mx-1 h-px w-5 sm:w-7 md:w-9 transition-colors',
+                    idx < currentIdx ? 'bg-emerald-500/40' : 'bg-border/40',
+                  )}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Bottom row: elapsed time + slice progress */}
+      {(elapsed || (slices && slices.length > 1 && currentIdx >= 4)) && (
+        <div className="mt-2 flex items-center justify-center gap-3 text-[10px] text-muted-foreground/60">
+          {elapsed && <span>⏱ {elapsed}</span>}
+          {slices && slices.length > 1 && currentIdx >= 4 && (
+            <span className="flex items-center gap-0.5">
+              {Array.from({ length: slices.length }, (_, i) => (
+                <span
+                  key={i}
+                  className={cn(
+                    'inline-block h-1.5 w-1.5 rounded-full transition-colors',
+                    i < sliceIdx ? 'bg-emerald-400' :
+                    i === sliceIdx ? 'bg-primary animate-pulse' :
+                    'bg-muted-foreground/20',
+                  )}
+                />
+              ))}
+            </span>
+          )}
         </div>
       )}
     </div>

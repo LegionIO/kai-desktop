@@ -2,13 +2,17 @@
  * Types shared between main and renderer process for Tasks.
  */
 
-export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
+export type KaiTaskStatus = 'todo' | 'in_progress' | 'awaiting_approval' | 'ai_review' | 'human_review' | 'done';
 
 export interface KaiTaskMetadata {
   category?: 'feature' | 'bug_fix' | 'refactoring' | 'docs' | 'other';
   labels?: string[];
   planFileName?: string;
   cwd?: string;
+  /** Injected source conversation messages for council context. */
+  sourceConversation?: Array<{ role: string; content: string }>;
+  /** Plugin-set: allow arbitrary metadata from hooks. */
+  [key: string]: unknown;
 }
 
 /** A message in the task's AI conversation history (for plan generation/refinement). */
@@ -54,3 +58,13 @@ export type TaskStreamEvent = {
   text?: string;
   error?: string;
 };
+
+/** A message from the council deliberation (streamed from Aithena plugin). */
+export interface CouncilMessage {
+  id: string;
+  agent: 'aithena' | 'aidan' | 'airen' | 'user';
+  phase: string;
+  content: string;
+  timestamp: string;
+  type: 'text' | 'plan' | 'review' | 'outcome' | 'clarification';
+}

@@ -886,7 +886,7 @@ export class PluginManager {
 
     if (hooks.length === 0) return null;
 
-    const HOOK_TIMEOUT_MS = 90_000; // Council deliberation requires multiple LLM calls (30-60s)
+    const HOOK_TIMEOUT_MS = 200_000; // Council deliberation: 4 LLM calls (advisor + planner + reviewer + signoff) ~180s max
     let mergedPatch: Record<string, unknown> | null = null;
     let executeDirective: TaskLifecycleHookResult['execute'] | undefined;
 

@@ -261,6 +261,12 @@ export type TaskLifecycleHookResult = {
   metadataPatch?: Record<string, unknown>;
   /** If present, spawns a non-interactive CLI execution with this prompt. */
   execute?: ExecutionDirective;
+  /** If present, overrides the task status (e.g. 'awaiting_approval'). */
+  statusOverride?: string;
+  /** If present, overrides the task title (e.g. plan title from council). */
+  titleOverride?: string;
+  /** If present, overrides the task description (e.g. plan content from council). */
+  descriptionOverride?: string;
 };
 
 export type PostTaskLifecycleHook = (

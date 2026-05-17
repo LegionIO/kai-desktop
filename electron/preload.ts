@@ -322,6 +322,12 @@ const appAPI = {
       ipcRenderer.on('tasks:stream-event', handler);
       return () => ipcRenderer.removeListener('tasks:stream-event', handler);
     },
+    // Council approval
+    approveCouncil: (taskId: string) =>
+      ipcRenderer.invoke('tasks:approve-council', taskId) as Promise<{ ok: boolean; error?: string }>,
+    // Council respond (user answers advisor's clarification questions)
+    councilRespond: (taskId: string, message: string) =>
+      ipcRenderer.invoke('tasks:council-respond', taskId, message) as Promise<{ ok: boolean; error?: string }>,
   },
 
   agents: {

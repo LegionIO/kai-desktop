@@ -19,6 +19,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
+import type { CouncilMessage } from '../../shared/task-types';
 
 // ── State & Actions ──────────────────────────────────────────────────────
 
@@ -33,6 +34,14 @@ interface TaskState {
   streamingText: string;
   /** Whether a plan stream is currently in flight. */
   isStreamingPlan: boolean;
+  /** Council messages per task (taskId → messages). */
+  councilMessages: Record<string, CouncilMessage[]>;
+  /** Current council phase per task. */
+  councilPhase: Record<string, string>;
+  /** Current speaking agent per task. */
+  councilAgent: Record<string, string>;
+  /** Whether council deliberation is active per task. */
+  isDeliberating: Record<string, boolean>;
 }
 
 type TaskAction =
@@ -46,10 +55,17 @@ type TaskAction =
   | { type: 'START_AI_CREATE'; taskId: string }
   | { type: 'STREAM_TEXT_DELTA'; text: string }
   | { type: 'STREAM_DONE' }
-  | { type: 'CANCEL_AI_CREATE' };
+  | { type: 'CANCEL_AI_CREATE' }
+  | { type: 'COUNCIL_MESSAGE'; taskId: string; message: CouncilMessage }
+  | { type: 'COUNCIL_PHASE_CHANGE'; taskId: string; phase: string }
+  | { type: 'COUNCIL_AGENT_CHANGE'; taskId: string; agent: string }
+  | { type: 'COUNCIL_START'; taskId: string }
+  | { type: 'COUNCIL_RESUME'; taskId: string }
+  | { type: 'COUNCIL_DONE'; taskId: string };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
+  awaiting_approval: [],
   in_progress: [],
   ai_review: [],
   human_review: [],
@@ -64,6 +80,10 @@ const initialState: TaskState = {
   creatingTaskId: null,
   streamingText: '',
   isStreamingPlan: false,
+  councilMessages: {},
+  councilPhase: {},
+  councilAgent: {},
+  isDeliberating: {},
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -99,6 +119,39 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
       return { ...state, isStreamingPlan: false };
     case 'CANCEL_AI_CREATE':
       return { ...state, creatingTaskId: null, streamingText: '', isStreamingPlan: false };
+    case 'COUNCIL_START':
+      return {
+        ...state,
+        isDeliberating: { ...state.isDeliberating, [action.taskId]: true },
+        councilMessages: { ...state.councilMessages, [action.taskId]: [] },
+      };
+    case 'COUNCIL_RESUME':
+      return {
+        ...state,
+        isDeliberating: { ...state.isDeliberating, [action.taskId]: true },
+      };
+    case 'COUNCIL_MESSAGE': {
+      const existing = state.councilMessages[action.taskId] ?? [];
+      return {
+        ...state,
+        councilMessages: { ...state.councilMessages, [action.taskId]: [...existing, action.message] },
+      };
+    }
+    case 'COUNCIL_PHASE_CHANGE':
+      return {
+        ...state,
+        councilPhase: { ...state.councilPhase, [action.taskId]: action.phase },
+      };
+    case 'COUNCIL_AGENT_CHANGE':
+      return {
+        ...state,
+        councilAgent: { ...state.councilAgent, [action.taskId]: action.agent },
+      };
+    case 'COUNCIL_DONE':
+      return {
+        ...state,
+        isDeliberating: { ...state.isDeliberating, [action.taskId]: false },
+      };
     default:
       return state;
   }
@@ -162,6 +215,24 @@ interface TaskContextValue {
 
   /** Exit AI creation mode (reset state, keep the task). */
   exitAICreation: () => void;
+
+  /** Approve a council plan and start execution. */
+  approveCouncil: (taskId: string) => Promise<{ ok: boolean; error?: string }>;
+
+  /** Respond to council (answer advisor's clarification questions). */
+  councilRespond: (taskId: string, message: string) => Promise<{ ok: boolean; error?: string }>;
+
+  /** Get council messages for a specific task. */
+  getCouncilMessages: (taskId: string) => CouncilMessage[];
+
+  /** Check if council is actively deliberating for a task. */
+  isTaskDeliberating: (taskId: string) => boolean;
+
+  /** Get the current council phase for a task. */
+  getCouncilPhase: (taskId: string) => string;
+
+  /** Get the currently speaking council agent for a task. */
+  getCouncilAgent: (taskId: string) => string;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -208,6 +279,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           // No order.json — initialize order from current tasks
           const initialOrder: KaiTaskOrder = {
             todo: [],
+            awaiting_approval: [],
             in_progress: [],
             ai_review: [],
             human_review: [],
@@ -464,28 +536,23 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const startAITaskCreation = useCallback(async (userMessage: string, metadata?: KaiTaskMetadata) => {
     try {
-      // Create a placeholder task
+      // Create task with user's message as description — this goes directly to council.
+      // The council (Aithena) will handle orchestration: gather, plan, review, approve.
       const task = (await app.tasks.create({
-        title: 'New Task',
-        description: '',
+        title: userMessage.slice(0, 120),  // Use user's message as initial title
+        description: userMessage,           // Full message as description for council
         status: 'todo',
         workspaceId: activeWorkspaceId || undefined,
         metadata,
       }));
       if (!task || !task.id) return;
 
+      // Signal that task was created so TaskCreationView can transition to detail view
       dispatch({ type: 'START_AI_CREATE', taskId: task.id });
 
-      // Generate title in parallel (non-blocking)
-      void app.tasks.generateTitle(userMessage).then(({ title }) => {
-        if (title) {
-          dispatch({ type: 'UPDATE_TASK', id: task.id, updates: { title } });
-          void app.tasks.update(task.id, { title });
-        }
-      });
-
-      // Start streaming the plan
-      await app.tasks.streamPlan(task.id, userMessage);
+      // Council triggers on task_created via the plugin lifecycle hook.
+      // It will see the full user message in title + description.
+      // No separate streamPlan needed — council handles everything.
     } catch (err) {
       console.error('[TaskProvider] Failed to start AI task creation:', err);
       dispatch({ type: 'CANCEL_AI_CREATE' });
@@ -521,6 +588,355 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     dispatch({ type: 'CANCEL_AI_CREATE' });
   }, [state.isStreamingPlan, state.creatingTaskId]);
 
+  // ── Council Event Subscription ────────────────────────────────────────
+
+  // Buffer for accumulating agent_delta content before flushing as a full message
+  const councilBufferRef = useRef<Record<string, { agent: string; phase: string; content: string }>>({});
+  // Keep a ref to councilMessages so event handlers can check for duplicates without deps
+  const councilMessagesRef = useRef(state.councilMessages);
+  councilMessagesRef.current = state.councilMessages;
+
+  useEffect(() => {
+    if (!window.app?.plugins?.onEvent) {
+      console.warn('[TaskProvider] plugins.onEvent NOT available — council events will not render');
+      return;
+    }
+    const unsub = app.plugins.onEvent((evt: unknown) => {
+      const e = evt as { pluginName?: string; eventName?: string; data?: unknown };
+      if (e.eventName !== 'council:message' && e.eventName !== 'council:result') return;
+
+      // Handle council:result — apply status/title/description from re-deliberation
+      if (e.eventName === 'council:result') {
+        const { taskId: resultTaskId, result: councilResult } = (e.data ?? {}) as {
+          taskId?: string;
+          result?: {
+            sessionId?: string;
+            reviewOutcome?: string;
+            planArtifact?: string;
+            clarificationRequired?: boolean;
+            clarificationQuestions?: string;
+          };
+        };
+        if (!resultTaskId || !councilResult) return;
+
+        // If still requesting clarification, update metadata but don't apply title/status changes
+        if (councilResult.clarificationRequired) {
+          app.tasks.get(resultTaskId).then((currentTask) => {
+            if (!currentTask) return;
+            const existingMeta = (currentTask.metadata ?? {}) as Record<string, unknown>;
+            const mergedMeta = {
+              ...existingMeta,
+              councilSessionId: councilResult.sessionId,
+              councilPhase: 'awaiting_clarification',
+              councilQuestions: councilResult.clarificationQuestions,
+            };
+            return app.tasks.update(resultTaskId, { metadata: mergedMeta } as Partial<TaskFile>);
+          }).then((updatedTask) => {
+            if (updatedTask) {
+              dispatch({ type: 'UPDATE_TASK', id: resultTaskId, updates: updatedTask as Partial<TaskFile> });
+            }
+          }).catch((err) => {
+            console.error('[TaskProvider] Failed to update task after council clarification:', err);
+          });
+          // Don't dispatch COUNCIL_DONE — keep composer active
+          dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId: resultTaskId, phase: 'awaiting_clarification' });
+          return;
+        }
+
+        // Extract plan title (same logic as plugin's extractPlanTitle)
+        const planTitle = extractPlanTitleFromArtifact(councilResult.planArtifact ?? '');
+
+        // Fetch current task to merge metadata (spread in IPC handler overwrites entire metadata)
+        app.tasks.get(resultTaskId).then((currentTask) => {
+          if (!currentTask) return;
+
+          const existingMeta = (currentTask.metadata ?? {}) as Record<string, unknown>;
+          const mergedMeta = {
+            ...existingMeta,
+            councilSessionId: councilResult.sessionId,
+            councilOutcome: councilResult.reviewOutcome,
+            councilPlan: (councilResult.planArtifact ?? '').slice(0, 8000),
+            councilPlanTitle: planTitle || existingMeta.councilPlanTitle,
+            councilPhase: councilResult.reviewOutcome === 'approved' ? 'approved' : councilResult.reviewOutcome,
+          };
+
+          const updates: Record<string, unknown> = {
+            metadata: mergedMeta,
+          };
+
+          // Don't override title — keep user's original intent as task title
+          if (councilResult.planArtifact) {
+            updates.description = councilResult.planArtifact;
+          }
+
+          // Auto-execute: council approved → go straight to execution (no human review gate)
+          if (councilResult.reviewOutcome === 'approved') {
+            updates.status = 'awaiting_approval'; // Temporarily — approve-council will flip to in_progress
+          }
+
+          return app.tasks.update(resultTaskId, updates as Partial<TaskFile>);
+        }).then((updatedTask) => {
+          if (updatedTask) {
+            dispatch({ type: 'UPDATE_TASK', id: resultTaskId, updates: updatedTask as Partial<TaskFile> });
+          }
+          // Auto-approve if council approved — starts execution immediately
+          if (councilResult.reviewOutcome === 'approved') {
+            app.tasks.approveCouncil(resultTaskId).catch((err) => {
+              console.error('[TaskProvider] Auto-approve failed:', err);
+            });
+          }
+        }).catch((err) => {
+          console.error('[TaskProvider] Failed to update task after council:result:', err);
+        });
+
+        dispatch({ type: 'COUNCIL_DONE', taskId: resultTaskId });
+        return;
+      }
+
+      const { taskId, event } = (e.data ?? {}) as {
+        taskId?: string;
+        event?: {
+          type: string;
+          agent?: string;
+          phase?: string;
+          content?: string;
+          data?: Record<string, unknown>;
+        };
+      };
+      if (!taskId || !event) return;
+
+      switch (event.type) {
+        case 'session_start': {
+          dispatch({ type: 'COUNCIL_START', taskId });
+          // Show the user's original message at the top of the council chat
+          const taskTitle = event.data?.task_title as string;
+          if (taskTitle) {
+            dispatch({
+              type: 'COUNCIL_MESSAGE',
+              taskId,
+              message: {
+                id: `${taskId}-${Date.now()}-user-init`,
+                agent: 'user',
+                phase: '',
+                content: taskTitle,
+                timestamp: new Date().toISOString(),
+                type: 'text',
+              },
+            });
+          }
+          break;
+        }
+
+        case 'session_resumed':
+          dispatch({ type: 'COUNCIL_RESUME', taskId });
+          break;
+
+        case 'phase_change':
+          dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId, phase: event.phase ?? event.data?.phase as string ?? '' });
+          break;
+
+        case 'agent_start': {
+          const agent = event.agent ?? '';
+          dispatch({ type: 'COUNCIL_AGENT_CHANGE', taskId, agent });
+          // Initialize buffer for this task+agent
+          councilBufferRef.current[taskId] = {
+            agent,
+            phase: event.phase ?? '',
+            content: '',
+          };
+          break;
+        }
+
+        case 'agent_delta': {
+          // Accumulate into buffer
+          const buf = councilBufferRef.current[taskId];
+          if (buf) {
+            buf.content += event.content ?? '';
+          }
+          break;
+        }
+
+        case 'agent_done': {
+          // Flush buffer as a complete message.
+          // Falls back to event.content for cases where agent_done arrives without
+          // preceding agent_delta (history restoration, user clarification responses).
+          const buf = councilBufferRef.current[taskId];
+          const content = (buf?.content?.trim()) || (event.content?.trim()) || '';
+          const agent = event.agent ?? buf?.agent ?? 'aithena';
+          const phase = event.phase ?? buf?.phase ?? '';
+
+          if (content) {
+            // Deduplicate user messages — prevent echo from fetch-history re-emitting
+            // messages that were already added by councilRespond's local dispatch.
+            if (agent === 'user') {
+              const existing = councilMessagesRef.current[taskId] ?? [];
+              const isDuplicate = existing.some(
+                (m) => m.agent === 'user' && m.content === content,
+              );
+              if (isDuplicate) {
+                delete councilBufferRef.current[taskId];
+                break;
+              }
+            }
+
+            const msgType = agent === 'aidan' ? 'plan' as const
+              : agent === 'airen' ? 'review' as const
+              : 'text' as const;
+
+            dispatch({
+              type: 'COUNCIL_MESSAGE',
+              taskId,
+              message: {
+                id: `${taskId}-${Date.now()}-${agent}`,
+                agent: (agent as 'aithena' | 'aidan' | 'airen' | 'user') || 'aithena',
+                phase,
+                content,
+                timestamp: new Date().toISOString(),
+                type: msgType,
+              },
+            });
+          }
+          delete councilBufferRef.current[taskId];
+          break;
+        }
+
+        case 'review_outcome': {
+          const outcome = event.data?.outcome as string ?? 'unknown';
+          dispatch({
+            type: 'COUNCIL_MESSAGE',
+            taskId,
+            message: {
+              id: `${taskId}-${Date.now()}-outcome`,
+              agent: 'aithena',
+              phase: 'advisor_signoff',
+              content: `Council outcome: **${outcome}**`,
+              timestamp: new Date().toISOString(),
+              type: 'outcome',
+            },
+          });
+          dispatch({ type: 'COUNCIL_DONE', taskId });
+          break;
+        }
+
+        case 'clarification_required': {
+          // Advisor gate fired — advisor's questions are already in council messages
+          // (flushed via agent_done buffer). Don't add a duplicate message.
+          // Just set phase + clear agent to stop "thinking" indicator.
+          dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId, phase: 'awaiting_clarification' });
+          dispatch({ type: 'COUNCIL_AGENT_CHANGE', taskId, agent: '' });
+          break;
+        }
+      }
+    });
+    return unsub;
+  }, []);
+
+  // ── Council Session History Restoration ──────────────────────────────────
+  // When a task is selected and has a council session but no messages in memory,
+  // fetch the session transcript from the server to restore the conversation.
+  // Track which tasks we've already fetched history for to prevent re-fetching.
+  const fetchedHistoryRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!state.selectedTaskId) return;
+    const task = state.tasks.find(t => t.id === state.selectedTaskId);
+    if (!task) return;
+
+    const meta = task.metadata as Record<string, unknown> | undefined;
+    const sessionId = meta?.councilSessionId as string | undefined;
+    if (!sessionId) return;
+
+    // Don't fetch if deliberation is currently active (live events are flowing)
+    if (state.isDeliberating[task.id]) return;
+
+    // Don't re-fetch if we already fetched for this task+session combo
+    const fetchKey = `${task.id}:${sessionId}`;
+    if (fetchedHistoryRef.current.has(fetchKey)) return;
+
+    // Only fetch if we have no messages cached in memory for this task
+    const existingMessages = state.councilMessages[task.id];
+    if (existingMessages && existingMessages.length > 0) return;
+
+    fetchedHistoryRef.current.add(fetchKey);
+
+    // Trigger the plugin action to fetch session history.
+    // Pass task metadata so the plugin can reconstruct from local data if server is unreachable.
+    // Retry once after 1.5s if the first call fails (startup race: plugin may not be ready yet)
+    const fetchHistory = () => app.plugins?.action?.('aithena', 'council:fetch-history', 'fetch', {
+      sessionId,
+      taskId: task.id,
+      taskMetadata: meta,
+    });
+
+    fetchHistory()?.catch((err) => {
+      console.warn('[TaskProvider:restore] First fetch-history attempt failed:', err);
+      // Retry once after delay — plugin may still be loading at startup
+      setTimeout(() => {
+        fetchHistory()?.catch((err2) => {
+          console.warn('[TaskProvider:restore] Retry also failed:', err2);
+          // Allow retry on next selection
+          fetchedHistoryRef.current.delete(fetchKey);
+        });
+      }, 1500);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.selectedTaskId, state.tasks]);
+
+  // ── Council Actions ────────────────────────────────────────────────────
+
+  const approveCouncil = useCallback(async (taskId: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const result = await app.tasks.approveCouncil(taskId);
+      return result;
+    } catch (err) {
+      console.error('[TaskProvider] Failed to approve council:', err);
+      return { ok: false, error: String(err) };
+    }
+  }, []);
+
+  const councilRespond = useCallback(async (taskId: string, message: string): Promise<{ ok: boolean; error?: string }> => {
+    // Immediately add the user's message to the council chat so they see their own input
+    dispatch({
+      type: 'COUNCIL_MESSAGE',
+      taskId,
+      message: {
+        id: `${taskId}-${Date.now()}-user`,
+        agent: 'user',
+        phase: '',
+        content: message,
+        timestamp: new Date().toISOString(),
+        type: 'text',
+      },
+    });
+    // Show "thinking" indicator immediately after user sends
+    dispatch({ type: 'COUNCIL_RESUME', taskId });
+    dispatch({ type: 'COUNCIL_PHASE_CHANGE', taskId, phase: 'gathering' });
+
+    try {
+      const result = await app.tasks.councilRespond(taskId, message);
+      return result;
+    } catch (err) {
+      console.error('[TaskProvider] Failed to respond to council:', err);
+      return { ok: false, error: String(err) };
+    }
+  }, []);
+
+  const getCouncilMessages = useCallback((taskId: string): CouncilMessage[] => {
+    return state.councilMessages[taskId] ?? [];
+  }, [state.councilMessages]);
+
+  const isTaskDeliberating = useCallback((taskId: string): boolean => {
+    return state.isDeliberating[taskId] ?? false;
+  }, [state.isDeliberating]);
+
+  const getCouncilPhase = useCallback((taskId: string): string => {
+    return state.councilPhase[taskId] ?? '';
+  }, [state.councilPhase]);
+
+  const getCouncilAgent = useCallback((taskId: string): string => {
+    return state.councilAgent[taskId] ?? '';
+  }, [state.councilAgent]);
+
   // ── Memoized context value ───────────────────────────────────────────
 
   const value = useMemo<TaskContextValue>(
@@ -539,6 +955,12 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       refineTaskPlan,
       cancelAIStream,
       exitAICreation,
+      approveCouncil,
+      councilRespond,
+      getCouncilMessages,
+      isTaskDeliberating,
+      getCouncilPhase,
+      getCouncilAgent,
     }),
     [
       state,
@@ -555,11 +977,64 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       refineTaskPlan,
       cancelAIStream,
       exitAICreation,
+      approveCouncil,
+      councilRespond,
+      getCouncilMessages,
+      isTaskDeliberating,
+      getCouncilPhase,
+      getCouncilAgent,
     ],
   );
 
   return <TaskContext.Provider value={value}>{children}</TaskContext.Provider>;
 };
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Extract a meaningful title from a council plan artifact (first heading or "Plan:" line). */
+function extractPlanTitleFromArtifact(plan: string): string | null {
+  if (!plan) return null;
+  const lines = plan.split('\n');
+  let firstHeading: string | null = null;
+  let planLine: string | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#') && !firstHeading) {
+      firstHeading = trimmed.replace(/^#+\s*/, '').slice(0, 120);
+    }
+    if (!planLine && /^Plan[\s:v]/i.test(trimmed)) {
+      planLine = trimmed
+        .replace(/^Plan\s*(?:v[\d.]+)?\s*[—–-]\s*/i, '')
+        .replace(/^Plan:\s*/i, '')
+        .slice(0, 120);
+    }
+  }
+
+  // Reject titles that are just meta-planning noise or contain "New Task"
+  const isUseless = (t: string) =>
+    /\bnew task\b/i.test(t) ||
+    /\btask clarification\b/i.test(t) ||
+    /\breadiness plan\b/i.test(t) ||
+    /\bplaceholder\b/i.test(t);
+
+  if (planLine && planLine.length > 5 && !isUseless(planLine)) return planLine;
+  if (firstHeading && firstHeading.length > 5 && !isUseless(firstHeading)) return firstHeading;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (
+      trimmed.length > 5
+      && !trimmed.startsWith('Acknowledged')
+      && !trimmed.startsWith('---')
+      && !trimmed.startsWith('#')
+      && !isUseless(trimmed)
+    ) {
+      return trimmed.slice(0, 120);
+    }
+  }
+  return null;
+}
 
 // ── Hook ─────────────────────────────────────────────────────────────────
 

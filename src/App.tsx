@@ -1745,8 +1745,8 @@ function AppShell() {
                           <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
                           <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
                             <DropdownMenu.Trigger asChild>
-                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                                <span className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
+                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10 max-w-[50vw]">
+                                <span className={`truncate text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
                                   {selectedTask.title}
                                 </span>
                                 {!taskIsPending && <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />}

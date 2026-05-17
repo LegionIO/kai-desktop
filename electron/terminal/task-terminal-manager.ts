@@ -112,6 +112,8 @@ export class TaskTerminalManager {
 
     let outputBuffer = '';
     const MAX_BUFFER = 8000;
+    const isClaude = options.runtime === 'claude-code';
+    let lineBuffer = ''; // Buffer partial lines for stream-json parsing
 
     proc.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
@@ -119,7 +121,22 @@ export class TaskTerminalManager {
       if (outputBuffer.length > MAX_BUFFER * 2) {
         outputBuffer = outputBuffer.slice(-MAX_BUFFER);
       }
-      this.broadcast('tasks:terminal-data', { sessionId, data: text });
+
+      if (isClaude) {
+        // Parse stream-json: accumulate lines, parse complete JSON objects
+        lineBuffer += text;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? ''; // Keep incomplete last line in buffer
+
+        for (const line of lines) {
+          const formatted = formatStreamJsonLine(line);
+          if (formatted) {
+            this.broadcast('tasks:terminal-data', { sessionId, data: formatted });
+          }
+        }
+      } else {
+        this.broadcast('tasks:terminal-data', { sessionId, data: text });
+      }
     });
 
     proc.stderr?.on('data', (chunk: Buffer) => {
@@ -128,10 +145,18 @@ export class TaskTerminalManager {
       if (outputBuffer.length > MAX_BUFFER * 2) {
         outputBuffer = outputBuffer.slice(-MAX_BUFFER);
       }
-      this.broadcast('tasks:terminal-data', { sessionId, data: text });
+      // stderr — show dimmed
+      this.broadcast('tasks:terminal-data', { sessionId, data: `\x1b[90m${text}\x1b[0m` });
     });
 
     proc.on('close', (exitCode: number | null) => {
+      // Flush remaining line buffer
+      if (isClaude && lineBuffer.trim()) {
+        const formatted = formatStreamJsonLine(lineBuffer);
+        if (formatted) {
+          this.broadcast('tasks:terminal-data', { sessionId, data: formatted });
+        }
+      }
       this.nonInteractiveProcs.delete(sessionId);
       const finalOutput = outputBuffer.slice(-MAX_BUFFER);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode: exitCode ?? 1 });
@@ -236,6 +261,141 @@ export class TaskTerminalManager {
       win.webContents.send(channel, data);
     }
   }
+}
+
+// ── Stream-JSON Formatter ──────────────────────────────────────────────
+// Converts Claude CLI `--output-format stream-json` lines into human-readable
+// ANSI-colored text for xterm.js display. Matches fusion-app's TerminalOutput.
+
+const ANSI = {
+  reset: '\x1b[0m',
+  dim: '\x1b[90m',
+  white: '\x1b[37m',
+  cyan: '\x1b[36m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  blue: '\x1b[34m',
+  bold: '\x1b[1m',
+};
+
+function formatStreamJsonLine(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  if (!trimmed.startsWith('{')) {
+    // Non-JSON line — pass through
+    return trimmed + '\r\n';
+  }
+
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    return formatJsonObject(obj);
+  } catch {
+    // Invalid JSON — pass through
+    return trimmed + '\r\n';
+  }
+}
+
+function formatJsonObject(obj: Record<string, unknown>): string | null {
+  const type = obj.type as string | undefined;
+
+  // ── System events ─────────────────────────────────
+  if (type === 'system') {
+    const subtype = obj.subtype as string | undefined;
+
+    if (subtype === 'init') {
+      const model = obj.model as string | undefined;
+      const version = obj.claude_code_version as string | undefined;
+      const tools = obj.tools as string[] | undefined;
+      return `${ANSI.dim}• Session initialized — model: ${model ?? 'unknown'}, v${version ?? '?'}, tools: ${tools?.length ?? 0}${ANSI.reset}\r\n`;
+    }
+
+    if (subtype === 'hook_started' || subtype === 'hook_response') {
+      return null; // Skip hook noise
+    }
+
+    return `${ANSI.dim}• [${subtype ?? 'system'}]${ANSI.reset}\r\n`;
+  }
+
+  // ── Assistant message ─────────────────────────────
+  if (type === 'assistant') {
+    const message = obj.message as Record<string, unknown> | undefined;
+    if (!message) return null;
+
+    const content = message.content;
+    if (!Array.isArray(content)) return null;
+
+    const parts: string[] = [];
+
+    for (const block of content) {
+      const b = block as Record<string, unknown>;
+      if (b.type === 'text' && b.text) {
+        parts.push(`${ANSI.white}${b.text as string}${ANSI.reset}`);
+      } else if (b.type === 'tool_use') {
+        const name = b.name as string;
+        const input = b.input as Record<string, unknown> | undefined;
+        const summary = input
+          ? Object.entries(input)
+              .slice(0, 3)
+              .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 80)}`)
+              .join(', ')
+          : '';
+        parts.push(`\r\n${ANSI.cyan}${ANSI.bold}› ${name}${ANSI.reset}${ANSI.dim}(${summary})${ANSI.reset}`);
+      }
+    }
+
+    return parts.length > 0 ? parts.join('\r\n') + '\r\n' : null;
+  }
+
+  // ── Content block start (tool use) ────────────────
+  if (type === 'content_block_start') {
+    const block = obj.content_block as Record<string, unknown> | undefined;
+    if (block?.type === 'tool_use') {
+      return `\r\n${ANSI.cyan}${ANSI.bold}› ${block.name as string}${ANSI.reset}\r\n`;
+    }
+    return null;
+  }
+
+  // ── Content block delta (streaming text) ──────────
+  if (type === 'content_block_delta') {
+    const delta = obj.delta as Record<string, unknown> | undefined;
+    if (delta?.type === 'text_delta' && delta.text) {
+      const text = (delta.text as string).replace(/\n/g, '\r\n');
+      return `${ANSI.white}${text}${ANSI.reset}`;
+    }
+    return null; // Skip input_json_delta
+  }
+
+  // ── Tool result ───────────────────────────────────
+  if (type === 'tool_result') {
+    const content = obj.content as string | undefined;
+    if (!content) return null;
+    const preview = content.length > 500 ? content.slice(0, 500) + '...' : content;
+    const lines = preview.replace(/\n/g, '\r\n');
+    return `${ANSI.green}${lines}${ANSI.reset}\r\n`;
+  }
+
+  // ── Final result ──────────────────────────────────
+  if (type === 'result') {
+    const result = obj.result as string | undefined;
+    const cost = obj.cost_usd as number | undefined;
+    const duration = obj.duration_ms as number | undefined;
+    const meta: string[] = [];
+    if (cost != null) meta.push(`$${cost.toFixed(4)}`);
+    if (duration != null) meta.push(`${(duration / 1000).toFixed(1)}s`);
+    const metaStr = meta.length > 0 ? ` ${ANSI.dim}(${meta.join(', ')})${ANSI.reset}` : '';
+    const text = result ? result.replace(/\n/g, '\r\n') : 'Execution complete';
+    return `\r\n${ANSI.green}${ANSI.bold}${text}${ANSI.reset}${metaStr}\r\n`;
+  }
+
+  // ── Message start/stop, content_block_stop — skip ─
+  if (type === 'message_start' || type === 'message_delta' || type === 'message_stop' || type === 'content_block_stop') {
+    return null;
+  }
+
+  // ── Unknown — skip ────────────────────────────────
+  return null;
 }
 
 // ── IPC Handler Registration ────────────────────────────────────────────

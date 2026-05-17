@@ -146,7 +146,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const tasksByStatus = useMemo(() => {
     const query = searchQuery.toLowerCase().trim();
     const grouped: Record<KaiTaskStatus, TaskFile[]> = {
-      todo: [], in_progress: [], ai_review: [], human_review: [], done: [],
+      todo: [], awaiting_approval: [], in_progress: [], ai_review: [], human_review: [], done: [],
     };
 
     for (const task of state.tasks) {

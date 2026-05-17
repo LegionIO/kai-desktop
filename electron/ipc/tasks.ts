@@ -9,6 +9,7 @@ import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { TaskLifecycleEvent, TaskLifecycleHookArgs, ExecutionDirective } from '../plugins/types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { readConversationStore } from './conversations.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -151,21 +152,20 @@ function startExecutionLoop(
           console.info(`[tasks] Execution cycle ${cycle} starting for task ${taskId}`);
           runCycle(result.execute.prompt, result.execute.cwd);
         } else if (result?.awaitApproval) {
-          // Level 3: Hard stop — move to human_review
+          // Level 3: Hard stop — move to human_review (keep terminalSessionId for output history)
           try {
             const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
             task.status = 'human_review';
-            task.terminalSessionId = undefined;
             task.updatedAt = new Date().toISOString();
             writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
             broadcastTaskChange(appHome);
           } catch { /* ignore */ }
         } else {
           // Default: move to human_review on success, keep in_progress on failure
+          // Keep terminalSessionId so the output history remains visible
           try {
             const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
             task.status = exitCode === 0 ? 'human_review' : 'in_progress';
-            task.terminalSessionId = undefined;
             task.updatedAt = new Date().toISOString();
             writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
             broadcastTaskChange(appHome);
@@ -244,6 +244,29 @@ export function registerTaskHandlers(
         const id = randomUUID();
         const now = new Date().toISOString();
         const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
+
+        // Inject source conversation messages into metadata for plugin consumption.
+        // When a task is created from a chat conversation, the plugin needs the
+        // conversation context to provide to the council advisor.
+        if (task.sourceConversationId) {
+          try {
+            const convStore = readConversationStore(appHome);
+            const sourceConvo = convStore.conversations[task.sourceConversationId];
+            if (sourceConvo?.messages?.length) {
+              // Take last 20 messages, truncate content to prevent metadata bloat
+              const relevantMessages = (sourceConvo.messages as Array<{ role?: string; content?: unknown }>).slice(-20).map((m) => ({
+                role: (m.role as string) ?? 'user',
+                content: typeof m.content === 'string'
+                  ? m.content.slice(0, 2000)
+                  : JSON.stringify(m.content ?? '').slice(0, 2000),
+              }));
+              task.metadata = { ...(task.metadata ?? {}), sourceConversation: relevantMessages };
+            }
+          } catch (convErr) {
+            console.warn('[tasks] Failed to inject source conversation:', convErr);
+          }
+        }
+
         writeFileSync(
           join(getTasksDir(appHome), `${id}.json`),
           JSON.stringify(task, null, 2),
@@ -273,6 +296,33 @@ export function registerTaskHandlers(
                 broadcastTaskChange(appHome);
               } catch (patchErr) {
                 console.error('[tasks] Failed to apply hook metadata patch (create):', patchErr);
+              }
+            }
+
+            // Apply status override (e.g. plugin sets 'awaiting_approval')
+            if (hookResult.statusOverride) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                current.status = hookResult.statusOverride as KaiTaskStatus;
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
+              } catch (statusErr) {
+                console.error('[tasks] Failed to apply hook status override (create):', statusErr);
+              }
+            }
+
+            // Apply title override (e.g. plan title from council deliberation)
+            if (hookResult.titleOverride || hookResult.descriptionOverride) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                if (hookResult.titleOverride) current.title = hookResult.titleOverride;
+                if (hookResult.descriptionOverride) current.description = hookResult.descriptionOverride;
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
+              } catch (titleErr) {
+                console.error('[tasks] Failed to apply hook title/description override (create):', titleErr);
               }
             }
 
@@ -347,6 +397,33 @@ export function registerTaskHandlers(
                 broadcastTaskChange(appHome);
               } catch (patchErr) {
                 console.error('[tasks] Failed to apply hook metadata patch:', patchErr);
+              }
+            }
+
+            // Apply status override (e.g. plugin sets 'awaiting_approval')
+            if (hookResult.statusOverride) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                current.status = hookResult.statusOverride as KaiTaskStatus;
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
+              } catch (statusErr) {
+                console.error('[tasks] Failed to apply hook status override:', statusErr);
+              }
+            }
+
+            // Apply title/description override
+            if (hookResult.titleOverride || hookResult.descriptionOverride) {
+              try {
+                const current = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+                if (hookResult.titleOverride) current.title = hookResult.titleOverride;
+                if (hookResult.descriptionOverride) current.description = hookResult.descriptionOverride;
+                current.updatedAt = new Date().toISOString();
+                writeFileSync(filePath, JSON.stringify(current, null, 2), 'utf-8');
+                broadcastTaskChange(appHome);
+              } catch (titleErr) {
+                console.error('[tasks] Failed to apply hook title/description override:', titleErr);
               }
             }
 
@@ -590,5 +667,90 @@ export function registerTaskHandlers(
     });
 
     return { title };
+  });
+
+  // ── Council Approval ──────────────────────────────────────────────────
+
+  ipcMain.handle('tasks:approve-council', async (_e, taskId: string) => {
+    const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+    try {
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+      if (task.status !== 'awaiting_approval' && task.status !== 'human_review') {
+        return { ok: false, error: `Task not in awaiting_approval or human_review (current: ${task.status})` };
+      }
+
+      // Plugin stores council data in metadata (extended beyond KaiTaskMetadata)
+      const meta = (task.metadata ?? {}) as Record<string, unknown>;
+      const plan = meta.councilPlan as string | undefined;
+      if (!plan) {
+        return { ok: false, error: 'No council plan found in task metadata' };
+      }
+
+      // Build execution prompt from stored plan
+      const executionPrompt = [
+        'You are executing an approved plan. Follow it precisely.',
+        '',
+        '## Approved Plan',
+        plan,
+        '',
+        '## Task',
+        `Title: ${task.title}`,
+        `Description: ${task.description || task.title}`,
+        '',
+        'Execute this plan now. Do not ask questions — proceed with implementation.',
+      ].join('\n');
+
+      const runtime = ((meta.chosenExecutor as string) ?? 'claude-code') as 'claude-code' | 'codex';
+      const cwd = (meta.cwd as string) ?? process.env.HOME ?? '/tmp';
+
+      // Move to in_progress
+      task.status = 'in_progress';
+      task.startedAt = task.startedAt ?? new Date().toISOString();
+      task.updatedAt = new Date().toISOString();
+      writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+      broadcastTaskChange(appHome);
+
+      // Start execution loop
+      if (terminalManager && pluginManager) {
+        startExecutionLoop(appHome, taskId, { prompt: executionPrompt, runtime, cwd }, pluginManager, terminalManager);
+      }
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  // Council respond — user answers advisor's clarification questions mid-deliberation
+  ipcMain.handle('tasks:council-respond', async (_e, taskId: string, message: string) => {
+    const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+    try {
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const meta = (task.metadata ?? {}) as Record<string, unknown>;
+
+      if (!pluginManager) {
+        return { ok: false, error: 'Plugin manager not available' };
+      }
+
+      // Call the Aithena plugin's council:respond action
+      await pluginManager.handleAction({
+        pluginName: 'aithena',
+        targetId: 'council:respond',
+        action: 'respond',
+        data: {
+          taskId,
+          message,
+          sessionId: meta.councilSessionId as string | undefined,
+          taskTitle: task.title,
+          taskDescription: task.description,
+          taskMetadata: meta,
+        },
+      });
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
   });
 }

@@ -13,6 +13,7 @@ import { useAgents } from '@/providers/AgentProvider';
 /** Subtle status-tinted background for task cards. */
 const CARD_BG_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'bg-sky-500/5',
+  awaiting_approval: 'bg-orange-500/5',
   in_progress: 'bg-amber-500/5',
   ai_review: 'bg-rose-500/5',
   human_review: 'bg-purple-400/5',
