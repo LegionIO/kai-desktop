@@ -802,9 +802,11 @@ export function registerTaskHandlers(
   });
 
   // ── Gather artifacts — council-driven deep gather via CLI runner ──────
-  ipcMain.handle('tasks:gather-artifacts', async (_e, taskId: string, prompt: string, cwd: string) => {
+  ipcMain.handle('tasks:gather-artifacts', async (_e, taskId: string, prompt: string, cwd: string, runtime?: string) => {
     if (!isValidTaskId(taskId)) return { error: 'Invalid task ID' };
     if (!terminalManager) return { error: 'Terminal manager not available' };
+
+    const resolvedRuntime = (runtime === 'codex' || runtime === 'claude-code') ? runtime : 'claude-code';
 
     const gatherPrompt = [
       '## GATHER-ONLY MODE — READ ONLY, DO NOT MODIFY FILES',
@@ -817,12 +819,24 @@ export function registerTaskHandlers(
 
     return new Promise<{ ok?: boolean; output?: string; exitCode?: number; sessionId?: string; error?: string }>((resolve) => {
       terminalManager!.createNonInteractive(taskId, {
-        runtime: 'claude-code',
+        runtime: resolvedRuntime,
         cwd,
         prompt: gatherPrompt,
         onComplete: ({ exitCode, output, sessionId }) => {
           resolve({ ok: true, output: output.slice(-8000), exitCode, sessionId });
         },
+      }).then((sessionId) => {
+        // Store terminal session on task so Agent tab shows live gather output
+        try {
+          const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+          if (existsSync(filePath)) {
+            const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            task.terminalSessionId = sessionId;
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+            broadcastTaskChange(appHome);
+          }
+        } catch { /* non-critical — gather still works without Agent tab visibility */ }
       }).catch((err) => {
         resolve({ error: String(err) });
       });

@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.84] - 2026-05-18
+
+### Added
+- **Gather runner streams to Agent tab** — Artifact gathering output now streams live to the Agent tab via `terminalSessionId`. The tab auto-switches when gathering starts and shows a compact "Gathering artifacts for council..." label with pulsing indicator.
+- **Executor detection for gather runner** — Gather runner accepts a `runtime` parameter from the plugin (detected via `chooseExecutor`), no longer hardcodes `claude-code`.
+- **Workflow run persistence via `council:result`** — When council approves through the clarification/gather path, `workflowRunId` and `workflowGoal` are persisted to task metadata so the entire execution lifecycle emits workflow events to Aithena V3.
+
+### Changed
+- `tasks:gather-artifacts` IPC handler now accepts optional `runtime` parameter and stores `terminalSessionId` on the task immediately after spawn.
+- `gatherArtifacts` preload/IPC-client signatures updated to include optional `runtime`.
+- `TaskProvider` council:result handler now persists `workflowRunId` from plugin events.
+
 ## [1.0.83] - 2026-05-17
 
 ### Added

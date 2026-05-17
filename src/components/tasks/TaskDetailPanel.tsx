@@ -914,6 +914,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       {activeTab === 'agent' && (
         /* ═══ AGENT TAB ═══ */
         <div className="flex min-h-0 flex-1 flex-col">
+          {/* Gathering artifacts label — shows above terminal when runner is active */}
+          {councilPhase === 'gathering_artifacts' && terminalSessionId && (
+            <div className="flex items-center gap-2 px-5 py-1.5 text-xs text-muted-foreground">
+              <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" />
+              Gathering artifacts for council...
+            </div>
+          )}
           <div className={cn('flex min-h-0 flex-1 flex-col mx-auto w-full px-5 pt-4 pb-4', !fullWidth && 'max-w-3xl')}>
             {terminalSessionId ? (
               <TaskTerminal

@@ -636,10 +636,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
       // Handle council:gather-request — council needs deeper artifact gathering via runner
       if (e.eventName === 'council:gather-request') {
-        const { taskId: gatherTaskId, gatherPrompt, cwd } = (e.data ?? {}) as {
+        const { taskId: gatherTaskId, gatherPrompt, cwd, runtime } = (e.data ?? {}) as {
           taskId?: string;
           gatherPrompt?: string;
           cwd?: string;
+          runtime?: string;
           sessionId?: string;
         };
         if (!gatherTaskId || !gatherPrompt || !cwd) return;
@@ -649,7 +650,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // Spawn gather-only runner and feed results back to council
         void (async () => {
           try {
-            const result = await app.tasks.gatherArtifacts(gatherTaskId, gatherPrompt, cwd);
+            const result = await app.tasks.gatherArtifacts(gatherTaskId, gatherPrompt, cwd, runtime);
             if (result.output) {
               // Feed gathered artifacts back to council via councilRespond
               await app.tasks.councilRespond(gatherTaskId, `## Gathered Artifacts\n\n${result.output}`);
@@ -673,8 +674,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             sessionId?: string;
             reviewOutcome?: string;
             planArtifact?: string;
+            planTitle?: string;
             clarificationRequired?: boolean;
             clarificationQuestions?: string;
+            workflowRunId?: string;
           };
         };
         if (!resultTaskId || !councilResult) return;
@@ -718,6 +721,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             councilPlan: (councilResult.planArtifact ?? '').slice(0, 8000),
             councilPlanTitle: planTitle || existingMeta.councilPlanTitle,
             councilPhase: councilResult.reviewOutcome === 'approved' ? 'approved' : councilResult.reviewOutcome,
+            // Persist workflowRunId so lifecycle hooks and execution can emit workflow events
+            ...(councilResult.workflowRunId ? { workflowRunId: councilResult.workflowRunId, workflowGoal: planTitle || currentTask.title } : {}),
           };
 
           const updates: Record<string, unknown> = {

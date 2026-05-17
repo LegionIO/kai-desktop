@@ -334,8 +334,8 @@ const appAPI = {
     stopExecution: (taskId: string) =>
       ipcRenderer.invoke('tasks:stop-execution', taskId) as Promise<{ ok?: boolean; error?: string }>,
     // Gather artifacts — council-driven deep gather via CLI runner
-    gatherArtifacts: (taskId: string, prompt: string, cwd: string) =>
-      ipcRenderer.invoke('tasks:gather-artifacts', taskId, prompt, cwd) as Promise<{ ok?: boolean; output?: string; error?: string }>,
+    gatherArtifacts: (taskId: string, prompt: string, cwd: string, runtime?: string) =>
+      ipcRenderer.invoke('tasks:gather-artifacts', taskId, prompt, cwd, runtime) as Promise<{ ok?: boolean; output?: string; error?: string }>,
   },
 
   agents: {

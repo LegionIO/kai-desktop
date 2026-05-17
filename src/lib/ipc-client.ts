@@ -196,7 +196,7 @@ type AppAPI = {
     // Stop execution — coordinated teardown (kill terminal, update status, emit workflow event)
     stopExecution: (taskId: string) => Promise<{ ok?: boolean; error?: string }>;
     // Gather artifacts — council-driven deep gather via CLI runner
-    gatherArtifacts: (taskId: string, prompt: string, cwd: string) => Promise<{ ok?: boolean; output?: string; error?: string }>;
+    gatherArtifacts: (taskId: string, prompt: string, cwd: string, runtime?: string) => Promise<{ ok?: boolean; output?: string; error?: string }>;
   };
   agents: {
     list: () => Promise<AgentFile[]>;
