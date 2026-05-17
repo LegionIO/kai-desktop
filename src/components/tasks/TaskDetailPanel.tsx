@@ -45,7 +45,7 @@ import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { TaskTerminal } from './TaskTerminal';
-import { CouncilMessageBubble, CouncilTypingIndicator } from './CouncilMessageBubble';
+import { CouncilMessageBubble, CouncilTypingIndicator, CouncilStreamingBubble } from './CouncilMessageBubble';
 import type { TaskFile } from '@/types/task';
 import {
   KAI_TASK_STATUS_LABELS,
@@ -58,7 +58,7 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, refineTaskPlan, approveCouncil, councilRespond, getCouncilMessages, isTaskDeliberating, getCouncilAgent, getCouncilPhase } = useTasks();
+  const { state, updateTask, refineTaskPlan, approveCouncil, councilRespond, getCouncilMessages, isTaskDeliberating, getCouncilAgent, getCouncilPhase, getCouncilStreaming } = useTasks();
   const { state: agentState } = useAgents();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -78,6 +78,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const councilMessages = getCouncilMessages(task.id);
   const deliberating = isTaskDeliberating(task.id);
   const currentCouncilAgent = getCouncilAgent(task.id);
+  const councilStreamingMsg = getCouncilStreaming(task.id);
   const councilPhase = getCouncilPhase(task.id);
   const awaitingClarification = councilPhase === 'awaiting_clarification';
 
@@ -270,7 +271,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     if (councilScrollRef.current && (deliberating || councilMessages.length > 0)) {
       councilScrollRef.current.scrollTop = councilScrollRef.current.scrollHeight;
     }
-  }, [councilMessages.length, deliberating]);
+  }, [councilMessages.length, deliberating, councilStreamingMsg?.content]);
 
   // Close on Escape (if onClose provided)
   useEffect(() => {
@@ -814,7 +815,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               <CouncilMessageBubble key={msg.id} message={msg} />
             ))}
             {deliberating && !awaitingClarification && (
-              <CouncilTypingIndicator agent={currentCouncilAgent || 'aithena'} />
+              councilStreamingMsg && councilStreamingMsg.content
+                ? <CouncilStreamingBubble
+                    agent={councilStreamingMsg.agent}
+                    phase={councilStreamingMsg.phase}
+                    content={councilStreamingMsg.content}
+                  />
+                : <CouncilTypingIndicator agent={currentCouncilAgent || 'aithena'} />
             )}
           </div>
 

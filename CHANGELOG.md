@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.81] - 2026-05-17
+
+### Added
+- **Council response streaming** — Agent responses now render token-by-token in real-time as SSE events arrive, replacing the previous "wait then show all at once" behavior. Uses `requestAnimationFrame` throttling for smooth 60fps rendering without excessive re-renders.
+- **`CouncilStreamingBubble` component** — Live-updating message bubble with pulsing indicator, per-agent styling, and incremental markdown rendering. Seamlessly transitions to the final `CouncilMessageBubble` on completion.
+
 ## [1.0.80] - 2026-05-17
 
 ### Added

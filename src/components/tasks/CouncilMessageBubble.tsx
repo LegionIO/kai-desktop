@@ -135,3 +135,53 @@ export const CouncilTypingIndicator: FC<{ agent: string }> = memo(({ agent }) =>
 });
 
 CouncilTypingIndicator.displayName = 'CouncilTypingIndicator';
+
+/** Live-streaming bubble — renders incrementally as agent_delta events arrive. */
+export const CouncilStreamingBubble: FC<{ agent: string; phase: string; content: string }> = memo(({ agent, phase, content }) => {
+  const config = AGENT_CONFIG[agent as CouncilMessage['agent']] ?? AGENT_CONFIG.aithena;
+  const Icon = config.icon;
+
+  return (
+    <div className="flex gap-3">
+      {/* Avatar */}
+      <div className={cn(
+        'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border',
+        config.borderColor,
+        config.bgColor,
+      )}>
+        <Icon className={cn('h-3.5 w-3.5', config.accentColor)} />
+      </div>
+
+      {/* Content */}
+      <div className={cn(
+        'min-w-0 max-w-[85%] rounded-xl border px-3.5 py-2.5',
+        config.borderColor,
+        config.bgColor,
+      )}>
+        {/* Agent name + phase */}
+        <div className="mb-1 flex items-center gap-2">
+          <span className={cn('text-[11px] font-semibold', config.accentColor)}>
+            {config.label}
+          </span>
+          {phase && (
+            <span className="text-[10px] text-muted-foreground/50">
+              {phase}
+            </span>
+          )}
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current opacity-60" style={{ color: 'var(--primary)' }} />
+        </div>
+
+        {/* Streaming content */}
+        <div className="prose prose-sm prose-invert max-w-none text-sm text-foreground/90 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+          {content ? (
+            <MarkdownText text={content} />
+          ) : (
+            <span className="text-muted-foreground/50 text-xs italic">thinking...</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+CouncilStreamingBubble.displayName = 'CouncilStreamingBubble';

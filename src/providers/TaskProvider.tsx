@@ -42,6 +42,8 @@ interface TaskState {
   councilAgent: Record<string, string>;
   /** Whether council deliberation is active per task. */
   isDeliberating: Record<string, boolean>;
+  /** Currently streaming council message per task (in-progress agent response). */
+  councilStreaming: Record<string, { agent: string; phase: string; content: string } | null>;
 }
 
 type TaskAction =
@@ -61,7 +63,9 @@ type TaskAction =
   | { type: 'COUNCIL_AGENT_CHANGE'; taskId: string; agent: string }
   | { type: 'COUNCIL_START'; taskId: string }
   | { type: 'COUNCIL_RESUME'; taskId: string }
-  | { type: 'COUNCIL_DONE'; taskId: string };
+  | { type: 'COUNCIL_DONE'; taskId: string }
+  | { type: 'COUNCIL_STREAM_DELTA'; taskId: string; agent: string; phase: string; content: string }
+  | { type: 'COUNCIL_STREAM_CLEAR'; taskId: string };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
@@ -84,6 +88,7 @@ const initialState: TaskState = {
   councilPhase: {},
   councilAgent: {},
   isDeliberating: {},
+  councilStreaming: {},
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -124,6 +129,7 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
         ...state,
         isDeliberating: { ...state.isDeliberating, [action.taskId]: true },
         councilMessages: { ...state.councilMessages, [action.taskId]: [] },
+        councilStreaming: { ...state.councilStreaming, [action.taskId]: null },
       };
     case 'COUNCIL_RESUME':
       return {
@@ -151,6 +157,24 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
       return {
         ...state,
         isDeliberating: { ...state.isDeliberating, [action.taskId]: false },
+        councilStreaming: { ...state.councilStreaming, [action.taskId]: null },
+      };
+    case 'COUNCIL_STREAM_DELTA':
+      return {
+        ...state,
+        councilStreaming: {
+          ...state.councilStreaming,
+          [action.taskId]: {
+            agent: action.agent,
+            phase: action.phase,
+            content: action.content,
+          },
+        },
+      };
+    case 'COUNCIL_STREAM_CLEAR':
+      return {
+        ...state,
+        councilStreaming: { ...state.councilStreaming, [action.taskId]: null },
       };
     default:
       return state;
@@ -233,6 +257,9 @@ interface TaskContextValue {
 
   /** Get the currently speaking council agent for a task. */
   getCouncilAgent: (taskId: string) => string;
+
+  /** Get the live-streaming council message for a task (in-progress agent response). */
+  getCouncilStreaming: (taskId: string) => { agent: string; phase: string; content: string } | null;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -595,6 +622,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // Keep a ref to councilMessages so event handlers can check for duplicates without deps
   const councilMessagesRef = useRef(state.councilMessages);
   councilMessagesRef.current = state.councilMessages;
+  // Throttle streaming dispatches using rAF batching (~16ms)
+  const streamingRafRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     if (!window.app?.plugins?.onEvent) {
@@ -744,6 +773,14 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             phase: event.phase ?? '',
             content: '',
           };
+          // Initialize streaming state — shows live-updating bubble immediately
+          dispatch({
+            type: 'COUNCIL_STREAM_DELTA',
+            taskId,
+            agent,
+            phase: event.phase ?? '',
+            content: '',
+          });
           break;
         }
 
@@ -752,11 +789,35 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           const buf = councilBufferRef.current[taskId];
           if (buf) {
             buf.content += event.content ?? '';
+            // Throttle streaming UI updates via rAF (~16ms batching)
+            if (!streamingRafRef.current[taskId]) {
+              streamingRafRef.current[taskId] = requestAnimationFrame(() => {
+                delete streamingRafRef.current[taskId];
+                const currentBuf = councilBufferRef.current[taskId];
+                if (currentBuf) {
+                  dispatch({
+                    type: 'COUNCIL_STREAM_DELTA',
+                    taskId,
+                    agent: currentBuf.agent,
+                    phase: currentBuf.phase,
+                    content: currentBuf.content,
+                  });
+                }
+              });
+            }
           }
           break;
         }
 
         case 'agent_done': {
+          // Cancel any pending rAF for this task
+          if (streamingRafRef.current[taskId]) {
+            cancelAnimationFrame(streamingRafRef.current[taskId]);
+            delete streamingRafRef.current[taskId];
+          }
+          // Clear streaming state — the final message replaces the live bubble
+          dispatch({ type: 'COUNCIL_STREAM_CLEAR', taskId });
+
           // Flush buffer as a complete message.
           // Falls back to event.content for cases where agent_done arrives without
           // preceding agent_delta (history restoration, user clarification responses).
@@ -937,6 +998,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     return state.councilAgent[taskId] ?? '';
   }, [state.councilAgent]);
 
+  const getCouncilStreaming = useCallback((taskId: string) => {
+    return state.councilStreaming[taskId] ?? null;
+  }, [state.councilStreaming]);
+
   // ── Memoized context value ───────────────────────────────────────────
 
   const value = useMemo<TaskContextValue>(
@@ -961,6 +1026,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       isTaskDeliberating,
       getCouncilPhase,
       getCouncilAgent,
+      getCouncilStreaming,
     }),
     [
       state,
@@ -983,6 +1049,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       isTaskDeliberating,
       getCouncilPhase,
       getCouncilAgent,
+      getCouncilStreaming,
     ],
   );
 
