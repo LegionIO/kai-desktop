@@ -289,3 +289,32 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
     videoGeneration: safeVideoGeneration,
   };
 }
+
+/**
+ * Resolve which view of the app config a plugin sees based on the
+ * permissions declared in its manifest.
+ *
+ * - Plugins that declared `'config:read-secrets'` receive the full
+ *   {@link AppConfig} including credentials.
+ * - All other plugins receive a redacted {@link PluginSafeConfig} with
+ *   API keys, AWS secrets, MCP env vars, web server password, TLS
+ *   private key paths, and Azure subscription keys stripped or replaced
+ *   with boolean / key-list indicators.
+ *
+ * Centralising the gate keeps `PluginAPI.config.get()` and the
+ * `onConfigChanged` dispatch path in `PluginManager` in lockstep and
+ * gives us a single place to test the policy.
+ *
+ * The caller is responsible for actually invoking the permission check
+ * that guards the read itself (`config:read`); this helper only decides
+ * the shape of the returned value once the read has been authorised.
+ */
+export function resolvePluginConfigView(
+  config: AppConfig,
+  permissions: readonly string[],
+): AppConfig | PluginSafeConfig {
+  if (permissions.includes('config:read-secrets')) {
+    return config;
+  }
+  return toPluginSafeConfig(config);
+}

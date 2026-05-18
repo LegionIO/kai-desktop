@@ -27,6 +27,7 @@ const HOST_PLUGIN_API_VERSION: string = __BRAND_PLUGIN_API_VERSION;
 const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   // ── Permission-gated capabilities (mirrors PluginPermission) ──
   'config:read',
+  'config:read-secrets',
   'config:write',
   'tools:register',
   'tools:detect',

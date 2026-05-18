@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { appConfigSchema, type AppConfig } from '../../config/schema.js';
-import { toPluginSafeConfig } from '../safe-config.js';
+import {
+  resolvePluginConfigView,
+  toPluginSafeConfig,
+  type PluginSafeConfig,
+} from '../safe-config.js';
 
 // Mock electron + heavy main-process deps that PluginManager imports at load
 // time. We never construct windows, notifications, or marketplace services in
@@ -701,5 +705,148 @@ describe('hook fire-site delivers redacted config — spy plugin integration', (
     expect(/sk-test-/i.test(flat)).toBe(false);
     expect(/ghp_/.test(flat)).toBe(false);
     expect(/Bearer\s/i.test(flat)).toBe(false);
+  });
+});
+
+/**
+ * Tests for the permission gate used by `PluginAPI.config.get()` and the
+ * `onConfigChanged` dispatch path in PluginManager. The gate is centralised
+ * in {@link resolvePluginConfigView} so both call sites share one policy.
+ *
+ * Threat model: a plugin without the `'config:read-secrets'` permission MUST
+ * NOT receive any credential leaf through `api.config.get()`, the
+ * `onChanged` callback, or the `onConfigChanged` module hook. The redactor
+ * must be the only thing standing between an untrusted plugin and the user's
+ * API keys, AWS credentials, MCP env vars, web server password, TLS private
+ * key paths, and Azure subscription keys.
+ */
+describe('resolvePluginConfigView (config:read-secrets gate)', () => {
+  /** Sample of the secret literals planted in `buildPopulatedConfig`. */
+  const SECRET_VALUES = [
+    SECRETS.openaiApiKey,
+    SECRETS.anthropicApiKey,
+    SECRETS.bedrockAccessKeyId,
+    SECRETS.bedrockSecretAccessKey,
+    SECRETS.bedrockSessionToken,
+    SECRETS.providerExtraHeader,
+    SECRETS.embeddingOpenaiKey,
+    SECRETS.mcpEnvSecret,
+    SECRETS.webPassword,
+    SECRETS.tlsKeyPath,
+    SECRETS.azureSubscriptionKey,
+    SECRETS.realtimeOpenaiKey,
+    SECRETS.imageOpenaiKey,
+    SECRETS.videoOpenaiKey,
+  ];
+
+  it('returns the redacted PluginSafeConfig when the plugin lacks config:read-secrets', () => {
+    const config = buildPopulatedConfig();
+    const permissions = ['config:read'];
+
+    const view = resolvePluginConfigView(config, permissions);
+    const serialized = JSON.stringify(view);
+
+    for (const secret of SECRET_VALUES) {
+      expect(
+        serialized.includes(secret),
+        `plugin without 'config:read-secrets' received credential value "${secret}"`,
+      ).toBe(false);
+    }
+
+    // Structural sanity check: providers carry the boolean indicators
+    // produced by the redactor, not raw credential fields.
+    const safe = view as PluginSafeConfig;
+    expect(safe.models.providers.openai.hasApiKey).toBe(true);
+    expect('apiKey' in safe.models.providers.openai).toBe(false);
+    expect(safe.webServer.auth.hasPassword).toBe(true);
+    expect('password' in safe.webServer.auth).toBe(false);
+  });
+
+  it('returns the full AppConfig (with credentials) when the plugin holds config:read-secrets', () => {
+    const config = buildPopulatedConfig();
+    const permissions = ['config:read', 'config:read-secrets'];
+
+    const view = resolvePluginConfigView(config, permissions);
+    const full = view as AppConfig;
+
+    // The full AppConfig branch is identity — the helper must hand the
+    // caller the same object reference it was given. (Plugins with this
+    // permission are expected to keep it private and not log it.)
+    expect(full).toBe(config);
+    expect(full.models.providers.openai.apiKey).toBe(SECRETS.openaiApiKey);
+    expect(full.models.providers.bedrock.accessKeyId).toBe(SECRETS.bedrockAccessKeyId);
+    expect(full.mcpServers[0].env?.TEST_API_KEY).toBe(SECRETS.mcpEnvSecret);
+    expect(full.webServer.auth.password).toBe(SECRETS.webPassword);
+  });
+
+  it('treats a missing permission identically to an explicitly-denied one', () => {
+    const config = buildPopulatedConfig();
+
+    // Empty permissions list ⇒ redacted.
+    const noPerms = resolvePluginConfigView(config, []);
+    expect(JSON.stringify(noPerms).includes(SECRETS.openaiApiKey)).toBe(false);
+
+    // Only the baseline 'config:read' ⇒ still redacted (no secrets perm).
+    const baseline = resolvePluginConfigView(config, ['config:read']);
+    expect(JSON.stringify(baseline).includes(SECRETS.openaiApiKey)).toBe(false);
+  });
+
+  it('redacts even when an unrelated permission resembles the secrets gate', () => {
+    // Guard against a substring-style bug: 'config:read-secrets-x' (or
+    // similar) must NOT satisfy the gate. We test with a sibling
+    // permission that shares a prefix.
+    const config = buildPopulatedConfig();
+    const view = resolvePluginConfigView(config, [
+      'config:read',
+      'config:read-secrets-not-a-real-permission',
+    ]);
+    expect(JSON.stringify(view).includes(SECRETS.openaiApiKey)).toBe(false);
+  });
+
+  it('redacted view is a deep clone — mutating it cannot leak back into the source', () => {
+    // Mirrors the deep-clone guarantee toPluginSafeConfig provides, but
+    // exercises it through the gate helper. A hostile plugin that tries
+    // to rewrite endpoints or other fields on the returned object must
+    // not be able to corrupt the live AppConfig.
+    const config = buildPopulatedConfig();
+    const view = resolvePluginConfigView(config, []) as PluginSafeConfig;
+
+    view.models.providers.openai.endpoint = 'https://malicious.example';
+    expect(config.models.providers.openai.endpoint).toBe('https://api.openai.com/v1');
+  });
+
+  it('schema-walk regression guard on the gated view: no surviving credential-shaped keys without the permission', () => {
+    // Equivalent of the top-level redactor regression test, but routed
+    // through resolvePluginConfigView so future API changes that swap
+    // out the redactor implementation still get checked.
+    const config = buildPopulatedConfig();
+    const view = resolvePluginConfigView(config, ['config:read']);
+
+    const suspiciousKeyPattern = /(?:^|[._-])(?:api[_-]?key|password|secret(?!ed)|session[_-]?token|access[_-]?key|subscription[_-]?key)(?:$|[._-])/i;
+    const keys = collectKeys(view);
+    const survivors = keys.filter((k) => suspiciousKeyPattern.test(k));
+
+    expect(
+      survivors,
+      `credential-shaped keys survived the gate for a plugin without 'config:read-secrets': ${survivors.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('grant + revoke transition: removing the permission from a plugin manifest restores the redacted view on the next read', () => {
+    // Models the scenario where a user revokes config:read-secrets
+    // (e.g. via a future settings UI, or by reapproving a manifest with
+    // the permission stripped). Permission state is read fresh on each
+    // call, so the next read MUST return the safe view immediately —
+    // there is no cached "I had it before" carve-out.
+    const config = buildPopulatedConfig();
+
+    const granted = resolvePluginConfigView(config, ['config:read', 'config:read-secrets']);
+    expect((granted as AppConfig).models.providers.openai.apiKey).toBe(SECRETS.openaiApiKey);
+
+    // Simulate revocation by passing the same config with a tightened
+    // permission list — the helper must respond on the very next call.
+    const revoked = resolvePluginConfigView(config, ['config:read']);
+    expect(JSON.stringify(revoked).includes(SECRETS.openaiApiKey)).toBe(false);
+    expect('apiKey' in (revoked as PluginSafeConfig).models.providers.openai).toBe(false);
   });
 });
