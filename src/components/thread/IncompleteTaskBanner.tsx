@@ -33,13 +33,23 @@ export const IncompleteTaskBanner: FC<IncompleteTaskBannerProps> = ({
   onDismiss,
   className,
 }) => {
-  // Keyboard shortcut: Cmd/Ctrl + Enter to continue
+  // Keyboard shortcut: Cmd/Ctrl + Enter to continue. Skip when the user is
+  // focused inside an editable control (the composer textarea, an input, or
+  // any contentEditable surface) so we don't swallow the composer's submit
+  // chord on a global window listener.
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        e.preventDefault();
-        onContinue();
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== 'Enter') return;
+      const target = e.target;
+      if (
+        target instanceof HTMLTextAreaElement
+        || target instanceof HTMLInputElement
+        || (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
       }
+      e.preventDefault();
+      onContinue();
     };
 
     window.addEventListener('keydown', handleKeyDown);

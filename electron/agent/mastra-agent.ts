@@ -16,6 +16,7 @@ import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '..
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
+import { didHitStepLimit } from './step-limit.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -864,8 +865,16 @@ async function* generateWithSyntheticEvents(
         ? fullResult.finishReason
         : fullResult.finishReason?.unified;
 
-      // Check if max steps were reached
-      const hitStepLimit = terminalFinishReason === 'max-steps';
+      // Check if max steps were reached.
+      // The AI SDK / Mastra never emits a 'max-steps' finishReason; instead the
+      // stream terminates with the last step's finishReason ('tool-calls',
+      // 'length', or 'stop') once `maxSteps` is hit. See `didHitStepLimit` for
+      // the predicate.
+      const hitStepLimit = didHitStepLimit({
+        currentStepCount,
+        maxStepsLimit,
+        terminalFinishReason,
+      });
 
       if (hitStepLimit) {
         console.warn(`[Agent] Max steps reached for ${conversationId}: ${currentStepCount}/${maxStepsLimit}`);
