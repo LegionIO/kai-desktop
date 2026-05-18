@@ -2377,7 +2377,7 @@ export function RuntimeProvider({
     onCancel,
     convertMessage: (m: ThreadMessageLike) => {
       if (!Array.isArray(m.content)) return m;
-      const KNOWN_ASSISTANT_UI_TYPES = new Set(['text', 'image', 'tool-call', 'tool-result', 'audio']);
+      const KNOWN_ASSISTANT_UI_TYPES = new Set(['text', 'image', 'tool-call', 'tool-result', 'audio', 'file', 'enrichments']);
       const stripped: string[] = [];
       const known = (m.content as ContentPart[]).filter((p) => {
         if (KNOWN_ASSISTANT_UI_TYPES.has(p.type)) return true;
