@@ -12,6 +12,8 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { spawn, type ChildProcess } from 'child_process';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 
 // node-pty is a native addon — imported dynamically to gracefully handle
 // missing builds (e.g. in CI or unsupported platforms).
@@ -37,6 +39,14 @@ export class TaskTerminalManager {
   private nonInteractiveProcs = new Map<string, NonInteractiveTerminal>();
   private outputHistory = new Map<string, string[]>();
   private readonly MAX_HISTORY_LINES = 500;
+  private readonly terminalDataDir: string;
+
+  constructor(dataDir?: string) {
+    this.terminalDataDir = dataDir ? join(dataDir, 'terminal-output') : '';
+    if (this.terminalDataDir) {
+      mkdirSync(this.terminalDataDir, { recursive: true });
+    }
+  }
 
   async create(
     taskId: string,
@@ -67,6 +77,7 @@ export class TaskTerminalManager {
     });
 
     proc.onExit(({ exitCode }: { exitCode: number }) => {
+      this.persistHistoryToDisk(sessionId);
       this.terminals.delete(sessionId);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
@@ -165,6 +176,7 @@ export class TaskTerminalManager {
           this.broadcast('tasks:terminal-data', { sessionId, data: formatted });
         }
       }
+      this.persistHistoryToDisk(sessionId);
       this.nonInteractiveProcs.delete(sessionId);
       const finalOutput = outputBuffer.slice(-MAX_BUFFER);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode: exitCode ?? 1 });
@@ -232,9 +244,18 @@ export class TaskTerminalManager {
     this.outputHistory.clear();
   }
 
-  /** Get buffered output history for replay on remount. */
+  /** Get buffered output history for replay on remount. Falls back to disk if not in memory. */
   getOutputHistory(sessionId: string): string[] {
-    return this.outputHistory.get(sessionId) ?? [];
+    const inMemory = this.outputHistory.get(sessionId);
+    if (inMemory && inMemory.length > 0) return inMemory;
+
+    // Try loading from disk (survives app restart)
+    const loaded = this.loadHistoryFromDisk(sessionId);
+    if (loaded) {
+      this.outputHistory.set(sessionId, loaded);
+      return loaded;
+    }
+    return [];
   }
 
   /** Append output data to the per-session history ring buffer. */
@@ -248,6 +269,34 @@ export class TaskTerminalManager {
     if (lines.length > this.MAX_HISTORY_LINES) {
       lines.splice(0, lines.length - this.MAX_HISTORY_LINES);
     }
+  }
+
+  /** Persist the in-memory history to disk so it survives app restarts. */
+  private persistHistoryToDisk(sessionId: string): void {
+    if (!this.terminalDataDir) return;
+    const lines = this.outputHistory.get(sessionId);
+    if (!lines || lines.length === 0) return;
+    try {
+      const filePath = join(this.terminalDataDir, `${sessionId}.json`);
+      writeFileSync(filePath, JSON.stringify(lines));
+    } catch {
+      // Non-critical — best effort persistence
+    }
+  }
+
+  /** Load history from disk (cold start recovery). */
+  private loadHistoryFromDisk(sessionId: string): string[] | null {
+    if (!this.terminalDataDir) return null;
+    try {
+      const filePath = join(this.terminalDataDir, `${sessionId}.json`);
+      if (!existsSync(filePath)) return null;
+      const raw = readFileSync(filePath, 'utf-8');
+      const lines = JSON.parse(raw) as string[];
+      if (Array.isArray(lines) && lines.length > 0) return lines;
+    } catch {
+      // Corrupted file — ignore
+    }
+    return null;
   }
 
   private getNonInteractiveCommand(runtime: string, prompt: string): { command: string; args: string[] } {

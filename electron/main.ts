@@ -657,7 +657,7 @@ if (gotSingleInstanceLock) {
     registerShellHandlers(ipcMain);
     registerPartitionHandlers(ipcMain);
     registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
-    const taskTerminalManager = new TaskTerminalManager();
+    const taskTerminalManager = new TaskTerminalManager(join(APP_HOME, 'data', 'tasks'));
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerAgentEntityHandlers(ipcMain, APP_HOME, taskTerminalManager);

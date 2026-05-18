@@ -15,6 +15,9 @@
 - `src/types/recommendation.ts` — `Recommendation` and `ConsumedRecommendation` interfaces.
 - `src/hooks/useAutoScroll.ts` — Reusable smart auto-scroll hook (distinguishes user scroll from programmatic scroll via RAF flag, 80px threshold, 5px hysteresis).
 
+### Fixed
+- **Agent tab terminal history persists across app restarts** — Terminal output is now saved to disk (`~/.kai/data/tasks/terminal-output/<sessionId>.json`) when a process exits. On cold start, `getOutputHistory` loads from disk if not in memory, so the Agent tab shows execution history even after restarting the app.
+
 ## [1.0.84] - 2026-05-18
 
 ### Added
