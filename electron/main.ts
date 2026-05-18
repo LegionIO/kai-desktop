@@ -188,6 +188,7 @@ function applyTheme(): void {
 }
 
 let updateDownloaded = false;
+let primaryWindowRef: BrowserWindow | null = null;
 
 function buildMenu(): void {
   const updateMenuItem: Electron.MenuItemConstructorOptions = updateDownloaded
@@ -317,6 +318,7 @@ function createWindow(): BrowserWindow {
       spellcheck: true,
     },
   });
+  primaryWindowRef = mainWindow;
   applyBrandUserAgent(mainWindow.webContents);
 
   if (IS_MAC) {
@@ -454,14 +456,28 @@ function createWindow(): BrowserWindow {
     if (saveTimeout) clearTimeout(saveTimeout);
     saveWindowState(mainWindow);
   });
+  mainWindow.on('closed', () => {
+    if (primaryWindowRef === mainWindow) {
+      primaryWindowRef = null;
+    }
+  });
 
   return mainWindow;
 }
 
 function focusPrimaryWindow(): void {
-  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed());
+  let win = primaryWindowRef && !primaryWindowRef.isDestroyed()
+    ? primaryWindowRef
+    : null;
   if (!win) {
-    if (app.isReady()) createWindow();
+    if (!app.isReady()) return;
+    win = createWindow();
+    win.once('ready-to-show', () => {
+      if (!win || win.isDestroyed()) return;
+      if (win.isMinimized()) win.restore();
+      if (!win.isVisible()) win.show();
+      win.focus();
+    });
     return;
   }
 

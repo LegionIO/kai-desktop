@@ -265,11 +265,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
         >
           Plugins
         </button>
-        {pluginUpdateCount > 0 && (
-          <span className="flex items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[9px] font-semibold text-blue-400">
-            {pluginUpdateCount} {pluginUpdateCount === 1 ? 'update' : 'updates'}
-          </span>
-        )}
+
         <div className="flex-1" />
         <button
           type="button"

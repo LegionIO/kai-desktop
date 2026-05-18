@@ -430,9 +430,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             tools: toolsForExecutionMode(registeredTools, effectiveExecutionMode),
           });
 
+          let providerResponseText = '';
           for await (const event of providerStream) {
             if (controller.signal.aborted && event.type !== 'done') continue;
-            if (event.type === 'text-delta') emittedTextDelta = true;
+            if (event.type === 'text-delta') {
+              emittedTextDelta = true;
+              providerResponseText += (event as Record<string, unknown>).text ?? '';
+            }
 
             // Stamp runtimeId on every event so the UI popover shows the
             // inference provider name regardless of whether the stream ends
@@ -449,6 +453,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
 
             broadcastStreamEvent(eventWithMeta as typeof event);
+          }
+
+          // Run post-receive hooks for plugin inference provider path
+          if (pluginManager && providerResponseText.length > 0) {
+            pluginManager.runPostReceiveHooks({
+              response: { role: 'assistant', content: providerResponseText },
+              messages: messages as HookMessage[],
+              config,
+            }).catch((err) => console.error('[Agent:stream] Post-receive hook error (provider path):', err));
           }
 
           // Provider handled the request — clean up and exit
@@ -482,6 +495,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
       let observer: ToolObserverManager | null = null;
+      // Accumulate assistant response text for post-receive hooks
+      let accumulatedResponseText = '';
       // Track the provider:modelName that is producing the current response.
       // Updated on model-fallback events so persisted messages carry the
       // correct source even after automatic fallback.

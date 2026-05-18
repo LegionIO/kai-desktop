@@ -4,6 +4,7 @@ import { useConfig } from '@/providers/ConfigProvider';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { usePlugins, type PluginPanelDescriptor } from '@/providers/PluginProvider';
 import { getPluginComponentByHint } from './PluginComponentRegistry';
+import { usePluginSettingsSections } from './PluginSettingsSections';
 import { getPluginNavigationIcon } from './plugin-icons';
 
 export const PluginPanelHost: FC<{
@@ -26,6 +27,7 @@ export const PluginPanelHost: FC<{
     getPluginRendererError,
     uiState,
   } = usePlugins();
+  const allSettingsSections = usePluginSettingsSections();
 
   void rendererLoadCount;
 
@@ -38,7 +40,8 @@ export const PluginPanelHost: FC<{
     pluginStatus === 'loading'
     || (hasRendererScript(panel.pluginName) && rendererStatus !== 'error' && rendererStatus !== 'ready')
   );
-  const hasSettings = uiState?.settingsSections?.some((s) => s.pluginName === panel.pluginName) ?? false;
+  const sectionsForPlugin = allSettingsSections.filter((s) => s.pluginName === panel.pluginName);
+  const hasSettings = sectionsForPlugin.length > 0;
   const pluginState = getPluginState(panel.pluginName);
   // Plugins opt-in to the "configured" check by explicitly setting state.configured = false.
   // By default (undefined/true), the plugin's panel renders normally.
@@ -52,7 +55,64 @@ export const PluginPanelHost: FC<{
     </span>
   );
 
-  // Standard unconfigured view — shown when plugin has a component but state.configured is not true
+  // Inline settings view — rendered when there's no panel component but the plugin has settings.
+  // Avoids the "Open Settings" indirection by surfacing the settings directly in the panel area.
+  const inlineSettingsView = (
+    <div className="px-5 py-5 space-y-4">
+      {sectionsForPlugin.map((pluginSection) => {
+        const SettingsComponent = getPluginComponentByHint(
+          pluginSection.pluginName,
+          pluginSection.component,
+          ['SettingsView', `${pluginSection.pluginName}Settings`],
+          'settings',
+        );
+        const sectionRendererStatus = getPluginRendererStatus(pluginSection.pluginName);
+        const sectionRendererError = getPluginRendererError(pluginSection.pluginName);
+        const sectionPluginError = getPluginError(pluginSection.pluginName);
+        const waitingForSectionRenderer = !SettingsComponent && (
+          getPluginStatus(pluginSection.pluginName) === 'loading'
+          || (hasRendererScript(pluginSection.pluginName) && sectionRendererStatus !== 'error' && sectionRendererStatus !== 'ready')
+        );
+
+        if (!SettingsComponent) {
+          if (waitingForSectionRenderer) {
+            return (
+              <div key={pluginSection.key} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                Loading settings...
+              </div>
+            );
+          }
+          if (sectionPluginError || sectionRendererError) {
+            return (
+              <div key={pluginSection.key} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                Failed to load settings: {sectionPluginError || sectionRendererError}
+              </div>
+            );
+          }
+          return null;
+        }
+
+        return (
+          <SettingsComponent
+            key={pluginSection.key}
+            pluginName={pluginSection.pluginName}
+            config={config ?? undefined}
+            updateConfig={updateConfig}
+            pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
+            pluginState={pluginState}
+            onAction={(action: string, data?: unknown) => {
+              sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+            }}
+            setPluginConfig={async (path: string, value: unknown) => {
+              await setPluginConfig(pluginSection.pluginName, path, value);
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+
+  // Fallback unconfigured view — only shown when there's no panel component AND no settings to render inline
   const unconfiguredView = (
     <div className="flex flex-col items-center gap-4 px-6 py-12 text-center">
       <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
@@ -61,18 +121,9 @@ export const PluginPanelHost: FC<{
       <div>
         <p className="text-sm font-medium text-foreground">Connect to {displayName}</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Open settings to configure this plugin.
+          No settings available for this plugin.
         </p>
       </div>
-      {hasSettings && (
-        <button
-          type="button"
-          onClick={() => window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: panel.pluginName } }))}
-          className="mt-2 rounded-lg bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
-        >
-          Open Settings
-        </button>
-      )}
     </div>
   );
 
@@ -92,9 +143,35 @@ export const PluginPanelHost: FC<{
           </div>
         );
       }
-      return unconfiguredView;
+      // No panel component — render settings inline if available, otherwise show fallback
+      return hasSettings ? inlineSettingsView : unconfiguredView;
     }
-    if (showUnconfigured) return unconfiguredView;
+    if (showUnconfigured) {
+      // Has a panel component but plugin reports unconfigured (e.g. Outlook, Rally awaiting credentials).
+      // Show the "Open Settings" button so the user configures the plugin before the panel renders.
+      return (
+        <div className="flex flex-col items-center gap-4 px-6 py-12 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
+            {pluginIcon}
+          </div>
+          <div>
+            <p className="text-sm font-medium text-foreground">Connect to {displayName}</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Open settings to configure this plugin.
+            </p>
+          </div>
+          {hasSettings && (
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: panel.pluginName } }))}
+              className="mt-2 rounded-lg bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
+            >
+              Open Settings
+            </button>
+          )}
+        </div>
+      );
+    }
     return (
       <Component
         pluginName={panel.pluginName}

@@ -14,11 +14,29 @@ const mocks = vi.hoisted(() => {
     isDestroyed: ReturnType<typeof vi.fn>;
   };
 
+  type NativeResponse = {
+    ok?: boolean;
+    typingMode?: 'ax' | 'kb' | 'idle';
+    targetPid?: number | null;
+    targetName?: string;
+    targetBundleId?: string | null;
+    capturedAt?: number;
+    capturedAx?: boolean;
+    partialText?: string;
+    strategy?: 'disabled' | 'full-replacement' | 'ax-verified' | 'tail-only' | 'full-patch' | null;
+    applied?: boolean;
+  };
+
+  type NativeOptions = {
+    onTargetDirty?: (reason: string) => void;
+    onExit?: (message: string) => void;
+    onProtocolError?: (message: string) => void;
+  };
+
   const state = {
     windows: [] as MockWindow[],
     browserWindowOptions: [] as Array<Record<string, unknown>>,
-    accessibilityTrusted: true,
-      recognizer: null as null | {
+    recognizer: null as null | {
       recognizing?: (_sender: unknown, event: { result: { text?: string } }) => void;
       recognized?: (_sender: unknown, event: { result: { reason: number; text?: string } }) => void;
       canceled?: (_sender: unknown, event: { reason: number; errorCode: number; errorDetails?: string }) => void;
@@ -27,15 +45,27 @@ const mocks = vi.hoisted(() => {
       close: ReturnType<typeof vi.fn>;
     },
     pushStream: null as null | { write: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> },
-    focusedTextSelection: {
+    targetPid: 4242 as number | null,
+    beginResponse: {
       ok: true,
-      selectedTextRangeLocation: 0,
-      selectedTextRangeLength: 0,
-      elementSignature: 'role=QVhUZXh0RmllbGQ=|x=10|y=10|w=200',
-    } as Record<string, unknown>,
-    focusedTextSelectionResponses: [] as Array<Record<string, unknown>>,
-    frontmostPid: null as number | null,
-    enforceReadFrontmostGuard: true,
+      typingMode: 'ax',
+      targetPid: 4242,
+      targetName: 'TextEdit',
+      targetBundleId: 'com.apple.TextEdit',
+      capturedAt: 1234,
+      capturedAx: true,
+      partialText: '',
+      strategy: null,
+      applied: false,
+    } as NativeResponse,
+    beginError: null as Error | null,
+    refreshResponse: null as NativeResponse | null,
+    applyPartialResponse: null as NativeResponse | null,
+    applyFinalResponse: null as NativeResponse | null,
+    takeoverMonitorParams: [] as Array<{
+      onEvent: (event: { kind: 'mouse' | 'keyboard' | 'other'; eventType: string; keyCode?: number; x: number; y: number; timestampMs: number }) => void;
+      onError?: (error: string) => void;
+    }>,
   };
 
   const globalShortcut = {
@@ -45,43 +75,81 @@ const mocks = vi.hoisted(() => {
   const ipcMain = {
     handle: vi.fn(),
   };
+  const createDictationOverlay = vi.fn();
   const showDictationOverlay = vi.fn(async () => {});
   const hideDictationOverlay = vi.fn();
   const destroyDictationOverlay = vi.fn();
   const sendToOverlay = vi.fn();
-  const getDictationTargetPid = vi.fn<() => number | null>(() => 4242);
+  const getDictationTargetPid = vi.fn<() => number | null>(() => state.targetPid);
   const recaptureDictationTargetFocus = vi.fn(async () => true);
-  const runLocalMacMouseCommand = vi.fn(async (args: string[]) => {
-    if (args[0] === 'permissions') {
-      return { ok: true, accessibilityTrusted: state.accessibilityTrusted };
-    }
-    if (args[0] === 'focusedTextSelection') {
-      const requestedPid = args[1] ? Number(args[1]) : null;
-      const frontmostPid = state.frontmostPid ?? getDictationTargetPid();
-      if (state.enforceReadFrontmostGuard && requestedPid != null && requestedPid !== frontmostPid) {
-        throw new Error('Frontmost application no longer matches dictation target');
-      }
-      if (state.focusedTextSelectionResponses.length > 0) {
-        return state.focusedTextSelectionResponses.shift()!;
-      }
-      return state.focusedTextSelection;
-    }
-    if (args[0] === 'focusedTextRangeState') {
-      const requestedPid = args[3] ? Number(args[3]) : null;
-      const frontmostPid = state.frontmostPid ?? getDictationTargetPid();
-      if (state.enforceReadFrontmostGuard && requestedPid != null && requestedPid !== frontmostPid) {
-        throw new Error('Frontmost application no longer matches dictation target');
-      }
-      return {
-        selectedTextRangeLocation: state.focusedTextSelection.selectedTextRangeLocation,
-        selectedTextRangeLength: state.focusedTextSelection.selectedTextRangeLength,
-        elementSignature: state.focusedTextSelection.elementSignature,
-        rangeText: '',
-        textUtf16Length: 0,
-      };
-    }
-    return { ok: true };
+  const setDictationExternalFocusRefreshSuppressed = vi.fn();
+  const setDictationTargetFocusSnapshot = vi.fn((snapshot: { pid?: number | null } | null) => {
+    state.targetPid = snapshot?.pid ?? null;
   });
+  const startLocalMacosTakeoverMonitor = vi.fn((params: (typeof state.takeoverMonitorParams)[number]) => {
+    state.takeoverMonitorParams.push(params);
+    return { stop: vi.fn() };
+  });
+  const runLocalMacMouseCommand = vi.fn(async () => ({ ok: true }));
+
+  class DictationNativeSessionError extends Error {
+    readonly errorCode?: string;
+
+    constructor(message: string, errorCode?: string) {
+      super(message);
+      this.errorCode = errorCode;
+    }
+  }
+
+  class DictationNativeSessionClient {
+    static instances: DictationNativeSessionClient[] = [];
+    readonly start = vi.fn(async () => {});
+    readonly beginSession = vi.fn(async () => {
+      if (state.beginError) throw state.beginError;
+      return state.beginResponse;
+    });
+    readonly startTargetTracking = vi.fn(async () => ({ ok: true }));
+    readonly stopTargetTracking = vi.fn(async () => ({ ok: true }));
+    readonly refreshTarget = vi.fn(async () => state.refreshResponse ?? {
+      ...state.beginResponse,
+      applied: false,
+    });
+    readonly applyPartial = vi.fn(async (text: string) => state.applyPartialResponse ?? {
+      ...state.beginResponse,
+      applied: true,
+      partialText: text,
+      strategy: state.beginResponse.typingMode === 'kb' ? 'full-patch' : 'full-replacement',
+    });
+    readonly applyFinal = vi.fn(async (text: string) => state.applyFinalResponse ?? {
+      ...state.beginResponse,
+      applied: true,
+      partialText: '',
+      strategy: null,
+      text,
+    });
+    readonly endSession = vi.fn(async () => {});
+    readonly getTargetSnapshot = vi.fn((response: NativeResponse) => {
+      if (!response.targetPid || !response.targetName) return null;
+      return {
+        appName: response.targetName,
+        bundleId: response.targetBundleId ?? null,
+        pid: response.targetPid,
+        capturedAt: response.capturedAt ?? Date.now(),
+      };
+    });
+
+    constructor(private readonly options: NativeOptions = {}) {
+      DictationNativeSessionClient.instances.push(this);
+    }
+
+    emitTargetDirty(reason = 'keyboard:keyDown'): void {
+      this.options.onTargetDirty?.(reason);
+    }
+
+    emitExit(message = 'helper exited'): void {
+      this.options.onExit?.(message);
+    }
+  }
 
   class BrowserWindow {
     destroyed = false;
@@ -121,29 +189,41 @@ const mocks = vi.hoisted(() => {
   const reset = () => {
     state.windows = [];
     state.browserWindowOptions = [];
-    state.accessibilityTrusted = true;
     state.recognizer = null;
     state.pushStream = null;
-    state.focusedTextSelection = {
+    state.targetPid = 4242;
+    state.beginResponse = {
       ok: true,
-      selectedTextRangeLocation: 0,
-      selectedTextRangeLength: 0,
-      elementSignature: 'role=QVhUZXh0RmllbGQ=|x=10|y=10|w=200',
+      typingMode: 'ax',
+      targetPid: 4242,
+      targetName: 'TextEdit',
+      targetBundleId: 'com.apple.TextEdit',
+      capturedAt: 1234,
+      capturedAx: true,
+      partialText: '',
+      strategy: null,
+      applied: false,
     };
-    state.focusedTextSelectionResponses = [];
-    state.frontmostPid = null;
-    state.enforceReadFrontmostGuard = true;
+    state.beginError = null;
+    state.refreshResponse = null;
+    state.applyPartialResponse = null;
+    state.applyFinalResponse = null;
+    state.takeoverMonitorParams = [];
+    DictationNativeSessionClient.instances = [];
     globalShortcut.register.mockClear().mockReturnValue(true);
     globalShortcut.unregister.mockClear();
     ipcMain.handle.mockClear();
+    createDictationOverlay.mockClear();
     showDictationOverlay.mockClear();
     hideDictationOverlay.mockClear();
     destroyDictationOverlay.mockClear();
     sendToOverlay.mockClear();
     getDictationTargetPid.mockClear();
-    getDictationTargetPid.mockReturnValue(4242);
-    recaptureDictationTargetFocus.mockClear();
-    recaptureDictationTargetFocus.mockResolvedValue(true);
+    getDictationTargetPid.mockImplementation(() => state.targetPid);
+    recaptureDictationTargetFocus.mockClear().mockResolvedValue(true);
+    setDictationExternalFocusRefreshSuppressed.mockClear();
+    setDictationTargetFocusSnapshot.mockClear();
+    startLocalMacosTakeoverMonitor.mockClear();
     runLocalMacMouseCommand.mockClear();
   };
 
@@ -152,13 +232,19 @@ const mocks = vi.hoisted(() => {
     BrowserWindow,
     globalShortcut,
     ipcMain,
+    createDictationOverlay,
     showDictationOverlay,
     hideDictationOverlay,
     destroyDictationOverlay,
     sendToOverlay,
     getDictationTargetPid,
     recaptureDictationTargetFocus,
+    setDictationExternalFocusRefreshSuppressed,
+    setDictationTargetFocusSnapshot,
+    startLocalMacosTakeoverMonitor,
     runLocalMacMouseCommand,
+    DictationNativeSessionClient,
+    DictationNativeSessionError,
     reset,
   };
 });
@@ -207,9 +293,10 @@ vi.mock('../../agent/language-model.js', () => ({ createLanguageModelFromConfig:
 vi.mock('../../agent/model-catalog.js', () => ({ resolveModelCatalog: vi.fn(() => ({ defaultEntry: null })) }));
 vi.mock('../../computer-use/permissions.js', () => ({ runLocalMacMouseCommand: mocks.runLocalMacMouseCommand }));
 vi.mock('../../computer-use/harnesses/local-macos.js', () => ({
-  startLocalMacosTakeoverMonitor: vi.fn(() => ({ stop: vi.fn() })),
+  startLocalMacosTakeoverMonitor: mocks.startLocalMacosTakeoverMonitor,
 }));
 vi.mock('../dictation-overlay.js', () => ({
+  createDictationOverlay: mocks.createDictationOverlay,
   showDictationOverlay: mocks.showDictationOverlay,
   hideDictationOverlay: mocks.hideDictationOverlay,
   destroyDictationOverlay: mocks.destroyDictationOverlay,
@@ -218,6 +305,12 @@ vi.mock('../dictation-overlay.js', () => ({
 vi.mock('../focus-preserver.js', () => ({
   getDictationTargetPid: mocks.getDictationTargetPid,
   recaptureDictationTargetFocus: mocks.recaptureDictationTargetFocus,
+  setDictationExternalFocusRefreshSuppressed: mocks.setDictationExternalFocusRefreshSuppressed,
+  setDictationTargetFocusSnapshot: mocks.setDictationTargetFocusSnapshot,
+}));
+vi.mock('../native-session-client.js', () => ({
+  DictationNativeSessionClient: mocks.DictationNativeSessionClient,
+  DictationNativeSessionError: mocks.DictationNativeSessionError,
 }));
 
 function createConfig() {
@@ -226,85 +319,37 @@ function createConfig() {
       enabled: true,
       hotkey: 'CommandOrControl+Shift+D',
       mode: 'toggle',
-      inputDeviceId: null,
-      vadSilenceDurationMs: 850,
-      finalCleanupEnabled: false,
-      livePartials: false,
-      partialTyping: { ax: 'disabled', kb: 'disabled' },
+      language: 'en-US',
+      livePartials: true,
+      partialTyping: { ax: 'full-replacement', kb: 'disabled' },
     },
     audio: {
-      azure: { region: 'eastus', subscriptionKey: 'test-key', sttLanguage: 'en-US' },
-      recording: { language: 'en-US' },
+      azure: { subscriptionKey: 'test-key', region: 'eastus' },
     },
     models: { providers: {}, catalog: [] },
-    realtime: {},
   };
 }
 
-describe('dictation manager lifecycle', () => {
-  beforeEach(() => {
+describe('dictation manager native session lifecycle', () => {
+  beforeEach(async () => {
     vi.resetModules();
+    vi.stubGlobal('__BRAND_PRODUCT_NAME', 'Kai');
     vi.stubGlobal('__BRAND_APP_SLUG', 'kai');
     mocks.reset();
   });
 
-  it('isolates the hidden recorder session from the main Electron session', async () => {
+  it('fails closed before recording when native Accessibility verification fails', async () => {
     const manager = await import('../dictation-manager.js');
-
-    manager.initDictation(createConfig() as never);
-    await manager.toggleDictation();
-
-    expect(mocks.state.browserWindowOptions[0]).toMatchObject({
-      webPreferences: {
-        partition: 'kai-dictation-recorder',
-      },
-    });
-
-    await manager.toggleDictation();
-  });
-
-  it('tears the session down when Azure STT cancels with an error', async () => {
-    const manager = await import('../dictation-manager.js');
-
-    manager.initDictation(createConfig() as never);
-    await manager.toggleDictation();
-    expect(manager.getDictationState().state).toBe('active');
-
-    mocks.state.recognizer?.canceled?.(null, {
-      reason: 1,
-      errorCode: 1,
-      errorDetails: 'do not expose this detail',
-    });
-
-    await vi.waitFor(() => {
-      expect(manager.getDictationState().state).toBe('idle');
-    });
-    expect(mocks.hideDictationOverlay).toHaveBeenCalled();
-  });
-
-  it('fails closed when the focused target app cannot be identified', async () => {
-    const manager = await import('../dictation-manager.js');
-    mocks.getDictationTargetPid.mockReturnValue(null);
-
-    manager.initDictation(createConfig() as never);
-    await manager.toggleDictation();
-
-    expect(manager.getDictationState().state).toBe('idle');
-    expect(mocks.state.browserWindowOptions).toHaveLength(0);
-    expect(mocks.sendToOverlay).toHaveBeenCalledWith(
-      'dictation:error',
-      expect.stringContaining('target app'),
+    mocks.state.beginError = new mocks.DictationNativeSessionError(
+      'Dictation requires macOS Accessibility permission before it can type safely.',
+      'accessibility',
     );
-  });
-
-  it('fails closed before recording when Accessibility is not trusted', async () => {
-    const manager = await import('../dictation-manager.js');
-    mocks.state.accessibilityTrusted = false;
 
     manager.initDictation(createConfig() as never);
     await manager.toggleDictation();
 
     expect(manager.getDictationState().state).toBe('idle');
+    expect(mocks.showDictationOverlay).not.toHaveBeenCalled();
     expect(mocks.state.browserWindowOptions).toHaveLength(0);
     expect(mocks.sendToOverlay).toHaveBeenCalledWith(
       'dictation:error',
@@ -312,184 +357,148 @@ describe('dictation manager lifecycle', () => {
     );
   });
 
-  it('fails closed before recording when the target cursor cannot be verified', async () => {
+  it('rejects secure fields before recording', async () => {
     const manager = await import('../dictation-manager.js');
-    mocks.state.focusedTextSelection = {
-      ok: true,
-      selectedTextRangeLocation: 0,
-      selectedTextRangeLength: 0,
-      elementSignature: '',
-    };
+    mocks.state.beginError = new mocks.DictationNativeSessionError(
+      'Dictation will not type into secure text fields.',
+      'secure_field',
+    );
 
     manager.initDictation(createConfig() as never);
     await manager.toggleDictation();
 
     expect(manager.getDictationState().state).toBe('idle');
-    expect(mocks.state.browserWindowOptions).toHaveLength(0);
-    expect(mocks.runLocalMacMouseCommand).not.toHaveBeenCalledWith(
-      expect.arrayContaining(['postText']),
-    );
+    expect(mocks.showDictationOverlay).not.toHaveBeenCalled();
     expect(mocks.sendToOverlay).toHaveBeenCalledWith(
       'dictation:error',
-      expect.stringContaining('cursor or selection'),
+      expect.stringContaining('secure text fields'),
     );
   });
 
-  it('retargets a final transcript to the currently focused app when no live partial was typed', async () => {
+  it('starts a verified AX target through the native session', async () => {
     const manager = await import('../dictation-manager.js');
-    mocks.getDictationTargetPid.mockReturnValue(1111);
 
     manager.initDictation(createConfig() as never);
     await manager.toggleDictation();
-    expect(manager.getDictationState().state).toBe('active');
 
-    mocks.recaptureDictationTargetFocus.mockImplementationOnce(async () => {
-      mocks.state.frontmostPid = 2222;
-      mocks.getDictationTargetPid.mockReturnValue(2222);
-      mocks.state.focusedTextSelection = {
-        ok: true,
-        selectedTextRangeLocation: 7,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=30|y=40|w=300',
-      };
-      return true;
+    const native = mocks.DictationNativeSessionClient.instances[0];
+    expect(manager.getDictationState().state).toBe('active');
+    expect(native.start).toHaveBeenCalled();
+    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+      allowBlindKeyboardFullPatch: false,
+      ownAppName: expect.any(String),
+      ownPid: expect.any(Number),
+    }));
+    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      pid: 4242,
+      appName: 'TextEdit',
+    }));
+    expect(mocks.showDictationOverlay).toHaveBeenCalledWith({ skipFocusCapture: true });
+    expect(native.startTargetTracking).toHaveBeenCalled();
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'ax');
+  });
+
+  it('starts in unreadable AX targets when KB full-patch is enabled', async () => {
+    const manager = await import('../dictation-manager.js');
+    const config = createConfig();
+    config.dictation.partialTyping = { ax: 'disabled', kb: 'full-patch' };
+    mocks.state.beginResponse = {
+      ...mocks.state.beginResponse,
+      typingMode: 'kb',
+      capturedAx: false,
+    };
+
+    manager.initDictation(config as never);
+    await manager.toggleDictation();
+
+    const native = mocks.DictationNativeSessionClient.instances[0];
+    expect(manager.getDictationState().state).toBe('active');
+    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+      allowBlindKeyboardFullPatch: true,
+    }));
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'kb');
+  });
+
+  it('sends live partials and cleaned finals to the native session', async () => {
+    const manager = await import('../dictation-manager.js');
+
+    manager.initDictation(createConfig() as never);
+    await manager.toggleDictation();
+    const native = mocks.DictationNativeSessionClient.instances[0];
+
+    mocks.state.recognizer?.recognizing?.(null, {
+      result: { text: 'hello wor' },
+    });
+
+    await vi.waitFor(() => {
+      expect(native.applyPartial).toHaveBeenCalledWith('hello wor');
     });
 
     mocks.state.recognizer?.recognized?.(null, {
-      result: { reason: 1, text: 'hello notes' },
+      result: { reason: 1, text: 'hello world' },
     } as never);
 
     await vi.waitFor(() => {
-      expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledWith(expect.arrayContaining([
-        'replaceTextAtomically',
-        '7',
-        '0',
-        Buffer.from('hello notes ', 'utf-8').toString('base64'),
-        '2222',
-        Buffer.from('role=QVhUZXh0QXJlYQ==|x=30|y=40|w=300', 'utf-8').toString('base64'),
-      ]));
+      expect(native.applyFinal).toHaveBeenCalledWith('hello world ');
     });
-    expect(mocks.sendToOverlay).not.toHaveBeenCalledWith(
+  });
+
+  it('refreshes the native target snapshot from target-dirty events', async () => {
+    const manager = await import('../dictation-manager.js');
+    mocks.state.refreshResponse = {
+      ...mocks.state.beginResponse,
+      targetPid: 7777,
+      targetName: 'Notes',
+      targetBundleId: 'com.apple.Notes',
+      capturedAx: true,
+    };
+
+    manager.initDictation(createConfig() as never);
+    await manager.toggleDictation();
+    const native = mocks.DictationNativeSessionClient.instances[0];
+
+    native.emitTargetDirty('keyboard:keyDown');
+
+    await vi.waitFor(() => {
+      expect(native.refreshTarget).toHaveBeenCalled();
+    });
+    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      pid: 7777,
+      appName: 'Notes',
+    }));
+  });
+
+  it('stops safely when the native helper exits mid-session', async () => {
+    const manager = await import('../dictation-manager.js');
+
+    manager.initDictation(createConfig() as never);
+    await manager.toggleDictation();
+    const native = mocks.DictationNativeSessionClient.instances[0];
+
+    native.emitExit('helper crashed');
+
+    await vi.waitFor(() => {
+      expect(manager.getDictationState().state).toBe('idle');
+    });
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith(
       'dictation:error',
-      expect.stringContaining('could not safely type'),
+      expect.stringContaining('native helper stopped unexpectedly'),
     );
+    expect(native.endSession).toHaveBeenCalled();
   });
 
-  it('retargets the first live partial after switching apps before any partial was typed', async () => {
+  it('keeps hold-mode release monitoring on the existing separate monitor', async () => {
     const manager = await import('../dictation-manager.js');
     const config = createConfig();
-    config.dictation.partialTyping = { ax: 'full-replacement', kb: 'disabled' };
-    mocks.getDictationTargetPid.mockReturnValue(1111);
+    config.dictation.mode = 'hold';
 
     manager.initDictation(config as never);
-    await manager.toggleDictation();
-    expect(manager.getDictationState().state).toBe('active');
-
-    mocks.state.frontmostPid = 2222;
-    mocks.state.enforceReadFrontmostGuard = false;
-    mocks.recaptureDictationTargetFocus.mockImplementationOnce(async () => {
-      mocks.getDictationTargetPid.mockReturnValue(2222);
-      mocks.state.focusedTextSelection = {
-        ok: true,
-        selectedTextRangeLocation: 9,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      };
-      return true;
-    });
-
-    mocks.state.recognizer?.recognizing?.(null, {
-      result: { text: 'first partial' },
-    });
+    const registered = (mocks.globalShortcut.register.mock.calls[0] as unknown[])[1] as () => void;
+    registered();
 
     await vi.waitFor(() => {
-      expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledWith(expect.arrayContaining([
-        'replaceTextAtomically',
-        '9',
-        '0',
-        Buffer.from('first partial', 'utf-8').toString('base64'),
-        '2222',
-        Buffer.from('role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300', 'utf-8').toString('base64'),
-      ]));
+      expect(manager.getDictationState().state).toBe('active');
     });
-    expect(mocks.recaptureDictationTargetFocus).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not suppress the whole utterance when first-partial verification misses before any mutation', async () => {
-    const manager = await import('../dictation-manager.js');
-    const config = createConfig();
-    config.dictation.partialTyping = { ax: 'full-replacement', kb: 'disabled' };
-
-    manager.initDictation(config as never);
-    await manager.toggleDictation();
-    expect(manager.getDictationState().state).toBe('active');
-
-    mocks.recaptureDictationTargetFocus.mockResolvedValue(true);
-    mocks.state.focusedTextSelectionResponses.push(
-      {
-        ok: true,
-        selectedTextRangeLocation: 10,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-      {
-        ok: true,
-        selectedTextRangeLocation: 11,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-      {
-        ok: true,
-        selectedTextRangeLocation: 12,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-      {
-        ok: true,
-        selectedTextRangeLocation: 13,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-    );
-
-    mocks.state.recognizer?.recognizing?.(null, {
-      result: { text: 'first' },
-    });
-
-    await vi.waitFor(() => {
-      expect(mocks.recaptureDictationTargetFocus).toHaveBeenCalledTimes(2);
-    });
-    expect(mocks.runLocalMacMouseCommand).not.toHaveBeenCalledWith(expect.arrayContaining([
-      'replaceTextAtomically',
-      '10',
-    ]));
-
-    mocks.state.focusedTextSelectionResponses.push(
-      {
-        ok: true,
-        selectedTextRangeLocation: 20,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-      {
-        ok: true,
-        selectedTextRangeLocation: 20,
-        selectedTextRangeLength: 0,
-        elementSignature: 'role=QVhUZXh0QXJlYQ==|x=80|y=90|w=300',
-      },
-    );
-
-    mocks.state.recognizer?.recognizing?.(null, {
-      result: { text: 'first retry' },
-    });
-
-    await vi.waitFor(() => {
-      expect(mocks.runLocalMacMouseCommand).toHaveBeenCalledWith(expect.arrayContaining([
-        'replaceTextAtomically',
-        '20',
-        '0',
-        Buffer.from('first retry', 'utf-8').toString('base64'),
-      ]));
-    });
+    expect(mocks.startLocalMacosTakeoverMonitor).toHaveBeenCalled();
   });
 });

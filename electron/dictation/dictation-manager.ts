@@ -27,6 +27,7 @@ import {
   type LocalMacosTakeoverMonitorHandle,
 } from '../computer-use/harnesses/local-macos.js';
 import {
+  createDictationOverlay,
   showDictationOverlay,
   hideDictationOverlay,
   destroyDictationOverlay,
@@ -39,7 +40,12 @@ import {
   type DictationPatchPhase,
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
-import { getDictationTargetPid, recaptureDictationTargetFocus } from './focus-preserver.js';
+import {
+  getDictationTargetPid,
+  recaptureDictationTargetFocus,
+  setDictationExternalFocusRefreshSuppressed,
+  setDictationTargetFocusSnapshot,
+} from './focus-preserver.js';
 import {
   getPartialTypingStrategyForConfig,
   hasEnabledPartialTypingStrategy,
@@ -50,6 +56,7 @@ import {
 } from './partial-typing.js';
 import {
   createAxDictationSpanFromSelection,
+  selectionMatchesDictationElement,
   selectionMatchesDictationEnd,
   selectionMatchesDictationStart,
   type AxDictationSpan,
@@ -59,9 +66,17 @@ import {
   isSafeKeyboardPatchText,
   normalizeCleanupResponse,
 } from './dictation-safety.js';
+import { dictationDebugLog } from './debug-log.js';
+import {
+  DictationNativeSessionClient,
+  DictationNativeSessionError,
+  type DictationNativeSessionResponse,
+  type DictationNativeTypingMode,
+} from './native-session-client.js';
 
 const AX_DEBUG_ENABLED = process.env.KAI_DICTATION_AX_DEBUG === '1';
 function axDebug(msg: string): void {
+  dictationDebugLog('AX', { msg });
   if (AX_DEBUG_ENABLED) console.info(`[Dictation AX] ${msg}`);
 }
 import { parseHotkeyCodes } from './hotkey-codes.js';
@@ -83,6 +98,15 @@ interface DictationConfig {
 type TypingMode = 'ax' | 'kb' | 'idle';
 type PersistConfigValue = (path: string, value: unknown) => void;
 type DictationSoundKind = 'start' | 'end';
+type KeyboardMutationOptions = {
+  allowUnverifiedKeyboard?: boolean;
+  targetPid?: number | null;
+};
+type VerifyDictationSpanOptions = {
+  requireTextMatch?: boolean;
+  allowSelectedSuffixExpansion?: boolean;
+  allowRecordedTextRecovery?: boolean;
+};
 
 let state: DictationState = 'idle';
 let config: DictationConfig | null = null;
@@ -98,6 +122,9 @@ let recorderWindow: BrowserWindow | null = null;
 let micDrainInterval: ReturnType<typeof setInterval> | null = null;
 let levelPollInterval: ReturnType<typeof setInterval> | null = null;
 let micSampleRateHz = 16000;
+let micDrainInFlight = false;
+let levelPollInFlight = false;
+let audioPollingGeneration = 0;
 
 // Session timing
 let sessionStartTime: number = 0;
@@ -111,6 +138,8 @@ const queuedPartialGate = new DictationQueuedPartialGate();
 let axDictationSpan: AxDictationSpan | null = null;
 let keyboardPatchStateUnverified = false;
 let keyboardPatchUnverifiedTargetText: string | null = null;
+let blindKeyboardPatchTargetPid: number | null = null;
+let lastAxCaptureFailureMessage: string | null = null;
 
 // When AX fails mid-utterance, suppress further AX attempts until the next clean final
 let axSuppressedUntilNextFinal: boolean = false;
@@ -128,6 +157,15 @@ const AZURE_STT_SAMPLE_RATE_HZ = 16000;
 const FINAL_CLEANUP_TIMEOUT_MS = 12_000;
 const POST_FINAL_AX_RECAPTURE_DELAY_MS = 120;
 const KEYBOARD_PATCH_VERIFY_DELAY_MS = 35;
+const TARGET_REFRESH_INTERVAL_MS = 250;
+const TARGET_REFRESH_IDLE_POLL_MS = 5000;
+const START_TARGET_IDENTIFY_ATTEMPTS = 3;
+const START_TARGET_IDENTIFY_RETRY_MS = 80;
+const STOP_TYPING_QUEUE_TIMEOUT_MS = 1500;
+const STOP_MIC_TIMEOUT_MS = 1500;
+const STOP_STT_TIMEOUT_MS = 2500;
+const MIC_DRAIN_SLOW_LOG_MS = 250;
+const LEVEL_POLL_SLOW_LOG_MS = 250;
 const MAX_SAFE_BACKSPACES = 120;
 const HOTKEY_SUSPEND_TTL_MS = 20_000;
 const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
@@ -158,6 +196,14 @@ let hotkeyRegistered = false;
 let hotkeyRegistrationError: string | null = null;
 let ipcHandlersRegistered = false;
 let sttCancellationStopRequested = false;
+let targetFocusMonitor: LocalMacosTakeoverMonitorHandle | null = null;
+let targetRefreshInterval: ReturnType<typeof setInterval> | null = null;
+let targetRefreshQueued = false;
+let targetRefreshDirty = false;
+let targetRefreshReason: string | null = null;
+let lastTargetRefreshAt = 0;
+let nativeSession: DictationNativeSessionClient | null = null;
+let nativeSessionClosing = false;
 
 /** Maximum hold duration before auto-stop (5 minutes) */
 const HOLD_SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -171,6 +217,7 @@ export function initDictation(appConfig: AppConfig, setConfig?: PersistConfigVal
   config = appConfig.dictation as DictationConfig | undefined ?? null;
   if (config?.enabled && config.hotkey) {
     registerHotkey(config.hotkey);
+    createDictationOverlay();
   }
   registerIpcHandlers();
 }
@@ -198,6 +245,11 @@ export function updateDictationConfig(appConfig: AppConfig): void {
       hotkeyRegistrationError = null;
       broadcastState();
     }
+  }
+  if (newConfig?.enabled) {
+    createDictationOverlay();
+  } else {
+    destroyDictationOverlay();
   }
 }
 
@@ -387,60 +439,128 @@ function playDictationSound(kind: DictationSoundKind): void {
   }
 }
 
+function normalizeNativeTypingMode(mode: DictationNativeTypingMode | undefined): TypingMode {
+  return mode === 'ax' || mode === 'kb' || mode === 'idle' ? mode : 'idle';
+}
+
+function applyNativeSessionResponse(response: DictationNativeSessionResponse): void {
+  partialTypedText = typeof response.partialText === 'string' ? response.partialText : partialTypedText;
+  if (response.strategy === 'disabled' || response.strategy == null) {
+    if (!partialTypedText) {
+      partialTypingStrategyUsed = null;
+      partialTypingModeUsed = null;
+    }
+  } else {
+    partialTypingStrategyUsed = response.strategy;
+    partialTypingModeUsed = normalizeNativeTypingMode(response.typingMode) === 'idle'
+      ? null
+      : normalizeNativeTypingMode(response.typingMode) as PartialTypingMode;
+  }
+  axDictationSpan = response.capturedAx
+    ? axDictationSpan ?? { location: 0, typedUtf16Length: partialTypedText.length, pid: response.targetPid ?? null, elementSignature: 'native' }
+    : null;
+  axSuppressedUntilNextFinal = false;
+  broadcastTypingMode(normalizeNativeTypingMode(response.typingMode));
+}
+
+function handleNativeSessionExit(generation: number, message: string): void {
+  dictationDebugLog('NATIVE_SESSION_EXIT', { generation, message, state });
+  if (nativeSessionClosing || generation !== sessionGeneration || state === 'idle' || state === 'stopping') return;
+  broadcastError('Dictation native helper stopped unexpectedly. Dictation was stopped to avoid unsafe typing.');
+  void stopDictation();
+}
+
 async function startDictation(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
   state = 'starting';
   sessionGeneration += 1;
   const generation = sessionGeneration;
+  const initializationStartedAt = Date.now();
   broadcastState();
-  sessionStartTime = Date.now();
+  dictationDebugLog('SESSION_START', { generation });
 
   try {
     axDebug(`--- SESSION START ---`);
 
-    // 1. Show overlay (this also captures + restores focus to the target app)
-    await showDictationOverlay();
+    // 1. Start native dictation session before the overlay can affect focus.
+    let phaseStartedAt = Date.now();
+    nativeSessionClosing = false;
+    nativeSession = new DictationNativeSessionClient({
+      onTargetDirty: (reason) => scheduleTypingTargetRefresh(`native:${reason}`),
+      onProtocolError: (message) => dictationDebugLog('NATIVE_SESSION_PROTOCOL', { message }),
+      onExit: (message) => handleNativeSessionExit(generation, message),
+    });
+    await nativeSession.start();
+    const beginResponse = await nativeSession.beginSession({
+      partialTyping: config.partialTyping,
+      livePartials: config.livePartials,
+      allowBlindKeyboardFullPatch: canAllowBlindKeyboardFullPatchConfig(),
+      ownPid: process.pid,
+      ownAppName: __BRAND_PRODUCT_NAME,
+    });
+    applyNativeSessionResponse(beginResponse);
+    setDictationTargetFocusSnapshot(nativeSession.getTargetSnapshot(beginResponse));
+    setDictationExternalFocusRefreshSuppressed(true);
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'native-session',
+      durationMs: Date.now() - phaseStartedAt,
+      targetPid: beginResponse.targetPid,
+      capturedAx: beginResponse.capturedAx,
+      mode: beginResponse.typingMode,
+    });
     if (!isStartingSession(generation)) return;
 
-    // Wait for focus restoration to settle before querying AX
-    await delay(350);
+    // 2. Show overlay after native target capture; skip the old one-shot focus capture.
+    phaseStartedAt = Date.now();
+    await showDictationOverlay({ skipFocusCapture: true });
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'overlay',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) return;
-
-    await assertLocalMacosAccessibilityTrusted();
-    if (!isStartingSession(generation)) return;
-
-    if (process.platform === 'darwin' && getDictationTargetPid() == null) {
-      throw new Error('Dictation could not identify the target app. Grant Automation permission for focus tracking, then try again.');
-    }
-
-    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
-    if (!isStartingSession(generation)) return;
-    axDebug(`startDictation: initial capture result=${axDictationSpan ? `loc=${axDictationSpan.location}` : 'null'}`);
-    if (!axDictationSpan) {
-      throw new Error('Dictation could not verify the target text cursor or selection. Click into a standard text field and try again.');
-    }
 
     // Broadcast typing mode after overlay is visible so it receives the message
-    broadcastTypingMode(getActivePartialTypingMode());
+    broadcastTypingMode(normalizeNativeTypingMode(beginResponse.typingMode));
 
-    // 2. Start mic capture
+    // 3. Start mic capture
+    phaseStartedAt = Date.now();
     await startMicCapture(config.inputDeviceId ?? undefined);
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'mic-start',
+      durationMs: Date.now() - phaseStartedAt,
+      sampleRateHz: micSampleRateHz,
+    });
     if (!isStartingSession(generation)) {
       await stopMicCapture();
       return;
     }
 
-    // 3. Start STT
+    // 4. Start STT
+    phaseStartedAt = Date.now();
     await startStt();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'stt-start',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) {
       await stopStt();
       await stopMicCapture();
       return;
     }
 
-    // 4. Start polling mic audio and levels
+    // 5. Start polling mic audio and levels
+    phaseStartedAt = Date.now();
     startAudioPolling();
+    dictationDebugLog('START_PHASE', {
+      generation,
+      phase: 'audio-polling',
+      durationMs: Date.now() - phaseStartedAt,
+    });
     if (!isStartingSession(generation)) {
       stopAudioPolling();
       await stopStt();
@@ -449,18 +569,27 @@ async function startDictation(): Promise<void> {
     }
 
     state = 'active';
+    sessionStartTime = Date.now();
+    startTypingTargetTracking();
     broadcastState();
     playDictationSound('start');
+    dictationDebugLog('SESSION_ACTIVE', {
+      generation,
+      mode: lastBroadcastedMode,
+      targetPid: getDictationTargetPid(),
+      initializationMs: Date.now() - initializationStartedAt,
+    });
     console.info('[Dictation] Started');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[Dictation] Start failed:', err);
+    dictationDebugLog('SESSION_START_FAILED', { generation, message });
     state = 'idle';
     sessionGeneration += 1;
     broadcastState();
     await cleanupSession();
-    broadcastError(message);
     hideDictationOverlay();
+    broadcastError(message);
   }
 }
 
@@ -468,30 +597,178 @@ function isStartingSession(generation: number): boolean {
   return state === 'starting' && generation === sessionGeneration;
 }
 
+async function _ensureDictationTargetIdentified(): Promise<void> {
+  if (process.platform !== 'darwin') return;
+  for (let attempt = 0; attempt < START_TARGET_IDENTIFY_ATTEMPTS; attempt++) {
+    if (getDictationTargetPid() != null) return;
+    const startedAt = Date.now();
+    const ok = await recaptureDictationTargetFocus();
+    dictationDebugLog('START_TARGET_CAPTURE', {
+      attempt: attempt + 1,
+      ok,
+      pid: getDictationTargetPid(),
+      durationMs: Date.now() - startedAt,
+    });
+    if (ok && getDictationTargetPid() != null) return;
+    if (attempt < START_TARGET_IDENTIFY_ATTEMPTS - 1) {
+      await delay(START_TARGET_IDENTIFY_RETRY_MS);
+    }
+  }
+}
+
 async function stopDictation(): Promise<void> {
-  if (state === 'idle' || state === 'stopping') return;
+  if (state === 'idle') {
+    hideDictationOverlay();
+    return;
+  }
+  if (state === 'stopping') {
+    hideDictationOverlay();
+    return;
+  }
 
   state = 'stopping';
   broadcastState();
+  hideDictationOverlay();
+  stopTypingTargetTracking();
   playDictationSound('end');
+  dictationDebugLog('SESSION_STOP_REQUESTED', { generation: sessionGeneration });
 
-  await finishSession();
+  try {
+    await finishSession();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn('[Dictation] Stop cleanup failed:', err);
+    dictationDebugLog('SESSION_STOP_CLEANUP_FAILED', { message });
+    try {
+      await cleanupSession();
+    } catch (cleanupErr) {
+      dictationDebugLog('SESSION_STOP_FORCE_CLEANUP_FAILED', {
+        message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+      });
+    }
+  }
 
   state = 'idle';
   sessionGeneration += 1;
   broadcastState();
   hideDictationOverlay();
+  dictationDebugLog('SESSION_STOPPED', { generation: sessionGeneration });
   console.info('[Dictation] Stopped');
+}
+
+function startTypingTargetTracking(): void {
+  stopTypingTargetTracking();
+  lastTargetRefreshAt = Date.now();
+  targetRefreshDirty = false;
+
+  if (process.platform === 'darwin') {
+    void nativeSession?.startTargetTracking()
+      .then(() => dictationDebugLog('TARGET_MONITOR_STARTED', { native: true }))
+      .catch((err) => {
+        dictationDebugLog('TARGET_MONITOR_START_FAILED', {
+          native: true,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  targetRefreshInterval = setInterval(() => {
+    const idleMs = Date.now() - lastTargetRefreshAt;
+    if (targetRefreshDirty || idleMs >= TARGET_REFRESH_IDLE_POLL_MS) {
+      scheduleTypingTargetRefresh(targetRefreshDirty ? 'dirty-poll' : 'idle-poll');
+    }
+  }, TARGET_REFRESH_INTERVAL_MS);
+
+}
+
+function stopTypingTargetTracking(): void {
+  if (targetFocusMonitor) {
+    targetFocusMonitor.stop();
+    targetFocusMonitor = null;
+  }
+  void nativeSession?.stopTargetTracking().catch(() => {});
+  if (targetRefreshInterval) {
+    clearInterval(targetRefreshInterval);
+    targetRefreshInterval = null;
+  }
+  targetRefreshDirty = false;
+  targetRefreshQueued = false;
+  targetRefreshReason = null;
+}
+
+function scheduleTypingTargetRefresh(reason: string): void {
+  if (state !== 'active' && state !== 'starting') return;
+  targetRefreshDirty = true;
+  targetRefreshReason = reason;
+  if (targetRefreshQueued) return;
+
+  targetRefreshQueued = true;
+  const generation = sessionGeneration;
+  enqueueTyping(generation, 'target-refresh', async () => {
+    const refreshReason = targetRefreshReason ?? reason;
+    targetRefreshReason = null;
+    try {
+      if (targetRefreshDirty) {
+        await refreshTypingTargetSnapshot(refreshReason);
+      }
+    } catch (err) {
+      dictationDebugLog('TARGET_REFRESH_ERROR', {
+        reason: refreshReason,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      targetRefreshQueued = false;
+      if (targetRefreshDirty && (state === 'active' || state === 'starting')) {
+        setTimeout(() => scheduleTypingTargetRefresh('queued-dirty'), 0);
+      }
+    }
+  });
+}
+
+async function refreshTypingTargetSnapshot(reason: string): Promise<void> {
+  targetRefreshDirty = false;
+  const startedAt = Date.now();
+  if (!nativeSession || partialTypedText.length > 0 || partialTypingStrategyUsed || partialTypingModeUsed) {
+    lastTargetRefreshAt = Date.now();
+    dictationDebugLog('TARGET_REFRESH', {
+      reason,
+      ok: false,
+      pid: getDictationTargetPid(),
+      canApplyAxSnapshot: false,
+      capturedAx: false,
+      skipped: nativeSession ? 'typing-started' : 'no-native-session',
+      mode: lastBroadcastedMode,
+      durationMs: lastTargetRefreshAt - startedAt,
+    });
+    return;
+  }
+
+  const response = await nativeSession.refreshTarget();
+  applyNativeSessionResponse(response);
+  setDictationTargetFocusSnapshot(nativeSession.getTargetSnapshot(response));
+
+  lastTargetRefreshAt = Date.now();
+  dictationDebugLog('TARGET_REFRESH', {
+    reason,
+    ok: response.ok !== false,
+    pid: getDictationTargetPid(),
+    canApplyAxSnapshot: partialTypedText.length === 0,
+    capturedAx: response.capturedAx === true,
+    mode: response.typingMode,
+    durationMs: lastTargetRefreshAt - startedAt,
+  });
 }
 
 async function finishSession(): Promise<void> {
   stopAudioPolling();
   stopHoldMonitor();
+  stopTypingTargetTracking();
   await drainRemainingAudioToStt();
   const finalChunks = await stopMicCapture();
   writeAudioChunksToStt(finalChunks);
   await stopStt();
   await waitForTypingQueueToSettle();
+  await endNativeSession();
   destroyRecorderWindow();
   resetSessionState();
 }
@@ -499,10 +776,28 @@ async function finishSession(): Promise<void> {
 async function cleanupSession(): Promise<void> {
   stopAudioPolling();
   stopHoldMonitor();
+  stopTypingTargetTracking();
   await stopStt();
   await stopMicCapture();
+  await endNativeSession();
   destroyRecorderWindow();
   resetSessionState();
+}
+
+async function endNativeSession(): Promise<void> {
+  const session = nativeSession;
+  nativeSession = null;
+  if (!session) return;
+  nativeSessionClosing = true;
+  try {
+    await session.endSession();
+  } catch (err) {
+    dictationDebugLog('NATIVE_SESSION_END_FAILED', {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    nativeSessionClosing = false;
+  }
 }
 
 function resetSessionState(): void {
@@ -511,13 +806,22 @@ function resetSessionState(): void {
   partialTypingModeUsed = null;
   keyboardPatchStateUnverified = false;
   keyboardPatchUnverifiedTargetText = null;
+  blindKeyboardPatchTargetPid = null;
+  lastAxCaptureFailureMessage = null;
+  targetRefreshQueued = false;
+  targetRefreshDirty = false;
+  targetRefreshReason = null;
   micSampleRateHz = AZURE_STT_SAMPLE_RATE_HZ;
+  micDrainInFlight = false;
+  levelPollInFlight = false;
+  audioPollingGeneration += 1;
   queuedPartialGate.invalidateQueuedPartials();
   axDictationSpan = null;
   axSuppressedUntilNextFinal = false;
   lastBroadcastedMode = 'idle';
   lastAxCaptureAttempt = 0;
   sttCancellationStopRequested = false;
+  setDictationExternalFocusRefreshSuppressed(false);
 }
 
 // ─── Hold Mode Monitor ──────────────────────────────────────────────────────
@@ -652,9 +956,17 @@ async function startMicCapture(deviceId?: string): Promise<void> {
 async function stopMicCapture(): Promise<string[]> {
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     try {
-      const chunks = await recorderWindow.webContents.executeJavaScript('window._mic.stopLiveStream()');
+      const chunks = await withTimeout(
+        recorderWindow.webContents.executeJavaScript('window._mic.stopLiveStream()'),
+        STOP_MIC_TIMEOUT_MS,
+        'Stop microphone capture',
+      );
       return Array.isArray(chunks) ? chunks : [];
-    } catch { /* ignore */ }
+    } catch (err) {
+      dictationDebugLog('MIC_STOP_FAILED', {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   return [];
 }
@@ -674,8 +986,15 @@ function destroyRecorderWindow(): void {
 async function drainMicChunks(): Promise<string[]> {
   if (!recorderWindow || recorderWindow.isDestroyed()) return [];
   try {
-    return await recorderWindow.webContents.executeJavaScript('window._mic.drainLiveChunks()');
-  } catch {
+    return await withTimeout(
+      recorderWindow.webContents.executeJavaScript('window._mic.drainLiveChunks()'),
+      STOP_MIC_TIMEOUT_MS,
+      'Drain microphone chunks',
+    );
+  } catch (err) {
+    dictationDebugLog('MIC_DRAIN_FAILED', {
+      message: err instanceof Error ? err.message : String(err),
+    });
     return [];
   }
 }
@@ -812,9 +1131,10 @@ async function stopStt(): Promise<void> {
   if (recognizer) {
     try {
       await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => resolve(), STOP_STT_TIMEOUT_MS);
         recognizer!.stopContinuousRecognitionAsync(
-          () => resolve(),
-          () => resolve(),
+          () => { clearTimeout(timeout); resolve(); },
+          () => { clearTimeout(timeout); resolve(); },
         );
       });
     } catch { /* ignore */ }
@@ -854,20 +1174,64 @@ function getAzureSttKeyFallback(): string {
 
 function startAudioPolling(): void {
   // Poll mic for audio chunks every 50ms and feed to STT
-  micDrainInterval = setInterval(async () => {
-    writeAudioChunksToStt(await drainMicChunks());
+  audioPollingGeneration += 1;
+  const pollingGeneration = audioPollingGeneration;
+  micDrainInFlight = false;
+  levelPollInFlight = false;
+  micDrainInterval = setInterval(() => {
+    if (micDrainInFlight) return;
+    micDrainInFlight = true;
+    const startedAt = Date.now();
+    void drainMicChunks()
+      .then((chunks) => {
+        writeAudioChunksToStt(chunks);
+        const durationMs = Date.now() - startedAt;
+        if (durationMs >= MIC_DRAIN_SLOW_LOG_MS) {
+          dictationDebugLog('MIC_DRAIN_SLOW', { durationMs, chunks: chunks.length });
+        }
+      })
+      .catch((err) => {
+        dictationDebugLog('MIC_DRAIN_FAILED', {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (pollingGeneration !== audioPollingGeneration) return;
+        micDrainInFlight = false;
+      });
   }, 50);
 
   // Poll mic level every 66ms (~15fps) for overlay waveform
-  levelPollInterval = setInterval(async () => {
-    const level = await getMicLevel();
-    sendToOverlay('dictation:level', level);
+  levelPollInterval = setInterval(() => {
+    if (levelPollInFlight) return;
+    levelPollInFlight = true;
+    const startedAt = Date.now();
+    void getMicLevel()
+      .then((level) => {
+        sendToOverlay('dictation:level', level);
+        const durationMs = Date.now() - startedAt;
+        if (durationMs >= LEVEL_POLL_SLOW_LOG_MS) {
+          dictationDebugLog('LEVEL_POLL_SLOW', { durationMs });
+        }
+      })
+      .catch((err) => {
+        dictationDebugLog('LEVEL_POLL_FAILED', {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (pollingGeneration !== audioPollingGeneration) return;
+        levelPollInFlight = false;
+      });
   }, 66);
 }
 
 function stopAudioPolling(): void {
+  audioPollingGeneration += 1;
   if (micDrainInterval) { clearInterval(micDrainInterval); micDrainInterval = null; }
   if (levelPollInterval) { clearInterval(levelPollInterval); levelPollInterval = null; }
+  micDrainInFlight = false;
+  levelPollInFlight = false;
 }
 
 // ─── Text Handling ──────────────────────────────────────────────────────────
@@ -882,23 +1246,41 @@ function isCurrentTypingSession(generation: number): boolean {
   return (state === 'active' || state === 'stopping') && generation === sessionGeneration;
 }
 
-function enqueueTyping(generation: number, fn: () => Promise<void>): void {
+function enqueueTyping(generation: number, label: string, fn: () => Promise<void>): void {
+  const enqueuedAt = Date.now();
   typingQueue = typingQueue.then(async () => {
     if (!isCurrentTypingSession(generation)) return;
+    dictationDebugLog('TYPING_QUEUE_START', { label, ageMs: Date.now() - enqueuedAt, generation });
     await fn();
+    dictationDebugLog('TYPING_QUEUE_DONE', { label, totalMs: Date.now() - enqueuedAt, generation });
   }).catch((err) => {
     console.error('[Dictation] Typing queue error:', err);
+    dictationDebugLog('TYPING_QUEUE_ERROR', {
+      label,
+      message: err instanceof Error ? err.message : String(err),
+    });
   });
 }
 
 async function waitForTypingQueueToSettle(): Promise<void> {
-  for (let i = 0; i < 3; i++) {
-    const pending = typingQueue;
-    await pending;
-    await new Promise(resolve => setTimeout(resolve, 0));
-    if (typingQueue === pending) return;
+  const startedAt = Date.now();
+  try {
+    await withTimeout((async () => {
+      for (let i = 0; i < 3; i++) {
+        const pending = typingQueue;
+        await pending;
+        await new Promise(resolve => setTimeout(resolve, 0));
+        if (typingQueue === pending) return;
+      }
+      await typingQueue;
+    })(), STOP_TYPING_QUEUE_TIMEOUT_MS, 'Dictation typing queue settle');
+    dictationDebugLog('TYPING_QUEUE_SETTLED', { durationMs: Date.now() - startedAt });
+  } catch (err) {
+    dictationDebugLog('TYPING_QUEUE_SETTLE_TIMEOUT', {
+      durationMs: Date.now() - startedAt,
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
-  await typingQueue;
 }
 
 function delay(ms: number): Promise<void> {
@@ -908,43 +1290,50 @@ function delay(ms: number): Promise<void> {
 function handlePartial(text: string): void {
   if (state !== 'active') return;
   sendToOverlay('dictation:partial', text);
+  dictationDebugLog('PARTIAL_RECEIVED', {
+    revision: queuedPartialGate.currentRevision(),
+    textLen: text.length,
+    partialTypedLen: partialTypedText.length,
+    mode: getBroadcastTypingMode(),
+  });
 
   if (!hasEnabledPartialTypingStrategy(config)) return;
 
   const generation = sessionGeneration;
   const partialRevision = queuedPartialGate.nextPartialRevision();
-  enqueueTyping(generation, async () => {
+  const enqueuedAt = Date.now();
+  enqueueTyping(generation, 'partial', async () => {
     if (!queuedPartialGate.isCurrent(partialRevision)) return;
-    if (keyboardPatchStateUnverified) return;
+    if (!nativeSession) return;
+    if (!queuedPartialGate.isCurrent(partialRevision)) return;
+    dictationDebugLog('PARTIAL_DEQUEUE', {
+      revision: partialRevision,
+      ageMs: Date.now() - enqueuedAt,
+      mode: lastBroadcastedMode,
+      strategy: partialTypingStrategyUsed,
+      currentLen: partialTypedText.length,
+      targetLen: text.length,
+    });
 
-    if (!axSuppressedUntilNextFinal) {
-      await retargetCurrentTypingAnchorBeforeFirstMutation(partialTypedText);
-    }
-
-    const mode = getActivePartialTypingMode();
-    const strategy = getPartialTypingStrategy(mode);
-    if (strategy === 'disabled') return;
-
-    const applied = await applyPartialTypingStrategy(partialTypedText, text, 'partial', strategy, mode);
+    const response = await nativeSession.applyPartial(text);
     if (!isCurrentTypingSession(generation)) return;
-    if (!applied) {
-      handlePartialTypingFailure(mode, strategy);
-      return;
-    }
-
-    partialTypedText = text;
-    partialTypingStrategyUsed = strategy;
-    partialTypingModeUsed = mode;
+    applyNativeSessionResponse(response);
   });
 }
 
 function handleFinal(text: string): void {
   if (state !== 'active' && state !== 'stopping') return;
   sendToOverlay('dictation:final', text);
+  dictationDebugLog('FINAL_RECEIVED', {
+    textLen: text.length,
+    partialTypedLen: partialTypedText.length,
+    strategy: partialTypingStrategyUsed,
+    mode: partialTypingModeUsed,
+  });
 
   const generation = sessionGeneration;
   queuedPartialGate.invalidateQueuedPartials();
-  enqueueTyping(generation, async () => {
+  enqueueTyping(generation, 'final', async () => {
     const finalText = await maybeCleanupFinalTranscript(text);
     if (!isCurrentTypingSession(generation)) return;
 
@@ -961,28 +1350,22 @@ function handleFinal(text: string): void {
     }
 
     const finalWithSpace = finalText + ' ';
+    if (!nativeSession) return;
     let applied = true;
-    if (partialTypedText.length > 0 && partialTypingStrategyUsed && partialTypingModeUsed) {
-      applied = await applyPartialTypingStrategy(
-        partialTypedText,
-        finalWithSpace,
-        'final',
-        partialTypingStrategyUsed,
-        partialTypingModeUsed,
-      );
-      if (!applied) {
-        axDebug(`final strategy failed; refusing fallback strategy=${partialTypingStrategyUsed} mode=${partialTypingModeUsed}`);
-      }
-    } else {
-      if (!isCurrentTypingSession(generation)) return;
-      applied = await insertFinalTranscriptWithoutLivePartial(finalWithSpace);
+    let response: DictationNativeSessionResponse;
+    try {
+      response = await nativeSession.applyFinal(finalWithSpace);
+      applyNativeSessionResponse(response);
+    } catch (err) {
+      dictationDebugLog('FINAL_NATIVE_FAILED', {
+        message: err instanceof Error ? err.message : String(err),
+        errorCode: err instanceof DictationNativeSessionError ? err.errorCode : undefined,
+      });
+      applied = false;
+      response = {};
     }
     if (!isCurrentTypingSession(generation)) return;
-    if (!applied) {
-      if (keyboardPatchStateUnverified && await recoverUnverifiedKeyboardPatchState()) {
-        applied = true;
-      }
-    }
+    applied = applied && response.applied !== false;
     if (!applied) {
       clearUnverifiedKeyboardPatchState();
       resetPartialTypingProgress();
@@ -990,19 +1373,14 @@ function handleFinal(text: string): void {
       broadcastFinalTypingFailure();
       return;
     }
-    partialTypedText = '';
-    partialTypingStrategyUsed = null;
-    partialTypingModeUsed = null;
     clearUnverifiedKeyboardPatchState();
+    blindKeyboardPatchTargetPid = null;
     axDictationSpan = null;
     axSuppressedUntilNextFinal = false;
 
-    if (state !== 'active') return;
-    await delay(POST_FINAL_AX_RECAPTURE_DELAY_MS);
-    if (!isCurrentTypingSession(generation) || state !== 'active') return;
-    // Re-acquire AX span for the next utterance (cursor is now at new position)
-    axDictationSpan = await captureFocusedTextSelectionForAxRewrite();
-    broadcastTypingMode(getBroadcastTypingMode());
+    if (state === 'active' && isCurrentTypingSession(generation)) {
+      setTimeout(() => scheduleTypingTargetRefresh('post-final'), POST_FINAL_AX_RECAPTURE_DELAY_MS);
+    }
   });
 }
 
@@ -1011,11 +1389,12 @@ function resetPartialTypingProgress(): void {
   partialTypingStrategyUsed = null;
   partialTypingModeUsed = null;
   axDictationSpan = null;
+  blindKeyboardPatchTargetPid = null;
   axSuppressedUntilNextFinal = true;
   broadcastTypingMode(getBroadcastTypingMode());
 }
 
-function handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTypingStrategy): void {
+function _handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTypingStrategy): void {
   axDebug(`partial strategy failed mode=${mode} strategy=${strategy}`);
   if (mode === 'kb' && strategy === 'full-patch' && keyboardPatchStateUnverified) {
     partialTypingStrategyUsed = strategy;
@@ -1024,17 +1403,18 @@ function handlePartialTypingFailure(mode: PartialTypingMode, strategy: PartialTy
   }
 }
 
-async function insertFinalTranscriptWithoutLivePartial(finalText: string): Promise<boolean> {
-  if (!await retargetCurrentTypingAnchor()) {
-    axDebug('final without live partials skipped because no verified AX anchor is available');
-    return false;
-  }
-
-  if (await replaceDictatedTextViaAxWithCapture('', finalText, 'final')) {
+async function _insertFinalTranscriptWithoutLivePartial(finalText: string): Promise<boolean> {
+  const hasTypingAnchor = await retargetCurrentTypingAnchor();
+  if (hasTypingAnchor && axDictationSpan && await replaceDictatedTextViaAxWithCapture('', finalText, 'final')) {
     return true;
   }
 
-  axDebug('final without live partials skipped blind keyboard fallback after AX anchor failure');
+  if (canUseBlindKeyboardPatchForCurrentText('')) {
+    axDebug('final without live partials using opt-in blind KX full-patch');
+    return applyBlindKeyboardDictationPatch('', finalText, 'final');
+  }
+
+  axDebug('final without live partials skipped because no verified AX anchor or opt-in KX full-patch target is available');
   return false;
 }
 
@@ -1055,10 +1435,11 @@ async function retargetCurrentTypingAnchor(): Promise<boolean> {
     axDictationSpan = null;
     axSuppressedUntilNextFinal = false;
     broadcastTypingMode(getBroadcastTypingMode());
-    return false;
+    return canUseBlindKeyboardFullPatch() && !lastAxCaptureFailedBecauseSecureTarget();
   }
 
   axDictationSpan = span;
+  blindKeyboardPatchTargetPid = null;
   axSuppressedUntilNextFinal = false;
   broadcastTypingMode(getBroadcastTypingMode());
   return true;
@@ -1097,6 +1478,7 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
 
   const raw = text.trim();
   if (!raw) return text;
+  const startedAt = Date.now();
 
   try {
     const modelEntry = resolveModelCatalog(fullConfig).defaultEntry;
@@ -1124,10 +1506,21 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
     );
 
     const cleaned = normalizeCleanupResponse(result.text);
-    if (!isAcceptableCleanupResponse(raw, cleaned)) return text;
+    const accepted = isAcceptableCleanupResponse(raw, cleaned);
+    dictationDebugLog('FINAL_CLEANUP', {
+      durationMs: Date.now() - startedAt,
+      accepted,
+      rawLen: raw.length,
+      cleanedLen: cleaned.length,
+    });
+    if (!accepted) return text;
     return cleaned;
   } catch (err) {
     console.warn('[Dictation] Final transcript cleanup failed; using raw final:', err);
+    dictationDebugLog('FINAL_CLEANUP_FAILED', {
+      durationMs: Date.now() - startedAt,
+      message: err instanceof Error ? err.message : String(err),
+    });
     return text;
   }
 }
@@ -1153,7 +1546,13 @@ function getActivePartialTypingMode(): PartialTypingMode {
 }
 
 function getBroadcastTypingMode(): TypingMode {
-  if (!axDictationSpan || axSuppressedUntilNextFinal) return 'idle';
+  if (!axDictationSpan || axSuppressedUntilNextFinal) {
+    return canUseBlindKeyboardFullPatch()
+      && !keyboardPatchStateUnverified
+      && !lastAxCaptureFailedBecauseSecureTarget()
+      ? 'kb'
+      : 'idle';
+  }
   return getActivePartialTypingMode();
 }
 
@@ -1161,7 +1560,7 @@ function getPartialTypingStrategy(mode: PartialTypingMode): PartialTypingStrateg
   return getPartialTypingStrategyForConfig(config, mode);
 }
 
-async function applyPartialTypingStrategy(
+async function _applyPartialTypingStrategy(
   currentText: string,
   targetText: string,
   phase: DictationPatchPhase,
@@ -1180,7 +1579,7 @@ async function applyPartialTypingStrategy(
       return applyTailOnlyDictationPatch(currentText, targetText, phase);
     case 'full-patch':
       if (mode !== 'kb') return false;
-      return applyVerifiedKeyboardDictationPatch(currentText, targetText, phase);
+      return applyKeyboardDictationPatch(currentText, targetText, phase);
   }
 }
 
@@ -1188,7 +1587,7 @@ async function ensureAxDictationSpan(currentText: string): Promise<boolean> {
   if (axSuppressedUntilNextFinal) return false;
   if (axDictationSpan) return true;
   if (currentText.length > 0) return false;
-  if (await retargetCurrentTypingAnchorBeforeFirstMutation(currentText)) return true;
+  if (await retargetCurrentTypingAnchorBeforeFirstMutation(currentText) && axDictationSpan) return true;
   if (Date.now() - lastAxCaptureAttempt <= AX_RECAPTURE_COOLDOWN_MS) return false;
 
   lastAxCaptureAttempt = Date.now();
@@ -1199,7 +1598,7 @@ async function ensureAxDictationSpan(currentText: string): Promise<boolean> {
 
 async function verifyDictationSpanStartingStateForMutation(
   currentText: string,
-  options?: { requireTextMatch?: boolean },
+  options?: VerifyDictationSpanOptions,
 ): Promise<boolean> {
   if (await verifyDictationSpanStartingState(currentText, options)) return true;
   if (!await retargetCurrentTypingAnchorBeforeFirstMutation(currentText)) return false;
@@ -1224,7 +1623,14 @@ async function replaceDictatedTextViaAxWithCapture(
   phase: DictationPatchPhase = 'partial',
 ): Promise<boolean> {
   if (!await ensureAxDictationSpan(currentText)) return false;
-  if (!await verifyDictationSpanStartingStateForMutation(currentText)) {
+  if (!await verifyDictationSpanStartingStateForMutation(currentText, {
+    allowSelectedSuffixExpansion: true,
+    allowRecordedTextRecovery: currentText.length > 0,
+  })) {
+    if (canFallbackToBlindKeyboardBeforeFirstMutation(phase, currentText)) {
+      axDebug('AX replacement falling back to blind KX before first mutation');
+      return applyBlindKeyboardDictationPatch(currentText, targetText, phase, { skipAxPreflight: true });
+    }
     if (deferFirstPartialAfterVerificationFailure(phase, currentText, 'dictation span changed before AX replacement')) {
       return false;
     }
@@ -1240,7 +1646,14 @@ async function replaceDictatedTextViaVerifiedKbWithCapture(
   phase: DictationPatchPhase = 'partial',
 ): Promise<boolean> {
   if (!await ensureAxDictationSpan(currentText)) return false;
-  if (!await verifyDictationSpanStartingStateForMutation(currentText)) {
+  if (!await verifyDictationSpanStartingStateForMutation(currentText, {
+    allowSelectedSuffixExpansion: true,
+    allowRecordedTextRecovery: currentText.length > 0,
+  })) {
+    if (canFallbackToBlindKeyboardBeforeFirstMutation(phase, currentText)) {
+      axDebug('AX-verified replacement falling back to blind KX before first mutation');
+      return applyBlindKeyboardDictationPatch(currentText, targetText, phase, { skipAxPreflight: true });
+    }
     if (deferFirstPartialAfterVerificationFailure(phase, currentText, 'dictation span changed before AX-verified replacement')) {
       return false;
     }
@@ -1302,7 +1715,65 @@ async function applyTailOnlyDictationPatch(
   return true;
 }
 
-async function applyVerifiedKeyboardDictationPatch(
+function canUseBlindKeyboardFullPatch(): boolean {
+  return getPartialTypingStrategy('kb') === 'full-patch'
+    && (process.platform !== 'darwin' || getDictationTargetPid() != null);
+}
+
+function canAllowBlindKeyboardFullPatchConfig(): boolean {
+  return getPartialTypingStrategy('kb') === 'full-patch';
+}
+
+function lastAxCaptureFailedBecauseSecureTarget(): boolean {
+  return lastAxCaptureFailureMessage?.toLowerCase().includes('secure text field') === true;
+}
+
+function resolveBlindKeyboardPatchTargetPid(currentText: string): number | null | undefined {
+  if (!canUseBlindKeyboardFullPatch()) return undefined;
+  if (lastAxCaptureFailedBecauseSecureTarget()) {
+    axDebug('blind KX full-patch skipped because AX identified a secure target');
+    return undefined;
+  }
+  const targetPid = getDictationTargetPid();
+
+  if (process.platform === 'darwin' && targetPid == null) {
+    axDebug('blind KX full-patch skipped because no target PID is available');
+    return undefined;
+  }
+
+  if (blindKeyboardPatchTargetPid != null && targetPid != null && blindKeyboardPatchTargetPid !== targetPid) {
+    axDebug(`blind KX full-patch skipped because target PID changed from ${blindKeyboardPatchTargetPid} to ${targetPid}`);
+    return undefined;
+  }
+
+  if (currentText.length > 0 && blindKeyboardPatchTargetPid == null && process.platform === 'darwin') {
+    axDebug('blind KX full-patch skipped because existing typed text has no remembered target PID');
+    return undefined;
+  }
+
+  return blindKeyboardPatchTargetPid ?? targetPid;
+}
+
+function canUseBlindKeyboardPatchForCurrentText(currentText: string): boolean {
+  return resolveBlindKeyboardPatchTargetPid(currentText) !== undefined;
+}
+
+function canFallbackToBlindKeyboardBeforeFirstMutation(
+  phase: DictationPatchPhase,
+  currentText: string,
+): boolean {
+  return phase === 'partial'
+    && canRetargetBeforeFirstMutation(currentText)
+    && canUseBlindKeyboardPatchForCurrentText(currentText);
+}
+
+function rememberBlindKeyboardPatchTarget(targetPid: number | null | undefined): void {
+  if (targetPid != null) {
+    blindKeyboardPatchTargetPid = targetPid;
+  }
+}
+
+async function applyKeyboardDictationPatch(
   currentText: string,
   targetText: string,
   phase: DictationPatchPhase,
@@ -1312,17 +1783,65 @@ async function applyVerifiedKeyboardDictationPatch(
     return false;
   }
 
-  if (!await ensureAxDictationSpan(currentText)) return false;
-  if (!await verifyDictationSpanStartingStateForMutation(currentText, { requireTextMatch: true })) {
-    axDebug(`applyPatch: skipped unverified keyboard patch start (phase=${phase})`);
-    if (deferFirstPartialAfterVerificationFailure(phase, currentText, 'dictation span changed before full-patch replacement')) {
-      return false;
+  if (axDictationSpan && !axSuppressedUntilNextFinal) {
+    if (await verifyDictationSpanStartingStateForMutation(currentText, { requireTextMatch: true })) {
+      return applyKeyboardPatchPlan(currentText, targetText, phase, {
+        allowUnverifiedKeyboard: false,
+      });
     }
-    suppressAxForCurrentUtterance('dictation span changed before full-patch replacement');
+
+    axDebug(`applyPatch: skipped unverified keyboard patch start (phase=${phase})`);
+    if (!deferFirstPartialAfterVerificationFailure(phase, currentText, 'dictation span changed before full-patch replacement')) {
+      suppressAxForCurrentUtterance('dictation span changed before full-patch replacement');
+    }
     return false;
   }
 
-  axDebug(`applyPatch: using verified KB patch (phase=${phase} currentLen=${currentText.length} targetLen=${targetText.length})`);
+  return applyBlindKeyboardDictationPatch(currentText, targetText, phase);
+}
+
+async function applyBlindKeyboardDictationPatch(
+  currentText: string,
+  targetText: string,
+  phase: DictationPatchPhase,
+  options?: { skipAxPreflight?: boolean },
+): Promise<boolean> {
+  if (!options?.skipAxPreflight && await retargetBeforeFirstBlindKeyboardPatch(currentText)) {
+    return replaceDictatedTextViaAxWithCapture(currentText, targetText, phase);
+  }
+
+  const targetPid = resolveBlindKeyboardPatchTargetPid(currentText);
+  if (targetPid === undefined) return false;
+
+  return applyKeyboardPatchPlan(currentText, targetText, phase, {
+    allowUnverifiedKeyboard: true,
+    targetPid,
+  });
+}
+
+async function retargetBeforeFirstBlindKeyboardPatch(currentText: string): Promise<boolean> {
+  if (process.platform !== 'darwin') return false;
+  if (!canRetargetBeforeFirstMutation(currentText) || axSuppressedUntilNextFinal) return false;
+
+  const startedAt = Date.now();
+  const ok = await retargetCurrentTypingAnchor();
+  dictationDebugLog('BLIND_KX_PREFLIGHT_RETARGET', {
+    ok,
+    capturedAx: Boolean(axDictationSpan),
+    pid: getDictationTargetPid(),
+    durationMs: Date.now() - startedAt,
+  });
+  return Boolean(axDictationSpan);
+}
+
+async function applyKeyboardPatchPlan(
+  currentText: string,
+  targetText: string,
+  phase: DictationPatchPhase,
+  options: KeyboardMutationOptions,
+): Promise<boolean> {
+  const allowUnverifiedKeyboard = options.allowUnverifiedKeyboard === true;
+  axDebug(`applyPatch: using ${allowUnverifiedKeyboard ? 'blind KX' : 'verified KB'} patch (phase=${phase} currentLen=${currentText.length} targetLen=${targetText.length})`);
   const plan = planDictationTextPatch(currentText, targetText, phase);
 
   let applied = false;
@@ -1332,11 +1851,11 @@ async function applyVerifiedKeyboardDictationPatch(
       return true;
     case 'append':
       mutationAttempted = true;
-      applied = await typeText(plan.text);
+      applied = await typeText(plan.text, options);
       break;
     case 'patch':
       mutationAttempted = plan.operations.length > 0;
-      applied = await applyTextPatch(plan.operations);
+      applied = await applyTextPatch(plan.operations, options);
       break;
     case 'tailRewrite': {
       mutationAttempted = plan.backspaceCount > 0 || Boolean(plan.text);
@@ -1344,11 +1863,11 @@ async function applyVerifiedKeyboardDictationPatch(
         axDebug(`applyPatch: skipped excessive tail rewrite backspace count=${plan.backspaceCount}`);
         return false;
       }
-      if (plan.backspaceCount > 0 && !await typeBackspaces(plan.backspaceCount)) {
+      if (plan.backspaceCount > 0 && !await typeBackspaces(plan.backspaceCount, options)) {
         markKeyboardPatchStateUnverified(targetText);
         return false;
       }
-      if (plan.text && !await typeText(plan.text)) {
+      if (plan.text && !await typeText(plan.text, options)) {
         markKeyboardPatchStateUnverified(targetText);
         return false;
       }
@@ -1361,6 +1880,13 @@ async function applyVerifiedKeyboardDictationPatch(
     if (mutationAttempted) markKeyboardPatchStateUnverified(targetText);
     return false;
   }
+
+  if (allowUnverifiedKeyboard) {
+    if (mutationAttempted) rememberBlindKeyboardPatchTarget(options.targetPid);
+    clearUnverifiedKeyboardPatchState();
+    return true;
+  }
+
   await delay(KEYBOARD_PATCH_VERIFY_DELAY_MS);
   if (!await verifyKeyboardPatchEndingState(targetText)) {
     axDebug(`applyPatch: ending verification failed (phase=${phase} targetLen=${targetText.length})`);
@@ -1375,6 +1901,7 @@ async function applyVerifiedKeyboardDictationPatch(
 
 async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpan | null> {
   if (process.platform !== 'darwin') return null;
+  lastAxCaptureFailureMessage = null;
   const pid = getDictationTargetPid();
   axDebug(`capture: targetPid=${pid}`);
   if (pid == null) {
@@ -1398,21 +1925,44 @@ async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpa
     return span;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    lastAxCaptureFailureMessage = msg;
     axDebug(`capture EXCEPTION: ${msg}`);
     return null;
   }
 }
 
-async function assertLocalMacosAccessibilityTrusted(): Promise<void> {
+async function _assertLocalMacosAccessibilityTrusted(): Promise<void> {
   if (process.platform !== 'darwin') return;
   try {
-    const permissions = await runLocalMacMouseCommand(['permissions']);
+    const permissions = await runDictationHelperCommand(['permissions'], 'permissions');
     if (permissions.accessibilityTrusted === false) {
       throw new Error('Dictation requires macOS Accessibility permission before it can type safely.');
     }
   } catch (err) {
     if (err instanceof Error && err.message.includes('Accessibility permission')) throw err;
     throw new Error('Dictation could not verify macOS Accessibility permission before typing.');
+  }
+}
+
+async function runDictationHelperCommand(args: string[], label: string): ReturnType<typeof runLocalMacMouseCommand> {
+  const startedAt = Date.now();
+  try {
+    const result = await runLocalMacMouseCommand(args);
+    dictationDebugLog('HELPER_COMMAND', {
+      label,
+      command: args[0],
+      ok: result.ok !== false,
+      durationMs: Date.now() - startedAt,
+    });
+    return result;
+  } catch (err) {
+    dictationDebugLog('HELPER_COMMAND_ERROR', {
+      label,
+      command: args[0],
+      durationMs: Date.now() - startedAt,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 }
 
@@ -1431,7 +1981,7 @@ async function readFocusedTextSelection(pid: number | null): Promise<FocusedText
   const args = pid != null
     ? ['focusedTextSelection', String(pid)]
     : ['focusedTextSelection'];
-  const result = await runLocalMacMouseCommand(args);
+  const result = await runDictationHelperCommand(args, 'focusedTextSelection');
   const location = result.selectedTextRangeLocation;
   const length = result.selectedTextRangeLength;
   const elementSignature = result.elementSignature;
@@ -1464,7 +2014,7 @@ async function readFocusedTextRangeState(
   ];
   if (pid != null) args.push(String(pid));
 
-  const result = await runLocalMacMouseCommand(args);
+  const result = await runDictationHelperCommand(args, 'focusedTextRangeState');
   const location = result.selectedTextRangeLocation;
   const length = result.selectedTextRangeLength;
   const rangeText = result.rangeText;
@@ -1515,8 +2065,9 @@ async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
     ];
     args.push(axDictationSpan.pid != null ? String(axDictationSpan.pid) : '');
     args.push(encodeElementSignature(axDictationSpan.elementSignature));
-    const result = await runLocalMacMouseCommand(args);
+    const result = await runDictationHelperCommand(args, 'replaceTextAtomically');
     updateAxDictationSpanLength(targetText, result.textUtf16Length);
+    await refreshAxDictationSpanElementSignatureAfterMutation('replaceViaAx');
     axDebug(`replaceViaAx OK: method=${result.method ?? 'unknown'} newTypedLen=${axDictationSpan.typedUtf16Length}`);
     return true;
   } catch (err) {
@@ -1540,8 +2091,9 @@ async function replaceDictatedTextViaVerifiedKb(targetText: string): Promise<boo
     ];
     args.push(axDictationSpan.pid != null ? String(axDictationSpan.pid) : '');
     args.push(encodeElementSignature(axDictationSpan.elementSignature));
-    const result = await runLocalMacMouseCommand(args);
+    const result = await runDictationHelperCommand(args, 'replaceTextRangeVerified');
     updateAxDictationSpanLength(targetText, result.textUtf16Length);
+    await refreshAxDictationSpanElementSignatureAfterMutation('replaceViaVerifiedKb');
     axDebug(`replaceViaVerifiedKb OK: method=${result.method ?? 'unknown'} newTypedLen=${axDictationSpan.typedUtf16Length}`);
     return true;
   } catch (err) {
@@ -1549,6 +2101,40 @@ async function replaceDictatedTextViaVerifiedKb(targetText: string): Promise<boo
     axDebug(`replaceViaVerifiedKb FAILED (suppressing until next final): ${err}`);
     console.info('[Dictation] AX-verified keyboard replacement failed:', err);
     return false;
+  }
+}
+
+async function refreshAxDictationSpanElementSignatureAfterMutation(label: string): Promise<void> {
+  const span = axDictationSpan;
+  if (!span || process.platform !== 'darwin') return;
+
+  try {
+    const selection = await readFocusedTextSelection(span.pid);
+    const cursorMatchesSpanEnd = Boolean(
+      selection
+      && selection.location === span.location + span.typedUtf16Length
+      && selection.length === 0,
+    );
+    const elementChanged = Boolean(
+      selection && selection.elementSignature !== span.elementSignature,
+    );
+    dictationDebugLog('AX_POST_MUTATION_SIGNATURE_REFRESH', {
+      label,
+      ok: cursorMatchesSpanEnd,
+      spanLocation: span.location,
+      spanLen: span.typedUtf16Length,
+      selectionLocation: selection?.location,
+      selectionLen: selection?.length,
+      elementChanged,
+    });
+    if (!selection || !cursorMatchesSpanEnd) return;
+
+    if (elementChanged) {
+      axDebug(`refreshed AX dictation element signature after ${label}`);
+    }
+    span.elementSignature = selection.elementSignature;
+  } catch (err) {
+    axDebug(`refreshAxDictationSpanElementSignatureAfterMutation FAILED: ${err}`);
   }
 }
 
@@ -1603,7 +2189,7 @@ async function recoverUnverifiedKeyboardPatchState(): Promise<boolean> {
 
 async function verifyDictationSpanStartingState(
   currentText: string,
-  options?: { requireTextMatch?: boolean },
+  options?: VerifyDictationSpanOptions,
 ): Promise<boolean> {
   const span = axDictationSpan;
   if (!span || axSuppressedUntilNextFinal) return false;
@@ -1619,9 +2205,159 @@ async function verifyDictationSpanStartingState(
     }
 
     const selection = await readFocusedTextSelection(span.pid);
-    return Boolean(selection && selectionMatchesDictationStart(span, selection, currentText.length));
+    if (selection && selectionMatchesDictationStart(span, selection, currentText.length)) return true;
+    if (options?.allowSelectedSuffixExpansion && currentText.length > 0) {
+      if (await tryExpandAxSpanThroughSelectedSuffix(span, currentText)) return true;
+    }
+    if (options?.allowRecordedTextRecovery && currentText.length > 0) {
+      return verifyRecordedAxTextAtSpan(span, currentText);
+    }
+    return false;
   } catch (err) {
     axDebug(`verifyDictationSpanStartingState FAILED: ${err}`);
+    return false;
+  }
+}
+
+async function verifyRecordedAxTextAtSpan(
+  span: AxDictationSpan,
+  currentText: string,
+): Promise<boolean> {
+  try {
+    const state = await readFocusedTextRangeState(span.pid, span.location, currentText.length);
+    const elementMatched = state ? selectionMatchesDictationElement(span, state) : false;
+    const cursorMatchesRecordedSpan = Boolean(
+      state
+      && state.location === span.location + currentText.length
+      && state.length === 0,
+    );
+    const ok = Boolean(
+      state
+      && state.rangeText === currentText
+      && (elementMatched || cursorMatchesRecordedSpan),
+    );
+    dictationDebugLog('AX_RECORDED_TEXT_CHECK', {
+      ok,
+      spanLocation: span.location,
+      spanLen: span.typedUtf16Length,
+      currentLen: currentText.length,
+      selectionLocation: state?.location,
+      selectionLen: state?.length,
+      rangeTextLen: state?.rangeText.length,
+      textUtf16Length: state?.textUtf16Length,
+      elementMatched,
+      cursorMatchesRecordedSpan,
+    });
+    if (ok) {
+      // A successful live AX partial is stronger evidence than a stale cursor
+      // readback. Rewrite the exact text we previously inserted.
+      if (state && !elementMatched) {
+        axDebug('updating AX dictation span element signature after focused range continuity check');
+        span.elementSignature = state.elementSignature;
+      }
+      span.typedUtf16Length = currentText.length;
+      axDebug(`verified recorded AX text at span despite cursor mismatch len=${currentText.length}`);
+      return true;
+    }
+  } catch (err) {
+    axDebug(`verifyRecordedAxTextAtSpan FAILED: ${err}`);
+  }
+
+  return recoverAxSpanFromFieldSuffix(span, currentText);
+}
+
+async function recoverAxSpanFromFieldSuffix(
+  span: AxDictationSpan,
+  currentText: string,
+): Promise<boolean> {
+  try {
+    const metadata = await readFocusedTextRangeState(span.pid, 0, 0);
+    if (
+      !metadata
+      || typeof metadata.textUtf16Length !== 'number'
+      || metadata.textUtf16Length < currentText.length
+    ) {
+      return false;
+    }
+
+    const suffixLocation = metadata.textUtf16Length - currentText.length;
+    if (suffixLocation === span.location) return false;
+
+    const suffixState = await readFocusedTextRangeState(span.pid, suffixLocation, currentText.length);
+    const suffixElementMatched = suffixState ? selectionMatchesDictationElement(span, suffixState) : false;
+    const suffixMatchesFocusedElement = Boolean(
+      suffixState && suffixState.elementSignature === metadata.elementSignature,
+    );
+    const cursorMatchesSuffixEnd = metadata.location === suffixLocation + currentText.length
+      && metadata.length === 0;
+    const ok = Boolean(
+      suffixState
+      && suffixMatchesFocusedElement
+      && (suffixElementMatched || cursorMatchesSuffixEnd)
+      && suffixState.rangeText === currentText
+    );
+    dictationDebugLog('AX_SUFFIX_RECOVERY_CHECK', {
+      ok,
+      oldLocation: span.location,
+      suffixLocation,
+      currentLen: currentText.length,
+      metadataSelectionLocation: metadata.location,
+      metadataSelectionLen: metadata.length,
+      textUtf16Length: metadata.textUtf16Length,
+      suffixRangeTextLen: suffixState?.rangeText.length,
+      elementMatched: suffixElementMatched,
+      suffixMatchesFocusedElement,
+      cursorMatchesSuffixEnd,
+    });
+    if (
+      !suffixState
+      || !suffixMatchesFocusedElement
+      || (!suffixElementMatched && !cursorMatchesSuffixEnd)
+      || suffixState.rangeText !== currentText
+    ) {
+      return false;
+    }
+
+    axDebug(`recovered AX dictation span from field suffix oldLocation=${span.location} newLocation=${suffixLocation} len=${currentText.length}`);
+    span.location = suffixLocation;
+    span.typedUtf16Length = currentText.length;
+    span.elementSignature = suffixState.elementSignature;
+    return true;
+  } catch (err) {
+    axDebug(`recoverAxSpanFromFieldSuffix FAILED: ${err}`);
+    return false;
+  }
+}
+
+async function tryExpandAxSpanThroughSelectedSuffix(
+  span: AxDictationSpan,
+  currentText: string,
+): Promise<boolean> {
+  try {
+    const state = await readFocusedTextRangeState(span.pid, span.location, currentText.length);
+    if (
+      !state
+      || !selectionMatchesDictationElement(span, state)
+      || state.rangeText !== currentText
+      || state.location !== span.location + currentText.length
+      || state.length <= 0
+    ) {
+      return false;
+    }
+
+    const expandedLength = currentText.length + state.length;
+    if (
+      typeof state.textUtf16Length === 'number'
+      && span.location + expandedLength > state.textUtf16Length
+    ) {
+      return false;
+    }
+
+    span.typedUtf16Length = expandedLength;
+    axDebug(`expanded AX dictation span through selected suffix len=${state.length}`);
+    return true;
+  } catch (err) {
+    axDebug(`tryExpandAxSpanThroughSelectedSuffix FAILED: ${err}`);
     return false;
   }
 }
@@ -1645,13 +2381,13 @@ async function verifyKeyboardPatchEndingState(targetText: string): Promise<boole
 
 // ─── Text Insertion via CGEvents ─────────────────────────────────────────────
 
-async function typeText(text: string): Promise<boolean> {
+async function typeText(text: string, options?: KeyboardMutationOptions): Promise<boolean> {
   if (!text) return true;
   const encoded = Buffer.from(text, 'utf-8').toString('base64');
   try {
     const args = ['postText', encoded];
-    if (!appendKeyboardTargetPid(args)) return false;
-    await runLocalMacMouseCommand(args);
+    if (!appendKeyboardTargetPid(args, options)) return false;
+    await runDictationHelperCommand(args, 'postText');
     return true;
   } catch (err) {
     console.error('[Dictation] typeText failed:', err);
@@ -1659,7 +2395,7 @@ async function typeText(text: string): Promise<boolean> {
   }
 }
 
-async function typeBackspaces(count: number): Promise<boolean> {
+async function typeBackspaces(count: number, options?: KeyboardMutationOptions): Promise<boolean> {
   if (count <= 0) return true;
   if (count > MAX_SAFE_BACKSPACES) {
     console.warn('[Dictation] Refusing excessive backspace count:', count);
@@ -1667,8 +2403,8 @@ async function typeBackspaces(count: number): Promise<boolean> {
   }
   try {
     const args = ['deleteBack', String(count)];
-    if (!appendKeyboardTargetPid(args)) return false;
-    await runLocalMacMouseCommand(args);
+    if (!appendKeyboardTargetPid(args, options)) return false;
+    await runDictationHelperCommand(args, 'deleteBack');
     return true;
   } catch (err) {
     console.error('[Dictation] typeBackspaces failed:', err);
@@ -1676,13 +2412,13 @@ async function typeBackspaces(count: number): Promise<boolean> {
   }
 }
 
-async function applyTextPatch(operations: DictationPatchOperation[]): Promise<boolean> {
+async function applyTextPatch(operations: DictationPatchOperation[], options?: KeyboardMutationOptions): Promise<boolean> {
   if (operations.length === 0) return true;
   const encoded = Buffer.from(JSON.stringify(operations), 'utf-8').toString('base64');
   try {
     const args = ['applyTextPatch', encoded];
-    if (!appendKeyboardTargetPid(args)) return false;
-    await runLocalMacMouseCommand(args);
+    if (!appendKeyboardTargetPid(args, options)) return false;
+    await runDictationHelperCommand(args, 'applyTextPatch');
     return true;
   } catch (err) {
     console.error('[Dictation] applyTextPatch failed:', err);
@@ -1690,13 +2426,16 @@ async function applyTextPatch(operations: DictationPatchOperation[]): Promise<bo
   }
 }
 
-function appendKeyboardTargetPid(args: string[]): boolean {
+function appendKeyboardTargetPid(args: string[], options?: KeyboardMutationOptions): boolean {
+  const allowUnverifiedKeyboard = options?.allowUnverifiedKeyboard === true;
   const span = axDictationSpan;
-  if (process.platform === 'darwin' && !span?.elementSignature) {
+  if (process.platform === 'darwin' && !allowUnverifiedKeyboard && !span?.elementSignature) {
     axDebug('keyboard mutation skipped because no verified AX element signature is available');
     return false;
   }
-  const pid = span?.pid ?? getDictationTargetPid();
+  const pid = allowUnverifiedKeyboard
+    ? options.targetPid ?? getDictationTargetPid()
+    : span?.pid ?? getDictationTargetPid();
   if (pid == null && process.platform === 'darwin') {
     axDebug('keyboard mutation skipped because no target PID is available');
     return false;
@@ -1706,7 +2445,14 @@ function appendKeyboardTargetPid(args: string[]): boolean {
   } else if (span?.elementSignature) {
     args.push('');
   }
-  if (span?.elementSignature) args.push(encodeElementSignature(span.elementSignature));
+  if (allowUnverifiedKeyboard) {
+    args.push('');
+    args.push('--allow-unverified-keyboard');
+    return true;
+  }
+  if (!allowUnverifiedKeyboard && span?.elementSignature) {
+    args.push(encodeElementSignature(span.elementSignature));
+  }
   return true;
 }
 

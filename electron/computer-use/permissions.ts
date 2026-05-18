@@ -133,6 +133,9 @@ export type LocalMacosHelperResponse = {
   desktopHeight?: number;
   pointerX?: number;
   pointerY?: number;
+  pid?: number;
+  name?: string;
+  bundleId?: string;
   selectedTextRangeLocation?: number;
   selectedTextRangeLength?: number;
   elementSignature?: string;

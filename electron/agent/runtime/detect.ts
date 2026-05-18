@@ -11,11 +11,12 @@
  * If the CLI binary is not found on the user's PATH, the runtime is reported
  * as "inactive" rather than "not installed".
  *
- * Results are cached for the lifetime of the process (reset via
- * `resetDetectionCache()` if the user installs a CLI while Kai is running).
+ * Successful results are cached for the lifetime of the process. Misses are
+ * rechecked because Kai resolves the user's shell PATH asynchronously during
+ * startup, and users may install a CLI while Kai is running.
  */
 
-import { execSync } from 'child_process';
+import { resolveBinaryPathSync } from '../../utils/shell-env.js';
 
 let _claudeCliPath: string | false | null = null;
 let _codexCliPath: string | false | null = null;
@@ -25,7 +26,7 @@ let _codexCliPath: string | false | null = null;
  * This is required for the Claude Agent SDK to function.
  */
 export async function detectClaudeAgentSdk(): Promise<boolean> {
-  if (_claudeCliPath !== null) return _claudeCliPath !== false;
+  if (typeof _claudeCliPath === 'string') return true;
   _claudeCliPath = resolveCliPath('claude');
   return _claudeCliPath !== false;
 }
@@ -36,7 +37,7 @@ export async function detectClaudeAgentSdk(): Promise<boolean> {
  * to the SDK when its bundled binary is missing.
  */
 export async function resolveClaudeCliPath(): Promise<string | undefined> {
-  if (_claudeCliPath === null) {
+  if (typeof _claudeCliPath !== 'string') {
     _claudeCliPath = resolveCliPath('claude');
   }
   return _claudeCliPath || undefined;
@@ -47,7 +48,7 @@ export async function resolveClaudeCliPath(): Promise<string | undefined> {
  * This is required for the Codex SDK to function.
  */
 export async function detectCodexSdk(): Promise<boolean> {
-  if (_codexCliPath !== null) return _codexCliPath !== false;
+  if (typeof _codexCliPath === 'string') return true;
   _codexCliPath = resolveCliPath('codex');
   return _codexCliPath !== false;
 }
@@ -66,15 +67,10 @@ export function resetDetectionCache(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the absolute path to a CLI binary on PATH using `which` (macOS/Linux).
+ * Resolve the absolute path to a CLI binary on Kai's normalized PATH.
  * Returns the trimmed path string if found, or `false` if not found.
  */
 function resolveCliPath(binaryName: string): string | false {
-  try {
-    const result = execSync(`which ${binaryName}`, { stdio: 'pipe', timeout: 5_000 });
-    const resolved = result.toString().trim();
-    return resolved || false;
-  } catch {
-    return false;
-  }
+  const resolved = resolveBinaryPathSync(binaryName);
+  return resolved || false;
 }

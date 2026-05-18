@@ -6,6 +6,10 @@ export class DictationQueuedPartialGate {
     return this.revision;
   }
 
+  currentRevision(): number {
+    return this.revision;
+  }
+
   invalidateQueuedPartials(): void {
     this.revision += 1;
   }

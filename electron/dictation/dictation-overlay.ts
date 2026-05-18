@@ -140,8 +140,7 @@ export function createDictationOverlay(): void {
 /**
  * Show the overlay (dictation started).
  */
-export async function showDictationOverlay(): Promise<void> {
-  await beginDictationFocusSession();
+export async function showDictationOverlay(options?: { skipFocusCapture?: boolean }): Promise<void> {
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     createDictationOverlay();
   }
@@ -155,6 +154,9 @@ export async function showDictationOverlay(): Promise<void> {
     overlayWindow.showInactive();
     restoreDictationTargetFocusSoon();
   }
+  if (!options?.skipFocusCapture) {
+    await beginDictationFocusSession();
+  }
 }
 
 /**
@@ -162,8 +164,13 @@ export async function showDictationOverlay(): Promise<void> {
  */
 export function hideDictationOverlay(): void {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.setIgnoreMouseEvents(true, { forward: true });
-    overlayWindow.hide();
+    try {
+      overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+      overlayWindow.hide();
+    } catch {
+      try { overlayWindow.destroy(); } catch { /* ignore */ }
+      overlayWindow = null;
+    }
     restoreDictationTargetFocusSoon();
   }
 }
@@ -173,7 +180,13 @@ export function hideDictationOverlay(): void {
  */
 export function destroyDictationOverlay(): void {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.close();
+    try {
+      overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+      overlayWindow.hide();
+      overlayWindow.destroy();
+    } catch {
+      try { overlayWindow.close(); } catch { /* ignore */ }
+    }
   }
   overlayWindow = null;
 }

@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { runLocalMacMouseCommand } from '../computer-use/permissions.js';
+import { dictationDebugLog } from './debug-log.js';
 
 const execFileAsync = promisify(execFile);
 const APPLESCRIPT_TIMEOUT_MS = 1500;
@@ -15,6 +17,7 @@ type FocusSnapshot = {
 
 let targetFocus: FocusSnapshot | null = null;
 let captureInFlight: Promise<void> | null = null;
+let externalFocusRefreshSuppressed = false;
 
 function appleString(value: string): string {
   const sanitized = value.replace(/[\u0000-\u001F\u007F]/g, ' ');
@@ -36,28 +39,28 @@ function isOwnProcess(snapshot: FocusSnapshot): boolean {
 async function captureFrontmostApp(): Promise<void> {
   if (process.platform !== 'darwin') return;
 
-  const output = await runAppleScript(`
-tell application "System Events"
-  set frontProcess to first application process whose frontmost is true
-  set frontBundle to ""
-  try
-    set frontBundle to bundle identifier of frontProcess as text
-  end try
-  set frontName to name of frontProcess as text
-  set frontPid to unix id of frontProcess as text
-  return frontBundle & linefeed & frontName & linefeed & frontPid
-end tell
-`);
-
-  const [bundleId = '', appName = '', pidText = ''] = output.split(/\r?\n/);
-  const trimmedPid = pidText.trim();
-  const parsedPid = Number(trimmedPid);
+  const startedAt = Date.now();
+  const result = await runLocalMacMouseCommand(['frontmostApplication']);
+  const rawPid = result.pid;
+  const parsedPid = typeof rawPid === 'number' && Number.isFinite(rawPid)
+    ? rawPid
+    : Number(rawPid);
+  const appName = typeof result.name === 'string' ? result.name.trim() : '';
+  const bundleId = typeof result.bundleId === 'string' ? result.bundleId.trim() : '';
   const snapshot: FocusSnapshot = {
-    bundleId: bundleId.trim() || null,
-    appName: appName.trim(),
-    pid: trimmedPid && Number.isFinite(parsedPid) ? parsedPid : null,
+    bundleId: bundleId || null,
+    appName,
+    pid: Number.isFinite(parsedPid) ? parsedPid : null,
     capturedAt: Date.now(),
   };
+
+  dictationDebugLog('FOCUS_CAPTURE', {
+    ok: Boolean(snapshot.appName && snapshot.pid != null && !isOwnProcess(snapshot)),
+    pid: snapshot.pid,
+    app: snapshot.appName,
+    own: isOwnProcess(snapshot),
+    durationMs: Date.now() - startedAt,
+  });
 
   if (!snapshot.appName || isOwnProcess(snapshot)) return;
   targetFocus = snapshot;
@@ -71,8 +74,11 @@ async function runFreshFocusCapture(): Promise<void> {
   if (process.platform !== 'darwin') return;
 
   const capture = captureFrontmostApp()
-    .catch(() => {
+    .catch((err) => {
       // Startup and mutation paths fail closed if a target cannot be identified.
+      dictationDebugLog('FOCUS_CAPTURE_ERROR', {
+        message: err instanceof Error ? err.message : String(err),
+      });
     })
     .finally(() => {
       if (captureInFlight === capture) {
@@ -88,7 +94,19 @@ export async function beginDictationFocusSession(): Promise<void> {
   await refreshDictationTargetFocusNow();
 }
 
+export function setDictationTargetFocusSnapshot(snapshot: FocusSnapshot | null): void {
+  targetFocus = snapshot;
+}
+
+export function setDictationExternalFocusRefreshSuppressed(suppressed: boolean): void {
+  externalFocusRefreshSuppressed = suppressed;
+}
+
 export function refreshDictationTargetFocus(): void {
+  if (externalFocusRefreshSuppressed) {
+    dictationDebugLog('FOCUS_REFRESH_SUPPRESSED');
+    return;
+  }
   void refreshDictationTargetFocusNow();
 }
 
