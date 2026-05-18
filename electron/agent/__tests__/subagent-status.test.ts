@@ -216,7 +216,13 @@ describe('subagent-status helper', () => {
   // `metadata` argument (e.g. replace-vs-merge), one of these will break
   // before it ships.
   // -------------------------------------------------------------------------
-  describe('updateThread metadata round-trip — real adapter shape', () => {
+  // Skipped on non-darwin runners: `@libsql/client` requires platform-specific
+  // native bindings (`@libsql/darwin-{arm64,x64}` etc.) that aren't installed
+  // on Linux CI runners. Kai is macOS-only per `CLAUDE.md`, so the contract
+  // these tests guard against is exercised on every developer's machine
+  // anyway. The 10 mock-based tests above cover the FSM, error paths, and
+  // call-shape semantics on every platform.
+  describe.skipIf(process.platform !== 'darwin')('updateThread metadata round-trip — real adapter shape', () => {
     let memory: Memory;
     let counter = 0;
     const tid = (label: string) => `roundtrip-${label}-${++counter}`;
