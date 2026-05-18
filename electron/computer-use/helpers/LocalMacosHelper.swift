@@ -998,6 +998,7 @@ final class DictationSessionServer {
   private var partialTyping: [String: String] = [:]
   private var livePartials = false
   private var allowBlindKeyboardFullPatch = false
+  private var debugLogging = false
   private var ownPid: pid_t?
   private var ownAppName = ""
   private var monitorTap: CFMachPort?
@@ -1086,10 +1087,57 @@ final class DictationSessionServer {
     if let partialTypingStrategyUsed {
       response["strategy"] = partialTypingStrategyUsed
     }
+    if let debug = gatherDebugMetadata() {
+      response["debug"] = debug
+    }
     for (key, value) in extra {
       response[key] = value
     }
     return response
+  }
+
+  private func gatherDebugMetadata() -> [String: Any]? {
+    guard debugLogging, let pid = targetPid else { return nil }
+    guard let element = focusedAccessibilityElement(pid: pid) else { return nil }
+
+    var debug: [String: Any] = [:]
+
+    // Role and subrole
+    debug["role"] = stringAttribute(element, kAXRoleAttribute as String) ?? "unknown"
+    debug["subrole"] = stringAttribute(element, kAXSubroleAttribute as String) ?? "none"
+    debug["identifier"] = stringAttribute(element, "AXIdentifier") ?? "none"
+
+    // Placeholder value
+    if let placeholder = stringAttribute(element, "AXPlaceholderValue") {
+      debug["placeholderValue"] = placeholder
+    }
+
+    // Value length
+    var valueRef: CFTypeRef?
+    let valueErr = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef)
+    if valueErr == .success, let valueStr = valueRef as? String {
+      debug["valueLength"] = valueStr.utf16.count
+    } else {
+      debug["axValueError"] = "\(valueErr.rawValue)"
+    }
+
+    // Selected text range
+    var rangeRef: CFTypeRef?
+    let selErr = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef)
+    if selErr == .success, let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() {
+      var range = CFRange(location: 0, length: 0)
+      if AXValueGetValue(rangeRef as! AXValue, .cfRange, &range) {
+        debug["selectedRangeLocation"] = range.location
+        debug["selectedRangeLength"] = range.length
+      }
+    } else {
+      debug["axSelectionError"] = "\(selErr.rawValue)"
+    }
+
+    // Secure field check
+    debug["isSecure"] = focusedTextTargetIsSecure(pid: pid)
+
+    return debug
   }
 
   private var hasAxSpan: Bool {
@@ -1156,6 +1204,7 @@ final class DictationSessionServer {
     }
     livePartials = (params["livePartials"] as? Bool) ?? false
     allowBlindKeyboardFullPatch = (params["allowBlindKeyboardFullPatch"] as? Bool) ?? false
+    debugLogging = (params["debugLogging"] as? Bool) ?? false
     if let rawPid = params["ownPid"] as? Int {
       ownPid = pid_t(rawPid)
     } else if let rawPid = params["ownPid"] as? NSNumber {

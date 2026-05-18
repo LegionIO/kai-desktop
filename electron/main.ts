@@ -14,9 +14,10 @@ import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { PluginManager } from './plugins/plugin-manager.js';
 import { registerPluginHandlers } from './ipc/plugins.js';
-import { registerMicRecorderHandlers, cleanupMicRecorder } from './audio/mic-recorder.js';
+import { registerMicRecorderHandlers, cleanupMicRecorder, getRecorderWindow } from './audio/mic-recorder.js';
 import { registerLiveSttHandlers } from './audio/live-stt.js';
 import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
+import { registerStreamingSttHandlers } from './audio/streaming-stt.js';
 import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
 import { registerRuntime, setPluginRuntimesSource } from './agent/runtime/index.js';
@@ -655,6 +656,7 @@ if (gotSingleInstanceLock) {
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
     registerBatchTranscribeHandlers(ipcMain, getConfig);
+    registerStreamingSttHandlers(ipcMain, getConfig, getRecorderWindow);
 
     // Initialize dictation system (global hotkey + STT + text insertion)
     initDictation(getConfig(), setConfig);
@@ -750,6 +752,25 @@ if (gotSingleInstanceLock) {
         syncRealtimeTools();
         console.info(`[${__BRAND_PRODUCT_NAME}] Plugin CLI tools updated: ${cliTools.length} tools`);
       });
+    });
+
+    // Titlebar double-click handler (macOS zoom/minimize respecting System Preferences)
+    ipcMain.handle('titlebar:double-click', () => {
+      const win = BrowserWindow.getFocusedWindow();
+      if (!win) return;
+      // Respect the user's macOS System Preferences for "Double-click a window's title bar to"
+      // which can be "Zoom" (maximize) or "Minimize"
+      const action = systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string');
+      if (action === 'Minimize') {
+        win.minimize();
+      } else {
+        // Default is "Zoom" (or "Fill" on newer macOS) — toggle maximize
+        if (win.isMaximized()) {
+          win.unmaximize();
+        } else {
+          win.maximize();
+        }
+      }
     });
 
     // File dialog handler

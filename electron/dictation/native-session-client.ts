@@ -24,6 +24,19 @@ export type DictationNativeSessionResponse = {
   partialText?: string;
   strategy?: PartialTypingStrategy | 'disabled' | null;
   applied?: boolean;
+  // Debug-only fields (populated when debugLogging is enabled)
+  debug?: {
+    role?: string;
+    subrole?: string;
+    identifier?: string;
+    placeholderValue?: string;
+    valueLength?: number;
+    selectedRangeLocation?: number;
+    selectedRangeLength?: number;
+    isSecure?: boolean;
+    axValueError?: string;
+    axSelectionError?: string;
+  };
 };
 
 export type DictationNativeBeginParams = {
@@ -32,6 +45,7 @@ export type DictationNativeBeginParams = {
   allowBlindKeyboardFullPatch: boolean;
   ownPid: number;
   ownAppName: string;
+  debugLogging?: boolean;
 };
 
 type DictationNativeEvent =
@@ -123,6 +137,19 @@ export class DictationNativeSessionClient {
 
   async beginSession(params: DictationNativeBeginParams): Promise<DictationNativeSessionResponse> {
     return this.checkedRequest('beginSession', params);
+  }
+
+  /**
+   * Like beginSession but does not throw on `ok: false` — returns the response
+   * directly so the caller can handle soft failures (e.g. cursor_unverified)
+   * while still using the target PID and other fields from the response.
+   */
+  async beginSessionUnchecked(params: DictationNativeBeginParams): Promise<DictationNativeSessionResponse> {
+    await this.start();
+    if (!this.child || this.child.killed) {
+      throw new DictationNativeSessionError('Dictation native helper is not running.', 'not_running');
+    }
+    return this.request('beginSession', params);
   }
 
   async startTargetTracking(): Promise<DictationNativeSessionResponse> {

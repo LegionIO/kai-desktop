@@ -146,6 +146,14 @@ export function getDictationTargetPid(): number | null {
   return targetFocus?.pid ?? null;
 }
 
+export function getDictationTargetAppName(): string | null {
+  return targetFocus?.appName ?? null;
+}
+
+export function getDictationTargetBundleId(): string | null {
+  return targetFocus?.bundleId ?? null;
+}
+
 export function restoreDictationTargetFocusSoon(): void {
   if (process.platform !== 'darwin') return;
 
@@ -158,6 +166,13 @@ async function restoreDictationTargetFocus(): Promise<void> {
   const snapshot = targetFocus;
   if (!snapshot || isOwnProcess(snapshot)) return;
   if (Date.now() - snapshot.capturedAt > MAX_FOCUS_SNAPSHOT_AGE_MS) return;
+
+  // Validate that the target PID is still alive before attempting to activate it.
+  // This prevents restoring focus to a stale/dead process from a previous session.
+  if (snapshot.pid != null && !isProcessAlive(snapshot.pid)) {
+    targetFocus = null;
+    return;
+  }
 
   const pidClause = snapshot.pid != null
     ? `
@@ -181,4 +196,13 @@ try
   tell application ${appleString(snapshot.appName)} to activate
 end try
 `);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

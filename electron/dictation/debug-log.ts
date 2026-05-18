@@ -1,19 +1,36 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+let enabled = false;
+let sessionStartMs = 0;
+let lastEventMs = 0;
+let eventSeq = 0;
 
-const DEBUG_LOG_DIR = join(process.cwd(), 'debug-logs');
-const DEBUG_LOG_PATH = join(DEBUG_LOG_DIR, 'dictation.log');
+export function setDictationDebugEnabled(value: boolean): void {
+  enabled = value;
+}
+
+export function isDictationDebugEnabled(): boolean {
+  return enabled;
+}
+
+export function resetDictationDebugSession(): void {
+  sessionStartMs = Date.now();
+  lastEventMs = sessionStartMs;
+  eventSeq = 0;
+}
 
 export function dictationDebugLog(tag: string, fields: Record<string, unknown> = {}): void {
-  try {
-    mkdirSync(DEBUG_LOG_DIR, { recursive: true });
-    const body = Object.entries(fields)
-      .map(([key, value]) => `${key}=${formatValue(value)}`)
-      .join(' ');
-    appendFileSync(DEBUG_LOG_PATH, `[${new Date().toISOString()}] [${tag}]${body ? ` ${body}` : ''}\n`);
-  } catch {
-    // Debug logging must never interfere with dictation.
-  }
+  if (!enabled) return;
+  const now = Date.now();
+  eventSeq += 1;
+  const deltaSession = sessionStartMs > 0 ? now - sessionStartMs : 0;
+  const deltaPrev = lastEventMs > 0 ? now - lastEventMs : 0;
+  lastEventMs = now;
+
+  const prefix = `seq=${eventSeq} t=+${deltaSession}ms dt=${deltaPrev}ms`;
+  const body = Object.entries(fields)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${formatValue(value)}`)
+    .join(' ');
+  console.info(`[Dictation] [${tag}] ${prefix}${body ? ` ${body}` : ''}`);
 }
 
 function formatValue(value: unknown): string {
@@ -22,5 +39,5 @@ function formatValue(value: unknown): string {
     return String(value);
   }
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return JSON.stringify(text.length > 180 ? `${text.slice(0, 180)}...` : text);
+  return text.length > 200 ? `"${text.slice(0, 200)}..."` : JSON.stringify(text);
 }

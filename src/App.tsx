@@ -1507,12 +1507,12 @@ function AppShell() {
             style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
           >
             <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
-            <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4">
+            <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4" onDoubleClick={() => window.app?.titlebar.doubleClick()}>
               <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
               <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
-              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1">
+              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1" onDoubleClick={(e) => e.stopPropagation()}>
                 <button
                   type="button"
                   onClick={toggleTheme}
@@ -1642,18 +1642,21 @@ function AppShell() {
           <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <UpdateCard />
             {/* Interactive title bar */}
-            <div className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 top-0 z-30 flex h-12 items-center justify-between px-3 md:h-14 md:px-6`}>
+            <div
+              onDoubleClick={() => window.app?.titlebar.doubleClick()}
+              className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6`}
+            >
               <div className="flex w-full items-center justify-between">
               {isMobile && (
                 <button
                   type="button"
                   onClick={() => setSidebarOpen(true)}
-                  className="mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
+                  className="titlebar-no-drag mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
                 >
                   <MenuIcon className="h-5 w-5" />
                 </button>
               )}
-              <div className="titlebar-no-drag min-w-0 flex-1 flex items-center justify-between">
+              <div className="titlebar-no-drag min-w-0 shrink-0 flex items-center" onDoubleClick={(e) => e.stopPropagation()}>
               <div className="min-w-0">
                 {activeView === SETTINGS_VIEW ? (
                   <div className="flex items-center gap-1.5">
@@ -2007,6 +2010,8 @@ function AppShell() {
                   </span>
                 ) : null}
               </div>
+              </div>
+              <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
               <WorkspaceSelector
                 workspaces={workspaces}
                 activeWorkspaceId={activeWorkspaceId}
@@ -2017,12 +2022,12 @@ function AppShell() {
             </div>
             <div className="min-h-0 flex-1 flex flex-col">
               {activeView === MARKETPLACE_VIEW ? (
-                <div className="relative flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                <div className="relative flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
                   <SplashBackground visible storageKey="__marketplace_bg_last_index" />
                   <PluginMarketplace />
                 </div>
               ) : activeView === PLUGINS_VIEW ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
                   <InstalledPluginsView
                     onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
                     onNavigate={handlePluginNavigationItem}
@@ -2031,7 +2036,7 @@ function AppShell() {
                   />
                 </div>
               ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
                   <div className="flex-1 overflow-y-auto">
                     <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
                       <BrokenPluginView
@@ -2042,7 +2047,7 @@ function AppShell() {
                   </div>
                 </div>
               ) : activePluginPanel ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
                   <PluginPanelHost
                     panel={activePluginPanel}
                     onClose={() => setActiveView(CHAT_VIEW)}
@@ -2073,7 +2078,7 @@ function AppShell() {
                     }}
                   />
                 ) : (
-                  <div className="flex flex-col flex-1 min-h-0 pt-12 md:pt-14">
+                  <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
                     <TaskQueue workspaceId={activeWorkspaceId} />
                   </div>
                 )
