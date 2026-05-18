@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
+import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -105,17 +106,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     if (!existsSync(filePath)) return null;
     try {
       const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-      
+
       // Validate common field naming mistakes
-      const raw = task as any;
-      if (raw.assignedAgent && !task.assignedAgentId) {
-        console.warn(
-          `[tasks] Task ${id} has deprecated field 'assignedAgent' but expected 'assignedAgentId'. ` +
-          `The task will not be properly assigned to an agent. ` +
-          `Please update the task JSON or reassign via the UI.`
-        );
-      }
-      
+      warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
+
       return task;
     } catch {
       return null;
