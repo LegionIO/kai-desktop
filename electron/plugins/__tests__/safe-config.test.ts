@@ -1,6 +1,39 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { appConfigSchema, type AppConfig } from '../../config/schema.js';
 import { toPluginSafeConfig } from '../safe-config.js';
+
+// Mock electron + heavy main-process deps that PluginManager imports at load
+// time. We never construct windows, notifications, or marketplace services in
+// these tests — we only exercise runPreSendHooks / runPostReceiveHooks against
+// a synthetic spy plugin injected into the private `plugins` map.
+vi.mock('electron', () => ({
+  Notification: class {
+    show() {}
+    close() {}
+    on() {}
+  },
+  BrowserWindow: { getAllWindows: () => [] },
+}));
+vi.mock('../marketplace-service.js', () => ({ MarketplaceService: class {} }));
+vi.mock('../plugin-api.js', () => ({
+  createPluginAPI: () => ({}),
+  cleanupPluginAPI: () => {},
+}));
+vi.mock('../plugin-bootstrap.js', () => ({ getBundledPluginIntegrity: () => null }));
+vi.mock('../plugin-integrity.js', () => ({
+  arePermissionSetsEqual: () => true,
+  hashPluginDirectory: () => '',
+  readPluginManifest: () => null,
+}));
+vi.mock('../plugin-compat.js', () => ({ checkPluginCompatibility: () => ({ ok: true }) }));
+vi.mock('../renderer-build.js', () => ({ buildPluginRendererBundle: async () => null }));
+vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => {} }));
+vi.mock('../../tools/skill-loader.js', () => ({ convertJsonSchemaToZod: () => null }));
+vi.mock('../../ipc/conversations.js', () => ({
+  readConversationStore: () => ({}),
+  writeConversationStore: () => {},
+  broadcastConversationChange: () => {},
+}));
 
 /**
  * Sentinel strings planted in every credential leaf of the fixture so
@@ -397,5 +430,276 @@ describe('toPluginSafeConfig', () => {
       leaked,
       `string values matching known secret prefixes leaked: ${leaked.join(', ')}`,
     ).toEqual([]);
+  });
+});
+
+/**
+ * Adversarial leak markers that should NEVER appear in any plugin-visible
+ * config. Distinctive enough to grep for via a substring search across the
+ * serialized output.
+ */
+const LEAK_MARKERS = {
+  openaiApiKey: 'sk-test-OPENAI-LEAK-XYZ',
+  awsSecretAccessKey: 'AWS-SECRET-LEAK-XYZ',
+  awsSessionToken: 'AWS-SESSION-LEAK-XYZ',
+  providerBearer: 'Bearer LEAK-TOKEN-XYZ',
+  mcpGithubToken: 'ghp_LEAK-XYZ',
+  mcpOpenaiKey: 'sk-test-MCP-LEAK-XYZ',
+  mcpCustomCred: 'leaky-token-value-XYZ',
+  webPassword: 'WEBSERVER-LEAK-XYZ',
+  tlsKeyPath: '/Users/secret/leaked-private-XYZ.key',
+  azureSubKey: 'AZURE-SUB-LEAK-XYZ',
+  realtimeOpenai: 'sk-test-REALTIME-LEAK-XYZ',
+  imageOpenai: 'sk-test-IMAGE-LEAK-XYZ',
+  videoOpenai: 'sk-test-VIDEO-LEAK-XYZ',
+} as const;
+
+function buildAdversarialConfig(): AppConfig {
+  const base = buildPopulatedConfig() as unknown as Record<string, unknown>;
+  // Overwrite credential leaves with the LEAK_MARKERS sentinels and add the
+  // unknown-name credential-shaped MCP env header.
+  const models = base.models as Record<string, unknown>;
+  const providers = models.providers as Record<string, Record<string, unknown>>;
+  providers.openai.apiKey = LEAK_MARKERS.openaiApiKey;
+  providers.openai.extraHeaders = { Authorization: LEAK_MARKERS.providerBearer };
+  providers.bedrock.secretAccessKey = LEAK_MARKERS.awsSecretAccessKey;
+  providers.bedrock.sessionToken = LEAK_MARKERS.awsSessionToken;
+
+  const mcp = (base.mcpServers as Array<Record<string, unknown>>)[0];
+  mcp.env = {
+    GITHUB_TOKEN: LEAK_MARKERS.mcpGithubToken,
+    OPENAI_API_KEY: LEAK_MARKERS.mcpOpenaiKey,
+    // Adversarial: a credential-shaped value under an unknown key name —
+    // the redactor must strip ALL env values regardless of key.
+    CUSTOM_CRED_HEADER: LEAK_MARKERS.mcpCustomCred,
+    NOT_A_SECRET: 'just-a-value',
+  };
+
+  const web = base.webServer as Record<string, Record<string, unknown>>;
+  web.auth.password = LEAK_MARKERS.webPassword;
+  web.tls.keyPath = LEAK_MARKERS.tlsKeyPath;
+
+  const audio = (base.audio as Record<string, Record<string, unknown>>).azure;
+  audio.subscriptionKey = LEAK_MARKERS.azureSubKey;
+
+  const realtime = base.realtime as Record<string, Record<string, unknown>>;
+  realtime.openai.apiKey = LEAK_MARKERS.realtimeOpenai;
+
+  const image = base.imageGeneration as Record<string, Record<string, unknown>>;
+  image.openai.apiKey = LEAK_MARKERS.imageOpenai;
+
+  const video = base.videoGeneration as Record<string, Record<string, unknown>>;
+  video.openai.apiKey = LEAK_MARKERS.videoOpenai;
+
+  return appConfigSchema.parse(base);
+}
+
+function makeSpyPluginInstance(captured: unknown[]): unknown {
+  return {
+    manifest: { name: 'spy-plugin', version: '0.0.0', displayName: 'Spy Plugin' },
+    dir: '/tmp/spy-plugin',
+    fileHash: '',
+    state: 'active',
+    module: null,
+    registeredTools: [],
+    preSendHooks: [
+      (args: { config: unknown }) => {
+        captured.push(args.config);
+        return { messages: [], systemPrompt: undefined };
+      },
+    ],
+    postReceiveHooks: [
+      (args: { config: unknown; response: unknown }) => {
+        captured.push(args.config);
+        return { response: args.response };
+      },
+    ],
+    preUpdateHooks: [],
+    postUpdateHooks: [],
+    uiBanners: [],
+    uiModals: [],
+    uiSettingsSections: [],
+    uiPanels: [],
+    uiNavigationItems: [],
+    uiCommands: [],
+    conversationDecorations: [],
+    threadDecorations: [],
+    publishedState: {},
+    notifications: [],
+    configChangeListeners: [],
+    rendererBuild: null,
+    inferenceProvider: null,
+    contributedRuntimes: [],
+    contributedCliTools: [],
+  };
+}
+
+describe('hook fire-site delivers redacted config — spy plugin integration', () => {
+  async function buildManagerWithSpy(): Promise<{
+    manager: {
+      runPreSendHooks: (args: Record<string, unknown>) => Promise<unknown>;
+      runPostReceiveHooks: (args: Record<string, unknown>) => Promise<unknown>;
+    };
+    captured: unknown[];
+  }> {
+    // Import lazily so the vi.mock declarations at the top of the file are
+    // applied before plugin-manager.ts is evaluated.
+    const { PluginManager } = await import('../plugin-manager.js');
+    const cfg = buildAdversarialConfig();
+    const manager = new PluginManager(
+      '/tmp/plugins-test',
+      '/tmp/app-home-test',
+      () => cfg,
+      () => {},
+      [],
+    );
+    const captured: unknown[] = [];
+    const spy = makeSpyPluginInstance(captured);
+    // Access the private `plugins` map and inject the spy plugin directly,
+    // bypassing discovery + activation (which depend on filesystem state).
+    (manager as unknown as { plugins: Map<string, unknown> }).plugins.set('spy-plugin', spy);
+    return {
+      manager: manager as unknown as {
+        runPreSendHooks: (args: Record<string, unknown>) => Promise<unknown>;
+        runPostReceiveHooks: (args: Record<string, unknown>) => Promise<unknown>;
+      },
+      captured,
+    };
+  }
+
+  function assertNoLeakStrings(serialized: string): void {
+    for (const [label, marker] of Object.entries(LEAK_MARKERS)) {
+      expect(
+        serialized.includes(marker),
+        `leak marker "${label}" (${marker}) reached plugin hook config`,
+      ).toBe(false);
+    }
+  }
+
+  it('pre-send hook fire-site: spy plugin receives redacted config with no leak strings', async () => {
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPreSendHooks({
+      messages: [{ role: 'user', content: 'hello' }],
+      modelKey: 'openai-gpt-4',
+      config: cfg,
+      systemPrompt: 'sys',
+    });
+    expect(captured.length).toBe(1);
+    const serialized = JSON.stringify(captured[0]);
+    assertNoLeakStrings(serialized);
+  });
+
+  it('post-receive hook fire-site: spy plugin receives redacted config with no leak strings', async () => {
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPostReceiveHooks({
+      messages: [{ role: 'user', content: 'hi' }],
+      response: { role: 'assistant', content: 'ok' },
+      config: cfg,
+    });
+    expect(captured.length).toBe(1);
+    const serialized = JSON.stringify(captured[0]);
+    assertNoLeakStrings(serialized);
+  });
+
+  it('non-secret fields survive redaction at the hook fire-site', async () => {
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPreSendHooks({
+      messages: [{ role: 'user', content: 'hi' }],
+      modelKey: 'openai-gpt-4',
+      config: cfg,
+      systemPrompt: 'sys',
+    });
+    const received = captured[0] as {
+      models: {
+        providers: { openai: { type: string; enabled: boolean; endpoint: string } };
+      };
+      mcpServers: Array<{ name: string; command: string; enabled: boolean }>;
+      webServer: { enabled: boolean; port: number };
+    };
+    expect(received.models.providers.openai.type).toBe('openai-compatible');
+    expect(received.models.providers.openai.enabled).toBe(true);
+    expect(received.models.providers.openai.endpoint).toBe('https://api.openai.com/v1');
+    expect(received.mcpServers[0].name).toBe('test-server');
+    expect(received.mcpServers[0].command).toBe('node');
+    expect(received.mcpServers[0].enabled).toBe(true);
+    expect(received.webServer.enabled).toBe(true);
+    expect(received.webServer.port).toBe(8443);
+  });
+
+  it('mcpServers[*].env is entirely stripped — even credential-shaped values under unknown key names', async () => {
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPreSendHooks({
+      messages: [],
+      modelKey: 'openai-gpt-4',
+      config: cfg,
+      systemPrompt: undefined,
+    });
+    const received = captured[0] as { mcpServers: Array<Record<string, unknown>> };
+    const mcp = received.mcpServers[0];
+    expect('env' in mcp).toBe(false);
+    // The key names may be exposed as a list (envKeys) so plugins can know
+    // which env vars exist, but the VALUES (including the adversarial
+    // CUSTOM_CRED_HEADER) must not appear anywhere in the serialized config.
+    const serialized = JSON.stringify(received);
+    expect(serialized.includes(LEAK_MARKERS.mcpCustomCred)).toBe(false);
+    expect(serialized.includes(LEAK_MARKERS.mcpGithubToken)).toBe(false);
+    expect(serialized.includes(LEAK_MARKERS.mcpOpenaiKey)).toBe(false);
+    // The plain non-secret value 'just-a-value' was passed in under
+    // NOT_A_SECRET — since the redactor cannot know which env values are
+    // secret, it must drop them all. Verify it did.
+    expect(serialized.includes('just-a-value')).toBe(false);
+  });
+
+  it('forward-compatibility credential-shape regex sweep — no suspicious patterns survive', async () => {
+    // This guards against future schema changes that introduce a new
+    // credential-bearing field whose name does not match the existing
+    // schema-walk regex. Even if the field name is unrecognized, a string
+    // VALUE shaped like a known credential type must not appear in the
+    // plugin-visible config. A few false positives are acceptable; a
+    // credential silently surviving redaction is not.
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPreSendHooks({
+      messages: [],
+      modelKey: 'openai-gpt-4',
+      config: cfg,
+      systemPrompt: undefined,
+    });
+    const flat = JSON.stringify(captured[0]);
+    const suspiciousPatterns: Array<{ name: string; pattern: RegExp }> = [
+      { name: 'OpenAI sk-* key', pattern: /sk-[a-z]/i },
+      { name: 'Slack bot token (xoxb-)', pattern: /xoxb-/ },
+      { name: 'AWS access key (AKIA*)', pattern: /AKIA[A-Z0-9]/ },
+      { name: 'GitHub personal access token (ghp_*)', pattern: /ghp_/ },
+      { name: 'HTTP Bearer token', pattern: /Bearer\s/i },
+      { name: 'PEM private key header', pattern: /-----BEGIN / },
+      { name: 'JWT (eyJ...)', pattern: /eyJ[A-Za-z0-9_-]+\./ },
+      { name: 'planted LEAK-XYZ sentinel', pattern: /LEAK-XYZ/i },
+    ];
+    for (const { name, pattern } of suspiciousPatterns) {
+      expect(
+        pattern.test(flat),
+        `credential-shaped pattern survived redaction: ${name} (${pattern})`,
+      ).toBe(false);
+    }
+  });
+
+  it('post-receive hook fire-site also passes the credential-shape sweep', async () => {
+    const { manager, captured } = await buildManagerWithSpy();
+    const cfg = buildAdversarialConfig();
+    await manager.runPostReceiveHooks({
+      messages: [{ role: 'user', content: 'q' }],
+      response: { role: 'assistant', content: 'a' },
+      config: cfg,
+    });
+    const flat = JSON.stringify(captured[0]);
+    expect(flat.includes('LEAK-XYZ')).toBe(false);
+    expect(/sk-test-/i.test(flat)).toBe(false);
+    expect(/ghp_/.test(flat)).toBe(false);
+    expect(/Bearer\s/i.test(flat)).toBe(false);
   });
 });
