@@ -35,6 +35,7 @@ import type {
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
+import { toPluginSafeConfig } from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
@@ -811,19 +812,26 @@ export class PluginManager {
     return result;
   }
 
-  async runPreSendHooks(args: PreSendHookArgs): Promise<PreSendHookResult> {
+  async runPreSendHooks(args: Omit<PreSendHookArgs, 'config'> & { config: AppConfig }): Promise<PreSendHookResult> {
     let result: PreSendHookResult = {
       messages: args.messages,
       systemPrompt: args.systemPrompt,
     };
+
+    // Build a redacted view of the config so credential-bearing fields
+    // (provider API keys, AWS secrets, MCP env, web server password, TLS
+    // key path, etc.) never reach plugin hook code. Compute once per call
+    // and reuse across all active hooks.
+    const safeConfig = toPluginSafeConfig(args.config);
 
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
       for (const hook of instance.preSendHooks) {
         try {
           const hookResult = await hook({
-            ...args,
             messages: result.messages,
+            modelKey: args.modelKey,
+            config: safeConfig,
             systemPrompt: result.systemPrompt,
           });
           result = {
@@ -842,14 +850,20 @@ export class PluginManager {
     return result;
   }
 
-  async runPostReceiveHooks(args: PostReceiveHookArgs): Promise<PostReceiveHookResult> {
+  async runPostReceiveHooks(args: Omit<PostReceiveHookArgs, 'config'> & { config: AppConfig }): Promise<PostReceiveHookResult> {
     let result: PostReceiveHookResult = { response: args.response };
+
+    const safeConfig = toPluginSafeConfig(args.config);
 
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
       for (const hook of instance.postReceiveHooks) {
         try {
-          result = await hook({ ...args, response: result.response });
+          result = await hook({
+            messages: args.messages,
+            response: result.response,
+            config: safeConfig,
+          });
         } catch (err) {
           console.error(`[PluginManager] Post-receive hook error in "${instance.manifest.name}":`, err);
         }

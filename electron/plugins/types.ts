@@ -1,6 +1,9 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { CompatCheckResult } from './plugin-compat.js';
+import type { PluginSafeConfig } from './safe-config.js';
+
+export type { PluginSafeConfig } from './safe-config.js';
 
 /* ── Manifest ── */
 
@@ -176,7 +179,13 @@ export type HookMessage = {
 export type PreSendHookArgs = {
   messages: HookMessage[];
   modelKey: string;
-  config: AppConfig;
+  /**
+   * Redacted view of the app config. Credential-bearing fields (provider
+   * API keys, AWS secrets, MCP server env vars, web server password, TLS
+   * private key paths, Azure subscription keys) are stripped or replaced
+   * with `hasX: boolean` indicators. See {@link PluginSafeConfig}.
+   */
+  config: PluginSafeConfig;
   systemPrompt?: string;
 };
 
@@ -192,7 +201,11 @@ export type PreSendHook = (args: PreSendHookArgs) => Promise<PreSendHookResult> 
 export type PostReceiveHookArgs = {
   response: HookMessage;
   messages: HookMessage[];
-  config: AppConfig;
+  /**
+   * Redacted view of the app config. See {@link PluginSafeConfig} and the
+   * note on {@link PreSendHookArgs.config}.
+   */
+  config: PluginSafeConfig;
 };
 
 export type PostReceiveHookResult = {
