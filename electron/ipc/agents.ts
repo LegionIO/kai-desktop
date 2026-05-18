@@ -15,6 +15,7 @@ import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
+import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -64,17 +65,10 @@ function readAgent(appHome: string, id: string): AgentFile | null {
   if (!existsSync(filePath)) return null;
   try {
     const agent = JSON.parse(readFileSync(filePath, 'utf-8')) as AgentFile;
-    
+
     // Validate common field naming mistakes
-    const raw = agent as any;
-    if (raw.assignedTaskId && !agent.currentTaskId) {
-      console.warn(
-        `[agents] Agent ${id} has deprecated field 'assignedTaskId' but expected 'currentTaskId'. ` +
-        `The agent will not properly link to its assigned task. ` +
-        `Please update the agent JSON or reassign via the UI.`
-      );
-    }
-    
+    warnOnDeprecatedField(agent, 'assignedTaskId', 'currentTaskId', 'agents', 'Agent', id);
+
     return agent;
   } catch {
     return null;
@@ -94,17 +88,10 @@ function readTask(appHome: string, id: string): TaskFile | null {
   if (!existsSync(filePath)) return null;
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-    
+
     // Validate common field naming mistakes
-    const raw = task as any;
-    if (raw.assignedAgent && !task.assignedAgentId) {
-      console.warn(
-        `[agents] Task ${id} has deprecated field 'assignedAgent' but expected 'assignedAgentId'. ` +
-        `The task will not be properly assigned to an agent. ` +
-        `Please update the task JSON or reassign via the UI.`
-      );
-    }
-    
+    warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
+
     return task;
   } catch {
     return null;
