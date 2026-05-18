@@ -16,6 +16,7 @@ import {
   ImageIcon,
   XIcon,
   ChevronUpIcon,
+  ChevronDownIcon,
   FileCodeIcon,
   TerminalIcon,
   MessagesSquareIcon,
@@ -43,8 +44,10 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
+import { useAutoScroll } from '@/hooks/useAutoScroll';
 import { TaskTerminal } from './TaskTerminal';
 import { CouncilMessageBubble, CouncilTypingIndicator, CouncilStreamingBubble } from './CouncilMessageBubble';
+import { RecommendationBanner } from './RecommendationBanner';
 import type { TaskFile } from '@/types/task';
 import {
   KAI_TASK_STATUS_LABELS,
@@ -119,7 +122,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     if (councilMessages.length > 0 || deliberating || awaitingClarification) return 'council';
     return 'plan';
   });
-  const councilScrollRef = useRef<HTMLDivElement>(null);
+
+  // Smart auto-scroll for council messages — allows user to scroll up without being snapped back
+  const { ref: councilScrollRef, handleScroll: handleCouncilScroll, userScrolled, setUserScrolled } =
+    useAutoScroll<HTMLDivElement>([councilMessages.length, councilStreamingMsg?.content]);
 
   // Reset tab to smart default when switching tasks or when messages arrive
   const prevTaskId = useRef(task.id);
@@ -260,13 +266,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       setActiveTab('council');
     }
   }, [awaitingClarification]);
-
-  // Auto-scroll council messages
-  useEffect(() => {
-    if (councilScrollRef.current && (deliberating || councilMessages.length > 0)) {
-      councilScrollRef.current.scrollTop = councilScrollRef.current.scrollHeight;
-    }
-  }, [councilMessages.length, deliberating, councilStreamingMsg?.content]);
 
   // Close on Escape (if onClose provided)
   useEffect(() => {
@@ -760,8 +759,12 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
             </div>
           )}
 
+          {/* ─── Aithena Recommendations Banner ─── */}
+          <RecommendationBanner taskId={task.id} />
+
           {/* Scrollable message list */}
-          <div ref={councilScrollRef} className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+          <div className="relative flex-1 min-h-0">
+          <div ref={councilScrollRef} onScroll={handleCouncilScroll} className="h-full overflow-y-auto px-6 py-4 space-y-4">
             {councilMessages.length === 0 && !deliberating && (
               <div className="flex h-full items-center justify-center">
                 <div className="flex flex-col items-center gap-3 text-center">
@@ -787,6 +790,22 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   />
                 : <CouncilTypingIndicator agent={currentCouncilAgent || 'aithena'} />
             )}
+          </div>
+
+          {/* Floating scroll-to-bottom button */}
+          {userScrolled && councilMessages.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                councilScrollRef.current?.scrollTo({ top: councilScrollRef.current.scrollHeight, behavior: 'smooth' });
+                setUserScrolled(false);
+              }}
+              className="absolute bottom-4 right-6 z-10 flex h-8 w-8 items-center justify-center rounded-full border border-border/50 bg-card/90 shadow-lg backdrop-blur-sm text-muted-foreground hover:text-foreground hover:bg-card transition-all duration-200 animate-in fade-in slide-in-from-bottom-2"
+              title="Scroll to latest"
+            >
+              <ChevronDownIcon size={16} />
+            </button>
+          )}
           </div>
 
           {/* Approval banner (when awaiting_approval — fallback if auto-execute didn't trigger) */}

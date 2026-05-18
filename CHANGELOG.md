@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.85] - 2026-05-18
+
+### Added
+- **Aithena Recommendations UI** — New `RecommendationBanner` component in the council tab displays Aithena V3's proactive recommendations (risk alerts, suggested actions, context notes, learnings, escalations) with confidence-based styling and type badges.
+- **Recommendation state management** — TaskProvider now tracks active and consumed recommendations per task via `council:recommendations` and `council:recommendation-consumed` plugin events.
+- **Dismiss & Apply actions** — Users can dismiss recommendations (synced to Aithena V3) or apply `next_action` suggestions directly through council (sends `suggested_action` as a council message).
+- **Auto-expand on alerts** — Banner auto-expands when high-confidence risk/escalation recommendations arrive.
+- **Consumed indicators** — Recently consumed recommendations show a brief indicator (auto-fades after 8s) so users know what Aithena already acted on.
+- **Smart auto-scroll for council tab** — New `useAutoScroll` hook replaces the hardcoded scroll-lock behavior. Users can now scroll up freely during streaming without being snapped back to the bottom.
+- **Floating scroll-to-bottom button** — When scrolled up in the council tab, a floating chevron button appears. Clicking it smooth-scrolls to the latest message and resumes auto-follow.
+
+### Added (types)
+- `src/types/recommendation.ts` — `Recommendation` and `ConsumedRecommendation` interfaces.
+- `src/hooks/useAutoScroll.ts` — Reusable smart auto-scroll hook (distinguishes user scroll from programmatic scroll via RAF flag, 80px threshold, 5px hysteresis).
+
 ## [1.0.84] - 2026-05-18
 
 ### Added

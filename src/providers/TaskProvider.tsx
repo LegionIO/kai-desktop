@@ -20,6 +20,7 @@ import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
 import type { CouncilMessage } from '../../shared/task-types';
+import type { Recommendation, ConsumedRecommendation } from '@/types/recommendation';
 
 // ── State & Actions ──────────────────────────────────────────────────────
 
@@ -44,6 +45,10 @@ interface TaskState {
   isDeliberating: Record<string, boolean>;
   /** Currently streaming council message per task (in-progress agent response). */
   councilStreaming: Record<string, { agent: string; phase: string; content: string } | null>;
+  /** Active recommendations per task (from Aithena proactive evaluator). */
+  recommendations: Record<string, Recommendation[]>;
+  /** Recently consumed recommendations per task (auto-faded after display). */
+  consumedRecommendations: Record<string, ConsumedRecommendation[]>;
 }
 
 type TaskAction =
@@ -65,7 +70,10 @@ type TaskAction =
   | { type: 'COUNCIL_RESUME'; taskId: string }
   | { type: 'COUNCIL_DONE'; taskId: string }
   | { type: 'COUNCIL_STREAM_DELTA'; taskId: string; agent: string; phase: string; content: string }
-  | { type: 'COUNCIL_STREAM_CLEAR'; taskId: string };
+  | { type: 'COUNCIL_STREAM_CLEAR'; taskId: string }
+  | { type: 'SET_RECOMMENDATIONS'; taskId: string; recommendations: Recommendation[] }
+  | { type: 'ADD_CONSUMED_RECOMMENDATION'; taskId: string; consumed: ConsumedRecommendation }
+  | { type: 'DISMISS_RECOMMENDATION'; taskId: string; recommendationId: string };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
@@ -89,6 +97,8 @@ const initialState: TaskState = {
   councilAgent: {},
   isDeliberating: {},
   councilStreaming: {},
+  recommendations: {},
+  consumedRecommendations: {},
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -176,6 +186,31 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
         ...state,
         councilStreaming: { ...state.councilStreaming, [action.taskId]: null },
       };
+    case 'SET_RECOMMENDATIONS':
+      return {
+        ...state,
+        recommendations: { ...state.recommendations, [action.taskId]: action.recommendations },
+      };
+    case 'ADD_CONSUMED_RECOMMENDATION': {
+      const existing = state.consumedRecommendations[action.taskId] ?? [];
+      return {
+        ...state,
+        consumedRecommendations: {
+          ...state.consumedRecommendations,
+          [action.taskId]: [...existing, action.consumed],
+        },
+      };
+    }
+    case 'DISMISS_RECOMMENDATION': {
+      const current = state.recommendations[action.taskId] ?? [];
+      return {
+        ...state,
+        recommendations: {
+          ...state.recommendations,
+          [action.taskId]: current.filter((r) => r.id !== action.recommendationId),
+        },
+      };
+    }
     default:
       return state;
   }
@@ -260,6 +295,18 @@ interface TaskContextValue {
 
   /** Get the live-streaming council message for a task (in-progress agent response). */
   getCouncilStreaming: (taskId: string) => { agent: string; phase: string; content: string } | null;
+
+  /** Get active Aithena recommendations for a task. */
+  getRecommendations: (taskId: string) => Recommendation[];
+
+  /** Get recently consumed recommendations for a task. */
+  getConsumedRecommendations: (taskId: string) => ConsumedRecommendation[];
+
+  /** Dismiss a recommendation (removes from UI + dismisses in Aithena V3). */
+  dismissRecommendation: (taskId: string, recommendationId: string) => void;
+
+  /** Apply a recommendation (sends suggested_action to council as a message). */
+  applyRecommendation: (taskId: string, rec: Recommendation) => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -632,7 +679,35 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     }
     const unsub = app.plugins.onEvent((evt: unknown) => {
       const e = evt as { pluginName?: string; eventName?: string; data?: unknown };
-      if (e.eventName !== 'council:message' && e.eventName !== 'council:result' && e.eventName !== 'council:gather-request') return;
+      if (e.eventName !== 'council:message' && e.eventName !== 'council:result' && e.eventName !== 'council:gather-request' && e.eventName !== 'council:recommendations' && e.eventName !== 'council:recommendation-consumed') return;
+
+      // Handle council:recommendations — Aithena proactive suggestions for a task
+      if (e.eventName === 'council:recommendations') {
+        const { taskId: recTaskId, recommendations: recs } = (e.data ?? {}) as {
+          taskId?: string;
+          recommendations?: Recommendation[];
+        };
+        if (recTaskId && recs) {
+          dispatch({ type: 'SET_RECOMMENDATIONS', taskId: recTaskId, recommendations: recs });
+        }
+        return;
+      }
+
+      // Handle council:recommendation-consumed — individual recommendation consumed by agent
+      if (e.eventName === 'council:recommendation-consumed') {
+        const { taskId: consumedTaskId, consumed } = (e.data ?? {}) as {
+          taskId?: string;
+          consumed?: ConsumedRecommendation;
+        };
+        if (consumedTaskId && consumed) {
+          dispatch({
+            type: 'ADD_CONSUMED_RECOMMENDATION',
+            taskId: consumedTaskId,
+            consumed: { ...consumed, timestamp: new Date().toISOString() },
+          });
+        }
+        return;
+      }
 
       // Handle council:gather-request — council needs deeper artifact gathering via runner
       if (e.eventName === 'council:gather-request') {
@@ -1038,6 +1113,41 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     return state.councilStreaming[taskId] ?? null;
   }, [state.councilStreaming]);
 
+  // ── Recommendation Actions ──────────────────────────────────────────────
+
+  const getRecommendations = useCallback((taskId: string): Recommendation[] => {
+    return state.recommendations[taskId] ?? [];
+  }, [state.recommendations]);
+
+  const getConsumedRecommendations = useCallback((taskId: string): ConsumedRecommendation[] => {
+    return state.consumedRecommendations[taskId] ?? [];
+  }, [state.consumedRecommendations]);
+
+  const dismissRecommendation = useCallback((taskId: string, recommendationId: string) => {
+    dispatch({ type: 'DISMISS_RECOMMENDATION', taskId, recommendationId });
+    // Tell plugin to dismiss in Aithena V3
+    // Need workflowRunId from task metadata — get it from current task
+    const task = state.tasks.find((t) => t.id === taskId);
+    const runId = (task?.metadata as Record<string, unknown> | undefined)?.workflowRunId as string;
+    if (runId) {
+      app.plugins?.action?.('aithena', 'recommendation:dismiss', 'dismiss', {
+        taskId,
+        runId,
+        recommendationId,
+      })?.catch((err) => {
+        console.warn('[TaskProvider] Failed to dismiss recommendation:', err);
+      });
+    }
+  }, [state.tasks]);
+
+  const applyRecommendation = useCallback((taskId: string, rec: Recommendation) => {
+    // Send the suggested_action to council as a user message
+    const message = rec.suggested_action || rec.rationale || rec.title;
+    void councilRespond(taskId, `[Applying Aithena suggestion] ${message}`);
+    // Dismiss it from the list
+    dispatch({ type: 'DISMISS_RECOMMENDATION', taskId, recommendationId: rec.id });
+  }, [councilRespond]);
+
   // ── Memoized context value ───────────────────────────────────────────
 
   const value = useMemo<TaskContextValue>(
@@ -1063,6 +1173,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       getCouncilPhase,
       getCouncilAgent,
       getCouncilStreaming,
+      getRecommendations,
+      getConsumedRecommendations,
+      dismissRecommendation,
+      applyRecommendation,
     }),
     [
       state,
@@ -1086,6 +1200,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       getCouncilPhase,
       getCouncilAgent,
       getCouncilStreaming,
+      getRecommendations,
+      getConsumedRecommendations,
+      dismissRecommendation,
+      applyRecommendation,
     ],
   );
 
