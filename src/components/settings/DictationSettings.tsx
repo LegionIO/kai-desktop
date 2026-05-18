@@ -59,6 +59,8 @@ function acceleratorKeyFromEvent(e: KeyboardEvent): string | null {
 
 type DictationConfig = {
   enabled?: boolean;
+  provider?: 'azure' | 'openai';
+  openai?: { baseUrl?: string; apiKey?: string; model?: string };
   hotkey?: string;
   mode?: 'toggle' | 'hold';
   inputDeviceId?: string | null;
@@ -67,6 +69,7 @@ type DictationConfig = {
   finalCleanupEnabled?: boolean;
   livePartials?: boolean;
   partialTyping?: PartialTypingConfig;
+  debugLogging?: boolean;
 };
 
 type DictationRuntimeState = {
@@ -417,6 +420,65 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
           onChange={(v) => void updateConfig('dictation.enabled', v)}
         />
 
+        {/* Speech Provider */}
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-1">Speech Recognition Provider</label>
+          <select
+            className={settingsSelectClass}
+            value={dictation.provider ?? 'azure'}
+            onChange={(e) => void updateConfig('dictation.provider', e.target.value)}
+          >
+            <option value="azure">Azure Speech Services</option>
+            <option value="openai">OpenAI Realtime</option>
+          </select>
+        </div>
+
+        {/* OpenAI config fields (shown when openai selected) */}
+        {(dictation.provider ?? 'azure') === 'openai' && (
+          <div className="space-y-2 rounded-lg border border-border/40 bg-muted/20 p-2.5">
+            <div>
+              <label className="text-[10px] text-muted-foreground block mb-1">Base URL</label>
+              <input
+                type="text"
+                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
+                placeholder="wss://api.openai.com"
+                value={dictation.openai?.baseUrl ?? ''}
+                onChange={(e) => void updateConfig('dictation.openai.baseUrl', e.target.value || undefined)}
+              />
+              <p className="mt-0.5 text-[9px] text-muted-foreground">
+                WebSocket endpoint for the OpenAI Realtime API. Leave blank for official OpenAI.
+              </p>
+            </div>
+            <div>
+              <label className="text-[10px] text-muted-foreground block mb-1">API Key</label>
+              <input
+                type="password"
+                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
+                placeholder="sk-..."
+                value={dictation.openai?.apiKey ?? ''}
+                onChange={(e) => void updateConfig('dictation.openai.apiKey', e.target.value || undefined)}
+              />
+            </div>
+            <div>
+              <label className="text-[10px] text-muted-foreground block mb-1">Model</label>
+              <input
+                type="text"
+                className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none"
+                placeholder="gpt-realtime-whisper"
+                value={dictation.openai?.model ?? ''}
+                onChange={(e) => void updateConfig('dictation.openai.model', e.target.value || undefined)}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Azure info note */}
+        {(dictation.provider ?? 'azure') === 'azure' && (
+          <p className="text-[9px] text-muted-foreground pl-1">
+            Uses credentials from Audio &amp; Voice settings.
+          </p>
+        )}
+
         {/* Hotkey */}
         <div>
           <label className="text-[10px] text-muted-foreground block mb-1">Global Hotkey</label>
@@ -615,12 +677,27 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         </p>
       </fieldset>
 
+      {/* Troubleshooting */}
+      <fieldset className="rounded-lg border border-border/60 p-3 space-y-2">
+        <legend className="px-1 text-[10px] font-medium text-muted-foreground">Troubleshooting</legend>
+
+        <Toggle
+          label="Enable debug logging"
+          checked={dictation.debugLogging ?? false}
+          onChange={(v) => void updateConfig('dictation.debugLogging', v)}
+        />
+        <p className="text-[10px] leading-relaxed text-muted-foreground pl-6">
+          Prints detailed dictation diagnostics to stdout (visible in the terminal when running Kai from the command line). Useful for reporting bugs.
+        </p>
+      </fieldset>
+
       {/* Info */}
       <div className="flex items-start gap-2 rounded-lg border border-border/60 bg-muted/30 p-3">
         <InfoIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
         <p className="text-[10px] text-muted-foreground leading-relaxed">
-          Dictation uses your configured Azure Speech provider from Audio &amp; Voice settings.
-          Requires Accessibility, Automation, and Microphone permissions. Autopilot covers Accessibility and Automation; Voice features cover Microphone.
+          {(dictation.provider ?? 'azure') === 'openai'
+            ? 'Dictation uses OpenAI Realtime for low-latency streaming transcription. Requires Accessibility, Automation, and Microphone permissions.'
+            : 'Dictation uses your configured Azure Speech provider from Audio & Voice settings. Requires Accessibility, Automation, and Microphone permissions. Autopilot covers Accessibility and Automation; Voice features cover Microphone.'}
         </p>
       </div>
     </div>

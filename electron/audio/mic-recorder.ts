@@ -501,6 +501,12 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
   });
 }
 
+/** Get the current recorder window (if alive). Used by streaming-stt. */
+export function getRecorderWindow(): BrowserWindow | null {
+  if (recorderWindow && !recorderWindow.isDestroyed()) return recorderWindow;
+  return null;
+}
+
 export function cleanupMicRecorder(): void {
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.close();

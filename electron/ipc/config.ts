@@ -235,6 +235,7 @@ function getDefaultConfig() {
         ax: 'disabled' as const,
         kb: 'disabled' as const,
       },
+      debugLogging: false,
     },
     advanced: {
       temperature: 0.4,

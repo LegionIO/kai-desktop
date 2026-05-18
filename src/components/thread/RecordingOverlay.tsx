@@ -20,6 +20,8 @@ export interface RecordingOverlayProps {
   inputLevel: number;
   isMuted: boolean;
   isTranscribing?: boolean;
+  isStreaming?: boolean;
+  partialTranscript?: string;
   onToggleMute: () => void;
   onCancel: () => void;
   onDone: () => void;
@@ -30,6 +32,8 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
   inputLevel,
   isMuted,
   isTranscribing,
+  isStreaming,
+  partialTranscript,
   onToggleMute,
   onCancel,
   onDone,
@@ -144,6 +148,15 @@ export const RecordingOverlay: FC<RecordingOverlayProps> = ({
               </span>
             </div>
           </div>
+
+          {/* Live partial transcript (streaming STT only) */}
+          {isStreaming && partialTranscript && (
+            <div className="px-1">
+              <p className="line-clamp-3 text-sm text-foreground/80 italic">
+                {partialTranscript}
+              </p>
+            </div>
+          )}
 
           {/* Row 2: Cancel + Status + Mute + Done */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">

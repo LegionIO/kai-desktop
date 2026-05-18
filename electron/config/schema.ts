@@ -250,9 +250,23 @@ const azureAudioConfigSchema = z.object({
   sttEndpoint: z.string().optional(),     // Custom WebSocket endpoint for STT
 });
 
+/** OpenAI Realtime STT config — used by both dictation and composer STT. */
+const openaiSttConfigSchema = z.object({
+  baseUrl: z.string().optional(),         // WebSocket base URL (default: "wss://api.openai.com")
+  apiKey: z.string().optional(),
+  model: z.string().optional(),           // default: "gpt-realtime-whisper"
+});
+
+const sttConfigSchema = z.object({
+  provider: z.enum(['azure', 'openai']).optional(), // default: follows audio.provider
+  openai: openaiSttConfigSchema.optional(),
+  livePartials: z.boolean().optional(),             // Show live partial text in composer (default: true)
+});
+
 const audioConfigSchema = z.object({
   provider: z.enum(['native', 'azure']).optional(), // default: 'native'
   azure: azureAudioConfigSchema.optional(),
+  stt: sttConfigSchema.optional(),
   tts: z.object({
     enabled: z.boolean(),
     voice: z.string().optional(),
@@ -515,6 +529,8 @@ export const appConfigSchema = z.object({
   computerUse: computerUseConfigSchema,
   dictation: z.object({
     enabled: z.boolean(),
+    provider: z.enum(['azure', 'openai']).optional(), // default: 'azure'
+    openai: openaiSttConfigSchema.optional(),         // Credentials for OpenAI Realtime STT
     hotkey: z.string(),
     mode: z.enum(['toggle', 'hold']),
     inputDeviceId: z.string().nullable().optional(),
@@ -526,6 +542,7 @@ export const appConfigSchema = z.object({
       ax: partialTypingStrategySchema.optional(),
       kb: partialTypingStrategySchema.optional(),
     }).optional(),
+    debugLogging: z.boolean().optional(),
   }).optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

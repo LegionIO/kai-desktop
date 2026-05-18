@@ -1520,6 +1520,8 @@ const Composer: FC<{
     elapsedSec: recordingElapsedSec,
     inputLevel: recordingInputLevel,
     isMuted: recordingMuted,
+    partialTranscript: recordingPartialTranscript,
+    isStreaming: recordingIsStreaming,
     toggleMute: toggleRecordingMute,
     startRecording,
     stopAndTranscribe,
@@ -1694,6 +1696,8 @@ const Composer: FC<{
         inputLevel={recordingInputLevel}
         isMuted={recordingMuted}
         isTranscribing={recordingState === 'transcribing'}
+        isStreaming={recordingIsStreaming}
+        partialTranscript={recordingPartialTranscript}
         onToggleMute={toggleRecordingMute}
         onCancel={handleRecordingCancel}
         onDone={handleRecordingDone}

@@ -421,6 +421,10 @@ const appAPI = {
       ipcRenderer.on('stt:error', handler);
       return () => ipcRenderer.removeListener('stt:error', handler);
     },
+    streamStart: (options?: { deviceId?: string; language?: string }) =>
+      ipcRenderer.invoke('stt:stream-start', options) as Promise<{ ok?: boolean; error?: string }>,
+    streamStop: () => ipcRenderer.invoke('stt:stream-stop') as Promise<{ text: string; error?: string }>,
+    streamCancel: () => ipcRenderer.invoke('stt:stream-cancel') as Promise<{ ok?: boolean }>,
     batchTranscribe: (options: {
       wavBase64?: string;
       tempFilePath?: string;
@@ -531,6 +535,10 @@ const appAPI = {
       ipcRenderer.on('dictation:typing-mode', handler);
       return () => ipcRenderer.removeListener('dictation:typing-mode', handler);
     },
+  },
+
+  titlebar: {
+    doubleClick: () => ipcRenderer.invoke('titlebar:double-click'),
   },
 };
 

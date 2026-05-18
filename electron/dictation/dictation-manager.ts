@@ -15,7 +15,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrowserWindow, globalShortcut, ipcMain } from 'electron';
+import { release } from 'node:os';
+import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
 import { generateText } from 'ai';
 import type { AppConfig } from '../config/schema.js';
@@ -41,6 +42,9 @@ import {
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
 import {
+  clearDictationTargetFocus,
+  getDictationTargetAppName,
+  getDictationTargetBundleId,
   getDictationTargetPid,
   recaptureDictationTargetFocus,
   setDictationExternalFocusRefreshSuppressed,
@@ -55,6 +59,10 @@ import {
   type PartialTypingStrategy,
 } from './partial-typing.js';
 import {
+  OpenAIRealtimeSttSession,
+  resolveOpenAISttConfig,
+} from '../audio/openai-realtime-stt.js';
+import {
   createAxDictationSpanFromSelection,
   selectionMatchesDictationElement,
   selectionMatchesDictationEnd,
@@ -66,7 +74,7 @@ import {
   isSafeKeyboardPatchText,
   normalizeCleanupResponse,
 } from './dictation-safety.js';
-import { dictationDebugLog } from './debug-log.js';
+import { dictationDebugLog, resetDictationDebugSession, setDictationDebugEnabled } from './debug-log.js';
 import {
   DictationNativeSessionClient,
   DictationNativeSessionError,
@@ -74,10 +82,8 @@ import {
   type DictationNativeTypingMode,
 } from './native-session-client.js';
 
-const AX_DEBUG_ENABLED = process.env.KAI_DICTATION_AX_DEBUG === '1';
 function axDebug(msg: string): void {
   dictationDebugLog('AX', { msg });
-  if (AX_DEBUG_ENABLED) console.info(`[Dictation AX] ${msg}`);
 }
 import { parseHotkeyCodes } from './hotkey-codes.js';
 
@@ -85,6 +91,8 @@ export type DictationState = 'idle' | 'starting' | 'active' | 'stopping';
 
 interface DictationConfig {
   enabled: boolean;
+  provider?: 'azure' | 'openai';
+  openai?: { baseUrl?: string; apiKey?: string; model?: string };
   hotkey: string;
   mode: 'toggle' | 'hold';
   inputDeviceId?: string | null;
@@ -93,6 +101,7 @@ interface DictationConfig {
   finalCleanupEnabled?: boolean;
   livePartials?: boolean;
   partialTyping?: PartialTypingConfig;
+  debugLogging?: boolean;
 }
 
 type TypingMode = 'ax' | 'kb' | 'idle';
@@ -116,6 +125,7 @@ let persistConfigValue: PersistConfigValue | null = null;
 // STT state (own instance for dictation, separate from in-app live-stt)
 let recognizer: sdk.SpeechRecognizer | null = null;
 let pushStream: sdk.PushAudioInputStream | null = null;
+let openaiSttSession: OpenAIRealtimeSttSession | null = null;
 
 // Mic capture state
 let recorderWindow: BrowserWindow | null = null;
@@ -132,6 +142,7 @@ let sessionGeneration: number = 0;
 
 // Partial typing state (for live partials mode)
 let partialTypedText: string = '';
+let lastRawPartialText: string = '';
 let partialTypingStrategyUsed: PartialTypingStrategy | null = null;
 let partialTypingModeUsed: PartialTypingMode | null = null;
 const queuedPartialGate = new DictationQueuedPartialGate();
@@ -168,6 +179,8 @@ const MIC_DRAIN_SLOW_LOG_MS = 250;
 const LEVEL_POLL_SLOW_LOG_MS = 250;
 const MAX_SAFE_BACKSPACES = 120;
 const HOTKEY_SUSPEND_TTL_MS = 20_000;
+const STOP_SESSION_OVERALL_TIMEOUT_MS = 8_000;
+const NATIVE_SESSION_END_TIMEOUT_MS = 3_000;
 const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
 const DICTATION_SOUND_BY_KIND: Record<DictationSoundKind, string> = {
   start: 'Blow',
@@ -205,6 +218,19 @@ let lastTargetRefreshAt = 0;
 let nativeSession: DictationNativeSessionClient | null = null;
 let nativeSessionClosing = false;
 
+/**
+ * Transition lock — serializes all state machine transitions (start/stop/toggle).
+ * Prevents concurrent overlapping calls from corrupting state when the hotkey
+ * is spammed rapidly.
+ */
+let transitionLock: Promise<void> = Promise.resolve();
+
+function withTransitionLock(fn: () => Promise<void>): Promise<void> {
+  const next = transitionLock.then(fn, fn);
+  transitionLock = next.catch(() => {});
+  return next;
+}
+
 /** Maximum hold duration before auto-stop (5 minutes) */
 const HOLD_SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -215,6 +241,7 @@ export function initDictation(appConfig: AppConfig, setConfig?: PersistConfigVal
   fullConfig = appConfig;
   persistConfigValue = setConfig ?? persistConfigValue;
   config = appConfig.dictation as DictationConfig | undefined ?? null;
+  setDictationDebugEnabled(config?.debugLogging === true);
   if (config?.enabled && config.hotkey) {
     registerHotkey(config.hotkey);
     createDictationOverlay();
@@ -232,6 +259,7 @@ export function updateDictationConfig(appConfig: AppConfig): void {
 
   fullConfig = appConfig;
   config = newConfig;
+  setDictationDebugEnabled(newConfig?.debugLogging === true);
 
   // Re-register hotkey if it changed
   if (oldHotkey !== newConfig?.hotkey || oldEnabled !== newConfig?.enabled) {
@@ -269,14 +297,16 @@ export function cleanupDictation(): void {
 }
 
 /**
- * Toggle dictation on/off.
+ * Toggle dictation on/off. Serialized via transition lock to prevent races.
  */
 export async function toggleDictation(): Promise<void> {
-  if (state === 'active' || state === 'starting') {
-    await stopDictation();
-  } else if (state === 'idle') {
-    await startDictation();
-  }
+  return withTransitionLock(async () => {
+    if (state === 'active' || state === 'starting') {
+      await stopDictationInner();
+    } else if (state === 'idle') {
+      await startDictationInner();
+    }
+  });
 }
 
 /**
@@ -296,6 +326,20 @@ export function getDictationState(): {
   };
 }
 
+/**
+ * Start dictation. Serialized via transition lock.
+ */
+async function startDictation(): Promise<void> {
+  return withTransitionLock(() => startDictationInner());
+}
+
+/**
+ * Stop dictation. Serialized via transition lock.
+ */
+async function stopDictation(): Promise<void> {
+  return withTransitionLock(() => stopDictationInner());
+}
+
 // ─── Private ─────────────────────────────────────────────────────────────────
 
 function registerHotkey(hotkey: string): void {
@@ -305,17 +349,12 @@ function registerHotkey(hotkey: string): void {
         // Hold mode: key-down starts dictation, key-up stops it.
         // globalShortcut only fires on key-down, so we start here
         // and use a native monitor to detect release.
+        // The transition lock ensures that if requestHoldStop() fires
+        // during startup, stopDictation() waits for start to finish.
         if (state === 'idle') {
           holdReleaseRequested = false;
           startHoldMonitor(hotkey);
-          void startDictation().then(() => {
-            if (holdReleaseRequested && state === 'active') {
-              console.info('[Dictation] Hold mode: release happened during startup, stopping');
-              void stopDictation();
-            } else if (state !== 'active') {
-              stopHoldMonitor();
-            }
-          });
+          void startDictation();
         }
       } else {
         // Toggle mode: press to start, press again to stop.
@@ -444,6 +483,28 @@ function normalizeNativeTypingMode(mode: DictationNativeTypingMode | undefined):
 }
 
 function applyNativeSessionResponse(response: DictationNativeSessionResponse): void {
+  dictationDebugLog('NATIVE_RESPONSE', {
+    typingMode: response.typingMode,
+    capturedAx: response.capturedAx,
+    strategy: response.strategy,
+    partialText: response.partialText,
+    targetPid: response.targetPid,
+    targetName: response.targetName,
+    targetBundleId: response.targetBundleId,
+    applied: response.applied,
+    error: response.error,
+    errorCode: response.errorCode,
+    ...(response.debug ? {
+      role: response.debug.role,
+      subrole: response.debug.subrole,
+      identifier: response.debug.identifier,
+      placeholderValue: response.debug.placeholderValue,
+      valueLength: response.debug.valueLength,
+      selectedRangeLocation: response.debug.selectedRangeLocation,
+      selectedRangeLength: response.debug.selectedRangeLength,
+      isSecure: response.debug.isSecure,
+    } : {}),
+  });
   partialTypedText = typeof response.partialText === 'string' ? response.partialText : partialTypedText;
   if (response.strategy === 'disabled' || response.strategy == null) {
     if (!partialTypedText) {
@@ -470,7 +531,7 @@ function handleNativeSessionExit(generation: number, message: string): void {
   void stopDictation();
 }
 
-async function startDictation(): Promise<void> {
+async function startDictationInner(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
   state = 'starting';
@@ -478,6 +539,7 @@ async function startDictation(): Promise<void> {
   const generation = sessionGeneration;
   const initializationStartedAt = Date.now();
   broadcastState();
+  resetDictationDebugSession();
   dictationDebugLog('SESSION_START', { generation });
 
   try {
@@ -492,13 +554,41 @@ async function startDictation(): Promise<void> {
       onExit: (message) => handleNativeSessionExit(generation, message),
     });
     await nativeSession.start();
-    const beginResponse = await nativeSession.beginSession({
+    dictationDebugLog('NATIVE_BEGIN_SESSION', {
+      partialTypingAx: config.partialTyping?.ax,
+      partialTypingKb: config.partialTyping?.kb,
+      livePartials: config.livePartials,
+      allowBlindKeyboardFullPatch: canAllowBlindKeyboardFullPatchConfig(),
+      cleanupEnabled: config.finalCleanupEnabled,
+      sttProvider: config.provider ?? 'azure',
+      language: config.language,
+      hotkeyMode: config.mode,
+      ownPid: process.pid,
+      appVersion: app.getVersion(),
+      electronVersion: process.versions.electron,
+      macosRelease: release(),
+      arch: process.arch,
+    });
+    // Use unchecked beginSession so that soft failures (e.g. cursor_unverified)
+    // don't abort the session — we proceed in degraded KX/blind keyboard mode.
+    const beginResponse = await nativeSession.beginSessionUnchecked({
       partialTyping: config.partialTyping,
       livePartials: config.livePartials,
       allowBlindKeyboardFullPatch: canAllowBlindKeyboardFullPatchConfig(),
       ownPid: process.pid,
       ownAppName: __BRAND_PRODUCT_NAME,
+      debugLogging: config.debugLogging,
     });
+    const beginSessionDegraded = beginResponse.ok === false;
+    if (beginSessionDegraded) {
+      dictationDebugLog('NATIVE_BEGIN_DEGRADED', {
+        generation,
+        errorCode: beginResponse.errorCode,
+        error: beginResponse.error,
+        targetPid: beginResponse.targetPid,
+        targetName: beginResponse.targetName,
+      });
+    }
     applyNativeSessionResponse(beginResponse);
     setDictationTargetFocusSnapshot(nativeSession.getTargetSnapshot(beginResponse));
     setDictationExternalFocusRefreshSuppressed(true);
@@ -509,6 +599,7 @@ async function startDictation(): Promise<void> {
       targetPid: beginResponse.targetPid,
       capturedAx: beginResponse.capturedAx,
       mode: beginResponse.typingMode,
+      degraded: beginSessionDegraded,
     });
     if (!isStartingSession(generation)) return;
 
@@ -577,6 +668,10 @@ async function startDictation(): Promise<void> {
       generation,
       mode: lastBroadcastedMode,
       targetPid: getDictationTargetPid(),
+      targetApp: getDictationTargetAppName(),
+      targetBundleId: getDictationTargetBundleId(),
+      axSpanLocation: axDictationSpan?.location,
+      axSpanLen: axDictationSpan?.typedUtf16Length,
       initializationMs: Date.now() - initializationStartedAt,
     });
     console.info('[Dictation] Started');
@@ -616,7 +711,7 @@ async function _ensureDictationTargetIdentified(): Promise<void> {
   }
 }
 
-async function stopDictation(): Promise<void> {
+async function stopDictationInner(): Promise<void> {
   if (state === 'idle') {
     hideDictationOverlay();
     return;
@@ -634,7 +729,7 @@ async function stopDictation(): Promise<void> {
   dictationDebugLog('SESSION_STOP_REQUESTED', { generation: sessionGeneration });
 
   try {
-    await finishSession();
+    await withTimeout(finishSession(), STOP_SESSION_OVERALL_TIMEOUT_MS, 'Dictation session stop');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.warn('[Dictation] Stop cleanup failed:', err);
@@ -734,10 +829,12 @@ async function refreshTypingTargetSnapshot(reason: string): Promise<void> {
       reason,
       ok: false,
       pid: getDictationTargetPid(),
+      targetApp: getDictationTargetAppName(),
       canApplyAxSnapshot: false,
       capturedAx: false,
       skipped: nativeSession ? 'typing-started' : 'no-native-session',
       mode: lastBroadcastedMode,
+      partialTypedText,
       durationMs: lastTargetRefreshAt - startedAt,
     });
     return;
@@ -752,9 +849,12 @@ async function refreshTypingTargetSnapshot(reason: string): Promise<void> {
     reason,
     ok: response.ok !== false,
     pid: getDictationTargetPid(),
+    targetApp: getDictationTargetAppName(),
     canApplyAxSnapshot: partialTypedText.length === 0,
     capturedAx: response.capturedAx === true,
     mode: response.typingMode,
+    axSpanLocation: axDictationSpan?.location,
+    axSpanLen: axDictationSpan?.typedUtf16Length,
     durationMs: lastTargetRefreshAt - startedAt,
   });
 }
@@ -790,18 +890,20 @@ async function endNativeSession(): Promise<void> {
   if (!session) return;
   nativeSessionClosing = true;
   try {
-    await session.endSession();
+    await withTimeout(session.endSession(), NATIVE_SESSION_END_TIMEOUT_MS, 'Native session end');
   } catch (err) {
     dictationDebugLog('NATIVE_SESSION_END_FAILED', {
       message: err instanceof Error ? err.message : String(err),
     });
   } finally {
+    session.close();
     nativeSessionClosing = false;
   }
 }
 
 function resetSessionState(): void {
   partialTypedText = '';
+  lastRawPartialText = '';
   partialTypingStrategyUsed = null;
   partialTypingModeUsed = null;
   keyboardPatchStateUnverified = false;
@@ -821,6 +923,7 @@ function resetSessionState(): void {
   lastBroadcastedMode = 'idle';
   lastAxCaptureAttempt = 0;
   sttCancellationStopRequested = false;
+  clearDictationTargetFocus();
   setDictationExternalFocusRefreshSuppressed(false);
 }
 
@@ -879,11 +982,12 @@ function requestHoldStop(reason: string): void {
 
   holdReleaseRequested = true;
   console.info('[Dictation] Hold mode: %s, stopping', reason);
-  if (state === 'active') {
+  if (state === 'active' || state === 'starting') {
     void stopDictation();
   } else if (state === 'idle') {
     stopHoldMonitor();
   }
+  // If state === 'stopping', stopDictation is already in-flight via the lock.
 }
 
 /**
@@ -1004,12 +1108,22 @@ async function drainRemainingAudioToStt(): Promise<void> {
 }
 
 function writeAudioChunksToStt(chunks: string[]): void {
-  if (!pushStream) return;
-  for (const chunk of chunks) {
-    try {
-      const buf = Buffer.from(chunk, 'base64');
-      pushStream.write(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
-    } catch { /* ignore */ }
+  // Azure Speech SDK path
+  if (pushStream) {
+    for (const chunk of chunks) {
+      try {
+        const buf = Buffer.from(chunk, 'base64');
+        pushStream.write(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  // OpenAI Realtime STT path
+  if (openaiSttSession) {
+    for (const chunk of chunks) {
+      openaiSttSession.pushAudio(chunk);
+    }
   }
 }
 
@@ -1034,7 +1148,45 @@ async function getMicLevel(): Promise<number> {
 async function startStt(): Promise<void> {
   if (!fullConfig) throw new Error('No config available');
 
-  const audio = fullConfig.audio as {
+  const dictationProvider = config?.provider ?? 'azure';
+
+  if (dictationProvider === 'openai') {
+    await startOpenAIStt();
+  } else {
+    await startAzureStt();
+  }
+}
+
+async function startOpenAIStt(): Promise<void> {
+  const sttConfig = resolveOpenAISttConfig(fullConfig as Record<string, unknown>, 'dictation');
+  if (!sttConfig) {
+    throw new Error('No OpenAI Realtime STT credentials configured. Configure them in Dictation settings.');
+  }
+
+  const audio = fullConfig!.audio as { recording?: { language?: string }; azure?: { sttLanguage?: string } };
+  const language = config?.language ?? audio?.recording?.language ?? audio?.azure?.sttLanguage ?? 'en-US';
+  const sampleRateHz = normalizeMicSampleRate(micSampleRateHz);
+
+  console.info('[Dictation] Starting OpenAI Realtime STT: baseUrl=%s, model=%s, language=%s, sampleRateHz=%d',
+    sttConfig.baseUrl, sttConfig.model, language, sampleRateHz);
+
+  openaiSttSession = new OpenAIRealtimeSttSession(
+    { ...sttConfig, sampleRate: sampleRateHz, language },
+    {
+      onPartial: (text) => { handlePartial(text); },
+      onFinal: (text) => { handleFinal(text); },
+      onError: (error) => {
+        console.error('[Dictation] OpenAI STT error: %s', error);
+        handleSttCancellationError();
+      },
+    },
+  );
+
+  await openaiSttSession.start();
+}
+
+async function startAzureStt(): Promise<void> {
+  const audio = fullConfig!.audio as {
     azure?: { region?: string; subscriptionKey?: string; sttLanguage?: string; sttEndpoint?: string; endpoint?: string };
     recording?: { language?: string };
   };
@@ -1123,6 +1275,14 @@ async function startStt(): Promise<void> {
 }
 
 async function stopStt(): Promise<void> {
+  // OpenAI Realtime STT cleanup
+  if (openaiSttSession) {
+    try { await openaiSttSession.stop(); } catch { /* ignore */ }
+    openaiSttSession.destroy();
+    openaiSttSession = null;
+  }
+
+  // Azure Speech SDK cleanup
   if (pushStream) {
     try { pushStream.close(); } catch { /* ignore */ }
     pushStream = null;
@@ -1290,12 +1450,18 @@ function delay(ms: number): Promise<void> {
 function handlePartial(text: string): void {
   if (state !== 'active') return;
   sendToOverlay('dictation:partial', text);
+  const sameAsPrevious = text === lastRawPartialText;
   dictationDebugLog('PARTIAL_RECEIVED', {
+    generation: sessionGeneration,
     revision: queuedPartialGate.currentRevision(),
+    text,
     textLen: text.length,
     partialTypedLen: partialTypedText.length,
     mode: getBroadcastTypingMode(),
+    sameAsPrevious,
+    isPrefix: !sameAsPrevious && text.startsWith(lastRawPartialText),
   });
+  lastRawPartialText = text;
 
   if (!hasEnabledPartialTypingStrategy(config)) return;
 
@@ -1311,8 +1477,12 @@ function handlePartial(text: string): void {
       ageMs: Date.now() - enqueuedAt,
       mode: lastBroadcastedMode,
       strategy: partialTypingStrategyUsed,
-      currentLen: partialTypedText.length,
-      targetLen: text.length,
+      currentText: partialTypedText,
+      targetText: text,
+      targetApp: getDictationTargetAppName(),
+      targetPid: getDictationTargetPid(),
+      axSpanLocation: axDictationSpan?.location,
+      axSpanLen: axDictationSpan?.typedUtf16Length,
     });
 
     const response = await nativeSession.applyPartial(text);
@@ -1325,17 +1495,42 @@ function handleFinal(text: string): void {
   if (state !== 'active' && state !== 'stopping') return;
   sendToOverlay('dictation:final', text);
   dictationDebugLog('FINAL_RECEIVED', {
+    generation: sessionGeneration,
+    text,
     textLen: text.length,
+    lastPartialText: lastRawPartialText,
+    matchesLastPartial: text === lastRawPartialText,
+    lastPartialIsPrefix: lastRawPartialText.length > 0 && text.startsWith(lastRawPartialText),
+    partialTypedText,
     partialTypedLen: partialTypedText.length,
     strategy: partialTypingStrategyUsed,
     mode: partialTypingModeUsed,
+    cleanupEnabled: config?.finalCleanupEnabled,
+    targetApp: getDictationTargetAppName(),
+    targetPid: getDictationTargetPid(),
   });
+  lastRawPartialText = '';
 
   const generation = sessionGeneration;
   queuedPartialGate.invalidateQueuedPartials();
   enqueueTyping(generation, 'final', async () => {
     const finalText = await maybeCleanupFinalTranscript(text);
     if (!isCurrentTypingSession(generation)) return;
+    dictationDebugLog('FINAL_APPLY_START', {
+      rawText: text,
+      cleanedText: finalText,
+      wasModified: finalText !== text,
+      keyboardPatchStateUnverified,
+      axSpanLocation: axDictationSpan?.location,
+      axSpanLen: axDictationSpan?.typedUtf16Length,
+      axSpanElement: axDictationSpan?.elementSignature?.slice(0, 30),
+      partialTypedText,
+      targetApp: getDictationTargetAppName(),
+      targetBundleId: getDictationTargetBundleId(),
+      targetPid: getDictationTargetPid(),
+      mode: lastBroadcastedMode,
+      strategy: partialTypingStrategyUsed,
+    });
 
     if (keyboardPatchStateUnverified) {
       axDebug('final found unverified keyboard patch state; attempting recovery');
@@ -1367,12 +1562,22 @@ function handleFinal(text: string): void {
     if (!isCurrentTypingSession(generation)) return;
     applied = applied && response.applied !== false;
     if (!applied) {
+      dictationDebugLog('FINAL_APPLY_FAILED', {
+        textLen: finalWithSpace.length,
+        responseApplied: response.applied,
+        responseError: response.error,
+      });
       clearUnverifiedKeyboardPatchState();
       resetPartialTypingProgress();
       axSuppressedUntilNextFinal = false;
       broadcastFinalTypingFailure();
       return;
     }
+    dictationDebugLog('FINAL_APPLY_OK', {
+      textLen: finalWithSpace.length,
+      typingMode: response.typingMode,
+      strategy: response.strategy,
+    });
     clearUnverifiedKeyboardPatchState();
     blindKeyboardPatchTargetPid = null;
     axDictationSpan = null;
@@ -1385,6 +1590,13 @@ function handleFinal(text: string): void {
 }
 
 function resetPartialTypingProgress(): void {
+  dictationDebugLog('PARTIAL_PROGRESS_RESET', {
+    clearedTextLen: partialTypedText.length,
+    oldStrategy: partialTypingStrategyUsed,
+    oldMode: partialTypingModeUsed,
+    hadAxSpan: Boolean(axDictationSpan),
+    axSpanLocation: axDictationSpan?.location,
+  });
   partialTypedText = '';
   partialTypingStrategyUsed = null;
   partialTypingModeUsed = null;
@@ -1906,6 +2118,7 @@ async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpa
   axDebug(`capture: targetPid=${pid}`);
   if (pid == null) {
     axDebug('capture FAILED: no dictation target PID');
+    dictationDebugLog('AX_CAPTURE', { ok: false, reason: 'no-target-pid' });
     return null;
   }
   try {
@@ -1919,14 +2132,31 @@ async function captureFocusedTextSelectionForAxRewrite(): Promise<AxDictationSpa
     );
     if (!span) {
       axDebug(`capture FAILED: invalid location=${selection?.location} length=${selection?.length} element=${selection?.elementSignature ?? 'none'}`);
+      dictationDebugLog('AX_CAPTURE', {
+        ok: false,
+        reason: 'invalid-selection',
+        pid,
+        location: selection?.location,
+        length: selection?.length,
+        elementSignature: selection?.elementSignature,
+      });
       return null;
     }
+    dictationDebugLog('AX_CAPTURE', {
+      ok: true,
+      pid,
+      targetApp: getDictationTargetAppName(),
+      location: span.location,
+      typedUtf16Length: span.typedUtf16Length,
+      elementSignature: span.elementSignature?.slice(0, 30),
+    });
     axDebug(`capture OK: location=${span.location} length=${span.typedUtf16Length} pid=${pid} element=${span.elementSignature}`);
     return span;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     lastAxCaptureFailureMessage = msg;
     axDebug(`capture EXCEPTION: ${msg}`);
+    dictationDebugLog('AX_CAPTURE', { ok: false, reason: 'exception', pid, error: msg });
     return null;
   }
 }
@@ -2149,6 +2379,13 @@ function updateAxDictationSpanLength(text: string, utf16Length?: unknown): void 
 }
 
 function suppressAxForCurrentUtterance(reason: string): void {
+  dictationDebugLog('AX_SUPPRESS', {
+    reason,
+    partialTypedLen: partialTypedText.length,
+    strategy: partialTypingStrategyUsed,
+    mode: partialTypingModeUsed,
+    targetPid: getDictationTargetPid(),
+  });
   axDictationSpan = null;
   axSuppressedUntilNextFinal = true;
   broadcastTypingMode(getBroadcastTypingMode());
@@ -2197,11 +2434,27 @@ async function verifyDictationSpanStartingState(
   try {
     if (options?.requireTextMatch && currentText.length > 0) {
       const state = await readFocusedTextRangeState(span.pid, span.location, currentText.length);
-      return Boolean(
+      const ok = Boolean(
         state
         && selectionMatchesDictationStart(span, state, currentText.length)
         && state.rangeText === currentText,
       );
+      if (!ok) {
+        dictationDebugLog('VERIFY_SPAN_START_FAIL', {
+          reason: 'textMatch',
+          spanLocation: span.location,
+          spanLen: span.typedUtf16Length,
+          spanPid: span.pid,
+          expectedText: currentText,
+          actualRangeText: state?.rangeText,
+          actualSelLocation: state?.location,
+          actualSelLen: state?.length,
+          rangeTextMatches: state?.rangeText === currentText,
+          elementSig: span.elementSignature?.slice(0, 30),
+          targetApp: getDictationTargetAppName(),
+        });
+      }
+      return ok;
     }
 
     const selection = await readFocusedTextSelection(span.pid);
@@ -2212,6 +2465,19 @@ async function verifyDictationSpanStartingState(
     if (options?.allowRecordedTextRecovery && currentText.length > 0) {
       return verifyRecordedAxTextAtSpan(span, currentText);
     }
+    dictationDebugLog('VERIFY_SPAN_START_FAIL', {
+      reason: 'selectionMismatch',
+      spanLocation: span.location,
+      spanLen: span.typedUtf16Length,
+      spanPid: span.pid,
+      currentTextLen: currentText.length,
+      currentText,
+      actualSelLocation: selection?.location,
+      actualSelLen: selection?.length,
+      actualElement: selection?.elementSignature?.slice(0, 30),
+      expectedElement: span.elementSignature?.slice(0, 30),
+      targetApp: getDictationTargetAppName(),
+    });
     return false;
   } catch (err) {
     axDebug(`verifyDictationSpanStartingState FAILED: ${err}`);
@@ -2368,11 +2634,25 @@ async function verifyKeyboardPatchEndingState(targetText: string): Promise<boole
 
   try {
     const state = await readFocusedTextRangeState(span.pid, span.location, targetText.length);
-    return Boolean(
+    const ok = Boolean(
       state
       && selectionMatchesDictationEnd(span, state, targetText.length)
       && state.rangeText === targetText,
     );
+    if (!ok) {
+      dictationDebugLog('VERIFY_KB_PATCH_END_FAIL', {
+        spanLocation: span.location,
+        spanLen: span.typedUtf16Length,
+        expectedText: targetText,
+        actualRangeText: state?.rangeText,
+        actualSelLocation: state?.location,
+        actualSelLen: state?.length,
+        rangeTextMatches: state?.rangeText === targetText,
+        targetApp: getDictationTargetAppName(),
+        targetPid: span.pid,
+      });
+    }
+    return ok;
   } catch (err) {
     axDebug(`verifyKeyboardPatchEndingState FAILED: ${err}`);
     return false;
@@ -2485,6 +2765,14 @@ function broadcastError(message: string): void {
 
 function broadcastTypingMode(mode: TypingMode): void {
   if (mode === lastBroadcastedMode) return;
+  dictationDebugLog('TYPING_MODE_CHANGE', {
+    from: lastBroadcastedMode,
+    to: mode,
+    axSpanLocation: axDictationSpan?.location,
+    axSpanLen: axDictationSpan?.typedUtf16Length,
+    axSuppressed: axSuppressedUntilNextFinal,
+    blindKxPid: blindKeyboardPatchTargetPid,
+  });
   lastBroadcastedMode = mode;
   sendToOverlay('dictation:typing-mode', mode);
 }

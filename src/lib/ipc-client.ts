@@ -302,6 +302,9 @@ type AppAPI = {
     onError: (callback: (message: string) => void) => () => void;
     onTypingMode: (callback: (mode: string) => void) => () => void;
   };
+  titlebar: {
+    doubleClick: () => Promise<void>;
+  };
 };
 
 type DictationRuntimeState = {

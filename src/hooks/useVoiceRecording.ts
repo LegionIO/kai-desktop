@@ -7,10 +7,9 @@
  *
  * Transcription strategy:
  * - Web bridge (browser): uses BackgroundSpeechCollector (Web Speech API)
- * - Electron + Azure configured: IPC mic recording → WAV → batchTranscribe
- * - Electron + native provider: IPC mic recording → WAV → batchTranscribe
- *   still requires Azure credentials; falls back to empty transcript if
- *   no Azure key is set (Web Speech API doesn't work in Electron).
+ * - Electron + OpenAI streaming STT: IPC stt:stream-start/stop with live partials
+ *   (streaming-stt.ts owns mic lifecycle — no separate startRecording needed)
+ * - Electron + batch: IPC mic recording → WAV → batchTranscribe (Azure/Whisper)
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react';
@@ -56,6 +55,12 @@ type MicApi = {
     wavBase64?: string;
     language: string;
   }) => Promise<{ text: string; error?: string }>;
+  streamStart: (options?: { deviceId?: string; language?: string }) => Promise<{ ok?: boolean; error?: string }>;
+  streamStop: () => Promise<{ text: string; error?: string }>;
+  streamCancel: () => Promise<{ ok?: boolean }>;
+  onPartial: (callback: (text: string) => void) => () => void;
+  onFinal: (callback: (text: string) => void) => () => void;
+  onSttError: (callback: (error: string) => void) => () => void;
 };
 
 export interface UseVoiceRecordingResult {
@@ -63,6 +68,8 @@ export interface UseVoiceRecordingResult {
   elapsedSec: number;
   inputLevel: number;
   isMuted: boolean;
+  partialTranscript: string;
+  isStreaming: boolean;
   toggleMute: () => void;
   startRecording: () => void;
   stopAndTranscribe: () => Promise<string>;
@@ -75,11 +82,18 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [inputLevel, setInputLevel] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
+  const [partialTranscript, setPartialTranscript] = useState('');
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const collectorRef = useRef<BackgroundSpeechCollector | null>(null);
   const webMonitorUnsubRef = useRef<(() => void) | null>(null);
+  const partialUnsubRef = useRef<(() => void) | null>(null);
+  const finalUnsubRef = useRef<(() => void) | null>(null);
+  const errorUnsubRef = useRef<(() => void) | null>(null);
+  const isStreamingRef = useRef(false);
+  const isBatchRecordingRef = useRef(false);
+  const startingRef = useRef(false); // Synchronous guard against double-start
 
   const isWebBridge = Boolean(
     (window as unknown as Record<string, unknown>).app &&
@@ -90,10 +104,15 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     provider?: string;
     azure?: { subscriptionKey?: string; region?: string; endpoint?: string; sttLanguage?: string };
     recording?: { enabled?: boolean; language?: string; inputDeviceId?: string };
+    stt?: { provider?: string; openai?: { baseUrl?: string; apiKey?: string; model?: string }; livePartials?: boolean };
   } | undefined;
   const recordingConfig = audioConfig?.recording;
   const selectedDeviceId = recordingConfig?.inputDeviceId;
   const language = recordingConfig?.language ?? audioConfig?.azure?.sttLanguage ?? 'en-US';
+
+  // Determine if streaming STT is available
+  const useStreamingStt = audioConfig?.stt?.provider === 'openai' && Boolean(audioConfig?.stt?.openai?.apiKey);
+  const livePartials = audioConfig?.stt?.livePartials !== false; // default true
 
   // ── Helpers ─────────────────────────────────────────────────────
 
@@ -106,12 +125,20 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     if (levelTimerRef.current) { clearInterval(levelTimerRef.current); levelTimerRef.current = null; }
     webMonitorUnsubRef.current?.();
     webMonitorUnsubRef.current = null;
+    partialUnsubRef.current?.();
+    partialUnsubRef.current = null;
+    finalUnsubRef.current?.();
+    finalUnsubRef.current = null;
+    errorUnsubRef.current?.();
+    errorUnsubRef.current = null;
   }, []);
 
   // ── Start Recording ──────────────────────────────────────────────
 
   const startRecording = useCallback(async () => {
     if (recordingState !== 'idle') return;
+    if (startingRef.current) return; // Prevent double-start before state updates
+    startingRef.current = true;
 
     const deviceId = selectedDeviceId ?? 'default';
 
@@ -140,6 +167,7 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
         const levels = monitor.getLevels();
         setInputLevel(levels[deviceId] ?? 0);
       }, 66);
+      startingRef.current = false;
       return;
     }
 
@@ -149,9 +177,91 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       debugLog('mic API not available');
       cleanupTimers();
       setRecordingState('idle');
+      startingRef.current = false;
       return;
     }
 
+    // ── Streaming STT path (OpenAI Realtime) ──
+    // streaming-stt.ts owns mic lifecycle: it calls startLiveStream/stopLiveStream internally.
+    // We only call streamStart/streamStop and subscribe to partial/final events.
+    if (useStreamingStt) {
+      debugLog(`starting streaming STT, device=${deviceId}, language=${language}`);
+      isStreamingRef.current = true;
+      setPartialTranscript('');
+
+      // Subscribe to partial/final transcript events
+      if (livePartials) {
+        partialUnsubRef.current = mic.onPartial((text) => {
+          setPartialTranscript(text);
+        });
+      }
+      finalUnsubRef.current = mic.onFinal((text) => {
+        setPartialTranscript(text);
+      });
+
+      // Subscribe to error events to reset UI if backend dies
+      errorUnsubRef.current = mic.onSttError(() => {
+        debugLog('STT error received, resetting UI');
+        cleanupTimers();
+        isStreamingRef.current = false;
+        setRecordingState('idle');
+        setElapsedSec(0);
+        setInputLevel(0);
+        setPartialTranscript('');
+        startingRef.current = false;
+        // Release the audio level monitor to prevent resource leak
+        mic.stopMonitor().catch(() => { /* ignore */ });
+      });
+
+      // Start the streaming session (handles mic start internally)
+      try {
+        const streamResult = await mic.streamStart({
+          deviceId: selectedDeviceId ?? undefined,
+          language,
+        });
+        if (streamResult.error) {
+          debugLog(`stream start error: ${streamResult.error}`);
+          cleanupTimers();
+          isStreamingRef.current = false;
+          setRecordingState('idle');
+          startingRef.current = false;
+          return;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        debugLog(`stream start exception: ${message}`);
+        cleanupTimers();
+        isStreamingRef.current = false;
+        setRecordingState('idle');
+        startingRef.current = false;
+        return;
+      }
+
+      // Level monitoring (separate from mic capture — uses the monitor API)
+      // Guard: if canceled during the await above, don't set up level polling
+      if (!isStreamingRef.current) {
+        startingRef.current = false;
+        return;
+      }
+      try { await mic.startMonitor([deviceId]); } catch { /* ignore */ }
+      if (!isStreamingRef.current) {
+        // Canceled during startMonitor await — clean up
+        mic.stopMonitor().catch(() => { /* ignore */ });
+        startingRef.current = false;
+        return;
+      }
+      levelTimerRef.current = setInterval(() => {
+        mic.getLevel().then((levels) => {
+          setInputLevel(levels[deviceId] ?? 0);
+        }).catch(() => setInputLevel(0));
+      }, 66);
+
+      debugLog('streaming STT started');
+      startingRef.current = false;
+      return;
+    }
+
+    // ── Batch recording path (existing) ──
     try {
       // Start recording before monitoring so the meter can attach to the
       // already-open mic stream on first-run device warmup.
@@ -161,6 +271,7 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
         debugLog(`start error: ${result.error}`);
         cleanupTimers();
         setRecordingState('idle');
+        startingRef.current = false;
         return;
       }
 
@@ -172,6 +283,7 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       }
 
       debugLog(`recording started, device=${deviceId}, language=${language}`);
+      isBatchRecordingRef.current = true;
 
       // Audio level polling
       levelTimerRef.current = setInterval(() => {
@@ -185,7 +297,8 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       cleanupTimers();
       setRecordingState('idle');
     }
-  }, [recordingState, selectedDeviceId, language, isWebBridge, cleanupTimers, getMic]);
+    startingRef.current = false;
+  }, [recordingState, selectedDeviceId, language, isWebBridge, useStreamingStt, livePartials, cleanupTimers, getMic]);
 
   // ── Stop & Transcribe ────────────────────────────────────────────
 
@@ -208,20 +321,60 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
       setElapsedSec(0);
       setInputLevel(0);
       setIsMuted(false);
+      setPartialTranscript('');
       return transcript;
     }
 
-    // Electron: stop IPC recording → get WAV → transcribe
+    // Electron: stop recording
     const mic = getMic();
     if (!mic) {
       setRecordingState('idle');
       setElapsedSec(0);
       setInputLevel(0);
       setIsMuted(false);
+      setPartialTranscript('');
       return '';
     }
 
+    // ── Streaming STT stop path ──
+    // streaming-stt.ts handles: final drain → commit → wait for transcription → stop mic
+    if (isStreamingRef.current) {
+      setRecordingState('transcribing');
+      isStreamingRef.current = false;
+
+      try {
+        mic.stopMonitor().catch(() => { /* ignore */ });
+
+        debugLog('stopping stream...');
+        const result = await mic.streamStop();
+
+        if (result.error) {
+          debugLog(`stream stop error: ${result.error}`);
+        } else {
+          debugLog(`stream stop: chars=${result.text.length}`);
+        }
+
+        const transcript = result.text ?? '';
+        setRecordingState('idle');
+        setElapsedSec(0);
+        setInputLevel(0);
+        setIsMuted(false);
+        setPartialTranscript('');
+        return transcript;
+      } catch (err) {
+        console.error('[useVoiceRecording] Stream stop failed:', err);
+        setRecordingState('idle');
+        setElapsedSec(0);
+        setInputLevel(0);
+        setIsMuted(false);
+        setPartialTranscript('');
+        return '';
+      }
+    }
+
+    // ── Batch stop path (existing) ──
     setRecordingState('transcribing');
+    isBatchRecordingRef.current = false;
 
     try {
       mic.stopMonitor().catch(() => { /* ignore */ });
@@ -281,7 +434,13 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     } else {
       const mic = getMic();
       if (mic) {
-        mic.cancelRecording().catch(() => { /* ignore */ });
+        if (isStreamingRef.current) {
+          // Use streamCancel — tears down immediately without committing audio
+          mic.streamCancel().catch(() => { /* ignore */ });
+          isStreamingRef.current = false;
+        } else {
+          mic.cancelRecording().catch(() => { /* ignore */ });
+        }
         mic.stopMonitor().catch(() => { /* ignore */ });
       }
     }
@@ -290,6 +449,7 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     setElapsedSec(0);
     setInputLevel(0);
     setIsMuted(false);
+    setPartialTranscript('');
   }, [recordingState, isWebBridge, cleanupTimers, getMic]);
 
   // ── Toggle Mute ─────────────────────────────────────────────────
@@ -304,6 +464,26 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     return () => {
       cleanupTimers();
       collectorRef.current?.destroy();
+
+      const mic = (window as unknown as { app?: { mic?: MicApi } }).app?.mic;
+      if (isStreamingRef.current) {
+        // Cancel active streaming session on unmount to prevent leak
+        if (mic) {
+          mic.streamCancel().catch(() => { /* ignore */ });
+          mic.stopMonitor().catch(() => { /* ignore */ });
+        }
+        isStreamingRef.current = false;
+      } else if (isBatchRecordingRef.current) {
+        // Cancel active batch recording on unmount
+        if (mic) {
+          mic.cancelRecording().catch(() => { /* ignore */ });
+          mic.stopMonitor().catch(() => { /* ignore */ });
+        }
+        isBatchRecordingRef.current = false;
+      } else if (mic) {
+        // Stop monitor if nothing else is active
+        mic.stopMonitor().catch(() => { /* ignore */ });
+      }
     };
   }, [cleanupTimers]);
 
@@ -312,6 +492,8 @@ export function useVoiceRecording(): UseVoiceRecordingResult {
     elapsedSec,
     inputLevel: isMuted ? 0 : inputLevel,
     isMuted,
+    partialTranscript,
+    isStreaming: isStreamingRef.current,
     toggleMute,
     startRecording: () => void startRecording(),
     stopAndTranscribe,
