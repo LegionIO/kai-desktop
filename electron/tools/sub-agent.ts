@@ -17,6 +17,8 @@ import type { LLMModelConfig } from '../agent/model-catalog.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
+import { getSharedMemory } from '../agent/memory.js';
+import { updateSubagentStatus } from '../agent/subagent-status.js';
 
 /** Follow-up message queues keyed by subAgentConversationId */
 const followUpQueues = new Map<string, string[]>();
@@ -248,6 +250,19 @@ export function createSubAgentTool(
           subAgentConversationId,
         });
 
+        // Set initial status to 'running' and link to parent
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: 'running',
+              parentThreadId: ctx.conversationId,
+            });
+          }
+        } catch (err) {
+          console.error('[Subagent] Failed to set initial status:', err);
+        }
+
         const stream = runSubAgent({
           subAgentConversationId,
           parentConversationId: ctx.toolCallId,
@@ -313,6 +328,21 @@ export function createSubAgentTool(
           depth: currentDepth + 1, task,
         });
 
+        // Persist completion status to database
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            const finalStatus = localController.signal.aborted ? 'stopped' : 'completed';
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: finalStatus,
+              completedAt: new Date().toISOString(),
+              exitReason: localController.signal.aborted ? 'user_aborted' : 'task_complete',
+            });
+          }
+        } catch (err) {
+          console.error('[Subagent] Failed to update completion status:', err);
+        }
+
         return {
           subAgentConversationId,
           response: fullResponse,
@@ -321,6 +351,20 @@ export function createSubAgentTool(
           status: localController.signal.aborted ? 'stopped' : 'completed',
         };
       } catch (error) {
+        // Persist failure status to database
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: 'failed',
+              completedAt: new Date().toISOString(),
+              exitReason: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+            });
+          }
+        } catch (dbErr) {
+          console.error('[Subagent] Failed to update error status in DB:', dbErr);
+        }
+
         return {
           isError: true, subAgentConversationId,
           error: error instanceof Error ? error.message : String(error),

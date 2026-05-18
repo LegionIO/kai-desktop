@@ -43,6 +43,7 @@ import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
+import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
 
@@ -1035,6 +1036,10 @@ if (gotSingleInstanceLock) {
           .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`))
           .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
       }
+
+      // Initialize subagent cleanup cron job
+      const dbPath = join(APP_HOME, 'data', 'memory.db');
+      initializeSubagentCleanup(getConfig, APP_HOME, dbPath);
     }).catch((err) => {
       console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
     });

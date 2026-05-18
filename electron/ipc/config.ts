@@ -234,7 +234,7 @@ function getDefaultConfig() {
     },
     advanced: {
       temperature: 0.4,
-      maxSteps: 10,
+      maxSteps: 25,
       maxRetries: 4,
       useResponsesApi: false,
     },
