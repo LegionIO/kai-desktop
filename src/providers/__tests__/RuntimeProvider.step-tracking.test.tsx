@@ -362,15 +362,28 @@ async function renderWithProviders(conversationId = ACTIVE_CONV_ID) {
       <StepTrackingConsumer />
     </AllProviders>
   );
-  // Wait until the active conversation ID is loaded into context
+  // Wait until the active conversation ID is loaded into context.
+  // Use a longer timeout because under CI load the provider's async
+  // mount sequence (load conv -> setActiveConversationId -> re-render
+  // -> activeIdRef.current sync via useEffect) can take >1s.
   await waitFor(() => {
     expect(screen.getByTestId('active-conv-id').textContent).toBe(conversationId);
-  });
+  }, { timeout: 3000 });
+  // Also wait until the stream event subscription has been registered,
+  // otherwise emitStreamEvent will silently no-op via optional chaining.
+  await waitFor(() => {
+    expect(streamEventCallback).not.toBeNull();
+  }, { timeout: 3000 });
   return result;
 }
 
-/** Emit a stream event through the captured callback */
+/** Emit a stream event through the captured callback.
+ *  Throws if the subscription was never registered, so flaky tests fail
+ *  loudly instead of silently passing a no-op through optional chaining. */
 async function emitStreamEvent(event: Record<string, unknown>) {
+  if (!streamEventCallback) {
+    throw new Error('emitStreamEvent called before provider subscribed to onStreamEvent');
+  }
   await act(async () => {
     streamEventCallback?.(event);
   });
