@@ -25,6 +25,7 @@ const PERMISSION_DESCRIPTIONS: Record<string, { label: string; icon: typeof Shie
   // ── Elevated (dangerous) ──
   'exec:whitelisted':        { label: 'Execute whitelisted CLI commands',        icon: Terminal,          level: 'high' },
   'fs:scoped-write':         { label: 'Write files within declared directories', icon: FileText,          level: 'high' },
+  'config:read-secrets':     { label: 'Read app configuration including API keys and credentials', icon: KeyRound,          level: 'high' },
   'fs:scoped-read':          { label: 'Read files within declared directories',  icon: Eye,               level: 'medium' },
   // ── Medium risk ──
   'messages:hook':           { label: 'Intercept messages before/after send',    icon: MessageSquare,     level: 'medium' },

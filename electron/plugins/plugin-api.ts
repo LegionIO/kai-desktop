@@ -49,6 +49,7 @@ import {
   SAFE_ENV_VARS,
 } from './sandboxed-exec.js';
 import { writeAuditEntry } from './audit-log.js';
+import { resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
@@ -384,9 +385,15 @@ export function createPluginAPI(
     },
 
     config: {
-      get: () => {
+      get: (): AppConfig | PluginSafeConfig => {
         requirePermission('config:read');
-        return callbacks.getConfig();
+        // Default to the redacted view. Only plugins that declared
+        // 'config:read-secrets' (gated through the install-time consent
+        // modal — see PluginManager.DANGEROUS_PERMISSIONS) receive the
+        // full AppConfig including provider API keys, AWS secrets, MCP
+        // server env vars, web server password, TLS private key paths,
+        // and Azure subscription keys.
+        return resolvePluginConfigView(callbacks.getConfig(), manifest.permissions);
       },
 
       set: (path: string, value: unknown) => {
@@ -404,7 +411,7 @@ export function createPluginAPI(
         callbacks.setPluginConfig(path, value);
       },
 
-      onChanged: (callback: (config: AppConfig) => void) => {
+      onChanged: (callback: (config: AppConfig | PluginSafeConfig) => void) => {
         requirePermission('config:read');
         instance.configChangeListeners.push(callback);
         return () => {
