@@ -495,8 +495,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
       let observer: ToolObserverManager | null = null;
-      // Accumulate assistant response text for post-receive hooks
-      let accumulatedResponseText = '';
       // Track the provider:modelName that is producing the current response.
       // Updated on model-fallback events so persisted messages carry the
       // correct source even after automatic fallback.

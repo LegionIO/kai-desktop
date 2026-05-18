@@ -59,7 +59,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onOpenPluginSettings,
   pluginBrandRequired,
 }) => {
-  const { uiState, pluginUpdateCount } = usePlugins();
+  const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');

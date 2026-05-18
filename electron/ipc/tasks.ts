@@ -7,7 +7,7 @@ import type { TaskFile, KaiTaskOrder, KaiTaskStatus, TaskConversationMessage, Ta
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
-import type { TaskLifecycleEvent, TaskLifecycleHookArgs, ExecutionDirective } from '../plugins/types.js';
+import type { TaskLifecycleEvent, ExecutionDirective } from '../plugins/types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { readConversationStore } from './conversations.js';
 

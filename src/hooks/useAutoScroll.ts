@@ -58,7 +58,6 @@ export function useAutoScroll<T extends HTMLElement>(deps: unknown[]) {
         lastScrollTopRef.current = el.scrollTop;
       });
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 
   // Cleanup on unmount

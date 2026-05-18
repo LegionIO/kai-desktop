@@ -73,7 +73,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const [terminalSessionId, setTerminalSessionId] = useState<string | null>(
     task.terminalSessionId ?? null,
   );
-  const [isStartingAgent, setIsStartingAgent] = useState(false);
+  const [_isStartingAgent, setIsStartingAgent] = useState(false);
   const selectedRuntime = task.agentRuntime ?? 'claude-code';
 
   // ── Council state ─────────────────────────────────────────────────────
@@ -316,7 +316,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   // ── Handlers ───────────────────────────────────────────────────────────
 
-  const handleStartAgent = useCallback(async () => {
+  const _handleStartAgent = useCallback(async () => {
     const runtime = task.agentRuntime ?? 'claude-code';
     setIsStartingAgent(true);
     try {
@@ -338,7 +338,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   }, [task.id, task.metadata?.cwd, currentWorkingDirectory, selectedRuntime, updateTask]);
 
-  const handleStopAgent = useCallback(() => {
+  const _handleStopAgent = useCallback(() => {
     void app.tasks.stopExecution(task.id);
   }, [task.id]);
 

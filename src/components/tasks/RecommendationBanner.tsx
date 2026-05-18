@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
-import type { Recommendation, ConsumedRecommendation } from '@/types/recommendation';
+import type { Recommendation } from '@/types/recommendation';
 
 interface RecommendationBannerProps {
   taskId: string;
@@ -91,7 +91,7 @@ export const RecommendationBanner: FC<RecommendationBannerProps> = memo(({ taskI
     if (hasUrgent && !expanded) {
       setExpanded(true);
     }
-  }, [recommendations]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [recommendations]);
 
   // Auto-fade consumed items after 8 seconds
   useEffect(() => {

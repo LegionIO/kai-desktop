@@ -1051,7 +1051,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         });
       }, 1500);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.selectedTaskId, state.tasks]);
 
   // ── Council Actions ────────────────────────────────────────────────────

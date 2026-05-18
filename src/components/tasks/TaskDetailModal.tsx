@@ -27,7 +27,7 @@ interface TaskDetailModalProps {
 
 export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenChange, onOpenFullView }) => {
   const { state: agentState } = useAgents();
-  const { updateTask, getCouncilMessages, isTaskDeliberating, getCouncilAgent } = useTasks();
+  const { getCouncilMessages, isTaskDeliberating, getCouncilAgent } = useTasks();
 
   const [activeTab, setActiveTab] = useState<'plan' | 'council' | 'agent'>('plan');
   const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
