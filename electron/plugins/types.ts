@@ -1,11 +1,15 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { CompatCheckResult } from './plugin-compat.js';
+import type { PluginSafeConfig } from './safe-config.js';
+
+export type { PluginSafeConfig } from './safe-config.js';
 
 /* ── Manifest ── */
 
 export type PluginPermission =
   | 'config:read'
+  | 'config:read-secrets'
   | 'config:write'
   | 'tools:register'
   | 'ui:banner'
@@ -144,7 +148,7 @@ export type PluginInstance = {
   threadDecorations: PluginThreadDecorationDescriptor[];
   publishedState: Record<string, unknown>;
   notifications: PluginNotificationDescriptor[];
-  configChangeListeners: Array<(config: AppConfig) => void>;
+  configChangeListeners: Array<(config: AppConfig | PluginSafeConfig) => void>;
   rendererBuild: PluginRendererBuild | null;
   inferenceProvider: PluginInferenceProvider | null;
   contributedRuntimes: PluginRuntimeContribution[];
@@ -156,7 +160,18 @@ export type PluginInstance = {
 export type PluginModule = {
   activate: (api: PluginAPI) => Promise<void> | void;
   deactivate?: () => Promise<void> | void;
-  onConfigChanged?: (config: AppConfig) => void;
+  /**
+   * Called when the app config changes. The argument is a redacted
+   * {@link PluginSafeConfig} unless the plugin declares the
+   * `'config:read-secrets'` permission, in which case the full
+   * {@link AppConfig} (including credentials) is passed instead.
+   *
+   * Plugins MUST narrow the union at runtime (e.g. check a known
+   * `hasApiKey`/`apiKey` discriminator) rather than relying on the
+   * declared permission alone, because future host-side fallbacks may
+   * downgrade to the safe view for any reason.
+   */
+  onConfigChanged?: (config: AppConfig | PluginSafeConfig) => void;
 };
 
 /* ── Message Hooks ── */
@@ -176,7 +191,13 @@ export type HookMessage = {
 export type PreSendHookArgs = {
   messages: HookMessage[];
   modelKey: string;
-  config: AppConfig;
+  /**
+   * Redacted view of the app config. Credential-bearing fields (provider
+   * API keys, AWS secrets, MCP server env vars, web server password, TLS
+   * private key paths, Azure subscription keys) are stripped or replaced
+   * with `hasX: boolean` indicators. See {@link PluginSafeConfig}.
+   */
+  config: PluginSafeConfig;
   systemPrompt?: string;
 };
 
@@ -192,7 +213,11 @@ export type PreSendHook = (args: PreSendHookArgs) => Promise<PreSendHookResult> 
 export type PostReceiveHookArgs = {
   response: HookMessage;
   messages: HookMessage[];
-  config: AppConfig;
+  /**
+   * Redacted view of the app config. See {@link PluginSafeConfig} and the
+   * note on {@link PreSendHookArgs.config}.
+   */
+  config: PluginSafeConfig;
 };
 
 export type PostReceiveHookResult = {
@@ -426,11 +451,36 @@ export type PluginAPI = {
   };
 
   config: {
-    get: () => AppConfig;
+    /**
+     * Read the current app config. Returns a redacted {@link PluginSafeConfig}
+     * by default — provider API keys, AWS secrets, MCP server env vars, web
+     * server password, TLS private key paths, Azure subscription keys, and
+     * provider extra headers are replaced with boolean / key-list indicators
+     * (`hasApiKey`, `envKeys`, etc.).
+     *
+     * Plugins that declare the `'config:read-secrets'` permission receive
+     * the full {@link AppConfig} including credentials. Approval for that
+     * permission is gated through the standard install-time consent flow.
+     *
+     * Callers should narrow the union at runtime, e.g.:
+     * ```ts
+     * const cfg = api.config.get();
+     * if ('apiKey' in cfg.models.providers.openai) {
+     *   // full-config branch
+     * }
+     * ```
+     */
+    get: () => AppConfig | PluginSafeConfig;
     set: (path: string, value: unknown) => void;
     getPluginData: () => Record<string, unknown>;
     setPluginData: (path: string, value: unknown) => void;
-    onChanged: (callback: (config: AppConfig) => void) => () => void;
+    /**
+     * Subscribe to app config changes. The callback receives the same
+     * redacted-by-default view as {@link PluginAPI.config.get}: a
+     * {@link PluginSafeConfig} unless the plugin holds `'config:read-secrets'`,
+     * in which case the full {@link AppConfig} is delivered.
+     */
+    onChanged: (callback: (config: AppConfig | PluginSafeConfig) => void) => () => void;
   };
 
   state: {

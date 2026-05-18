@@ -35,6 +35,11 @@ import type {
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
+import {
+  toPluginSafeConfig,
+  resolvePluginConfigView,
+  type PluginSafeConfig,
+} from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
@@ -184,6 +189,11 @@ export class PluginManager {
   /** Permissions that require explicit user consent via modal. */
   private static readonly DANGEROUS_PERMISSIONS: Set<PluginPermission> = new Set([
     'exec:whitelisted',
+    // Grants the plugin direct access to provider API keys, AWS secrets,
+    // MCP env vars, web server password, TLS private key paths, and Azure
+    // subscription keys via api.config.get() / onConfigChanged. Without
+    // this permission, only the redacted PluginSafeConfig is returned.
+    'config:read-secrets',
   ]);
 
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */
@@ -679,10 +689,14 @@ export class PluginManager {
 
     // Fire the plugin's own config-change listeners so api.config.onChanged
     // callbacks are triggered when plugin settings change (not just app config).
-    const appConfig = this.getConfig();
+    // Plugins receive the redacted PluginSafeConfig unless they declared
+    // 'config:read-secrets'; this mirrors api.config.get()'s behaviour and
+    // prevents on-change broadcasts from leaking credentials to plugins that
+    // never asked for them.
+    const payload = resolvePluginConfigView(this.getConfig(), instance.manifest.permissions);
     for (const listener of instance.configChangeListeners) {
       try {
-        listener(appConfig);
+        listener(payload);
       } catch (err) {
         console.error(`[PluginManager] Error in plugin "${pluginName}" config listener:`, err);
       }
@@ -692,18 +706,35 @@ export class PluginManager {
   /* ── Config Change Forwarding ── */
 
   onConfigChanged(config: AppConfig): void {
+    // Compute the redacted view lazily and cache it so we don't run the
+    // redactor once per plugin. Plugins that declared 'config:read-secrets'
+    // receive the raw AppConfig; everyone else receives the same shared
+    // PluginSafeConfig instance. Hook bodies treat the argument as
+    // read-only — they cannot mutate the redacted view back into the
+    // source because toPluginSafeConfig deep-clones.
+    let safeConfig: PluginSafeConfig | null = null;
+    const viewFor = (instance: PluginInstance): AppConfig | PluginSafeConfig => {
+      if (instance.manifest.permissions.includes('config:read-secrets')) {
+        return config;
+      }
+      if (!safeConfig) safeConfig = toPluginSafeConfig(config);
+      return safeConfig;
+    };
+
     for (const [name, instance] of this.plugins) {
       if (instance.state !== 'active') continue;
 
+      const payload = viewFor(instance);
+
       try {
-        instance.module?.onConfigChanged?.(config);
+        instance.module?.onConfigChanged?.(payload);
       } catch (err) {
         console.error(`[PluginManager] Error in plugin "${name}" onConfigChanged:`, err);
       }
 
       for (const listener of instance.configChangeListeners) {
         try {
-          listener(config);
+          listener(payload);
         } catch (err) {
           console.error(`[PluginManager] Error in plugin "${name}" config listener:`, err);
         }
@@ -777,19 +808,26 @@ export class PluginManager {
     return result;
   }
 
-  async runPreSendHooks(args: PreSendHookArgs): Promise<PreSendHookResult> {
+  async runPreSendHooks(args: Omit<PreSendHookArgs, 'config'> & { config: AppConfig }): Promise<PreSendHookResult> {
     let result: PreSendHookResult = {
       messages: args.messages,
       systemPrompt: args.systemPrompt,
     };
+
+    // Build a redacted view of the config so credential-bearing fields
+    // (provider API keys, AWS secrets, MCP env, web server password, TLS
+    // key path, etc.) never reach plugin hook code. Compute once per call
+    // and reuse across all active hooks.
+    const safeConfig = toPluginSafeConfig(args.config);
 
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
       for (const hook of instance.preSendHooks) {
         try {
           const hookResult = await hook({
-            ...args,
             messages: result.messages,
+            modelKey: args.modelKey,
+            config: safeConfig,
             systemPrompt: result.systemPrompt,
           });
           result = {
@@ -808,14 +846,20 @@ export class PluginManager {
     return result;
   }
 
-  async runPostReceiveHooks(args: PostReceiveHookArgs): Promise<PostReceiveHookResult> {
+  async runPostReceiveHooks(args: Omit<PostReceiveHookArgs, 'config'> & { config: AppConfig }): Promise<PostReceiveHookResult> {
     let result: PostReceiveHookResult = { response: args.response };
+
+    const safeConfig = toPluginSafeConfig(args.config);
 
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
       for (const hook of instance.postReceiveHooks) {
         try {
-          result = await hook({ ...args, response: result.response });
+          result = await hook({
+            messages: args.messages,
+            response: result.response,
+            config: safeConfig,
+          });
         } catch (err) {
           console.error(`[PluginManager] Post-receive hook error in "${instance.manifest.name}":`, err);
         }
