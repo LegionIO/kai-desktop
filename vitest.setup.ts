@@ -3,6 +3,13 @@ import { expect, afterEach, vi } from 'vitest';
 // Define global variables that Electron provides
 (global as Record<string, unknown>).__BRAND_MEDIA_PROTOCOL = 'kai-media';
 
+// Kai is a macOS-only product. Several modules under test guard native paths with
+// `process.platform === 'darwin'`. CI runs on Linux runners, so force the platform
+// to darwin here to keep platform-gated code paths exercised everywhere tests run.
+if (process.platform !== 'darwin') {
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+}
+
 // DOM-specific setup — only runs in jsdom environment (src/** tests)
 if (typeof document !== 'undefined') {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
