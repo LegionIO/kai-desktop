@@ -1,0 +1,46 @@
+name: workflow-sanity
+
+# Run on any PR that modifies a workflow file. Validates the YAML syntax and
+# semantics of every workflow with actionlint, so a typo or a deprecated
+# expression cannot land silently and break CI for the next unrelated PR.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+concurrency:
+  group: workflow-sanity-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # rhysd/actionlint provides both the linter binary and a small wrapper
+      # for surfacing problems as PR annotations. Pin to a tagged release of
+      # the helper script so a regression upstream cannot break the lint job.
+      #
+      # Flag rationale:
+      #   -shellcheck=             disable the bundled shellcheck integration;
+      #                            workflow-sanity is about workflow syntax,
+      #                            not shell style. Run shellcheck separately
+      #                            if needed.
+      #   -ignore 'label "macos-26" is unknown.*'
+      #                            macos-26 is a real GitHub-hosted runner
+      #                            label, but actionlint's static label list
+      #                            lags upstream. The release workflow has
+      #                            used this label since launch.
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          reporter: github-pr-check
+          fail_on_error: 'true'
+          actionlint_flags: -color -shellcheck= -ignore 'label "macos-26" is unknown.*'
