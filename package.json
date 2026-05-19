@@ -29,6 +29,7 @@
     "test:coverage": "vitest --coverage --run -c vitest.unit.config.ts",
     "fixtures:gen": "tsx electron/__tests__/__fixtures__/generate.ts",
     "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
+    "compare:fixture-shapes": "tsx scripts/compare-fixture-shapes.ts",
     "verify:fuses": "tsx scripts/verify-fuses.ts",
     "test:ipc-seam:linux": "playwright test --config playwright.config.ts",
     "prepare": "husky"

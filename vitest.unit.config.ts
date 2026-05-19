@@ -18,7 +18,7 @@ import { brandDefines } from './vitest.config';
  */
 export default defineConfig({
   test: {
-    include: ['electron/**/*.test.ts', 'test-utils/**/*.test.ts'],
+    include: ['electron/**/*.test.ts', 'test-utils/**/*.test.ts', 'scripts/__tests__/**/*.test.ts'],
     exclude: [
       '**/*.component.test.tsx',
       '**/*.integration.test.ts',
