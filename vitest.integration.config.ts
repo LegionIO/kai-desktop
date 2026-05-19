@@ -13,12 +13,29 @@ import { brandDefines } from './vitest.config';
  */
 export default defineConfig({
   test: {
-    include: ['electron/**/*.integration.test.ts'],
+    include: [
+      'electron/**/*.integration.test.ts',
+      // Real-API smoke tests live under `integration-real/`. Each file's own
+      // `describe.skipIf(...)` gate keeps them dormant unless
+      // `RUN_REAL_API_TESTS=1` is set in the environment — local dev runs
+      // see them in the list but skip every test inside.
+      'electron/__tests__/integration-real/**/*.real.test.ts',
+    ],
     exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
     environment: 'node',
     globals: true,
-    setupFiles: ['./vitest.setup.ts'],
-    testTimeout: 30_000,
+    setupFiles: [
+      './vitest.setup.ts',
+      // Sequenced AFTER vitest.setup.ts so the egress firewall installs,
+      // self-tests, and then THIS file conditionally restores real fetch
+      // when `RUN_REAL_API_TESTS=1`. Defense-in-depth: every real test
+      // independently skips on the same env flag.
+      './electron/__tests__/integration-real/setup-real-api.ts',
+    ],
+    // Real-API calls can take 20-30s on cold paths (especially the streaming
+    // smoke). Push the timeout up so a slow but successful response doesn't
+    // get killed mid-flight.
+    testTimeout: 60_000,
     // No integration tests exist yet — the slice is scaffolding for future
     // multi-subsystem suites. Don't fail the run until one lands.
     passWithNoTests: true,

@@ -25,6 +25,7 @@
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:component": "vitest run --config vitest.component.config.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:real": "vitest run --config vitest.integration.config.ts electron/__tests__/integration-real/",
     "test:coverage": "vitest --coverage --run -c vitest.unit.config.ts",
     "fixtures:gen": "tsx electron/__tests__/__fixtures__/generate.ts",
     "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
