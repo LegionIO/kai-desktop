@@ -20,7 +20,8 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.2.2",
@@ -38,6 +39,8 @@
     "electron-builder": "^26.8.1",
     "electron-vite": "^5.0.0",
     "eslint": "^10.2.0",
+    "husky": "^9.1.0",
+    "lint-staged": "^15.5.0",
     "sharp": "0.34.5",
     "tailwindcss": "^4.2.2",
     "tsx": "^4.21.0",
@@ -132,5 +135,9 @@
       "fast-xml-parser@>=5.0.0 <5.5.6": ">=5.5.6",
       "@xmldom/xmldom": "~0.8.12"
     }
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": ["eslint --fix", "prettier --write"],
+    "*.{js,json,md,yml,yaml}": ["prettier --write"]
   }
 }
