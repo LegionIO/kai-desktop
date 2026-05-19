@@ -51,6 +51,7 @@
     "electron-builder": "^26.8.1",
     "electron-vite": "^5.0.0",
     "eslint": "^10.2.0",
+    "fast-check": "^4.0.0",
     "husky": "^9.1.0",
     "jsdom": "^25.0.1",
     "lint-staged": "^15.5.0",
