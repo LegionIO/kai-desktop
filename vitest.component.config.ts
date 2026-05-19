@@ -6,6 +6,8 @@ import { brandDefines } from './vitest.config';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
 /**
  * Component-test slice. Renders React components in jsdom and matches
  * against the testing-library matchers from `@testing-library/jest-dom`.
