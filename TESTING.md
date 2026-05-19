@@ -69,3 +69,9 @@ The launcher always passes `--no-sandbox` on Linux. That flag is required by xvf
 ## Follow-up
 
 A `TESTING_ARCHITECTURE.md` document explaining the full rationale — including the trade-offs between unit, seam smoke, and packaging integration — will land in a follow-up PR. This file is intentionally short.
+
+## See also
+
+- [`docs/TESTING_ARCHITECTURE.md`](docs/TESTING_ARCHITECTURE.md) — long-form architecture: layers, hermeticity boundaries, fixture strategy, and the reasoning behind each.
+- `docs/EVAL_RUBRIC.md` — evaluation rubric used by the nightly behavioural-regression workflow. Will be added in a follow-up PR.
+- [`CONTRIBUTING.md` testing conventions](CONTRIBUTING.md#testing-conventions) — explicit-assertions, helper-driven fixtures, determinism seams.

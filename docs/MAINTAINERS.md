@@ -78,8 +78,8 @@ authored is outside the scope of this plan.
    gh variable set BEHAVIORAL_REGRESSIONS_PROJECT_ID --body "<project-node-id>"
    ```
 
-3. Add the columns the workflow expects: `Triage`, `In Progress`, `Fix
-Pending Review`, `Resolved`. Capture the field IDs for `Status`,
+3. Add the columns the workflow expects: `Triage`, `In Progress`,
+   `Fix Pending Review`, `Resolved`. Capture the field IDs for `Status`,
    `Severity`, `Detected-By`, and `Affected-Prompt-Id` as additional
    repository variables (e.g. `BEHAVIORAL_REGRESSIONS_FIELD_STATUS`).
 

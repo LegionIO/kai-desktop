@@ -36,24 +36,24 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 ### Main Process (`electron/`)
 
-| Directory | Purpose |
-|-----------|---------|
-| `electron/agent/` | Mastra agent orchestration, model catalog, memory, sub-agents, tokenization |
-| `electron/ipc/` | IPC handler registration (agent, config, conversations, mcp, memory, oauth, skills) |
-| `electron/tools/` | Tool implementations + registry builder |
-| `electron/config/schema.ts` | Zod config schema (`AppConfig`) - central to everything |
-| `electron/main.ts` | App bootstrap, window creation, menu, hot-reload for MCP + skills |
+| Directory                   | Purpose                                                                             |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| `electron/agent/`           | Mastra agent orchestration, model catalog, memory, sub-agents, tokenization         |
+| `electron/ipc/`             | IPC handler registration (agent, config, conversations, mcp, memory, oauth, skills) |
+| `electron/tools/`           | Tool implementations + registry builder                                             |
+| `electron/config/schema.ts` | Zod config schema (`AppConfig`) - central to everything                             |
+| `electron/main.ts`          | App bootstrap, window creation, menu, hot-reload for MCP + skills                   |
 
 ### Renderer (`src/`)
 
-| Directory | Purpose |
-|-----------|---------|
-| `src/components/thread/` | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views |
-| `src/components/settings/` | Settings panels (models, tools, MCP, memory, compaction, skills, advanced) |
-| `src/components/conversations/` | Sidebar conversation list, sub-agent section |
-| `src/components/agent-lattice/` | Agent Lattice OAuth auth banner |
-| `src/providers/` | React context providers (Config, Runtime, Attachments) |
-| `src/lib/` | IPC client wrapper, utilities |
+| Directory                       | Purpose                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `src/components/thread/`        | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views |
+| `src/components/settings/`      | Settings panels (models, tools, MCP, memory, compaction, skills, advanced) |
+| `src/components/conversations/` | Sidebar conversation list, sub-agent section                               |
+| `src/components/agent-lattice/` | Agent Lattice OAuth auth banner                                            |
+| `src/providers/`                | React context providers (Config, Runtime, Attachments)                     |
+| `src/lib/`                      | IPC client wrapper, utilities                                              |
 
 ## Key Files
 
@@ -70,25 +70,27 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 All app state lives under `~/.kai/`:
 
-| Path | Contents |
-|------|----------|
-| `~/.kai/config.json` | Primary config (models, tools, MCP, memory, compaction, etc.) |
-| `~/.kai/data/` | Conversation persistence |
-| `~/.kai/skills/` | Installed skill directories |
-| `~/.kai/certs/` | TLS certificates for integrations |
-| `~/.kai/settings/llm.json` | Imported provider/model settings |
+| Path                       | Contents                                                      |
+| -------------------------- | ------------------------------------------------------------- |
+| `~/.kai/config.json`       | Primary config (models, tools, MCP, memory, compaction, etc.) |
+| `~/.kai/data/`             | Conversation persistence                                      |
+| `~/.kai/skills/`           | Installed skill directories                                   |
+| `~/.kai/certs/`            | TLS certificates for integrations                             |
+| `~/.kai/settings/llm.json` | Imported provider/model settings                              |
 
 Config changes trigger hot-reload for MCP servers and skills (fingerprint diffing in `main.ts`).
 
 ## Code Style
 
 ESLint enforces (see `eslint.config.js`):
+
 - `consistent-type-imports` (error) - use `import type` for type-only imports
 - `no-explicit-any` (warn)
 - `no-unused-vars` (warn, `_` prefix ignored)
 - `no-console` (warn, `console.warn/error/info` allowed)
 
 Additional conventions:
+
 - Tailwind CSS 4 (PostCSS plugin, not the old `tailwind.config.js` approach)
 - Radix UI primitives for all interactive components
 - `@/` path alias maps to `src/`
@@ -110,6 +112,7 @@ Renderer code **never** accesses Node APIs directly. All communication goes thro
 ## Model Providers
 
 Supported via Mastra + AI SDK:
+
 - OpenAI-compatible (custom endpoints)
 - Anthropic
 - Amazon Bedrock (AWS credential chain)
@@ -128,25 +131,32 @@ Config schema: `models.providers` (keyed by name) + `models.catalog` (array of m
 - **Tool registry is async** - tools build after window creation; MCP connections happen at startup
 - **Config persistence allowlist** - `desktopConfigPayload()` in `electron/ipc/config.ts` is an explicit allowlist; new config sections MUST be added there or they won't persist
 
+## Testing Conventions
+
+Tests follow a small set of conventions documented in [`CONTRIBUTING.md`](CONTRIBUTING.md#testing-conventions): explicit assertions only (no snapshots), helper-driven fixtures from [`test-utils/`](test-utils/) over inline setup, no real network egress (the fetch firewall in [`vitest.setup.ts`](vitest.setup.ts) fails-closed against unmocked provider hosts), and reliance on the global determinism seams — frozen system time, deterministic UUIDs, and the `@lydell/node-pty` stub. For the architectural rationale behind these choices, see [`docs/TESTING_ARCHITECTURE.md`](docs/TESTING_ARCHITECTURE.md).
+
 ## Debug Logging
 
 When debugging issues that span process boundaries (renderer <-> main) or involve async race conditions, use the project-local debug log directory instead of `console.warn`:
 
-| Item | Value |
-|------|-------|
-| **Directory** | `debug-logs/` (project root, gitignored) |
-| **Convention** | One file per topic, e.g. `debug-logs/persist.log`, `debug-logs/stream.log` |
-| **Format** | `[ISO-timestamp] [TAG] key=value key=value ...` — structured, grep-friendly |
+| Item           | Value                                                                       |
+| -------------- | --------------------------------------------------------------------------- |
+| **Directory**  | `debug-logs/` (project root, gitignored)                                    |
+| **Convention** | One file per topic, e.g. `debug-logs/persist.log`, `debug-logs/stream.log`  |
+| **Format**     | `[ISO-timestamp] [TAG] key=value key=value ...` — structured, grep-friendly |
 
 ### How to use
 
 **Main process** (Node / Electron main) — write directly with `fs.appendFileSync`:
+
 ```typescript
 import { appendFileSync } from 'fs';
 import { join } from 'path';
 const DEBUG_LOG = join(__dirname, '../../debug-logs/persist.log');
 function debugLog(msg: string) {
-  try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+  try {
+    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
 }
 ```
 

@@ -35,15 +35,15 @@ pnpm dev          # starts Electron in dev/watch mode
 
 ### Useful Commands
 
-| Command | Purpose |
-|---------|---------|
-| `pnpm dev` | Start Electron app with hot reload |
-| `pnpm build` | Build main + preload + renderer |
-| `pnpm lint` | ESLint (TypeScript files only) |
-| `pnpm type-check` | `tsc --noEmit` -- full type check |
-| `pnpm build:mac` | Compile Swift helper + build + package macOS DMG |
-| `pnpm preview` | Preview a production build |
-| `pnpm rebuild` | Rebuild native dependencies |
+| Command           | Purpose                                          |
+| ----------------- | ------------------------------------------------ |
+| `pnpm dev`        | Start Electron app with hot reload               |
+| `pnpm build`      | Build main + preload + renderer                  |
+| `pnpm lint`       | ESLint (TypeScript files only)                   |
+| `pnpm type-check` | `tsc --noEmit` -- full type check                |
+| `pnpm build:mac`  | Compile Swift helper + build + package macOS DMG |
+| `pnpm preview`    | Preview a production build                       |
+| `pnpm rebuild`    | Rebuild native dependencies                      |
 
 All app runtime data lives under `~/.kai/` (config, conversations, skills, certs). The app creates this directory on first launch.
 
@@ -76,11 +76,11 @@ Write clear, descriptive commit messages. No strict format is enforced -- look a
 
 Kai follows the standard Electron three-process model with strict isolation:
 
-| Layer | Location | What to know |
-|-------|----------|--------------|
-| Main process | `electron/` | Node.js, full system access, tools, agent orchestration, config |
-| Preload | [`electron/preload.ts`](electron/preload.ts) | Bridge between main and renderer via `contextBridge` |
-| Renderer | `src/` | React app, browser-only -- no Node APIs |
+| Layer        | Location                                     | What to know                                                    |
+| ------------ | -------------------------------------------- | --------------------------------------------------------------- |
+| Main process | `electron/`                                  | Node.js, full system access, tools, agent orchestration, config |
+| Preload      | [`electron/preload.ts`](electron/preload.ts) | Bridge between main and renderer via `contextBridge`            |
+| Renderer     | `src/`                                       | React app, browser-only -- no Node APIs                         |
 
 ### The IPC Boundary
 
@@ -153,6 +153,7 @@ All checks must pass before merge.
 Skills are installed under `~/.kai/skills/` and loaded from a JSON manifest. Supported execution types include `shell`, `script`, `prompt`, `http`, and `composite`.
 
 Relevant source files:
+
 - [`electron/tools/skill-loader.ts`](electron/tools/skill-loader.ts) -- manifest schema and loading logic
 - [`electron/tools/skill-manage.ts`](electron/tools/skill-manage.ts) -- skill management tool definitions
 
@@ -161,11 +162,25 @@ Relevant source files:
 Plugins have a `main` entry (runs in the main process with full Node access) and an optional `renderer` entry (compiled to browser ESM -- no Node builtins like `fs`, `net`, or `child_process`).
 
 Relevant source files:
+
 - [`electron/plugins/plugin-api.ts`](electron/plugins/plugin-api.ts) -- plugin API
 - [`electron/plugins/types.ts`](electron/plugins/types.ts) -- type definitions
 - [`electron/plugins/plugin-manager.ts`](electron/plugins/plugin-manager.ts) -- lifecycle management
 
 A dedicated plugin/skill authoring guide may be added in the future. For now, refer to the source files listed above.
+
+## Testing Conventions
+
+When adding tests, follow these conventions:
+
+- **Explicit assertions only.** Use `expect(...).toBe(...)`, `.toEqual(...)`, `.toMatchObject(...)`, `.toBeInTheDocument()`, etc. Snapshots (`.toMatchSnapshot`, `.toMatchInlineSnapshot`) are forbidden because they invite rubber-stamp updates.
+- **Helper-driven fixtures over inline setup.** See [`test-utils/`](test-utils/) for `createIpcHarness`, `renderWithProviders`, `setupHttpMock`. Reuse before reinventing.
+- **No real network egress in tests.** The `globalThis.fetch` firewall in [`vitest.setup.ts`](vitest.setup.ts) will throw an `ECONNREFUSED`-shaped error on unmocked provider hosts. If your test needs HTTP, use msw via `setupHttpMock()` and call `server.listen()` in your suite's own `beforeAll`.
+- **AI provider mocking strategy.** `vi.mock` at the SDK package boundary for the Claude Agent SDK, the OpenAI Codex SDK, and the Mastra factory; msw at the HTTP egress for the `@ai-sdk/*` providers in [`electron/agent/language-model.ts`](electron/agent/language-model.ts).
+- **Determinism seams.** [`vitest.setup.ts`](vitest.setup.ts) sets a frozen system time (`2026-01-01T00:00:00.000Z`), spies `crypto.randomUUID`, and mocks `@lydell/node-pty`. Tests should rely on these globals rather than reintroducing them.
+- **No production-code changes for testability** unless a clear seam is needed and the PR explicitly carves it out.
+
+For the full architectural rationale, see [`docs/TESTING_ARCHITECTURE.md`](docs/TESTING_ARCHITECTURE.md).
 
 ## Getting Help
 
