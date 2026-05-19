@@ -27,18 +27,11 @@ function camelToScreamingSnake(s: string): string {
 }
 
 const resolved = resolveBranding({ ...branding });
-const _brandDefines: Record<string, string> = {};
+const brandDefines: Record<string, string> = {};
 for (const [key, value] of Object.entries(resolved)) {
-  _brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
+  brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
 }
-_brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
-
-/**
- * Frozen brand define() map; re-exported so the per-slice vitest configs
- * (vitest.unit / .component / .integration) can reuse the same map
- * without re-deriving it from `branding.config.ts` themselves.
- */
-export const brandDefines = _brandDefines;
+brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 
 export const baseConfig = defineConfig({
   test: {
@@ -51,8 +44,7 @@ export const baseConfig = defineConfig({
     environment: 'node',
     // Resolve .ts extensions
     globals: true,
-    // Global setup: deterministic time/UUID, node-pty stub; msw is opt-in
-    // (installed by individual suites that need it).
+    // Global setup: deterministic time/UUID, node-pty stub, msw lifecycle
     setupFiles: ['./vitest.setup.ts'],
   },
   define: brandDefines,
