@@ -27,11 +27,14 @@ function camelToScreamingSnake(s: string): string {
 }
 
 const resolved = resolveBranding({ ...branding });
-const brandDefines: Record<string, string> = {};
+const _brandDefines: Record<string, string> = {};
 for (const [key, value] of Object.entries(resolved)) {
-  brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
+  _brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
 }
-brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
+_brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
+
+/** Frozen brand define() map; re-exported so slice configs can reuse it. */
+export const brandDefines = _brandDefines;
 
 export const baseConfig = defineConfig({
   test: {
@@ -44,7 +47,8 @@ export const baseConfig = defineConfig({
     environment: 'node',
     // Resolve .ts extensions
     globals: true,
-    // Global setup: deterministic time/UUID, node-pty stub, msw lifecycle
+    // Global setup: deterministic time/UUID, node-pty stub; msw is opt-in
+    // (installed by individual suites that need it).
     setupFiles: ['./vitest.setup.ts'],
   },
   define: brandDefines,
