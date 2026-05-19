@@ -507,6 +507,276 @@ const FIXTURE_INPUTS: FixtureInput[] = [
       },
     ],
   },
+  {
+    provider: 'anthropic',
+    file: 'tool-use.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'What is the weather in NYC?' }],
+          tools: [
+            {
+              name: 'get_weather',
+              description: 'Get weather for a city.',
+              input_schema: {
+                type: 'object',
+                properties: { city: { type: 'string' } },
+                required: ['city'],
+              },
+            },
+          ],
+        },
+        responseBody: {
+          id: 'msg_test_tool_0001',
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'I will check the weather for you.' },
+            {
+              type: 'tool_use',
+              id: 'toolu_test_0001',
+              name: 'get_weather',
+              input: { city: 'NYC' },
+            },
+          ],
+          model: 'claude-3-5-sonnet-20241022',
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 25, output_tokens: 35 },
+        },
+      },
+    ],
+  },
+  {
+    provider: 'anthropic',
+    file: 'streaming-multi-block.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 256,
+          stream: true,
+          messages: [{ role: 'user', content: 'Tell a quick story.' }],
+        },
+        responseStream: [
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_stream_0001","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20241022","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Once upon"}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" a time."}}\n\n',
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ],
+      },
+    ],
+  },
+  {
+    provider: 'anthropic',
+    file: 'error-rate-limit.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: 'Trigger rate limit.' }],
+        },
+        responseBody: {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Number of request tokens has exceeded your per-minute rate limit.',
+          },
+        },
+        status: 429,
+      },
+    ],
+  },
+  {
+    provider: 'openai',
+    file: 'chat-streaming.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'Stream a short greeting.' }],
+          stream: true,
+        } as OpenAIChatParams,
+        responseStream: [
+          'data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n',
+          'data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"lo!"},"finish_reason":null}]}\n\n',
+          'data: {"id":"chatcmpl-stream-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        ],
+      },
+    ],
+  },
+  {
+    provider: 'openai',
+    file: 'chat-tool-calls.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'What is the weather in SF?' }],
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'get_weather',
+                description: 'Get weather for a city.',
+                parameters: {
+                  type: 'object',
+                  properties: { city: { type: 'string' } },
+                  required: ['city'],
+                },
+              },
+            },
+          ],
+        } as OpenAIChatParams,
+        responseBody: {
+          id: 'chatcmpl-tool-0001',
+          object: 'chat.completion',
+          created: 1735689600,
+          model: 'gpt-4o-mini',
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_test_0001',
+                    type: 'function',
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{"city":"SF"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+          usage: { prompt_tokens: 30, completion_tokens: 12, total_tokens: 42 },
+        },
+      },
+    ],
+  },
+  {
+    provider: 'claude-sdk',
+    file: 'init-then-tool-use.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'List files.' }],
+          tools: [
+            {
+              name: 'mcp__kai__list_files',
+              description: 'List files in a dir.',
+              input_schema: {
+                type: 'object',
+                properties: { path: { type: 'string' } },
+              },
+            },
+          ],
+        },
+        responseBody: {
+          id: 'msg_sdk_init_0001',
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_sdk_0001',
+              name: 'mcp__kai__list_files',
+              input: { path: '.' },
+            },
+          ],
+          model: 'claude-3-5-sonnet-20241022',
+          stop_reason: 'tool_use',
+          stop_sequence: null,
+          usage: { input_tokens: 50, output_tokens: 20 },
+        },
+      },
+    ],
+  },
+  {
+    provider: 'claude-sdk',
+    file: 'session-resume.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'Continue.' }],
+        },
+        responseBody: {
+          id: 'msg_sdk_resume_0001',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Resuming session.' }],
+          model: 'claude-3-5-sonnet-20241022',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 4 },
+        },
+      },
+    ],
+  },
+  {
+    provider: 'codex',
+    file: 'tool-call-deltas.jsonl',
+    entries: [
+      {
+        requestBody: {
+          model: 'gpt-4o-mini',
+          input: 'Run a shell command.',
+          stream: true,
+          tools: [
+            {
+              type: 'mcp',
+              server_label: 'kai',
+              server_url: 'http://localhost:2/mcp',
+            },
+          ],
+        },
+        responseStream: [
+          'data: {"type":"response.created","response":{"id":"resp_tool_0001"}}\n\n',
+          'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_tool_0001","name":"shell","arguments":""}}\n\n',
+          'data: {"type":"response.function_call_arguments.delta","delta":"{\\"cmd\\":\\"ls"}\n\n',
+          'data: {"type":"response.function_call_arguments.delta","delta":"\\"}"}\n\n',
+          'data: {"type":"response.completed","response":{"id":"resp_tool_0001"}}\n\n',
+          'data: [DONE]\n\n',
+        ],
+      },
+    ],
+  },
+  {
+    provider: 'mastra',
+    file: 'tool-call-sequence.jsonl',
+    entries: [
+      {
+        requestUrl: 'https://api.openai.com/v1/chat/completions',
+        requestBody: {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'Read a file.' }],
+          stream: true,
+        },
+        responseStream: [
+          'data: {"id":"chatcmpl-mastra-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n',
+          'data: {"id":"chatcmpl-mastra-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"Reading file..."},"finish_reason":null}]}\n\n',
+          'data: {"id":"chatcmpl-mastra-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_mastra_0001","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}]},"finish_reason":null}]}\n\n',
+          'data: {"id":"chatcmpl-mastra-0001","object":"chat.completion.chunk","created":1735689600,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+          'data: [DONE]\n\n',
+        ],
+      },
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------------

@@ -96,7 +96,10 @@ function buildHandler(
 }
 
 // ─── Anthropic ─────────────────────────────────────────────────────────────
-const ANTHROPIC_URL = /https:\/\/api\.anthropic\.com\/v1\/messages.*/;
+// `@ai-sdk/anthropic` v3 calls `/messages` directly when baseURL is bare; the
+// raw Anthropic REST API uses `/v1/messages`. Match both shapes so handler
+// drift doesn't fail the canaries.
+const ANTHROPIC_URL = /https:\/\/api\.anthropic\.com(\/v1)?\/messages.*/;
 
 export function mockAnthropic(fixture = 'simple-completion.jsonl'): RequestHandler[] {
   const entries = loadFixtures('anthropic', fixture);
@@ -104,8 +107,10 @@ export function mockAnthropic(fixture = 'simple-completion.jsonl'): RequestHandl
 }
 
 // ─── OpenAI Chat Completions + Responses API ───────────────────────────────
-const OPENAI_CHAT_URL = /https:\/\/api\.openai\.com\/v1\/chat\/completions.*/;
-const OPENAI_RESPONSES_URL = /https:\/\/api\.openai\.com\/v1\/responses.*/;
+// `@ai-sdk/openai` v3 hits `/chat/completions` when baseURL is bare; the raw
+// REST API uses `/v1/chat/completions`. Same for `/responses` vs `/v1/responses`.
+const OPENAI_CHAT_URL = /https:\/\/api\.openai\.com(\/v1)?\/chat\/completions.*/;
+const OPENAI_RESPONSES_URL = /https:\/\/api\.openai\.com(\/v1)?\/responses.*/;
 
 export function mockOpenAI(fixture = 'chat-basic.jsonl'): RequestHandler[] {
   const entries = loadFixtures('openai', fixture);
@@ -129,8 +134,12 @@ export function mockBedrock(
 }
 
 // ─── Azure OpenAI ──────────────────────────────────────────────────────────
+// Azure has two routing shapes:
+//   • `/openai/deployments/<dep>/chat/completions` (api-version query param)
+//   • `/openai/v1/chat/completions` (modern @ai-sdk/openai routing)
+// Match both so handler drift doesn't quietly break canaries.
 const AZURE_URL =
-  /https:\/\/[^.]+\.openai\.azure\.com\/openai\/deployments\/.+\/chat\/completions/;
+  /https:\/\/[^.]+\.openai\.azure\.com\/openai\/(deployments\/[^/]+|v1)\/chat\/completions.*/;
 
 export function mockAzure(
   fixture = 'azure-openai-chat.jsonl',
