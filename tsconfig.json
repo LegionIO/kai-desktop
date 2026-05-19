@@ -17,11 +17,20 @@
     "jsx": "react-jsx",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@/test-utils/*": ["./test-utils/*"]
     },
     "types": ["node"]
   },
-  "include": ["branding.d.ts", "electron/**/*.ts", "electron.vite.config.ts", "src/**/*.ts", "src/**/*.tsx"],
+  "include": [
+    "branding.d.ts",
+    "electron/**/*.ts",
+    "electron.vite.config.ts",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test-utils/**/*.ts",
+    "test-utils/**/*.tsx"
+  ],
   "exclude": ["out", "dist", "node_modules"],
   "_deferredFlags": "noUnusedParameters (3 violations), noUnusedLocals (13 violations, mostly _-prefixed which ESLint already allows), noUncheckedIndexedAccess (362 violations across renderer code) — to be addressed in follow-up PRs."
 }
