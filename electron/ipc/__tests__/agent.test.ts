@@ -1,0 +1,353 @@
+/**
+ * IPC handler tests for `electron/ipc/agent.ts`.
+ *
+ * Two complementary surfaces are covered here:
+ *
+ *   1. The lightweight approval / sub-agent channels exposed by
+ *      `registerAgentHandlers`. These do not need the full streaming pipeline,
+ *      so we can register them through `createIpcHarness` after mocking the
+ *      heavy production dependencies (Mastra, web-server, plugins, etc.).
+ *
+ *   2. The runtime injection contract. `stubMastra` from
+ *      `test-utils/runtime-stubs.ts` is the canonical fake `AgentRuntime` test
+ *      fixture. We exercise its `stream()` shape directly and verify that the
+ *      events match what the renderer-side `RuntimeProvider` accumulates
+ *      (`text-delta`, `done`).
+ */
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+
+import { createIpcHarness } from '../../../test-utils/ipc-harness.js';
+import { stubMastra } from '../../../test-utils/runtime-stubs.js';
+
+// ---------------------------------------------------------------------------
+// Mocks for the heavy production graph that `electron/ipc/agent.ts` pulls in.
+//
+// We are testing the simple approval / sub-agent handlers, not the streaming
+// pipeline, so every dependency below is mocked with a minimal shape that
+// keeps the import side-effects predictable.
+// ---------------------------------------------------------------------------
+
+vi.mock('electron', () => ({
+  BrowserWindow: {
+    getAllWindows: vi.fn(() => []),
+  },
+}));
+
+vi.mock('../../web-server/web-clients.js', () => ({
+  broadcastToWebClients: vi.fn(),
+  webClients: new Set(),
+}));
+
+vi.mock('../../web-server/web-server.js', () => ({
+  createLoginToken: vi.fn(() => 'token'),
+}));
+
+vi.mock('../../agent/model-catalog.js', () => ({
+  resolveModelCatalog: vi.fn(() => ({ entries: [], defaultEntry: null })),
+  resolveStreamConfig: vi.fn(() => null),
+  resolveModelForThread: vi.fn(() => null),
+}));
+
+vi.mock('../../agent/mastra-agent.js', () => ({
+  normalizeAgentCwd: vi.fn((cwd: string | undefined) => cwd ?? '/tmp'),
+  streamAgentResponse: vi.fn(),
+}));
+
+vi.mock('../../agent/title-generation.js', () => ({
+  generateTitle: vi.fn(async () => 'Test Title'),
+}));
+
+vi.mock('../../agent/runtime-switch.js', () => ({
+  detectRuntimeSwitch: vi.fn(() => null),
+  generateSwitchContext: vi.fn(async () => ''),
+  wrapSwitchContext: vi.fn((ctx: string) => ctx),
+}));
+
+vi.mock('../../agent/compaction.js', () => ({
+  shouldCompact: vi.fn(() => ({ shouldCompact: false })),
+  compactConversationPrefix: vi.fn(async () => ({ compactedMessages: null })),
+  compactToolResult: vi.fn(async (content: string) => ({ content, wasCompacted: false })),
+  estimateToolTokens: vi.fn(() => 0),
+}));
+
+vi.mock('../../agent/tool-observer.js', () => ({
+  ToolObserverManager: vi.fn(),
+  resolveToolObserverConfig: vi.fn(() => ({})),
+  summarizeLatestUserRequest: vi.fn(() => ''),
+  summarizeThreadContext: vi.fn(() => ''),
+}));
+
+vi.mock('../../agent/runtime/index.js', () => ({
+  resolveRuntimeForStream: vi.fn(async () => ({
+    runtime: { id: 'mastra', name: 'Mastra', capabilities: {} },
+    resolution: { runtimeId: 'mastra' },
+  })),
+  getAvailableRuntimes: vi.fn(async () => [
+    { id: 'mastra', name: 'Mastra', available: true },
+  ]),
+  getActiveRuntimeId: vi.fn(async () => 'mastra'),
+}));
+
+vi.mock('../../tools/sub-agent.js', () => ({
+  sendSubAgentFollowUp: vi.fn(() => true),
+  sendSubAgentFollowUpByToolCall: vi.fn(() => true),
+  stopSubAgent: vi.fn(() => true),
+  getActiveSubAgentIds: vi.fn(() => ['sub-1', 'sub-2']),
+}));
+
+vi.mock('../../tools/naming.js', () => ({
+  ensureSafeToolDefinitions: vi.fn((tools: unknown[]) => tools),
+  findToolByName: vi.fn(() => null),
+}));
+
+vi.mock('../usage.js', () => ({
+  recordUsageEvent: vi.fn(),
+}));
+
+vi.mock('../config.js', () => ({
+  readEffectiveConfig: vi.fn(() => ({
+    models: { defaultModelKey: 'placeholder', providers: {}, catalog: [] },
+    profiles: [],
+    defaultProfileKey: undefined,
+    titleGeneration: { enabled: true },
+  })),
+}));
+
+vi.mock('../conversations.js', () => ({
+  readConversationStore: vi.fn(() => ({
+    conversations: {},
+    activeConversationId: null,
+    settings: {},
+  })),
+}));
+
+// ---------------------------------------------------------------------------
+// Imports under test — must come after the mocks above so `vi.mock` rewrites
+// the resolution before the production module loads.
+// ---------------------------------------------------------------------------
+
+import { registerAgentHandlers } from '../agent.js';
+import { pendingToolApprovals } from '../tool-approval.js';
+import { pendingQuestionAnswers } from '../../tools/ask-user.js';
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+// Production handlers are registered with the signature
+// `(event, ...args) => ...`. The harness passes args verbatim, so tests must
+// supply an event placeholder as the first argument when invoking.
+const FAKE_EVENT = Object.freeze({}) as unknown;
+
+beforeEach(() => {
+  pendingToolApprovals.clear();
+  pendingQuestionAnswers.clear();
+});
+
+afterEach(() => {
+  pendingToolApprovals.clear();
+  pendingQuestionAnswers.clear();
+});
+
+// ---------------------------------------------------------------------------
+// Approval-channel coverage
+// ---------------------------------------------------------------------------
+
+describe('agent IPC: tool approval channels', () => {
+  it('resolves the pending approval promise with true on agent:approve-tool', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    const decisions: Array<boolean | 'dismiss'> = [];
+    const pending = new Promise<boolean | 'dismiss'>((resolve) => {
+      pendingToolApprovals.set('tc-approve', { resolve });
+    }).then((value) => {
+      decisions.push(value);
+      return value;
+    });
+
+    const result = await harness.invoke<{ ok: boolean }>(
+      'agent:approve-tool',
+      FAKE_EVENT,
+      'tc-approve',
+    );
+    expect(result).toEqual({ ok: true });
+
+    await pending;
+    expect(decisions).toEqual([true]);
+    expect(pendingToolApprovals.has('tc-approve')).toBe(false);
+  });
+
+  it('resolves the pending approval promise with false on agent:reject-tool', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    const decisions: Array<boolean | 'dismiss'> = [];
+    const pending = new Promise<boolean | 'dismiss'>((resolve) => {
+      pendingToolApprovals.set('tc-reject', { resolve });
+    }).then((value) => {
+      decisions.push(value);
+      return value;
+    });
+
+    const result = await harness.invoke<{ ok: boolean }>(
+      'agent:reject-tool',
+      FAKE_EVENT,
+      'tc-reject',
+    );
+    expect(result).toEqual({ ok: true });
+
+    await pending;
+    expect(decisions).toEqual([false]);
+    expect(pendingToolApprovals.has('tc-reject')).toBe(false);
+  });
+
+  it('resolves with the sentinel "dismiss" string on agent:dismiss-tool', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    const decisions: Array<boolean | 'dismiss'> = [];
+    const pending = new Promise<boolean | 'dismiss'>((resolve) => {
+      pendingToolApprovals.set('tc-dismiss', { resolve });
+    }).then((value) => {
+      decisions.push(value);
+      return value;
+    });
+
+    await harness.invoke('agent:dismiss-tool', FAKE_EVENT, 'tc-dismiss');
+    await pending;
+    expect(decisions).toEqual(['dismiss']);
+  });
+
+  it('stores answers and approves the call on agent:answer-tool-question', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    const decisions: Array<boolean | 'dismiss'> = [];
+    new Promise<boolean | 'dismiss'>((resolve) => {
+      pendingToolApprovals.set('tc-ask', { resolve });
+    }).then((value) => {
+      decisions.push(value);
+    });
+
+    const answers = { q1: 'Yes please' };
+    await harness.invoke('agent:answer-tool-question', FAKE_EVENT, 'tc-ask', answers);
+
+    expect(pendingQuestionAnswers.get('tc-ask')).toEqual(answers);
+    // Drain microtasks so the resolved promise's `.then` runs.
+    await Promise.resolve();
+    expect(decisions).toEqual([true]);
+  });
+
+  it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    // No entry has been registered for "ghost". The handler should treat that
+    // as a benign no-op so out-of-order renderer clicks do not crash the IPC.
+    const result = await harness.invoke<{ ok: boolean }>(
+      'agent:approve-tool',
+      FAKE_EVENT,
+      'ghost',
+    );
+    expect(result).toEqual({ ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sub-agent inventory channel
+// ---------------------------------------------------------------------------
+
+describe('agent IPC: sub-agent channels', () => {
+  it('returns the active sub-agent id list from agent:sub-agent-list', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    const result = await harness.invoke<{ ids: string[] }>('agent:sub-agent-list', FAKE_EVENT);
+    expect(result).toEqual({ ids: ['sub-1', 'sub-2'] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime-stub contract: stubMastra exercised directly.
+//
+// The agent IPC delegates to the runtime registry via `resolveRuntimeForStream`.
+// The streaming pipeline itself is too large to exercise end-to-end here, so
+// instead we verify that `stubMastra` — the fixture future tests will inject
+// into the registry — produces the event shape the renderer side consumes.
+// ---------------------------------------------------------------------------
+
+describe('agent IPC: stubMastra runtime contract', () => {
+  it('exposes the AgentRuntime fields the streaming pipeline reads', () => {
+    const stub = stubMastra();
+    expect(stub.id).toBe('mastra');
+    expect(stub.name).toBe('Mastra');
+    // `agent.ts` reads `runtime.capabilities.toolObserver` and `.compaction`
+    // to decide whether to wire the observer/compaction paths.
+    expect(stub.capabilities).toMatchObject({
+      toolObserver: true,
+      compaction: true,
+    });
+  });
+
+  it('yields a text-delta then a done event on stream() — the minimum renderer contract', async () => {
+    const stub = stubMastra();
+    const events: Array<{ type: string; conversationId?: string }> = [];
+
+    for await (const event of stub.stream({ conversationId: 'conv-x' })) {
+      events.push({ type: event.type, conversationId: (event as { conversationId?: string }).conversationId });
+    }
+
+    expect(events.length).toBeGreaterThanOrEqual(2);
+    expect(events[0]).toMatchObject({ type: 'text-delta' });
+    expect(events[events.length - 1]).toMatchObject({ type: 'done' });
+  });
+
+  it('records stream invocations on the vi.fn so tests can assert arguments', async () => {
+    const stub = stubMastra();
+    const opts = { conversationId: 'conv-record', messages: [], config: {}, tools: [], appHome: '/tmp' };
+
+    // Drain the generator so the stub's vi.fn captures the call.
+    for await (const _event of stub.stream(opts)) {
+      // intentionally empty
+    }
+
+    expect(stub.stream).toHaveBeenCalledTimes(1);
+    expect(stub.stream).toHaveBeenCalledWith(opts);
+  });
+
+  it('honours overrides so tests can inject custom event sequences', async () => {
+    async function* customStream() {
+      yield { conversationId: 'c', type: 'text-delta' as const, text: 'Hello' };
+      yield { conversationId: 'c', type: 'tool-call' as const, toolCallId: 't1', toolName: 'echo', args: { x: 1 } };
+      yield { conversationId: 'c', type: 'tool-result' as const, toolCallId: 't1', result: { ok: true } };
+      yield { conversationId: 'c', type: 'done' as const };
+    }
+
+    const stub = stubMastra({ stream: vi.fn(() => customStream()) });
+    const events: Array<{ type: string }> = [];
+    for await (const event of stub.stream({ conversationId: 'c' })) {
+      events.push({ type: event.type });
+    }
+
+    expect(events.map((e) => e.type)).toEqual(['text-delta', 'tool-call', 'tool-result', 'done']);
+  });
+});
