@@ -1,0 +1,79 @@
+name: pr-mac-build-weekly-safety-net
+
+# Weekly catch-up build for every open PR.
+#
+# Why: the per-PR pr-mac-build job in ci.yml debounces aggressively — it
+# only re-runs when the diff touches packaging-relevant paths. That keeps
+# the macos-26 runner cost low, but means a PR whose first commit passed
+# can sit open for weeks without a fresh DMG build. Once a week, on
+# Sunday at 02:00 UTC, this workflow walks the open PR list and dispatches
+# the CI workflow on each one so any regression that snuck past the
+# debounce surfaces within 7 days.
+#
+# The dispatched run uses workflow_dispatch, which the if-expression in
+# pr-mac-build interprets as "always run", so the mac build runs even on
+# PRs whose diff would otherwise skip it.
+
+on:
+  schedule:
+    # 02:00 UTC every Sunday. Pick a quiet window so failed runs do not
+    # collide with humans pushing fixes in their first morning hour.
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    # Manual trigger for maintainers to force the sweep on demand.
+
+concurrency:
+  group: pr-mac-build-weekly-safety-net
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Dispatch CI on every open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # List every open PR. For each one, dispatch the CI workflow on
+          # the PR's head branch — the dispatched run reads as
+          # workflow_dispatch, which bypasses the pr-mac-build debounce.
+          set -euo pipefail
+
+          mapfile -t prs < <(
+            gh pr list \
+              --repo "$REPO" \
+              --state open \
+              --limit 200 \
+              --json number,headRefName \
+              --jq '.[] | "\(.number)\t\(.headRefName)"'
+          )
+
+          if [ "${#prs[@]}" -eq 0 ]; then
+            echo "no open PRs nothing to do"
+            exit 0
+          fi
+
+          for line in "${prs[@]}"; do
+            num="${line%%$'\t'*}"
+            ref="${line#*$'\t'}"
+            echo "dispatching CI for PR ${num} on branch ${ref}"
+            # The workflow file name is intentionally the short alias so a
+            # rename of the underlying file requires updating this list once.
+            if ! gh workflow run ci.yml \
+              --repo "$REPO" \
+              --ref "$ref"; then
+              echo "::warning::failed to dispatch CI for PR ${num} (ref ${ref})"
+            fi
+          done
