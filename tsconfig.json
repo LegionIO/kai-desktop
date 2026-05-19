@@ -6,6 +6,8 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
     "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
@@ -20,5 +22,6 @@
     "types": ["node"]
   },
   "include": ["branding.d.ts", "electron/**/*.ts", "electron.vite.config.ts", "src/**/*.ts", "src/**/*.tsx"],
-  "exclude": ["out", "dist", "node_modules"]
+  "exclude": ["out", "dist", "node_modules"],
+  "_deferredFlags": "noUnusedParameters (3 violations), noUnusedLocals (13 violations, mostly _-prefixed which ESLint already allows), noUncheckedIndexedAccess (362 violations across renderer code) — to be addressed in follow-up PRs."
 }
