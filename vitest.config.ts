@@ -1,21 +1,55 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
-export default defineConfig({
+import { branding } from './branding.config';
+import { resolveBranding } from './scripts/resolve-branding';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const pkg = JSON.parse(
+  readFileSync(`${__dirname}/package.json`, 'utf8'),
+) as { version: string };
+
+/**
+ * Mirror the `define()` map produced in `electron.vite.config.ts` so any test
+ * that imports production code referencing `__BRAND_*` compile-time constants
+ * can resolve them. Without this, those identifiers throw `ReferenceError`
+ * the moment a test pulls in a module that uses them.
+ *
+ * The transform here intentionally matches the build's behaviour:
+ *   branding.productName  →  __BRAND_PRODUCT_NAME
+ *   branding.appSlug      →  __BRAND_APP_SLUG
+ *   …etc.
+ *
+ * Local branding overrides (`branding.config.local.ts`) are NOT merged here —
+ * tests should run against the committed defaults so CI stays deterministic.
+ */
+function camelToScreamingSnake(s: string): string {
+  return s.replace(/([A-Z])/g, '_$1').toUpperCase();
+}
+
+const resolved = resolveBranding({ ...branding });
+const brandDefines: Record<string, string> = {};
+for (const [key, value] of Object.entries(resolved)) {
+  brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
+}
+brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
+
+export const baseConfig = defineConfig({
   test: {
     // Test files live alongside source code or in __tests__ directories
     include: ['electron/**/__tests__/**/*.test.ts', 'electron/**/*.test.ts'],
+    // Nightly-only suites are opted out of the default run; trigger them
+    // explicitly via the dedicated config (or a workflow on a schedule).
+    exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
     // Use Node environment for electron main-process tests
     environment: 'node',
     // Resolve .ts extensions
     globals: true,
-    // Global setup: deterministic time/UUID, node-pty stub
+    // Global setup: deterministic time/UUID, node-pty stub, msw lifecycle
     setupFiles: ['./vitest.setup.ts'],
   },
-  define: {
-    // Brand placeholders so production code referencing __BRAND_* constants can
-    // be imported under test without triggering "X is not defined" errors.
-    __BRAND_NAME__: JSON.stringify('Kai'),
-    __BRAND_VERSION__: JSON.stringify('test'),
-    __BRAND_BUILD__: JSON.stringify('test-build'),
-  },
+  define: brandDefines,
 });
+
+export default baseConfig;
