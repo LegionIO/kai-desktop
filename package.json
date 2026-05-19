@@ -27,10 +27,12 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "fixtures:gen": "tsx electron/__tests__/__fixtures__/generate.ts",
     "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
+    "verify:fuses": "tsx scripts/verify-fuses.ts",
     "test:ipc-seam:linux": "playwright test --config playwright.config.ts",
     "prepare": "husky"
   },
   "devDependencies": {
+    "@electron/fuses": "^1.8.0",
     "@playwright/test": "^1.50.0",
     "@tailwindcss/postcss": "^4.2.2",
     "@testing-library/jest-dom": "^6.6.3",

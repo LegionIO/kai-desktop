@@ -344,6 +344,9 @@ jobs:
 
       - run: pnpm build:mac
 
+      - name: Verify Electron Fuses
+        run: pnpm verify:fuses
+
   pr-win-build:
     needs: checks
     runs-on: windows-latest
