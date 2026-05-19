@@ -1,0 +1,297 @@
+name: Behavioural Evals
+
+# Nightly behavioural evaluation against pinned model versions.
+#
+# Cadence: scheduled (07:00 UTC daily), manual dispatch, and on-demand for
+# PRs that have the `run-eval` label (mirrors the `mac-build` gating pattern
+# in ci.yml). The schedule is intentionally offset 1h after the nightly
+# integration window so the two workflows don't contend for runners or
+# rate-limit budget.
+#
+# Why not on every PR: the harness makes real provider calls (no msw, no
+# committed fixtures — those are owned by the weekly fixture-drift workflow).
+# The cost-per-run is small but non-zero, and the signal is most useful as a
+# slow-moving trend, not a per-commit gate.
+#
+# Hermeticity: this is the ONLY workflow on the PR axis that touches the real
+# provider hosts, and it requires the `run-eval` label to engage. PR-time
+# CI is fully offline by construction (see docs/TESTING_ARCHITECTURE.md).
+#
+# Untrusted input safety: this file does not embed any
+# github.event.* user-supplied strings into `run:` blocks. The only
+# event-derived value referenced in shell context is the run url, and
+# it is routed through `env:` (the SAFE pattern). Issue titles are
+# built from `date -u`, not from the event payload.
+
+on:
+  schedule:
+    # 07:00 UTC daily. The nightly integration workflow runs at 06:00 UTC
+    # (sibling PR in this stack), so this slot is the second runner cohort
+    # of the night.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: evals-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    # Gate the PR path on the explicit `run-eval` label. Scheduled and
+    # dispatch runs always proceed.
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.label.name == 'run-eval'
+    runs-on: ubuntu-latest
+    environment: eval
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    outputs:
+      eval-status: ${{ steps.run.outputs.status }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install
+
+      - name: Run behavioural evals
+        id: run
+        env:
+          # Real-API mode. Without this, the harness validates structure
+          # only and reports `skipped-dry-run` for every prompt.
+          RUN_REAL_EVALS: '1'
+        continue-on-error: true
+        run: |
+          set +e
+          # Capture both stdout (the summary) and the exit code. The
+          # summary is uploaded as an artifact regardless of outcome so
+          # a maintainer can inspect the per-prompt detail.
+          pnpm test:evals > eval-report.txt 2>&1
+          ec=$?
+          set -e
+          echo "exit-code=${ec}" >> "$GITHUB_OUTPUT"
+          if [ "${ec}" -eq 0 ]; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+          fi
+          # Surface the report inline in the job log too, so an operator
+          # debugging a cron failure does not have to download the
+          # artifact to see the verdict.
+          echo "::group::eval report"
+          cat eval-report.txt
+          echo "::endgroup::"
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.txt
+          retention-days: 30
+
+      # ── PR-triggered path: post a sticky comment with the eval delta. ────
+      # github-script is permitted here per the project plan because the
+      # comment-marker upsert pattern is the same as the coverage workflow.
+      # Project-board ingestion is NOT done here — that uses the gh CLI in
+      # the regression-issue step below.
+      - name: Post sticky eval comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVAL_STATUS: ${{ steps.run.outputs.status }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+
+            const MARKER = '<!-- evals-report -->';
+
+            let report = '';
+            try {
+              report = fs.readFileSync(path.join(process.cwd(), 'eval-report.txt'), 'utf8');
+            } catch (err) {
+              core.warning(`Could not read eval-report.txt: ${err.message}`);
+              report = '(report file not available)';
+            }
+
+            const status = process.env.EVAL_STATUS || 'unknown';
+            const truncated = report.length > 60000 ? `${report.slice(0, 60000)}\n\n(truncated)\n` : report;
+            const body = [
+              MARKER,
+              '## Behavioural evaluation report',
+              '',
+              `Status: **${status}**`,
+              '',
+              '<details>',
+              '<summary>Per-prompt detail</summary>',
+              '',
+              '```',
+              truncated,
+              '```',
+              '',
+              '</details>',
+              '',
+              '_The behavioural evaluation runs on PRs only when the `run-eval` label is applied. See `docs/EVAL_RUBRIC.md` for the gate semantics._',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            if (!issue_number) {
+              core.warning('No PR number available; skipping comment.');
+              return;
+            }
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const prior = existing.find((c) => c.body && c.body.includes(MARKER));
+            if (prior) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
+              core.info(`Updated existing eval comment #${prior.id}`);
+            } else {
+              const created = await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info(`Created eval comment #${created.data.id}`);
+            }
+
+      # ── Scheduled path: open a regression Issue if any prompt failed. ────
+      # Uses the gh CLI with the project-owned issue template so the
+      # rendered body follows the standard regression schema. Dedup is by
+      # title prefix on open issues with the `nightly-detected` label.
+      #
+      # The shell only consumes values routed through `env:`. No
+      # github.event.* user-supplied strings are interpolated directly.
+      - name: Open behavioural-regression issue on cron failure
+        if: |
+          github.event_name == 'schedule' &&
+          steps.run.outputs.status == 'fail'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Title prefix is stable across runs so the dedup search works.
+          title_prefix="Behavioural regression detected on"
+          today="$(date -u +%Y-%m-%d)"
+          full_title="${title_prefix} ${today}"
+
+          # Dedup: do not open a second issue today if one already exists.
+          existing="$(gh issue list \
+            --label nightly-detected \
+            --label behavioral-regression \
+            --search "${title_prefix}" \
+            --state open \
+            --json number,title \
+            --jq '.[] | select(.title | startswith("'"${title_prefix}"'")) | .number' \
+            | head -n1 || true)"
+          if [ -n "${existing}" ]; then
+            echo "issue #${existing} already exists for ${title_prefix}; skipping create"
+            exit 0
+          fi
+
+          # Body falls through to the structured template; we add a tail
+          # link to the failed run so the on-call has a one-click pointer
+          # to the artifact and log.
+          tail_body="$(printf '\n\n---\n\nWorkflow run: %s\n\nFull eval-report uploaded as an artifact on the linked run.\n' "${RUN_URL}")"
+          if ! gh issue create \
+              --title "${full_title}" \
+              --label "behavioral-regression" \
+              --label "nightly-detected" \
+              --label "category:llm-eval" \
+              --template "behavioral-regression.yml" \
+              --body "${tail_body}"; then
+            # Template may not exist on first deploy; fall back to a
+            # minimal inline body so the regression is still tracked.
+            echo "::warning::issue template behavioral-regression.yml unavailable; creating with inline body"
+            gh issue create \
+              --title "${full_title}" \
+              --label "behavioral-regression" \
+              --label "nightly-detected" \
+              --label "category:llm-eval" \
+              --body "Nightly behavioural eval failed.${tail_body}"
+          fi
+
+      # ── Scheduled passing path: append a row to docs/eval-history.jsonl. ──
+      # The append happens via a follow-up PR. The PR's only path is
+      # docs/eval-history.jsonl, which is NOT in the trigger filter for
+      # this workflow, so the PR does not retrigger evals.
+      - name: Append eval-history row
+        if: |
+          github.event_name == 'schedule' &&
+          steps.run.outputs.status == 'pass'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # The JSONL row is intentionally minimal: timestamp, status,
+          # commit, and a run-url breadcrumb. Future schema extensions
+          # should be additive so older readers keep working.
+          printf '{"ts":"%s","status":"pass","sha":"%s","run":"%s"}\n' \
+            "${ts}" "${COMMIT_SHA}" "${RUN_URL}" >> docs/eval-history.jsonl
+
+      - name: Open follow-up PR for eval-history append
+        if: |
+          github.event_name == 'schedule' &&
+          steps.run.outputs.status == 'pass'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore(evals): append nightly eval-history row'
+          title: 'chore(evals): append nightly eval-history row'
+          body: |
+            Nightly behavioural eval passed. Appending the new row to
+            `docs/eval-history.jsonl` so the historical trend stays
+            current.
+
+            This PR's only path is `docs/eval-history.jsonl`, which is
+            outside the trigger filter of `evals.yml`, so merging it
+            does not retrigger the eval workflow.
+          branch: chore/eval-history-${{ github.run_id }}
+          delete-branch: true
+          add-paths: docs/eval-history.jsonl
+
+      # Final step: re-exit non-zero if the harness failed, so the
+      # workflow itself shows red in the UI. continue-on-error on the
+      # harness step lets us run the artifact upload + comment + issue
+      # steps regardless of harness outcome.
+      - name: Reflect harness exit code
+        if: always()
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+        run: |
+          if [ "${STATUS}" = "fail" ]; then
+            echo "harness reported failure; failing workflow"
+            exit 1
+          fi
+          echo "harness OK"
