@@ -370,6 +370,39 @@ jobs:
 
       - run: pnpm build:win
 
+  # macOS-only smoke test for the @lydell/node-pty native binding. Runs
+  # OUTSIDE vitest so the global vi.mock in vitest.setup.ts does not apply
+  # — we are exercising the real native binding to catch ABI drift or a
+  # missing electron-builder rebuild before users do. The smoke script is
+  # CommonJS and self-contained; see scripts/smoke-node-pty.cjs.
+  node-pty-smoke:
+    needs: checks
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      # Rebuild native modules against the Electron ABI used by the app.
+      # This invokes electron-builder install-app-deps under the hood —
+      # the same script developers run locally via `pnpm rebuild`.
+      - name: Rebuild native modules for Electron ABI
+        run: pnpm rebuild
+
+      - name: Run node-pty native smoke
+        run: node scripts/smoke-node-pty.cjs
+
   # Aggregator gate. Branch protection should be configured to require this
   # single check; it succeeds if every required upstream job either passed or
   # was correctly skipped via the path filters. A skipped required job would
@@ -381,6 +414,7 @@ jobs:
       - ipc-seam-smoke
       - pr-mac-build
       - pr-win-build
+      - node-pty-smoke
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -391,6 +425,7 @@ jobs:
       IPC_RESULT: ${{ needs.ipc-seam-smoke.result }}
       MAC_RESULT: ${{ needs.pr-mac-build.result }}
       WIN_RESULT: ${{ needs.pr-win-build.result }}
+      PTY_RESULT: ${{ needs.node-pty-smoke.result }}
     steps:
       - name: Verify all required jobs succeeded or were skipped intentionally
         run: |
@@ -398,7 +433,7 @@ jobs:
           # skipped (path filter / debounce). Any other outcome — failure,
           # cancelled, or "skipped because an ancestor failed" — fails the gate.
           fail=0
-          for name in CHANGES_RESULT CHECKS_RESULT IPC_RESULT MAC_RESULT WIN_RESULT; do
+          for name in CHANGES_RESULT CHECKS_RESULT IPC_RESULT MAC_RESULT WIN_RESULT PTY_RESULT; do
             value="${!name}"
             case "$value" in
               success|skipped)
