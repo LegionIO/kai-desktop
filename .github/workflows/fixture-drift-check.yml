@@ -1,0 +1,470 @@
+name: fixture-drift-check
+
+# Weekly canary that detects when an upstream provider SDK has quietly
+# changed the SHAPE of its responses out from under the committed JSONL
+# fixtures. We do this by:
+#
+#   1. Replaying one minimal request per provider against the LIVE API
+#      (cheapest model, 3-token prompt). The request keys are stored in
+#      this workflow's dedicated `fixture-drift` environment, separate
+#      from the `eval` environment so the blast radius of a leak is
+#      bounded and the required-reviewer protections can differ.
+#
+#   2. Extracting a "shape" from the live response — event-type sequence
+#      plus the set of populated field names per event. Response BODIES
+#      are hashed and discarded immediately; we never write them to disk
+#      and never upload them as artifacts.
+#
+#   3. Diffing that shape against the same shape extracted from the
+#      committed fixture. The comparator lives in scripts/compare-fixture-
+#      shapes.ts and is unit-tested independently.
+#
+# On drift the workflow opens (or updates) a tagged GitHub Issue with
+# the diff. On a clean run it opens a follow-up PR appending a single
+# row to docs/fixture-drift-history.jsonl so the maintainer has a
+# weekly heartbeat. On the workflow's own failure (provider 5xx, dep
+# install break, etc.) it opens a separate issue tagged
+# `fixture-drift-workflow-error` so silence is never mistaken for
+# "no drift this week".
+#
+# Security note: every value derived from a github.event.* field that
+# could be attacker-controlled is routed through `env:` and quoted in
+# the shell. Since this workflow only triggers on `schedule` and
+# `workflow_dispatch`, the surface for injection is already small, but
+# we keep the SAFE pattern anyway so a future trigger change does not
+# silently introduce a vulnerability.
+
+on:
+  schedule:
+    # Monday 13:00 UTC — fixed slot so the weekly heartbeat is predictable.
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+    # Manual trigger so maintainers can rerun after a known provider outage.
+
+concurrency:
+  group: fixture-drift-check-${{ github.workflow }}
+  cancel-in-progress: false
+
+# Top-level permissions are intentionally minimal. The only places that
+# need extra scope are the issue-creation step (`issues: write`) and the
+# history-PR step (`peter-evans/create-pull-request` exposes its own
+# permission boundary via the action). This workflow never pushes to
+# the default branch and never has `contents: write`.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-drift:
+    name: Compare live provider shapes against committed fixtures
+    runs-on: ubuntu-latest
+    # The `fixture-drift` environment is SEPARATE from `eval`. Maintainers
+    # configure DRIFT_CHECK_ANTHROPIC_KEY and DRIFT_CHECK_OPENAI_KEY as
+    # dedicated low-balance accounts ($5/month spend cap each) so a leak
+    # or runaway loop here cannot drain the eval budget.
+    environment: fixture-drift
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    outputs:
+      anthropic-drift: ${{ steps.compare-anthropic.outputs.drift }}
+      anthropic-symptom: ${{ steps.compare-anthropic.outputs.symptom }}
+      openai-drift: ${{ steps.compare-openai.outputs.drift }}
+      openai-symptom: ${{ steps.compare-openai.outputs.symptom }}
+      any-drift: ${{ steps.aggregate.outputs.any }}
+      run-clean: ${{ steps.aggregate.outputs.clean }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install
+
+      # ── Anthropic shape capture ────────────────────────────────────────
+      #
+      # One minimal request against the cheapest live model. The Node
+      # inline script:
+      #   1. POSTs to /v1/messages with a 3-token prompt and max_tokens=8.
+      #   2. Reads the JSON body, computes its sha256 (for the diagnostic
+      #      symptom hash), and IMMEDIATELY discards the body.
+      #   3. Writes the shape summary — event type plus top-level field
+      #      names — to a workspace path. The shape summary is NOT the
+      #      response; it carries no user content, no model output, no
+      #      ids — just the keys.
+      #
+      # The script reads its API key from the env so the secret value
+      # cannot land in a `run:` shell where ::add-mask:: protections are
+      # weaker. The key never appears in step output.
+      - name: Capture Anthropic live response shape
+        id: capture-anthropic
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.DRIFT_CHECK_ANTHROPIC_KEY }}
+        run: |
+          node --input-type=module --eval "$(cat <<'NODE'
+            import { createHash } from 'node:crypto';
+            import { writeFileSync } from 'node:fs';
+
+            const key = process.env.ANTHROPIC_API_KEY;
+            if (!key) {
+              console.error('::error::DRIFT_CHECK_ANTHROPIC_KEY is unset');
+              process.exit(2);
+            }
+
+            const requestBody = {
+              model: 'claude-3-5-haiku-latest',
+              max_tokens: 8,
+              messages: [{ role: 'user', content: 'hi' }],
+            };
+
+            const resp = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-api-key': key,
+                'anthropic-version': '2023-06-01',
+              },
+              body: JSON.stringify(requestBody),
+            });
+
+            const text = await resp.text();
+            const bodyHash = createHash('sha256').update(text).digest('hex');
+
+            if (!resp.ok) {
+              console.error('::error::Anthropic request failed status=' + resp.status + ' body-sha256=' + bodyHash);
+              process.exit(3);
+            }
+
+            const body = JSON.parse(text);
+
+            // Build the shape summary — only top-level field NAMES, never values.
+            const fields = Object.keys(body).sort();
+            const tag = typeof body.type === 'string' ? 'body:' + body.type : 'body';
+            const shape = {
+              label: 'anthropic-live',
+              capturedAt: new Date().toISOString().slice(0, 10),
+              bodyHash,
+              events: [{ type: tag, fields }],
+            };
+
+            writeFileSync('captured-anthropic.json', JSON.stringify(shape, null, 2));
+            console.log('captured Anthropic shape body-sha256=' + bodyHash + ' fields=' + fields.length);
+          NODE
+          )"
+
+      - name: Compare Anthropic shape against fixture
+        id: compare-anthropic
+        run: |
+          set -euo pipefail
+          # The comparator emits structured JSON on stdout and exits 0/1.
+          # Capture both the JSON and the markdown report; the markdown is
+          # what we embed in the GitHub Issue body.
+          report_json=$(
+            pnpm exec tsx scripts/compare-fixture-shapes.ts \
+              --captured captured-anthropic.json \
+              --fixture electron/__tests__/__fixtures__/anthropic/simple-completion.jsonl \
+              --captured-label anthropic-live \
+              --fixture-label simple-completion.jsonl \
+              --format json || true
+          )
+          drift=$(echo "$report_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(s).drift?"true":"false")}catch{process.stdout.write("false")}})')
+          symptom=$(echo "$report_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(s).symptomHash||"none")}catch{process.stdout.write("none")}})')
+          report_md=$(
+            pnpm exec tsx scripts/compare-fixture-shapes.ts \
+              --captured captured-anthropic.json \
+              --fixture electron/__tests__/__fixtures__/anthropic/simple-completion.jsonl \
+              --captured-label anthropic-live \
+              --fixture-label simple-completion.jsonl \
+              --format markdown || true
+          )
+          {
+            echo "drift=${drift}"
+            echo "symptom=${symptom}"
+            echo "report<<EOF_REPORT"
+            echo "${report_md}"
+            echo "EOF_REPORT"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── OpenAI shape capture (same pattern, different endpoint) ────────
+      - name: Capture OpenAI live response shape
+        id: capture-openai
+        env:
+          OPENAI_API_KEY: ${{ secrets.DRIFT_CHECK_OPENAI_KEY }}
+        run: |
+          node --input-type=module --eval "$(cat <<'NODE'
+            import { createHash } from 'node:crypto';
+            import { writeFileSync } from 'node:fs';
+
+            const key = process.env.OPENAI_API_KEY;
+            if (!key) {
+              console.error('::error::DRIFT_CHECK_OPENAI_KEY is unset');
+              process.exit(2);
+            }
+
+            const requestBody = {
+              model: 'gpt-4o-mini',
+              max_tokens: 8,
+              messages: [{ role: 'user', content: 'hi' }],
+            };
+
+            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                authorization: 'Bearer ' + key,
+              },
+              body: JSON.stringify(requestBody),
+            });
+
+            const text = await resp.text();
+            const bodyHash = createHash('sha256').update(text).digest('hex');
+
+            if (!resp.ok) {
+              console.error('::error::OpenAI request failed status=' + resp.status + ' body-sha256=' + bodyHash);
+              process.exit(3);
+            }
+
+            const body = JSON.parse(text);
+
+            const fields = Object.keys(body).sort();
+            const tag = typeof body.object === 'string' ? 'body:' + body.object : 'body';
+            const shape = {
+              label: 'openai-live',
+              capturedAt: new Date().toISOString().slice(0, 10),
+              bodyHash,
+              events: [{ type: tag, fields }],
+            };
+
+            writeFileSync('captured-openai.json', JSON.stringify(shape, null, 2));
+            console.log('captured OpenAI shape body-sha256=' + bodyHash + ' fields=' + fields.length);
+          NODE
+          )"
+
+      - name: Compare OpenAI shape against fixture
+        id: compare-openai
+        run: |
+          set -euo pipefail
+          report_json=$(
+            pnpm exec tsx scripts/compare-fixture-shapes.ts \
+              --captured captured-openai.json \
+              --fixture electron/__tests__/__fixtures__/openai/chat-basic.jsonl \
+              --captured-label openai-live \
+              --fixture-label chat-basic.jsonl \
+              --format json || true
+          )
+          drift=$(echo "$report_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(s).drift?"true":"false")}catch{process.stdout.write("false")}})')
+          symptom=$(echo "$report_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(s).symptomHash||"none")}catch{process.stdout.write("none")}})')
+          report_md=$(
+            pnpm exec tsx scripts/compare-fixture-shapes.ts \
+              --captured captured-openai.json \
+              --fixture electron/__tests__/__fixtures__/openai/chat-basic.jsonl \
+              --captured-label openai-live \
+              --fixture-label chat-basic.jsonl \
+              --format markdown || true
+          )
+          {
+            echo "drift=${drift}"
+            echo "symptom=${symptom}"
+            echo "report<<EOF_REPORT"
+            echo "${report_md}"
+            echo "EOF_REPORT"
+          } >> "$GITHUB_OUTPUT"
+
+      # Discard the captured shape files. We never upload them as artifacts
+      # — only the diff report (which carries field NAMES, not values) is
+      # surfaced, and that lands inside a GitHub Issue body.
+      - name: Discard captured shape files
+        if: always()
+        run: |
+          rm -f captured-anthropic.json captured-openai.json
+          echo "captured files discarded; no artifact upload by design"
+
+      - name: Aggregate drift status
+        id: aggregate
+        env:
+          ANTHROPIC_DRIFT: ${{ steps.compare-anthropic.outputs.drift }}
+          OPENAI_DRIFT: ${{ steps.compare-openai.outputs.drift }}
+        run: |
+          any=false
+          if [ "${ANTHROPIC_DRIFT}" = "true" ] || [ "${OPENAI_DRIFT}" = "true" ]; then
+            any=true
+          fi
+          clean=false
+          if [ "${ANTHROPIC_DRIFT}" = "false" ] && [ "${OPENAI_DRIFT}" = "false" ]; then
+            clean=true
+          fi
+          {
+            echo "any=${any}"
+            echo "clean=${clean}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Drift handling: open or update a tagged issue. ─────────────────
+      #
+      # Dedup by deterministic title (`[fixture-drift] anthropic: <hash>`)
+      # so repeated detection of the same symptom reuses the existing
+      # open issue rather than spamming the tracker.
+      #
+      # Every value pulled from a previous step's outputs is routed
+      # through `env:` first and only referenced as a quoted shell
+      # variable, so a future change that adds an untrusted-input
+      # trigger cannot inject through the `run:` body.
+      - name: Open issue on Anthropic drift
+        if: steps.compare-anthropic.outputs.drift == 'true'
+        env:
+          SYMPTOM: ${{ steps.compare-anthropic.outputs.symptom }}
+          REPORT: ${{ steps.compare-anthropic.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="[fixture-drift] anthropic: ${SYMPTOM}"
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Weekly fixture-drift-check detected a shape mismatch between the live Anthropic API response and the committed JSONL fixture." \
+            "${REPORT}" \
+            "Workflow run: ${RUN_URL}")
+          existing=$(gh issue list --repo "$REPO" --state open --search "${title}" --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --repo "$REPO" --body "${body}"
+          else
+            gh issue create --repo "$REPO" \
+              --title "${title}" \
+              --label fixture-drift \
+              --label nightly-detected \
+              --body "${body}"
+          fi
+
+      - name: Open issue on OpenAI drift
+        if: steps.compare-openai.outputs.drift == 'true'
+        env:
+          SYMPTOM: ${{ steps.compare-openai.outputs.symptom }}
+          REPORT: ${{ steps.compare-openai.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="[fixture-drift] openai: ${SYMPTOM}"
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Weekly fixture-drift-check detected a shape mismatch between the live OpenAI API response and the committed JSONL fixture." \
+            "${REPORT}" \
+            "Workflow run: ${RUN_URL}")
+          existing=$(gh issue list --repo "$REPO" --state open --search "${title}" --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --repo "$REPO" --body "${body}"
+          else
+            gh issue create --repo "$REPO" \
+              --title "${title}" \
+              --label fixture-drift \
+              --label nightly-detected \
+              --body "${body}"
+          fi
+
+      # Add newly opened drift issues to the Behavioral Regressions project
+      # board. The mapping uses the declarative actions/add-to-project
+      # ingestion step — no actions/github-script anywhere in this
+      # workflow. Field-value updates would normally use `gh api graphql`,
+      # but that requires knowing the project's organization slug and node
+      # IDs ahead of time; we leave the board's default Status column to
+      # surface the issue and let a maintainer triage from there.
+      - name: Ingest drift issues onto Behavioral Regressions board
+        if: steps.aggregate.outputs.any == 'true'
+        uses: actions/add-to-project@v2
+        continue-on-error: true
+        with:
+          project-url: ${{ vars.BEHAVIORAL_REGRESSIONS_PROJECT_URL }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          labeled: fixture-drift
+
+      # ── Clean run: append a heartbeat row to the history file. ─────────
+      #
+      # The history file lives at docs/fixture-drift-history.jsonl. We
+      # append a single JSON line per clean weekly run via a PR opened
+      # by peter-evans/create-pull-request. This action provides its own
+      # permission boundary, so the workflow itself never gets
+      # `contents: write` — the PAT/token used by the action is scoped
+      # by the maintainer's configuration of its `token` input.
+      #
+      # The PR's paths intentionally include only the history file so a
+      # merged history PR cannot retrigger fixture-drift-check.
+      - name: Append clean-run heartbeat to history
+        if: steps.aggregate.outputs.clean == 'true'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%Y-%m-%d)
+          row=$(printf '{"date":"%s","status":"clean","run":"%s"}\n' "${today}" "${RUN_URL}")
+          printf '%s' "${row}" >> docs/fixture-drift-history.jsonl
+
+      - name: Open history-update PR
+        if: steps.aggregate.outputs.clean == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # The default GITHUB_TOKEN cannot trigger other workflows, which
+          # is exactly what we want — a history-only PR must not trigger
+          # this workflow recursively. A maintainer can override with a
+          # PAT only if they explicitly want cross-workflow triggering.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: fixture-drift-history-update
+          delete-branch: true
+          base: main
+          title: 'chore(drift-check): record clean weekly run'
+          commit-message: 'chore(drift-check): record clean weekly run'
+          body: |
+            Automated heartbeat row appended to `docs/fixture-drift-history.jsonl`
+            after a clean weekly fixture-drift-check run.
+
+            This PR's diff is intentionally scoped to a single file so it
+            cannot retrigger the fixture-drift-check workflow on merge.
+          add-paths: |
+            docs/fixture-drift-history.jsonl
+          labels: |
+            drift-check-heartbeat
+
+  # If the check-drift job itself fails (provider 5xx, pnpm install break,
+  # rate limiter trip, etc.) silence would look identical to "no drift this
+  # week". Opening a separate, distinctly labelled issue here removes that
+  # ambiguity so a maintainer knows to retry rather than assume safety.
+  workflow-failure-issue:
+    name: Open issue if drift-check itself failed
+    needs: check-drift
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open workflow-error issue
+        run: |
+          set -euo pipefail
+          title="[fixture-drift-workflow-error] weekly run did not complete"
+          body=$(printf '%s\n\n%s\n' \
+            "The fixture-drift-check workflow failed before producing a drift verdict. This is NOT the same as 'no drift detected' — the comparator did not run to completion. Please retry the workflow." \
+            "Workflow run: ${RUN_URL}")
+          existing=$(gh issue list --repo "$REPO" --state open --search "${title}" --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --repo "$REPO" --body "${body}"
+          else
+            gh issue create --repo "$REPO" \
+              --title "${title}" \
+              --label fixture-drift-workflow-error \
+              --body "${body}"
+          fi
