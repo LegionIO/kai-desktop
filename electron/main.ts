@@ -3,7 +3,15 @@ import { basename, join } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
-import { registerAgentHandlers, registerTools, updateMcpTools, updateSkillTools, updatePluginTools, updateCliTools, getRegisteredTools } from './ipc/agent.js';
+import {
+  registerAgentHandlers,
+  registerTools,
+  updateMcpTools,
+  updateSkillTools,
+  updatePluginTools,
+  updateCliTools,
+  getRegisteredTools,
+} from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
@@ -35,10 +43,20 @@ import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/ta
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
-import { registerAutoUpdateHandlers, checkForUpdatesInteractive, performQuitAndInstall, setUpdateHookRunner, consumePostUpdateMarker } from './ipc/auto-update.js';
+import {
+  registerAutoUpdateHandlers,
+  checkForUpdatesInteractive,
+  performQuitAndInstall,
+  setUpdateHookRunner,
+  consumePostUpdateMarker,
+} from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
-import { bootstrapBundledPlugins, getBrandRequiredPluginNames, getBrandMarketplaceUrls } from './plugins/plugin-bootstrap.js';
+import {
+  bootstrapBundledPlugins,
+  getBrandRequiredPluginNames,
+  getBrandMarketplaceUrls,
+} from './plugins/plugin-bootstrap.js';
 import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
@@ -48,7 +66,22 @@ import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 
-const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
+/**
+ * Resolve the directory used to persist app config, conversations, skills, etc.
+ *
+ * Defaults to `~/.{brandSlug}/`. Tests and CI can point Kai at a temp directory
+ * by setting the `KAI_USER_DATA` env var — this avoids polluting the developer's
+ * real `~/.kai/` while still exercising the full bootstrap path.
+ */
+function resolveUserDataDir(): string {
+  const envOverride = process.env.KAI_USER_DATA;
+  if (envOverride && envOverride.length > 0) {
+    return envOverride;
+  }
+  return join(homedir(), '.' + __BRAND_APP_SLUG);
+}
+
+const APP_HOME = resolveUserDataDir();
 
 // ── OTA Bootstrap ────────────────────────────────────────────────────────
 // Check for crash-based rollback BEFORE resolving code paths, so a broken
@@ -192,6 +225,16 @@ function ensureAppHome(): void {
     bootstrapBundledPlugins(join(APP_HOME, 'plugins'));
   } catch (err) {
     console.warn('[Main] Bundled plugin bootstrap failed (non-fatal):', err);
+  }
+
+  // Sentinel: tests subscribe to this to know the user-data directory has
+  // been provisioned and bootstrapping is complete. The event is fire-and-forget;
+  // it never blocks startup.
+  try {
+    app.emit('data-app-ready', APP_HOME);
+  } catch {
+    // EventEmitter.emit only throws when no listener is registered for an
+    // 'error' event — never for custom event names. Defensive try/catch.
   }
 }
 
@@ -360,7 +403,7 @@ function createWindow(): BrowserWindow {
     transparent: IS_MAC,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     visualEffectState: IS_MAC ? 'active' : undefined,
-    backgroundColor: IS_MAC ? '#00000000' : (nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff'),
+    backgroundColor: IS_MAC ? '#00000000' : nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff',
     webPreferences: {
       preload: join(codePaths.preload, 'index.mjs'),
       contextIsolation: true,
@@ -409,35 +452,43 @@ function createWindow(): BrowserWindow {
 
     // Image context menu
     if (params.mediaType === 'image' && params.srcURL) {
-      menu.append(new MenuItem({
-        label: 'Copy Image',
-        click: () => mainWindow.webContents.copyImageAt(params.x, params.y),
-      }));
-      menu.append(new MenuItem({
-        label: 'Copy Image URL',
-        click: () => clipboard.writeText(params.srcURL),
-      }));
-      menu.append(new MenuItem({
-        label: 'Save Image As\u2026',
-        click: async () => {
-          try {
-            const defaultName = params.srcURL.split('/').pop()?.split('?')[0] || 'image.png';
-            const result = await dialog.showSaveDialog(mainWindow, {
-              defaultPath: defaultName,
-              filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }],
-            });
-            if (!result.canceled && result.filePath) {
-              const resp = await net.fetch(params.srcURL, {
-                headers: withBrandUserAgent(),
+      menu.append(
+        new MenuItem({
+          label: 'Copy Image',
+          click: () => mainWindow.webContents.copyImageAt(params.x, params.y),
+        }),
+      );
+      menu.append(
+        new MenuItem({
+          label: 'Copy Image URL',
+          click: () => clipboard.writeText(params.srcURL),
+        }),
+      );
+      menu.append(
+        new MenuItem({
+          label: 'Save Image As\u2026',
+          click: async () => {
+            try {
+              const defaultName = params.srcURL.split('/').pop()?.split('?')[0] || 'image.png';
+              const result = await dialog.showSaveDialog(mainWindow, {
+                defaultPath: defaultName,
+                filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }],
               });
-              if (resp.ok) {
-                const buffer = Buffer.from(await resp.arrayBuffer());
-                writeFileSync(result.filePath, buffer);
+              if (!result.canceled && result.filePath) {
+                const resp = await net.fetch(params.srcURL, {
+                  headers: withBrandUserAgent(),
+                });
+                if (resp.ok) {
+                  const buffer = Buffer.from(await resp.arrayBuffer());
+                  writeFileSync(result.filePath, buffer);
+                }
               }
+            } catch {
+              /* ignore save errors */
             }
-          } catch { /* ignore save errors */ }
-        },
-      }));
+          },
+        }),
+      );
       if (params.selectionText) {
         menu.append(new MenuItem({ type: 'separator' }));
         menu.append(new MenuItem({ role: 'copy' }));
@@ -447,19 +498,23 @@ function createWindow(): BrowserWindow {
       if (params.misspelledWord) {
         if (params.dictionarySuggestions.length > 0) {
           for (const suggestion of params.dictionarySuggestions) {
-            menu.append(new MenuItem({
-              label: suggestion,
-              click: () => mainWindow.webContents.replaceMisspelling(suggestion),
-            }));
+            menu.append(
+              new MenuItem({
+                label: suggestion,
+                click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+              }),
+            );
           }
         } else {
           menu.append(new MenuItem({ label: 'No suggestions', enabled: false }));
         }
         menu.append(new MenuItem({ type: 'separator' }));
-        menu.append(new MenuItem({
-          label: 'Add to Dictionary',
-          click: () => mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
-        }));
+        menu.append(
+          new MenuItem({
+            label: 'Add to Dictionary',
+            click: () => mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+          }),
+        );
         menu.append(new MenuItem({ type: 'separator' }));
       }
       // Editable field context menu
@@ -482,14 +537,18 @@ function createWindow(): BrowserWindow {
     // Link items (appended to any menu type)
     if (params.linkURL) {
       menu.append(new MenuItem({ type: 'separator' }));
-      menu.append(new MenuItem({
-        label: 'Open Link',
-        click: () => shell.openExternal(params.linkURL),
-      }));
-      menu.append(new MenuItem({
-        label: 'Copy Link',
-        click: () => clipboard.writeText(params.linkURL),
-      }));
+      menu.append(
+        new MenuItem({
+          label: 'Open Link',
+          click: () => shell.openExternal(params.linkURL),
+        }),
+      );
+      menu.append(
+        new MenuItem({
+          label: 'Copy Link',
+          click: () => clipboard.writeText(params.linkURL),
+        }),
+      );
     }
 
     if (menu.items.length > 0) {
@@ -529,9 +588,7 @@ function createWindow(): BrowserWindow {
 }
 
 function focusPrimaryWindow(): void {
-  let win = primaryWindowRef && !primaryWindowRef.isDestroyed()
-    ? primaryWindowRef
-    : null;
+  let win = primaryWindowRef && !primaryWindowRef.isDestroyed() ? primaryWindowRef : null;
   if (!win) {
     if (!app.isReady()) return;
     win = createWindow();
@@ -569,11 +626,14 @@ if (gotSingleInstanceLock) {
 
     // Request microphone permission on macOS (needed for voice recording / speech-to-text)
     if (process.platform === 'darwin') {
-      systemPreferences.askForMediaAccess('microphone').then((granted) => {
-        console.info(`[${__BRAND_PRODUCT_NAME}] Microphone permission: ${granted ? 'granted' : 'denied'}`);
-      }).catch((err) => {
-        console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to request microphone permission:`, err);
-      });
+      systemPreferences
+        .askForMediaAccess('microphone')
+        .then((granted) => {
+          console.info(`[${__BRAND_PRODUCT_NAME}] Microphone permission: ${granted ? 'granted' : 'denied'}`);
+        })
+        .catch((err) => {
+          console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to request microphone permission:`, err);
+        });
     }
 
     // Set dock icon (macOS) — needed for dev mode since packager config doesn't apply.
@@ -610,13 +670,15 @@ if (gotSingleInstanceLock) {
       if (newMcpFp !== lastMcpFingerprint) {
         lastMcpFingerprint = newMcpFp;
         console.info(`[${__BRAND_PRODUCT_NAME}] MCP servers changed, rebuilding...`);
-        rebuildMcpTools(config.mcpServers ?? []).then((mcpTools) => {
-          updateMcpTools(mcpTools);
-          syncRealtimeTools();
-          console.info(`[${__BRAND_PRODUCT_NAME}] MCP hot-reload complete: ${mcpTools.length} MCP tools`);
-        }).catch((err) => {
-          console.error(`[${__BRAND_PRODUCT_NAME}] MCP hot-reload failed:`, err);
-        });
+        rebuildMcpTools(config.mcpServers ?? [])
+          .then((mcpTools) => {
+            updateMcpTools(mcpTools);
+            syncRealtimeTools();
+            console.info(`[${__BRAND_PRODUCT_NAME}] MCP hot-reload complete: ${mcpTools.length} MCP tools`);
+          })
+          .catch((err) => {
+            console.error(`[${__BRAND_PRODUCT_NAME}] MCP hot-reload failed:`, err);
+          });
       }
 
       // Skills hot-reload
@@ -634,14 +696,16 @@ if (gotSingleInstanceLock) {
       const newCliToolsFp = JSON.stringify(config.cliTools ?? []);
       if (newCliToolsFp !== lastCliToolsFingerprint) {
         lastCliToolsFingerprint = newCliToolsFp;
-        void shellPathReady.then(() => {
-          const cliTools = buildCliTools(getConfig, pluginManager.getPluginCliTools());
-          updateCliTools(cliTools);
-          syncRealtimeTools();
-          console.info(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload: ${cliTools.length} tools`);
-        }).catch((err) => {
-          console.error(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload failed:`, err);
-        });
+        void shellPathReady
+          .then(() => {
+            const cliTools = buildCliTools(getConfig, pluginManager.getPluginCliTools());
+            updateCliTools(cliTools);
+            syncRealtimeTools();
+            console.info(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload: ${cliTools.length} tools`);
+          })
+          .catch((err) => {
+            console.error(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload failed:`, err);
+          });
       }
 
       // Display list change detection — auto-update maxDimension when allowed displays change
@@ -656,16 +720,21 @@ if (gotSingleInstanceLock) {
               const layout = await getLocalMacDisplayLayout();
               if (!layout || layout.displays.length === 0) return;
               const allowedLower = new Set(allowedDisplays.map((n: string) => n.toLowerCase()));
-              const enabled = layout.displays.filter((d: { name: string; displayId: string }) =>
-                allowedLower.has(d.name.toLowerCase()) || allowedLower.has(d.displayId.toLowerCase()),
+              const enabled = layout.displays.filter(
+                (d: { name: string; displayId: string }) =>
+                  allowedLower.has(d.name.toLowerCase()) || allowedLower.has(d.displayId.toLowerCase()),
               );
               if (enabled.length === 0) return;
               const maxDim = Math.max(
-                ...enabled.map((d: { pixelWidth: number; pixelHeight: number }) => Math.max(d.pixelWidth, d.pixelHeight)),
+                ...enabled.map((d: { pixelWidth: number; pixelHeight: number }) =>
+                  Math.max(d.pixelWidth, d.pixelHeight),
+                ),
               );
               if (maxDim > 0 && maxDim !== config.computerUse?.capture?.maxDimension) {
                 setConfig('computerUse.capture.maxDimension', maxDim);
-                console.info(`[${__BRAND_PRODUCT_NAME}] Auto-updated maxDimension to ${maxDim} for ${enabled.length} enabled displays`);
+                console.info(
+                  `[${__BRAND_PRODUCT_NAME}] Auto-updated maxDimension to ${maxDim} for ${enabled.length} enabled displays`,
+                );
               }
             } catch {
               // Non-fatal
@@ -684,7 +753,11 @@ if (gotSingleInstanceLock) {
           const wsConfig = config.webServer;
           if (wsConfig?.enabled) {
             restartWebServer(wsConfig)
-              .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://${wsConfig.bindAddress || '0.0.0.0'}:${wsConfig.port}`))
+              .then(() =>
+                console.info(
+                  `[${__BRAND_PRODUCT_NAME}] Web UI server restarted on ${wsConfig.tls?.enabled ? 'https' : 'http'}://${wsConfig.bindAddress || '0.0.0.0'}:${wsConfig.port}`,
+                ),
+              )
               .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server restart failed:`, err));
           } else {
             stopWebServer()
@@ -730,7 +803,9 @@ if (gotSingleInstanceLock) {
         mkdirSync(debugLogDir, { recursive: true });
         const safeName = file.replace(/[^a-zA-Z0-9_-]/g, '');
         appendFileSync(join(debugLogDir, `${safeName}.log`), `[${new Date().toISOString()}] ${message}\n`);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     });
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
@@ -767,7 +842,9 @@ if (gotSingleInstanceLock) {
         setConfig('computerUse.localMacos.allowedDisplays', allNames);
 
         const maxDim = Math.max(
-          ...layout.displays.map((d: { pixelWidth: number; pixelHeight: number }) => Math.max(d.pixelWidth, d.pixelHeight)),
+          ...layout.displays.map((d: { pixelWidth: number; pixelHeight: number }) =>
+            Math.max(d.pixelWidth, d.pixelHeight),
+          ),
         );
         if (maxDim > 0) {
           setConfig('computerUse.capture.maxDimension', maxDim);
@@ -846,18 +923,20 @@ if (gotSingleInstanceLock) {
     });
 
     // File dialog handler
-    ipcMain.handle('dialog:open-file', async (_event, options?: { filters?: Array<{ name: string; extensions: string[] }> }) => {
-      const win = BrowserWindow.getFocusedWindow();
-      if (!win) return { canceled: true, filePaths: [] };
-      const result = await dialog.showOpenDialog(win, {
-        properties: ['openFile', 'multiSelections'],
-        filters: options?.filters ?? [
-          { name: 'All Files', extensions: ['*'] },
-          { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
-          { name: 'Documents', extensions: ['pdf', 'txt', 'md', 'json', 'csv'] },
-        ],
-      });
-      if (result.canceled) return { canceled: true, filePaths: [] };
+    ipcMain.handle(
+      'dialog:open-file',
+      async (_event, options?: { filters?: Array<{ name: string; extensions: string[] }> }) => {
+        const win = BrowserWindow.getFocusedWindow();
+        if (!win) return { canceled: true, filePaths: [] };
+        const result = await dialog.showOpenDialog(win, {
+          properties: ['openFile', 'multiSelections'],
+          filters: options?.filters ?? [
+            { name: 'All Files', extensions: ['*'] },
+            { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+            { name: 'Documents', extensions: ['pdf', 'txt', 'md', 'json', 'csv'] },
+          ],
+        });
+        if (result.canceled) return { canceled: true, filePaths: [] };
 
       // Read files and return as base64 data URLs
       const files = result.filePaths.map((filePath) => {
@@ -1053,9 +1132,19 @@ if (gotSingleInstanceLock) {
       const data = readFileSync(filePath);
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
       const mimeTypes: Record<string, string> = {
-        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
-        mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
-        mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', opus: 'audio/opus', ogg: 'audio/ogg',
+        png: 'image/png',
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        webp: 'image/webp',
+        gif: 'image/gif',
+        mp4: 'video/mp4',
+        webm: 'video/webm',
+        mov: 'video/quicktime',
+        mp3: 'audio/mpeg',
+        wav: 'audio/wav',
+        flac: 'audio/flac',
+        opus: 'audio/opus',
+        ogg: 'audio/ogg',
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 
@@ -1126,12 +1215,14 @@ if (gotSingleInstanceLock) {
         const updateMarker = consumePostUpdateMarker();
         if (updateMarker) {
           console.info(`[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version}`);
-          pluginManager.runPostUpdateHooks({
-            version: updateMarker.version,
-            success: true,
-          }).catch((err) => {
-            console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
-          });
+          pluginManager
+            .runPostUpdateHooks({
+              version: updateMarker.version,
+              success: true,
+            })
+            .catch((err) => {
+              console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
+            });
         }
       } catch (err) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Plugin loading failed:`, err);
@@ -1146,25 +1237,32 @@ if (gotSingleInstanceLock) {
     });
 
     // Initialize tools asynchronously
-    shellPathReady.then(() => buildToolRegistry(getConfig, APP_HOME, pluginManager)).then((tools) => {
-      const pluginTools = pluginManager.getAllPluginTools();
-      const allTools = [...tools, ...pluginTools];
-      registerTools(allTools);
-      console.info(`[${__BRAND_PRODUCT_NAME}] ${tools.length} tools + ${pluginTools.length} plugin tools registered`);
+    shellPathReady
+      .then(() => buildToolRegistry(getConfig, APP_HOME, pluginManager))
+      .then((tools) => {
+        const pluginTools = pluginManager.getAllPluginTools();
+        const allTools = [...tools, ...pluginTools];
+        registerTools(allTools);
+        console.info(`[${__BRAND_PRODUCT_NAME}] ${tools.length} tools + ${pluginTools.length} plugin tools registered`);
 
-      // Register realtime handlers (needs tool registry)
-      registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);
+        // Register realtime handlers (needs tool registry)
+        registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);
 
-      // Start web UI server if enabled
-      const webServerConfig = getConfig().webServer;
-      if (webServerConfig?.enabled) {
-        startWebServer(webServerConfig)
-          .then(() => console.info(`[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`))
-          .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
-      }
-    }).catch((err) => {
-      console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
-    });
+        // Start web UI server if enabled
+        const webServerConfig = getConfig().webServer;
+        if (webServerConfig?.enabled) {
+          startWebServer(webServerConfig)
+            .then(() =>
+              console.info(
+                `[${__BRAND_PRODUCT_NAME}] Web UI server started on ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`,
+              ),
+            )
+            .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
+        }
+      })
+      .catch((err) => {
+        console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
+      });
 
     app.on('activate', () => {
       const allWindows = BrowserWindow.getAllWindows();
