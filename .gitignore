@@ -26,3 +26,9 @@ electron-builder.yml
 bundled-plugins/*/
 !bundled-plugins/microsoft-teams/
 !bundled-plugins/microsoft-teams/**
+
+# Playwright IPC seam smoke artifacts (see TESTING.md)
+e2e/.cache/
+playwright-report/
+test-results/
+pw-results.xml
