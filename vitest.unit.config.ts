@@ -11,6 +11,10 @@ import { brandDefines } from './vitest.config';
  * here replaces — instead of concatenating with — the base config's
  * default include. Brand `define()` map and the global setup file are
  * re-imported from `vitest.config.ts`.
+ *
+ * Coverage is reporting-only: no thresholds, no failure gate. The
+ * `pnpm test:coverage` script and the PR coverage workflow both consume
+ * the `json-summary` reporter; the `html` reporter is for local browsing.
  */
 export default defineConfig({
   test: {
@@ -25,6 +29,45 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     setupFiles: ['./vitest.setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['json-summary', 'html'],
+      reportsDirectory: './coverage',
+      // Reporting only — no thresholds. Exclude generated, vendored, and
+      // non-instrumentable surfaces so the headline number reflects the
+      // code that actually ships in the main process unit slice.
+      exclude: [
+        // Test plumbing
+        '**/__tests__/**',
+        '**/__fixtures__/**',
+        '**/*.test.ts',
+        '**/*.test.tsx',
+        'test-utils/**',
+        'vitest.*.ts',
+        'vitest.*.config.ts',
+        // Build output and tooling
+        'out/**',
+        'dist/**',
+        'build/**',
+        'coverage/**',
+        'node_modules/**',
+        'scripts/**',
+        // Renderer code is covered by the component slice, not here
+        'src/**',
+        // E2E and Playwright artifacts
+        'e2e/**',
+        'playwright.config.ts',
+        // Native / platform-specific surfaces that v8 cannot instrument
+        // meaningfully (Swift bridge stubs, native dictation hosts, etc.)
+        'electron/dictation/native/**',
+        // Build-time templates and configuration
+        'electron-builder.template.yml',
+        'electron.vite.config.ts',
+        'branding.config.ts',
+        'branding.d.ts',
+        '**/*.d.ts',
+      ],
+    },
   },
   define: brandDefines,
 });
