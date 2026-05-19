@@ -18,6 +18,8 @@ pnpm build            # build main + preload + renderer
 pnpm build:mac        # build + package for macOS (arm64 + x64)
 pnpm lint             # eslint (ts/tsx only)
 pnpm type-check       # tsc --noEmit
+pnpm test             # vitest run (unit + component tests)
+pnpm test:watch       # vitest in watch mode
 pnpm preview          # preview production build
 pnpm rebuild          # rebuild native deps (electron-builder install-app-deps)
 ```
@@ -120,7 +122,7 @@ Config schema: `models.providers` (keyed by name) + `models.catalog` (array of m
 - **macOS only** for now - `electron-builder.yml` only targets `mac` with `dmg` output
 - **contextIsolation is ON** - never try to use `require()` or Node APIs in renderer code
 - **Tailwind v4** - uses `@tailwindcss/postcss` plugin, not the v3 `tailwind.config.js` pattern
-- **No test suite** - no specs or test framework currently configured
+- **Tests** - Vitest is the test runner (`pnpm test`); the suite runs on every PR and on pre-push via Husky
 - **`sandbox: false`** in webPreferences - needed for preload script to work with full Node access
 - **No conversation auto-cleanup** - conversations are never auto-deleted; users manage their own threads
 - **Tool registry is async** - tools build after window creation; MCP connections happen at startup
