@@ -34,13 +34,57 @@ jobs:
 
       - run: pnpm build
 
+  ipc-seam-smoke:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      - run: pnpm build
+
+      # Install xvfb so we can run the headed Electron binary under a
+      # virtual framebuffer on the headless ubuntu runner.
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      # The Playwright spec passes `--no-sandbox` to the Electron binary on
+      # Linux. That switch is required for xvfb-driven CI runners (and most
+      # container environments) and is orthogonal to all Electron Fuses —
+      # it changes only the OS-level sandbox attached at process start, not
+      # any bit baked into the packaged binary. The Mac DMG security signal
+      # is asserted independently by `pr-mac-build`, so this dev-only
+      # switch cannot contaminate the production trust surface.
+      - name: Run IPC seam smoke
+        run: xvfb-run -a pnpm test:ipc-seam:linux
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
   pr-mac-build:
     needs: checks
     runs-on: macos-26
     permissions:
       contents: read
     env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v5
 
