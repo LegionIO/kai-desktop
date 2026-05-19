@@ -50,7 +50,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: eval
     permissions:
-      contents: read
+      # `contents: write` is required for the peter-evans/create-pull-request
+      # step at the end of this job, which opens a follow-up PR appending to
+      # docs/eval-history.jsonl. The action needs to push a branch (contents)
+      # and open a PR (pull-requests). issues:write covers regression-issue
+      # creation on a failed nightly run.
+      contents: write
       issues: write
       pull-requests: write
     env:
@@ -264,7 +269,7 @@ jobs:
         if: |
           github.event_name == 'schedule' &&
           steps.run.outputs.status == 'pass'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'chore(evals): append nightly eval-history row'

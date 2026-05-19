@@ -64,8 +64,15 @@ jobs:
     # or runaway loop here cannot drain the eval budget.
     environment: fixture-drift
     permissions:
-      contents: read
+      # contents: write + pull-requests: write are required by the
+      # peter-evans/create-pull-request step that opens a follow-up PR
+      # appending to docs/fixture-drift-history.jsonl when the drift
+      # check passes. The action must push a branch (contents) and open
+      # a PR (pull-requests). issues: write covers the regression-issue
+      # creation path when drift is detected.
+      contents: write
       issues: write
+      pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
