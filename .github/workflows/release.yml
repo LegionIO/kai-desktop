@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       verbump:
@@ -16,86 +15,12 @@ on:
           - patch
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  checks:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: pnpm/action-setup@v5
-        with:
-          version: 10.33.0
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - run: pnpm install
-
-      - run: pnpm lint
-
-      - run: pnpm type-check
-
-      - run: pnpm build
-
-  pr-mac-build:
-    if: ${{ github.event_name == 'pull_request' }}
-    needs: checks
-    runs-on: macos-26
-    permissions:
-      contents: read
-    env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: pnpm/action-setup@v5
-        with:
-          version: 10.33.0
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - run: pnpm install
-
-      - run: pnpm build:mac
-
-  pr-win-build:
-    if: ${{ github.event_name == 'pull_request' }}
-    needs: checks
-    runs-on: windows-latest
-    permissions:
-      contents: read
-    env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: pnpm/action-setup@v5
-        with:
-          version: 10.33.0
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - run: pnpm install
-
-      - run: pnpm build:win
-
   prepare-release:
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    needs: checks
     runs-on: ubuntu-latest
     permissions:
       contents: write
