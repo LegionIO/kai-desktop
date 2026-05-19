@@ -1,0 +1,315 @@
+name: integration-nightly
+
+# Nightly real-API smoke + opt-in PR runs gated on the `run-eval` label.
+#
+# Triggers:
+#   schedule        — 06:00 UTC daily; the canonical signal source
+#   workflow_dispatch — manual maintainer kick (any branch)
+#   pull_request labeled — runs ONLY when the `run-eval` label lands on a PR.
+#                          Other PR events (opened, synchronize, etc.) are
+#                          ignored. Maintainers attach the label by hand;
+#                          the `environment: eval` block below requires a
+#                          reviewer approval before the secrets are released.
+#
+# The `if:` on the single job below additionally hard-gates the PR path so
+# unlabeled PR events that somehow slip past the `types: [labeled]` filter
+# (e.g. relabel) still cannot exfiltrate secrets.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: integration-nightly-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+# Default workflow permissions are read-only. The job below escalates to the
+# narrowest scopes required: issues:write to open + comment on auto-issues,
+# pull-requests:write to comment back on a label-triggered PR.
+permissions:
+  contents: read
+
+jobs:
+  real-api:
+    name: Real-API smoke + auto-triage
+    # Three-layered gate. Each line is a distinct guard:
+    #   schedule + workflow_dispatch — always run (maintainer-triggered).
+    #   pull_request — must be the `run-eval` label specifically, and the
+    #                  reusable `environment: eval` requires reviewer approval.
+    if: >
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && github.event.label.name == 'run-eval')
+    runs-on: ubuntu-latest
+    # `environment: eval` is a GitHub Environment maintainers configure once
+    # in repo settings: required reviewers + scoped secrets. Secrets pulled
+    # via secrets.* below resolve from this environment's scope only.
+    environment: eval
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    timeout-minutes: 20
+    env:
+      RUN_REAL_API_TESTS: '1'
+      # Test files write here when COST_LEDGER_DIR is set; the workflow
+      # uploads the directory as an artifact below regardless of outcome.
+      COST_LEDGER_DIR: ${{ github.workspace }}/cost-ledger
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install
+
+      - name: Prepare cost-ledger directory
+        run: mkdir -p "${COST_LEDGER_DIR}"
+
+      # Real-API smoke tests. `id: smoke` so subsequent steps can branch on
+      # the outcome. `continue-on-error: true` lets the auto-issue path run
+      # even when the suite fails — the job's overall result is restored by
+      # the explicit `Fail the job if smoke failed` step further down.
+      #
+      # Test output is teed into RUN_LOG so the failed-test-id extraction
+      # step below can mine it without re-running the suite (and re-billing
+      # the providers).
+      - name: Real-API smoke tests
+        id: smoke
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RUN_LOG: ${{ runner.temp }}/smoke.log
+        run: |
+          set -o pipefail
+          pnpm test:integration:real 2>&1 | tee "${RUN_LOG}"
+
+      # Persist the cost ledger and any test output so a triager can read
+      # exact usage numbers off the failed run. 30-day retention is enough
+      # to triage a regression that nightly catches on Friday by Monday.
+      - name: Upload cost ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-ledger-${{ github.run_id }}
+          path: ${{ env.COST_LEDGER_DIR }}/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── Auto-triage on failure ──────────────────────────────────────────
+      # We extract a stable test-id symbol from the test output and feed it
+      # to `gh issue list` / `gh issue create`. Everything is declarative
+      # `gh` invocations — no actions/github-script anywhere, so the workflow
+      # cannot be hijacked through script injection.
+      #
+      # Untrusted-ish values (the test output, the run URL) route through
+      # `env:` blocks and are NEVER inlined into a shell. Each `gh` call
+      # reads them via $VAR_NAME so even an attacker-controlled string is
+      # treated as a literal argument by the shell.
+
+      - name: Locate failed test-id for dedup
+        if: steps.smoke.outcome == 'failure'
+        id: failed-test
+        env:
+          RUN_LOG: ${{ runner.temp }}/smoke.log
+        run: |
+          set -euo pipefail
+          # Pull the first stable test-id symbol from the smoke output. The
+          # *.real.test.ts files all use the convention `TEST_ID = 'real.*'`
+          # so this regex doesn't snag arbitrary other identifiers.
+          #
+          # If we can't find a test-id, fall back to a synthetic one keyed
+          # to the run; the dedup search will then always miss and we'll
+          # open a fresh issue rather than silently swallowing the failure.
+          if [ -f "${RUN_LOG}" ]; then
+            test_id="$(grep -oE 'real\.[a-z0-9.-]+' "${RUN_LOG}" | head -n1 || true)"
+          else
+            test_id=""
+          fi
+          if [ -z "${test_id}" ]; then
+            test_id="real.unknown.run-${GITHUB_RUN_ID}"
+          fi
+          # Emit only safe alphanumeric/dotted strings into outputs — defense
+          # in depth against any future regex regression. The pattern matches
+          # the same shape the tests use for their TEST_ID constants.
+          if ! printf '%s' "${test_id}" | grep -qE '^real\.[a-zA-Z0-9._-]+$'; then
+            test_id="real.unknown.run-${GITHUB_RUN_ID}"
+          fi
+          echo "test_id=${test_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Dedup search for existing issue
+        if: steps.smoke.outcome == 'failure'
+        id: dedup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_ID: ${{ steps.failed-test.outputs.test_id }}
+        run: |
+          set -euo pipefail
+          # gh issue list reads its arguments as a single search query string;
+          # passing TEST_ID via env keeps an injected backtick or $() from
+          # ever reaching the shell parser. The search uses the
+          # `<!-- test-id:... -->` marker we plant in newly opened issues.
+          existing="$(gh issue list \
+            --search "behavioral-regression test-id:${TEST_ID} in:body state:open" \
+            --json number,title \
+            --limit 1)"
+          # `existing` is a JSON array; ".[0].number" extracts the first hit
+          # or returns empty when no match.
+          existing_number="$(printf '%s' "${existing}" | jq -r '.[0].number // empty')"
+          if [ -n "${existing_number}" ]; then
+            echo "existing=${existing_number}" >> "$GITHUB_OUTPUT"
+          else
+            echo "existing=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on existing issue
+        if: steps.smoke.outcome == 'failure' && steps.dedup.outputs.existing != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ steps.dedup.outputs.existing }}
+          TEST_ID: ${{ steps.failed-test.outputs.test_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # All values routed through env. The body is built with a printf
+          # template; %s placeholders accept literal strings, so even shell
+          # metacharacters in TEST_ID would not be interpreted.
+          body="$(printf 'New occurrence of behavioral regression `%s`.\n\nRun: %s\n' \
+            "${TEST_ID}" "${RUN_URL}")"
+          gh issue comment "${ISSUE}" --body "${body}"
+
+      - name: Open new issue
+        if: steps.smoke.outcome == 'failure' && steps.dedup.outputs.existing == ''
+        id: new-issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_ID: ${{ steps.failed-test.outputs.test_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Issue title and body both built from env vars. `--label` is
+          # repeated rather than comma-joined so each token is a separate
+          # argument and `gh` does not have to split a single string.
+          title="[regression] ${TEST_ID}: nightly smoke detected a failure (run ${RUN_ID})"
+          body="$(printf 'A nightly real-API smoke test failed.\n\n- **Test ID**: `%s`\n- **Run URL**: %s\n\nThis issue was auto-created; see the workflow run for the request/response excerpts. A maintainer will triage and set severity.\n\n<!-- test-id:%s -->\n' \
+            "${TEST_ID}" "${RUN_URL}" "${TEST_ID}")"
+          # Capture the resulting issue URL so the next step can add it to
+          # the project board. The URL is the last line of `gh issue create`
+          # stdout.
+          url="$(gh issue create \
+            --title "${title}" \
+            --body "${body}" \
+            --label "behavioral-regression" \
+            --label "nightly-detected" \
+            --label "severity:auto")"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Add new issue to project board
+        if: |
+          steps.smoke.outcome == 'failure'
+          && steps.dedup.outputs.existing == ''
+          && vars.BEHAVIORAL_REGRESSIONS_PROJECT_URL != ''
+        id: project-add
+        uses: actions/add-to-project@v2
+        with:
+          project-url: ${{ vars.BEHAVIORAL_REGRESSIONS_PROJECT_URL }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set project field values for new issue
+        if: |
+          steps.smoke.outcome == 'failure'
+          && steps.dedup.outputs.existing == ''
+          && vars.BEHAVIORAL_REGRESSIONS_PROJECT_ID != ''
+          && steps.project-add.outputs.itemId != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_ID: ${{ vars.BEHAVIORAL_REGRESSIONS_PROJECT_ID }}
+          ITEM_ID: ${{ steps.project-add.outputs.itemId }}
+          STATUS_FIELD_ID: ${{ vars.STATUS_FIELD_ID }}
+          SEVERITY_FIELD_ID: ${{ vars.SEVERITY_FIELD_ID }}
+          DETECTED_BY_FIELD_ID: ${{ vars.DETECTED_BY_FIELD_ID }}
+          AFFECTED_PROMPT_ID_FIELD_ID: ${{ vars.AFFECTED_PROMPT_ID_FIELD_ID }}
+          STATUS_DETECTED_OPTION_ID: ${{ vars.STATUS_DETECTED_OPTION_ID }}
+          SEVERITY_AUTO_OPTION_ID: ${{ vars.SEVERITY_AUTO_OPTION_ID }}
+          DETECTED_BY_NIGHTLY_OPTION_ID: ${{ vars.DETECTED_BY_NIGHTLY_OPTION_ID }}
+          TEST_ID: ${{ steps.failed-test.outputs.test_id }}
+        run: |
+          set -euo pipefail
+          # Each field-update is a single mutation; we issue them one at a
+          # time so a missing repo variable for one field doesn't break the
+          # others. Field IDs that are empty are treated as "not configured"
+          # and skipped — the issue still lands on the board.
+
+          set_single_select() {
+            local field_id="$1"
+            local option_id="$2"
+            [ -z "${field_id}" ] && return 0
+            [ -z "${option_id}" ] && return 0
+            gh api graphql \
+              -f query='mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}' \
+              -F project="${PROJECT_ID}" \
+              -F item="${ITEM_ID}" \
+              -F field="${field_id}" \
+              -F option="${option_id}" > /dev/null
+          }
+
+          set_text() {
+            local field_id="$1"
+            local text_value="$2"
+            [ -z "${field_id}" ] && return 0
+            gh api graphql \
+              -f query='mutation($project:ID!,$item:ID!,$field:ID!,$text:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$text}}){projectV2Item{id}}}' \
+              -F project="${PROJECT_ID}" \
+              -F item="${ITEM_ID}" \
+              -F field="${field_id}" \
+              -F text="${text_value}" > /dev/null
+          }
+
+          set_single_select "${STATUS_FIELD_ID}" "${STATUS_DETECTED_OPTION_ID}"
+          set_single_select "${SEVERITY_FIELD_ID}" "${SEVERITY_AUTO_OPTION_ID}"
+          set_single_select "${DETECTED_BY_FIELD_ID}" "${DETECTED_BY_NIGHTLY_OPTION_ID}"
+          set_text "${AFFECTED_PROMPT_ID_FIELD_ID}" "${TEST_ID}"
+
+      # ── PR-comment branch for label-triggered runs ───────────────────────
+      - name: Comment on PR (label-triggered runs)
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$(printf 'Real-API smoke run on this PR: **%s**\n\nRun: %s\n\n_To re-trigger, re-apply the `run-eval` label._\n' \
+            "${SMOKE_OUTCOME}" "${RUN_URL}")"
+          gh issue comment "${PR_NUMBER}" --body "${body}"
+
+      # ── Restore the failure signal ───────────────────────────────────────
+      # `continue-on-error: true` on the smoke step lets the issue/PR comment
+      # logic run even when the suite fails; this final step re-raises the
+      # failure so the job overall fails and the schedule's status surfaces
+      # as red rather than green.
+      - name: Fail the job if smoke failed
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Real-API smoke tests failed. See the auto-issue link in the previous steps."
+          exit 1
