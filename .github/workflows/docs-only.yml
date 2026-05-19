@@ -1,0 +1,60 @@
+name: docs-only
+
+# Fast lane for PRs that only touch documentation. The main CI workflow's
+# path filters cause the heavy code jobs to skip on these PRs; this workflow
+# fills in the gap with a lightweight markdown lint and publishes the same
+# `gate` check name so branch protection is satisfied either way.
+
+on:
+  pull_request:
+    paths:
+      # Mirror the docs-only filter in ci.yml. Keep these lists in sync.
+      - 'docs/**'
+      - '**/*.md'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE'
+      - 'CHANGELOG.md'
+
+concurrency:
+  group: docs-only-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint the markdown that changed on this PR. Uses the official markdownlint
+  # action with a relaxed default config — the goal is to catch broken links
+  # and obviously malformed YAML front-matter, not to enforce strict style.
+  markdown:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint changed markdown
+        uses: DavidAnson/markdownlint-cli2-action@v18
+        with:
+          # Limit the run to the docs surface so a single broken historical
+          # file in a long-archived directory cannot block a docs PR.
+          globs: |
+            docs/**/*.md
+            CONTRIBUTING.md
+            CHANGELOG.md
+            README.md
+            TESTING.md
+            AGENTS.md
+            CLAUDE.md
+
+  # Publish a check named `gate` that matches the aggregator in ci.yml so a
+  # branch protection rule requiring `gate` is satisfied by either workflow.
+  # This job is intentionally a no-op script after `markdown` succeeds.
+  gate:
+    needs: markdown
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: docs-only gate satisfied
+        run: echo "ok docs-only PR markdown lint passed"
