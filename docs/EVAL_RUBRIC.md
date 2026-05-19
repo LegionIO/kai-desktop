@@ -77,11 +77,11 @@ Free-form notes for maintainers reading the file by hand.
 ### Frontmatter Field Reference
 
 | Field                      | Type     | Required | Notes                                                                                                                                                                                   |
-| -------------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| -------------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `prompt_id`                | string   | yes      | Globally unique identifier. Used as the filename stem and as the key in baselines.                                                                                                      |
 | `category`                 | string   | yes      | One of `competence` or `usage`. The harness uses this purely for reporting; the gate is per-prompt.                                                                                     |
 | `subcategory`              | string   | no       | Maintainer-readable refinement, e.g. `code-gen`, `explain`, `search`.                                                                                                                   |
-| `prompt`                   | string   | yes      | The text the harness sends to the model. Multi-line allowed via the YAML `                                                                                                              | ` block style. |
+| `prompt`                   | string   | yes      | The text the harness sends to the model. Multi-line allowed via the YAML block style (a `\|` literal followed by an indented block).                                                    |
 | `rubric.length.min`        | integer  | no       | Minimum non-empty output lines after trimming.                                                                                                                                          |
 | `rubric.length.max`        | integer  | no       | Maximum non-empty output lines after trimming.                                                                                                                                          |
 | `rubric.required_tokens`   | string[] | no       | Each entry must appear as a substring of the output. Case-sensitive.                                                                                                                    |
