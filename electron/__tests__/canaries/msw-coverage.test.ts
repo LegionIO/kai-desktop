@@ -7,6 +7,9 @@
  * API key so any leak to the real provider would fail-closed), and asserts
  * via the L1 watchdog (`httpMock.expectHit`) that the mock claimed it.
  *
+ * msw is installed locally inside this suite (not globally — see the
+ * comment in `vitest.setup.ts` for the reasoning).
+ *
  * If a canary breaks:
  *   • Check whether the SDK URL changed (real upstream API change) – update
  *     the corresponding `mockX` builder in `electron/__tests__/setup/msw.ts`.
@@ -16,16 +19,23 @@
  *     than the handler expects – instrument the call site and reconcile.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 
 import { httpMock } from '../../../vitest.setup.js';
-import {
-  mockAnthropic,
-  mockOpenAI,
-  mockBedrock,
-  mockAzure,
-  mockCodex,
-} from '../setup/msw.js';
+import { mockAnthropic, mockOpenAI, mockBedrock, mockAzure, mockCodex } from '../setup/msw.js';
+
+beforeAll(() => {
+  httpMock.server.listen({ onUnhandledRequest: 'error' });
+});
+
+afterEach(() => {
+  httpMock.server.resetHandlers();
+  httpMock.reset();
+});
+
+afterAll(() => {
+  httpMock.server.close();
+});
 
 const FAKE_KEY = 'test-key-not-real';
 
@@ -70,9 +80,7 @@ describe('msw coverage canaries', () => {
 
   it('intercepts Bedrock /model/{id}/invoke', async () => {
     httpMock.use(...mockBedrock());
-    const modelId = encodeURIComponent(
-      'anthropic.claude-3-5-sonnet-20241022-v2:0',
-    );
+    const modelId = encodeURIComponent('anthropic.claude-3-5-sonnet-20241022-v2:0');
     const url = `https://bedrock-runtime.us-east-1.amazonaws.com/model/${modelId}/invoke`;
     const res = await fetch(url, {
       method: 'POST',

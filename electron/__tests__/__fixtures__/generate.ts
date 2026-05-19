@@ -21,9 +21,15 @@ import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 
-import type { MessageCreateParams as AnthropicMessageParams } from '@anthropic-ai/sdk/resources/messages';
 import type { ChatCompletionCreateParamsBase as OpenAIChatParams } from 'openai/resources/chat/completions';
-import type { InvokeModelCommandInput as BedrockInvokeInput } from '@aws-sdk/client-bedrock-runtime';
+
+// Anthropic and Bedrock body shapes are validated at runtime by the msw
+// handlers (and by the canary tests). We keep them as `Record<string,
+// unknown>` here because pulling in `@anthropic-ai/sdk` or
+// `@aws-sdk/client-bedrock-runtime` purely for typedefs would bloat
+// devDependencies without buying us much: the wire format is well
+// documented and rarely changes.
+type AnthropicMessageParams = Record<string, unknown>;
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -94,11 +100,7 @@ interface BedrockInput {
   entries: Array<{
     modelId: string;
     region: string;
-    requestBody: BedrockInvokeInput['body'] extends infer B
-      ? B extends Uint8Array | undefined
-        ? Record<string, unknown>
-        : never
-      : never;
+    requestBody: Record<string, unknown>;
     responseBody?: unknown;
     status?: number;
   }>;
@@ -166,9 +168,7 @@ function sortKeys<T>(value: T): T {
   return value;
 }
 
-function redactHeaders(
-  headers: Record<string, string> | undefined,
-): Record<string, string> | undefined {
+function redactHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
   if (!headers) return undefined;
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) {
@@ -440,7 +440,7 @@ const FIXTURE_INPUTS: FixtureInput[] = [
           anthropic_version: 'bedrock-2023-05-31',
           max_tokens: 64,
           messages: [{ role: 'user', content: 'Say hi.' }],
-        } as never,
+        },
         responseBody: {
           id: 'msg_bdrk_test_0001',
           type: 'message',
@@ -567,11 +567,9 @@ function main(): void {
     const out = join(__dirname, built.provider, built.file.file);
     mkdirSync(dirname(out), { recursive: true });
     writeFileSync(out, toJsonl(built.file));
-    // eslint-disable-next-line no-console
     console.info(`[fixtures] wrote ${relative(__dirname, out)}`);
   }
   writeChecksumManifest(__dirname);
-  // eslint-disable-next-line no-console
   console.info(`[fixtures] wrote ${relative(__dirname, join(__dirname, '.checksum'))}`);
 }
 

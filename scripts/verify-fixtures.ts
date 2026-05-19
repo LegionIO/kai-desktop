@@ -15,12 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = dirname(__dirname);
-const FIXTURES_DIR = join(
-  REPO_ROOT,
-  'electron',
-  '__tests__',
-  '__fixtures__',
-);
+const FIXTURES_DIR = join(REPO_ROOT, 'electron', '__tests__', '__fixtures__');
 const MANIFEST = join(FIXTURES_DIR, '.checksum');
 
 function listFixtureFiles(root: string): string[] {
@@ -43,10 +38,7 @@ function sha256(file: string): string {
 
 function main(): void {
   if (!existsSync(MANIFEST)) {
-    // eslint-disable-next-line no-console
-    console.error(
-      `[fixtures] manifest missing: ${MANIFEST}. Run \`pnpm fixtures:gen\` first.`,
-    );
+    console.error(`[fixtures] manifest missing: ${MANIFEST}. Run \`pnpm fixtures:gen\` first.`);
     process.exit(1);
   }
   const manifest = readFileSync(MANIFEST, 'utf8')
@@ -58,9 +50,7 @@ function main(): void {
     });
 
   const expected = new Map(manifest.map((m) => [m.file, m.hash]));
-  const actualFiles = listFixtureFiles(FIXTURES_DIR).map((f) =>
-    relative(FIXTURES_DIR, f),
-  );
+  const actualFiles = listFixtureFiles(FIXTURES_DIR).map((f) => relative(FIXTURES_DIR, f));
 
   let failed = false;
 
@@ -68,38 +58,27 @@ function main(): void {
     const wantHash = expected.get(file);
     const haveHash = sha256(join(FIXTURES_DIR, file));
     if (!wantHash) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[fixtures] new file not in manifest: ${file} (sha256 ${haveHash})`,
-      );
+      console.error(`[fixtures] new file not in manifest: ${file} (sha256 ${haveHash})`);
       failed = true;
       continue;
     }
     if (wantHash !== haveHash) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[fixtures] checksum mismatch for ${file}: expected ${wantHash}, got ${haveHash}`,
-      );
+      console.error(`[fixtures] checksum mismatch for ${file}: expected ${wantHash}, got ${haveHash}`);
       failed = true;
     }
     expected.delete(file);
   }
 
   for (const stale of expected.keys()) {
-    // eslint-disable-next-line no-console
     console.error(`[fixtures] manifest references missing file: ${stale}`);
     failed = true;
   }
 
   if (failed) {
-    // eslint-disable-next-line no-console
-    console.error(
-      `[fixtures] verification failed. Run \`pnpm fixtures:gen\` to regenerate.`,
-    );
+    console.error(`[fixtures] verification failed. Run \`pnpm fixtures:gen\` to regenerate.`);
     process.exit(1);
   }
 
-  // eslint-disable-next-line no-console
   console.info(`[fixtures] verified ${actualFiles.length} files OK`);
 }
 
