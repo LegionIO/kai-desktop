@@ -57,6 +57,28 @@ const FUSE_INHERIT = 144;
 const FUSE_REMOVED = 114;
 type FuseStateByte = typeof FUSE_DISABLE | typeof FUSE_ENABLE | typeof FUSE_INHERIT | typeof FUSE_REMOVED;
 
+/**
+ * Runtime sanity check: any byte we read out of the fuse wire must be one
+ * of the four documented FuseState values. A future @electron/fuses major
+ * version that adds a fifth FuseState (e.g. for FuseV2) would otherwise
+ * fall through `stateToBoolean` returning `null` and produce a confusing
+ * "got null wanted true/false" diagnostic. Failing explicitly here keeps
+ * the maintenance pressure on the upgrade rather than on the operator
+ * reading the verifier output.
+ */
+const KNOWN_FUSE_STATE_BYTES = new Set<number>([FUSE_DISABLE, FUSE_ENABLE, FUSE_INHERIT, FUSE_REMOVED]);
+function assertKnownFuseByte(byte: number, fuseName: string): asserts byte is FuseStateByte {
+  if (!KNOWN_FUSE_STATE_BYTES.has(byte)) {
+    console.error(
+      `[fuses] FATAL: fuse "${fuseName}" reported unknown byte=${byte} (0x${byte.toString(16)}). ` +
+        `This usually means @electron/fuses has shipped a new FuseState value that the verifier ` +
+        `does not yet understand. Update scripts/verify-fuses.ts to add the new byte before relying ` +
+        `on this gate again.`,
+    );
+    process.exit(1);
+  }
+}
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = dirname(__dirname);
 const DIST_MAC_ARM64 = join(REPO_ROOT, 'dist', 'mac-arm64');
@@ -155,7 +177,13 @@ async function main(): Promise<void> {
   const failures: string[] = [];
 
   for (const { name, option, want } of EXPECTED) {
-    const got = wire[option] as FuseStateByte | undefined;
+    const rawByte = wire[option] as number | undefined;
+    if (rawByte !== undefined) {
+      // Fail-loud on a byte value the verifier doesn't recognise — see the
+      // comment on `KNOWN_FUSE_STATE_BYTES` above.
+      assertKnownFuseByte(rawByte, name);
+    }
+    const got = rawByte as FuseStateByte | undefined;
     const gotBool = got === undefined ? null : stateToBoolean(got);
     if (gotBool === null || gotBool !== want) {
       failures.push(`  - ${name}: expected ${want ? 'ENABLE (true)' : 'DISABLE (false)'}, got ${describeState(got)}`);

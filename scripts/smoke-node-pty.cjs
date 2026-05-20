@@ -60,12 +60,17 @@ async function main() {
 
   let proc;
   try {
+    // Pin cwd + env explicitly rather than inheriting from the surrounding
+    // shell. The smoke runs in CI under the runner user — `process.env.HOME`
+    // is reliable there but a developer hook environment might be hostile
+    // (e.g. `HOME=/var/empty`). A fixed `cwd: '/tmp'` plus a minimal env
+    // keeps the smoke deterministic regardless of who invoked it.
     proc = pty.spawn('echo', [EXPECTED_OUTPUT], {
       name: 'xterm-256color',
       cols: 80,
       rows: 24,
-      cwd: process.env.HOME ?? '/tmp',
-      env: { ...process.env, TERM: 'xterm-256color' },
+      cwd: '/tmp',
+      env: { TERM: 'xterm-256color', PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
     });
   } catch (spawnErr) {
     fail('pty.spawn', spawnErr);

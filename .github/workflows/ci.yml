@@ -20,6 +20,7 @@ jobs:
   # does not pay for the renderer test suite.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -110,6 +111,7 @@ jobs:
     # cover those paths with their own faster checks).
     if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
       # dorny/test-reporter publishes vitest results as a check run; this
@@ -191,6 +193,7 @@ jobs:
     # changes, plus the broader code surface that drives the renderer build.
     if: ${{ (needs.changes.outputs.ipc-seam == 'true' || needs.changes.outputs.code == 'true') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
       # checks:write surfaces the Playwright result as a check run on the PR;
@@ -298,6 +301,7 @@ jobs:
       github.event.pull_request.commits == 1 ||
       needs.changes.outputs.electron == 'true'
     runs-on: macos-26
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -376,8 +380,10 @@ jobs:
   # missing electron-builder rebuild before users do. The smoke script is
   # CommonJS and self-contained; see scripts/smoke-node-pty.cjs.
   node-pty-smoke:
-    needs: checks
+    needs: [changes, checks]
+    if: needs.changes.outputs.electron == 'true'
     runs-on: macos-26
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -417,6 +423,7 @@ jobs:
       - node-pty-smoke
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     env:

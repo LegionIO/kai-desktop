@@ -43,8 +43,10 @@ export default defineConfig({
         '**/*.test.ts',
         '**/*.test.tsx',
         'test-utils/**',
+        // `vitest.*.ts` catches both root `vitest.config.ts`/`vitest.setup.ts`
+        // and the slice configs (`vitest.unit.config.ts` etc.); the previous
+        // `vitest.*.config.ts` entry was a redundant subset.
         'vitest.*.ts',
-        'vitest.*.config.ts',
         // Build output and tooling
         'out/**',
         'dist/**',

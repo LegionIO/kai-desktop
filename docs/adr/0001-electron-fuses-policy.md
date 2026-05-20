@@ -71,14 +71,18 @@ packaged binary on disk and compares them against the table above. It
 runs on the macOS packaging job because the fuses only exist in the
 packaged binary, not in `pnpm dev` output.
 
-A complementary **static security lint** runs in the lint job on Linux and
-catches the same regression class on cheap runs without needing a packaged
-binary. The lint inspects [`electron-builder.template.yml`](../../electron-builder.template.yml)
-and the renderer / preload sources for the well-known patterns that
-disable fuses (for example, a stray `runAsNode: true` in the builder
-config, or `webPreferences.nodeIntegration: true` in a `BrowserWindow`
-constructor). Linux lint is cheap and runs on every PR; the Mac fuse
-check is expensive and gated. The two together give us a fast-fail signal
+A complementary **static security lint** runs in the lint job on Linux
+and catches the related command-line-switch regressions cheaply, without
+needing a packaged binary. The lint greps `electron/main.ts` for the
+forbidden runtime-debugging switches — `app.commandLine.appendSwitch(
+'inspect' | 'remote-debugging-port' | 'js-flags', ...)` — which would
+expose remote debugging surfaces even with the fuses locked down. The
+lint deliberately does NOT chase `webPreferences.nodeIntegration: true`
+or `runAsNode: true` in the builder config; those regressions are caught
+authoritatively by the packaged-binary fuse verifier above and by the
+IPC seam smoke test (which asserts `contextIsolation === true` at
+runtime). Linux lint is cheap and runs on every PR; the Mac fuse check
+is expensive and gated. The two together give us a fast-fail signal
 before the Mac job ever spins up.
 
 ## Consequences
