@@ -261,6 +261,12 @@ jobs:
         run: xvfb-run -a pnpm test:ipc-seam:linux
 
       - name: Publish Playwright report summary
+        # `continue-on-error` so a PR from a fork (where GITHUB_TOKEN is
+        # read-only on `pull-requests` regardless of the workflow's
+        # declared `pull-requests: write` permission) doesn't fail the
+        # job over an unpostable sticky comment. The IPC seam smoke
+        # itself already ran; this step is reporting-only.
+        continue-on-error: true
         if: always()
         uses: daun/playwright-report-summary@v3
         with:
