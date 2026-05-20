@@ -48,6 +48,13 @@ jobs:
           retention-days: 7
 
       - name: Post coverage summary comment
+        # `continue-on-error` so a PR coming from a fork (where GitHub
+        # restricts the default GITHUB_TOKEN to read-only on
+        # `pull-requests`, ignoring the workflow-declared `pull-requests:
+        # write` permission) doesn't fail the whole coverage job over an
+        # unpostable sticky comment. The artifact + summary still upload;
+        # coverage is reporting-only by design.
+        continue-on-error: true
         if: always()
         uses: actions/github-script@v8
         env:
