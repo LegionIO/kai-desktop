@@ -11,6 +11,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../../../config/schema.js';
 import type { StreamOptions, StreamEvent } from '../types.js';
 
+// `resolveStreamConfig` is invoked from inside MastraRuntime.stream — the
+// test for the fallback branch needs to swap the mock return between
+// configurations. The mock function is hoisted via vi.mock below; we keep
+// a writable reference here that the test mutates.
+type ResolvedStreamConfig = {
+  fallbackEnabled: boolean;
+  fallbackModels: Array<{ key: string }>;
+};
+
+let mockedStreamConfig: ResolvedStreamConfig = {
+  fallbackEnabled: false,
+  fallbackModels: [],
+};
+
 // ---------------------------------------------------------------------------
 // Mock at Kai's factory boundary — NOT @mastra/core.
 // ---------------------------------------------------------------------------
@@ -72,8 +86,11 @@ vi.mock('../../model-catalog.js', () => ({
     temperature: 0.7,
     maxSteps: 25,
     maxRetries: 2,
-    fallbackEnabled: false,
-    fallbackModels: [],
+    // The test rewrites the fallback half via `mockedStreamConfig` so the
+    // happy-path tests stay deterministic; the fallback-path test below
+    // mutates `mockedStreamConfig` to flip the branch.
+    fallbackEnabled: mockedStreamConfig.fallbackEnabled,
+    fallbackModels: mockedStreamConfig.fallbackModels,
   })),
 }));
 
@@ -122,6 +139,7 @@ beforeEach(() => {
   mastraState.lastPrimaryArgs = undefined;
   mastraState.lastFallbackArgs = undefined;
   mastraState.shouldAbort = undefined;
+  mockedStreamConfig = { fallbackEnabled: false, fallbackModels: [] };
 });
 
 // ---------------------------------------------------------------------------
@@ -172,6 +190,39 @@ describe('MastraRuntime', () => {
       // streamAgentResponse signature: (conversationId, messages, modelConfig, config, tools, dbPath, options)
       const lastOpts = (mastraState.lastPrimaryArgs?.[6] ?? {}) as { abortSignal?: AbortSignal };
       expect(lastOpts.abortSignal).toBe(ac.signal);
+    });
+  });
+
+  describe('stream — fallback enabled', () => {
+    it('routes through streamWithFallback when fallbackEnabled + fallbackModels is non-empty', async () => {
+      mockedStreamConfig = {
+        fallbackEnabled: true,
+        fallbackModels: [{ key: 'backup-model' }],
+      };
+      mastraState.fallbackEvents = [
+        { conversationId: 'conv-mastra', type: 'text-delta', text: 'From fallback path.' },
+        { conversationId: 'conv-mastra', type: 'done' },
+      ];
+
+      const rt = new MastraRuntime();
+      const events = await collect(rt.stream(makeOptions()));
+
+      // The adapter must pick the fallback path, not the primary.
+      expect(mastraState.fallbackCallCount).toBe(1);
+      expect(mastraState.primaryCallCount).toBe(0);
+      expect(events).toEqual(mastraState.fallbackEvents);
+    });
+
+    it('falls back to streamAgentResponse when fallbackEnabled but fallbackModels is empty', async () => {
+      mockedStreamConfig = { fallbackEnabled: true, fallbackModels: [] };
+      mastraState.primaryEvents = [{ conversationId: 'conv-mastra', type: 'done' }];
+
+      const rt = new MastraRuntime();
+      await collect(rt.stream(makeOptions()));
+
+      // Empty fallbackModels array short-circuits to primary.
+      expect(mastraState.primaryCallCount).toBe(1);
+      expect(mastraState.fallbackCallCount).toBe(0);
     });
   });
 });

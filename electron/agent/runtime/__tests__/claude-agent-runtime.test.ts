@@ -195,6 +195,60 @@ describe('ClaudeAgentRuntime', () => {
     });
   });
 
+  describe('stream — tool-result round-trip', () => {
+    it('translates `user` content_block tool_result into a tool-result StreamEvent', async () => {
+      // The SDK emits a `user` message with `tool_result` blocks AFTER the
+      // assistant's tool_use. A regression that drops the result event would
+      // leave the renderer waiting forever — this test pins the contract.
+      sdkState.messages = [
+        {
+          type: 'assistant',
+          session_id: 'sess-tr',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                id: 'toolu_2',
+                name: 'mcp__kai__read_file',
+                input: { path: 'README.md' },
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 4 },
+          },
+        },
+        {
+          type: 'user',
+          session_id: 'sess-tr',
+          message: {
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_2',
+                content: '# Hello world',
+                is_error: false,
+              },
+            ],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 'sess-tr' },
+      ];
+
+      const rt = new ClaudeAgentRuntime();
+      const events = await collect(rt.stream(makeOptions()));
+
+      const toolResults = events.filter((e) => e.type === 'tool-result');
+      expect(toolResults.length).toBeGreaterThanOrEqual(1);
+      const tr = toolResults[0];
+      if (tr.type === 'tool-result') {
+        expect(tr.toolCallId).toBe('toolu_2');
+        // Result content should reach the renderer verbatim.
+        const resultStr = typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result);
+        expect(resultStr).toContain('Hello world');
+      }
+      expect(events[events.length - 1].type).toBe('done');
+    });
+  });
+
   describe('stream — session resume', () => {
     it('captures session_id from the first message and stores it for resume', async () => {
       sdkState.messages = [

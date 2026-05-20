@@ -298,6 +298,18 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
 
       const errs = events.filter((e) => e.type === 'error');
       expect(errs.length).toBeGreaterThanOrEqual(1);
+      // Surface the underlying provider failure verbatim — a regression that
+      // swallowed the message and emitted a generic "Unknown error" must fail
+      // this assertion. The synthetic SDK error names the underlying
+      // `AI_APICallError: Invalid response body` shape.
+      const firstErr = errs[0];
+      const errorMessage =
+        firstErr.type === 'error'
+          ? typeof firstErr.error === 'string'
+            ? firstErr.error
+            : JSON.stringify(firstErr.error)
+          : '';
+      expect(errorMessage).toMatch(/AI_APICallError|Invalid response body/);
       expect(events[events.length - 1].type).toBe('done');
     });
   });

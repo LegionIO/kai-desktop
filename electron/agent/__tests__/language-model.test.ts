@@ -11,8 +11,9 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { http, HttpResponse } from 'msw';
 import { httpMock } from '../../../vitest.setup.js';
-import { mockAnthropic, mockOpenAI, mockAzure } from '../../__tests__/setup/msw.js';
+import { mockAnthropic, mockOpenAI, mockAzure, mockBedrock } from '../../__tests__/setup/msw.js';
 
 // Stub the electron module — only `app.getVersion()` is read at module load by
 // the brand-user-agent helper. In test mode there is no Electron runtime, so
@@ -82,6 +83,21 @@ function azureConfig(): LLMModelConfig {
   };
 }
 
+function bedrockConfig(): LLMModelConfig {
+  return {
+    provider: 'amazon-bedrock',
+    endpoint: 'https://bedrock-runtime.us-east-1.amazonaws.com',
+    apiKey: 'unused-aws-uses-credential-chain',
+    region: 'us-east-1',
+    accessKeyId: 'AKIA-TEST-NOT-REAL',
+    secretAccessKey: 'test-secret-not-real',
+    modelName: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+    temperature: 0.7,
+    maxSteps: 25,
+    maxRetries: 1,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -134,16 +150,62 @@ describe('createLanguageModelFromConfig — HTTP integration', () => {
     });
   });
 
+  describe('Bedrock', () => {
+    it('routes a doGenerate() call to the bedrock-runtime converse endpoint', async () => {
+      // `@ai-sdk/amazon-bedrock` calls the `/converse` API (not the legacy
+      // `/invoke`), so we install a one-off handler returning a minimal
+      // converse-shaped response. `mockBedrock()` targets `/invoke` for
+      // direct SDK callers and stays useful for those tests.
+      httpMock.server.use(
+        http.post(/https:\/\/bedrock-runtime\.[^/]+\.amazonaws\.com\/model\/.+\/converse/, async () => {
+          return HttpResponse.json({
+            output: {
+              message: {
+                role: 'assistant',
+                content: [{ text: 'Hi.' }],
+              },
+            },
+            stopReason: 'end_turn',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            metrics: { latencyMs: 1 },
+          });
+        }),
+      );
+
+      const model = await createLanguageModelFromConfig(bedrockConfig());
+
+      const res = await (model as unknown as { doGenerate: (opts: unknown) => Promise<unknown> }).doGenerate({
+        prompt: [{ role: 'user', content: [{ type: 'text', text: 'Say hi.' }] }],
+      });
+
+      expect(res).toBeDefined();
+      httpMock.expectHit(/bedrock-runtime\..+\.amazonaws\.com/);
+      httpMock.expectNoUnhandled();
+    });
+  });
+
   describe('authorization header propagation', () => {
     it('forwards the API key on Anthropic requests', async () => {
+      // Capture the x-api-key inside the handler instead of via
+      // `server.events.on('request:match', ...)`. Event listeners persist
+      // across tests in the same suite unless explicitly removed; the
+      // single-handler form ties the capture's lifetime to the suite's
+      // `resetHandlers()` call in `afterEach`.
       let observedKey: string | null = null;
       httpMock.server.use(
-        // Capture the x-api-key header by registering a one-off handler.
-        ...mockAnthropic(),
+        http.post(/api\.anthropic\.com(\/v1)?\/messages.*/, async ({ request }) => {
+          observedKey = request.headers.get('x-api-key');
+          return HttpResponse.json({
+            id: 'msg_test',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hi.' }],
+            model: 'claude-3-5-sonnet-20241022',
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          });
+        }),
       );
-      httpMock.server.events.on('request:match', ({ request }) => {
-        observedKey = request.headers.get('x-api-key');
-      });
 
       const model = await createLanguageModelFromConfig(anthropicConfig());
       await (model as unknown as { doGenerate: (opts: unknown) => Promise<unknown> }).doGenerate({

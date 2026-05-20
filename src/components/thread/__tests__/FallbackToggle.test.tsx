@@ -26,10 +26,13 @@ describe('FallbackToggle', () => {
   it('renders the "Auto" label and the auto-routing tooltip title when enabled', () => {
     renderWithProviders(<FallbackToggle enabled={true} onToggle={() => undefined} />);
 
+    // Use `toHaveAccessibleDescription` rather than `getAttribute('title')`
+    // — the assertion stays correct if the component swaps the native
+    // `title` attribute for `aria-describedby` (e.g. Radix Tooltip).
     const button = screen.getByRole('button');
     expect(button).toBeInTheDocument();
     expect(button).toHaveTextContent('Auto');
-    expect(button.getAttribute('title')).toMatch(/Auto-routing enabled/i);
+    expect(button).toHaveAccessibleDescription(/Auto-routing enabled/i);
   });
 
   it('renders the "Manual" label and the enable-tooltip title when disabled', () => {
@@ -38,7 +41,7 @@ describe('FallbackToggle', () => {
     const button = screen.getByRole('button');
     expect(button).toBeInTheDocument();
     expect(button).toHaveTextContent('Manual');
-    expect(button.getAttribute('title')).toMatch(/Enable auto-routing/i);
+    expect(button).toHaveAccessibleDescription(/Enable auto-routing/i);
   });
 
   it('calls onToggle with the inverted value on click', () => {

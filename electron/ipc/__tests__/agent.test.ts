@@ -1,23 +1,18 @@
 /**
  * IPC handler tests for `electron/ipc/agent.ts`.
  *
- * Two complementary surfaces are covered here:
+ * Covers the lightweight approval / sub-agent channels exposed by
+ * `registerAgentHandlers`. These do not need the full streaming pipeline,
+ * so we can register them through `createIpcHarness` after mocking the
+ * heavy production dependencies (Mastra, web-server, plugins, etc.).
  *
- *   1. The lightweight approval / sub-agent channels exposed by
- *      `registerAgentHandlers`. These do not need the full streaming pipeline,
- *      so we can register them through `createIpcHarness` after mocking the
- *      heavy production dependencies (Mastra, web-server, plugins, etc.).
- *
- *   2. The runtime injection contract. `stubMastra` from
- *      `test-utils/runtime-stubs.ts` is the canonical fake `AgentRuntime` test
- *      fixture. We exercise its `stream()` shape directly and verify that the
- *      events match what the renderer-side `RuntimeProvider` accumulates
- *      (`text-delta`, `done`).
+ * The `stubMastra` fixture self-tests live in
+ * `test-utils/__tests__/runtime-stubs.test.ts` — they pin the fake-runtime
+ * shape but do not exercise any agent.ts code path.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createIpcHarness } from '../../../test-utils/ipc-harness.js';
-import { stubMastra } from '../../../test-utils/runtime-stubs.js';
 
 // ---------------------------------------------------------------------------
 // Mocks for the heavy production graph that `electron/ipc/agent.ts` pulls in.
@@ -82,9 +77,7 @@ vi.mock('../../agent/runtime/index.js', () => ({
     runtime: { id: 'mastra', name: 'Mastra', capabilities: {} },
     resolution: { runtimeId: 'mastra' },
   })),
-  getAvailableRuntimes: vi.fn(async () => [
-    { id: 'mastra', name: 'Mastra', available: true },
-  ]),
+  getAvailableRuntimes: vi.fn(async () => [{ id: 'mastra', name: 'Mastra', available: true }]),
   getActiveRuntimeId: vi.fn(async () => 'mastra'),
 }));
 
@@ -169,11 +162,7 @@ describe('agent IPC: tool approval channels', () => {
       return value;
     });
 
-    const result = await harness.invoke<{ ok: boolean }>(
-      'agent:approve-tool',
-      FAKE_EVENT,
-      'tc-approve',
-    );
+    const result = await harness.invoke<{ ok: boolean }>('agent:approve-tool', FAKE_EVENT, 'tc-approve');
     expect(result).toEqual({ ok: true });
 
     await pending;
@@ -196,11 +185,7 @@ describe('agent IPC: tool approval channels', () => {
       return value;
     });
 
-    const result = await harness.invoke<{ ok: boolean }>(
-      'agent:reject-tool',
-      FAKE_EVENT,
-      'tc-reject',
-    );
+    const result = await harness.invoke<{ ok: boolean }>('agent:reject-tool', FAKE_EVENT, 'tc-reject');
     expect(result).toEqual({ ok: true });
 
     await pending;
@@ -260,11 +245,7 @@ describe('agent IPC: tool approval channels', () => {
 
     // No entry has been registered for "ghost". The handler should treat that
     // as a benign no-op so out-of-order renderer clicks do not crash the IPC.
-    const result = await harness.invoke<{ ok: boolean }>(
-      'agent:approve-tool',
-      FAKE_EVENT,
-      'ghost',
-    );
+    const result = await harness.invoke<{ ok: boolean }>('agent:approve-tool', FAKE_EVENT, 'ghost');
     expect(result).toEqual({ ok: true });
   });
 });
@@ -287,67 +268,9 @@ describe('agent IPC: sub-agent channels', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Runtime-stub contract: stubMastra exercised directly.
-//
-// The agent IPC delegates to the runtime registry via `resolveRuntimeForStream`.
-// The streaming pipeline itself is too large to exercise end-to-end here, so
-// instead we verify that `stubMastra` — the fixture future tests will inject
-// into the registry — produces the event shape the renderer side consumes.
+// Runtime-stub contract tests now live in
+// `test-utils/__tests__/runtime-stubs.test.ts` — they pin the fake-runtime
+// fixture shape directly and do not need the agent.ts production graph
+// loaded. Keeping them here would have inflated this file's stated scope
+// (IPC handler coverage) with code that exercises only the fixture.
 // ---------------------------------------------------------------------------
-
-describe('agent IPC: stubMastra runtime contract', () => {
-  it('exposes the AgentRuntime fields the streaming pipeline reads', () => {
-    const stub = stubMastra();
-    expect(stub.id).toBe('mastra');
-    expect(stub.name).toBe('Mastra');
-    // `agent.ts` reads `runtime.capabilities.toolObserver` and `.compaction`
-    // to decide whether to wire the observer/compaction paths.
-    expect(stub.capabilities).toMatchObject({
-      toolObserver: true,
-      compaction: true,
-    });
-  });
-
-  it('yields a text-delta then a done event on stream() — the minimum renderer contract', async () => {
-    const stub = stubMastra();
-    const events: Array<{ type: string; conversationId?: string }> = [];
-
-    for await (const event of stub.stream({ conversationId: 'conv-x' })) {
-      events.push({ type: event.type, conversationId: (event as { conversationId?: string }).conversationId });
-    }
-
-    expect(events.length).toBeGreaterThanOrEqual(2);
-    expect(events[0]).toMatchObject({ type: 'text-delta' });
-    expect(events[events.length - 1]).toMatchObject({ type: 'done' });
-  });
-
-  it('records stream invocations on the vi.fn so tests can assert arguments', async () => {
-    const stub = stubMastra();
-    const opts = { conversationId: 'conv-record', messages: [], config: {}, tools: [], appHome: '/tmp' };
-
-    // Drain the generator so the stub's vi.fn captures the call.
-    for await (const _event of stub.stream(opts)) {
-      // intentionally empty
-    }
-
-    expect(stub.stream).toHaveBeenCalledTimes(1);
-    expect(stub.stream).toHaveBeenCalledWith(opts);
-  });
-
-  it('honours overrides so tests can inject custom event sequences', async () => {
-    async function* customStream() {
-      yield { conversationId: 'c', type: 'text-delta' as const, text: 'Hello' };
-      yield { conversationId: 'c', type: 'tool-call' as const, toolCallId: 't1', toolName: 'echo', args: { x: 1 } };
-      yield { conversationId: 'c', type: 'tool-result' as const, toolCallId: 't1', result: { ok: true } };
-      yield { conversationId: 'c', type: 'done' as const };
-    }
-
-    const stub = stubMastra({ stream: vi.fn(() => customStream()) });
-    const events: Array<{ type: string }> = [];
-    for await (const event of stub.stream({ conversationId: 'c' })) {
-      events.push({ type: event.type });
-    }
-
-    expect(events.map((e) => e.type)).toEqual(['text-delta', 'tool-call', 'tool-result', 'done']);
-  });
-});

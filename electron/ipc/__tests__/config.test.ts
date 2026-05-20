@@ -7,8 +7,8 @@
  *   • Mock the `electron` module so production code that imports BrowserWindow
  *     does not crash in a Node-only vitest environment.
  *   • Redirect `os.homedir()` to a per-test temp directory so the production
- *     `APP_LLM_CONFIG_PATH` constant (evaluated at module load) cannot reach
- *     the developer's real `~/.kai/` while the suite runs.
+ *     `getAppLlmConfigPath()` resolver cannot reach the developer's real
+ *     `~/.kai/` while the suite runs.
  *   • Drive an in-memory IPC harness — `createIpcHarness({ registerHandlers })`
  *     — instead of standing up Electron's real IPC, which is not available in
  *     vitest. The harness mirrors `ipcMain.handle()` for invoke channels and
@@ -33,14 +33,17 @@ vi.mock('electron', () => ({
   },
 }));
 
-// Redirect `os.homedir()` so `APP_LLM_CONFIG_PATH` (a module-level constant
-// in config.ts) cannot point at the developer's real `~/.kai/settings/llm.json`.
+// Redirect `os.homedir()` so `getAppLlmConfigPath()` cannot point at the
+// developer's real `~/.kai/settings/llm.json`.
 //
 // `vi.mock` factories are hoisted above all imports and top-level statements,
 // so the redirect target must be readable the instant any imported module
-// calls `homedir()`. Stashing the value on `globalThis` plus a string fallback
-// keeps the call safe even before `beforeEach` has run — early callers see a
-// deterministic (but unused) placeholder path under the OS tmpdir.
+// calls `homedir()`. Several non-config production modules (self-signed.ts,
+// audit-log.ts, web-server.ts) still evaluate paths at module load, so the
+// fallback must be a value, not a TDZ-bound `let`. Stashing the slot on
+// `globalThis` and falling through to `actual.tmpdir()` keeps the early
+// callers safe — they see a deterministic placeholder path under the OS
+// tmpdir until the per-test `beforeEach` reassigns it.
 declare global {
   var __kaiTestHomedir: string | undefined;
 }
@@ -60,8 +63,7 @@ vi.mock('os', async () => {
 });
 
 // Import production code AFTER vi.mock calls so the mocked `electron`/`os`
-// modules are wired up by the time config.ts evaluates its top-level
-// `APP_LLM_CONFIG_PATH = join(homedir(), ...)` expression.
+// modules are wired up before any imported module reads them.
 import {
   registerConfigHandlers,
   desktopConfigPayload,
@@ -87,8 +89,9 @@ let appHome: string;
 
 beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), 'kai-config-ipc-'));
-  // `homedir()` is mocked above to return `globalThis.__kaiTestHomedir`. Point
-  // it at the per-test temp dir so `APP_LLM_CONFIG_PATH` resolves under it.
+  // `homedir()` is mocked above to return `globalThis.__kaiTestHomedir`.
+  // Point it at the per-test temp dir so `getAppLlmConfigPath()` resolves
+  // under it.
   globalThis.__kaiTestHomedir = tempHome;
   appHome = join(tempHome, '.kai');
   mkdirSync(join(appHome, 'settings'), { recursive: true });
@@ -96,7 +99,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(tempHome, { recursive: true, force: true });
-  globalThis.__kaiTestHomedir = '';
+  globalThis.__kaiTestHomedir = undefined;
 });
 
 // ---------------------------------------------------------------------------
@@ -121,9 +124,7 @@ describe('config IPC: desktopConfigPayload round-trip', () => {
     expect(rereadPayload.cliTools).toEqual(payload.cliTools);
     expect(rereadPayload.advanced).toEqual(payload.advanced);
     // The disk file should match the allowlist output byte-for-byte.
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect(onDisk).toEqual(rereadPayload);
   });
 
@@ -137,20 +138,14 @@ describe('config IPC: desktopConfigPayload round-trip', () => {
       // Not in the allowlist — must NOT survive the next write.
       experimentalGhostSetting: { secret: 'leak-me' },
     };
-    writeFileSync(
-      join(appHome, 'settings', 'desktop.json'),
-      JSON.stringify(tainted, null, 2),
-      'utf-8',
-    );
+    writeFileSync(join(appHome, 'settings', 'desktop.json'), JSON.stringify(tainted, null, 2), 'utf-8');
 
     // Round-trip: read effective config (which strips through the schema and
     // the allowlist) and write it back.
     const reread = readEffectiveConfig(appHome);
     writeDesktopConfig(appHome, reread);
 
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect('experimentalGhostSetting' in onDisk).toBe(false);
     // Allowlisted sections still present after the strip.
     expect(onDisk.agent).toBeDefined();
@@ -199,9 +194,7 @@ describe('config IPC: registered channels', () => {
     const reread = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
     expect(reread.launchAtLogin).toBe(true);
 
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect(onDisk.launchAtLogin).toBe(true);
   });
 
@@ -235,9 +228,7 @@ describe('config IPC: allowlist enforcement', () => {
     await harness.invoke('config:set', FAKE_EVENT, 'experimentalGhost', { secret: 'leak-me' });
 
     expect(existsSync(join(appHome, 'settings', 'desktop.json'))).toBe(true);
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect('experimentalGhost' in onDisk).toBe(false);
   });
 });
@@ -264,10 +255,7 @@ describe('config IPC: renderer contract', () => {
             ipc.handle(channel, handler);
           },
         };
-        registerConfigHandlers(
-          wrapped as Parameters<typeof registerConfigHandlers>[0],
-          appHome,
-        );
+        registerConfigHandlers(wrapped as Parameters<typeof registerConfigHandlers>[0], appHome);
       },
     });
 
