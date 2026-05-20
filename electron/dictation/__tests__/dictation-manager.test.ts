@@ -108,6 +108,15 @@ const mocks = vi.hoisted(() => {
       if (state.beginError) throw state.beginError;
       return state.beginResponse;
     });
+    // Main's dictation refactor renamed the production call from
+    // `beginSession` to `beginSessionUnchecked`. Provide both on the mock
+    // so the test works against whichever production source vitest ends
+    // up loading (PR-head version with `beginSession`, or merge-with-main
+    // version with `beginSessionUnchecked`).
+    readonly beginSessionUnchecked = vi.fn(async () => {
+      if (state.beginError) throw state.beginError;
+      return state.beginResponse;
+    });
     readonly startTargetTracking = vi.fn(async () => ({ ok: true }));
     readonly stopTargetTracking = vi.fn(async () => ({ ok: true }));
     readonly refreshTarget = vi.fn(async () => state.refreshResponse ?? {
