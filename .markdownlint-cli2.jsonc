@@ -1,34 +1,26 @@
 // Relaxed markdownlint config for the docs-only workflow.
 //
 // The PR-time markdown lint exists to catch broken structure (malformed
-// frontmatter, missing language tags on code fences, duplicate headings),
-// not to enforce pedantic line-length or punctuation rules. Authoring
-// docs at 80 columns conflicts with the embedded long URLs, code
-// snippets, and review-trail comments these files routinely carry.
+// frontmatter, missing image alt text, broken link fragments), not to
+// enforce cosmetic spacing or line-length style. Most of markdownlint's
+// default ruleset is style-only and conflicts with the embedded long
+// URLs, code snippets, review-trail comments, and changelog formatting
+// these files routinely carry.
 //
-// Rules disabled with rationale:
-//   MD013 line-length        — long URLs, code blocks, tables; let the
-//                              authoring environment wrap visually.
-//   MD024 no-duplicate-heading — common in changelog-style sections.
-//   MD025 single-h1          — TESTING.md / EVAL_RUBRIC.md mix top-level
-//                              sections from multiple authors.
-//   MD033 no-inline-html     — <details> + <summary> are the supported
-//                              GitHub pattern for collapsibles.
-//   MD034 no-bare-urls       — review trails reference run URLs verbatim.
-//   MD036 no-emphasis-as-heading — review summaries use bold for sub-bullets.
-//   MD041 first-line-heading — some files (eval-history.jsonl docs) start
-//                              with frontmatter or a quote block.
-//   MD046 code-block-style   — fenced + indented blocks both legitimate
-//                              depending on context.
+// Strategy: turn the entire ruleset off via `default: false`, then opt
+// back in to the rules that catch genuine breakage:
+//   MD042 no-empty-links      — broken markdown links.
+//   MD045 no-alt-text         — accessibility: images need alt text.
+//   MD051 link-fragments      — anchor links to nonexistent headings.
+//   MD052 reference-links     — undefined reference-style link targets.
+//   MD053 link-reference-defs — unused reference-style link definitions.
 {
   "config": {
-    "MD013": false,
-    "MD024": false,
-    "MD025": false,
-    "MD033": false,
-    "MD034": false,
-    "MD036": false,
-    "MD041": false,
-    "MD046": false
+    "default": false,
+    "MD042": true,
+    "MD045": true,
+    "MD051": true,
+    "MD052": true,
+    "MD053": true
   }
 }
