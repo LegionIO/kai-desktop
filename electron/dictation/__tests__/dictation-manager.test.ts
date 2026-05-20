@@ -405,6 +405,12 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
     vi.resetModules();
     vi.stubGlobal('__BRAND_PRODUCT_NAME', 'Kai');
     vi.stubGlobal('__BRAND_APP_SLUG', 'kai');
+    // Force the macOS code path. The production dictation manager
+    // `early-return`s when `process.platform !== 'darwin'`, leaving state
+    // at 'idle' on Linux CI runners — so these assertions are platform-
+    // dependent without an explicit stub. Override at the property level
+    // (the `process` object itself is non-replaceable in Node 22).
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
     mocks.reset();
   });
 
