@@ -257,6 +257,34 @@ vi.mock('electron', () => ({
   BrowserWindow: mocks.BrowserWindow,
   globalShortcut: mocks.globalShortcut,
   ipcMain: mocks.ipcMain,
+  // Minimal `app` shape so transitive imports (computer-use, plugins,
+  // utils/user-agent, ...) don't fail with `No "app" export defined on
+  // the "electron" mock`. The dictation manager itself doesn't reference
+  // these, but the production code path reaches into permissions.js
+  // which does.
+  app: {
+    getName: vi.fn(() => 'Kai'),
+    getVersion: vi.fn(() => '0.0.0-test'),
+    getPath: vi.fn(() => '/tmp/kai-test'),
+    isReady: vi.fn(() => true),
+    isPackaged: false,
+    focus: vi.fn(),
+    on: vi.fn(),
+    once: vi.fn(),
+    whenReady: vi.fn(() => Promise.resolve()),
+  },
+  systemPreferences: {
+    isTrustedAccessibilityClient: vi.fn(() => true),
+    getMediaAccessStatus: vi.fn(() => 'granted'),
+  },
+  shell: { openExternal: vi.fn() },
+  screen: { getPrimaryDisplay: vi.fn(() => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } })) },
+  Notification: vi.fn(),
+  safeStorage: { isEncryptionAvailable: vi.fn(() => false), encryptString: vi.fn(), decryptString: vi.fn() },
+  session: { defaultSession: {} },
+  net: { fetch: vi.fn() },
+  nativeImage: { createEmpty: vi.fn(() => ({})) },
+  dialog: {},
 }));
 
 vi.mock('microsoft-cognitiveservices-speech-sdk', () => ({
