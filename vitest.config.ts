@@ -6,9 +6,7 @@ import { branding } from './branding.config';
 import { resolveBranding } from './scripts/resolve-branding';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const pkg = JSON.parse(
-  readFileSync(`${__dirname}/package.json`, 'utf8'),
-) as { version: string };
+const pkg = JSON.parse(readFileSync(`${__dirname}/package.json`, 'utf8')) as { version: string };
 
 /**
  * Mirror the `define()` map produced in `electron.vite.config.ts` so any test
@@ -35,7 +33,11 @@ for (const [key, value] of Object.entries(resolved)) {
 }
 _brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 
-/** Frozen brand define() map; re-exported so slice configs can reuse it. */
+/**
+ * Frozen brand define() map; re-exported so the per-slice vitest configs
+ * (vitest.unit / .component / .integration) can reuse the same map
+ * without re-deriving it from `branding.config.ts` themselves.
+ */
 export const brandDefines = _brandDefines;
 
 export const baseConfig = defineConfig({

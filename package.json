@@ -22,14 +22,11 @@
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-<<<<<<< HEAD
-    "fixtures:gen": "tsx electron/__tests__/__fixtures__/generate.ts",
-    "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
-=======
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:component": "vitest run --config vitest.component.config.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",
->>>>>>> 75189f9 (refactor: split vitest config into unit/component/integration slices)
+    "fixtures:gen": "tsx electron/__tests__/__fixtures__/generate.ts",
+    "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
     "prepare": "husky"
   },
   "devDependencies": {
