@@ -12,7 +12,16 @@
  */
 
 import { vi, beforeEach, afterEach } from 'vitest';
+import type * as Undici from 'undici';
 import { setupHttpMock } from './test-utils/http-mock.js';
+import {
+  BLOCKED_HOSTS,
+  HTTP_FIREWALL_ERROR_CODE,
+  HTTP_FIREWALL_INSTALLED_SYMBOL,
+  extractHostname,
+  isBlockedHostname,
+  makeFirewallError,
+} from './test-utils/blocked-hosts.js';
 
 // Freeze system time globally so date-dependent assertions are deterministic.
 beforeEach(() => {
@@ -85,58 +94,123 @@ afterEach(() => {
 //   • Suites that do NOT call `server.listen()` see our wrapper as the
 //     front line. Any provider-bound fetch throws immediately.
 //
+// Defence-in-depth against `undici` direct imports: the L2 wrapper only
+// covers `globalThis.fetch`. A test calling `import { request } from 'undici'`
+// would bypass it. The `vi.mock('undici', …)` block below routes every
+// undici client API through the same firewall check.
+//
 // Why `globalThis.fetch` and not `node:dns`? Node 22 marks
 // `dns.lookup` non-configurable, and the previous `Object.defineProperty`
 // approach silently failed (the try/catch swallowed the TypeError). The
 // `fetch` global is writable and is what every SDK in this repo routes
 // through, so wrapping it is both reliable and easy to verify.
-const BLOCKED_HOSTS: Array<string | RegExp> = [
-  'api.anthropic.com',
-  'api.openai.com',
-  /^bedrock-runtime\.[^.]+\.amazonaws\.com$/,
-  /^[^.]+\.openai\.azure\.com$/,
-];
 
-function isBlockedHostname(hostname: string): boolean {
-  return BLOCKED_HOSTS.some((pattern) => (typeof pattern === 'string' ? hostname === pattern : pattern.test(hostname)));
-}
-
-function extractHostname(input: RequestInfo | URL): string | null {
-  try {
-    if (typeof input === 'string') return new URL(input).hostname;
-    if (input instanceof URL) return input.hostname;
-    // Request object – has a `url` string.
-    return new URL((input as Request).url).hostname;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Marker so tests can recognise a firewall-injected error vs. a real
- * network error. The new dns-firewall canary asserts on this.
- */
-export const HTTP_FIREWALL_ERROR_CODE = 'ECONNREFUSED';
-
-function makeFirewallError(hostname: string): Error & { code: string } {
-  const err = new Error(
-    `HTTP egress firewall: real provider request blocked for ${hostname}. ` +
-      `Egress to provider hostname blocked — install msw handlers or add hostname to allowlist. ` +
-      `(See vitest.setup.ts BLOCKED_HOSTS.)`,
-  ) as Error & { code: string };
-  err.code = HTTP_FIREWALL_ERROR_CODE;
-  return err;
-}
+// Re-export so canary suites that still import these from `vitest.setup.ts`
+// keep compiling. New code should import from `test-utils/blocked-hosts.ts`.
+export { HTTP_FIREWALL_ERROR_CODE, HTTP_FIREWALL_INSTALLED_SYMBOL };
 
 const __realFetch = globalThis.fetch.bind(globalThis);
 const __firewallFetch: typeof globalThis.fetch = async (input, init) => {
   const hostname = extractHostname(input as RequestInfo | URL);
   if (hostname && isBlockedHostname(hostname)) {
-    throw makeFirewallError(hostname);
+    throw makeFirewallError(hostname, 'fetch');
   }
   return __realFetch(input as RequestInfo | URL, init);
 };
+
+// Stamp the wrapper so any later setup file that reassigns `globalThis.fetch`
+// (e.g. `electron/__tests__/integration-real/setup-real-api.ts`) can assert
+// the firewall was actually installed before replacing it.
+(__firewallFetch as unknown as Record<symbol, unknown>)[HTTP_FIREWALL_INSTALLED_SYMBOL] = true;
 globalThis.fetch = __firewallFetch;
+
+// ── undici guard ──────────────────────────────────────────────────────────
+// `globalThis.fetch` wrapping above only catches code that uses the global.
+// A test or transitive dep that does `import { request } from 'undici'` (or
+// `new Pool(...)`, `new Agent(...)`) bypasses the global entirely. Route
+// every undici client API through the same blocked-host check.
+//
+// `fetch` from undici is wired to delegate to `globalThis.fetch` so the L2
+// wrapper above still runs; the rest throw the firewall error eagerly.
+//
+// Tests that genuinely need real provider HTTP (the `integration-real/`
+// suite) opt in by re-assigning `globalThis.fetch = undiciFetch` inside
+// their own setup file — at which point this mock is still active for
+// `request`/`stream`/etc but `fetch` is bypassed via the global swap.
+vi.mock('undici', async () => {
+  const actual = await vi.importActual<typeof Undici>('undici');
+
+  type FetchInput = Parameters<typeof actual.fetch>[0];
+  type FetchInit = Parameters<typeof actual.fetch>[1];
+
+  // undici's Response type narrows differently from lib.dom Response; cast
+  // through `unknown` so the dual-shape return doesn't trip the strict
+  // structural compatibility check.
+  const wrappedFetch = ((input: FetchInput, init?: FetchInit) =>
+    globalThis.fetch(
+      input as unknown as RequestInfo | URL,
+      init as RequestInit | undefined,
+    )) as unknown as typeof actual.fetch;
+
+  const guard = (url: unknown, source: string): void => {
+    const hostname = extractHostname(url);
+    if (hostname && isBlockedHostname(hostname)) {
+      throw makeFirewallError(hostname, source);
+    }
+  };
+
+  const guardedRequest: typeof actual.request = ((url: unknown, opts?: unknown) => {
+    guard(url, 'undici.request');
+    return (actual.request as unknown as (u: unknown, o?: unknown) => unknown)(url, opts);
+  }) as typeof actual.request;
+
+  const guardedStream: typeof actual.stream = ((url: unknown, opts: unknown, factory: unknown) => {
+    guard(url, 'undici.stream');
+    return (actual.stream as unknown as (u: unknown, o: unknown, f: unknown) => unknown)(url, opts, factory);
+  }) as typeof actual.stream;
+
+  const guardedPipeline: typeof actual.pipeline = ((url: unknown, opts: unknown, handler: unknown) => {
+    guard(url, 'undici.pipeline');
+    return (actual.pipeline as unknown as (u: unknown, o: unknown, h: unknown) => unknown)(url, opts, handler);
+  }) as typeof actual.pipeline;
+
+  const guardedConnect: typeof actual.connect = ((opts: unknown, callback?: unknown) => {
+    const target =
+      typeof opts === 'string'
+        ? opts
+        : opts && typeof opts === 'object' && 'origin' in (opts as Record<string, unknown>)
+          ? (opts as { origin: unknown }).origin
+          : null;
+    guard(target, 'undici.connect');
+    return (actual.connect as unknown as (o: unknown, c?: unknown) => unknown)(opts, callback);
+  }) as typeof actual.connect;
+
+  // Pool / Client / Agent: throw on construction if origin is blocked.
+  class GuardedPool extends actual.Pool {
+    constructor(origin: string | URL, opts?: ConstructorParameters<typeof actual.Pool>[1]) {
+      guard(origin, 'undici.Pool');
+      super(origin, opts);
+    }
+  }
+
+  class GuardedClient extends actual.Client {
+    constructor(origin: string | URL, opts?: ConstructorParameters<typeof actual.Client>[1]) {
+      guard(origin, 'undici.Client');
+      super(origin, opts);
+    }
+  }
+
+  return {
+    ...actual,
+    fetch: wrappedFetch,
+    request: guardedRequest,
+    stream: guardedStream,
+    pipeline: guardedPipeline,
+    connect: guardedConnect,
+    Pool: GuardedPool,
+    Client: GuardedClient,
+  };
+});
 
 // Fail-loud install self-test. If the wrapper isn't actually attached (e.g.
 // future Node makes `fetch` non-configurable or a transitive dep stamps over
@@ -153,6 +227,20 @@ globalThis.fetch = __firewallFetch;
     }
   }
   if (!blocked) {
-    throw new Error('HTTP egress firewall failed to install — test hermeticity compromised. ' + 'See vitest.setup.ts.');
+    throw new Error(
+      'HTTP egress firewall failed to install — test hermeticity compromised. ' +
+        'See vitest.setup.ts / test-utils/blocked-hosts.ts.',
+    );
+  }
+  // Sanity: the stamp must round-trip. If a transitive dep clobbered fetch
+  // between install and this assertion, we want to know.
+  if (!(globalThis.fetch as unknown as Record<symbol, unknown>)[HTTP_FIREWALL_INSTALLED_SYMBOL]) {
+    throw new Error(
+      'HTTP egress firewall stamp missing on globalThis.fetch — a transitive dep replaced fetch ' +
+        'after install. See test-utils/blocked-hosts.ts HTTP_FIREWALL_INSTALLED_SYMBOL.',
+    );
   }
 }
+
+// Suppress unused-import warning on BLOCKED_HOSTS (re-exported for canary tests).
+export { BLOCKED_HOSTS };

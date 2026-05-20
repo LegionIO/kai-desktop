@@ -1,16 +1,18 @@
 /**
  * HTTP mocking adapter for tests.
  *
- * This module hides whether the underlying transport is msw or undici's
- * MockAgent. Tests should only import the high-level harness exposed by
- * `setupHttpMock()` so swapping the backend later is a single-file change.
+ * The msw backend is the only backend in production use; the undici
+ * alternate is currently a no-op stub kept as scaffolding so a future
+ * migration can swap implementations without changing test sites. The
+ * adapter shape exists so that, if/when we do migrate, the diff is
+ * limited to this file.
  *
- * Backend selection: `KAI_HTTP_MOCK_BACKEND=msw|undici` (default `msw`).
+ * The harness instance is constructed once at module scope from
+ * `vitest.setup.ts` and shared across the suite.
  *
- * The msw backend is the primary implementation and is hooked into the
- * vitest lifecycle from `vitest.setup.ts`. The undici alternate is a thin
- * stub kept for future migration; it preserves the same public API so
- * tests do not need to change when the transport flips.
+ * To activate the (currently no-op) undici stub for local experimentation,
+ * set `KAI_HTTP_MOCK_BACKEND=undici`. The undici stub does NOT yet implement
+ * fetch interception — selecting it from CI would amount to disabling msw.
  */
 
 import { setupServer, type SetupServer } from 'msw/node';
@@ -108,9 +110,7 @@ function createMswHarness(opts: HttpMockOptions): HttpMockHarness {
     },
     expectNoUnhandled() {
       if (unhandledCount > 0) {
-        throw new Error(
-          `HTTP mock watchdog: ${unhandledCount} unhandled request(s) fired during this test`,
-        );
+        throw new Error(`HTTP mock watchdog: ${unhandledCount} unhandled request(s) fired during this test`);
       }
     },
     reset() {

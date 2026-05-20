@@ -10,14 +10,22 @@ import { getLanAddresses } from '../web-server/network.js';
 import { createLoginToken } from '../web-server/web-server.js';
 export type { AppConfig } from '../config/schema.js';
 
-export const APP_LLM_CONFIG_PATH = join(homedir(), '.' + __BRAND_APP_SLUG, 'settings', 'llm.json');
+/**
+ * Resolves the LLM config file path lazily. Lazy form lets tests redirect
+ * `os.homedir()` via `vi.mock` without racing module-load evaluation — the
+ * earlier `const APP_LLM_CONFIG_PATH = join(homedir(), ...)` form was
+ * evaluated before any `beforeEach` could override `homedir`, forcing
+ * the test harness into a `globalThis.__kaiTestHomedir` slot.
+ */
+export function getAppLlmConfigPath(): string {
+  return join(homedir(), '.' + __BRAND_APP_SLUG, 'settings', 'llm.json');
+}
 const DESKTOP_SETTINGS_FILENAME = 'desktop.json';
 const DEFAULT_SYSTEM_PROMPT = `You are ${__BRAND_ASSISTANT_NAME}, a powerful local AI assistant with access to the user's computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you're doing and why.`;
 
 export function getDesktopSettingsPath(appHome: string): string {
   return join(appHome, 'settings', DESKTOP_SETTINGS_FILENAME);
 }
-
 
 function getDefaultConfig() {
   return {
@@ -99,7 +107,13 @@ function getDefaultConfig() {
         maxPerParent: 2,
       },
     },
-    mcpServers: [] as Array<{ name: string; command?: string; args?: string[]; url?: string; env?: Record<string, string> }>,
+    mcpServers: [] as Array<{
+      name: string;
+      command?: string;
+      args?: string[];
+      url?: string;
+      env?: Record<string, string>;
+    }>,
     skills: {
       directory: '~/.' + __BRAND_APP_SLUG + '/skills',
       enabled: [] as string[],
@@ -118,7 +132,18 @@ function getDefaultConfig() {
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
     pluginSystem: { compatibilityMode: 'warn' as const },
     marketplace: {
-      installedPlugins: {} as Record<string, { name: string; repository: string; version: string; fileHash?: string; permissions?: string[]; installedAt: string; marketplaceUrl: string }>,
+      installedPlugins: {} as Record<
+        string,
+        {
+          name: string;
+          repository: string;
+          version: string;
+          fileHash?: string;
+          permissions?: string[];
+          installedAt: string;
+          marketplaceUrl: string;
+        }
+      >,
     },
     launchAtLogin: false,
     ui: {
@@ -273,29 +298,198 @@ function getDefaultConfig() {
       timeout: 300000,
     },
     cliTools: [
-      { name: 'github', binary: 'gh', extraBinaries: ['git'], description: 'Run GitHub CLI (gh) and git commands. Use for:\n- GitHub: gh pr list, gh issue create, gh repo clone, gh api, gh run list\n- Git: git status, git log, git diff, git commit, git push, git pull, git branch\n- Worktrees: git worktree add, git worktree list, git worktree remove\nPass the full command string including the binary name (gh or git).', prefix: 'gh pr list', enabled: true, builtIn: true },
-      { name: 'brew', binary: 'brew', description: 'Run Homebrew package manager commands.\nExamples: brew install <pkg>, brew upgrade, brew list, brew search <query>, brew info <pkg>, brew services list.', enabled: true, builtIn: true },
-      { name: 'wget', binary: 'wget', description: 'Download files from the web using wget.\nExamples: wget <url>, wget -O <file> <url>, wget -r <url>, wget --spider <url>.', enabled: true, builtIn: true },
-      { name: 'jq', binary: 'jq', description: 'Process JSON data with jq. Pipe JSON into jq or read from files.\nExamples: echo \'{"a":1}\' | jq .a, cat file.json | jq \'.items[] | .name\', jq -r .version package.json.', enabled: true, builtIn: true },
-      { name: 'tree', binary: 'tree', description: 'Display directory structure as a tree.\nExamples: tree, tree -L 2, tree -I node_modules, tree --dirsfirst -a, tree -P "*.ts".', enabled: true, builtIn: true },
-      { name: 'python', binary: 'python3', extraBinaries: ['pip3'], description: 'Run Python 3 and pip commands.\nExamples: python3 script.py, python3 -c "print(1+1)", pip3 install <pkg>, pip3 list, pip3 freeze.\nPass the full command including the binary name (python3 or pip3).', prefix: 'python3 --version', enabled: true, builtIn: true },
-      { name: 'ollama', binary: 'ollama', description: 'Manage and run local LLM models with Ollama.\nExamples: ollama list, ollama pull <model>, ollama run <model>, ollama show <model>, ollama ps, ollama rm <model>.', enabled: true, builtIn: true },
-      { name: 'klist', binary: 'klist', description: 'Display Kerberos ticket cache contents.\nExamples: klist, klist -l, klist -e, klist -A.', enabled: true, builtIn: true },
-      { name: 'jfrog', binary: 'jfrog', description: 'Run JFrog CLI commands for Artifactory, Xray, and other JFrog services.\nExamples: jfrog rt ping, jfrog rt search <pattern>, jfrog rt upload <file> <repo>, jfrog config show.', enabled: true, builtIn: true },
-      { name: 'curl', binary: 'curl', description: 'Make HTTP requests with curl.\nExamples: curl -s <url>, curl -X POST -d \'{"key":"val"}\' -H "Content-Type: application/json" <url>, curl -o file <url>.', enabled: true, builtIn: true },
-      { name: 'docker', binary: 'docker', extraBinaries: ['docker-compose'], description: 'Manage Docker containers and images.\nExamples: docker ps, docker images, docker run, docker build, docker-compose up, docker-compose down.', prefix: 'docker ps', enabled: true, builtIn: true },
-      { name: 'kubectl', binary: 'kubectl', description: 'Manage Kubernetes clusters with kubectl.\nExamples: kubectl get pods, kubectl get services, kubectl describe pod <name>, kubectl logs <pod>.', enabled: true, builtIn: true },
-      { name: 'node', binary: 'node', extraBinaries: ['npm', 'npx', 'pnpm'], description: 'Run Node.js, npm, npx, and pnpm commands.\nExamples: node -e "console.log(1)", npm list, npx create-react-app, pnpm install.\nPass the full command including the binary name (node, npm, npx, or pnpm).', prefix: 'node --version', enabled: true, builtIn: true },
-      { name: 'aws', binary: 'aws', description: 'Run AWS CLI commands.\nExamples: aws s3 ls, aws ec2 describe-instances, aws sts get-caller-identity, aws iam list-users.', enabled: true, builtIn: true },
-      { name: 'terraform', binary: 'terraform', description: 'Run Terraform infrastructure-as-code commands.\nExamples: terraform plan, terraform apply, terraform state list, terraform init, terraform output.', enabled: true, builtIn: true },
-      { name: 'rsync', binary: 'rsync', description: 'Sync files and directories with rsync.\nExamples: rsync -av src/ dest/, rsync -avz --progress src/ remote:dest/.', enabled: true, builtIn: true },
-      { name: 'make', binary: 'make', description: 'Run Makefile targets with make.\nExamples: make, make build, make test, make clean, make -j4.', enabled: true, builtIn: true },
-      { name: 'ruby', binary: 'ruby', extraBinaries: ['gem', 'bundle'], description: 'Run Ruby, gem, and bundler commands.\nExamples: ruby -e "puts 1+1", gem list, bundle install, bundle exec rspec.\nPass the full command including the binary name (ruby, gem, or bundle).', prefix: 'ruby --version', enabled: true, builtIn: true },
-      { name: 'go', binary: 'go', description: 'Run Go toolchain commands.\nExamples: go build, go test, go run main.go, go mod tidy, go vet.', enabled: true, builtIn: true },
-      { name: 'cargo', binary: 'cargo', description: 'Run Rust Cargo commands.\nExamples: cargo build, cargo test, cargo run, cargo clippy, cargo fmt.', enabled: true, builtIn: true },
-      { name: 'ssh', binary: 'ssh', extraBinaries: ['scp'], description: 'SSH and SCP for remote access and file transfer.\nExamples: ssh user@host, scp file user@host:/path, ssh -L 8080:localhost:80 user@host.', enabled: true, builtIn: true },
-      { name: 'helm', binary: 'helm', description: 'Manage Kubernetes Helm charts.\nExamples: helm list, helm install <release> <chart>, helm upgrade, helm repo update.', enabled: true, builtIn: true },
-    ] as Array<{ name: string; binary: string; extraBinaries?: string[]; description: string; prefix?: string; enabled: boolean; builtIn: boolean }>,
+      {
+        name: 'github',
+        binary: 'gh',
+        extraBinaries: ['git'],
+        description:
+          'Run GitHub CLI (gh) and git commands. Use for:\n- GitHub: gh pr list, gh issue create, gh repo clone, gh api, gh run list\n- Git: git status, git log, git diff, git commit, git push, git pull, git branch\n- Worktrees: git worktree add, git worktree list, git worktree remove\nPass the full command string including the binary name (gh or git).',
+        prefix: 'gh pr list',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'brew',
+        binary: 'brew',
+        description:
+          'Run Homebrew package manager commands.\nExamples: brew install <pkg>, brew upgrade, brew list, brew search <query>, brew info <pkg>, brew services list.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'wget',
+        binary: 'wget',
+        description:
+          'Download files from the web using wget.\nExamples: wget <url>, wget -O <file> <url>, wget -r <url>, wget --spider <url>.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'jq',
+        binary: 'jq',
+        description:
+          "Process JSON data with jq. Pipe JSON into jq or read from files.\nExamples: echo '{\"a\":1}' | jq .a, cat file.json | jq '.items[] | .name', jq -r .version package.json.",
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'tree',
+        binary: 'tree',
+        description:
+          'Display directory structure as a tree.\nExamples: tree, tree -L 2, tree -I node_modules, tree --dirsfirst -a, tree -P "*.ts".',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'python',
+        binary: 'python3',
+        extraBinaries: ['pip3'],
+        description:
+          'Run Python 3 and pip commands.\nExamples: python3 script.py, python3 -c "print(1+1)", pip3 install <pkg>, pip3 list, pip3 freeze.\nPass the full command including the binary name (python3 or pip3).',
+        prefix: 'python3 --version',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'ollama',
+        binary: 'ollama',
+        description:
+          'Manage and run local LLM models with Ollama.\nExamples: ollama list, ollama pull <model>, ollama run <model>, ollama show <model>, ollama ps, ollama rm <model>.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'klist',
+        binary: 'klist',
+        description: 'Display Kerberos ticket cache contents.\nExamples: klist, klist -l, klist -e, klist -A.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'jfrog',
+        binary: 'jfrog',
+        description:
+          'Run JFrog CLI commands for Artifactory, Xray, and other JFrog services.\nExamples: jfrog rt ping, jfrog rt search <pattern>, jfrog rt upload <file> <repo>, jfrog config show.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'curl',
+        binary: 'curl',
+        description:
+          'Make HTTP requests with curl.\nExamples: curl -s <url>, curl -X POST -d \'{"key":"val"}\' -H "Content-Type: application/json" <url>, curl -o file <url>.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'docker',
+        binary: 'docker',
+        extraBinaries: ['docker-compose'],
+        description:
+          'Manage Docker containers and images.\nExamples: docker ps, docker images, docker run, docker build, docker-compose up, docker-compose down.',
+        prefix: 'docker ps',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'kubectl',
+        binary: 'kubectl',
+        description:
+          'Manage Kubernetes clusters with kubectl.\nExamples: kubectl get pods, kubectl get services, kubectl describe pod <name>, kubectl logs <pod>.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'node',
+        binary: 'node',
+        extraBinaries: ['npm', 'npx', 'pnpm'],
+        description:
+          'Run Node.js, npm, npx, and pnpm commands.\nExamples: node -e "console.log(1)", npm list, npx create-react-app, pnpm install.\nPass the full command including the binary name (node, npm, npx, or pnpm).',
+        prefix: 'node --version',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'aws',
+        binary: 'aws',
+        description:
+          'Run AWS CLI commands.\nExamples: aws s3 ls, aws ec2 describe-instances, aws sts get-caller-identity, aws iam list-users.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'terraform',
+        binary: 'terraform',
+        description:
+          'Run Terraform infrastructure-as-code commands.\nExamples: terraform plan, terraform apply, terraform state list, terraform init, terraform output.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'rsync',
+        binary: 'rsync',
+        description:
+          'Sync files and directories with rsync.\nExamples: rsync -av src/ dest/, rsync -avz --progress src/ remote:dest/.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'make',
+        binary: 'make',
+        description: 'Run Makefile targets with make.\nExamples: make, make build, make test, make clean, make -j4.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'ruby',
+        binary: 'ruby',
+        extraBinaries: ['gem', 'bundle'],
+        description:
+          'Run Ruby, gem, and bundler commands.\nExamples: ruby -e "puts 1+1", gem list, bundle install, bundle exec rspec.\nPass the full command including the binary name (ruby, gem, or bundle).',
+        prefix: 'ruby --version',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'go',
+        binary: 'go',
+        description: 'Run Go toolchain commands.\nExamples: go build, go test, go run main.go, go mod tidy, go vet.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'cargo',
+        binary: 'cargo',
+        description: 'Run Rust Cargo commands.\nExamples: cargo build, cargo test, cargo run, cargo clippy, cargo fmt.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'ssh',
+        binary: 'ssh',
+        extraBinaries: ['scp'],
+        description:
+          'SSH and SCP for remote access and file transfer.\nExamples: ssh user@host, scp file user@host:/path, ssh -L 8080:localhost:80 user@host.',
+        enabled: true,
+        builtIn: true,
+      },
+      {
+        name: 'helm',
+        binary: 'helm',
+        description:
+          'Manage Kubernetes Helm charts.\nExamples: helm list, helm install <release> <chart>, helm upgrade, helm repo update.',
+        enabled: true,
+        builtIn: true,
+      },
+    ] as Array<{
+      name: string;
+      binary: string;
+      extraBinaries?: string[];
+      description: string;
+      prefix?: string;
+      enabled: boolean;
+      builtIn: boolean;
+    }>,
   };
 }
 
@@ -330,20 +524,50 @@ type AppLlmFile = {
   };
 };
 
-const OPENAI_FALLBACK_MODELS = [
-  'gpt-5.4',
-  'gpt-5.4-pro',
-  'gpt-4.1',
-  'gpt-4.1-mini',
-] as const;
+const OPENAI_FALLBACK_MODELS = ['gpt-5.4', 'gpt-5.4-pro', 'gpt-4.1', 'gpt-4.1-mini'] as const;
 
-const BEDROCK_FALLBACK_CATALOG: ReadonlyArray<{ key: string; displayName: string; modelName: string; maxInputTokens?: number }> = [
-  { key: 'us.anthropic.claude-sonnet-4-6', displayName: 'Sonnet 4.6', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 200000 },
-  { key: 'us.anthropic.claude-sonnet-4-6-1m', displayName: 'Sonnet 4.6 [1M]', modelName: 'us.anthropic.claude-sonnet-4-6', maxInputTokens: 1000000 },
-  { key: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', displayName: 'Sonnet 4.5', modelName: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', maxInputTokens: 200000 },
-  { key: 'us.anthropic.claude-opus-4-6-v1', displayName: 'Opus 4.6', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 200000 },
-  { key: 'us.anthropic.claude-opus-4-6-v1-1m', displayName: 'Opus 4.6 [1M]', modelName: 'us.anthropic.claude-opus-4-6-v1', maxInputTokens: 1000000 },
-  { key: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', displayName: 'Haiku 4.5', modelName: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', maxInputTokens: 200000 },
+const BEDROCK_FALLBACK_CATALOG: ReadonlyArray<{
+  key: string;
+  displayName: string;
+  modelName: string;
+  maxInputTokens?: number;
+}> = [
+  {
+    key: 'us.anthropic.claude-sonnet-4-6',
+    displayName: 'Sonnet 4.6',
+    modelName: 'us.anthropic.claude-sonnet-4-6',
+    maxInputTokens: 200000,
+  },
+  {
+    key: 'us.anthropic.claude-sonnet-4-6-1m',
+    displayName: 'Sonnet 4.6 [1M]',
+    modelName: 'us.anthropic.claude-sonnet-4-6',
+    maxInputTokens: 1000000,
+  },
+  {
+    key: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    displayName: 'Sonnet 4.5',
+    modelName: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    maxInputTokens: 200000,
+  },
+  {
+    key: 'us.anthropic.claude-opus-4-6-v1',
+    displayName: 'Opus 4.6',
+    modelName: 'us.anthropic.claude-opus-4-6-v1',
+    maxInputTokens: 200000,
+  },
+  {
+    key: 'us.anthropic.claude-opus-4-6-v1-1m',
+    displayName: 'Opus 4.6 [1M]',
+    modelName: 'us.anthropic.claude-opus-4-6-v1',
+    maxInputTokens: 1000000,
+  },
+  {
+    key: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    displayName: 'Haiku 4.5',
+    modelName: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    maxInputTokens: 200000,
+  },
 ];
 
 function toTitleCase(value: string): string {
@@ -419,12 +643,16 @@ function defaultAppConfig(): AppLlmFile {
 }
 
 function readAppLlmConfig(): AppLlmFile {
-  if (!existsSync(APP_LLM_CONFIG_PATH)) {
+  const path = getAppLlmConfigPath();
+  if (!existsSync(path)) {
     return defaultAppConfig();
   }
 
   try {
-    return deepMerge(defaultAppConfig() as Record<string, unknown>, JSON.parse(readFileSync(APP_LLM_CONFIG_PATH, 'utf-8'))) as AppLlmFile;
+    return deepMerge(
+      defaultAppConfig() as Record<string, unknown>,
+      JSON.parse(readFileSync(path, 'utf-8')),
+    ) as AppLlmFile;
   } catch (error) {
     console.error('[Config] Failed to parse LLM config, using defaults:', error);
     return defaultAppConfig();
@@ -432,7 +660,7 @@ function readAppLlmConfig(): AppLlmFile {
 }
 
 function writeAppLlmConfig(config: AppLlmFile): void {
-  writeFileSync(APP_LLM_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
+  writeFileSync(getAppLlmConfigPath(), JSON.stringify(config, null, 2), 'utf-8');
 }
 
 function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Record<string, unknown> {
@@ -487,32 +715,26 @@ function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig
 }
 
 function collectProviderModelNames(provider: AppProviderConfig | undefined): string[] {
-  return [
-    provider?.default_model,
-    provider?.small_model,
-    provider?.medium_model,
-    provider?.large_model,
-  ].filter((value, index, array): value is string => Boolean(value?.trim()) && array.indexOf(value) === index);
+  return [provider?.default_model, provider?.small_model, provider?.medium_model, provider?.large_model].filter(
+    (value, index, array): value is string => Boolean(value?.trim()) && array.indexOf(value) === index,
+  );
 }
 
 function hasProviderCredentials(providerKey: AppProviderType, provider: AppProviderConfig | undefined): boolean {
   if (!provider?.enabled) return false;
   if (providerKey === 'bedrock') {
     return Boolean(
-      provider.bearer_token?.trim()
-      || provider.region?.trim()
-      || (provider.access_key_id?.trim() && provider.secret_access_key?.trim())
-      || provider.aws_profile?.trim()
-      || provider.role_arn?.trim()
+      provider.bearer_token?.trim() ||
+      provider.region?.trim() ||
+      (provider.access_key_id?.trim() && provider.secret_access_key?.trim()) ||
+      provider.aws_profile?.trim() ||
+      provider.role_arn?.trim(),
     );
   }
   return Boolean(provider.api_key?.trim() || provider.openai_api_key?.trim());
 }
 
-function resolveProviderModelNames(
-  providerKey: AppProviderType,
-  provider: AppProviderConfig | undefined,
-): string[] {
+function resolveProviderModelNames(providerKey: AppProviderType, provider: AppProviderConfig | undefined): string[] {
   const explicit = collectProviderModelNames(provider);
   if (explicit.length > 0) return explicit;
   if (providerKey === 'openai' && hasProviderCredentials(providerKey, provider)) {
@@ -521,7 +743,10 @@ function resolveProviderModelNames(
   return explicit;
 }
 
-function toCatalogEntries(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Array<Record<string, unknown>> {
+function toCatalogEntries(
+  providerKey: AppProviderType,
+  provider: AppProviderConfig | undefined,
+): Array<Record<string, unknown>> {
   const explicit = resolveProviderModelNames(providerKey, provider);
   if (explicit.length > 0) {
     return explicit.map((modelName) => ({
@@ -586,7 +811,7 @@ function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models']
       ? preferredDefaultModel!
       : defaults.defaultModelKey !== 'placeholder'
         ? defaults.defaultModelKey
-        : (catalog[0]?.key as string | undefined) ?? defaults.defaultModelKey;
+        : ((catalog[0]?.key as string | undefined) ?? defaults.defaultModelKey);
 
     return {
       defaultModelKey,
@@ -619,11 +844,7 @@ function updateAppProviderModelSlots(
   provider.large_model = ordered[3] ?? null;
 }
 
-export function persistAppModels(
-  path: string,
-  value: unknown,
-  currentConfig: AppConfig,
-): void {
+export function persistAppModels(path: string, value: unknown, currentConfig: AppConfig): void {
   const appLlmConfig = readAppLlmConfig();
   const llm = appLlmConfig.llm ?? (appLlmConfig.llm = defaultAppConfig().llm!);
   const providers = llm.providers ?? (llm.providers = {});
@@ -687,18 +908,16 @@ export function persistAppModels(
   }
 
   if (path === 'models.catalog') {
-    const catalog = Array.isArray(value) ? value as AppConfig['models']['catalog'] : currentConfig.models.catalog;
-    const defaultModelName = getModelNameByKey(catalog, currentConfig.models.defaultModelKey)
-      ?? llm.default_model
-      ?? null;
-    const defaultProvider = catalog.find((model) => model.key === currentConfig.models.defaultModelKey)?.provider
-      ?? llm.default_provider
-      ?? null;
+    const catalog = Array.isArray(value) ? (value as AppConfig['models']['catalog']) : currentConfig.models.catalog;
+    const defaultModelName =
+      getModelNameByKey(catalog, currentConfig.models.defaultModelKey) ?? llm.default_model ?? null;
+    const defaultProvider =
+      catalog.find((model) => model.key === currentConfig.models.defaultModelKey)?.provider ??
+      llm.default_provider ??
+      null;
 
     for (const providerKey of providerOrder) {
-      const providerCatalog = catalog
-        .filter((entry) => entry.provider === providerKey)
-        .map((entry) => entry.modelName);
+      const providerCatalog = catalog.filter((entry) => entry.provider === providerKey).map((entry) => entry.modelName);
       const provider = providers[providerKey] ?? {};
       const preferredDefault = defaultProvider === providerKey ? defaultModelName : null;
       updateAppProviderModelSlots(provider, providerCatalog, preferredDefault);
@@ -760,14 +979,20 @@ export function readEffectiveConfig(appHome: string): AppConfig {
   if (existsSync(configPath)) {
     try {
       const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-      return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(deepMerge(defaults, raw) as AppConfig, appHome)));
+      return ensureDefaultProfile(
+        normalizeResponsesApiConfig(applyExternalModelConfig(deepMerge(defaults, raw) as AppConfig, appHome)),
+      );
     } catch (error) {
       console.error('[Config] Failed to parse desktop.json, using defaults:', error);
-      return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)));
+      return ensureDefaultProfile(
+        normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
+      );
     }
   }
 
-  return ensureDefaultProfile(normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)));
+  return ensureDefaultProfile(
+    normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
+  );
 }
 
 /**
@@ -851,7 +1076,11 @@ export function setNestedValue(obj: Record<string, unknown>, path: string, value
   let current = obj;
   for (let i = 0; i < keys.length - 1; i++) {
     const key = keys[i];
-    if (!Object.prototype.hasOwnProperty.call(current, key) || typeof current[key] !== 'object' || current[key] === null) {
+    if (
+      !Object.prototype.hasOwnProperty.call(current, key) ||
+      typeof current[key] !== 'object' ||
+      current[key] === null
+    ) {
       current[key] = {};
     }
     current = current[key] as Record<string, unknown>;
@@ -902,8 +1131,9 @@ export function registerConfigHandlers(
   if (existsSync(configPath)) {
     watch(configPath, reloadConfig);
   }
-  if (existsSync(APP_LLM_CONFIG_PATH)) {
-    watch(APP_LLM_CONFIG_PATH, reloadConfig);
+  const appLlmPath = getAppLlmConfigPath();
+  if (existsSync(appLlmPath)) {
+    watch(appLlmPath, reloadConfig);
   }
 
   // Unified setConfig that handles models.* persistence correctly.
@@ -970,7 +1200,6 @@ export function registerConfigHandlers(
     }
     return results;
   });
-
 
   return { setConfig: setConfigImpl };
 }
