@@ -28,8 +28,8 @@ export type ClaudeAuth = {
 };
 
 export type RuntimeResolution = {
-  /** The runtime to use */
-  runtimeId: RuntimeId;
+  /** The runtime to use (built-in RuntimeId or plugin-contributed runtime ID) */
+  runtimeId: string;
   /** For Claude Code: resolved Anthropic-compatible credentials */
   claudeAuth?: ClaudeAuth;
   /** For incompatible explicit-runtime selections */
@@ -52,7 +52,7 @@ export function resolveRuntimeForModel(
   model: ModelCatalogEntry | null,
   config: AppConfig,
   preferred: RuntimeId | 'auto',
-  available: Set<RuntimeId>,
+  available: Set<string>,
 ): RuntimeResolution {
   const providerType: LLMProviderType | null = model?.modelConfig?.provider ?? null;
 
@@ -71,7 +71,7 @@ function resolveAutoMode(
   model: ModelCatalogEntry | null,
   providerType: LLMProviderType | null,
   config: AppConfig,
-  available: Set<RuntimeId>,
+  available: Set<string>,
 ): RuntimeResolution {
   // No model or no provider info — fall back to default behavior (Claude Code → Mastra)
   if (!model || !providerType) {
@@ -79,6 +79,23 @@ function resolveAutoMode(
       return { runtimeId: 'claude-agent-sdk' };
     }
     return { runtimeId: 'mastra' };
+  }
+
+  // Check if this model belongs to a plugin-contributed runtime.
+  // Plugin models use provider keys that start with or match their runtime ID
+  // (e.g., provider key 'legionio' or 'legionio_anthropic' → runtime 'legion').
+  const rawCatalogEntry = config.models.catalog.find((m) => m.key === model.key);
+  if (rawCatalogEntry) {
+    const providerKey = rawCatalogEntry.provider;
+    // Check each available runtime to see if the provider key indicates plugin ownership
+    for (const runtimeId of available) {
+      // Skip built-in runtimes — they don't own provider keys
+      if (runtimeId === 'mastra' || runtimeId === 'claude-agent-sdk' || runtimeId === 'codex-sdk') continue;
+      // Match: provider key starts with the plugin runtime ID (e.g., 'legionio' starts with 'legion')
+      if (providerKey.startsWith(runtimeId) || runtimeId.startsWith(providerKey.split('_')[0])) {
+        return { runtimeId };
+      }
+    }
   }
 
   switch (providerType) {
@@ -129,7 +146,7 @@ function resolveExplicitMode(
   providerType: LLMProviderType | null,
   config: AppConfig,
   preferred: RuntimeId,
-  available: Set<RuntimeId>,
+  available: Set<string>,
 ): RuntimeResolution {
   // Runtime not available — fall back to Mastra with no warning (existing behavior)
   if (!available.has(preferred)) {

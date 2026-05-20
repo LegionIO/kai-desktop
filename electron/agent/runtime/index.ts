@@ -151,7 +151,7 @@ export async function resolveRuntimeForStream(
       : 'auto';
 
   // Build the set of currently available runtimes
-  const available = new Set<RuntimeId>();
+  const available = new Set<string>();
   for (const [id, rt] of runtimes) {
     if (await rt.isAvailable()) {
       available.add(id);
@@ -161,7 +161,7 @@ export async function resolveRuntimeForStream(
   const pluginRuntimes = pluginRuntimesSource?.() ?? [];
   for (const pr of pluginRuntimes) {
     if (pr.isAvailable()) {
-      available.add(pr.id as RuntimeId);
+      available.add(pr.id);
     }
   }
   // Mastra is always available
@@ -170,7 +170,7 @@ export async function resolveRuntimeForStream(
   const resolution = resolveRuntimeForModel(model, config, preferred, available);
 
   // Look up the actual runtime instance — check built-ins first, then plugin runtimes
-  const runtime = runtimes.get(resolution.runtimeId);
+  const runtime = runtimes.get(resolution.runtimeId as RuntimeId);
   if (runtime) {
     return { runtime, resolution };
   }

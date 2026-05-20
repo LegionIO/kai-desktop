@@ -745,11 +745,43 @@ export class PluginManager {
 
   /* ── Inference Provider ── */
 
-  getInferenceProvider(): PluginInferenceProvider | null {
+  /**
+   * Get an inference provider, optionally filtered by context.
+   *
+   * When `context` is provided, only returns a provider from a plugin whose
+   * contributed runtimes include the resolved runtimeId, OR whose runtime IDs
+   * match the model's provider key prefix. This prevents a plugin inference
+   * provider from hijacking requests meant for other configured providers.
+   *
+   * When `context` is omitted, returns the first available provider (legacy behavior).
+   */
+  getInferenceProvider(context?: { runtimeId?: string; modelProviderKey?: string }): PluginInferenceProvider | null {
     for (const instance of this.plugins.values()) {
       if (instance.state !== 'active') continue;
-      if (instance.inferenceProvider && instance.inferenceProvider.isAvailable()) {
+      if (!instance.inferenceProvider || !instance.inferenceProvider.isAvailable()) continue;
+
+      // If no context provided, return first available (legacy behavior)
+      if (!context) {
         return instance.inferenceProvider;
+      }
+
+      // Check if this plugin owns the resolved runtime
+      const pluginRuntimeIds = instance.contributedRuntimes.map((r) => r.id);
+      if (context.runtimeId && pluginRuntimeIds.includes(context.runtimeId)) {
+        return instance.inferenceProvider;
+      }
+
+      // Check if the model's provider key matches a plugin runtime ID prefix
+      // (e.g., model provider key 'legionio' or 'legionio_anthropic' matches
+      // a plugin that contributes runtime 'legion')
+      if (context.modelProviderKey) {
+        const matchesRuntime = pluginRuntimeIds.some(
+          (rid) => context.modelProviderKey!.startsWith(rid) ||
+                   context.modelProviderKey!.startsWith(instance.inferenceProvider!.name.toLowerCase().replace(/\s+/g, '')),
+        );
+        if (matchesRuntime) {
+          return instance.inferenceProvider;
+        }
       }
     }
     return null;

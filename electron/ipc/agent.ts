@@ -410,8 +410,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
     // Run streaming in background
     (async () => {
-      // Check for plugin inference provider before starting the standard pipeline
-      const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
+      // Check for plugin inference provider — only use it when the resolved
+      // runtime or model belongs to the plugin that registered the provider.
+      // This prevents a plugin provider from hijacking requests meant for
+      // other configured providers (e.g. llm-gateway, OpenAI direct).
+      const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
+      const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
+      const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
+      const inferenceProvider = pluginManager?.getInferenceProvider({
+        runtimeId: resolution.runtimeId,
+        modelProviderKey,
+      }) ?? null;
       if (inferenceProvider) {
         console.info(`[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`);
         let emittedTextDelta = false;
@@ -1474,13 +1483,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   ipcMain.handle('agent:get-active-runtime', async () => {
     const { getActiveRuntimeId } = await import('../agent/runtime/index.js');
     try {
-      // If a plugin inference provider is active and available, it is the
-      // effective runtime from the user's perspective — report its name.
+      const config = readEffectiveConfig(appHome);
+      // Determine the active runtime. If a plugin inference provider is active
+      // and the current model belongs to it, report the plugin name.
       const inferenceProvider = pluginManager?.getInferenceProvider() ?? null;
       if (inferenceProvider && inferenceProvider.isAvailable()) {
-        return inferenceProvider.name;
+        const defaultModelKey = config.models.defaultModelKey;
+        const rawEntry = config.models.catalog.find((m) => m.key === defaultModelKey);
+        if (rawEntry) {
+          // Check with context to see if the plugin owns this model
+          const contextualProvider = pluginManager?.getInferenceProvider({
+            modelProviderKey: rawEntry.provider,
+          }) ?? null;
+          if (contextualProvider) {
+            return contextualProvider.name;
+          }
+        }
       }
-      const config = readEffectiveConfig(appHome);
       return getActiveRuntimeId(config);
     } catch {
       return 'mastra';
