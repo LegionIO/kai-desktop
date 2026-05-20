@@ -33,7 +33,11 @@ for (const [key, value] of Object.entries(resolved)) {
 }
 _brandDefines.__APP_VERSION = JSON.stringify(pkg.version);
 
-/** Frozen brand define() map; re-exported so slice configs can reuse it. */
+/**
+ * Frozen brand define() map; re-exported so the per-slice vitest configs
+ * (vitest.unit / .component / .integration) can reuse the same map
+ * without re-deriving it from `branding.config.ts` themselves.
+ */
 export const brandDefines = _brandDefines;
 
 export const baseConfig = defineConfig({
