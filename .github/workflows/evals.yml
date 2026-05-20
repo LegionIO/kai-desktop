@@ -40,6 +40,13 @@ concurrency:
 permissions:
   contents: read
 
+# Single source of truth for the PR-gate label name. Three workflows
+# (evals.yml, integration-nightly.yml, fixture-drift-check.yml) consume
+# the same label; centralising it here means a rename is a one-line edit
+# per workflow rather than a grep-and-replace across three files.
+env:
+  RUN_LABEL: run-eval
+
 jobs:
   evals:
     # Gate the PR path on the explicit `run-eval` label. Scheduled and
@@ -48,19 +55,18 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.label.name == 'run-eval'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: eval
     permissions:
-      # `contents: write` is required for the peter-evans/create-pull-request
-      # step at the end of this job, which opens a follow-up PR appending to
-      # docs/eval-history.jsonl. The action needs to push a branch (contents)
-      # and open a PR (pull-requests). issues:write covers regression-issue
-      # creation on a failed nightly run.
-      contents: write
+      # Read-only `contents`. Repo-write (the JSONL heartbeat append)
+      # lives in the `evals-history-pr` follow-up job — splitting the
+      # capability away from the job that runs real provider HTTP keeps
+      # a harness-side code-injection bug from acquiring repo-write.
+      # issues:write covers regression-issue creation on cron failure;
+      # pull-requests:write covers the sticky comment on PR-labelled runs.
+      contents: read
       issues: write
       pull-requests: write
-    env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     outputs:
       eval-status: ${{ steps.run.outputs.status }}
     steps:
@@ -91,6 +97,12 @@ jobs:
           # Real-API mode. Without this, the harness validates structure
           # only and reports `skipped-dry-run` for every prompt.
           RUN_REAL_EVALS: '1'
+          # Step-level scoping for provider secrets. NOT in the job-level
+          # `env:` block — that would leak the keys into every step,
+          # including the github-script PR-comment step below. Surfaced
+          # in the second-pass security review.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         continue-on-error: true
         run: |
           set +e
@@ -245,14 +257,42 @@ jobs:
               --body "Nightly behavioural eval failed.${tail_body}"
           fi
 
-      # ── Scheduled passing path: append a row to docs/eval-history.jsonl. ──
-      # The append happens via a follow-up PR. The PR's only path is
-      # docs/eval-history.jsonl, which is NOT in the trigger filter for
-      # this workflow, so the PR does not retrigger evals.
+      # Final step: re-exit non-zero if the harness failed, so the
+      # workflow itself shows red in the UI. continue-on-error on the
+      # harness step lets us run the artifact upload + comment + issue
+      # steps regardless of harness outcome.
+      - name: Reflect harness exit code
+        if: always()
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+        run: |
+          if [ "${STATUS}" = "fail" ]; then
+            echo "harness reported failure; failing workflow"
+            exit 1
+          fi
+          echo "harness OK"
+
+  # ── Scheduled passing path: append a row to docs/eval-history.jsonl. ──────
+  # Split into its own job so the `contents: write` capability does NOT
+  # overlap with the eval job that runs real provider HTTP. A harness-side
+  # code-injection bug in evals cannot acquire repo-write — this job runs
+  # in a clean checkout, reads only the static history-row inputs
+  # (timestamp, sha, run URL), and writes one line to docs/eval-history.jsonl
+  # before opening the follow-up PR.
+  evals-history-pr:
+    needs: evals
+    if: |
+      github.event_name == 'schedule' &&
+      needs.evals.outputs.eval-status == 'pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
       - name: Append eval-history row
-        if: |
-          github.event_name == 'schedule' &&
-          steps.run.outputs.status == 'pass'
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
@@ -266,9 +306,6 @@ jobs:
             "${ts}" "${COMMIT_SHA}" "${RUN_URL}" >> docs/eval-history.jsonl
 
       - name: Open follow-up PR for eval-history append
-        if: |
-          github.event_name == 'schedule' &&
-          steps.run.outputs.status == 'pass'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -285,18 +322,3 @@ jobs:
           branch: chore/eval-history-${{ github.run_id }}
           delete-branch: true
           add-paths: docs/eval-history.jsonl
-
-      # Final step: re-exit non-zero if the harness failed, so the
-      # workflow itself shows red in the UI. continue-on-error on the
-      # harness step lets us run the artifact upload + comment + issue
-      # steps regardless of harness outcome.
-      - name: Reflect harness exit code
-        if: always()
-        env:
-          STATUS: ${{ steps.run.outputs.status }}
-        run: |
-          if [ "${STATUS}" = "fail" ]; then
-            echo "harness reported failure; failing workflow"
-            exit 1
-          fi
-          echo "harness OK"

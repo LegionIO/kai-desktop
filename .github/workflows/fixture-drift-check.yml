@@ -414,8 +414,11 @@ jobs:
         run: |
           set -euo pipefail
           today=$(date -u +%Y-%m-%d)
-          row=$(printf '{"date":"%s","status":"clean","run":"%s"}\n' "${today}" "${RUN_URL}")
-          printf '%s' "${row}" >> docs/fixture-drift-history.jsonl
+          # Use `%s\n` (not `%s`) so a prior row missing a trailing newline
+          # doesn't cause the next row to concatenate onto the prior line
+          # and corrupt the JSONL. Matches the evals.yml convention.
+          row=$(printf '{"date":"%s","status":"clean","run":"%s"}' "${today}" "${RUN_URL}")
+          printf '%s\n' "${row}" >> docs/fixture-drift-history.jsonl
 
       - name: Open history-update PR
         if: steps.aggregate.outputs.clean == 'true'

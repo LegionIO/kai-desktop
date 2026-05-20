@@ -33,7 +33,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -593,11 +593,12 @@ async function evaluateOne(prompt: PromptFile, model: PinnedModel, opts: MainOpt
       score_std: observed.std,
       outputs_sha256: sampleHashes,
     };
-    writeFileSync(
-      join(opts.baselineDir, model.id, `${prompt.prompt_id}.json`),
-      `${JSON.stringify(newBaseline, null, 2)}\n`,
-      'utf8',
-    );
+    // Ensure the per-model subdirectory exists. A maintainer doing a
+    // "fresh regen" after deleting the baselines folder would otherwise
+    // hit a confusing ENOENT here.
+    const modelDir = join(opts.baselineDir, model.id);
+    mkdirSync(modelDir, { recursive: true });
+    writeFileSync(join(modelDir, `${prompt.prompt_id}.json`), `${JSON.stringify(newBaseline, null, 2)}\n`, 'utf8');
     return {
       prompt_id: prompt.prompt_id,
       model_id: model.id,
@@ -619,6 +620,30 @@ async function evaluateOne(prompt: PromptFile, model: PinnedModel, opts: MainOpt
   };
   const floorOk = observed.mean >= Math.max(prompt.score_floor, baselineStats.mean - 2 * baselineStats.std);
   const status: PromptVerdict['status'] = deterministicFailures.length === 0 && floorOk ? 'pass' : 'fail';
+
+  // Consume `prompt.reference_output_hash`. The field documents the
+  // canonical reference output captured at baseline-regeneration time;
+  // if it's set to a real hash and that hash isn't present in the
+  // baseline's `outputs_sha256` array, the prompt and baseline have
+  // drifted apart and a maintainer should refresh both. Skip the check
+  // when the field is still a placeholder.
+  const notes: string[] = [
+    `score floor = max(${prompt.score_floor}, ${baselineStats.mean.toFixed(3)} - 2 * ${baselineStats.std.toFixed(3)}) = ${Math.max(
+      prompt.score_floor,
+      baselineStats.mean - 2 * baselineStats.std,
+    ).toFixed(3)}`,
+  ];
+  if (
+    prompt.reference_output_hash &&
+    !prompt.reference_output_hash.includes(PLACEHOLDER_SENTINEL) &&
+    !baseline.outputs_sha256.includes(prompt.reference_output_hash)
+  ) {
+    notes.push(
+      `prompt.reference_output_hash (${prompt.reference_output_hash}) not present in baseline.outputs_sha256 ` +
+        `(${baseline.outputs_sha256.join(', ')}) — prompt + baseline have drifted; refresh both`,
+    );
+  }
+
   return {
     prompt_id: prompt.prompt_id,
     model_id: model.id,
@@ -627,12 +652,7 @@ async function evaluateOne(prompt: PromptFile, model: PinnedModel, opts: MainOpt
     sample_scores: sampleScores,
     observed,
     baseline,
-    notes: [
-      `score floor = max(${prompt.score_floor}, ${baselineStats.mean.toFixed(3)} - 2 * ${baselineStats.std.toFixed(3)}) = ${Math.max(
-        prompt.score_floor,
-        baselineStats.mean - 2 * baselineStats.std,
-      ).toFixed(3)}`,
-    ],
+    notes,
   };
 }
 

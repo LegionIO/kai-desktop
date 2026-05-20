@@ -150,7 +150,10 @@ jobs:
           # Emit only safe alphanumeric/dotted strings into outputs — defense
           # in depth against any future regex regression. The pattern matches
           # the same shape the tests use for their TEST_ID constants.
-          if ! printf '%s' "${test_id}" | grep -qE '^real\.[a-zA-Z0-9._-]+$'; then
+          # Lower-case-only (matching the upstream `grep -oE` validator);
+          # tightens the contract so any future uppercase/underscore test id
+          # is forced to triage rather than silently widening the schema.
+          if ! printf '%s' "${test_id}" | grep -qE '^real\.[a-z0-9.-]+$'; then
             test_id="real.unknown.run-${GITHUB_RUN_ID}"
           fi
           echo "test_id=${test_id}" >> "$GITHUB_OUTPUT"
@@ -299,6 +302,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # GitHub guarantees `github.event.pull_request.number` is an integer,
+          # but the trigger could be reconfigured someday. Validate explicitly
+          # so a future config drift fails this step rather than passing junk
+          # into `gh issue comment`.
+          if ! printf '%s' "${PR_NUMBER}" | grep -qE '^[0-9]+$'; then
+            echo "::error::PR_NUMBER must be numeric, got '${PR_NUMBER}'" >&2
+            exit 1
+          fi
           body="$(printf 'Real-API smoke run on this PR: **%s**\n\nRun: %s\n\n_To re-trigger, re-apply the `run-eval` label._\n' \
             "${SMOKE_OUTCOME}" "${RUN_URL}")"
           gh issue comment "${PR_NUMBER}" --body "${body}"

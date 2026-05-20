@@ -319,6 +319,39 @@ export class CostMeter {
   }
 
   /**
+   * Error-path reconcile.
+   *
+   * The AI SDK does NOT guarantee `onFinish` fires on every provider error
+   * — a 5xx that returns partial usage in the body, an Anthropic 429 that
+   * billed the input but rejected the response, or an aborted stream all
+   * leave the happy-path `record()` call dangling. Without this helper the
+   * ledger would show `cost_usd: 0` for those tests and the suite cap
+   * would never advance, letting a runaway error loop spend without
+   * tripping F1.
+   *
+   * Callers should invoke this from the `catch` block of every provider
+   * call site, passing whatever usage shape the error body exposed (the
+   * Anthropic SDK surfaces it on `error.response.usage`; the OpenAI SDK
+   * exposes `error.usage` directly). If usage is unknown, pass `null` to
+   * record the failed attempt at zero cost — the ledger row will still
+   * land so a maintainer can correlate.
+   */
+  recordOnError(
+    provider: Provider,
+    model: string,
+    usage: CanonicalUsage | null,
+  ): { suiteTotalUsd: number; testTotalUsd: number; capped: boolean } {
+    if (usage === null) {
+      return {
+        suiteTotalUsd: this.suiteTotalUsd,
+        testTotalUsd: this.currentTestUsd,
+        capped: this.currentTestUsd > this.perTestCap || this.suiteTotalUsd > this.suiteCap,
+      };
+    }
+    return this.record(provider, model, usage);
+  }
+
+  /**
    * Flush a final row for the current test and clear per-test accumulators.
    * Call this from an `afterEach` so every test contributes exactly one row.
    */

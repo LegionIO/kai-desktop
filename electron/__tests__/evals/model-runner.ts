@@ -21,6 +21,16 @@ export interface PinnedModel {
 }
 
 /**
+ * Bound the per-sample generation length so a runaway "explain everything"
+ * response can't blow the cost ceiling. The rubric's `length.max` would
+ * flag an over-long answer post-hoc, but it can't refund the spend.
+ * 1024 tokens fits the longest prompt's expected answer (refactor /
+ * write-tests) with headroom; tighten further if cost-meter ever flags a
+ * single-sample overage.
+ */
+const SAMPLE_MAX_TOKENS = 1024;
+
+/**
  * Run a single sample against a pinned model.
  *
  * Reads provider credentials from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
@@ -40,6 +50,7 @@ export async function runModel(model: PinnedModel, prompt: string): Promise<stri
       // variance still comes from server-side stochasticity but the
       // shape is tightened so the deterministic rubric is meaningful.
       temperature: 0,
+      maxOutputTokens: SAMPLE_MAX_TOKENS,
     });
     return text;
   }
@@ -53,6 +64,7 @@ export async function runModel(model: PinnedModel, prompt: string): Promise<stri
       model: provider(model.id),
       prompt,
       temperature: 0,
+      maxOutputTokens: SAMPLE_MAX_TOKENS,
     });
     return text;
   }

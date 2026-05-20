@@ -66,22 +66,50 @@ authored is outside the scope of this plan.
 
 ### Setup (one-time, performed by a maintainer)
 
+> Until the steps below are completed, the `integration-nightly`,
+> `evals`, and `fixture-drift-check` workflows will run on schedule but
+> their issue-creation and board-ingestion steps silently skip because
+> the field-ID guards treat missing variables as "not configured". A
+> contributor watching the Actions tab will see them as green-but-empty.
+> Do not merge PR-stack changes that depend on these workflows until
+> these variables are set.
+
 1. Create the project board with `gh project create`:
 
    ```bash
    gh project create --owner <org> --title "Behavioral Regressions"
    ```
 
-2. Capture the resulting node ID and store it as a repository variable:
+2. Add the columns the workflow expects. The shipped workflow writes
+   `Status: Detected` as the first state, then maintainers manually
+   advance items to `Triage`, `In Progress`, `Fix Pending Review`, and
+   `Resolved` during review.
+
+3. Capture the project URL plus every field + option ID the workflow
+   reads, then store each as a repository variable. The exact names
+   below are what `integration-nightly.yml` and `evals.yml` consume —
+   the prior generic names (`BEHAVIORAL_REGRESSIONS_PROJECT_ID`,
+   `BEHAVIORAL_REGRESSIONS_FIELD_STATUS`, etc.) are NOT read anywhere
+   and were never wired to the workflow:
 
    ```bash
-   gh variable set BEHAVIORAL_REGRESSIONS_PROJECT_ID --body "<project-node-id>"
-   ```
+   # Project handles
+   gh variable set BEHAVIORAL_REGRESSIONS_PROJECT_URL --body "<project-url>"
+   gh variable set BEHAVIORAL_REGRESSIONS_PROJECT_NODE_ID --body "<project-node-id>"
 
-3. Add the columns the workflow expects: `Triage`, `In Progress`,
-   `Fix Pending Review`, `Resolved`. Capture the field IDs for `Status`,
-   `Severity`, `Detected-By`, and `Affected-Prompt-Id` as additional
-   repository variables (e.g. `BEHAVIORAL_REGRESSIONS_FIELD_STATUS`).
+   # Field IDs (one per column the workflow writes)
+   gh variable set STATUS_FIELD_ID --body "<status-field-id>"
+   gh variable set SEVERITY_FIELD_ID --body "<severity-field-id>"
+   gh variable set DETECTED_BY_FIELD_ID --body "<detected-by-field-id>"
+   gh variable set AFFECTED_PROMPT_ID_FIELD_ID --body "<affected-prompt-id-field-id>"
+
+   # Single-select option IDs (the workflow writes these specific values
+   # when ingesting a new regression; replace each with the option ID
+   # captured from the project schema query)
+   gh variable set STATUS_DETECTED_OPTION_ID --body "<status:detected-option-id>"
+   gh variable set SEVERITY_AUTO_OPTION_ID --body "<severity:auto-option-id>"
+   gh variable set DETECTED_BY_NIGHTLY_OPTION_ID --body "<detected-by:nightly-option-id>"
+   ```
 
 The IDs are static once captured — they only change if the board is
 recreated.
@@ -90,8 +118,7 @@ recreated.
 
 Nightly evaluation workflows file an issue per detected regression using
 `gh issue create` against the template at
-`.github/ISSUE_TEMPLATE/behavioral-regression.yml` (added in a follow-up
-PR). The body captures:
+`.github/ISSUE_TEMPLATE/behavioral-regression.yml`. The body captures:
 
 - The prompt ID or test case ID that regressed.
 - The detected severity (auto-classified by the eval rubric).
@@ -100,6 +127,15 @@ PR). The body captures:
 
 Labels applied automatically: `behavioral-regression`, `nightly-detected`,
 `severity:auto`.
+
+**Dedup**: the workflow searches existing issues by a `<!-- test-id:... -->`
+body trailer (or by the dated title prefix for the evals workflow) before
+creating a new issue, so a regression that recurs on subsequent nights
+appends to the open issue rather than creating duplicates. The search
+itself has a 30–60s GitHub-side indexing latency, which is acceptable for
+the nightly cadence but means two cron runs in the same minute could open
+distinct issues — that is by design and is the trade-off for keeping the
+detection path free of an explicit lock.
 
 ### Board ingestion (automated)
 

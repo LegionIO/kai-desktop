@@ -169,6 +169,37 @@ describe('CostMeter post-call reconcile (T2)', () => {
     expect(result.capped).toBe(true);
     expect(result.testTotalUsd).toBeGreaterThan(0.0001);
   });
+
+  it('recordOnError bills against the suite cap when the error body carries usage', () => {
+    const meter = new CostMeter({ ledgerPath });
+    meter.beginTest('hermetic.reconcile.error-with-usage');
+
+    // Simulate the 429 path: provider billed the input but rejected the
+    // response. The harness must still record those input tokens against
+    // the suite ceiling, otherwise an error loop spends silently.
+    const result = meter.recordOnError('anthropic', 'claude-3-5-haiku-latest', {
+      inputTokens: 1000,
+      outputTokens: 0,
+    });
+
+    // 1000 × $0.80 / 1e6 = $0.0008
+    expect(result.testTotalUsd).toBeCloseTo(0.0008, 6);
+    expect(result.suiteTotalUsd).toBeCloseTo(0.0008, 6);
+  });
+
+  it('recordOnError returns the current accumulator when usage is unknown (null)', () => {
+    const meter = new CostMeter({ ledgerPath });
+    meter.beginTest('hermetic.reconcile.error-no-usage');
+
+    // Some failure modes (network reset before any byte) genuinely have no
+    // usage to record. We still call recordOnError so the failure path is
+    // explicit, but the helper must not fabricate cost.
+    const result = meter.recordOnError('openai', 'gpt-4o-mini', null);
+
+    expect(result.testTotalUsd).toBe(0);
+    expect(result.suiteTotalUsd).toBe(0);
+    expect(result.capped).toBe(false);
+  });
 });
 
 describe('CostMeter ledger output', () => {

@@ -10,6 +10,30 @@ model's behaviour drifts in a way that the deterministic rubric — written
 once, by hand — can see. It is not a leaderboard, not a model-quality
 benchmark, and not a per-PR merge gate.
 
+### Scope (what this harness DOES NOT cover)
+
+The harness is **single-turn** and uses the **provider's default system
+prompt**. That covers the prompt → response contract for ~80% of
+behavioural regressions but explicitly does NOT exercise:
+
+- **Multi-turn dialog.** The `conversation-continuation-*` prompts
+  simulate prior turns by stuffing them into a single user-message
+  string. The harness never calls a model with a `messages: [...]`
+  array containing distinct assistant/user turns. A regression that
+  breaks turn handling will not be caught here.
+- **System-prompt sensitivity.** No prompt is rendered with a custom
+  `system:` field. A regression caused by the provider changing
+  default-system behaviour is invisible.
+- **Long context.** Prompts top out at ~50 lines (the `refactor-001`
+  prompt). Drift on long-context comprehension (32k+ tokens) is out
+  of scope.
+- **Tool-use round-trips.** The `tool-use-with-error-001` prompt asks
+  the model to _refuse_ a tool call; the harness never wires real
+  tools or asserts on the tool_use → tool_result protocol.
+
+A separate, heavier-weight evaluation initiative is the right home for
+those surfaces.
+
 Companion reading: [`docs/TESTING_ARCHITECTURE.md`](TESTING_ARCHITECTURE.md)
 explains why the pipeline avoids LLM-as-judge graders; this doc explains
 how the deterministic alternative is constructed and extended.
