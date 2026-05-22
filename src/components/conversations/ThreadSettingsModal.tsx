@@ -133,6 +133,14 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
     // Map field names to ConversationRecord field names
     void persistSetting(field, value);
 
+    // When the runtime override changes, also update the global agent.runtime so
+    // new conversations inherit the user's preference instead of reverting to the
+    // previous global default on restart.
+    if (field === 'runtimeOverride') {
+      const runtime = (value as string | null) ?? 'auto';
+      void app.config.set('agent.runtime', runtime);
+    }
+
     // Notify App.tsx if this is the active conversation
     if (isActiveConversation && conversationId) {
       window.dispatchEvent(new CustomEvent('thread-settings-changed', {

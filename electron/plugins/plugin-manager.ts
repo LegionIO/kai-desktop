@@ -771,10 +771,12 @@ export class PluginManager {
         return instance.inferenceProvider;
       }
 
-      // Check if the model's provider key matches a plugin runtime ID prefix
-      // (e.g., model provider key 'legionio' or 'legionio_anthropic' matches
-      // a plugin that contributes runtime 'legion')
-      if (context.modelProviderKey) {
+      // Check if the model's provider key matches a plugin runtime ID prefix.
+      // Only use this fallback when no explicit runtime was chosen — if the user
+      // has overridden the runtime, respect that choice and do not let a plugin
+      // claim the request based on model provider key alone.
+      const hasExplicitRuntime = context.runtimeId && context.runtimeId !== 'auto';
+      if (!hasExplicitRuntime && context.modelProviderKey) {
         const matchesRuntime = pluginRuntimeIds.some(
           (rid) => context.modelProviderKey!.startsWith(rid) ||
                    context.modelProviderKey!.startsWith(instance.inferenceProvider!.name.toLowerCase().replace(/\s+/g, '')),

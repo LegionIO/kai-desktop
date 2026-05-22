@@ -71,6 +71,8 @@ export const branding = {
   artifactPrefix: '{{productName}}',
   /** macOS app category. */
   macCategory: 'public.app-category.developer-tools',
+  /** GitHub "owner/repo" used as the auto-updater release source. */
+  updateRepo: 'legionio/kai-desktop',
 
   // ── Theme / visual identity ──────────────────────────────────────────
   /** OKLCh hue angle (0-360) used for the brand accent across the UI. */

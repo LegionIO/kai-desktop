@@ -21,7 +21,7 @@ import type { RuntimeId } from './types.js';
 // Types
 // ---------------------------------------------------------------------------
 
-export type ClaudeAuth = {
+export type ModelAuth = {
   modelName: string;
   baseUrl: string;
   apiKey: string;
@@ -31,7 +31,7 @@ export type RuntimeResolution = {
   /** The runtime to use (built-in RuntimeId or plugin-contributed runtime ID) */
   runtimeId: string;
   /** For Claude Code: resolved Anthropic-compatible credentials */
-  claudeAuth?: ClaudeAuth;
+  modelAuth?: ModelAuth;
   /** For incompatible explicit-runtime selections */
   warning?: string;
 };
@@ -82,8 +82,7 @@ function resolveAutoMode(
   }
 
   // Check if this model belongs to a plugin-contributed runtime.
-  // Plugin models use provider keys that start with or match their runtime ID
-  // (e.g., provider key 'legionio' or 'legionio_anthropic' → runtime 'legion').
+  // Plugin models use provider keys that start with or match their runtime ID.
   const rawCatalogEntry = config.models.catalog.find((m) => m.key === model.key);
   if (rawCatalogEntry) {
     const providerKey = rawCatalogEntry.provider;
@@ -91,7 +90,7 @@ function resolveAutoMode(
     for (const runtimeId of available) {
       // Skip built-in runtimes — they don't own provider keys
       if (runtimeId === 'mastra' || runtimeId === 'claude-agent-sdk' || runtimeId === 'codex-sdk') continue;
-      // Match: provider key starts with the plugin runtime ID (e.g., 'legionio' starts with 'legion')
+      // Match: provider key starts with the plugin runtime ID
       if (providerKey.startsWith(runtimeId) || runtimeId.startsWith(providerKey.split('_')[0])) {
         return { runtimeId };
       }
@@ -105,7 +104,7 @@ function resolveAutoMode(
       if (available.has('claude-agent-sdk')) {
         return {
           runtimeId: 'claude-agent-sdk',
-          claudeAuth: extractClaudeAuth(model),
+          modelAuth: extractModelAuth(model),
         };
       }
       return { runtimeId: 'mastra' };
@@ -113,16 +112,17 @@ function resolveAutoMode(
 
     case 'openai-compatible': {
       // Check if the same model is available under an Anthropic/Bedrock provider
+      // with a claude-* model name (SDK validates names client-side).
       const crossRef = crossReferenceAnthropicProvider(model.modelConfig.modelName, config);
-      if (crossRef && available.has('claude-agent-sdk')) {
+      if (crossRef && crossRef.modelName.toLowerCase().startsWith('claude') && available.has('claude-agent-sdk')) {
         return {
           runtimeId: 'claude-agent-sdk',
-          claudeAuth: crossRef,
+          modelAuth: crossRef,
         };
       }
       // Genuinely non-Claude model — use Codex (native OpenAI) or Mastra (universal)
       if (available.has('codex-sdk')) {
-        return { runtimeId: 'codex-sdk' };
+        return { runtimeId: 'codex-sdk', modelAuth: extractModelAuth(model) };
       }
       return { runtimeId: 'mastra' };
     }
@@ -148,6 +148,7 @@ function resolveExplicitMode(
   preferred: RuntimeId,
   available: Set<string>,
 ): RuntimeResolution {
+
   // Runtime not available — fall back to Mastra with no warning (existing behavior)
   if (!available.has(preferred)) {
     return { runtimeId: 'mastra' };
@@ -163,20 +164,45 @@ function resolveExplicitMode(
       if (providerType === 'anthropic' || providerType === 'amazon-bedrock') {
         return {
           runtimeId: 'claude-agent-sdk',
-          claudeAuth: extractClaudeAuth(model),
+          modelAuth: extractModelAuth(model),
         };
       }
-      // OpenAI model — try cross-reference
+      // OpenAI model — try cross-reference to find an Anthropic-compatible endpoint
       if (providerType === 'openai-compatible') {
         const crossRef = crossReferenceAnthropicProvider(model.modelConfig.modelName, config);
         if (crossRef) {
+          // The Claude Code SDK validates model names client-side and only accepts
+          // names starting with 'claude'. If the model isn't aliased with a claude-
+          // prefix on the gateway, warn the user rather than letting it fail silently.
+          if (!crossRef.modelName.toLowerCase().startsWith('claude')) {
+            return {
+              runtimeId: 'claude-agent-sdk',
+              warning: `The selected model (${model.displayName}) cannot be used with the Claude Code runtime because its model ID ("${crossRef.modelName}") is not a Claude model name.`,
+            };
+          }
           return {
             runtimeId: 'claude-agent-sdk',
-            claudeAuth: crossRef,
+            modelAuth: crossRef,
           };
         }
       }
-      // Incompatible
+      // Plugin-owned model (e.g. a model contributed by a runtime plugin whose
+      // provider key is not a built-in Anthropic/Bedrock entry). The plugin's
+      // inference provider has already been bypassed by the explicit runtime
+      // override, so show a clear incompatibility warning rather than silently
+      // failing inside the Claude Code runtime.
+      const rawEntry = config.models.catalog.find((m) => m.key === model.key);
+      const providerKey = rawEntry?.provider ?? '';
+      const isBuiltInProvider = providerKey === 'anthropic' || providerKey === 'amazon-bedrock'
+        || providerKey === 'openai' || providerKey === 'google' || providerKey === 'gemini'
+        || providerKey === 'ollama' || providerKey === 'bedrock';
+      if (!isBuiltInProvider) {
+        return {
+          runtimeId: 'claude-agent-sdk',
+          warning: `The selected model (${model.displayName}) is not compatible with the Claude Code runtime. Claude Code only supports Claude models. Switch to Auto runtime or select a Claude model.`,
+        };
+      }
+      // Incompatible built-in model
       return {
         runtimeId: 'claude-agent-sdk',
         warning: `The selected model (${model.displayName}) is from ${providerTypeLabel(providerType)} provider, which is not supported by the Claude Code runtime. Switch to Auto runtime in Settings → Agent Runtime, or select a model from an Anthropic provider.`,
@@ -185,7 +211,7 @@ function resolveExplicitMode(
 
     case 'codex-sdk': {
       if (providerType === 'openai-compatible') {
-        return { runtimeId: 'codex-sdk' };
+        return { runtimeId: 'codex-sdk', modelAuth: extractModelAuth(model) };
       }
       // Incompatible
       return {
@@ -214,7 +240,7 @@ function resolveExplicitMode(
  * Extract Claude-compatible auth from a model entry that's already under
  * an Anthropic or Bedrock provider.
  */
-function extractClaudeAuth(model: ModelCatalogEntry): ClaudeAuth {
+function extractModelAuth(model: ModelCatalogEntry): ModelAuth {
   return {
     modelName: model.modelConfig.modelName,
     baseUrl: stripV1Suffix(model.modelConfig.endpoint),
@@ -230,8 +256,9 @@ function extractClaudeAuth(model: ModelCatalogEntry): ClaudeAuth {
 function crossReferenceAnthropicProvider(
   modelName: string,
   config: AppConfig,
-): ClaudeAuth | null {
+): ModelAuth | null {
   const catalog = resolveModelCatalog(config);
+
 
   for (const entry of catalog.entries) {
     if (

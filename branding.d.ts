@@ -32,6 +32,7 @@ declare const __BRAND_JWT_ISSUER: string;
 // ── Build / packaging ─────────────────────────────────────────────────────
 declare const __BRAND_ARTIFACT_PREFIX: string;
 declare const __BRAND_MAC_CATEGORY: string;
+declare const __BRAND_UPDATE_REPO: string;
 declare const __APP_VERSION: string;
 
 // ── Theme / visual identity ───────────────────────────────────────────────

@@ -319,7 +319,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 7. Start the query
     // -----------------------------------------------------------------------
-    // When claudeAuth is provided, model + endpoint + API key are passed via
+    // When modelAuth is provided, model + endpoint + API key are passed via
     // the SDK's `settings` option (highest-priority layer). Otherwise the SDK
     // falls back to its own config (~/.claude/settings.json).
 
@@ -352,7 +352,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // Use pre-resolved auth from the model-runtime compatibility layer.
     // This ensures Kai is always in control of which model + endpoint is used,
     // rather than silently falling back to ~/.claude/settings.json.
-    const auth = options.claudeAuth ?? null;
+    const auth = options.modelAuth ?? null;
 
     debugLog(`[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`);
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
@@ -362,8 +362,6 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       abortController,
       cwd: cwd ?? process.cwd(),
       // Model + auth from Kai's model-runtime resolver.
-      // When auth is present, we pass model name directly and override the SDK's
-      // default endpoint/key via the settings option (highest priority layer).
       ...(auth ? { model: auth.modelName } : {}),
       maxTurns,
       thinking: thinkingConfig as SdkOptions['thinking'],

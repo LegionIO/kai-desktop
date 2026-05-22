@@ -30,7 +30,7 @@ function getDefaultConfig() {
       catalog: [],
     },
     memory: {
-      enabled: true,
+      enabled: false,
       workingMemory: { enabled: true, scope: 'resource' as const },
       observationalMemory: { enabled: true, scope: 'resource' as const },
       semanticRecall: {

@@ -78,7 +78,72 @@ function timestampMs(value: string | null | undefined): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function isStaleRunningWrite(prev: ConversationRecord, next: ConversationRecord): boolean {
+type ConversationMessageLike = {
+  role?: unknown;
+  createdAt?: unknown;
+};
+
+function toIsoTimestamp(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  }
+  if (value instanceof Date) {
+    const parsed = value.getTime();
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  }
+  return null;
+}
+
+function latestTimestamp(...values: Array<string | null | undefined>): string | null {
+  let latestValue: string | null = null;
+  let latestMs = 0;
+  for (const value of values) {
+    const parsed = timestampMs(value);
+    if (parsed > latestMs) {
+      latestMs = parsed;
+      latestValue = value ?? null;
+    }
+  }
+  return latestValue;
+}
+
+export function reconcileConversationActivity(
+  prev: ConversationRecord | undefined,
+  next: ConversationRecord,
+): ConversationRecord {
+  const messages = Array.isArray(next.messages) ? next.messages as ConversationMessageLike[] : [];
+  let derivedLastMessageAt: string | null = null;
+  let derivedLastAssistantUpdateAt: string | null = null;
+  let derivedUserMessageCount = 0;
+
+  for (const message of messages) {
+    const createdAt = toIsoTimestamp(message.createdAt);
+    if (message.role === 'user') {
+      derivedUserMessageCount++;
+    }
+    if (createdAt) {
+      derivedLastMessageAt = latestTimestamp(derivedLastMessageAt, createdAt);
+      if (message.role === 'assistant') {
+        derivedLastAssistantUpdateAt = latestTimestamp(derivedLastAssistantUpdateAt, createdAt);
+      }
+    }
+  }
+
+  return {
+    ...next,
+    messageCount: messages.length,
+    userMessageCount: derivedUserMessageCount,
+    lastMessageAt: latestTimestamp(prev?.lastMessageAt, next.lastMessageAt, derivedLastMessageAt),
+    lastAssistantUpdateAt: latestTimestamp(
+      prev?.lastAssistantUpdateAt,
+      next.lastAssistantUpdateAt,
+      derivedLastAssistantUpdateAt,
+    ),
+  };
+}
+
+export function isStaleRunningWrite(prev: ConversationRecord, next: ConversationRecord): boolean {
   // Protect both terminal states ('idle' and 'awaiting-approval') from being
   // clobbered by a stale debounced write that still carries runStatus:'running'.
   if ((prev.runStatus !== 'idle' && prev.runStatus !== 'awaiting-approval') || next.runStatus !== 'running') return false;
@@ -86,13 +151,27 @@ function isStaleRunningWrite(prev: ConversationRecord, next: ConversationRecord)
   // A new user turn is allowed to move an idle conversation back to running.
   if (next.userMessageCount > prev.userMessageCount) return false;
 
+  // Regenerate / restart flows legitimately move the active branch or head
+  // without adding a new user message.
+  if (next.headId !== prev.headId || next.messageCount !== prev.messageCount) return false;
+
+  // A legitimate restart will usually change the active branch or head.
+  const sameBranch = next.headId === prev.headId
+    && next.messageCount === prev.messageCount
+    && next.userMessageCount === prev.userMessageCount;
+  const noFreshActivity = timestampMs(next.lastAssistantUpdateAt) <= timestampMs(prev.lastAssistantUpdateAt)
+    && timestampMs(next.lastMessageAt) <= timestampMs(prev.lastMessageAt);
+  if (sameBranch && noFreshActivity) return true;
+
   // Stale async writes often carry an older updatedAt, or they were read before
   // the done handler populated lastAssistantUpdateAt.
   return timestampMs(next.updatedAt) <= timestampMs(prev.updatedAt)
-    || Boolean(prev.lastAssistantUpdateAt && !next.lastAssistantUpdateAt);
+    || Boolean(prev.lastAssistantUpdateAt && !next.lastAssistantUpdateAt)
+    || timestampMs(next.lastAssistantUpdateAt) < timestampMs(prev.lastAssistantUpdateAt)
+    || timestampMs(next.lastMessageAt) < timestampMs(prev.lastMessageAt);
 }
 
-function preserveTerminalRunFields(prev: ConversationRecord, next: ConversationRecord): ConversationRecord {
+export function preserveTerminalRunFields(prev: ConversationRecord, next: ConversationRecord): ConversationRecord {
   if (!isStaleRunningWrite(prev, next)) return next;
 
   return {
@@ -159,7 +238,10 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     }
 
     if (prev) {
+      nextConversation = reconcileConversationActivity(prev, nextConversation);
       nextConversation = preserveTerminalRunFields(prev, nextConversation);
+    } else {
+      nextConversation = reconcileConversationActivity(undefined, nextConversation);
     }
 
     store.conversations[conversation.id] = nextConversation;

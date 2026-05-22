@@ -4,7 +4,7 @@ import { Trash2Icon, ArchiveIcon, MessageSquareIcon, MonitorIcon, PinIcon, Penci
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
-import type { ConversationRecord } from '@/providers/RuntimeProvider';
+import { useAssistantResponseTiming, useRuntimeConversationId, type ConversationRecord } from '@/providers/RuntimeProvider';
 import type { ComputerSession } from '../../../shared/computer-use';
 import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
@@ -103,6 +103,8 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const [threadSettingsConvId, setThreadSettingsConvId] = useState<string | null>(null);
+  const runtimeConversationId = useRuntimeConversationId();
+  const { activeRunStartedAt } = useAssistantResponseTiming();
 
   const togglePin = useCallback((id: string) => {
     setPinnedIds((prev) => {
@@ -377,7 +379,8 @@ export const ConversationList: FC<ConversationListProps> = ({
               {section.items.map((conv) => {
                 const isActive = conv.id === activeConversationId || conv.id === fadingActiveId;
                 const isAwaitingApproval = conv.runStatus === 'awaiting-approval';
-                const isRunning = conv.runStatus === 'running' && !isAwaitingApproval;
+                const runtimeSaysActiveThreadIsIdle = conv.id === runtimeConversationId && !activeRunStartedAt;
+                const isRunning = conv.runStatus === 'running' && !isAwaitingApproval && !runtimeSaysActiveThreadIsIdle;
                 const hasUnread = (conv.hasUnread && !isActive) || (isAwaitingApproval && !isActive);
                 const isRemoving = removingIds.has(conv.id);
                 const computerStatus = getComputerStatus(conv.id);

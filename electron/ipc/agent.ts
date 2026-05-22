@@ -375,7 +375,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       ? { ...config, agent: { ...config.agent, runtime: threadOverrides.runtimeOverride } } as AppConfig
       : config;
     const { runtime, resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
-    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} claudeAuth=${resolution.claudeAuth ? `model=${resolution.claudeAuth.modelName} baseUrl=${resolution.claudeAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
+    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} modelAuth=${resolution.modelAuth ? `model=${resolution.modelAuth.modelName} baseUrl=${resolution.modelAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
 
     // If the user has an explicitly-set runtime that is incompatible with the
     // selected model, surface the warning in the chat and bail early.
@@ -1184,7 +1184,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           abortSignal: controller.signal,
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
-          claudeAuth: resolution.claudeAuth,
+          modelAuth: resolution.modelAuth,
           conversationMetadata: convMetadata,
           switchContext,
           emitEvent: streamOptions.emitEvent,
