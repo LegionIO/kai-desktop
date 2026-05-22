@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, type FC } from 'react';
 import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
+import { app } from '@/lib/ipc-client';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 import { ProfileSettings } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
@@ -493,7 +494,7 @@ const ModelForm: FC<{
             onChange={(e) => setPreferredTarget((e.target.value || 'isolated-browser') as NonNullable<CatalogEntry['preferredTarget']>)}
           >
             <option value="isolated-browser">Isolated Browser</option>
-            <option value="local-macos">Local Mac</option>
+            {app.platform.os === 'darwin' && <option value="local-macos">Local Mac</option>}
           </select>
         </div>
       </div>

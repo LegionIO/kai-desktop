@@ -69,6 +69,30 @@ jobs:
 
       - run: pnpm build:mac
 
+  pr-win-build:
+    if: ${{ github.event_name == 'pull_request' }}
+    needs: checks
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      - run: pnpm build:win
+
   prepare-release:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: checks
@@ -270,6 +294,53 @@ jobs:
           if [ -n "$manifest_path" ]; then
             gh release upload "$TAG" "$manifest_path" --clobber
           fi
+
+  publish-release-win:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [prepare-release, publish-release]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      - run: pnpm build:win
+
+      - name: Upload Windows artifacts to release
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          # Upload the NSIS installer
+          exe_path="$(find dist -maxdepth 1 -type f -name '*.exe' | head -n 1)"
+          if [ -z "$exe_path" ]; then
+            echo "ERROR: No .exe installer found in dist/" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "$exe_path" --clobber
+
+          # Upload the latest.yml manifest (tells electron-updater where to find the Windows update)
+          manifest_path="$(find dist -maxdepth 1 -type f -name 'latest.yml' | head -n 1)"
+          if [ -z "$manifest_path" ]; then
+            echo "ERROR: No latest.yml manifest found in dist/" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "$manifest_path" --clobber
 
   update-cask:
     if: ${{ github.event_name == 'workflow_dispatch' }}

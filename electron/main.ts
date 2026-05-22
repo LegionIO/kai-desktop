@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen } from 'electron';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
@@ -205,21 +205,27 @@ function buildMenu(): void {
           checkForUpdatesInteractive();
         },
       };
-  const template: Electron.MenuItemConstructorOptions[] = [
-    {
+
+  const settingsMenuItem: Electron.MenuItemConstructorOptions = {
+    label: 'Settings…',
+    accelerator: 'CommandOrControl+,',
+    click: () => {
+      const win = BrowserWindow.getFocusedWindow();
+      if (win) win.webContents.send('menu:open-settings');
+    },
+  };
+
+  const template: Electron.MenuItemConstructorOptions[] = [];
+
+  if (IS_MAC) {
+    // macOS: app-name menu with About, Settings, Services, Hide, Quit
+    template.push({
       label: app.name,
       submenu: [
         { role: 'about' },
         { type: 'separator' },
         updateMenuItem,
-        {
-          label: 'Settings…',
-          accelerator: 'Cmd+,',
-          click: () => {
-            const win = BrowserWindow.getFocusedWindow();
-            if (win) win.webContents.send('menu:open-settings');
-          },
-        },
+        settingsMenuItem,
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -229,53 +235,72 @@ function buildMenu(): void {
         { type: 'separator' },
         { role: 'quit' },
       ],
-    },
-    {
-      label: 'Edit',
+    });
+  } else {
+    // Windows/Linux: File menu with Settings, Check for Updates, Exit
+    template.push({
+      label: 'File',
       submenu: [
-        { role: 'undo' },
-        { role: 'redo' },
+        settingsMenuItem,
+        updateMenuItem,
         { type: 'separator' },
-        { role: 'cut' },
-        { role: 'copy' },
-        { role: 'paste' },
-        { role: 'selectAll' },
-        { type: 'separator' },
-        {
-          label: 'Find',
-          accelerator: 'Cmd+F',
-          click: () => {
-            const win = BrowserWindow.getFocusedWindow();
-            if (win) win.webContents.send('menu:find');
-          },
+        { role: 'quit', label: 'Exit' },
+      ],
+    });
+  }
+
+  template.push({
+    label: 'Edit',
+    submenu: [
+      { role: 'undo' },
+      { role: 'redo' },
+      { type: 'separator' },
+      { role: 'cut' },
+      { role: 'copy' },
+      { role: 'paste' },
+      { role: 'selectAll' },
+      { type: 'separator' },
+      {
+        label: 'Find',
+        accelerator: 'CommandOrControl+F',
+        click: () => {
+          const win = BrowserWindow.getFocusedWindow();
+          if (win) win.webContents.send('menu:find');
         },
-      ],
-    },
-    {
-      label: 'View',
-      submenu: [
-        { role: 'reload' },
-        { role: 'forceReload' },
-        { role: 'toggleDevTools' },
-        { type: 'separator' },
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
-        { type: 'separator' },
-        { role: 'togglefullscreen' },
-      ],
-    },
-    {
-      label: 'Window',
-      submenu: [
-        { role: 'minimize' },
-        { role: 'zoom', label: 'Maximize' },
-        { role: 'close' },
-        { type: 'separator' },
-        { role: 'front' },
-      ],
-    },
-  ];
+      },
+    ],
+  });
+
+  template.push({
+    label: 'View',
+    submenu: [
+      { role: 'reload' },
+      { role: 'forceReload' },
+      { role: 'toggleDevTools' },
+      { type: 'separator' },
+      { role: 'resetZoom' },
+      { role: 'zoomIn' },
+      { role: 'zoomOut' },
+      { type: 'separator' },
+      { role: 'togglefullscreen' },
+    ],
+  });
+
+  template.push({
+    label: 'Window',
+    submenu: IS_MAC
+      ? [
+          { role: 'minimize' },
+          { role: 'zoom', label: 'Maximize' },
+          { role: 'close' },
+          { type: 'separator' },
+          { role: 'front' },
+        ]
+      : [
+          { role: 'minimize' },
+          { role: 'close' },
+        ],
+  });
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -283,6 +308,7 @@ function buildMenu(): void {
 // Resolve the app icon — works in both dev and packaged builds
 const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
+const IS_WIN = process.platform === 'win32';
 
 function setMacDockIcon(): void {
   setPaddedMacDockIcon(APP_ICON);
@@ -305,8 +331,9 @@ function createWindow(): BrowserWindow {
     show: false,
     title: __BRAND_PRODUCT_NAME,
     icon: windowIcon,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 20, y: 18 },
+    titleBarStyle: IS_MAC ? 'hiddenInset' : 'hidden',
+    ...(IS_MAC ? { trafficLightPosition: { x: 20, y: 18 } } : {}),
+    ...(IS_WIN ? { titleBarOverlay: { color: '#1a1a1a', symbolColor: '#ffffff', height: 38 } } : {}),
     transparent: IS_MAC,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     visualEffectState: IS_MAC ? 'active' : undefined,
@@ -758,13 +785,22 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('titlebar:double-click', () => {
       const win = BrowserWindow.getFocusedWindow();
       if (!win) return;
-      // Respect the user's macOS System Preferences for "Double-click a window's title bar to"
-      // which can be "Zoom" (maximize) or "Minimize"
-      const action = systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string');
-      if (action === 'Minimize') {
-        win.minimize();
+      if (IS_MAC) {
+        // Respect the user's macOS System Preferences for "Double-click a window's title bar to"
+        // which can be "Zoom" (maximize) or "Minimize"
+        const action = systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string');
+        if (action === 'Minimize') {
+          win.minimize();
+        } else {
+          // Default is "Zoom" (or "Fill" on newer macOS) — toggle maximize
+          if (win.isMaximized()) {
+            win.unmaximize();
+          } else {
+            win.maximize();
+          }
+        }
       } else {
-        // Default is "Zoom" (or "Fill" on newer macOS) — toggle maximize
+        // Windows/Linux: toggle maximize on double-click
         if (win.isMaximized()) {
           win.unmaximize();
         } else {
@@ -800,7 +836,7 @@ if (gotSingleInstanceLock) {
         const isImage = mime.startsWith('image/');
         return {
           path: filePath,
-          name: filePath.split('/').pop() ?? filePath,
+          name: basename(filePath),
           mime,
           isImage,
           size: data.length,
@@ -826,7 +862,7 @@ if (gotSingleInstanceLock) {
       return {
         canceled: false,
         directoryPath,
-        name: directoryPath.split('/').pop() ?? directoryPath,
+        name: basename(directoryPath),
       };
     });
 

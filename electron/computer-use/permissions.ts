@@ -32,6 +32,8 @@ const LOCAL_MACOS_PRIVACY_URLS: Record<ComputerUsePermissionSection, string> = {
  * Returns the path if the binary exists and is executable, otherwise null.
  */
 export function resolveCompiledHelperBinary(): string | null {
+  if (process.platform !== 'darwin') return null;
+
   const candidates: string[] = [];
 
   // Production: electron-builder extraResources places it under Resources/bin/
@@ -173,6 +175,9 @@ export type LocalMacosHelperResponse = {
 };
 
 async function runLocalMacHelper(args: string[]): Promise<LocalMacosHelperResponse> {
+  if (process.platform !== 'darwin') {
+    return { ok: false, error: 'Local macOS helper is only available on macOS' };
+  }
   try {
     // Prefer the pre-compiled binary (always available in production builds,
     // available in dev after running `pnpm compile:swift`)
@@ -225,6 +230,7 @@ async function requestScreenRecordingPermission(): Promise<boolean> {
 }
 
 async function probeAutomationPermission(): Promise<boolean> {
+  if (process.platform !== 'darwin') return false;
   try {
     await execFileAsync('osascript', ['-e', 'tell application "System Events" to count processes'], {
       timeout: 10000,

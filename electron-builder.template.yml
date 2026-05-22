@@ -16,21 +16,22 @@ files:
   - out/**/*
   - "!**/*.map"
 extraResources:
-  - from: build/bin/LocalMacosHelper
-    to: bin/LocalMacosHelper
   - from: bundled-plugins
     to: bundled-plugins
     filter:
       - "**/*"
       - "!.gitkeep"
 {{esbuildExtraResources}}
-icon: build/icon.icns
+icon: build/icon
 mac:
   category: "{{macCategory}}"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
   notarize: true
+  extraResources:
+    - from: build/bin/LocalMacosHelper
+      to: bin/LocalMacosHelper
   extendInfo:
     CFBundleDisplayName: "{{productName}}"
     CFBundleName: "{{productName}}"
@@ -68,3 +69,15 @@ publish:
   - provider: github
     owner: legionio
     repo: kai-desktop
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "{{artifactPrefix}}-${version}-win-x64.${ext}"
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
