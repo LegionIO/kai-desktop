@@ -271,6 +271,49 @@ jobs:
             gh release upload "$TAG" "$manifest_path" --clobber
           fi
 
+      - name: Classify release for OTA eligibility
+        id: ota-classify
+        run: |
+          node --import tsx scripts/classify-release.ts
+          # Read the classification output
+          OTA_ELIGIBLE=$(node -p "require('./dist/ota-classification.json').otaEligible")
+          MIN_BASE_VERSION=$(node -p "require('./dist/ota-classification.json').minBaseVersion")
+          echo "eligible=$OTA_ELIGIBLE" >> "$GITHUB_OUTPUT"
+          echo "min_base_version=$MIN_BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "OTA eligible: $OTA_ELIGIBLE (min base: $MIN_BASE_VERSION)"
+
+      - name: Build OTA archive
+        if: steps.ota-classify.outputs.eligible == 'true'
+        env:
+          MIN_BASE_VERSION: ${{ steps.ota-classify.outputs.min_base_version }}
+        run: |
+          node --import tsx scripts/build-ota-archive.ts
+          # Patch the minBaseVersion in the feed (classify-release knows the real minimum)
+          node -e "
+            const fs = require('fs');
+            const feed = JSON.parse(fs.readFileSync('dist/latest-ota.json', 'utf-8'));
+            feed.latest.minBaseVersion = '$MIN_BASE_VERSION';
+            fs.writeFileSync('dist/latest-ota.json', JSON.stringify(feed, null, 2));
+          "
+
+      - name: Upload OTA artifacts
+        if: steps.ota-classify.outputs.eligible == 'true'
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          # Upload the OTA archive
+          ota_path="$(find dist -maxdepth 1 -type f -name '*-ota-*.tar.gz' | head -n 1)"
+          if [ -n "$ota_path" ]; then
+            gh release upload "$TAG" "$ota_path" --clobber
+            echo "Uploaded OTA archive: $(basename "$ota_path") ($(du -h "$ota_path" | cut -f1))"
+          fi
+
+          # Upload the OTA feed manifest
+          if [ -f "dist/latest-ota.json" ]; then
+            gh release upload "$TAG" "dist/latest-ota.json" --clobber
+            echo "Uploaded OTA feed manifest"
+          fi
+
   update-cask:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs:

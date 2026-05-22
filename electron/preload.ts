@@ -461,6 +461,20 @@ const appAPI = {
     },
   },
 
+  ota: {
+    check: () => ipcRenderer.invoke('ota:check'),
+    download: () => ipcRenderer.invoke('ota:download'),
+    apply: () => ipcRenderer.invoke('ota:apply'),
+    applyAndRestart: () => ipcRenderer.invoke('ota:apply-and-restart'),
+    status: () => ipcRenderer.invoke('ota:status'),
+    rollback: () => ipcRenderer.invoke('ota:rollback'),
+    onStatus: (callback: (status: Record<string, unknown>) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: Record<string, unknown>) => callback(status);
+      ipcRenderer.on('ota:status', handler);
+      return () => ipcRenderer.removeListener('ota:status', handler);
+    },
+  },
+
   onMenuOpenSettings: (callback: () => void) => {
     const handler = () => callback();
     ipcRenderer.on('menu:open-settings', handler);
