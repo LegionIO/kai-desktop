@@ -333,7 +333,11 @@ function createWindow(): BrowserWindow {
     icon: windowIcon,
     titleBarStyle: IS_MAC ? 'hiddenInset' : 'hidden',
     ...(IS_MAC ? { trafficLightPosition: { x: 20, y: 18 } } : {}),
-    ...(IS_WIN ? { titleBarOverlay: { color: '#1a1a1a', symbolColor: '#ffffff', height: 38 } } : {}),
+    ...(IS_WIN ? { titleBarOverlay: {
+      color: nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#f5f5f5',
+      symbolColor: nativeTheme.shouldUseDarkColors ? '#ffffff' : '#1a1a1a',
+      height: 38,
+    } } : {}),
     transparent: IS_MAC,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     visualEffectState: IS_MAC ? 'active' : undefined,
@@ -352,6 +356,18 @@ function createWindow(): BrowserWindow {
   if (IS_MAC) {
     mainWindow.webContents.on('page-favicon-updated', restoreMacDockIconAfterRendererIconUpdates);
     mainWindow.webContents.on('did-finish-load', restoreMacDockIconAfterRendererIconUpdates);
+  }
+
+  // Sync titleBarOverlay colors when the system/user theme changes (Windows only)
+  if (IS_WIN) {
+    nativeTheme.on('updated', () => {
+      if (mainWindow.isDestroyed()) return;
+      const dark = nativeTheme.shouldUseDarkColors;
+      mainWindow.setTitleBarOverlay({
+        color: dark ? '#1a1a1a' : '#f5f5f5',
+        symbolColor: dark ? '#ffffff' : '#1a1a1a',
+      });
+    });
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
