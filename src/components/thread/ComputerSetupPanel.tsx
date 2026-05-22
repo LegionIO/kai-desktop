@@ -58,7 +58,10 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     probeInputMonitoring,
   } = useComputerUse();
   const [computerGoal, setComputerGoal] = useState('');
-  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser');
+  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(() => {
+    const fallback = app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser';
+    return fallback;
+  });
   const [computerApprovalMode, setComputerApprovalMode] = useState<'step' | 'goal' | 'autonomous'>('autonomous');
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
   const [probedLocalPermissionState, setProbedLocalPermissionState] = useState<ComputerUsePermissions | null>(null);
@@ -78,7 +81,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   } | undefined;
 
   useEffect(() => {
-    setComputerTarget(computerConfig?.defaultTarget ?? (app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser'));
+    const target = computerConfig?.defaultTarget ?? (app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser');
+    setComputerTarget((target === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : target);
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.approvalModeDefault, computerConfig?.defaultTarget]);
 
