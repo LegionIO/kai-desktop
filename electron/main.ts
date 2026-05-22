@@ -44,8 +44,27 @@ import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
+import { resolveCodePaths } from './ota/bootstrap.js';
+import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
+import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 
 const APP_HOME = join(homedir(), '.' + __BRAND_APP_SLUG);
+
+// ── OTA Bootstrap ────────────────────────────────────────────────────────
+// Check for crash-based rollback BEFORE resolving code paths, so a broken
+// overlay gets wiped before we try to load it.
+const otaRollbackResult = checkAndHandleRollback(__BRAND_APP_SLUG, __APP_VERSION);
+if (otaRollbackResult) {
+  console.warn(`[OTA] Rolled back from v${otaRollbackResult.rolledBackFrom}: ${otaRollbackResult.reason}`);
+}
+
+// Resolve whether to load code from OTA overlay or bundled asar.
+// NOTE: In the current architecture, the main process code is already loaded from
+// the bundled asar by the time this runs (we can't dynamically re-require ourselves).
+// The bootstrap primarily controls the PRELOAD and RENDERER paths, plus reporting
+// the active code version. A future enhancement could use a tiny entry.js wrapper
+// to also redirect main process loading.
+const codePaths = resolveCodePaths(__BRAND_APP_SLUG, __APP_VERSION, import.meta.dirname);
 
 // ── Window state persistence ──────────────────────────────────────────
 const WINDOW_STATE_FILE = join(APP_HOME, 'settings', 'window-state.json');
@@ -312,7 +331,7 @@ function createWindow(): BrowserWindow {
     visualEffectState: IS_MAC ? 'active' : undefined,
     backgroundColor: IS_MAC ? '#00000000' : (nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff'),
     webPreferences: {
-      preload: join(import.meta.dirname, '../preload/index.mjs'),
+      preload: join(codePaths.preload, 'index.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -438,7 +457,7 @@ function createWindow(): BrowserWindow {
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    mainWindow.loadFile(join(import.meta.dirname, '../renderer/index.html'));
+    mainWindow.loadFile(join(codePaths.renderer, 'index.html'));
   }
 
   mainWindow.once('ready-to-show', () => {
@@ -685,6 +704,7 @@ if (gotSingleInstanceLock) {
       updateDownloaded = true;
       buildMenu();
     });
+    registerOtaHandlers(ipcMain, codePaths, __BRAND_APP_SLUG, __APP_VERSION);
 
     // Auto-seed computer use display settings on startup.
     // If allowedDisplays is empty, populate it with all discovered displays
@@ -1069,6 +1089,9 @@ if (gotSingleInstanceLock) {
       }
 
       mainWindow.setOpacity(1);
+
+      // Signal OTA rollback system that the app is running stably
+      signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
     });
 
     // Initialize tools asynchronously
@@ -1113,6 +1136,9 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // Signal OTA rollback that this was a graceful quit (not a crash)
+  signalGracefulQuit(__BRAND_APP_SLUG);
+  cleanupOta();
   // Stop web UI server
   stopWebServer().catch(() => {});
   // Best-effort plugin cleanup (don't block quit on failures)
