@@ -11,6 +11,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
+import { homedir } from 'os';
 
 // node-pty is a native addon — imported dynamically to gracefully handle
 // missing builds (e.g. in CI or unsupported platforms).
@@ -46,7 +47,7 @@ export class TaskTerminalManager {
       name: 'xterm-256color',
       cols: options.cols ?? 80,
       rows: options.rows ?? 24,
-      cwd: options.cwd ?? process.env.HOME ?? '/tmp',
+      cwd: options.cwd ?? homedir(),
       env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
     });
 
@@ -116,7 +117,10 @@ export class TaskTerminalManager {
       case 'mastra':
         return { command: 'npx', args: ['mastra', 'dev'] };
       default:
-        // Fall back to user's shell
+        // Fall back to user's shell (platform-aware)
+        if (process.platform === 'win32') {
+          return { command: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe', args: [] };
+        }
         return { command: process.env.SHELL ?? '/bin/zsh', args: [] };
     }
   }

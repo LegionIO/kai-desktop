@@ -1503,12 +1503,16 @@ const Composer: FC<{
     approvalModeDefault?: ComputerUseApprovalMode;
   } | undefined;
   const [computerUseToggled, setComputerUseToggled] = useState(false);
-  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(computerConfig?.defaultTarget ?? 'local-macos');
+  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(() => {
+    const configured = computerConfig?.defaultTarget ?? 'isolated-browser';
+    return (configured === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : configured;
+  });
   const [computerApprovalMode, setComputerApprovalMode] = useState<ComputerUseApprovalMode>(computerConfig?.approvalModeDefault ?? 'autonomous');
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
 
   useEffect(() => {
-    setComputerTarget(computerConfig?.defaultTarget ?? 'local-macos');
+    const target = computerConfig?.defaultTarget ?? 'isolated-browser';
+    setComputerTarget((target === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : target);
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.defaultTarget, computerConfig?.approvalModeDefault]);
 

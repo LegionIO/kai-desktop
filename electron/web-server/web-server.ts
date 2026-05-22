@@ -308,6 +308,7 @@ function getBridgeScript(): string {
       save: function() { return Promise.resolve({ canceled: true }); }
     },
     platform: {
+      os: '${process.platform}',
       homedir: function() { return invoke('platform:homedir'); }
     },
     webServer: {

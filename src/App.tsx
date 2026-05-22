@@ -1508,7 +1508,7 @@ function AppShell() {
           >
             <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
             <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4" onDoubleClick={() => window.app?.titlebar.doubleClick()}>
-              <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
+              {app.platform.os === 'darwin' && <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />}
               <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
                 <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
               </span>
@@ -1644,7 +1644,7 @@ function AppShell() {
             {/* Interactive title bar */}
             <div
               onDoubleClick={() => window.app?.titlebar.doubleClick()}
-              className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 right-2 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6`}
+              className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
             >
               <div className="flex w-full items-center justify-between">
               {isMobile && (

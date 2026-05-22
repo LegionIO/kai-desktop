@@ -260,6 +260,7 @@ const appAPI = {
   },
 
   platform: {
+    os: process.platform as 'darwin' | 'win32' | 'linux',
     homedir: () => ipcRenderer.invoke('platform:homedir'),
   },
 

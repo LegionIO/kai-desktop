@@ -203,6 +203,7 @@ type AppAPI = {
     onChanged: (callback: (agents: AgentFile[]) => void) => () => void;
   };
   platform: {
+    os: 'darwin' | 'win32' | 'linux';
     homedir: () => Promise<string>;
   };
   computerUse: {

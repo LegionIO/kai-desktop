@@ -445,7 +445,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
             <label className="text-[10px] text-muted-foreground block mb-0.5">Default Target</label>
             <select className={settingsSelectClass} value={computerUse.defaultTarget} onChange={(e) => updateConfig('computerUse.defaultTarget', e.target.value)}>
               <option value="isolated-browser">Isolated Browser</option>
-              <option value="local-macos">Local Mac</option>
+              {app.platform.os === 'darwin' && <option value="local-macos">Local Mac</option>}
             </select>
           </div>
           <div>
@@ -500,6 +500,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         </div>
       </fieldset>
 
+      {app.platform.os === 'darwin' && (
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Local Mac</legend>
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
@@ -512,6 +513,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         <DisplayListPicker label="Allowed Displays" value={computerUse.localMacos.allowedDisplays ?? []} onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)} onDisplaysDiscovered={handleDisplaysDiscovered} hint="Select which displays autopilot can capture. All displays are enabled by default." />
         <AppListPicker label="Capture Excluded Apps" value={computerUse.localMacos.captureExcludedApps ?? []} onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)} hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID." />
       </fieldset>
+      )}
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Overlay</legend>

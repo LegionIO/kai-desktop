@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useRef, useState, type FC } from 'react';
+import { useCallback, useEffect, useRef, useState, useMemo, type FC } from 'react';
 import { CheckIcon, ChevronUpIcon, FootprintsIcon, GlobeIcon, LaptopIcon, MonitorIcon, ShieldCheckIcon, TargetIcon, ZapIcon } from 'lucide-react';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
+import { app } from '@/lib/ipc-client';
 import type { ComputerUseTarget } from '../../../shared/computer-use';
 
 type ApprovalMode = 'step' | 'goal' | 'autonomous';
 
-const TARGET_OPTIONS: Array<{ value: ComputerUseTarget; label: string; description: string; icon: typeof GlobeIcon }> = [
+const ALL_TARGET_OPTIONS: Array<{ value: ComputerUseTarget; label: string; description: string; icon: typeof GlobeIcon }> = [
   { value: 'isolated-browser', label: 'Browser', description: 'Sandboxed browser session', icon: GlobeIcon },
   { value: 'local-macos', label: 'Local Mac', description: 'Full desktop access', icon: LaptopIcon },
 ];
@@ -28,6 +29,12 @@ export const ComputerSettingsButton: FC<{
 }> = ({ target, onChangeTarget, approvalMode, onChangeApprovalMode, toggled, onToggle }) => {
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  // Filter targets by platform — local-macos is only available on macOS
+  const TARGET_OPTIONS = useMemo(
+    () => ALL_TARGET_OPTIONS.filter((opt) => opt.value !== 'local-macos' || app.platform.os === 'darwin'),
+    [],
+  );
 
   // Close on outside click
   useEffect(() => {

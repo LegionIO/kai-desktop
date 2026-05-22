@@ -14,7 +14,43 @@ let cachedResolvedAt = 0;
 let inFlightResolution: Promise<string> | null = null;
 
 function defaultPathEntries(): string[] {
-  if (process.platform === 'win32') return [];
+  if (process.platform === 'win32') {
+    // Common Windows tool install locations
+    const winEntries: string[] = [];
+    const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+    const localAppData = process.env.LOCALAPPDATA ?? '';
+    const appData = process.env.APPDATA ?? '';
+
+    winEntries.push(
+      // Git for Windows
+      `${programFiles}\\Git\\cmd`,
+      `${programFiles}\\Git\\bin`,
+      `${programFiles}\\Git\\usr\\bin`,
+      `${programFilesX86}\\Git\\cmd`,
+      // Node.js (official installer)
+      `${programFiles}\\nodejs`,
+      `${programFilesX86}\\nodejs`,
+      // Python (official installer, common locations)
+      `${localAppData}\\Programs\\Python\\Python311`,
+      `${localAppData}\\Programs\\Python\\Python312`,
+      `${localAppData}\\Programs\\Python\\Python313`,
+      `${programFiles}\\Python311`,
+      `${programFiles}\\Python312`,
+      `${programFiles}\\Python313`,
+      // VS Code CLI
+      `${programFiles}\\Microsoft VS Code\\bin`,
+      `${programFilesX86}\\Microsoft VS Code\\bin`,
+      // pnpm global bin
+      `${localAppData}\\pnpm`,
+      // npm global
+      `${appData}\\npm`,
+      // Scoop shims
+      `${localAppData}\\scoop\\shims`,
+    );
+
+    return winEntries.filter(Boolean);
+  }
 
   const entries = [
     '/usr/bin',
