@@ -10,6 +10,20 @@ import { readEffectiveConfig } from './config.js';
 import { readConversationStore } from './conversations.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { shouldCompact, compactConversationPrefix, compactToolResult, estimateToolTokens } from '../agent/compaction.js';
+import { appendFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+
+// ---------------------------------------------------------------------------
+// Debug logging for stream pipeline diagnostics
+// ---------------------------------------------------------------------------
+const IPC_DEBUG_DIR = join(process.cwd(), 'debug-logs');
+const IPC_DEBUG_LOG = join(IPC_DEBUG_DIR, 'stream-pipeline.log');
+function ipcDebugLog(msg: string): void {
+  try {
+    mkdirSync(IPC_DEBUG_DIR, { recursive: true });
+    appendFileSync(IPC_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* ignore */ }
+}
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
@@ -46,6 +60,21 @@ import { pendingQuestionAnswers } from '../tools/ask-user.js';
 const activeStreamModelKeys = new Map<string, string>();
 
 function broadcastStreamEvent(event: StreamEvent): void {
+  // Debug: log every event broadcast
+  const eventSummary = event.type === 'text-delta'
+    ? `text-delta len=${(event.text ?? '').length}`
+    : event.type === 'tool-call'
+      ? `tool-call id=${event.toolCallId} name=${event.toolName}`
+      : event.type === 'tool-result'
+        ? `tool-result id=${event.toolCallId} name=${event.toolName}`
+        : event.type === 'done'
+          ? `done data=${JSON.stringify((event as Record<string, unknown>).data ?? null)}`
+          : event.type === 'error'
+            ? `error msg=${(event.error ?? '').slice(0, 200)}`
+            : event.type;
+  const windowCount = BrowserWindow.getAllWindows().length;
+  ipcDebugLog(`[BROADCAST] conv=${event.conversationId} ${eventSummary} windows=${windowCount}`);
+
   // Intercept context-usage events to record LLM token usage
   if (event.type === 'context-usage' && event.conversationId) {
     const data = event.data as {
@@ -346,6 +375,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       ? { ...config, agent: { ...config.agent, runtime: threadOverrides.runtimeOverride } } as AppConfig
       : config;
     const { runtime, resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
+    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} modelAuth=${resolution.modelAuth ? `model=${resolution.modelAuth.modelName} baseUrl=${resolution.modelAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
 
     // If the user has an explicitly-set runtime that is incompatible with the
     // selected model, surface the warning in the chat and bail early.
@@ -1167,6 +1197,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // After a plan-related done event has been sent and the stream aborted,
           // ignore any trailing events (especially the generator's final plain done).
           if (planDoneSent) {
+            ipcDebugLog(`[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=planDoneSent`);
             continue;
           }
           if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
@@ -1259,11 +1290,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             };
           }
           if (activeObserverSessions.get(conversationId) !== observerSessionId) {
+            ipcDebugLog(`[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=observerSessionMismatch current=${activeObserverSessions.get(conversationId)} expected=${observerSessionId}`);
             continue;
           }
+          ipcDebugLog(`[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`);
           broadcastStreamEvent(event);
         }
       } catch (error) {
+        ipcDebugLog(`[LOOP-ERROR] conv=${conversationId} aborted=${controller.signal.aborted} error=${error instanceof Error ? error.message : String(error)}`);
         if (!controller.signal.aborted) {
           broadcastStreamEvent({
             conversationId,
@@ -1273,6 +1307,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           broadcastStreamEvent({ conversationId, type: 'done' });
         }
       } finally {
+        ipcDebugLog(`[LOOP-FINALLY] conv=${conversationId} cleaning up`);
         observerLaunchesEnabled = false;
         await waitForObserverToolExecutions();
         observer?.dispose();
