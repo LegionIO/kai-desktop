@@ -1370,6 +1370,17 @@ export function RuntimeProvider({
     void loadConversationState(conversationId);
   }, [conversationId, activeConversationId, loadConversationState]);
 
+  useEffect(() => {
+    if (!activeConversationId || isRunning || streamAccumulators.has(activeConversationId)) return;
+
+    void (async () => {
+      const conv = await app.conversations.get(activeConversationId) as ConversationRecord | null;
+      if (conv?.runStatus === 'running') {
+        await patchConversation(activeConversationId, { runStatus: 'idle' });
+      }
+    })();
+  }, [activeConversationId, isRunning, tree, headId]);
+
   const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
     const timers = persistTimersRef.current;
     const existing = timers.get(conversationId);

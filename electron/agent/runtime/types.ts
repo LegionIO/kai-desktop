@@ -125,11 +125,10 @@ export type StreamOptions = {
   primaryModel?: ModelCatalogEntry | null;
 
   /**
-   * Pre-resolved Anthropic-compatible credentials for the Claude Code runtime.
-   * When present, the Claude runtime passes these via the SDK `settings` option,
-   * overriding ~/.claude/settings.json.
+   * Pre-resolved credentials for the selected model, used by runtimes that
+   * need explicit endpoint + API key + model name (Claude Code, Codex).
    */
-  claudeAuth?: {
+  modelAuth?: {
     modelName: string;
     baseUrl: string;
     apiKey: string;

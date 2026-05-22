@@ -374,12 +374,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const runtimeConfig = threadOverrides?.runtimeOverride
       ? { ...config, agent: { ...config.agent, runtime: threadOverrides.runtimeOverride } } as AppConfig
       : config;
+    ipcDebugLog(`[RUNTIME:resolve] conv=${conversationId} globalRuntime=${config.agent?.runtime ?? 'auto'} threadOverride=${threadOverrides?.runtimeOverride ?? 'none'} effectiveRuntime=${runtimeConfig.agent?.runtime ?? 'auto'} modelKey=${modelEntry?.key ?? modelKey ?? 'default'} modelProvider=${modelEntry?.modelConfig?.provider ?? 'unknown'} rawCatalogProvider=${config.models.catalog.find((m) => m.key === (modelEntry?.key ?? modelKey ?? config.models.defaultModelKey))?.provider ?? 'not-found'}`);
     const { runtime, resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
-    ipcDebugLog(`[RUNTIME] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} claudeAuth=${resolution.claudeAuth ? `model=${resolution.claudeAuth.modelName} baseUrl=${resolution.claudeAuth.baseUrl}` : 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
+    ipcDebugLog(`[RUNTIME:resolved] conv=${conversationId} runtime=${runtime.id} name=${runtime.name} runtimeId=${resolution.runtimeId} modelAuth=${resolution.modelAuth ? `model=${resolution.modelAuth.modelName} baseUrl=${resolution.modelAuth.baseUrl}` : 'none'} warning=${resolution.warning ?? 'none'} capabilities=${JSON.stringify(runtime.capabilities)}`);
 
     // If the user has an explicitly-set runtime that is incompatible with the
     // selected model, surface the warning in the chat and bail early.
     if (resolution.warning) {
+      ipcDebugLog(`[RUNTIME:warning-bail] conv=${conversationId} warning=${resolution.warning}`);
       broadcastStreamEvent({ conversationId, type: 'text-delta', text: `⚠️ ${resolution.warning}` });
       broadcastStreamEvent({ conversationId, type: 'done' });
       activeStreams.delete(conversationId);
@@ -417,10 +419,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
       const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
       const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
+      ipcDebugLog(`[PROVIDER:lookup] conv=${conversationId} effectiveModelKey=${effectiveModelKey} modelProviderKey=${modelProviderKey ?? 'none'} runtimeId=${resolution.runtimeId}`);
       const inferenceProvider = pluginManager?.getInferenceProvider({
         runtimeId: resolution.runtimeId,
         modelProviderKey,
       }) ?? null;
+      ipcDebugLog(`[PROVIDER:result] conv=${conversationId} inferenceProvider=${inferenceProvider ? inferenceProvider.name : 'null'} path=${inferenceProvider ? 'plugin-inference' : 'standard-pipeline'}`);
       if (inferenceProvider) {
         console.info(`[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`);
         let emittedTextDelta = false;
@@ -1184,7 +1188,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           abortSignal: controller.signal,
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
-          claudeAuth: resolution.claudeAuth,
+          modelAuth: resolution.modelAuth,
           conversationMetadata: convMetadata,
           switchContext,
           emitEvent: streamOptions.emitEvent,

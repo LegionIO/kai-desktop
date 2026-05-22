@@ -137,6 +137,7 @@ export class CodexRuntime implements AgentRuntime {
       cwd,
       reasoningEffort,
       abortSignal,
+      modelAuth,
     } = options;
 
     // -----------------------------------------------------------------------
@@ -180,8 +181,10 @@ export class CodexRuntime implements AgentRuntime {
     };
     const modelEffort = effortMap[reasoningEffort ?? 'high'] ?? 'high';
 
-    // Extract API key from the model config (look for OpenAI-compatible provider)
-    const apiKey = extractOpenAiApiKey(config);
+    // Extract API key + base URL from modelAuth (pre-resolved by the IPC layer)
+    // or fall back to scanning the provider config for an openai-compatible entry.
+    const apiKey = modelAuth?.apiKey ?? extractOpenAiApiKey(config);
+    const baseUrl = modelAuth?.baseUrl ?? undefined;
 
     // -----------------------------------------------------------------------
     // 3. Extract prompt from messages
@@ -223,6 +226,7 @@ export class CodexRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     const codex = new CodexCtor({
       ...(apiKey ? { apiKey } : {}),
+      ...(baseUrl ? { baseUrl } : {}),
       ...(bridgeUrl ? {
         config: {
           features: {
@@ -236,6 +240,7 @@ export class CodexRuntime implements AgentRuntime {
     });
 
     const threadOptions = {
+      ...(modelAuth?.modelName ? { model: modelAuth.modelName } : {}),
       workingDirectory: cwd ?? process.cwd(),
       modelReasoningEffort: modelEffort,
       approvalPolicy,
