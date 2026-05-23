@@ -110,8 +110,11 @@ export class MarketplaceService {
   /* ── GitHub token resolution ── */
 
   private async resolveGitHubToken(repo: string): Promise<string | null> {
-    // For private repos, try to get a token from gh CLI auth
-    // This is pragmatic since enterprise users authenticate with gh
+    // Prefer explicit env vars (works in CI, containers, and GUI-launched apps)
+    const envToken = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    if (envToken) return envToken;
+
+    // Fall back to gh CLI auth
     try {
       const repoHost = 'github.com';
       const token = await new Promise<string>((resolve, reject) => {
@@ -125,12 +128,11 @@ export class MarketplaceService {
       // gh CLI not available or not authenticated — fall through
     }
 
-    // Check if the repo remote URL in the config has an embedded token
-    // (some private repos embed ghp_ tokens directly in remote URLs)
+    // Check if the repo is public (no token needed)
     try {
       const checkUrl = `https://api.github.com/repos/${repo}`;
       const publicCheck = await net.fetch(checkUrl, { method: 'HEAD' });
-      if (publicCheck.ok) return null; // Public repo, no token needed
+      if (publicCheck.ok) return null;
     } catch {
       // Can't reach API — try without token anyway
     }
@@ -154,22 +156,38 @@ export class MarketplaceService {
       const isGitHub = entry.marketplaceUrl.includes('github.com') || entry.marketplaceUrl.includes('raw.githubusercontent.com');
 
       let tarballUrl: string;
+      let headers: Record<string, string> = {};
+
       if (isGitHub) {
-        // GitHub-hosted: use releases URL pattern
-        tarballUrl = `https://github.com/${entry.repository}/releases/download/${tag}/${assetName}`;
+        const token = await this.resolveGitHubToken(entry.repository);
+
+        // Use the GitHub Releases API to resolve the binary download URL.
+        // The browser-style download URL (github.com/.../releases/download/...)
+        // returns HTML instead of binary content for private repositories, even
+        // when a valid Bearer token is provided.
+        const apiUrl = `https://api.github.com/repos/${entry.repository}/releases/tags/${tag}`;
+        const apiHeaders: Record<string, string> = { Accept: 'application/vnd.github+json' };
+        if (token) apiHeaders['Authorization'] = `Bearer ${token}`;
+
+        const releaseResp = await net.fetch(apiUrl, { headers: apiHeaders });
+        if (!releaseResp.ok) {
+          throw new Error(`Failed to find release "${tag}" for plugin "${entry.name}": HTTP ${releaseResp.status}`);
+        }
+
+        const releaseData = await releaseResp.json() as { assets: Array<{ name: string; url: string }> };
+        const asset = releaseData.assets.find((a) => a.name === assetName);
+        if (!asset) {
+          throw new Error(`Release "${tag}" for plugin "${entry.name}" has no asset named "${assetName}"`);
+        }
+
+        // Download via the asset API URL with octet-stream accept header
+        tarballUrl = asset.url;
+        headers = { Accept: 'application/octet-stream' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
       } else {
         // Self-hosted (S3, etc): tarballs are siblings of marketplace.json
         const baseUrl = entry.marketplaceUrl.replace(/\/[^/]*$/, '');
         tarballUrl = `${baseUrl}/${entry.name}/${tag}/${assetName}`;
-      }
-
-      const headers: Record<string, string> = {};
-      if (isGitHub) {
-        headers['Accept'] = 'application/vnd.github+json';
-        const token = await this.resolveGitHubToken(entry.repository);
-        if (token) {
-          headers['Authorization'] = `Bearer ${token}`;
-        }
       }
 
       const response = await net.fetch(tarballUrl, { headers });

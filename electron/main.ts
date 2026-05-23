@@ -1100,13 +1100,10 @@ if (gotSingleInstanceLock) {
 
     const mainWindow = createWindow();
 
-    // Show the window immediately but fully transparent while plugin approval
-    // dialogs are pending. This keeps the window "shown" (so native dialogs
-    // have a valid app context on macOS) without flashing a partially-rendered UI.
-    mainWindow.once('ready-to-show', async () => {
-      mainWindow.setOpacity(0);
-      mainWindow.show();
-
+    // Initialize marketplace and plugins immediately. We avoid putting this
+    // inside `ready-to-show` because createWindow() calls loadURL(), which may
+    // fire the event before any handler registered here can observe it.
+    (async () => {
       try {
         // Initialize marketplace and auto-install required plugins before loading
         const marketplaceUrls = getBrandMarketplaceUrls();
@@ -1139,8 +1136,10 @@ if (gotSingleInstanceLock) {
       } catch (err) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Plugin loading failed:`, err);
       }
+    })();
 
-      mainWindow.setOpacity(1);
+    mainWindow.once('ready-to-show', () => {
+      mainWindow.show();
 
       // Signal OTA rollback system that the app is running stably
       signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
