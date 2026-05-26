@@ -72,6 +72,10 @@ See [`eslint.config.js`](eslint.config.js) for the full configuration.
 
 Write clear, descriptive commit messages. No strict format is enforced -- look at recent `git log` output for style reference.
 
+### Naming Convention
+
+The codebase uses **Chat** for user-facing labels, **Conversation** for IPC channels / on-disk storage / renderer state IDs, and **Thread** for `@assistant-ui/react` `ThreadPrimitive` consumers, plugin extensions, and Mastra agent internals. See [`docs/adr/0002-thread-conversation-chat-naming-convention.md`](docs/adr/0002-thread-conversation-chat-naming-convention.md) for the full layer table and forcing functions before proposing renames.
+
 ## Architecture Awareness
 
 Kai follows the standard Electron three-process model with strict isolation:
@@ -85,6 +89,8 @@ Kai follows the standard Electron three-process model with strict isolation:
 ### The IPC Boundary
 
 Renderer code **never** accesses Node APIs directly. All communication goes through the `window.app` bridge defined in [`electron/preload.ts`](electron/preload.ts). If a new feature needs Node access from the renderer, add an IPC handler in `electron/ipc/` and expose it through the preload bridge.
+
+IPC payloads cross the naming layer (renderer Chat-vocab UI ⇄ `conversations:`-prefixed channel wire format ⇄ Mastra `scope: 'thread'` runtime). When adding or renaming a channel, see [`docs/adr/0002-thread-conversation-chat-naming-convention.md`](docs/adr/0002-thread-conversation-chat-naming-convention.md) so the channel name + parameter names match the layer they route to.
 
 ### Key Files
 

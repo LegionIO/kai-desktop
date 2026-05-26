@@ -39,11 +39,11 @@ KAI_UPDATE_TEST_VERSION=0.0.1 KAI_UPDATE_REPO=owner/repo pnpm dev
 KAI_UPDATE_TEST_VERSION=0.0.1 KAI_UPDATE_URL=https://example.com/releases/latest pnpm dev
 ```
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `KAI_UPDATE_TEST_VERSION` | *(unset — updater disabled in dev)* | Fake current version (e.g. `0.0.1`) |
-| `KAI_UPDATE_REPO` | `legionio/kai-desktop` | GitHub `owner/repo` for release lookup |
-| `KAI_UPDATE_URL` | *(unset)* | Generic server URL (takes priority over `KAI_UPDATE_REPO`). Server must host `latest-mac.yml` + zip at this URL. |
+| Variable                  | Default                             | Purpose                                                                                                          |
+| ------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `KAI_UPDATE_TEST_VERSION` | _(unset — updater disabled in dev)_ | Fake current version (e.g. `0.0.1`)                                                                              |
+| `KAI_UPDATE_REPO`         | `legionio/kai-desktop`              | GitHub `owner/repo` for release lookup                                                                           |
+| `KAI_UPDATE_URL`          | _(unset)_                           | Generic server URL (takes priority over `KAI_UPDATE_REPO`). Server must host `latest-mac.yml` + zip at this URL. |
 
 Note: the actual install/relaunch step will fail in dev mode (Squirrel expects a signed app bundle) but the full check → download → UI notification flow can be verified.
 
@@ -59,24 +59,24 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 ### Main Process (`electron/`)
 
-| Directory | Purpose |
-|-----------|---------|
-| `electron/agent/` | Mastra agent orchestration, model catalog, memory, sub-agents, tokenization |
-| `electron/ipc/` | IPC handler registration (agent, config, conversations, mcp, memory, skills, plugins, usage, media, realtime, computer use) |
-| `electron/tools/` | Tool implementations + registry builder |
-| `electron/config/schema.ts` | Zod config schema (`AppConfig`) - central to everything |
-| `electron/main.ts` | App bootstrap, window creation, menu, hot-reload for MCP + skills |
+| Directory                   | Purpose                                                                                                                     |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `electron/agent/`           | Mastra agent orchestration, model catalog, memory, sub-agents, tokenization                                                 |
+| `electron/ipc/`             | IPC handler registration (agent, config, conversations, mcp, memory, skills, plugins, usage, media, realtime, computer use) |
+| `electron/tools/`           | Tool implementations + registry builder                                                                                     |
+| `electron/config/schema.ts` | Zod config schema (`AppConfig`) - central to everything                                                                     |
+| `electron/main.ts`          | App bootstrap, window creation, menu, hot-reload for MCP + skills                                                           |
 
 ### Renderer (`src/`)
 
-| Directory | Purpose |
-|-----------|---------|
-| `src/components/thread/` | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
-| `src/components/settings/` | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage) |
-| `src/components/conversations/` | Sidebar conversation list and sub-agent section |
-| `src/components/plugins/` | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections |
-| `src/providers/` | React context providers (Config, Runtime, Attachments) |
-| `src/lib/` | IPC client wrapper, utilities |
+| Directory                       | Purpose                                                                                                        |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `src/components/thread/`        | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
+| `src/components/settings/`      | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage)                              |
+| `src/components/conversations/` | Sidebar conversation list and sub-agent section                                                                |
+| `src/components/plugins/`       | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections                        |
+| `src/providers/`                | React context providers (Config, Runtime, Attachments)                                                         |
+| `src/lib/`                      | IPC client wrapper, utilities                                                                                  |
 
 ## Key Files
 
@@ -93,29 +93,51 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 All app state lives under `~/.kai/`:
 
-| Path | Contents |
-|------|----------|
-| `~/.kai/config.json` | Primary config (models, tools, MCP, memory, compaction, etc.) |
-| `~/.kai/data/` | Conversation persistence |
-| `~/.kai/skills/` | Installed skill directories |
-| `~/.kai/certs/` | TLS certificates for integrations |
-| `~/.kai/settings/llm.json` | Imported provider/model settings |
+| Path                       | Contents                                                      |
+| -------------------------- | ------------------------------------------------------------- |
+| `~/.kai/config.json`       | Primary config (models, tools, MCP, memory, compaction, etc.) |
+| `~/.kai/data/`             | Conversation persistence                                      |
+| `~/.kai/skills/`           | Installed skill directories                                   |
+| `~/.kai/certs/`            | TLS certificates for integrations                             |
+| `~/.kai/settings/llm.json` | Imported provider/model settings                              |
 
 Config changes trigger hot-reload for MCP servers and skills (fingerprint diffing in `main.ts`).
 
 ## Code Style
 
 ESLint enforces (see `eslint.config.js`):
+
 - `consistent-type-imports` (error) - use `import type` for type-only imports
 - `no-explicit-any` (warn)
 - `no-unused-vars` (warn, `_` prefix ignored)
 - `no-console` (warn, `console.warn/error/info` allowed)
 
 Additional conventions:
+
 - Tailwind CSS 4 (PostCSS plugin, not the old `tailwind.config.js` approach)
 - Radix UI primitives for all interactive components
 - `@/` path alias maps to `src/`
 - Lucide React for icons
+
+## Naming Convention
+
+The codebase uses three terms — **Chat**, **Conversation**, **Thread** — and
+each is load-bearing in a different layer. Full rationale and forcing
+functions in [`docs/adr/0002-thread-conversation-chat-naming-convention.md`](docs/adr/0002-thread-conversation-chat-naming-convention.md).
+
+| Layer                                        | Term             | Why                                              |
+| -------------------------------------------- | ---------------- | ------------------------------------------------ |
+| User-facing UI (labels, modals, page titles) | **Chat**         | Industry vocabulary                              |
+| Renderer state (active IDs, refs)            | **Conversation** | References storage entities                      |
+| Sub-agent state + types                      | **Thread**       | Nested assistant-ui threads                      |
+| Plugin extension API                         | **Thread**       | `@assistant-ui/react` `ThreadPrimitive` contract |
+| Mastra / agent internals                     | **Thread**       | Mastra runtime `scope === "thread"` check        |
+| IPC channels, parameters, on-disk storage    | **Conversation** | Wire-protocol + `conversations.json` stability   |
+
+Directory names match their **integration boundary** (e.g.
+`src/components/thread/` is named for `ThreadPrimitive`), not the UI
+vocabulary at the leaves — so `thread/ChatSettingsButton.tsx` and
+`thread/SubAgentThread.tsx` coexist correctly in the same directory.
 
 ## IPC Boundary
 
@@ -140,6 +162,7 @@ Renderer code **never** accesses Node APIs directly. All communication goes thro
 ## Model Providers
 
 Supported via Mastra + AI SDK:
+
 - OpenAI-compatible (custom endpoints)
 - Anthropic
 - Amazon Bedrock (AWS credential chain)
@@ -162,21 +185,24 @@ Config schema: `models.providers` (keyed by name) + `models.catalog` (array of m
 
 When debugging issues that span process boundaries (renderer <-> main) or involve async race conditions, use the project-local debug log directory instead of `console.warn`:
 
-| Item | Value |
-|------|-------|
-| **Directory** | `debug-logs/` (project root, gitignored) |
-| **Convention** | One file per topic, e.g. `debug-logs/persist.log`, `debug-logs/stream.log` |
-| **Format** | `[ISO-timestamp] [TAG] key=value key=value ...` — structured, grep-friendly |
+| Item           | Value                                                                       |
+| -------------- | --------------------------------------------------------------------------- |
+| **Directory**  | `debug-logs/` (project root, gitignored)                                    |
+| **Convention** | One file per topic, e.g. `debug-logs/persist.log`, `debug-logs/stream.log`  |
+| **Format**     | `[ISO-timestamp] [TAG] key=value key=value ...` — structured, grep-friendly |
 
 ### How to use
 
 **Main process** (Node / Electron main) — write directly with `fs.appendFileSync`:
+
 ```typescript
 import { appendFileSync } from 'fs';
 import { join } from 'path';
 const DEBUG_LOG = join(__dirname, '../../debug-logs/persist.log');
 function debugLog(msg: string) {
-  try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+  try {
+    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
 }
 ```
 
