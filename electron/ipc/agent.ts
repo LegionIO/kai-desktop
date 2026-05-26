@@ -444,7 +444,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (controller.signal.aborted && event.type !== 'done') continue;
             if (event.type === 'text-delta') {
               emittedTextDelta = true;
-              providerResponseText += (event as Record<string, unknown>).text ?? '';
+              providerResponseText += event.text ?? '';
             }
 
             // Stamp runtimeId on every event so the UI popover shows the
@@ -464,13 +464,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             broadcastStreamEvent(eventWithMeta as typeof event);
           }
 
-          // Run post-receive hooks for plugin inference provider path
-          if (pluginManager && providerResponseText.length > 0) {
-            pluginManager.runPostReceiveHooks({
-              response: { role: 'assistant', content: providerResponseText },
-              messages: messages as HookMessage[],
-              config,
-            }).catch((err) => console.error('[Agent:stream] Post-receive hook error (provider path):', err));
+          // Run post-receive hooks for plugin inference provider path.
+          // Awaited + abort-guarded to mirror the Mastra path below (the
+          // `runtime.stream(...)` loop's `event.type === 'done'` branch).
+          // Without the abort guard, a mid-stream cancel that still flushes
+          // a final `'done'` event would fire hooks on truncated content;
+          // without the await, plugin learning pipelines (e.g.
+          // kai-plugin-aithena) can race the next user turn.
+          if (
+            pluginManager
+            && providerResponseText.length > 0
+            && !controller.signal.aborted
+          ) {
+            try {
+              await pluginManager.runPostReceiveHooks({
+                response: { role: 'assistant', content: providerResponseText },
+                messages: messages as HookMessage[],
+                config,
+              });
+            } catch (err) {
+              console.error('[Agent:stream] Post-receive hook error (provider path):', err);
+            }
           }
 
           // Provider handled the request — clean up and exit
@@ -1280,7 +1294,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           }
           if (event.type === 'text-delta') {
-            accumulatedResponseText += (event as Record<string, unknown>).text ?? '';
+            accumulatedResponseText += event.text ?? '';
             (event as Record<string, unknown>).messageMeta = {
               ...((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined ?? {}),
               ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
