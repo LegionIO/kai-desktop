@@ -521,7 +521,7 @@ export const appConfigSchema = z.object({
     activeWorkspaceId: z.string().nullable().default(null),
     composer: z.object({
       showModelProfileSelector: z.boolean(),
-    }).default({ showModelProfileSelector: false }),
+    }).default({ showModelProfileSelector: true }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

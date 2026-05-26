@@ -161,7 +161,7 @@ function getDefaultConfig() {
         lastActiveConversationId: string | null;
       }>,
       activeWorkspaceId: null as string | null,
-      composer: { showModelProfileSelector: false },
+      composer: { showModelProfileSelector: true },
     },
     webServer: {
       enabled: false,
