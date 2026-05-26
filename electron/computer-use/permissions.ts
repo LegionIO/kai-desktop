@@ -1,6 +1,14 @@
 import { app, shell, systemPreferences } from 'electron';
 import { execFile } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -14,6 +22,7 @@ import type {
 } from '../../shared/computer-use.js';
 import { LOCAL_MACOS_HELPER_SOURCE } from './helpers/local-macos-helper-source.js';
 import { getResolvedProcessEnv } from '../utils/shell-env.js';
+import type { HelperRunner, HelperRunnerResult } from './helper-runner.js';
 
 const execFileAsync = promisify(execFile);
 const LOCAL_MACOS_PRIVACY_URLS: Record<ComputerUsePermissionSection, string> = {
@@ -174,40 +183,77 @@ export type LocalMacosHelperResponse = {
   displayCount?: number;
 };
 
-async function runLocalMacHelper(args: string[]): Promise<LocalMacosHelperResponse> {
+/**
+ * Production helper runner — spawns the Swift `LocalMacosHelper` binary (or
+ * falls back to `xcrun swift` in dev). Returns a structured `HelperRunnerResult`
+ * whose `data` field is the parsed JSON payload.
+ *
+ * Platform guard lives inside the real implementation, not the calling code,
+ * so test fixtures can inject a fake runner that returns canned results
+ * without re-encoding the `process.platform !== 'darwin'` check. The
+ * `HelperRunner` contract is platform-agnostic; only the real `xcrun swift`
+ * spawn requires darwin.
+ */
+export const realSwiftHelperRunner: HelperRunner = async (subcommand, args = []) => {
   if (process.platform !== 'darwin') {
     return { ok: false, error: 'Local macOS helper is only available on macOS' };
   }
   try {
+    const fullArgs = [subcommand, ...args];
     // Prefer the pre-compiled binary (always available in production builds,
-    // available in dev after running `pnpm compile:swift`)
+    // available in dev after running `pnpm compile:swift`).
     const binaryPath = resolveCompiledHelperBinary();
     if (binaryPath) {
-      const { stdout } = await execFileAsync(binaryPath, args, { timeout: 15000 });
-      return JSON.parse(stdout || '{}') as LocalMacosHelperResponse;
+      const { stdout } = await execFileAsync(binaryPath, fullArgs, { timeout: 15000 });
+      return { ok: true, data: JSON.parse(stdout || '{}') as LocalMacosHelperResponse };
     }
 
     // Fallback: interpret via xcrun swift (dev mode without pre-compiled binary).
     // Use the safe env to ensure xcrun/swift are on PATH even in packaged apps.
     const helperScriptPath = resolveMaterializedHelperPath();
-    const { stdout } = await execFileAsync('xcrun', ['swift', helperScriptPath, ...args], {
+    const { stdout } = await execFileAsync('xcrun', ['swift', helperScriptPath, ...fullArgs], {
       timeout: 15000,
       env: buildSwiftFallbackEnv(),
     });
-    return JSON.parse(stdout || '{}') as LocalMacosHelperResponse;
+    return { ok: true, data: JSON.parse(stdout || '{}') as LocalMacosHelperResponse };
   } catch (error) {
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     };
   }
+};
+
+/**
+ * The module-level default helperRunner. The named exports below all delegate
+ * through this. Tests should construct their own `PermissionsService` via
+ * `createPermissionsService()` rather than mutating this binding.
+ */
+const activeHelperRunner: HelperRunner = realSwiftHelperRunner;
+
+function unwrapHelperResponse(result: HelperRunnerResult): LocalMacosHelperResponse {
+  if (!result.ok) {
+    return { ok: false, error: result.error };
+  }
+  const data = (result.data ?? {}) as LocalMacosHelperResponse;
+  // The helper itself can report `ok: false` in its JSON payload even when
+  // the runner reported success (process exited 0). Preserve any explicit
+  // `ok` from the payload; otherwise default to true.
+  return { ...data, ok: data.ok ?? true };
+}
+
+async function runLocalMacHelper(args: string[]): Promise<LocalMacosHelperResponse> {
+  const [subcommand, ...rest] = args;
+  if (!subcommand) {
+    return { ok: false, error: 'Missing helper subcommand' };
+  }
+  const result = await activeHelperRunner(subcommand, rest);
+  return unwrapHelperResponse(result);
 }
 
 function getAccessibilityStatus(): boolean {
   try {
-    return process.platform === 'darwin'
-      ? systemPreferences.isTrustedAccessibilityClient(false)
-      : false;
+    return process.platform === 'darwin' ? systemPreferences.isTrustedAccessibilityClient(false) : false;
   } catch {
     return false;
   }
@@ -215,9 +261,7 @@ function getAccessibilityStatus(): boolean {
 
 function getScreenRecordingStatus(helperResult?: LocalMacosHelperResponse): boolean {
   try {
-    const status = process.platform === 'darwin'
-      ? systemPreferences.getMediaAccessStatus('screen')
-      : 'not-determined';
+    const status = process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : 'not-determined';
     return status === 'granted';
   } catch {
     return helperResult?.screenRecordingGranted ?? false;
@@ -281,7 +325,12 @@ function buildPermissionGuidance(
   if (openedSettings.length > 0) {
     fragments.push('System Settings was opened so you can finish the approval flow.');
   }
-  if (!permissions.accessibilityTrusted || !permissions.screenRecordingGranted || !permissions.automationGranted || !permissions.inputMonitoringGranted) {
+  if (
+    !permissions.accessibilityTrusted ||
+    !permissions.screenRecordingGranted ||
+    !permissions.automationGranted ||
+    !permissions.inputMonitoringGranted
+  ) {
     fragments.push('After granting access, start or resume the session again.');
   }
   return fragments.length > 0 ? fragments.join(' ') : undefined;
@@ -454,16 +503,18 @@ export async function getLocalMacPointerPosition(): Promise<{ x: number; y: numb
 export async function getLocalMacDesktopSize(): Promise<{ width: number; height: number } | null> {
   const result = await runLocalMacHelper(['permissions']);
   if (!result.ok) return null;
-  const width = typeof result.desktopCoordinateWidth === 'number'
-    ? Math.max(1, Math.round(result.desktopCoordinateWidth))
-    : typeof result.desktopWidth === 'number'
-      ? Math.max(1, Math.round(result.desktopWidth))
-      : null;
-  const height = typeof result.desktopCoordinateHeight === 'number'
-    ? Math.max(1, Math.round(result.desktopCoordinateHeight))
-    : typeof result.desktopHeight === 'number'
-      ? Math.max(1, Math.round(result.desktopHeight))
-      : null;
+  const width =
+    typeof result.desktopCoordinateWidth === 'number'
+      ? Math.max(1, Math.round(result.desktopCoordinateWidth))
+      : typeof result.desktopWidth === 'number'
+        ? Math.max(1, Math.round(result.desktopWidth))
+        : null;
+  const height =
+    typeof result.desktopCoordinateHeight === 'number'
+      ? Math.max(1, Math.round(result.desktopCoordinateHeight))
+      : typeof result.desktopHeight === 'number'
+        ? Math.max(1, Math.round(result.desktopHeight))
+        : null;
   if (!width || !height) return null;
   return { width, height };
 }
@@ -496,11 +547,11 @@ export function parseDisplayInfoArray(
   // Filter by allowed displays (by ID or name) if specified
   if (allowedDisplays && allowedDisplays.length > 0) {
     const allowed = new Set(allowedDisplays.map((s) => s.toLowerCase()));
-    displays = displays.filter(
-      (d) => allowed.has(d.displayId.toLowerCase()) || allowed.has(d.name.toLowerCase()),
-    );
+    displays = displays.filter((d) => allowed.has(d.displayId.toLowerCase()) || allowed.has(d.name.toLowerCase()));
     // Re-index after filtering
-    displays.forEach((d, i) => { d.displayIndex = i; });
+    displays.forEach((d, i) => {
+      d.displayIndex = i;
+    });
   }
 
   return displays;
@@ -521,10 +572,80 @@ export function buildDisplayLayout(
 /**
  * Get the full multi-display layout from the Swift helper.
  */
-export async function getLocalMacDisplayLayout(
-  allowedDisplays?: string[],
-): Promise<ComputerDisplayLayout | undefined> {
+export async function getLocalMacDisplayLayout(allowedDisplays?: string[]): Promise<ComputerDisplayLayout | undefined> {
   const result = await runLocalMacHelper(['displays']);
   if (!result.ok) return undefined;
   return buildDisplayLayout(result.displays, allowedDisplays);
 }
+
+// ---------------------------------------------------------------------------
+// Permissions service — injectable helperRunner for tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Encapsulates the high-level permission queries against the Swift helper.
+ *
+ * Construct via `createPermissionsService({ helperRunner })` in tests to
+ * substitute the real Swift helper with an in-memory stub. Production code
+ * imports `permissionsService` (the default-wired singleton).
+ */
+export interface PermissionsService {
+  /** Invoke any helper subcommand and return the parsed response. */
+  check(subcommand: string, args?: string[]): Promise<LocalMacosHelperResponse>;
+  /** Aggregated current permission state. */
+  getPermissions(options?: {
+    probeInputMonitoring?: boolean;
+    probeTimeoutMs?: number;
+  }): Promise<ComputerUsePermissions>;
+}
+
+export interface CreatePermissionsServiceOptions {
+  helperRunner: HelperRunner;
+}
+
+export function createPermissionsService(opts: CreatePermissionsServiceOptions): PermissionsService {
+  const runner = opts.helperRunner;
+
+  const check = async (subcommand: string, args: string[] = []): Promise<LocalMacosHelperResponse> => {
+    const result = await runner(subcommand, args);
+    return unwrapHelperResponse(result);
+  };
+
+  const probeInput = async (timeoutMs: number): Promise<boolean> => {
+    const response = await check('probeInputMonitoring', [String(timeoutMs)]);
+    return response.ok === true && (response.inputMonitoringGranted ?? false);
+  };
+
+  return {
+    check,
+    async getPermissions(options) {
+      const shouldProbe = options?.probeInputMonitoring ?? true;
+      const probeTimeout = options?.probeTimeoutMs ?? 3000;
+
+      const [helperResult, automationGranted, inputMonitoringProbeResult] = await Promise.all([
+        check('permissions'),
+        probeAutomationPermission(),
+        shouldProbe ? probeInput(probeTimeout) : Promise.resolve(null),
+      ]);
+
+      return {
+        target: 'local-macos',
+        accessibilityTrusted: getAccessibilityStatus(),
+        screenRecordingGranted: getScreenRecordingStatus(helperResult),
+        automationGranted,
+        inputMonitoringGranted: inputMonitoringProbeResult ?? true,
+        helperReady: helperResult.ok === true,
+        message: helperResult.error,
+      };
+    },
+  };
+}
+
+/**
+ * The default-wired permissions service used by production code paths. Tests
+ * should not rely on this — use `createPermissionsService()` with a stubbed
+ * `helperRunner` instead.
+ */
+export const permissionsService: PermissionsService = createPermissionsService({
+  helperRunner: realSwiftHelperRunner,
+});

@@ -63,7 +63,14 @@ const mocks = vi.hoisted(() => {
     applyPartialResponse: null as NativeResponse | null,
     applyFinalResponse: null as NativeResponse | null,
     takeoverMonitorParams: [] as Array<{
-      onEvent: (event: { kind: 'mouse' | 'keyboard' | 'other'; eventType: string; keyCode?: number; x: number; y: number; timestampMs: number }) => void;
+      onEvent: (event: {
+        kind: 'mouse' | 'keyboard' | 'other';
+        eventType: string;
+        keyCode?: number;
+        x: number;
+        y: number;
+        timestampMs: number;
+      }) => void;
       onError?: (error: string) => void;
     }>,
   };
@@ -119,23 +126,32 @@ const mocks = vi.hoisted(() => {
     });
     readonly startTargetTracking = vi.fn(async () => ({ ok: true }));
     readonly stopTargetTracking = vi.fn(async () => ({ ok: true }));
-    readonly refreshTarget = vi.fn(async () => state.refreshResponse ?? {
-      ...state.beginResponse,
-      applied: false,
-    });
-    readonly applyPartial = vi.fn(async (text: string) => state.applyPartialResponse ?? {
-      ...state.beginResponse,
-      applied: true,
-      partialText: text,
-      strategy: state.beginResponse.typingMode === 'kb' ? 'full-patch' : 'full-replacement',
-    });
-    readonly applyFinal = vi.fn(async (text: string) => state.applyFinalResponse ?? {
-      ...state.beginResponse,
-      applied: true,
-      partialText: '',
-      strategy: null,
-      text,
-    });
+    readonly refreshTarget = vi.fn(
+      async () =>
+        state.refreshResponse ?? {
+          ...state.beginResponse,
+          applied: false,
+        },
+    );
+    readonly applyPartial = vi.fn(
+      async (text: string) =>
+        state.applyPartialResponse ?? {
+          ...state.beginResponse,
+          applied: true,
+          partialText: text,
+          strategy: state.beginResponse.typingMode === 'kb' ? 'full-patch' : 'full-replacement',
+        },
+    );
+    readonly applyFinal = vi.fn(
+      async (text: string) =>
+        state.applyFinalResponse ?? {
+          ...state.beginResponse,
+          applied: true,
+          partialText: '',
+          strategy: null,
+          text,
+        },
+    );
     readonly endSession = vi.fn(async () => {});
     // Production cleanup path calls `close()` on the native session after
     // beginSessionUnchecked rejects (e.g. accessibility / secure-field
@@ -423,10 +439,7 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
 
     expect(manager.getDictationState().state).toBe('idle');
     expect(mocks.showDictationOverlay).not.toHaveBeenCalled();
-    expect(mocks.sendToOverlay).toHaveBeenCalledWith(
-      'dictation:error',
-      expect.stringContaining('secure text fields'),
-    );
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:error', expect.stringContaining('secure text fields'));
   });
 
   it('starts a verified AX target through the native session', async () => {
@@ -516,10 +529,12 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
     await vi.waitFor(() => {
       expect(native.refreshTarget).toHaveBeenCalled();
     });
-    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(expect.objectContaining({
-      pid: 7777,
-      appName: 'Notes',
-    }));
+    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pid: 7777,
+        appName: 'Notes',
+      }),
+    );
   });
 
   it('stops safely when the native helper exits mid-session', async () => {
