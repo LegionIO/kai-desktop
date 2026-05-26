@@ -129,6 +129,30 @@ function toolsForExecutionMode(tools: ToolDefinition[], executionMode: Execution
   return tools;
 }
 
+/**
+ * Resolve {placeholder} templates in extraHeaders with runtime values.
+ * Templates use the format `{key}` where key is one of the supported
+ * runtime variables (conversationId, cwd, modelKey, modelName).
+ * Returns the original object if no templates are found (avoids allocation).
+ */
+function resolveHeaderTemplates(
+  headers: Record<string, string>,
+  vars: Record<string, string>,
+): Record<string, string> {
+  let changed = false;
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value.includes('{')) {
+      const resolved = value.replace(/\{(\w+)\}/g, (_, name) => vars[name] ?? '');
+      result[key] = resolved;
+      if (resolved !== value) changed = true;
+    } else {
+      result[key] = value;
+    }
+  }
+  return changed ? result : headers;
+}
+
 function broadcastExecutionMode(mode: ExecutionMode): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:execution-mode-changed', mode);
@@ -415,6 +439,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           };
         }
         console.info(`[Agent:stream] Provider override: routing ${modelEntry.key} through ${resolution.providerOverride} (${overrideProviderConfig.endpoint})`);
+      }
+    }
+
+    // ── Dynamic header template resolution ────────────────────────────────
+    // Provider extraHeaders may contain {placeholder} templates that are
+    // substituted with runtime values per-stream. This enables plugins to
+    // declare headers like {"X-My-Conv-Id": "{conversationId}"} in their
+    // static provider config and have them resolved at request time.
+    if (modelEntry?.modelConfig?.extraHeaders) {
+      const templateVars: Record<string, string> = {
+        conversationId: conversationId ?? '',
+        cwd: effectiveCwd ?? '',
+        modelKey: modelEntry.key ?? '',
+        modelName: modelEntry.modelConfig.modelName ?? '',
+      };
+      const resolved = resolveHeaderTemplates(modelEntry.modelConfig.extraHeaders, templateVars);
+      if (resolved !== modelEntry.modelConfig.extraHeaders) {
+        modelEntry = { ...modelEntry, modelConfig: { ...modelEntry.modelConfig, extraHeaders: resolved } };
+        if (streamConfig) {
+          streamConfig = { ...streamConfig, primaryModel: modelEntry };
+        }
       }
     }
 
