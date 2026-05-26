@@ -69,14 +69,14 @@ src/App.tsx               <- Renderer: React shell, sidebar, conversations, sett
 
 ### Renderer (`src/`)
 
-| Directory                       | Purpose                                                                                                        |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `src/components/thread/`        | Chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
-| `src/components/settings/`      | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage)                              |
-| `src/components/conversations/` | Sidebar conversation list and sub-agent section                                                                |
-| `src/components/plugins/`       | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections                        |
-| `src/providers/`                | React context providers (Config, Runtime, Attachments)                                                         |
-| `src/lib/`                      | IPC client wrapper, utilities                                                                                  |
+| Directory                       | Purpose                                                                                                                                                                      |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/components/thread/`        | `@assistant-ui/react` `ThreadPrimitive` composition surface — chat thread, composer, markdown, code blocks, tool groups, sub-agent views, token usage, and pipeline insights |
+| `src/components/settings/`      | Settings panels (models, tools, MCP, memory, compaction, skills, advanced, usage)                                                                                            |
+| `src/components/conversations/` | Sidebar conversation list and sub-agent section                                                                                                                              |
+| `src/components/plugins/`       | Plugin banners, modal host, panel host, toast host, and plugin-driven settings sections                                                                                      |
+| `src/providers/`                | React context providers (Config, Runtime, Attachments)                                                                                                                       |
+| `src/lib/`                      | IPC client wrapper, utilities                                                                                                                                                |
 
 ## Key Files
 
