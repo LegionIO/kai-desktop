@@ -1,0 +1,281 @@
+name: Coverage
+
+on:
+  pull_request:
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Reporting only: posts a sticky comment with project-wide delta and a
+# per-file changed-files breakdown. No thresholds, no failure gate — the
+# comment serves as a review aid, not a merge requirement.
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need history so we can diff the PR head against its merge-base
+          # with the base branch and identify "changed files" for the
+          # per-file table.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      - name: Run tests with coverage
+        run: pnpm test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Post coverage summary comment
+        # `continue-on-error` so a PR coming from a fork (where GitHub
+        # restricts the default GITHUB_TOKEN to read-only on
+        # `pull-requests`, ignoring the workflow-declared `pull-requests:
+        # write` permission) doesn't fail the whole coverage job over an
+        # unpostable sticky comment. The artifact + summary still upload;
+        # coverage is reporting-only by design.
+        continue-on-error: true
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          # Untrusted-ish event payload values are routed through env (the
+          # SAFE pattern) so they never land inside a `run:` shell. The
+          # github-script body reads them via `process.env.*` only.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const { execFileSync } = require('node:child_process');
+
+            // Stable marker so subsequent pushes edit the existing comment
+            // in place rather than spamming the PR thread.
+            const MARKER = '<!-- coverage-report -->';
+
+            // ── Step 1: read this run's coverage-summary.json ────────────
+            const summaryPath = path.join(process.cwd(), 'coverage', 'coverage-summary.json');
+            let summary = null;
+            try {
+              summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+            } catch (err) {
+              core.warning(`No coverage-summary.json at ${summaryPath}: ${err.message}`);
+            }
+
+            function pct(node, kind) {
+              const v = node && node[kind] && node[kind].pct;
+              return typeof v === 'number' ? v : null;
+            }
+
+            const head = (summary && summary.total) || null;
+
+            // ── Step 2: try to fetch the latest passing coverage on
+            //           the base branch from a previous workflow run.
+            //           Graceful degradation: any failure here just means
+            //           the comment shows "no baseline available".
+            let baseline = null;
+            let baselineSource = 'none';
+            try {
+              const { owner, repo } = context.repo;
+              const baseRef = process.env.BASE_REF || 'main';
+              const workflowRuns = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: 'coverage.yml',
+                branch: baseRef,
+                status: 'success',
+                per_page: 1,
+              });
+              const run = workflowRuns.data.workflow_runs[0];
+              if (run) {
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+                const artifact = artifacts.data.artifacts.find((a) => a.name === 'coverage-report');
+                if (artifact) {
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner,
+                    repo,
+                    artifact_id: artifact.id,
+                    archive_format: 'zip',
+                  });
+                  const zipPath = path.join(process.cwd(), 'baseline-coverage.zip');
+                  fs.writeFileSync(zipPath, Buffer.from(download.data));
+                  const extractDir = path.join(process.cwd(), 'baseline-coverage');
+                  fs.mkdirSync(extractDir, { recursive: true });
+                  // execFileSync avoids any shell interpretation of paths.
+                  execFileSync('unzip', ['-o', zipPath, '-d', extractDir], { stdio: 'pipe' });
+                  const baseSummaryPath = path.join(extractDir, 'coverage-summary.json');
+                  if (fs.existsSync(baseSummaryPath)) {
+                    const baseSummary = JSON.parse(fs.readFileSync(baseSummaryPath, 'utf8'));
+                    baseline = (baseSummary && baseSummary.total) || null;
+                    baselineSource = `run #${run.run_number} on ${baseRef}`;
+                  }
+                }
+              }
+            } catch (err) {
+              core.warning(`Baseline lookup failed (graceful degradation): ${err.message}`);
+            }
+
+            // ── Step 3: identify changed files for the per-file breakdown.
+            //           BASE_SHA and HEAD_SHA come from env, never inlined
+            //           into a shell. We use execFileSync so even if those
+            //           values were attacker-controlled, no shell metachar
+            //           injection is possible.
+            let changedFiles = [];
+            try {
+              const baseSha = process.env.BASE_SHA;
+              const headSha = process.env.HEAD_SHA;
+              if (baseSha && headSha) {
+                const diff = execFileSync('git', ['diff', '--name-only', baseSha, headSha], { encoding: 'utf8' });
+                changedFiles = diff
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter((s) => s && (s.endsWith('.ts') || s.endsWith('.tsx')))
+                  .filter((s) => !s.includes('__tests__') && !s.endsWith('.test.ts') && !s.endsWith('.test.tsx'));
+              }
+            } catch (err) {
+              core.warning(`git diff failed: ${err.message}`);
+            }
+
+            // ── Step 4: render the comment body. ─────────────────────────
+            function fmt(n) {
+              if (n === null || n === undefined) return '—';
+              return `${n.toFixed(2)}%`;
+            }
+            function delta(headPct, basePct) {
+              if (headPct === null || basePct === null) return '';
+              const d = headPct - basePct;
+              if (Math.abs(d) < 0.005) return ' (=)';
+              const sign = d > 0 ? '+' : '';
+              return ` (${sign}${d.toFixed(2)}%)`;
+            }
+
+            const lines = [MARKER];
+            lines.push('## Coverage report');
+            lines.push('');
+            if (!head) {
+              lines.push('No coverage-summary.json was produced by this run.');
+              lines.push('See the `coverage-report` artifact for details.');
+            } else {
+              lines.push('Project-wide coverage (reporting only — no gate):');
+              lines.push('');
+              lines.push('| Metric | This PR | Baseline |');
+              lines.push('| --- | --- | --- |');
+              const kinds = ['lines', 'statements', 'functions', 'branches'];
+              for (const kind of kinds) {
+                const hp = pct(head, kind);
+                const bp = baseline ? pct(baseline, kind) : null;
+                lines.push(`| ${kind} | ${fmt(hp)}${delta(hp, bp)} | ${fmt(bp)} |`);
+              }
+              lines.push('');
+              if (baseline) {
+                lines.push(`Baseline: ${baselineSource}.`);
+              } else {
+                lines.push('No baseline available — first run, missing artifact, or fetch failed.');
+              }
+            }
+
+            // Per-file changed-files breakdown
+            if (head && changedFiles.length > 0) {
+              const fileEntries = changedFiles
+                .map((file) => {
+                  // coverage-summary.json keys are absolute paths.
+                  const cwd = process.cwd();
+                  const key = path.join(cwd, file);
+                  const node = (summary && (summary[key] || summary[file])) || null;
+                  if (!node) return null;
+                  return {
+                    file,
+                    lines: pct(node, 'lines'),
+                    statements: pct(node, 'statements'),
+                    functions: pct(node, 'functions'),
+                    branches: pct(node, 'branches'),
+                  };
+                })
+                .filter((entry) => entry !== null);
+
+              const withCoverage = fileEntries.length;
+              const totalChanged = changedFiles.length;
+              const skipped = totalChanged - withCoverage;
+
+              lines.push('');
+              lines.push(`Changed-file coverage (${withCoverage} of ${totalChanged} files instrumented`
+                + (skipped > 0 ? `; ${skipped} not in unit slice)` : ')'));
+              if (fileEntries.length > 0) {
+                lines.push('');
+                lines.push('<details>');
+                lines.push('<summary>Per-file table</summary>');
+                lines.push('');
+                lines.push('| File | Lines | Statements | Functions | Branches |');
+                lines.push('| --- | --- | --- | --- | --- |');
+                for (const entry of fileEntries) {
+                  lines.push(`| \`${entry.file}\` | ${fmt(entry.lines)} | ${fmt(entry.statements)} | ${fmt(entry.functions)} | ${fmt(entry.branches)} |`);
+                }
+                lines.push('');
+                lines.push('</details>');
+              }
+            }
+
+            lines.push('');
+            lines.push('_Coverage is reporting-only. No thresholds, no merge gate._');
+
+            const body = lines.join('\n');
+
+            // ── Step 5: upsert sticky comment by marker. ─────────────────
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            if (!issue_number) {
+              core.warning('No PR number available; skipping comment.');
+              return;
+            }
+
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const prior = existing.find((c) => c.body && c.body.includes(MARKER));
+
+            if (prior) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: prior.id,
+                body,
+              });
+              core.info(`Updated existing coverage comment #${prior.id}`);
+            } else {
+              const created = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+              core.info(`Created coverage comment #${created.data.id}`);
+            }

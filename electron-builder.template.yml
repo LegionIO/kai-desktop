@@ -23,6 +23,16 @@ extraResources:
       - "!.gitkeep"
 {{esbuildExtraResources}}
 icon: build/icon
+# Electron Fuses — locked-down per ADR 0001 (docs/adr/0001-electron-fuses-policy.md).
+# verify-fuses.ts (run from the pr-mac-build job after `pnpm build:mac`)
+# reads these back off the packaged .app and fails CI on any drift.
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
 mac:
   category: "{{macCategory}}"
   hardenedRuntime: true

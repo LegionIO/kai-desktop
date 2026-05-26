@@ -1,0 +1,85 @@
+name: _setup
+
+# Reusable workflow that performs the standard CI bootstrap:
+#   - checkout
+#   - pnpm setup (pinned to 10.33.0)
+#   - node setup (pinned to 22)
+#   - pnpm store + Electron binary caches
+#   - pnpm install
+#
+# Why a reusable workflow and not a composite action: composite actions can
+# inline steps into an existing job, but they cannot declare their own
+# permissions or runner. A reusable workflow gives a future workflow file a
+# self-contained `pnpm install` runner it can chain off of via `needs:`.
+#
+# This file is intentionally not consumed by ci.yml yet — the main CI jobs
+# each do their own setup so a transient failure here cannot cascade across
+# every job. New workflows that need a quick "give me a tree with deps
+# installed" step should call this:
+#
+#   jobs:
+#     setup:
+#       uses: ./.github/workflows/_setup.yml
+#     downstream:
+#       needs: setup
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v5
+#         - run: pnpm something
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label for the setup job
+        required: false
+        type: string
+        default: ubuntu-latest
+      node-version:
+        description: Node major version
+        required: false
+        type: string
+        default: '22'
+      pnpm-version:
+        description: pnpm version to install via pnpm/action-setup
+        required: false
+        type: string
+        default: '10.33.0'
+
+jobs:
+  setup-pnpm:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      # pnpm-lock.yaml is gitignored in this repo, so key the cache on
+      # package.json + the runner OS. Restore keys allow partial re-use even
+      # when package.json bumps trigger a re-install.
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Cache Electron binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+
+      - run: pnpm install

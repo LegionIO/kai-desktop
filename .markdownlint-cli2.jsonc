@@ -1,0 +1,26 @@
+// Relaxed markdownlint config for the docs-only workflow.
+//
+// The PR-time markdown lint exists to catch broken structure (malformed
+// frontmatter, missing image alt text, broken link fragments), not to
+// enforce cosmetic spacing or line-length style. Most of markdownlint's
+// default ruleset is style-only and conflicts with the embedded long
+// URLs, code snippets, review-trail comments, and changelog formatting
+// these files routinely carry.
+//
+// Strategy: turn the entire ruleset off via `default: false`, then opt
+// back in to the rules that catch genuine breakage:
+//   MD042 no-empty-links      — broken markdown links.
+//   MD045 no-alt-text         — accessibility: images need alt text.
+//   MD051 link-fragments      — anchor links to nonexistent headings.
+//   MD052 reference-links     — undefined reference-style link targets.
+//   MD053 link-reference-defs — unused reference-style link definitions.
+{
+  "config": {
+    "default": false,
+    "MD042": true,
+    "MD045": true,
+    "MD051": true,
+    "MD052": true,
+    "MD053": true
+  }
+}

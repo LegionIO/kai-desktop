@@ -2,16 +2,121 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
+    # Manual trigger so maintainers can force every job to run on any branch
+    # (including bypassing the mac-build debounce on a quiet PR).
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  checks:
+  # Compute which categories of jobs should run for this PR, based on the
+  # files changed in the diff. Downstream jobs gate on these outputs so a
+  # docs-only PR does not pay for an Electron build, and a workflow-only PR
+  # does not pay for the renderer test suite.
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      electron: ${{ steps.filter.outputs.electron }}
+      ipc-seam: ${{ steps.filter.outputs.ipc-seam }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      docs-only: ${{ steps.filter.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Every path entry is annotated. If the filter matches, the named
+          # output flips to "true" and the corresponding downstream jobs run.
+          filters: |
+            code:
+              # Renderer source — drives lint, type-check, unit + component tests, build.
+              - 'src/**'
+              # Main / preload / IPC source — same gates as renderer; also drives ipc-seam.
+              - 'electron/**'
+              # Shared modules consumed by both processes.
+              - 'shared/**'
+              # Test helpers — changes here can break the suite even if app code is untouched.
+              - 'test-utils/**'
+              # Vitest configs + setup — changes here always need a full test run.
+              - 'vitest*.config.ts'
+              - 'vitest.setup.ts'
+              # TypeScript project configs — changes here can break type-check.
+              - 'tsconfig*.json'
+              # ESLint config — changes here can flip lint pass/fail.
+              - 'eslint.config.js'
+              # Vite + electron-vite configs — drive the build outputs.
+              - 'electron.vite.config.ts'
+              # Tailwind / PostCSS configs (no committed file today, but future-proofed).
+              - 'postcss.config.*'
+              - 'tailwind.config.*'
+              # Package surface — adding deps or scripts always retests.
+              - 'package.json'
+              # Branding config — affects compiled defines used by every artifact.
+              - 'branding.config.ts'
+              - 'branding.d.ts'
+              # Build scripts that run in `pnpm build` / `pnpm build:mac`.
+              - 'scripts/**'
+            electron:
+              # Source paths that affect the packaged macOS DMG.
+              - 'electron/**'
+              # electron-builder template + DMG/icon assets live under build/.
+              - 'build/**'
+              # The template the generator consumes to produce electron-builder.yml.
+              - 'electron-builder.template.yml'
+              # Scripts called by `pnpm build:mac` (helper compile, builder config gen).
+              - 'scripts/**'
+              # Branding drives appId / productName / artifactName.
+              - 'branding.config.ts'
+              # Electron + electron-builder version pins live in package.json.
+              - 'package.json'
+              # Native module rebuild list lives under pnpm.onlyBuiltDependencies.
+              - 'pnpm-workspace.yaml'
+            ipc-seam:
+              # The Playwright spec + its launcher + config drive the seam smoke.
+              - 'e2e/**'
+              - 'playwright.config.ts'
+              # Preload / contextBridge changes flow through the seam directly.
+              - 'electron/preload.ts'
+              - 'electron/main.ts'
+              # IPC handler surface — adding or renaming a handler can break the seam.
+              - 'electron/ipc/**'
+              # Renderer-side IPC client wrapper.
+              - 'src/lib/**'
+            workflows:
+              # Any change inside this directory triggers actionlint via workflow-sanity.
+              - '.github/workflows/**'
+            docs-only:
+              # If the only changes match these globs, downstream code jobs can skip.
+              - 'docs/**'
+              - '**/*.md'
+              - 'CONTRIBUTING.md'
+              - 'LICENSE'
+              - 'CHANGELOG.md'
+
+  checks:
+    needs: changes
+    # Run if any code-shaped path changed, or on manual dispatch. Skip on
+    # pure docs/workflow PRs (the docs-only and workflow-sanity workflows
+    # cover those paths with their own faster checks).
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      # dorny/test-reporter publishes vitest results as a check run; this
+      # scope is required for it to write that result.
+      checks: write
     steps:
       - uses: actions/checkout@v5
 
@@ -24,21 +129,80 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
+      # The pnpm-lock.yaml is intentionally gitignored in this repo, so the
+      # cache key falls back to package.json + the pnpm version. Restore keys
+      # let us re-use a partial cache across PRs even when package.json changes.
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      # Cache the Electron binary download. Keyed on the Electron version
+      # pulled from package.json so a bump invalidates the cache automatically.
+      - name: Cache Electron binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+
       - run: pnpm install
+
+      # Belt-and-suspenders against accidentally shipping debug switches that
+      # would defeat the Electron Fuses. The packaged binary is validated by
+      # the verify step inside pr-mac-build; this grep is a fast cross-platform
+      # gate that fails the PR before we even build.
+      - name: Static security lint (electron command-line switches)
+        run: |
+          forbidden='inspect|remote-debugging-port|js-flags'
+          if grep -nE "app\.commandLine\.appendSwitch\(\s*['\"]($forbidden)" electron/main.ts; then
+            echo "::error file=electron/main.ts::Forbidden command-line switch found in electron/main.ts. Switches matching ($forbidden) defeat the production Fuses contract." >&2
+            exit 1
+          fi
+          echo "ok: no forbidden command-line switches in electron/main.ts"
 
       - run: pnpm lint
 
       - run: pnpm type-check
 
-      - run: pnpm test --run --passWithNoTests
+      # Emit a JUnit report so dorny/test-reporter can surface failures as
+      # PR-level check annotations. The output path is gitignored.
+      - name: Unit + component tests
+        run: pnpm test --reporter=default --reporter=junit --outputFile.junit=./pw-results.xml -- --passWithNoTests
+
+      - name: Report vitest results
+        if: always()
+        uses: dorny/test-reporter@v2
+        with:
+          name: vitest
+          path: pw-results.xml
+          reporter: jest-junit
+          fail-on-error: false
 
       - run: pnpm build
 
   ipc-seam-smoke:
-    needs: checks
+    needs:
+      - changes
+      - checks
+    # Re-run the seam smoke when any source that touches the IPC bridge
+    # changes, plus the broader code surface that drives the renderer build.
+    if: ${{ (needs.changes.outputs.ipc-seam == 'true' || needs.changes.outputs.code == 'true') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
+      # checks:write surfaces the Playwright result as a check run on the PR;
+      # pull-requests:write lets daun/playwright-report-summary post the
+      # report comment. Both are no-ops on forks (GitHub strips write scopes
+      # from GITHUB_TOKEN on cross-repo PRs); the report artifact upload
+      # below remains the canonical evidence in that case.
+      checks: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
 
@@ -50,6 +214,32 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Cache Electron binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+
+      # Cache the Playwright browser downloads. Keyed on the @playwright/test
+      # version in package.json so a Playwright bump pulls fresh browsers.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
 
       - run: pnpm install
 
@@ -70,6 +260,19 @@ jobs:
       - name: Run IPC seam smoke
         run: xvfb-run -a pnpm test:ipc-seam:linux
 
+      - name: Publish Playwright report summary
+        # `continue-on-error` so a PR from a fork (where GITHUB_TOKEN is
+        # read-only on `pull-requests` regardless of the workflow's
+        # declared `pull-requests: write` permission) doesn't fail the
+        # job over an unpostable sticky comment. The IPC seam smoke
+        # itself already ran; this step is reporting-only.
+        continue-on-error: true
+        if: always()
+        uses: daun/playwright-report-summary@v3
+        with:
+          report-file: playwright-report/index.html
+          comment-title: Playwright IPC seam smoke
+
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -78,9 +281,33 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
+  # Path-aware debounce for the macOS DMG build.
+  #
+  # Cost projection: this policy plus the weekly safety net is projected to
+  # reduce the macos-26 runner spend on PR builds from ~$1040/yr to ~$340/yr.
+  # The first commit of any PR always builds (baseline signal); subsequent
+  # commits only rebuild if the diff touches electron/build/builder/lock paths;
+  # adding the `mac-build` label forces an immediate build; and a separate
+  # scheduled workflow re-runs the mac build for every open PR weekly so any
+  # regression that snuck past the debounce surfaces within 7 days.
   pr-mac-build:
-    needs: checks
+    needs:
+      - changes
+      - checks
+    # The if-expression below is intentionally explicit and ordered so a
+    # human reviewer can read each branch in turn:
+    #   1. Manual workflow_dispatch — always run.
+    #   2. PR has the `mac-build` label — always run.
+    #   3. PR is its first commit (commits == 1) — always run for baseline.
+    #   4. PR diff touches packaging-relevant paths — run.
+    # Otherwise skip; the weekly safety-net workflow will catch regressions.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'mac-build') ||
+      github.event.pull_request.commits == 1 ||
+      needs.changes.outputs.electron == 'true'
     runs-on: macos-26
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -97,9 +324,38 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Cache Electron binary
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+
+      # Cache the compiled universal Swift helper binary. Keyed on the source
+      # file and the compile script so a change to either path invalidates it.
+      # The compile-swift-helper.sh script is a no-op on non-Darwin and the
+      # output lives at build/bin/LocalMacosHelper.
+      - name: Cache Swift helper binary
+        uses: actions/cache@v4
+        with:
+          path: build/bin
+          key: swift-helper-${{ runner.os }}-${{ hashFiles('electron/computer-use/helpers/LocalMacosHelper.swift', 'scripts/compile-swift-helper.sh') }}
+
       - run: pnpm install
 
       - run: pnpm build:mac
+
+      - name: Verify Electron Fuses
+        run: pnpm verify:fuses
 
   pr-win-build:
     needs: checks
@@ -124,3 +380,85 @@ jobs:
 
       - run: pnpm build:win
 
+  # macOS-only smoke test for the @lydell/node-pty native binding. Runs
+  # OUTSIDE vitest so the global vi.mock in vitest.setup.ts does not apply
+  # — we are exercising the real native binding to catch ABI drift or a
+  # missing electron-builder rebuild before users do. The smoke script is
+  # CommonJS and self-contained; see scripts/smoke-node-pty.cjs.
+  node-pty-smoke:
+    needs: [changes, checks]
+    if: needs.changes.outputs.electron == 'true'
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - run: pnpm install
+
+      # Rebuild native modules against the Electron ABI used by the app.
+      # This invokes electron-builder install-app-deps under the hood —
+      # the same script developers run locally via `pnpm rebuild`.
+      - name: Rebuild native modules for Electron ABI
+        run: pnpm rebuild
+
+      - name: Run node-pty native smoke
+        run: node scripts/smoke-node-pty.cjs
+
+  # Aggregator gate. Branch protection should be configured to require this
+  # single check; it succeeds if every required upstream job either passed or
+  # was correctly skipped via the path filters. A skipped required job would
+  # otherwise leave branch protection blocked indefinitely on docs-only PRs.
+  gate:
+    needs:
+      - changes
+      - checks
+      - ipc-seam-smoke
+      - pr-mac-build
+      - pr-win-build
+      - node-pty-smoke
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      CHECKS_RESULT: ${{ needs.checks.result }}
+      IPC_RESULT: ${{ needs.ipc-seam-smoke.result }}
+      MAC_RESULT: ${{ needs.pr-mac-build.result }}
+      WIN_RESULT: ${{ needs.pr-win-build.result }}
+      PTY_RESULT: ${{ needs.node-pty-smoke.result }}
+    steps:
+      - name: Verify all required jobs succeeded or were skipped intentionally
+        run: |
+          # A required dependency is acceptable if it succeeded OR if it was
+          # skipped (path filter / debounce). Any other outcome — failure,
+          # cancelled, or "skipped because an ancestor failed" — fails the gate.
+          fail=0
+          for name in CHANGES_RESULT CHECKS_RESULT IPC_RESULT MAC_RESULT WIN_RESULT PTY_RESULT; do
+            value="${!name}"
+            case "$value" in
+              success|skipped)
+                echo "  - ${name}: ${value}"
+                ;;
+              *)
+                echo "::error::${name} reported '${value}' (expected success or skipped)"
+                fail=1
+                ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "gate: all required jobs OK"
