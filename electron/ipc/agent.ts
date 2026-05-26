@@ -324,7 +324,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       fallbackEnabled: fallbackEnabled ?? false,
       threadOverrides: threadOverrides ?? undefined,
     });
-    const modelEntry = streamConfig?.primaryModel ?? null;
+    let modelEntry = streamConfig?.primaryModel ?? null;
     let effectiveSystemPrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
 
     // Inject execution mode before plugin hooks so prompt/message middleware sees
@@ -386,6 +386,36 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       activeStreamModelKeys.delete(conversationId);
       activeObserverSessions.delete(conversationId);
       return { conversationId };
+    }
+
+    // Non-blocking fallback notice: the preferred runtime is unavailable but we
+    // can still route through the standard pipeline. Show a visible notice.
+    if (resolution.fallbackNotice) {
+      broadcastStreamEvent({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
+    }
+
+    // Provider override: a plugin runtime was selected for a non-plugin model.
+    // Override the model's provider config to route through the plugin's endpoint.
+    if (resolution.providerOverride && modelEntry) {
+      const overrideProviderConfig = config.models.providers[resolution.providerOverride];
+      if (overrideProviderConfig) {
+        const overriddenModelConfig = {
+          ...modelEntry.modelConfig,
+          provider: overrideProviderConfig.type as typeof modelEntry.modelConfig.provider,
+          endpoint: overrideProviderConfig.endpoint ?? modelEntry.modelConfig.endpoint,
+          apiKey: overrideProviderConfig.apiKey ?? modelEntry.modelConfig.apiKey,
+          useResponsesApi: overrideProviderConfig.useResponsesApi ?? false,
+        };
+        modelEntry = { ...modelEntry, modelConfig: overriddenModelConfig };
+        // Also update streamConfig if it references the primary model
+        if (streamConfig) {
+          streamConfig = {
+            ...streamConfig,
+            primaryModel: modelEntry,
+          };
+        }
+        console.info(`[Agent:stream] Provider override: routing ${modelEntry.key} through ${resolution.providerOverride} (${overrideProviderConfig.endpoint})`);
+      }
     }
 
     const observerSupported = runtime.capabilities.toolObserver;
