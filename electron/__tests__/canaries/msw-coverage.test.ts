@@ -20,6 +20,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { createAnthropic } from '@ai-sdk/anthropic';
 
 import { httpMock } from '../../../vitest.setup.js';
 import { mockAnthropic, mockOpenAI, mockBedrock, mockAzure, mockCodex } from '../setup/msw.js';
@@ -40,22 +41,19 @@ afterAll(() => {
 const FAKE_KEY = 'test-key-not-real';
 
 describe('msw coverage canaries', () => {
-  it('intercepts Anthropic /v1/messages', async () => {
+  it('intercepts Anthropic /v1/messages via the real @ai-sdk/anthropic provider', async () => {
+    // Use the real SDK so handler URL drift is caught at the SDK level too,
+    // not just at the raw fetch boundary. If a future SDK release changes
+    // its URL or auth-header shape, this canary will flag it.
     httpMock.use(...mockAnthropic());
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': FAKE_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 64,
-        messages: [{ role: 'user', content: 'Say hi.' }],
-      }),
+    const anthropic = createAnthropic({ apiKey: FAKE_KEY });
+    const model = anthropic('claude-3-5-sonnet-20241022');
+
+    const res = await model.doGenerate({
+      prompt: [{ role: 'user', content: [{ type: 'text', text: 'Say hi.' }] }],
     });
-    expect(res.status).toBe(200);
+
+    expect(res).toBeDefined();
     httpMock.expectHit('api.anthropic.com');
     httpMock.expectNoUnhandled();
   });

@@ -1,6 +1,10 @@
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
-import { brandDefines } from './vitest.config';
+import { baseConfig } from './vitest.config';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 /**
  * Component-test slice. Renders React components in jsdom and matches
@@ -10,6 +14,10 @@ import { brandDefines } from './vitest.config';
  * here replaces the base config's electron-main-process include. The base
  * setup file is still loaded (for deterministic clock/UUID + pty stub)
  * and the jest-dom setup is appended.
+ *
+ * The `@` resolve alias mirrors the renderer build configuration in
+ * `electron.vite.config.ts` so component source files that import via
+ * `@/...` resolve identically in tests.
  */
 export default defineConfig({
   test: {
@@ -21,6 +29,11 @@ export default defineConfig({
     // No component tests exist yet — the slice is scaffolding for future
     // React testing-library suites. Don't fail the run until one lands.
     passWithNoTests: true,
+  },
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
+    },
   },
   define: brandDefines,
 });
