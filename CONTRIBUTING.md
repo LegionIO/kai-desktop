@@ -98,7 +98,7 @@ Renderer code **never** accesses Node APIs directly. All communication goes thro
 
 - **`contextIsolation` is ON** -- never use `require()` or Node APIs in renderer code.
 - **Tailwind v4** -- do not create a `tailwind.config.js`.
-- **No test suite** -- there are no specs or test framework yet. Contributions that add tests are welcome.
+- **Tests** -- Vitest is the unit/component test runner. Run `pnpm test` locally; CI runs the same suite on every PR. New code should land with tests where possible.
 - **Config persistence allowlist** -- new config sections must be added to `desktopConfigPayload()` in `electron/ipc/config.ts` or they will not persist.
 
 For a deeper architecture reference, see [`CLAUDE.md`](CLAUDE.md).
@@ -117,8 +117,11 @@ Run these locally and make sure they pass:
 ```bash
 pnpm lint          # fix any errors; warnings are acceptable but should be minimized
 pnpm type-check    # must pass cleanly
+pnpm test          # vitest suite must pass
 pnpm build         # full build must succeed
 ```
+
+`pnpm install` registers Husky hooks via the `prepare` script: a pre-commit hook runs `lint-staged` (ESLint + Prettier on changed files), and a pre-push hook runs `pnpm type-check` followed by `pnpm test` so broken pushes are caught locally.
 
 ### CI Checks
 
@@ -126,8 +129,9 @@ Every PR automatically runs:
 
 1. `pnpm lint`
 2. `pnpm type-check`
-3. `pnpm build`
-4. macOS DMG build
+3. `pnpm test`
+4. `pnpm build`
+5. macOS DMG build
 
 All checks must pass before merge.
 
