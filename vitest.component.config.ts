@@ -1,4 +1,6 @@
-import { defineConfig, mergeConfig } from 'vitest/config';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { defineConfig } from 'vitest/config';
 
 import { brandDefines } from './vitest.config';
 
@@ -8,21 +10,30 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
  * Component-test slice. Renders React components in jsdom and matches
  * against the testing-library matchers from `@testing-library/jest-dom`.
  *
- * The brand `define()` map and the global setup (msw + deterministic
- * clock/UUID) are inherited from `baseConfig` via `mergeConfig`. We append
- * an extra setup file that wires `@testing-library/jest-dom/vitest`.
+ * Defined standalone rather than via `mergeConfig` so the `include` glob
+ * here replaces the base config's electron-main-process include. The base
+ * setup file is still loaded (for deterministic clock/UUID + pty stub)
+ * and the jest-dom setup is appended.
+ *
+ * The `@` resolve alias mirrors the renderer build configuration in
+ * `electron.vite.config.ts` so component source files that import via
+ * `@/...` resolve identically in tests.
  */
-const baseSetupFiles =
-  (baseConfig.test?.setupFiles as string[] | undefined) ?? [];
-
-export default mergeConfig(
-  baseConfig,
-  defineConfig({
-    test: {
-      include: ['src/**/*.component.test.tsx', 'src/**/*.test.tsx'],
-      exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
-      environment: 'jsdom',
-      setupFiles: [...baseSetupFiles, './test-utils/jest-dom-setup.ts'],
+export default defineConfig({
+  test: {
+    include: ['src/**/*.component.test.tsx', 'src/**/*.test.tsx'],
+    exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./vitest.setup.ts', './test-utils/jest-dom-setup.ts'],
+    // No component tests exist yet — the slice is scaffolding for future
+    // React testing-library suites. Don't fail the run until one lands.
+    passWithNoTests: true,
+  },
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
     },
-  }),
-);
+  },
+  define: brandDefines,
+});
