@@ -137,6 +137,10 @@ const mocks = vi.hoisted(() => {
       text,
     });
     readonly endSession = vi.fn(async () => {});
+    // Production cleanup path calls `close()` on the native session after
+    // beginSessionUnchecked rejects (e.g. accessibility / secure-field
+    // refusals). Stub it so the cleanup doesn't crash the test runner.
+    readonly close = vi.fn(async () => {});
     readonly getTargetSnapshot = vi.fn((response: NativeResponse) => {
       if (!response.targetPid || !response.targetName) return null;
       return {
@@ -340,7 +344,13 @@ vi.mock('../dictation-overlay.js', () => ({
   sendToOverlay: mocks.sendToOverlay,
 }));
 vi.mock('../focus-preserver.js', () => ({
+  clearDictationTargetFocus: vi.fn(),
   getDictationTargetPid: mocks.getDictationTargetPid,
+  // Production dictation-manager reads the target app name + bundle id when
+  // building the native session config payload. Deterministic stubs keep the
+  // unit suite from depending on real focus-tracking state.
+  getDictationTargetAppName: vi.fn(() => 'TextEdit'),
+  getDictationTargetBundleId: vi.fn(() => 'com.apple.TextEdit'),
   recaptureDictationTargetFocus: mocks.recaptureDictationTargetFocus,
   setDictationExternalFocusRefreshSuppressed: mocks.setDictationExternalFocusRefreshSuppressed,
   setDictationTargetFocusSnapshot: mocks.setDictationTargetFocusSnapshot,
@@ -421,7 +431,7 @@ describe('dictation manager native session lifecycle', () => {
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
     expect(native.start).toHaveBeenCalled();
-    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
       allowBlindKeyboardFullPatch: false,
       ownAppName: expect.any(String),
       ownPid: expect.any(Number),
@@ -450,7 +460,7 @@ describe('dictation manager native session lifecycle', () => {
 
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
-    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
       allowBlindKeyboardFullPatch: true,
     }));
     expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'kb');
