@@ -15,6 +15,7 @@ import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
+import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -63,7 +64,12 @@ function readAgent(appHome: string, id: string): AgentFile | null {
   const filePath = join(getAgentsDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as AgentFile;
+    const agent = JSON.parse(readFileSync(filePath, 'utf-8')) as AgentFile;
+
+    // Validate common field naming mistakes
+    warnOnDeprecatedField(agent, 'assignedTaskId', 'currentTaskId', 'agents', 'Agent', id);
+
+    return agent;
   } catch {
     return null;
   }
@@ -81,7 +87,12 @@ function readTask(appHome: string, id: string): TaskFile | null {
   const filePath = join(getTasksDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+    // Validate common field naming mistakes
+    warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
+
+    return task;
   } catch {
     return null;
   }

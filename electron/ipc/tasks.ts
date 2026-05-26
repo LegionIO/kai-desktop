@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
+import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -104,7 +105,12 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     const filePath = join(getTasksDir(appHome), `${id}.json`);
     if (!existsSync(filePath)) return null;
     try {
-      return JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+      // Validate common field naming mistakes
+      warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
+
+      return task;
     } catch {
       return null;
     }
