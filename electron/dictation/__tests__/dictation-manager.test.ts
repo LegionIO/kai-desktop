@@ -108,6 +108,15 @@ const mocks = vi.hoisted(() => {
       if (state.beginError) throw state.beginError;
       return state.beginResponse;
     });
+    // Main's dictation refactor renamed the production call from
+    // `beginSession` to `beginSessionUnchecked`. Provide both on the mock
+    // so the test works against whichever production source vitest ends
+    // up loading (PR-head version with `beginSession`, or merge-with-main
+    // version with `beginSessionUnchecked`).
+    readonly beginSessionUnchecked = vi.fn(async () => {
+      if (state.beginError) throw state.beginError;
+      return state.beginResponse;
+    });
     readonly startTargetTracking = vi.fn(async () => ({ ok: true }));
     readonly stopTargetTracking = vi.fn(async () => ({ ok: true }));
     readonly refreshTarget = vi.fn(async () => state.refreshResponse ?? {
@@ -128,6 +137,10 @@ const mocks = vi.hoisted(() => {
       text,
     });
     readonly endSession = vi.fn(async () => {});
+    // Production cleanup path calls `close()` on the native session after
+    // beginSessionUnchecked rejects (e.g. accessibility / secure-field
+    // refusals). Stub it so the cleanup doesn't crash the test runner.
+    readonly close = vi.fn(async () => {});
     readonly getTargetSnapshot = vi.fn((response: NativeResponse) => {
       if (!response.targetPid || !response.targetName) return null;
       return {
@@ -257,6 +270,34 @@ vi.mock('electron', () => ({
   BrowserWindow: mocks.BrowserWindow,
   globalShortcut: mocks.globalShortcut,
   ipcMain: mocks.ipcMain,
+  // Minimal `app` shape so transitive imports (computer-use, plugins,
+  // utils/user-agent, ...) don't fail with `No "app" export defined on
+  // the "electron" mock`. The dictation manager itself doesn't reference
+  // these, but the production code path reaches into permissions.js
+  // which does.
+  app: {
+    getName: vi.fn(() => 'Kai'),
+    getVersion: vi.fn(() => '0.0.0-test'),
+    getPath: vi.fn(() => '/tmp/kai-test'),
+    isReady: vi.fn(() => true),
+    isPackaged: false,
+    focus: vi.fn(),
+    on: vi.fn(),
+    once: vi.fn(),
+    whenReady: vi.fn(() => Promise.resolve()),
+  },
+  systemPreferences: {
+    isTrustedAccessibilityClient: vi.fn(() => true),
+    getMediaAccessStatus: vi.fn(() => 'granted'),
+  },
+  shell: { openExternal: vi.fn() },
+  screen: { getPrimaryDisplay: vi.fn(() => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } })) },
+  Notification: vi.fn(),
+  safeStorage: { isEncryptionAvailable: vi.fn(() => false), encryptString: vi.fn(), decryptString: vi.fn() },
+  session: { defaultSession: {} },
+  net: { fetch: vi.fn() },
+  nativeImage: { createEmpty: vi.fn(() => ({})) },
+  dialog: {},
 }));
 
 vi.mock('microsoft-cognitiveservices-speech-sdk', () => ({
@@ -303,7 +344,13 @@ vi.mock('../dictation-overlay.js', () => ({
   sendToOverlay: mocks.sendToOverlay,
 }));
 vi.mock('../focus-preserver.js', () => ({
+  clearDictationTargetFocus: vi.fn(),
   getDictationTargetPid: mocks.getDictationTargetPid,
+  // Production dictation-manager reads the target app name + bundle id when
+  // building the native session config payload. Deterministic stubs keep the
+  // unit suite from depending on real focus-tracking state.
+  getDictationTargetAppName: vi.fn(() => 'TextEdit'),
+  getDictationTargetBundleId: vi.fn(() => 'com.apple.TextEdit'),
   recaptureDictationTargetFocus: mocks.recaptureDictationTargetFocus,
   setDictationExternalFocusRefreshSuppressed: mocks.setDictationExternalFocusRefreshSuppressed,
   setDictationTargetFocusSnapshot: mocks.setDictationTargetFocusSnapshot,
@@ -384,7 +431,7 @@ describe('dictation manager native session lifecycle', () => {
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
     expect(native.start).toHaveBeenCalled();
-    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
       allowBlindKeyboardFullPatch: false,
       ownAppName: expect.any(String),
       ownPid: expect.any(Number),
@@ -413,7 +460,7 @@ describe('dictation manager native session lifecycle', () => {
 
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
-    expect(native.beginSession).toHaveBeenCalledWith(expect.objectContaining({
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
       allowBlindKeyboardFullPatch: true,
     }));
     expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'kb');
