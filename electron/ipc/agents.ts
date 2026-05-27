@@ -128,6 +128,52 @@ function broadcastTaskChange(appHome: string): void {
   }
 }
 
+/**
+ * Decide what state a task should land in once its agent terminal has exited.
+ *
+ * Exit code conventions:
+ *   - 0           → clean exit (success)
+ *   - 124         → timeout (treated as crash by convention)
+ *   - >1 or <0    → crash / abnormal termination
+ *   - 1           → soft failure; treat as needing human review
+ *   - undefined   → terminal vanished without an exit code recorded
+ */
+function analyzeCompletion(
+  exitCode: number | undefined,
+  options: { requireHumanReview?: boolean },
+): { nextStatus: 'human_review' | 'done'; isCrash: boolean } {
+  if (exitCode === undefined) {
+    // Unknown — be conservative and route to human review.
+    return { nextStatus: 'human_review', isCrash: false };
+  }
+  if (exitCode === 124) {
+    return { nextStatus: 'human_review', isCrash: true };
+  }
+  if (exitCode > 1 || exitCode < 0) {
+    return { nextStatus: 'human_review', isCrash: true };
+  }
+  if (exitCode === 0) {
+    return {
+      nextStatus: options.requireHumanReview ? 'human_review' : 'done',
+      isCrash: false,
+    };
+  }
+  // exitCode === 1 — soft failure, hand to a human.
+  return { nextStatus: 'human_review', isCrash: false };
+}
+
+/** Returns true if the same calendar day in UTC. */
+function isSameUtcDay(a: string | undefined, b: Date): boolean {
+  if (!a) return false;
+  const d = new Date(a);
+  if (Number.isNaN(d.getTime())) return false;
+  return (
+    d.getUTCFullYear() === b.getUTCFullYear() &&
+    d.getUTCMonth() === b.getUTCMonth() &&
+    d.getUTCDate() === b.getUTCDate()
+  );
+}
+
 // ── Registration ─────────────────────────────────────────────────────────
 
 export function registerAgentHandlers(
@@ -467,28 +513,63 @@ export function registerAgentHandlers(
         try {
           terminalManager.write(agent.terminalSessionId, '');
         } catch {
-          // Terminal is gone — update agent status
+          // Terminal is gone — read fresh agent state and reconcile.
           const freshAgent = readAgent(appHome, agent.id);
-          if (freshAgent && freshAgent.status === 'running') {
-            freshAgent.status = 'idle';
-            freshAgent.terminalSessionId = undefined;
-            freshAgent.updatedAt = new Date().toISOString();
-            freshAgent.stats.tasksCompleted += 1;
-            writeAgent(appHome, freshAgent);
+          if (!freshAgent || freshAgent.status !== 'running') continue;
 
-            // Move task to human_review
-            if (freshAgent.currentTaskId) {
-              const task = readTask(appHome, freshAgent.currentTaskId);
-              if (task) {
-                task.status = 'human_review';
-                task.terminalSessionId = undefined;
-                task.updatedAt = new Date().toISOString();
-                writeTask(appHome, task);
-                broadcastTaskChange(appHome);
-              }
+          const sessionId = freshAgent.terminalSessionId;
+          const exitCode = sessionId ? terminalManager.consumeExitCode(sessionId) : undefined;
+
+          // Optional per-agent override: route every completion through human review.
+          const requireHumanReview =
+            (freshAgent.config as { requireHumanReview?: boolean } | undefined)
+              ?.requireHumanReview === true;
+
+          const { nextStatus, isCrash } = analyzeCompletion(exitCode, {
+            requireHumanReview,
+          });
+
+          // Update agent
+          freshAgent.terminalSessionId = undefined;
+          freshAgent.updatedAt = new Date().toISOString();
+
+          if (isCrash) {
+            const now = new Date();
+            // Reset crash counter at UTC day boundary
+            if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
+              freshAgent.stats.crashCount = 0;
             }
-            broadcastAgentChange(appHome);
+            freshAgent.stats.crashCount += 1;
+            freshAgent.stats.lastCrashAt = now.toISOString();
+
+            const cap = freshAgent.config.maxCrashesPerDay ?? 5;
+            if (freshAgent.stats.crashCount >= cap) {
+              freshAgent.status = 'error';
+            } else {
+              freshAgent.status = 'idle';
+            }
+          } else {
+            freshAgent.status = 'idle';
+            freshAgent.stats.tasksCompleted += 1;
           }
+          writeAgent(appHome, freshAgent);
+
+          // Move task to next status
+          if (freshAgent.currentTaskId) {
+            const task = readTask(appHome, freshAgent.currentTaskId);
+            if (task) {
+              const taskNow = new Date().toISOString();
+              task.status = nextStatus;
+              task.terminalSessionId = undefined;
+              task.updatedAt = taskNow;
+              if (nextStatus === 'done') {
+                task.completedAt = taskNow;
+              }
+              writeTask(appHome, task);
+              broadcastTaskChange(appHome);
+            }
+          }
+          broadcastAgentChange(appHome);
         }
       }
     }
