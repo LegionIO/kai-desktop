@@ -21,6 +21,7 @@ import {
   resolveRuntime,
   getAvailableRuntimes,
   getActiveRuntimeId,
+  setPluginRuntimesSource,
 } from '../index.js';
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,7 @@ describe('Runtime Registry', () => {
     registerRuntime(createStubRuntime('mastra', 'Mastra', true));
     registerRuntime(createStubRuntime('claude-agent-sdk', 'Claude Code', false));
     registerRuntime(createStubRuntime('codex-sdk', 'Codex', false));
+    setPluginRuntimesSource(() => []);
   });
 
   describe('registerRuntime / getRuntime', () => {
@@ -117,6 +119,12 @@ describe('Runtime Registry', () => {
     it('falls back to Mastra when selected runtime is unavailable', async () => {
       const rt = await resolveRuntime(makeConfig('claude-agent-sdk'));
       expect(rt.id).toBe('mastra');
+    });
+
+    it('does not fall back to Mastra when an explicit plugin runtime is unavailable', async () => {
+      const rt = await resolveRuntime(makeConfig('legion'));
+      expect(rt.id).toBe('legion');
+      expect(await rt.isAvailable()).toBe(false);
     });
 
     it('falls back to Mastra when config has no agent.runtime', async () => {

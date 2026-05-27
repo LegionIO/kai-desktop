@@ -401,8 +401,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // If the user has an explicitly-set runtime that is incompatible with the
     // selected model, surface the warning in the chat and bail early.
     if (resolution.warning) {
-      broadcastStreamEvent({ conversationId, type: 'text-delta', text: `⚠️ ${resolution.warning}` });
-      broadcastStreamEvent({ conversationId, type: 'done' });
+      const warningMeta = resolution.inferenceProviderRuntimeId
+        ? { runtimeId: resolution.inferenceProviderRuntimeId }
+        : undefined;
+      broadcastStreamEvent({
+        conversationId,
+        type: 'text-delta',
+        text: `⚠️ ${resolution.warning}`,
+        ...(warningMeta ? { messageMeta: warningMeta } : {}),
+      });
+      broadcastStreamEvent({
+        conversationId,
+        type: 'done',
+        ...(warningMeta ? { messageMeta: warningMeta } : {}),
+      });
       activeStreams.delete(conversationId);
       activeStreamModelKeys.delete(conversationId);
       activeObserverSessions.delete(conversationId);
@@ -489,18 +501,39 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
       const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
       const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
+      const isBuiltInRuntime = (id: string): boolean =>
+        id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
+      const pluginRuntimeId = resolution.inferenceProviderRuntimeId
+        ?? (!isBuiltInRuntime(resolution.runtimeId) ? resolution.runtimeId : undefined);
       const inferenceProvider = pluginManager?.getInferenceProvider({
-        runtimeId: resolution.inferenceProviderRuntimeId ?? resolution.runtimeId,
+        runtimeId: pluginRuntimeId ?? resolution.runtimeId,
         modelProviderKey,
       }) ?? null;
+      if (!inferenceProvider && pluginRuntimeId) {
+        const meta = { runtimeId: pluginRuntimeId };
+        broadcastStreamEvent({
+          conversationId,
+          type: 'error',
+          error: `Runtime "${pluginRuntimeId}" is selected, but no inference provider is available. Start or re-enable the plugin before sending messages.`,
+          messageMeta: meta,
+        });
+        broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+        activeStreams.delete(conversationId);
+        activeStreamModelKeys.delete(conversationId);
+        activeObserverSessions.delete(conversationId);
+        return;
+      }
       if (inferenceProvider) {
         console.info(`[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`);
         let emittedTextDelta = false;
         try {
+          const providerModelKey = rawCatalogEntry?.provider === rawCatalogEntry?.key
+            ? undefined
+            : modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
           const providerStream = inferenceProvider.stream({
             conversationId,
             messages: messages as Array<{ role: string; content: unknown }>,
-            modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+            ...(providerModelKey ? { modelKey: providerModelKey } : {}),
             systemPrompt: effectiveSystemPrompt,
             reasoningEffort,
             abortSignal: controller.signal,
@@ -581,8 +614,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             activeObserverSessions.delete(conversationId);
             return;
           }
-          // No text emitted yet — fall through to standard Mastra pipeline
-          console.warn(`[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text, falling back to standard pipeline:`, providerError);
+          console.error(`[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text:`, providerError);
+          const meta = { runtimeId: inferenceProvider.name };
+          broadcastStreamEvent({
+            conversationId,
+            type: 'error',
+            error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
+            messageMeta: meta,
+          });
+          broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+          activeStreams.delete(conversationId);
+          activeStreamModelKeys.delete(conversationId);
+          activeObserverSessions.delete(conversationId);
+          return;
         }
       }
 

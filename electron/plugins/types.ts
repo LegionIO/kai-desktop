@@ -680,7 +680,7 @@ export type PluginInferenceStreamEvent = {
 export type PluginInferenceStreamOptions = {
   conversationId: string;
   messages: Array<{ role: string; content: unknown }>;
-  modelKey: string;
+  modelKey?: string;
   systemPrompt: string;
   reasoningEffort?: string;
   abortSignal?: AbortSignal;
