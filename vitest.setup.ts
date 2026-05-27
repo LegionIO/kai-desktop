@@ -28,6 +28,16 @@ beforeEach(() => {
   vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
 });
 
+// Kai is a macOS-only product. Several modules under test guard native paths with
+// `process.platform === 'darwin'`. CI runs on Linux runners, so force the platform
+// to darwin here to keep platform-gated code paths exercised everywhere tests run.
+//
+// DOM-specific setup is handled in a separate setupFile (`test-utils/jest-dom-setup.ts`)
+// loaded only by `vitest.component.config.ts`; don't duplicate it here.
+if (process.platform !== 'darwin') {
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+}
+
 // Spy on crypto.randomUUID so tests can assert against deterministic IDs.
 // Tests that need real UUIDs can call `vi.unstubAllGlobals()` themselves.
 let __uuidCounter = 0;

@@ -17,6 +17,8 @@ import type { LLMModelConfig } from '../agent/model-catalog.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
+import { getSharedMemory } from '../agent/memory.js';
+import { updateSubagentStatus } from '../agent/subagent-status.js';
 
 /** Follow-up message queues keyed by subAgentConversationId */
 const followUpQueues = new Map<string, string[]>();
@@ -25,17 +27,20 @@ const activeSubAgentControllers = new Map<string, AbortController>();
 /** Map parent toolCallId → subAgentConversationId for observer lookups */
 const toolCallToSubAgent = new Map<string, string>();
 /** Persisted sub-agent conversation state for resumption */
-const subAgentState = new Map<string, {
-  messages: Array<{ role: string; content: unknown }>;
-  config: AppConfig;
-  modelConfig: LLMModelConfig;
-  tools: ToolDefinition[];
-  dbPath: string;
-  parentConversationId: string;
-  parentToolCallId: string;
-  depth: number;
-  task: string;
-}>();
+const subAgentState = new Map<
+  string,
+  {
+    messages: Array<{ role: string; content: unknown }>;
+    config: AppConfig;
+    modelConfig: LLMModelConfig;
+    tools: ToolDefinition[];
+    dbPath: string;
+    parentConversationId: string;
+    parentToolCallId: string;
+    depth: number;
+    task: string;
+  }
+>();
 
 function broadcastEvent(event: SubAgentEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -83,15 +88,23 @@ async function resumeSubAgent(
 
   // Emit user message event
   broadcastEvent({
-    subAgentConversationId, parentConversationId, parentToolCallId,
+    subAgentConversationId,
+    parentConversationId,
+    parentToolCallId,
     conversationId: subAgentConversationId,
-    type: 'sub-agent-user-message', text: message, source: 'user',
+    type: 'sub-agent-user-message',
+    text: message,
+    source: 'user',
   });
 
   // Emit running status
   broadcastEvent({
-    subAgentConversationId, parentConversationId, parentToolCallId,
-    type: 'sub-agent-status', status: 'running', summary: 'Resuming conversation',
+    subAgentConversationId,
+    parentConversationId,
+    parentToolCallId,
+    type: 'sub-agent-status',
+    status: 'running',
+    summary: 'Resuming conversation',
   });
 
   const localController = new AbortController();
@@ -100,9 +113,12 @@ async function resumeSubAgent(
 
   try {
     const stream = streamAgentResponse(
-      subAgentConversationId, messages, modelConfig,
+      subAgentConversationId,
+      messages,
+      modelConfig,
       { ...config, systemPrompt: config.systemPrompts?.chat?.trim() || config.systemPrompt },
-      tools, dbPath,
+      tools,
+      dbPath,
       {
         abortSignal: localController.signal,
         emitEvent: (event) => {
@@ -135,21 +151,30 @@ async function resumeSubAgent(
     }
 
     broadcastEvent({
-      subAgentConversationId, parentConversationId, parentToolCallId,
-      type: 'sub-agent-status', status: 'completed', summary: 'Response complete',
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
+      type: 'sub-agent-status',
+      status: 'completed',
+      summary: 'Response complete',
     });
 
     // Emit done so the UI finalizes
     broadcastEvent({
-      subAgentConversationId, parentConversationId, parentToolCallId,
-      conversationId: subAgentConversationId, type: 'done',
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
+      conversationId: subAgentConversationId,
+      type: 'done',
     });
-
   } catch (error) {
     broadcastEvent({
-      subAgentConversationId, parentConversationId, parentToolCallId,
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
       conversationId: subAgentConversationId,
-      type: 'error', error: error instanceof Error ? error.message : String(error),
+      type: 'error',
+      error: error instanceof Error ? error.message : String(error),
     });
   } finally {
     followUpQueues.delete(subAgentConversationId);
@@ -188,21 +213,34 @@ export function createSubAgentTool(
       `Current nesting depth: ${currentDepth}.`,
     ].join(' '),
     inputSchema: z.object({
-      task: z.string().describe('The task/instruction for the sub-agent. Be specific and clear about what you want accomplished.'),
+      task: z
+        .string()
+        .describe('The task/instruction for the sub-agent. Be specific and clear about what you want accomplished.'),
       model: z.string().optional().describe('Model key to use for the sub-agent (omit to inherit the current model).'),
-      context: z.string().optional().describe('Additional context from the current conversation that the sub-agent needs.'),
+      context: z
+        .string()
+        .optional()
+        .describe('Additional context from the current conversation that the sub-agent needs.'),
     }),
     execute: async (input: unknown, ctx: ToolExecutionContext): Promise<unknown> => {
       const { task, model, context } = input as { task: string; model?: string; context?: string };
       const config = getConfig();
-      const subAgentConfig = config.tools?.subAgents ?? { enabled: true, maxDepth: 3, maxConcurrent: 4, maxPerParent: 2 };
+      const subAgentConfig = config.tools?.subAgents ?? {
+        enabled: true,
+        maxDepth: 3,
+        maxConcurrent: 4,
+        maxPerParent: 2,
+      };
 
       const maxDepth = subAgentConfig.maxDepth ?? 3;
       if (currentDepth >= maxDepth) {
         return { isError: true, error: `Sub-agent depth limit reached (max: ${maxDepth}).` };
       }
       if (getActiveSubAgentCount() >= (subAgentConfig.maxConcurrent ?? 4)) {
-        return { isError: true, error: `Maximum concurrent sub-agents (${subAgentConfig.maxConcurrent ?? 4}) reached.` };
+        return {
+          isError: true,
+          error: `Maximum concurrent sub-agents (${subAgentConfig.maxConcurrent ?? 4}) reached.`,
+        };
       }
 
       const modelKey = model ?? subAgentConfig.defaultModel ?? null;
@@ -224,16 +262,16 @@ export function createSubAgentTool(
         return { isError: true, error: 'Parent operation was cancelled.' };
       }
 
-      const parentAbortHandler = (): void => { localController.abort(); };
+      const parentAbortHandler = (): void => {
+        localController.abort();
+      };
       ctx.abortSignal?.addEventListener('abort', parentAbortHandler, { once: true });
 
       const baseTools = parentTools ?? [];
       const subAgentTools = baseTools
         .filter((t) => t.name !== 'sub_agent')
         .concat(
-          currentDepth + 1 < maxDepth
-            ? [createSubAgentTool(getConfig, appHome, currentDepth + 1, baseTools)]
-            : [],
+          currentDepth + 1 < maxDepth ? [createSubAgentTool(getConfig, appHome, currentDepth + 1, baseTools)] : [],
         );
 
       try {
@@ -244,15 +282,31 @@ export function createSubAgentTool(
           stream: 'stdout',
           delta: `[Sub-agent started] Task: ${task.slice(0, 200)}\n`,
           output: `[Sub-agent started] Task: ${task.slice(0, 200)}\n`,
-          bytesSeen: 0, truncated: false, stopped: false,
+          bytesSeen: 0,
+          truncated: false,
+          stopped: false,
           subAgentConversationId,
         });
+
+        // Set initial status to 'running' and link to parent
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: 'running',
+              parentThreadId: ctx.conversationId,
+            });
+          }
+        } catch (err) {
+          console.error('[Subagent] Failed to set initial status:', err);
+        }
 
         const stream = runSubAgent({
           subAgentConversationId,
           parentConversationId: ctx.toolCallId,
           parentToolCallId: ctx.toolCallId,
-          task, context,
+          task,
+          context,
           depth: currentDepth + 1,
           config,
           modelConfig: modelEntry.modelConfig,
@@ -270,11 +324,13 @@ export function createSubAgentTool(
           if (event.type === 'text-delta' && 'text' in event && event.text) {
             fullResponse += event.text;
             ctx.onProgress?.({
-              stream: 'stdout', delta: event.text,
+              stream: 'stdout',
+              delta: event.text,
               output: fullResponse.slice(-4000),
               bytesSeen: fullResponse.length,
               truncated: fullResponse.length > 4000,
-              stopped: false, subAgentConversationId,
+              stopped: false,
+              subAgentConversationId,
             });
           } else if (event.type === 'tool-call' && 'toolName' in event) {
             const toolName = event.toolName ?? 'unknown';
@@ -283,7 +339,9 @@ export function createSubAgentTool(
               stream: 'stdout',
               delta: `[Sub-agent using tool: ${toolName}]\n`,
               output: `[Sub-agent using tool: ${toolName}]\n`,
-              bytesSeen: fullResponse.length, truncated: false, stopped: false,
+              bytesSeen: fullResponse.length,
+              truncated: false,
+              stopped: false,
               subAgentConversationId,
             });
           } else if (event.type === 'sub-agent-status') {
@@ -291,7 +349,9 @@ export function createSubAgentTool(
               stream: 'stdout',
               delta: `[Status: ${event.status}] ${event.summary ?? ''}\n`,
               output: `[Status: ${event.status}] ${event.summary ?? ''}\n`,
-              bytesSeen: fullResponse.length, truncated: false, stopped: false,
+              bytesSeen: fullResponse.length,
+              truncated: false,
+              stopped: false,
               subAgentConversationId,
             });
           }
@@ -299,19 +359,35 @@ export function createSubAgentTool(
 
         // Persist state for resumption after completion
         // Collect messages from the runner (they were built up in runSubAgent)
-        const persistedMessages: Array<{ role: string; content: unknown }> = [
-          { role: 'user', content: task },
-        ];
+        const persistedMessages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: task }];
         if (fullResponse) persistedMessages.push({ role: 'assistant', content: fullResponse });
 
         subAgentState.set(subAgentConversationId, {
           messages: persistedMessages,
-          config, modelConfig: modelEntry.modelConfig,
-          tools: subAgentTools, dbPath,
+          config,
+          modelConfig: modelEntry.modelConfig,
+          tools: subAgentTools,
+          dbPath,
           parentConversationId: ctx.toolCallId,
           parentToolCallId: ctx.toolCallId,
-          depth: currentDepth + 1, task,
+          depth: currentDepth + 1,
+          task,
         });
+
+        // Persist completion status to database
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            const finalStatus = localController.signal.aborted ? 'stopped' : 'completed';
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: finalStatus,
+              completedAt: new Date().toISOString(),
+              exitReason: localController.signal.aborted ? 'user_aborted' : 'task_complete',
+            });
+          }
+        } catch (err) {
+          console.error('[Subagent] Failed to update completion status:', err);
+        }
 
         return {
           subAgentConversationId,
@@ -321,10 +397,26 @@ export function createSubAgentTool(
           status: localController.signal.aborted ? 'stopped' : 'completed',
         };
       } catch (error) {
+        // Persist failure status to database
+        try {
+          const memory = getSharedMemory(config, dbPath);
+          if (memory) {
+            await updateSubagentStatus(memory, subAgentConversationId, {
+              status: 'failed',
+              completedAt: new Date().toISOString(),
+              exitReason: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+            });
+          }
+        } catch (dbErr) {
+          console.error('[Subagent] Failed to update error status in DB:', dbErr);
+        }
+
         return {
-          isError: true, subAgentConversationId,
+          isError: true,
+          subAgentConversationId,
           error: error instanceof Error ? error.message : String(error),
-          depth: currentDepth + 1, status: 'error',
+          depth: currentDepth + 1,
+          status: 'error',
         };
       } finally {
         ctx.abortSignal?.removeEventListener('abort', parentAbortHandler);
