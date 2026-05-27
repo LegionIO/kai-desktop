@@ -134,10 +134,15 @@ functions in [`docs/adr/0002-thread-conversation-chat-naming-convention.md`](doc
 | Mastra / agent internals                     | **Thread**       | Mastra runtime `scope === "thread"` check                                                 |
 | IPC channels, parameters, on-disk storage    | **Conversation** | Wire-protocol + `conversations.json` stability                                            |
 
-Directory names match their **integration boundary** (e.g.
-`src/components/thread/` is named for `ThreadPrimitive`), not the UI
-vocabulary at the leaves — so `thread/ChatSettingsButton.tsx` and
-`thread/SubAgentThread.tsx` coexist correctly in the same directory.
+Directory names follow the **user-facing surface** a user would name in
+conversation. The chat surface lives in `src/components/thread/` today;
+that directory will rename to `src/components/chat/` once the in-flight
+PR backlog drains (see ADR-0002 §Directory naming). The sidebar
+chat-list directory renames `conversations/ → chat-list/` in the same
+commit. **Symbol** names inside still follow the layer rules in the
+table above — so leaves like `SubAgentThread.tsx` (Thread-layer symbol,
+assistant-ui contract) and `RenameChatModal.tsx` (Chat-layer symbol,
+user-facing UI) coexist correctly inside the chat directory.
 
 ## IPC Boundary
 

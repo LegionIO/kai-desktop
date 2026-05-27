@@ -71,7 +71,10 @@ Each layer of the codebase uses the term that matches its forcing function:
 ### Worked examples
 
 These examples ground the Decision table above; each one points to a
-real symbol on `main`.
+real symbol on `main`. Directory paths shown are the pre-rename layout;
+once the rename in §Directory naming lands, `thread/` becomes `chat/`
+and `conversations/` becomes `chat-list/`. Symbol names follow contracts
+and don't move.
 
 - `electron/config/schema.ts`: `scope: z.enum(['thread', 'resource'])` —
   Thread layer (Mastra runtime contract)
@@ -79,10 +82,10 @@ real symbol on `main`.
   Conversation layer (wire format)
 - `src/providers/RuntimeProvider.tsx`: `const [activeConversationId, ...]` —
   Conversation layer (state references storage entity)
-- `src/components/thread/SubAgentThread.tsx` — Thread layer (assistant-ui
-  composition primitive)
-- `src/components/thread/ChatSettingsButton.tsx` — Chat layer (UI leaf)
-  inside a Thread-layer directory (assistant-ui boundary)
+- `src/components/thread/SubAgentThread.tsx` — Thread layer
+  (assistant-ui composition primitive). The **symbol** name `SubAgentThread`
+  persists post-rename because it names the assistant-ui contract; only
+  the parent directory renames.
 - `electron/plugins/types.ts`: `PluginThreadDecorationDescriptor` — Thread
   layer (assistant-ui extension API)
 - IPC channels: `conversations:list`, `conversations:get`, `agent:stream`
@@ -102,15 +105,52 @@ activation, not storage operations on a conversation entity.
 
 ### Directory naming
 
-Directory names match their **integration boundary**, not the user-facing
-vocabulary at the leaves. `src/components/thread/` is named for the
-`@assistant-ui/react` `ThreadPrimitive` it composes around; the files
-inside follow the layer rules above, so leaves like `ChatSettingsButton.tsx`
-and `SubAgentThread.tsx` coexist in the same directory and that is correct.
+Name a `src/components/` directory for the **user-facing surface a user
+would name in conversation**. Use a **boundary name** only when the
+directory's primary export is a contract-shaped abstraction other
+directories depend on — i.e. removing it would break unrelated features,
+not just one user-facing surface.
 
-The same applies to `src/components/conversations/`: the directory is the
-storage-domain grouping, and the files inside use UI vocabulary at the
-leaves (`ChatsListPage.tsx`, `RenameChatModal.tsx`).
+An audit of the eleven directories under `src/components/` on `main`
+finds: four directories cleanly support a boundary reading (`overlay/`,
+`plugins/`, `thread/`, `ui/`), five are user-facing surface names
+(`agents/`, `backgrounds/`, `settings/`, `sidebar/`, `tasks/`), and two
+are dual-named (`conversations/`, `dictation/`). The dominant pattern
+is user-facing-surface naming; boundary naming is the narrower case.
+
+Applied to the dual-named directories:
+
+- `src/components/thread/` — **misnamed under this rule**. The directory
+  is the chat surface: a user calls this "the chat," not "the
+  assistant-ui thread surface." `ThreadPrimitive` is an internal
+  composition primitive used inside `Thread.tsx` itself, not a contract
+  other unrelated features depend on. The only cross-feature coupling
+  is two utility leaves (`MarkdownText`, `RecordingButton`) imported by
+  `src/components/tasks/` — that is an extraction smell, not a
+  load-bearing boundary.
+- `src/components/conversations/` — also misnamed. The user-facing
+  surface is "the chat list" (sidebar list of chats). The directory
+  currently mirrors the storage-domain name from
+  `electron/ipc/conversations.ts`, but renderer directories are not
+  wire-protocol-stable, so the storage mirror buys nothing the IPC
+  channel namespace doesn't already provide.
+
+**Commitment**: rename `src/components/thread/ → src/components/chat/`
+and `src/components/conversations/ → src/components/chat-list/`. The
+two shared utilities (`MarkdownText`, `RecordingButton`) extract to
+`src/components/shared/` first, so the renamed `chat/` directory
+contains only chat-surface code.
+
+**Sequencing**: execution is deferred until the in-flight PR backlog
+touching these directories drains. A bulk path rename mid-stream
+produces gratuitous conflicts on every open PR. The rename ships as a
+single mechanical commit once the backlog clears; until then, **new
+files in these directories follow the layer rules above and the
+rename plan absorbs them automatically**.
+
+The wire-protocol layers (`electron/ipc/conversations.ts`,
+`conversations.json`, Mastra `scope === "thread"`) are unaffected by
+the directory rename and stay as documented in the Decision table.
 
 ### Container layer vs. prop / parameter layer
 
@@ -156,22 +196,36 @@ has no library forcing function pulling it toward "Thread".
 Rejected. Conflicts with `@assistant-ui/react`'s `Thread*` vocabulary —
 there is no `ConversationPrimitive`. Not what users say.
 
-### Rename directories now and absorb the migration debt
+### Keep `thread/` and `conversations/` directory names as-is
 
-Rejected. This was iamhollow's original proposal in #13: rename
-`src/components/thread/ → src/components/chat/` and
-`src/components/conversations/ → src/components/chat-list/`. The
-architectural argument against: directory names express the
-_integration boundary_ (the `@assistant-ui/react` composition surface,
-the storage domain), while file names express what the file is.
-Renaming the directories erases the integration-boundary signal in
-favor of UI vocabulary, telling future readers "these are just chat
-UI files" when they are actually "the assistant-ui thread surface that
-_renders as_ chat" and "the conversation storage domain that _renders
-as_ a chat list." Renaming is technically possible — and the migration
-cost is real — but it would lose information rather than add it. The
-file-level Chat naming inside the existing directories is the better
-tradeoff.
+Rejected. This was the original framing of this ADR: directory names
+express the _integration boundary_ (the `@assistant-ui/react`
+composition surface, the storage domain); file names express what the
+file is. The argument _for_ keeping the names: renaming erases the
+integration-boundary signal in favor of UI vocabulary, telling future
+readers "these are just chat UI files" when they are actually "the
+assistant-ui thread surface that _renders as_ chat."
+
+The argument doesn't survive a per-directory audit. Across the eleven
+`src/components/` directories on `main`, only four match an
+integration-boundary reading (`overlay/`, `plugins/`, `thread/`, `ui/`);
+five are user-facing surface names (`agents/`, `backgrounds/`,
+`settings/`, `sidebar/`, `tasks/`); two are dual-named
+(`conversations/`, `dictation/`). The dominant pattern is user-facing
+surface naming, not boundary naming. Preserving the integration-boundary
+framing would force eleven directories to defend the same rule and most
+of them can't.
+
+Applied to `thread/` itself: the directory contains 33 chat-surface
+files (composer, message renderers, tool group display, selectors). Its
+twelve importers are dominated by `src/App.tsx`; the only cross-feature
+coupling is two utility leaves imported by `src/components/tasks/`
+(`MarkdownText`, `RecordingButton`) — accidental leakage, not a
+contract other features depend on. Under the user-facing-surface rule
+(§Directory naming), the directory should be named `chat/`. The same
+analysis applies to `conversations/` → `chat-list/`. iamhollow's
+original proposal in #13 was directionally right; this ADR commits to
+the rename, deferred until the in-flight PR backlog drains.
 
 ### Stop using `@assistant-ui/react`
 
@@ -206,10 +260,12 @@ assumes the dependency stays.
 
 ### Negative
 
-- **Mixed dialect inside directories.** Following the layer rules means
-  `src/components/thread/ChatSettingsButton.tsx` looks inconsistent at
-  first glance. The integration-boundary explanation in the Decision
-  section above is necessary context.
+- **Mixed dialect inside directories during the rename window.** Until
+  the §Directory naming rename ships, paths like
+  `src/components/thread/ChatSettingsButton.tsx` mix Thread-vocab
+  directories with Chat-vocab leaves. The mix resolves once the rename
+  lands; until then, the §Directory naming subsection is necessary
+  context for any reader encountering one of these paths.
 - **Cognitive overhead at boundary crossings.** Code at the IPC ↔ Mastra
   boundary reads `memory.getThreadById({ threadId: conversationId })` —
   the same string identifier carries two names depending on which side
@@ -223,14 +279,32 @@ assumes the dependency stays.
   table — the pragmatic rule is that renderer state names follow
   whichever layer the event or state is bridging at that moment.
 - **OSS-contributor learning cost.** A first-time external contributor
-  will encounter `src/components/conversations/ThreadSettingsModal.tsx`
-  — a single file path with three vocabulary terms in it — and need to
-  read this ADR to interpret it. Internal contributors can ask in chat;
-  OSS contributors cannot. The Mitigation pointers exist to shorten
-  this curve.
-- **High switching cost.** Any future decision to change the convention
-  (for example if Mastra changes its scope enum in a breaking release)
-  requires touching multiple layers atomically.
+  will encounter file paths like
+  `src/components/conversations/ThreadSettingsModal.tsx` (pre-rename)
+  or `src/components/chat-list/ThreadSettingsModal.tsx` (post-rename)
+  and need to read this ADR to understand the Thread/Chat split. The
+  directory rename reduces this from three vocabulary terms in one
+  path to two, but the layer rules still require Thread and
+  Conversation symbols in some leaves. Internal contributors can ask
+  in chat; OSS contributors cannot. The Mitigation pointers exist to
+  shorten this curve.
+- **Directory-rename migration cost.** The §Directory naming
+  commitment requires renaming `src/components/thread/ →
+src/components/chat/` and `src/components/conversations/ →
+src/components/chat-list/`. This touches every import site (twelve
+  for `thread/`, six for `conversations/`), invalidates `git
+log --follow` callers that don't pass `-M`, and produces conflicts on
+  every open PR that touches files in these directories. The rename
+  is deferred until the in-flight PR backlog drains; it then ships as
+  a single mechanical commit. The two utility leaves
+  (`MarkdownText.tsx`, `RecordingButton.tsx`) that
+  `src/components/tasks/` depends on extract to
+  `src/components/shared/` first — see Mitigation.
+- **Layer-cross-boundary cost remains.** Any future decision to change
+  the convention (for example if Mastra changes its scope enum in a
+  breaking release) still requires touching multiple layers
+  atomically. The directory rename does not address this; only the
+  wire-format mitigations (branded ID types, lint rules) would.
 - **Documentation-only enforcement.** There is no lint rule, no CI gate,
   and no runtime check that asserts the convention is preserved across
   PRs. Drift is possible. See Mitigation for the path to mechanizing
@@ -241,22 +315,43 @@ assumes the dependency stays.
 - The pointer in `CLAUDE.md` ("Naming Convention" section) and the
   `### Naming Convention` subsection in `CONTRIBUTING.md` route both
   agents and human contributors to this ADR at the moment of need.
+- **Pre-rename: extract shared utilities.** Before the
+  `thread/ → chat/` directory rename can land, the two leaves that
+  `src/components/tasks/` depends on must move out of the chat surface
+  so the renamed `chat/` directory contains only chat-surface code:
+  - `src/components/thread/MarkdownText.tsx` → `src/components/shared/MarkdownText.tsx`
+    (imported by `tasks/TaskDetailModal.tsx`, `tasks/TaskCreationView.tsx`,
+    `tasks/TaskDetailPanel.tsx`, and several leaves inside `thread/`
+    itself)
+  - `src/components/thread/RecordingButton.tsx` → `src/components/shared/RecordingButton.tsx`
+    (imported by `tasks/TaskCreationView.tsx`,
+    `tasks/TaskDetailPanel.tsx`, and `thread/ComposerInput.tsx`)
+
+  These two files are extraction candidates regardless of the rename —
+  authored as chat-surface leaves but adopted by `tasks/`, they are now
+  cross-feature utilities masquerading as chat-surface code. The
+  extraction ships as a separate commit before the directory rename
+  and unblocks it.
+
 - Drift can be audited manually with `grep` against these rules:
-  - Imports from `@assistant-ui/react` live only under
-    `src/components/thread/` or `src/providers/`. Hits elsewhere mean
-    the assistant-ui composition surface is leaking outside its
-    integration boundary.
+  - Imports from `@assistant-ui/react` live only under the chat
+    directory (`src/components/thread/` pre-rename;
+    `src/components/chat/` post-rename) or `src/providers/`. Hits
+    elsewhere mean the assistant-ui composition surface is leaking
+    outside the chat directory.
   - IPC channel prefixes use `conversations:` for storage operations,
     not `chat:`. A `chat:list` / `chat:get` / `chat:delete` channel is
-    a wire-format drift signal.
+    a wire-format drift signal. The directory rename does **not**
+    extend to IPC; storage is still wire-protocol-stable.
   - `conversations.json` and `scope: "thread"` are byte-stable. Any
     diff that touches the literal `"conversations.json"` filename or
     the `'thread'` enum value in `electron/config/schema.ts` is
     crossing a wire-protocol boundary and needs review.
-    A real ESLint custom rule or branded ID types (`type ConversationId =
+
+  A real ESLint custom rule or branded ID types (`type ConversationId =
 string & { __brand: ... }`) is the long-term answer that converts
-    this convention from documentation-only to a hard typecheck gate,
-    but that is a larger change than this ADR.
+  this convention from documentation-only to a hard typecheck gate,
+  but that is a larger change than this ADR.
 
 ## References
 
