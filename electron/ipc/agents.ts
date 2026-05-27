@@ -194,6 +194,16 @@ export function assignTaskToAgent(appHome: string, agentId: string, taskId: stri
     }
   }
 
+  // Clear the previous agent that was assigned to this task (if different)
+  if (task.assignedAgentId && task.assignedAgentId !== agentId) {
+    const prevAgent = readAgent(appHome, task.assignedAgentId);
+    if (prevAgent && prevAgent.currentTaskId === taskId) {
+      prevAgent.currentTaskId = undefined;
+      prevAgent.updatedAt = new Date().toISOString();
+      writeAgent(appHome, prevAgent);
+    }
+  }
+
   agent.currentTaskId = taskId;
   agent.updatedAt = new Date().toISOString();
   writeAgent(appHome, agent);
@@ -263,12 +273,55 @@ export async function startAgentRun(
     broadcastAgentChange(appHome);
     broadcastTaskChange(appHome);
 
-    if (task.description && (effectiveRuntime === 'claude-code' || effectiveRuntime === 'codex')) {
+    if (task.description) {
       setTimeout(() => {
         const prompt = task.description.trim() + '\n';
         terminalManager.write(sessionId, prompt);
       }, 1500);
     }
+
+    // Register immediate exit callback for fast reconciliation
+    terminalManager.onSessionExit(sessionId, (exitCode: number) => {
+      const freshAgent = readAgent(appHome, agentId);
+      if (!freshAgent || freshAgent.status !== 'running') return;
+
+      const requireHumanReview =
+        (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
+      const { nextStatus, isCrash } = analyzeCompletion(exitCode, { requireHumanReview });
+
+      freshAgent.terminalSessionId = undefined;
+      freshAgent.updatedAt = new Date().toISOString();
+
+      if (isCrash) {
+        const now = new Date();
+        if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
+          freshAgent.stats.crashCount = 0;
+        }
+        freshAgent.stats.crashCount += 1;
+        freshAgent.stats.lastCrashAt = now.toISOString();
+
+        const cap = freshAgent.config.maxCrashesPerDay ?? 5;
+        freshAgent.status = freshAgent.stats.crashCount >= cap ? 'error' : 'idle';
+      } else {
+        freshAgent.status = 'idle';
+        freshAgent.stats.tasksCompleted += 1;
+      }
+      writeAgent(appHome, freshAgent);
+
+      if (freshAgent.currentTaskId) {
+        const exitTask = readTask(appHome, freshAgent.currentTaskId);
+        if (exitTask) {
+          const taskNow = new Date().toISOString();
+          exitTask.status = nextStatus;
+          exitTask.terminalSessionId = undefined;
+          exitTask.updatedAt = taskNow;
+          if (nextStatus === 'done') exitTask.completedAt = taskNow;
+          writeTask(appHome, exitTask);
+          broadcastTaskChange(appHome);
+        }
+      }
+      broadcastAgentChange(appHome);
+    });
 
     return { sessionId };
   } catch (err) {

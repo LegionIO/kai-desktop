@@ -29,6 +29,16 @@ export class TaskTerminalManager {
   private terminals = new Map<string, TaskTerminal>();
   /** Exit codes for recently-exited sessions, keyed by sessionId. */
   private exitCodes = new Map<string, number>();
+  /** Callbacks invoked immediately when a terminal session exits. */
+  private exitCallbacks = new Map<string, (exitCode: number) => void>();
+
+  /**
+   * Register a callback to be notified immediately when a terminal session exits.
+   * The callback is automatically removed after it fires.
+   */
+  onSessionExit(sessionId: string, callback: (exitCode: number) => void): void {
+    this.exitCallbacks.set(sessionId, callback);
+  }
 
   async create(
     taskId: string,
@@ -60,6 +70,8 @@ export class TaskTerminalManager {
     proc.onExit(({ exitCode }: { exitCode: number }) => {
       this.terminals.delete(sessionId);
       this.exitCodes.set(sessionId, exitCode);
+      this.exitCallbacks.get(sessionId)?.(exitCode);
+      this.exitCallbacks.delete(sessionId);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
 

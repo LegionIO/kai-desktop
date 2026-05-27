@@ -50,7 +50,7 @@ interface TaskDetailPanelProps {
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
   const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
-  const { state: agentState, startAgent, unassignTask } = useAgents();
+  const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
@@ -256,13 +256,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   }, [assignedAgent, startAgent]);
 
-  const handleStopAgent = useCallback(() => {
-    if (terminalSessionId) {
-      void app.tasks.terminalKill(terminalSessionId);
-      setTerminalSessionId(null);
-      void updateTask(task.id, { terminalSessionId: undefined, status: 'human_review' });
-    }
-  }, [terminalSessionId, task.id, updateTask]);
+  const handleStopAgent = useCallback(async () => {
+    if (!assignedAgent) return;
+    await stopAgent(assignedAgent.id);
+    setTerminalSessionId(null);
+  }, [assignedAgent, stopAgent]);
 
   const handleTerminalExit = useCallback(
     (_exitCode: number) => {

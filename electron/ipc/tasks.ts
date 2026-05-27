@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdir
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
+import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
@@ -145,6 +146,14 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     }
     try {
       const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+      // Validate state machine transition
+      if (updates.status && existing.status !== updates.status) {
+        if (!isValidTransition(existing.status, updates.status)) {
+          return { error: `Invalid transition: ${existing.status} → ${updates.status}` };
+        }
+      }
+
       // Don't bump updatedAt for operational/bookkeeping-only fields.
       // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
       const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
