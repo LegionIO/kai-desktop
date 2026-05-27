@@ -4,19 +4,22 @@
  * was killed mid-task.
  *
  * Scheduling:
- *   - A `node-schedule` cron fires once a day at 03:00 local time.
+ *   - A native `setTimeout` fires the first sweep at the next 03:00 local time,
+ *     then a `setInterval` repeats every 24 h. We deliberately do not depend on
+ *     a cron library (`node-schedule` was removed in PR #29) for a single
+ *     fixed daily slot — DST drift over a 24 h interval is acceptable given
+ *     the 72 h orphan window this protects.
  *   - On startup we also read a tiny timestamp file
  *     (`<APP_HOME>/data/subagent-cleanup-last-run.txt`) and run an immediate
  *     catch-up sweep if the last run was >25 h ago (or the file is missing).
- *     This covers the macOS-sleep / app-not-running case where a cron from a
- *     previous day was simply skipped.
- *   - Every successful sweep (cron OR startup catch-up) rewrites the file
+ *     This covers the macOS-sleep / app-not-running case where the daily
+ *     fire from a previous day was simply skipped.
+ *   - Every successful sweep (timer OR startup catch-up) rewrites the file
  *     with `Date.now()` so both paths keep the timestamp fresh.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
-import schedule from 'node-schedule';
 import { getResourceId, getSharedMemory } from '../agent/memory.js';
 import { readSubagentStatus, updateSubagentStatus } from '../agent/subagent-status.js';
 import type { AppConfig } from '../config/schema.js';
@@ -137,9 +140,23 @@ export function initializeSubagentCleanup(getConfig: () => AppConfig, appHome: s
     void runSweep('startup');
   }
 
-  // Daily cron at 03:00 local time.
-  schedule.scheduleJob('0 3 * * *', () => {
+  // Daily timer at 03:00 local time: wait until next 03:00, then repeat every 24 h.
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const now = new Date();
+  const next3am = new Date(now);
+  next3am.setHours(3, 0, 0, 0);
+  if (next3am.getTime() <= now.getTime()) {
+    next3am.setDate(next3am.getDate() + 1);
+  }
+  const msUntilNext = next3am.getTime() - now.getTime();
+  const initialTimer = setTimeout(() => {
     void runSweep('cron');
-  });
+    const intervalTimer = setInterval(() => {
+      void runSweep('cron');
+    }, ONE_DAY_MS);
+    // Allow the process to exit even with the interval pending.
+    intervalTimer.unref?.();
+  }, msUntilNext);
+  initialTimer.unref?.();
   console.info('[Cleanup] Sub-agent cleanup scheduled (daily at 03:00)');
 }

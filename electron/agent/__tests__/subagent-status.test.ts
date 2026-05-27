@@ -10,6 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Memory } from '@mastra/memory';
 import type { StorageThreadType } from '@mastra/core/memory';
 import { readSubagentStatus, updateSubagentStatus, __internal } from '../subagent-status.js';
 
