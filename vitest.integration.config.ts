@@ -21,7 +21,12 @@ export default defineConfig({
       // see them in the list but skip every test inside.
       'electron/__tests__/integration-real/**/*.real.test.ts',
     ],
-    exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
+    // `*.darwin.test.ts`: see comment in vitest.unit.config.ts.
+    exclude: [
+      '**/*.nightly.test.ts',
+      'node_modules/**',
+      ...(process.platform !== 'darwin' ? ['**/*.darwin.test.ts'] : []),
+    ],
     environment: 'node',
     globals: true,
     setupFiles: [

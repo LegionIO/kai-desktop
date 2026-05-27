@@ -22,7 +22,12 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 export default defineConfig({
   test: {
     include: ['src/**/*.component.test.tsx', 'src/**/*.test.tsx'],
-    exclude: ['**/*.nightly.test.ts', 'node_modules/**'],
+    // `*.darwin.test.ts`: see comment in vitest.unit.config.ts.
+    exclude: [
+      '**/*.nightly.test.ts',
+      'node_modules/**',
+      ...(process.platform !== 'darwin' ? ['**/*.darwin.test.ts'] : []),
+    ],
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./vitest.setup.ts', './test-utils/jest-dom-setup.ts'],

@@ -19,12 +19,19 @@ import { brandDefines } from './vitest.config';
 export default defineConfig({
   test: {
     include: ['electron/**/*.test.ts', 'test-utils/**/*.test.ts', 'scripts/__tests__/**/*.test.ts'],
+    // `*.darwin.test.ts` files load platform-specific native bindings
+    // (e.g. `@mastra/libsql` → `@libsql/darwin-{arm64,x64}`) at module
+    // evaluation time. Excluded on non-darwin runners so Linux CI (incl.
+    // the coverage workflow) does not crash with `Cannot find module
+    // '@libsql/darwin-x64'`. Kai ships macOS-only per CLAUDE.md, so the
+    // contract is exercised on the `pr-mac-build` CI job.
     exclude: [
       '**/*.component.test.tsx',
       '**/*.integration.test.ts',
       '**/*.nightly.test.ts',
       'electron/__tests__/canaries/**',
       'node_modules/**',
+      ...(process.platform !== 'darwin' ? ['**/*.darwin.test.ts'] : []),
     ],
     environment: 'node',
     globals: true,
