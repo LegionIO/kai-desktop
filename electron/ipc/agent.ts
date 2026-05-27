@@ -38,6 +38,7 @@ import {
 import { sendSubAgentFollowUp, sendSubAgentFollowUpByToolCall, stopSubAgent, getActiveSubAgentIds } from '../tools/sub-agent.js';
 import { recordUsageEvent } from './usage.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
+import { normalizeTokenUsage } from '../../shared/token-usage.js';
 import type { HookMessage } from '../plugins/types.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
@@ -60,6 +61,7 @@ import { pendingQuestionAnswers } from '../tools/ask-user.js';
 const activeStreamModelKeys = new Map<string, string>();
 
 function broadcastStreamEvent(event: StreamEvent): void {
+  let eventToBroadcast = event;
   // Debug: log every event broadcast
   const eventSummary = event.type === 'text-delta'
     ? `text-delta len=${(event.text ?? '').length}`
@@ -77,31 +79,26 @@ function broadcastStreamEvent(event: StreamEvent): void {
 
   // Intercept context-usage events to record LLM token usage
   if (event.type === 'context-usage' && event.conversationId) {
-    const data = event.data as {
-      inputTokens?: number;
-      outputTokens?: number;
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      totalTokens?: number;
-    } | undefined;
-    if (data && (data.inputTokens || data.outputTokens || data.totalTokens)) {
+    const data = normalizeTokenUsage(event.data);
+    if (data) {
+      eventToBroadcast = { ...event, data };
       recordUsageEvent({
         modality: 'llm',
         conversationId: event.conversationId,
         modelKey: activeStreamModelKeys.get(event.conversationId) ?? undefined,
-        inputTokens: data.inputTokens ?? 0,
-        outputTokens: data.outputTokens ?? 0,
-        cacheReadTokens: data.cacheReadTokens ?? 0,
-        cacheWriteTokens: data.cacheWriteTokens ?? 0,
-        totalTokens: data.totalTokens ?? 0,
+        inputTokens: data.inputTokens,
+        outputTokens: data.outputTokens,
+        cacheReadTokens: data.cacheReadTokens,
+        cacheWriteTokens: data.cacheWriteTokens,
+        totalTokens: data.totalTokens,
       });
     }
   }
 
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:stream-event', event);
+    win.webContents.send('agent:stream-event', eventToBroadcast);
   }
-  broadcastToWebClients('agent:stream-event', event);
+  broadcastToWebClients('agent:stream-event', eventToBroadcast);
 }
 
 function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): AbortSignal | undefined {

@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.89] - 2026-05-27
+
+### Fixed
+- Restore token input/output metrics in the message info popover by normalizing Legion daemon, plugin, and OpenAI-compatible context-usage payloads before recording or rendering them.
+
 ## [1.0.88] - 2026-05-27
 
 ### Fixed

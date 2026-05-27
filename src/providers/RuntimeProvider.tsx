@@ -10,6 +10,7 @@ import { useAttachments } from './AttachmentContext';
 import { useConfig } from './ConfigProvider';
 import { createUnifiedSpeechAdapter, createUnifiedRecordingAdapter, type AudioProvider } from '@/lib/audio/speech-adapters';
 import { buildResponseTiming, getResponseTiming, withResponseTiming } from '@/lib/response-timing';
+import { normalizeTokenUsage, type TokenUsageData as NormalizedTokenUsageData } from '../../shared/token-usage';
 
 export type DebateEnrichment = {
   enabled: boolean;
@@ -36,13 +37,7 @@ export type PipelineEnrichments = {
   curation?: CurationEnrichment;
 };
 
-export type TokenUsageData = {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  totalTokens: number;
-};
+export type TokenUsageData = NormalizedTokenUsageData;
 
 type ContentPart =
   | { type: 'text'; text: string; source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' }
@@ -1798,22 +1793,8 @@ export function RuntimeProvider({
           })();
         }
       } else if (e.type === 'context-usage') {
-        const usageData = e.data as {
-          inputTokens?: number;
-          outputTokens?: number;
-          cacheReadTokens?: number;
-          cacheWriteTokens?: number;
-          totalTokens?: number;
-        } | undefined;
-        if (usageData?.inputTokens !== undefined || usageData?.outputTokens !== undefined) {
-          applyTokenUsage(acc, {
-            inputTokens: usageData.inputTokens ?? 0,
-            outputTokens: usageData.outputTokens ?? 0,
-            cacheReadTokens: usageData.cacheReadTokens ?? 0,
-            cacheWriteTokens: usageData.cacheWriteTokens ?? 0,
-            totalTokens: usageData.totalTokens ?? (usageData.inputTokens ?? 0) + (usageData.outputTokens ?? 0),
-          });
-        }
+        const usageData = normalizeTokenUsage(e.data);
+        if (usageData) applyTokenUsage(acc, usageData);
       } else if (e.type === 'model-fallback') {
         const fbData = e.data as {
           fromModel: string;
