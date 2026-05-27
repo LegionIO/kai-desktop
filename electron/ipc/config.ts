@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, watch, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
+import { toBroadcastSafeConfig } from '../plugins/safe-config.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { binaryExists } from '../tools/cli-tools.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
@@ -1107,7 +1108,18 @@ export function registerConfigHandlers(
     if (snapshot === lastBroadcastSnapshot) return;
 
     lastBroadcastSnapshot = snapshot;
-    broadcastToAllWindows('config:changed', currentConfig);
+    // Redact credential leaves before the broadcast crosses the IPC and
+    // WebSocket boundaries. `broadcastToAllWindows` fans out to every
+    // BrowserWindow (including any in-process renderer running third-party
+    // plugin code loaded via plugin-renderer://) and to every connected
+    // web-server WebSocket client. The raw `currentConfig` must stay on
+    // the main-process side; only `onChanged?.(...)` receives it, since
+    // main-process subsystems (agent, MCP loader, etc.) legitimately need
+    // the credentials. The same denylist as the plugin-sandbox redactor
+    // is used so there is a single source of truth for what counts as a
+    // credential — see `electron/plugins/safe-config.ts`.
+    const broadcastPayload = toBroadcastSafeConfig(currentConfig);
+    broadcastToAllWindows('config:changed', broadcastPayload);
     onChanged?.(currentConfig);
   };
 
