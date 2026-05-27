@@ -275,7 +275,11 @@ export async function startAgentRun(
     broadcastAgentChange(appHome);
     broadcastTaskChange(appHome);
 
-    if (task.description) {
+    // Only auto-write task description to agent-backed runtimes (claude-code, codex)
+    // that accept text prompts. Shell-backed runtimes (mastra/default) would execute
+    // the description as a shell command — a security risk.
+    const promptableRuntimes = ['claude-code', 'codex'];
+    if (task.description && promptableRuntimes.includes(effectiveRuntime)) {
       setTimeout(() => {
         const prompt = task.description.trim() + '\n';
         terminalManager.write(sessionId, prompt);
@@ -385,6 +389,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
   ipcMain.handle('agents:update', (_e, id: string, updates: Partial<AgentFile>) => {
     if (!isValidId(id)) return { error: 'Invalid agent ID' };
+    // Validate nested IDs to prevent path traversal via persisted references
+    if (updates.currentTaskId && !isValidId(updates.currentTaskId)) {
+      return { error: 'Invalid task ID in update' };
+    }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };
     try {

@@ -72,8 +72,13 @@ export class TaskTerminalManager {
     proc.onExit(({ exitCode }: { exitCode: number }) => {
       this.terminals.delete(sessionId);
       this.exitCodes.set(sessionId, exitCode);
-      this.exitCallbacks.get(sessionId)?.(exitCode);
+      const cb = this.exitCallbacks.get(sessionId);
       this.exitCallbacks.delete(sessionId);
+      // If a callback consumed the exit, clean up the code immediately
+      if (cb) {
+        cb(exitCode);
+        this.exitCodes.delete(sessionId);
+      }
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
 
@@ -141,6 +146,7 @@ export class TaskTerminalManager {
     }
     this.terminals.clear();
     this.exitCodes.clear();
+    this.exitCallbacks.clear();
   }
 
   private getShellCommand(runtime: string, customArgs?: string[]): { command: string; args: string[] } {
