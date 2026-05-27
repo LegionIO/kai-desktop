@@ -6,19 +6,16 @@
  */
 
 import { type FC, useState, useEffect, useRef, useCallback } from 'react';
-import {
-  BotIcon,
-  TerminalIcon,
-  Trash2Icon,
-  Loader2Icon,
-} from 'lucide-react';
+import { BotIcon, TerminalIcon, Trash2Icon, Loader2Icon, FileTextIcon, ExternalLinkIcon, XIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useAgents } from '@/providers/AgentProvider';
+import { useTasks } from '@/providers/TaskProvider';
 import { AgentStatusBadge } from './AgentStatusBadge';
 import { RuntimePicker } from './RuntimePicker';
 import { DeleteAgentModal } from './DeleteAgentModal';
 import { TaskTerminal } from '@/components/tasks/TaskTerminal';
+import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
 import type { AgentFile, AgentRuntime } from '../../../shared/agent-types';
 
 // ── Component ────────────────────────────────────────────────────────────
@@ -28,11 +25,14 @@ interface AgentDetailViewProps {
 }
 
 export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
-  const { updateAgent, deleteAgent, selectAgent, state } = useAgents();
+  const { updateAgent, deleteAgent, selectAgent, state, unassignTask } = useAgents();
+  const { state: taskState } = useTasks();
   const fullWidth = useFullWidthContent();
 
   const isSynthesizing = state.synthesizingIds.has(agent.id);
   const isPending = agent.name === 'New Agent';
+
+  const currentTask = agent.currentTaskId ? (taskState.tasks.find((t) => t.id === agent.currentTaskId) ?? null) : null;
 
   const [instructions, setInstructions] = useState(agent.instructions ?? '');
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -102,20 +102,70 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
-                <h2 className={cn(
-                  'truncate text-base font-semibold',
-                  isPending ? 'italic text-muted-foreground/50' : 'text-foreground',
-                )}>{agent.name}</h2>
+                <h2
+                  className={cn(
+                    'truncate text-base font-semibold',
+                    isPending ? 'italic text-muted-foreground/50' : 'text-foreground',
+                  )}
+                >
+                  {agent.name}
+                </h2>
                 <AgentStatusBadge status={agent.status} />
               </div>
             </div>
           </div>
 
+          {/* Current Task */}
+          {currentTask && (
+            <div className="mb-6 rounded-xl border border-border/60 bg-card p-4">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-medium text-foreground">Current Task</span>
+                {agent.status !== 'running' && (
+                  <button
+                    type="button"
+                    onClick={() => void unassignTask(agent.id)}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                    title="Unassign task"
+                  >
+                    <XIcon size={12} />
+                    Unassign
+                  </button>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  window.dispatchEvent(
+                    new CustomEvent('kai:navigate', {
+                      detail: { view: 'task', taskId: currentTask.id },
+                    }),
+                  );
+                }}
+                className="group flex w-full items-center gap-2 rounded-lg border border-border/40 bg-background/40 px-3 py-2 text-left transition-colors hover:border-border/70 hover:bg-background"
+              >
+                <FileTextIcon size={14} className="shrink-0 text-muted-foreground" />
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate text-sm font-medium text-foreground">{currentTask.title}</span>
+                  <span
+                    className={cn(
+                      'mt-0.5 inline-flex w-fit items-center rounded-full px-2 py-px text-[10px] font-medium',
+                      KAI_TASK_STATUS_COLORS[currentTask.status],
+                    )}
+                  >
+                    {KAI_TASK_STATUS_LABELS[currentTask.status]}
+                  </span>
+                </div>
+                <ExternalLinkIcon
+                  size={12}
+                  className="shrink-0 text-muted-foreground/60 transition-colors group-hover:text-foreground"
+                />
+              </button>
+            </div>
+          )}
+
           {/* Instructions Editor */}
           <div className="mb-6">
-            <label className="mb-2 block text-sm font-medium text-foreground">
-              Instructions
-            </label>
+            <label className="mb-2 block text-sm font-medium text-foreground">Instructions</label>
             <p className="mb-3 text-xs text-muted-foreground">
               System prompt for this agent. Defines how it should behave, what it focuses on, and its constraints.
             </p>
@@ -164,12 +214,9 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
 
             {/* Runtime */}
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                Runtime
-              </label>
+              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Runtime</label>
               <RuntimePicker value={agent.runtime} onChange={handleRuntimeChange} />
             </div>
-
           </div>
 
           {/* Stats */}
@@ -183,17 +230,13 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
               <div>
                 <span className="text-xs text-muted-foreground">Total runtime</span>
                 <p className="font-medium text-foreground">
-                  {agent.stats.totalRuntime > 0
-                    ? `${Math.round(agent.stats.totalRuntime / 60)}m`
-                    : '—'}
+                  {agent.stats.totalRuntime > 0 ? `${Math.round(agent.stats.totalRuntime / 60)}m` : '—'}
                 </p>
               </div>
               <div>
                 <span className="text-xs text-muted-foreground">Last run</span>
                 <p className="font-medium text-foreground">
-                  {agent.stats.lastRunAt
-                    ? new Date(agent.stats.lastRunAt).toLocaleDateString()
-                    : '—'}
+                  {agent.stats.lastRunAt ? new Date(agent.stats.lastRunAt).toLocaleDateString() : '—'}
                 </p>
               </div>
               <div>
