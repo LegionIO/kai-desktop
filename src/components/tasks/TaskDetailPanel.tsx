@@ -50,7 +50,7 @@ interface TaskDetailPanelProps {
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
   const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
-  const { state: agentState, startAgent } = useAgents();
+  const { state: agentState, startAgent, unassignTask } = useAgents();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
@@ -260,7 +260,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     if (terminalSessionId) {
       void app.tasks.terminalKill(terminalSessionId);
       setTerminalSessionId(null);
-      void updateTask(task.id, { terminalSessionId: undefined });
+      void updateTask(task.id, { terminalSessionId: undefined, status: 'human_review' });
     }
   }, [terminalSessionId, task.id, updateTask]);
 
@@ -722,6 +722,45 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       ) : (
         /* ═══ AGENT TAB ═══ */
         <div className="flex min-h-0 flex-1 flex-col">
+          {/* Agent toolbar — stop/unassign controls */}
+          {(terminalSessionId || assignedAgent) && (
+            <div className={cn('flex items-center gap-2 mx-auto w-full px-5 pt-3 pb-1', !fullWidth && 'max-w-3xl')}>
+              {assignedAgent && (
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <span>{assignedAgent.icon ?? '🤖'}</span>
+                  <span className="font-medium">{assignedAgent.name}</span>
+                  {terminalSessionId && (
+                    <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-500">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      Running
+                    </span>
+                  )}
+                </span>
+              )}
+              <div className="ml-auto flex items-center gap-1.5">
+                {terminalSessionId && (
+                  <button
+                    type="button"
+                    onClick={handleStopAgent}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
+                  >
+                    <StopCircleIcon className="h-3.5 w-3.5" />
+                    Stop Agent
+                  </button>
+                )}
+                {!terminalSessionId && assignedAgent && (
+                  <button
+                    type="button"
+                    onClick={() => void unassignTask(assignedAgent.id)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-border/50 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                  >
+                    <XIcon className="h-3 w-3" />
+                    Unassign
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           <div
             className={cn(
               'flex min-h-0 flex-1 flex-col gap-3 mx-auto w-full px-5 pt-4 pb-4 md:pb-5',
@@ -737,16 +776,24 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   <div className="flex flex-1 items-center justify-center">
                     <div className="flex flex-col items-center gap-3 text-center">
                       <TerminalIcon className="h-8 w-8 text-white/20" />
-                      <p className="text-sm text-white/40">No agent running</p>
-                      <button
-                        type="button"
-                        onClick={handleStartAgent}
-                        disabled={isStartingAgent}
-                        className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
-                      >
-                        <PlayIcon className="h-3.5 w-3.5" />
-                        {isStartingAgent ? 'Starting…' : assignedAgent ? `Start ${assignedAgent.name}` : 'Assign Agent'}
-                      </button>
+                      <p className="text-sm text-white/40">
+                        {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
+                      </p>
+                      {assignedAgent ? (
+                        <button
+                          type="button"
+                          onClick={handleStartAgent}
+                          disabled={isStartingAgent}
+                          className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
+                        >
+                          <PlayIcon className="h-3.5 w-3.5" />
+                          {isStartingAgent ? 'Starting…' : `Start ${assignedAgent.name}`}
+                        </button>
+                      ) : (
+                        <div className="inline-flex items-center gap-2">
+                          <AgentAssignDropdown taskId={task.id} currentAgentId={task.assignedAgentId} variant="button" />
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
