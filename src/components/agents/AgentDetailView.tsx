@@ -26,6 +26,7 @@ import { RuntimePicker } from './RuntimePicker';
 import { DeleteAgentModal } from './DeleteAgentModal';
 import { TaskTerminal } from '@/components/tasks/TaskTerminal';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
+import type { TaskFile } from '@/types/task';
 import type { AgentFile, AgentRuntime } from '../../../shared/agent-types';
 
 // ── Component ────────────────────────────────────────────────────────────
@@ -42,7 +43,9 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
   const isSynthesizing = state.synthesizingIds.has(agent.id);
   const isPending = agent.name === 'New Agent';
 
-  const currentTask = agent.currentTaskId ? (taskState.tasks.find((t) => t.id === agent.currentTaskId) ?? null) : null;
+  const currentTask: TaskFile | null = agent.currentTaskId
+    ? (taskState.tasks.find((t) => t.id === agent.currentTaskId) ?? null)
+    : null;
 
   const [instructions, setInstructions] = useState(agent.instructions ?? '');
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -196,7 +199,7 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
                   Currently working on
                 </p>
                 <p className="truncate text-sm text-foreground">
-                  {currentTask?.title ?? 'Open task'}
+                  Open task
                 </p>
               </div>
               <ArrowRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--brand-accent)]" />
