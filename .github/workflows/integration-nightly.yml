@@ -83,6 +83,28 @@ jobs:
       - name: Prepare cost-ledger directory
         run: mkdir -p "${COST_LEDGER_DIR}"
 
+      # Fail-closed gate on provider secrets. Without this the real-API
+      # smoke suite would run with `RUN_REAL_API_TESTS=1` but no keys, hit
+      # the per-test `describe.skipIf(!key)` gates, and the job exits 0
+      # with every test "skipped". A nightly that silently skips its own
+      # contents is indistinguishable from a nightly that passed —
+      # disable that failure mode. Matches the pattern in
+      # fixture-drift-check.yml lines 132-136. Exits 2 so a secret-config
+      # failure is visibly distinct from a harness fail (exit 1).
+      - name: Verify provider secrets are configured (fail-closed)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          missing=""
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then missing="${missing} ANTHROPIC_API_KEY"; fi
+          if [ -z "${OPENAI_API_KEY}" ]; then missing="${missing} OPENAI_API_KEY"; fi
+          if [ -n "${missing}" ]; then
+            echo "::error::Required provider secret(s) unset:${missing}. Configure them in the 'eval' GitHub Environment before running this workflow. Silent skipping has been disabled."
+            exit 2
+          fi
+          echo "All required provider secrets present."
+
       # Real-API smoke tests. `id: smoke` so subsequent steps can branch on
       # the outcome. `continue-on-error: true` lets the auto-issue path run
       # even when the suite fails — the job's overall result is restored by
