@@ -34,21 +34,17 @@ function relativeTime(iso: string): string {
   return `${Math.floor(diffMs / 86_400_000)}d ago`;
 }
 
-function outcomeBadge(outcome: DispatchDecision['outcome']) {
-  switch (outcome) {
-    case 'started':
-      return { Icon: PlayIcon, color: 'text-emerald-500', label: 'Started' };
-    case 'assigned':
-      return { Icon: CheckCircle2Icon, color: 'text-[var(--brand-accent)]', label: 'Assigned' };
-    case 'no-match':
-      return { Icon: CircleDashedIcon, color: 'text-muted-foreground/70', label: 'No match' };
-    case 'skipped':
-      return { Icon: CircleDashedIcon, color: 'text-muted-foreground/70', label: 'Skipped' };
-    case 'error':
-      return { Icon: AlertCircleIcon, color: 'text-red-500', label: 'Error' };
-    default:
-      return { Icon: CircleDashedIcon, color: 'text-muted-foreground/70', label: outcome };
+function outcomeBadge(decision: DispatchDecision) {
+  if (decision.error) {
+    return { Icon: AlertCircleIcon, color: 'text-red-500', label: 'Error' };
   }
+  if (decision.started) {
+    return { Icon: PlayIcon, color: 'text-emerald-500', label: 'Started' };
+  }
+  if (decision.assigned) {
+    return { Icon: CheckCircle2Icon, color: 'text-[var(--brand-accent)]', label: 'Assigned' };
+  }
+  return { Icon: CircleDashedIcon, color: 'text-muted-foreground/70', label: 'Skipped' };
 }
 
 export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => {
@@ -76,7 +72,7 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
     );
   }
 
-  const items = state.log.slice(0, maxItems);
+  const items = state.decisions.slice(0, maxItems);
   const hasItems = items.length > 0;
 
   return (
@@ -88,7 +84,7 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
           <span className="text-xs font-medium text-foreground">Activity</span>
           {hasItems && (
             <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-              {state.log.length}
+              {state.decisions.length}
             </span>
           )}
         </div>
@@ -121,20 +117,21 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
         </div>
       ) : (
         <ul className="divide-y divide-border/30">
-          {items.map((d) => {
-            const taskName = taskNameById.get(d.taskId) ?? 'Unknown task';
+          {items.map((d, idx) => {
+            const taskName = taskNameById.get(d.taskId) ?? d.taskTitle ?? 'Unknown task';
             const agent = d.agentId ? agentNameById.get(d.agentId) : null;
-            const { Icon, color, label } = outcomeBadge(d.outcome);
+            const agentLabel = agent ? `${agent.icon ?? '🤖'} ${agent.name}` : d.agentName ?? '—';
+            const { Icon, color, label } = outcomeBadge(d);
             const scorePct = Math.round((d.score ?? 0) * 100);
             return (
-              <li key={d.id} className="flex items-start gap-2 px-3 py-2">
+              <li key={`${d.at}-${d.taskId}-${idx}`} className="flex items-start gap-2 px-3 py-2">
                 <Icon className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', color)} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 text-xs">
                     <span className="truncate font-medium text-foreground">{taskName}</span>
                     <ArrowRightIcon className="h-3 w-3 shrink-0 text-muted-foreground/60" />
                     <span className="truncate text-foreground/80">
-                      {agent ? `${agent.icon ?? '🤖'} ${agent.name}` : '—'}
+                      {agentLabel}
                     </span>
                   </div>
                   <div className="mt-0.5 flex items-center gap-2 text-[10px] text-muted-foreground">
@@ -146,9 +143,14 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
                       </>
                     )}
                     <span className="text-muted-foreground/40">·</span>
-                    <span>{relativeTime(d.timestamp)}</span>
+                    <span>{relativeTime(d.at)}</span>
                   </div>
-                  {d.reason && (
+                  {d.error && (
+                    <p className="mt-0.5 truncate text-[10px] text-red-500/80" title={d.error}>
+                      {d.error}
+                    </p>
+                  )}
+                  {d.reason && !d.error && (
                     <p className="mt-0.5 truncate text-[10px] text-muted-foreground/70" title={d.reason}>
                       {d.reason}
                     </p>

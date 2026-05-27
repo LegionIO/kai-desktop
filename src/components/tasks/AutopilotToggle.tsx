@@ -24,13 +24,15 @@ export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
   if (!available || loading) return null;
 
   const enabled = state.config.enabled;
-  const assignedCount = state.assignedTaskIds.length;
+  const runningCount = state.decisions.filter((d) => d.started && !d.error).length;
 
   const statusText = !enabled
     ? 'Off'
-    : assignedCount > 0
-      ? `${assignedCount} assigned`
-      : 'Watching…';
+    : runningCount > 0
+      ? `${runningCount} dispatched`
+      : state.running
+        ? 'Watching…'
+        : 'Idle';
 
   const handleToggle = () => {
     void toggle(!enabled);
@@ -79,7 +81,7 @@ export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
             enabled ? 'text-[var(--brand-accent)]' : 'text-muted-foreground/70',
           )}
         >
-          {enabled && assignedCount === 0 && (
+          {enabled && runningCount === 0 && (
             <span className="relative flex h-1.5 w-1.5 shrink-0">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--brand-accent)] opacity-60" />
               <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--brand-accent)]" />

@@ -10,14 +10,7 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { ChevronDownIcon, CheckIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS, type KaiTaskStatus, type TaskFile } from '@/types/task';
-
-const VALID_TRANSITIONS: Record<KaiTaskStatus, KaiTaskStatus[]> = {
-  todo: ['in_progress', 'done'],
-  in_progress: ['human_review', 'ai_review', 'done'],
-  ai_review: ['human_review', 'done', 'in_progress'],
-  human_review: ['done', 'in_progress'],
-  done: ['todo'],
-};
+import { getValidManualTransitions } from '../../../shared/task-state-machine';
 
 const itemClassName =
   'flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none data-[highlighted]:bg-muted data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50';
@@ -28,7 +21,7 @@ interface TaskStatusDropdownProps {
 }
 
 export const TaskStatusDropdown: FC<TaskStatusDropdownProps> = ({ task, onStatusChange }) => {
-  const transitions = VALID_TRANSITIONS[task.status] ?? [];
+  const transitions = getValidManualTransitions(task.status);
   const currentLabel = KAI_TASK_STATUS_LABELS[task.status];
   const currentColor = KAI_TASK_STATUS_COLORS[task.status];
 

@@ -11,15 +11,15 @@ import { useCallback, useEffect, useState } from 'react';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-export type MatchingStrategy = 'best-fit' | 'round-robin' | 'random';
+export type MatchingStrategy = 'simple' | 'ai-scored';
 
 export interface DispatcherConfig {
   /** Master enable for the autopilot loop. */
   enabled: boolean;
-  /** Polling interval in seconds between ticks. */
-  intervalSeconds: number;
-  /** Maximum number of tasks running concurrently under autopilot. */
-  maxConcurrent: number;
+  /** Polling interval in milliseconds between ticks. */
+  intervalMs: number;
+  /** Maximum number of agents running concurrently under autopilot. */
+  maxConcurrentAgents: number;
   /** Strategy used to match tasks to agents. */
   matchingStrategy: MatchingStrategy;
   /** Auto-start the assigned agent (vs. just assigning it). */
@@ -29,20 +29,22 @@ export interface DispatcherConfig {
 }
 
 export interface DispatchDecision {
-  /** Stable id for this decision row. */
-  id: string;
-  /** Timestamp (ISO string) of the decision. */
-  timestamp: string;
-  /** Task that was considered/dispatched. */
+  /** ISO timestamp when the decision was made. */
+  at: string;
   taskId: string;
-  /** Agent that was selected (null if no match). */
-  agentId: string | null;
-  /** Match score 0–1 (best-fit). */
+  agentId: string;
+  taskTitle: string;
+  agentName: string;
+  /** Match score 0–1. */
   score: number;
-  /** Outcome: assigned, started, skipped, etc. */
-  outcome: 'assigned' | 'started' | 'skipped' | 'no-match' | 'error';
-  /** Human readable reason / note (e.g. "no idle agent"). */
-  reason?: string;
+  /** Human readable reason / note. */
+  reason: string;
+  /** Whether the agent was actually assigned. */
+  assigned: boolean;
+  /** Whether the agent was auto-started after assignment. */
+  started: boolean;
+  /** Error message if something went wrong. */
+  error?: string;
 }
 
 export interface TaskDispatcherState {
@@ -50,30 +52,30 @@ export interface TaskDispatcherState {
   /** Whether the dispatcher tick loop is actively running. */
   running: boolean;
   /** Recent decisions, newest first. */
-  log: DispatchDecision[];
-  /** Currently assigned (running) task ids under autopilot. */
-  assignedTaskIds: string[];
+  decisions: DispatchDecision[];
   /** Last tick timestamp (ISO string), or null if never ticked. */
   lastTickAt: string | null;
+  /** Next scheduled tick timestamp (ISO string), or null. */
+  nextTickAt: string | null;
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: DispatcherConfig = {
   enabled: false,
-  intervalSeconds: 30,
-  maxConcurrent: 3,
-  matchingStrategy: 'best-fit',
-  autoStart: false,
+  intervalMs: 30000,
+  maxConcurrentAgents: 3,
+  matchingStrategy: 'simple',
+  autoStart: true,
   requireHumanReview: true,
 };
 
 const DEFAULT_STATE: TaskDispatcherState = {
   config: DEFAULT_CONFIG,
   running: false,
-  log: [],
-  assignedTaskIds: [],
+  decisions: [],
   lastTickAt: null,
+  nextTickAt: null,
 };
 
 // ── IPC accessor ──────────────────────────────────────────────────────────

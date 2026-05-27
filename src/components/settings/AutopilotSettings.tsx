@@ -13,9 +13,8 @@ import { useOrchestrator, type MatchingStrategy } from '@/hooks/useOrchestrator'
 import { settingsSelectClass } from './shared';
 
 const STRATEGY_OPTIONS: Array<{ value: MatchingStrategy; label: string; description: string }> = [
-  { value: 'best-fit', label: 'Best fit', description: 'Score each agent against the task and pick the highest match.' },
-  { value: 'round-robin', label: 'Round-robin', description: 'Cycle through idle agents in order.' },
-  { value: 'random', label: 'Random', description: 'Pick any idle agent at random.' },
+  { value: 'simple', label: 'Simple', description: 'Score each agent against the task using keyword overlap and role matching.' },
+  { value: 'ai-scored', label: 'AI Scored', description: 'Use an AI model to score how well each agent fits the task.' },
 ];
 
 interface AutopilotSettingsProps {
@@ -73,16 +72,16 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
         {/* Interval slider */}
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">
-            Tick interval: every {cfg.intervalSeconds}s
+            Tick interval: every {Math.round(cfg.intervalMs / 1000)}s
           </label>
           <input
             type="range"
             className="w-full accent-[var(--color-primary)]"
-            min={5}
-            max={300}
-            step={5}
-            value={cfg.intervalSeconds}
-            onChange={(e) => void setConfig({ intervalSeconds: Number(e.target.value) })}
+            min={5000}
+            max={300000}
+            step={5000}
+            value={cfg.intervalMs}
+            onChange={(e) => void setConfig({ intervalMs: Number(e.target.value) })}
           />
           <div className="mt-0.5 flex justify-between text-[9px] text-muted-foreground/60">
             <span>5s</span>
@@ -93,7 +92,7 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
         {/* Max concurrent */}
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">
-            Max concurrent tasks: {cfg.maxConcurrent}
+            Max concurrent agents: {cfg.maxConcurrentAgents}
           </label>
           <input
             type="range"
@@ -101,8 +100,8 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
             min={1}
             max={10}
             step={1}
-            value={cfg.maxConcurrent}
-            onChange={(e) => void setConfig({ maxConcurrent: Number(e.target.value) })}
+            value={cfg.maxConcurrentAgents}
+            onChange={(e) => void setConfig({ maxConcurrentAgents: Number(e.target.value) })}
           />
           <div className="mt-0.5 flex justify-between text-[9px] text-muted-foreground/60">
             <span>1</span>

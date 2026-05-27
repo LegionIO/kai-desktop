@@ -49,7 +49,7 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, refineTaskPlan } = useTasks();
+  const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
   const { state: agentState, startAgent } = useAgents();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -327,7 +327,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const leftRows: Array<{ label: string; value: React.ReactNode }> = [
     {
       label: 'Status',
-      value: <TaskStatusDropdown task={task} onStatusChange={(s) => updateTask(task.id, { status: s })} />,
+      value: <TaskStatusDropdown task={task} onStatusChange={(s) => void updateTaskStatus(task.id, s)} />,
     },
     {
       label: 'Agent',
