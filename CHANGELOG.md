@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.88] - 2026-05-27
+
+### Fixed
+- Preserve plugin runtime ownership when Legion-backed requests use Mastra as fallback transport, so Legion native mode can intercept inference through the registered provider instead of falling through to `/v1/chat/completions`.
+
 ## [1.0.19] - 2026-04-08
 
 ### Added
