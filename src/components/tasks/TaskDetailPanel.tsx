@@ -20,6 +20,7 @@ import {
   ChevronUpIcon,
   FileCodeIcon,
   TerminalIcon,
+  CheckCircle2Icon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -423,6 +424,27 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   ) : (
                     <p className="text-sm italic text-muted-foreground">No description</p>
                   )}
+
+                  {/* Completion summary — shown when autopilot or agent has reported a wrap-up */}
+                  {(() => {
+                    const summary = (task as unknown as { completionSummary?: string }).completionSummary;
+                    const showSummary =
+                      !!summary && (task.status === 'human_review' || task.status === 'done');
+                    if (!showSummary) return null;
+                    return (
+                      <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
+                        <div className="mb-2 flex items-center gap-2">
+                          <CheckCircle2Icon className="h-4 w-4 text-emerald-500" />
+                          <span className="text-xs font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+                            {task.status === 'human_review' ? 'Ready for review' : 'Completion summary'}
+                          </span>
+                        </div>
+                        <div className="text-sm text-foreground/90">
+                          <MarkdownText text={summary} />
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
               {/* Sticky plan composer */}

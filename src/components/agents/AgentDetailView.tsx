@@ -6,7 +6,17 @@
  */
 
 import { type FC, useState, useEffect, useRef, useCallback } from 'react';
-import { BotIcon, TerminalIcon, Trash2Icon, Loader2Icon, FileTextIcon, ExternalLinkIcon, XIcon } from 'lucide-react';
+import {
+  BotIcon,
+  TerminalIcon,
+  Trash2Icon,
+  Loader2Icon,
+  FileTextIcon,
+  ExternalLinkIcon,
+  XIcon,
+  ClipboardListIcon,
+  ArrowRightIcon,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useAgents } from '@/providers/AgentProvider';
@@ -82,6 +92,16 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
     await deleteAgent(agent.id);
     selectAgent(null);
   }, [agent.id, deleteAgent, selectAgent]);
+
+  // Cross-nav: jump to the task this agent is currently working on
+  const handleNavigateToTask = useCallback(() => {
+    if (!agent.currentTaskId) return;
+    window.dispatchEvent(
+      new CustomEvent('kai:navigate', {
+        detail: { tab: 'tasks', selectedId: agent.currentTaskId },
+      }),
+    );
+  }, [agent.currentTaskId]);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -161,6 +181,26 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
                 />
               </button>
             </div>
+          )}
+
+          {/* Cross-nav: currently working on task */}
+          {!currentTask && agent.currentTaskId && (
+            <button
+              type="button"
+              onClick={handleNavigateToTask}
+              className="group mb-6 flex w-full items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2.5 text-left transition-colors hover:border-[var(--brand-accent)]/40 hover:bg-[var(--brand-accent)]/5"
+            >
+              <ClipboardListIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                  Currently working on
+                </p>
+                <p className="truncate text-sm text-foreground">
+                  {currentTask?.title ?? 'Open task'}
+                </p>
+              </div>
+              <ArrowRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--brand-accent)]" />
+            </button>
           )}
 
           {/* Instructions Editor */}
