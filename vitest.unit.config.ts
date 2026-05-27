@@ -40,6 +40,14 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['json-summary', 'html'],
       reportsDirectory: './coverage',
+      // Include every file matched by the `include` glob, even if no test
+      // imports it. Without `all: true`, vitest only reports files that
+      // a running test touched, hiding 100+ unreached main-process files
+      // from the headline % and overstating coverage. We accept the
+      // resulting lower headline (the report is reporting-only — no
+      // thresholds — so an honest baseline is the only thing at risk).
+      all: true,
+      include: ['electron/**/*.ts'],
       // Reporting only — no thresholds. Exclude generated, vendored, and
       // non-instrumentable surfaces so the headline number reflects the
       // code that actually ships in the main process unit slice.
