@@ -11,10 +11,13 @@ import {
   TerminalIcon,
   Trash2Icon,
   Loader2Icon,
+  ClipboardListIcon,
+  ArrowRightIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { useAgents } from '@/providers/AgentProvider';
+import { useTasks } from '@/providers/TaskProvider';
 import { AgentStatusBadge } from './AgentStatusBadge';
 import { RuntimePicker } from './RuntimePicker';
 import { DeleteAgentModal } from './DeleteAgentModal';
@@ -29,6 +32,7 @@ interface AgentDetailViewProps {
 
 export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
   const { updateAgent, deleteAgent, selectAgent, state } = useAgents();
+  const { state: taskState } = useTasks();
   const fullWidth = useFullWidthContent();
 
   const isSynthesizing = state.synthesizingIds.has(agent.id);
@@ -83,6 +87,20 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
     selectAgent(null);
   }, [agent.id, deleteAgent, selectAgent]);
 
+  // Cross-nav: jump to the task this agent is currently working on
+  const currentTask = agent.currentTaskId
+    ? taskState.tasks.find((t) => t.id === agent.currentTaskId)
+    : null;
+
+  const handleNavigateToTask = useCallback(() => {
+    if (!agent.currentTaskId) return;
+    window.dispatchEvent(
+      new CustomEvent('kai:navigate', {
+        detail: { tab: 'tasks', selectedId: agent.currentTaskId },
+      }),
+    );
+  }, [agent.currentTaskId]);
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* Top gradient fade */}
@@ -110,6 +128,26 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
               </div>
             </div>
           </div>
+
+          {/* Cross-nav: currently working on task */}
+          {agent.currentTaskId && (
+            <button
+              type="button"
+              onClick={handleNavigateToTask}
+              className="group mb-6 flex w-full items-center gap-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2.5 text-left transition-colors hover:border-[var(--brand-accent)]/40 hover:bg-[var(--brand-accent)]/5"
+            >
+              <ClipboardListIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                  Currently working on
+                </p>
+                <p className="truncate text-sm text-foreground">
+                  {currentTask?.title ?? 'Open task'}
+                </p>
+              </div>
+              <ArrowRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--brand-accent)]" />
+            </button>
+          )}
 
           {/* Instructions Editor */}
           <div className="mb-6">

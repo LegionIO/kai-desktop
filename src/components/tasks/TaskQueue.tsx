@@ -43,6 +43,7 @@ import { TaskQueueRow } from './TaskQueueRow';
 import { TaskCard } from './TaskCard';
 import { TaskDetailPanel } from './TaskDetailPanel';
 import { TaskDetailModal } from './TaskDetailModal';
+import { AutopilotToggle } from './AutopilotToggle';
 import { Tooltip } from '@/components/ui/Tooltip';
 
 // ── Filter types ───────────────────────────────────────────────────────────
@@ -306,6 +307,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                 </button>
               )}
             </div>
+
+            {/* Autopilot toggle */}
+            <AutopilotToggle className="shrink-0" />
 
             {/* Filter dropdown */}
             <DropdownMenu.Root>
