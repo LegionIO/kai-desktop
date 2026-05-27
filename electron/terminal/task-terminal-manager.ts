@@ -27,6 +27,8 @@ interface TaskTerminal {
 
 export class TaskTerminalManager {
   private terminals = new Map<string, TaskTerminal>();
+  /** Exit codes for recently-exited sessions, keyed by sessionId. */
+  private exitCodes = new Map<string, number>();
 
   async create(
     taskId: string,
@@ -57,6 +59,7 @@ export class TaskTerminalManager {
 
     proc.onExit(({ exitCode }: { exitCode: number }) => {
       this.terminals.delete(sessionId);
+      this.exitCodes.set(sessionId, exitCode);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
 
@@ -96,6 +99,23 @@ export class TaskTerminalManager {
     }
   }
 
+  /** Read the exit code for a session without removing it from the cache. */
+  getExitCode(sessionId: string): number | undefined {
+    return this.exitCodes.get(sessionId);
+  }
+
+  /**
+   * Read and clear the exit code for a session.
+   * Returns undefined if the session never exited or was already consumed.
+   */
+  consumeExitCode(sessionId: string): number | undefined {
+    const code = this.exitCodes.get(sessionId);
+    if (code !== undefined) {
+      this.exitCodes.delete(sessionId);
+    }
+    return code;
+  }
+
   /** Clean up all terminals (app shutdown). */
   dispose(): void {
     for (const [, term] of this.terminals) {
@@ -106,6 +126,7 @@ export class TaskTerminalManager {
       }
     }
     this.terminals.clear();
+    this.exitCodes.clear();
   }
 
   private getShellCommand(runtime: string): { command: string; args: string[] } {

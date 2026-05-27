@@ -19,6 +19,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
+import { isValidTransition } from '../../shared/task-state-machine';
 
 // ── State & Actions ──────────────────────────────────────────────────────
 
@@ -312,6 +313,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     async (id: string, status: KaiTaskStatus) => {
       const now = new Date().toISOString();
       const task = state.tasks.find((t) => t.id === id);
+      // Validate the transition against the formal state machine
+      if (task && !isValidTransition(task.status, status)) {
+        console.warn(
+          `[TaskProvider] Rejected invalid status transition for task ${id}: ${task.status} → ${status}`,
+        );
+        return;
+      }
       // Kill terminal when marking as done
       if (status === 'done') {
         if (task?.terminalSessionId) {
@@ -393,6 +401,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const moveTaskToColumn = useCallback(
     async (taskId: string, targetStatus: KaiTaskStatus, sourceStatus: KaiTaskStatus) => {
+      // Validate the transition against the formal state machine
+      if (!isValidTransition(sourceStatus, targetStatus)) {
+        console.warn(
+          `[TaskProvider] Rejected invalid status transition for task ${taskId}: ${sourceStatus} → ${targetStatus}`,
+        );
+        return;
+      }
       // Optimistic status update
       const statusUpdates: Partial<TaskFile> =
         targetStatus === 'done'
