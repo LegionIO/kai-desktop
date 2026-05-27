@@ -15,11 +15,12 @@ Four forcing functions constrain the answer:
 
 1. **Mastra's scope literal contract.** Three config fields —
    `memory.workingMemory.scope`, `memory.observationalMemory.scope`, and
-   `memory.semanticRecall.scope` (`electron/config/schema.ts` lines 84, 89, 95) — are passed through to Mastra's memory subsystem and must be one
-   of the documented scope literals (`"thread"` or `"resource"`). The
-   Zod enum at config-parse time prevents arbitrary renames inside the
-   stored config from reaching Mastra at all; the harder-to-catch failure
-   mode is a schema-side rename (e.g. flipping the enum from
+   `memory.semanticRecall.scope` in `electron/config/schema.ts` — are
+   passed through to Mastra's memory subsystem and must be one of the
+   documented scope literals (`"thread"` or `"resource"`). The Zod enum
+   at config-parse time prevents arbitrary renames inside the stored
+   config from reaching Mastra at all; the harder-to-catch failure mode
+   is a schema-side rename (e.g. flipping the enum from
    `['thread', 'resource']` to `['chat', 'resource']`) which passes
    typecheck locally but breaks the wire contract with Mastra.
 2. **On-disk + wire-protocol stability.** Conversation state persists to
@@ -67,7 +68,10 @@ Each layer of the codebase uses the term that matches its forcing function:
 | Mastra / agent internals                       | **Thread**       | Mastra's runtime `scope === "thread"` check                                                                                                                                                                                                       |
 | IPC channels, parameter names, on-disk storage | **Conversation** | Wire protocol + on-disk format stability (`conversations.json`)                                                                                                                                                                                   |
 
-### Concrete examples
+### Worked examples
+
+These examples ground the Decision table above; each one points to a
+real symbol on `main`.
 
 - `electron/config/schema.ts`: `scope: z.enum(['thread', 'resource'])` —
   Thread layer (Mastra runtime contract)
@@ -85,6 +89,16 @@ Each layer of the codebase uses the term that matches its forcing function:
   (parameter `conversationId`) — Conversation layer
 - IPC channel: `computer-use:focus-thread` — Thread layer (routes to the
   assistant-ui thread surface)
+
+### Exception: IPC channels that route to a UI surface
+
+The Decision table's "IPC channels → Conversation" row is the default,
+not a total rule. IPC channels whose purpose is _routing to a specific
+UI surface_ (rather than performing storage CRUD) take the layer of the
+surface they route to. The current example is `computer-use:focus-thread`:
+it routes to the assistant-ui thread surface, so it takes the Thread
+layer. The exception exists because the channel's _purpose_ is surface
+activation, not storage operations on a conversation entity.
 
 ### Directory naming
 
@@ -227,13 +241,22 @@ assumes the dependency stays.
 - The pointer in `CLAUDE.md` ("Naming Convention" section) and the
   `### Naming Convention` subsection in `CONTRIBUTING.md` route both
   agents and human contributors to this ADR at the moment of need.
-- A follow-up could add a lightweight `scripts/check-naming.sh` (or an
-  ESLint custom rule) that greps for the known drift patterns
-  (`chatId` inside `electron/ipc/**`, `scope: 'chat'` anywhere, etc.)
-  and wires it into `lint-staged`. That would convert the convention
-  from documentation-only to a soft CI gate. The right long-term answer
-  is branded ID types (`type ConversationId = string & { __brand: ... }`)
-  but that is a larger change than this ADR.
+- Drift can be audited manually with `grep` against these rules:
+  - Imports from `@assistant-ui/react` live only under
+    `src/components/thread/` or `src/providers/`. Hits elsewhere mean
+    the assistant-ui composition surface is leaking outside its
+    integration boundary.
+  - IPC channel prefixes use `conversations:` for storage operations,
+    not `chat:`. A `chat:list` / `chat:get` / `chat:delete` channel is
+    a wire-format drift signal.
+  - `conversations.json` and `scope: "thread"` are byte-stable. Any
+    diff that touches the literal `"conversations.json"` filename or
+    the `'thread'` enum value in `electron/config/schema.ts` is
+    crossing a wire-protocol boundary and needs review.
+    A real ESLint custom rule or branded ID types (`type ConversationId =
+string & { __brand: ... }`) is the long-term answer that converts
+    this convention from documentation-only to a hard typecheck gate,
+    but that is a larger change than this ADR.
 
 ## References
 
