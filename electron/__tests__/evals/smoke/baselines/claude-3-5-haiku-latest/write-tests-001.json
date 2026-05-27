@@ -1,0 +1,9 @@
+{
+  "model_id": "claude-3-5-haiku-latest",
+  "prompt_id": "write-tests-001",
+  "captured_at": "PLACEHOLDER - regenerate before enabling workflow",
+  "n_samples": 5,
+  "score_mean": null,
+  "score_std": null,
+  "outputs_sha256": []
+}
