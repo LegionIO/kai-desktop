@@ -47,20 +47,22 @@ export class TaskTerminalManager {
       cwd?: string;
       cols?: number;
       rows?: number;
+      customArgs?: string[];
+      env?: Record<string, string>;
     },
   ): Promise<string> {
     // Dynamic import so a missing native build doesn't crash the whole app
     const pty = await import('@lydell/node-pty');
 
     const sessionId = randomUUID();
-    const shell = this.getShellCommand(options.runtime);
+    const shell = this.getShellCommand(options.runtime, options.customArgs);
 
     const proc = pty.spawn(shell.command, shell.args, {
       name: 'xterm-256color',
       cols: options.cols ?? 80,
       rows: options.rows ?? 24,
       cwd: options.cwd ?? homedir(),
-      env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
+      env: { ...process.env, ...options.env, TERM: 'xterm-256color' } as Record<string, string>,
     });
 
     proc.onData((data: string) => {
@@ -141,20 +143,38 @@ export class TaskTerminalManager {
     this.exitCodes.clear();
   }
 
-  private getShellCommand(runtime: string): { command: string; args: string[] } {
+  private getShellCommand(runtime: string, customArgs?: string[]): { command: string; args: string[] } {
     switch (runtime) {
       case 'claude-code':
-        return { command: 'claude', args: ['--permission-mode', 'bypassPermissions'] };
+        return {
+          command: 'claude',
+          args: [
+            '--dangerously-skip-permissions',
+            ...(customArgs ?? []),
+          ],
+        };
       case 'codex':
-        return { command: 'codex', args: [] };
+        return {
+          command: 'codex',
+          args: [
+            '--dangerously-bypass-approvals-and-sandbox',
+            ...(customArgs ?? []),
+          ],
+        };
       case 'mastra':
-        return { command: 'npx', args: ['mastra', 'dev'] };
+        // Mastra as a terminal agent: use the shell and let the task description
+        // be processed as a command or prompt. The actual Mastra agent stream is
+        // handled via the runtime system, not the terminal PTY.
+        return {
+          command: process.env.SHELL ?? '/bin/zsh',
+          args: [...(customArgs ?? [])],
+        };
       default:
         // Fall back to user's shell (platform-aware)
         if (process.platform === 'win32') {
-          return { command: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe', args: [] };
+          return { command: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe', args: [...(customArgs ?? [])] };
         }
-        return { command: process.env.SHELL ?? '/bin/zsh', args: [] };
+        return { command: process.env.SHELL ?? '/bin/zsh', args: [...(customArgs ?? [])] };
     }
   }
 

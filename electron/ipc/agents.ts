@@ -254,6 +254,8 @@ export async function startAgentRun(
       cwd,
       cols: 120,
       rows: 30,
+      customArgs: agent.config.customArgs,
+      env: agent.config.env,
     });
 
     agent.status = 'running';
