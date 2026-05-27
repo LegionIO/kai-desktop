@@ -26,11 +26,25 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
   const thread = threads.get(subAgentConversationId);
   const isRunning = thread?.status === 'running' || thread?.status === 'awaiting-input';
 
+  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     if (viewportRef.current) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
   }, [thread?.messages.length]);
+
+  // HOTFIX: Escape key handler to exit sub-agent view
+  // Addresses KAI-SUBAGENT-002 - button collision preventing exit
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onBack();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onBack]);
 
   const handleSend = useCallback(async () => {
     if (!messageInput.trim()) return;
@@ -54,7 +68,7 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col min-h-0 overflow-hidden">
       <Header
         task={thread.task}
         status={thread.status}
@@ -64,7 +78,7 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
       />
 
       {/* Messages */}
-      <div ref={viewportRef} className="flex-1 overflow-y-auto px-4 pt-4">
+      <div ref={viewportRef} className="flex-1 overflow-y-auto px-4 pt-4 min-h-0">
         {thread.messages.map((msg, i) => {
           const content = Array.isArray(msg.content) ? msg.content : [];
           const role = msg.role as string;
@@ -133,12 +147,18 @@ const Header: FC<{
   };
 
   return (
-    <div className="border-b px-4 py-3 flex items-center gap-3">
-      <button type="button" onClick={onBack} className="p-1.5 rounded-md hover:bg-muted transition-colors shrink-0" title="Back to parent thread">
+    <div className="sticky top-0 z-40 border-b px-4 py-3 flex items-center gap-3 bg-background">
+      <button 
+        type="button" 
+        onClick={onBack} 
+        className="p-1.5 rounded-md hover:bg-muted transition-colors shrink-0 relative z-50 focus:ring-2 focus:ring-primary" 
+        title="Back to parent thread (or press Escape)"
+        style={{ pointerEvents: 'auto' }}
+      >
         <ArrowLeftIcon className="h-4 w-4" />
       </button>
       <BotIcon className="h-4 w-4 text-blue-400 shrink-0" />
-      <div className="flex-1 min-w-0">
+      <div className="flex-1 min-w-0 mr-2">
         <div className="text-sm font-medium truncate">{task.length > 80 ? task.slice(0, 77) + '...' : task}</div>
         <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
           <span className={`inline-block h-1.5 w-1.5 rounded-full ${statusColors[status] ?? 'bg-muted-foreground'}`} />
