@@ -125,14 +125,14 @@ The codebase uses three terms — **Chat**, **Conversation**, **Thread** — and
 each is load-bearing in a different layer. Full rationale and forcing
 functions in [`docs/adr/0002-thread-conversation-chat-naming-convention.md`](docs/adr/0002-thread-conversation-chat-naming-convention.md).
 
-| Layer                                        | Term             | Why                                              |
-| -------------------------------------------- | ---------------- | ------------------------------------------------ |
-| User-facing UI (labels, modals, page titles) | **Chat**         | Industry vocabulary                              |
-| Renderer state (active IDs, refs)            | **Conversation** | References storage entities                      |
-| Sub-agent state + types                      | **Thread**       | Nested assistant-ui threads                      |
-| Plugin extension API                         | **Thread**       | `@assistant-ui/react` `ThreadPrimitive` contract |
-| Mastra / agent internals                     | **Thread**       | Mastra runtime `scope === "thread"` check        |
-| IPC channels, parameters, on-disk storage    | **Conversation** | Wire-protocol + `conversations.json` stability   |
+| Layer                                        | Term             | Why                                                                                       |
+| -------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------- |
+| User-facing UI (labels, modals, page titles) | **Chat**         | Industry vocabulary                                                                       |
+| Renderer state (active IDs, refs)            | **Conversation** | Renames invalidate stored `conversations.json`                                            |
+| Sub-agent state + types                      | **Thread**       | Nested within a conversation (`SubAgentThread`)                                           |
+| Plugin extension API                         | **Both**         | `ThreadDecoration` + `ConversationDecoration` descriptors; each decorates its named layer |
+| Mastra / agent internals                     | **Thread**       | Mastra runtime `scope === "thread"` check                                                 |
+| IPC channels, parameters, on-disk storage    | **Conversation** | Wire-protocol + `conversations.json` stability                                            |
 
 Directory names match their **integration boundary** (e.g.
 `src/components/thread/` is named for `ThreadPrimitive`), not the UI
