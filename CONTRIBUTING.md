@@ -99,6 +99,7 @@ IPC payloads cross the naming layer (renderer Chat-vocab UI ⇄ `conversations:`
 - [`electron/preload.ts`](electron/preload.ts) -- Defines the `window.app` API surface the renderer sees.
 - [`electron/agent/mastra-agent.ts`](electron/agent/mastra-agent.ts) -- Mastra agent setup and streaming.
 - [`src/providers/`](src/providers/) -- React context providers (Config, Runtime, Attachments).
+- [`docs/adr/`](docs/adr/) -- Architecture Decision Records. Read the relevant ADR before changing a contract the project has already debated (current ADRs cover Electron fuses policy and the Thread/Conversation/Chat naming convention).
 
 ### Gotchas
 
