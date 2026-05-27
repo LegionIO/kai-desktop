@@ -61,20 +61,26 @@ const modelsConfigSchema = z.object({
 
 const embeddingProviderSchema = z.object({
   type: z.enum(['openai', 'azure', 'custom']),
-  model: z.string().optional(),           // e.g. "text-embedding-3-small"
-  openai: z.object({
-    apiKey: z.string().optional(),
-  }).optional(),
-  azure: z.object({
-    endpoint: z.string().optional(),      // e.g. "https://myresource.openai.azure.com"
-    apiKey: z.string().optional(),
-    deploymentName: z.string().optional(), // e.g. "text-embedding-3-small"
-    apiVersion: z.string().optional(),     // e.g. "2024-02-01"
-  }).optional(),
-  custom: z.object({
-    baseUrl: z.string().optional(),       // Any OpenAI-compatible embeddings endpoint
-    apiKey: z.string().optional(),
-  }).optional(),
+  model: z.string().optional(), // e.g. "text-embedding-3-small"
+  openai: z
+    .object({
+      apiKey: z.string().optional(),
+    })
+    .optional(),
+  azure: z
+    .object({
+      endpoint: z.string().optional(), // e.g. "https://myresource.openai.azure.com"
+      apiKey: z.string().optional(),
+      deploymentName: z.string().optional(), // e.g. "text-embedding-3-small"
+      apiVersion: z.string().optional(), // e.g. "2024-02-01"
+    })
+    .optional(),
+  custom: z
+    .object({
+      baseUrl: z.string().optional(), // Any OpenAI-compatible embeddings endpoint
+      apiKey: z.string().optional(),
+    })
+    .optional(),
 });
 
 const memoryConfigSchema = z.object({
@@ -240,27 +246,27 @@ const computerUseConfigSchema = z.object({
 });
 
 const azureAudioConfigSchema = z.object({
-  endpoint: z.string().optional(),        // Custom TTS base URL (overrides region-based URL)
-  region: z.string().optional(),          // e.g. "eastus" — used to construct standard Azure endpoints
+  endpoint: z.string().optional(), // Custom TTS base URL (overrides region-based URL)
+  region: z.string().optional(), // e.g. "eastus" — used to construct standard Azure endpoints
   subscriptionKey: z.string().optional(), // Ocp-Apim-Subscription-Key
-  ttsVoice: z.string().optional(),        // e.g. "en-US-JennyNeural"
+  ttsVoice: z.string().optional(), // e.g. "en-US-JennyNeural"
   ttsOutputFormat: z.string().optional(), // e.g. "audio-24khz-48kbitrate-mono-mp3"
   ttsRate: z.number().min(0.5).max(3).optional(),
-  sttLanguage: z.string().optional(),     // e.g. "en-US"
-  sttEndpoint: z.string().optional(),     // Custom WebSocket endpoint for STT
+  sttLanguage: z.string().optional(), // e.g. "en-US"
+  sttEndpoint: z.string().optional(), // Custom WebSocket endpoint for STT
 });
 
 /** OpenAI Realtime STT config — used by both dictation and composer STT. */
 const openaiSttConfigSchema = z.object({
-  baseUrl: z.string().optional(),         // WebSocket base URL (default: "wss://api.openai.com")
+  baseUrl: z.string().optional(), // WebSocket base URL (default: "wss://api.openai.com")
   apiKey: z.string().optional(),
-  model: z.string().optional(),           // default: "gpt-realtime-whisper"
+  model: z.string().optional(), // default: "gpt-realtime-whisper"
 });
 
 const sttConfigSchema = z.object({
   provider: z.enum(['azure', 'openai']).optional(), // default: follows audio.provider
   openai: openaiSttConfigSchema.optional(),
-  livePartials: z.boolean().optional(),             // Show live partial text in composer (default: true)
+  livePartials: z.boolean().optional(), // Show live partial text in composer (default: true)
 });
 
 const audioConfigSchema = z.object({
@@ -283,77 +289,97 @@ const audioConfigSchema = z.object({
 const realtimeConfigSchema = z.object({
   enabled: z.boolean(),
   provider: z.enum(['openai', 'azure', 'custom']),
-  openai: z.object({
-    apiKey: z.string().optional(),
-  }).optional(),
-  azure: z.object({
-    endpoint: z.string().optional(),       // e.g. "https://myresource.openai.azure.com"
-    apiKey: z.string().optional(),
-    deploymentName: z.string().optional(),  // e.g. "gpt-realtime-1.5"
-    apiVersion: z.string().optional(),      // e.g. "2024-10-01-preview"
-  }).optional(),
-  custom: z.object({
-    baseUrl: z.string().optional(),        // WebSocket base URL
-    apiKey: z.string().optional(),
-  }).optional(),
-  model: z.string().optional(),            // default: "gpt-4o-realtime-preview"
-  voice: z.string().optional(),            // default: "alloy"
-  instructions: z.string().optional(),     // system instructions for realtime session
-  turnDetection: z.object({
-    type: z.enum(['server_vad', 'none']).optional(),
-    threshold: z.number().min(0).max(1).optional(),
-    silenceDurationMs: z.number().positive().optional(),
-  }).optional(),
+  openai: z
+    .object({
+      apiKey: z.string().optional(),
+    })
+    .optional(),
+  azure: z
+    .object({
+      endpoint: z.string().optional(), // e.g. "https://myresource.openai.azure.com"
+      apiKey: z.string().optional(),
+      deploymentName: z.string().optional(), // e.g. "gpt-realtime-1.5"
+      apiVersion: z.string().optional(), // e.g. "2024-10-01-preview"
+    })
+    .optional(),
+  custom: z
+    .object({
+      baseUrl: z.string().optional(), // WebSocket base URL
+      apiKey: z.string().optional(),
+    })
+    .optional(),
+  model: z.string().optional(), // default: "gpt-4o-realtime-preview"
+  voice: z.string().optional(), // default: "alloy"
+  instructions: z.string().optional(), // system instructions for realtime session
+  turnDetection: z
+    .object({
+      type: z.enum(['server_vad', 'none']).optional(),
+      threshold: z.number().min(0).max(1).optional(),
+      silenceDurationMs: z.number().positive().optional(),
+    })
+    .optional(),
   inputAudioTranscription: z.boolean().optional(),
   inputDeviceId: z.string().nullable().optional(),
   outputDeviceId: z.string().nullable().optional(),
-  autoEndCall: z.object({
-    enabled: z.boolean().optional(),
-    silenceTimeoutSec: z.number().positive().optional(),
-  }).optional(),
-  memoryContext: z.object({
-    enabled: z.boolean(),
-    maxTokens: z.number().positive(),
-    conversationHistory: z.object({
+  autoEndCall: z
+    .object({
+      enabled: z.boolean().optional(),
+      silenceTimeoutSec: z.number().positive().optional(),
+    })
+    .optional(),
+  memoryContext: z
+    .object({
       enabled: z.boolean(),
-      maxMessages: z.number().nonnegative(),
-    }),
-    workingMemory: z.object({ enabled: z.boolean() }),
-    semanticRecall: z.object({
+      maxTokens: z.number().positive(),
+      conversationHistory: z.object({
+        enabled: z.boolean(),
+        maxMessages: z.number().nonnegative(),
+      }),
+      workingMemory: z.object({ enabled: z.boolean() }),
+      semanticRecall: z.object({
+        enabled: z.boolean(),
+        topK: z.number().positive(),
+      }),
+      observationalMemory: z.object({ enabled: z.boolean() }),
+    })
+    .optional(),
+  computerUseUpdates: z
+    .object({
       enabled: z.boolean(),
-      topK: z.number().positive(),
-    }),
-    observationalMemory: z.object({ enabled: z.boolean() }),
-  }).optional(),
-  computerUseUpdates: z.object({
-    enabled: z.boolean(),
-    throttleMs: z.number().min(1000).max(30000),
-    onStepCompleted: z.boolean(),
-    onStepFailed: z.boolean(),
-    onCheckpoint: z.boolean(),
-    onApprovalNeeded: z.boolean(),
-    onGuidanceReceived: z.boolean(),
-    onSessionCompleted: z.boolean(),
-    onSessionFailed: z.boolean(),
-  }).optional(),
+      throttleMs: z.number().min(1000).max(30000),
+      onStepCompleted: z.boolean(),
+      onStepFailed: z.boolean(),
+      onCheckpoint: z.boolean(),
+      onApprovalNeeded: z.boolean(),
+      onGuidanceReceived: z.boolean(),
+      onSessionCompleted: z.boolean(),
+      onSessionFailed: z.boolean(),
+    })
+    .optional(),
 });
 
 const mediaGenProviderConfigSchema = z.object({
   enabled: z.boolean(),
   provider: z.enum(['openai', 'azure', 'custom']),
-  openai: z.object({
-    apiKey: z.string().optional(),
-  }).optional(),
-  azure: z.object({
-    endpoint: z.string().optional(),
-    apiKey: z.string().optional(),
-    deploymentName: z.string().optional(),
-    apiVersion: z.string().optional(),
-  }).optional(),
-  custom: z.object({
-    baseUrl: z.string().optional(),
-    apiKey: z.string().optional(),
-  }).optional(),
+  openai: z
+    .object({
+      apiKey: z.string().optional(),
+    })
+    .optional(),
+  azure: z
+    .object({
+      endpoint: z.string().optional(),
+      apiKey: z.string().optional(),
+      deploymentName: z.string().optional(),
+      apiVersion: z.string().optional(),
+    })
+    .optional(),
+  custom: z
+    .object({
+      baseUrl: z.string().optional(),
+      apiKey: z.string().optional(),
+    })
+    .optional(),
   model: z.string().optional(),
 });
 
@@ -391,10 +417,12 @@ const marketplaceConfigSchema = z.object({
   installedPlugins: z.record(z.string(), marketplaceInstalledPluginSchema),
 });
 
-const pluginSystemSchema = z.object({
-  /** Controls behavior when a plugin's version/capability constraints don't match the host. */
-  compatibilityMode: z.enum(['strict', 'warn']).default('warn'),
-}).default({ compatibilityMode: 'warn' });
+const pluginSystemSchema = z
+  .object({
+    /** Controls behavior when a plugin's version/capability constraints don't match the host. */
+    compatibilityMode: z.enum(['strict', 'warn']).default('warn'),
+  })
+  .default({ compatibilityMode: 'warn' });
 
 const cliToolSchema = z.object({
   name: z.string(),
@@ -407,6 +435,21 @@ const cliToolSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Autopilot (Orchestrator)
+// ---------------------------------------------------------------------------
+
+const autopilotConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  intervalMs: z.number().min(5000).max(300000).default(30000),
+  autoStart: z.boolean().default(true),
+  maxConcurrentAgents: z.number().min(1).max(10).default(3),
+  matchingStrategy: z.enum(['simple', 'ai-scored']).default('simple'),
+  requireHumanReview: z.boolean().default(true),
+});
+
+export type AutopilotConfig = z.infer<typeof autopilotConfigSchema>;
+
+// ---------------------------------------------------------------------------
 // Agent runtime config
 // ---------------------------------------------------------------------------
 
@@ -415,11 +458,13 @@ export type RuntimeIdConfig = 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
 const claudeAgentSdkConfigSchema = z.object({
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),
   maxTurns: z.number().positive().optional(),
-  thinking: z.discriminatedUnion('type', [
-    z.object({ type: z.literal('adaptive') }),
-    z.object({ type: z.literal('disabled') }),
-    z.object({ type: z.literal('enabled'), budgetTokens: z.number().positive() }),
-  ]).optional(),
+  thinking: z
+    .discriminatedUnion('type', [
+      z.object({ type: z.literal('adaptive') }),
+      z.object({ type: z.literal('disabled') }),
+      z.object({ type: z.literal('enabled'), budgetTokens: z.number().positive() }),
+    ])
+    .optional(),
   persistSession: z.boolean().optional(),
 });
 
@@ -455,8 +500,14 @@ const webServerConfigSchema = z.object({
 // ── Workspace ─────────────────────────────────────────────────────────────
 
 export const WORKSPACE_COLORS = [
-  '#EF4444', '#F97316', '#F59E0B', '#22C55E',
-  '#14B8A6', '#3B82F6', '#8B5CF6', '#EC4899',
+  '#EF4444',
+  '#F97316',
+  '#F59E0B',
+  '#22C55E',
+  '#14B8A6',
+  '#3B82F6',
+  '#8B5CF6',
+  '#EC4899',
 ] as const;
 
 export const workspaceSchema = z.object({
@@ -490,14 +541,18 @@ export const appConfigSchema = z.object({
     processStreaming: processStreamingSchema,
     subAgents: subAgentConfigSchema,
     executionMode: executionModeSchema.default('auto'),
-    webFetch: z.object({
-      enabled: z.boolean().default(true),
-      timeout: z.number().positive().optional(),
-    }).optional(),
-    webSearch: z.object({
-      enabled: z.boolean().default(true),
-      timeout: z.number().positive().optional(),
-    }).optional(),
+    webFetch: z
+      .object({
+        enabled: z.boolean().default(true),
+        timeout: z.number().positive().optional(),
+      })
+      .optional(),
+    webSearch: z
+      .object({
+        enabled: z.boolean().default(true),
+        timeout: z.number().positive().optional(),
+      })
+      .optional(),
   }),
   mcpServers: z.array(mcpServerSchema),
   skills: z.object({
@@ -519,31 +574,37 @@ export const appConfigSchema = z.object({
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),
-    composer: z.object({
-      showModelProfileSelector: z.boolean(),
-    }).default({ showModelProfileSelector: true }),
+    composer: z
+      .object({
+        showModelProfileSelector: z.boolean(),
+      })
+      .default({ showModelProfileSelector: true }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,
   realtime: realtimeConfigSchema,
   computerUse: computerUseConfigSchema,
-  dictation: z.object({
-    enabled: z.boolean(),
-    provider: z.enum(['azure', 'openai']).optional(), // default: 'azure'
-    openai: openaiSttConfigSchema.optional(),         // Credentials for OpenAI Realtime STT
-    hotkey: z.string(),
-    mode: z.enum(['toggle', 'hold']),
-    inputDeviceId: z.string().nullable().optional(),
-    language: z.string().optional(),
-    vadSilenceDurationMs: z.number().min(300).max(5000).optional(),
-    finalCleanupEnabled: z.boolean().optional(),
-    livePartials: z.boolean().optional(),
-    partialTyping: z.object({
-      ax: partialTypingStrategySchema.optional(),
-      kb: partialTypingStrategySchema.optional(),
-    }).optional(),
-    debugLogging: z.boolean().optional(),
-  }).optional(),
+  dictation: z
+    .object({
+      enabled: z.boolean(),
+      provider: z.enum(['azure', 'openai']).optional(), // default: 'azure'
+      openai: openaiSttConfigSchema.optional(), // Credentials for OpenAI Realtime STT
+      hotkey: z.string(),
+      mode: z.enum(['toggle', 'hold']),
+      inputDeviceId: z.string().nullable().optional(),
+      language: z.string().optional(),
+      vadSilenceDurationMs: z.number().min(300).max(5000).optional(),
+      finalCleanupEnabled: z.boolean().optional(),
+      livePartials: z.boolean().optional(),
+      partialTyping: z
+        .object({
+          ax: partialTypingStrategySchema.optional(),
+          kb: partialTypingStrategySchema.optional(),
+        })
+        .optional(),
+      debugLogging: z.boolean().optional(),
+    })
+    .optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
     maxSteps: z.number().positive(),
@@ -556,6 +617,7 @@ export const appConfigSchema = z.object({
   imageGeneration: imageGenerationConfigSchema.optional(),
   videoGeneration: videoGenerationConfigSchema.optional(),
   cliTools: z.array(cliToolSchema).optional(),
+  autopilot: autopilotConfigSchema.optional(),
 });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;

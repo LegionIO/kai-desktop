@@ -1,4 +1,18 @@
-import { app, BrowserWindow, ipcMain, shell, Menu, nativeTheme, dialog, net, MenuItem, clipboard, systemPreferences, protocol, screen } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  shell,
+  Menu,
+  nativeTheme,
+  dialog,
+  net,
+  MenuItem,
+  clipboard,
+  systemPreferences,
+  protocol,
+  screen,
+} from 'electron';
 import { basename, join } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
@@ -37,7 +51,15 @@ import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
-import { registerAgentHandlers as registerAgentEntityHandlers } from './ipc/agents.js';
+import {
+  registerAgentHandlers as registerAgentEntityHandlers,
+  listAllAgents,
+  assignTaskToAgent,
+  startAgentRun,
+} from './ipc/agents.js';
+import { listAllTasks } from './ipc/tasks.js';
+import { TaskDispatcher } from './agent/task-dispatcher.js';
+import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
@@ -197,6 +219,7 @@ if (!gotSingleInstanceLock) {
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
 let taskTerminalManagerRef: TaskTerminalManager | null = null;
+let taskDispatcherRef: TaskDispatcher | null = null;
 
 function ensureAppHome(): void {
   const dirs = [
@@ -302,12 +325,7 @@ function buildMenu(): void {
     // Windows/Linux: File menu with Settings, Check for Updates, Exit
     template.push({
       label: 'File',
-      submenu: [
-        settingsMenuItem,
-        updateMenuItem,
-        { type: 'separator' },
-        { role: 'quit', label: 'Exit' },
-      ],
+      submenu: [settingsMenuItem, updateMenuItem, { type: 'separator' }, { role: 'quit', label: 'Exit' }],
     });
   }
 
@@ -358,10 +376,7 @@ function buildMenu(): void {
           { type: 'separator' },
           { role: 'front' },
         ]
-      : [
-          { role: 'minimize' },
-          { role: 'close' },
-        ],
+      : [{ role: 'minimize' }, { role: 'close' }],
   });
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
@@ -395,11 +410,15 @@ function createWindow(): BrowserWindow {
     icon: windowIcon,
     titleBarStyle: IS_MAC ? 'hiddenInset' : 'hidden',
     ...(IS_MAC ? { trafficLightPosition: { x: 20, y: 18 } } : {}),
-    ...(IS_WIN ? { titleBarOverlay: {
-      color: nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#f5f5f5',
-      symbolColor: nativeTheme.shouldUseDarkColors ? '#ffffff' : '#1a1a1a',
-      height: 38,
-    } } : {}),
+    ...(IS_WIN
+      ? {
+          titleBarOverlay: {
+            color: nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#f5f5f5',
+            symbolColor: nativeTheme.shouldUseDarkColors ? '#ffffff' : '#1a1a1a',
+            height: 38,
+          },
+        }
+      : {}),
     transparent: IS_MAC,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     visualEffectState: IS_MAC ? 'active' : undefined,
@@ -659,6 +678,7 @@ if (gotSingleInstanceLock) {
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
     let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
+    let lastAutopilotFingerprint = JSON.stringify(getConfig().autopilot ?? {});
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
@@ -779,6 +799,24 @@ if (gotSingleInstanceLock) {
         lastLaunchAtLoginFp = newLaunchAtLoginFp;
         app.setLoginItemSettings({ openAtLogin: config.launchAtLogin ?? false });
       }
+
+      // Autopilot config — react to external changes (e.g. settings UI flips
+      // the toggle via config:set rather than the orchestrator IPC).
+      const newAutopilotFp = JSON.stringify(config.autopilot ?? {});
+      if (newAutopilotFp !== lastAutopilotFingerprint) {
+        lastAutopilotFingerprint = newAutopilotFp;
+        if (taskDispatcherRef) {
+          const next = config.autopilot;
+          if (next) {
+            taskDispatcherRef.updateConfig(next);
+            if (next.enabled) {
+              taskDispatcherRef.start();
+            } else {
+              taskDispatcherRef.stop();
+            }
+          }
+        }
+      }
     };
 
     // Register IPC handlers (capture must be installed first for web UI bridge)
@@ -817,6 +855,25 @@ if (gotSingleInstanceLock) {
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerAgentEntityHandlers(ipcMain, APP_HOME, taskTerminalManager);
+
+    // Autopilot / orchestrator — drives task auto-assignment when enabled.
+    const initialAutopilotConfig = getConfig().autopilot;
+    const taskDispatcher = new TaskDispatcher(
+      {
+        listTasks: () => listAllTasks(APP_HOME),
+        listAgents: () => listAllAgents(APP_HOME),
+        assignTask: (agentId, taskId) => assignTaskToAgent(APP_HOME, agentId, taskId),
+        startAgent: (agentId) => startAgentRun(APP_HOME, taskTerminalManager, agentId),
+        getConfig: () => getConfig().autopilot ?? null,
+        broadcastState: broadcastOrchestratorState,
+      },
+      initialAutopilotConfig,
+    );
+    registerOrchestratorHandlers(ipcMain, taskDispatcher, APP_HOME, { setConfig });
+    if (initialAutopilotConfig?.enabled) {
+      taskDispatcher.start();
+    }
+    taskDispatcherRef = taskDispatcher;
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;
@@ -938,32 +995,39 @@ if (gotSingleInstanceLock) {
         });
         if (result.canceled) return { canceled: true, filePaths: [] };
 
-      // Read files and return as base64 data URLs
-      const files = result.filePaths.map((filePath) => {
-        const data = readFileSync(filePath);
-        const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
-        const mimeTypes: Record<string, string> = {
-          png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-          webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf',
-          txt: 'text/plain', md: 'text/markdown', json: 'application/json', csv: 'text/csv',
-        };
-        const mime = mimeTypes[ext] ?? 'application/octet-stream';
-        const isImage = mime.startsWith('image/');
-        return {
-          path: filePath,
-          name: basename(filePath),
-          mime,
-          isImage,
-          size: data.length,
-          dataUrl: `data:${mime};base64,${data.toString('base64')}`,
-          // For text files, also include raw text
-          ...(mime.startsWith('text/') || mime === 'application/json'
-            ? { text: data.toString('utf-8') }
-            : {}),
-        };
-      });
-      return { canceled: false, files };
-    });
+        // Read files and return as base64 data URLs
+        const files = result.filePaths.map((filePath) => {
+          const data = readFileSync(filePath);
+          const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+          const mimeTypes: Record<string, string> = {
+            png: 'image/png',
+            jpg: 'image/jpeg',
+            jpeg: 'image/jpeg',
+            gif: 'image/gif',
+            webp: 'image/webp',
+            svg: 'image/svg+xml',
+            pdf: 'application/pdf',
+            txt: 'text/plain',
+            md: 'text/markdown',
+            json: 'application/json',
+            csv: 'text/csv',
+          };
+          const mime = mimeTypes[ext] ?? 'application/octet-stream';
+          const isImage = mime.startsWith('image/');
+          return {
+            path: filePath,
+            name: basename(filePath),
+            mime,
+            isImage,
+            size: data.length,
+            dataUrl: `data:${mime};base64,${data.toString('base64')}`,
+            // For text files, also include raw text
+            ...(mime.startsWith('text/') || mime === 'application/json' ? { text: data.toString('utf-8') } : {}),
+          };
+        });
+        return { canceled: false, files };
+      },
+    );
 
     ipcMain.handle('dialog:open-directory', async () => {
       const win = BrowserWindow.getFocusedWindow();
@@ -1298,4 +1362,5 @@ app.on('before-quit', () => {
   cleanupDictation();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
+  taskDispatcherRef?.stop();
 });

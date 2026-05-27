@@ -42,6 +42,12 @@ export interface TaskFile {
   conversationHistory?: TaskConversationMessage[];
   /** ISO timestamp set when the task is archived. Archived tasks are hidden from normal views. */
   archivedAt?: string;
+  /** Optional priority used by the orchestrator when ranking tasks. Higher = sooner. */
+  priority?: number;
+  /** AI-generated summary written when the task completes. */
+  completionSummary?: string;
+  /** The exit code from the last terminal session for this task. */
+  lastExitCode?: number;
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */

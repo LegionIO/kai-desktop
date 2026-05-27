@@ -76,11 +76,7 @@ function readAgent(appHome: string, id: string): AgentFile | null {
 }
 
 function writeAgent(appHome: string, agent: AgentFile): void {
-  writeFileSync(
-    join(getAgentsDir(appHome), `${agent.id}.json`),
-    JSON.stringify(agent, null, 2),
-    'utf-8',
-  );
+  writeFileSync(join(getAgentsDir(appHome), `${agent.id}.json`), JSON.stringify(agent, null, 2), 'utf-8');
 }
 
 function readTask(appHome: string, id: string): TaskFile | null {
@@ -99,11 +95,7 @@ function readTask(appHome: string, id: string): TaskFile | null {
 }
 
 function writeTask(appHome: string, task: TaskFile): void {
-  writeFileSync(
-    join(getTasksDir(appHome), `${task.id}.json`),
-    JSON.stringify(task, null, 2),
-    'utf-8',
-  );
+  writeFileSync(join(getTasksDir(appHome), `${task.id}.json`), JSON.stringify(task, null, 2), 'utf-8');
 }
 
 function broadcastAgentChange(appHome: string): void {
@@ -128,13 +120,119 @@ function broadcastTaskChange(appHome: string): void {
   }
 }
 
-// ── Registration ─────────────────────────────────────────────────────────
+// ── Exported helpers (used by the orchestrator) ─────────────────────────
 
-export function registerAgentHandlers(
-  ipcMain: IpcMain,
+export { listAllAgents };
+
+/**
+ * Assign a task to an agent. Used by both the IPC handler and the autopilot
+ * dispatcher. Returns `{ ok: true }` on success or `{ error }` on failure.
+ */
+export function assignTaskToAgent(appHome: string, agentId: string, taskId: string): { ok?: boolean; error?: string } {
+  if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
+  if (!isValidId(taskId)) return { error: 'Invalid task ID' };
+
+  const agent = readAgent(appHome, agentId);
+  if (!agent) return { error: `Agent ${agentId} not found` };
+  if (agent.status === 'running') return { error: 'Cannot reassign while agent is running' };
+
+  const task = readTask(appHome, taskId);
+  if (!task) return { error: `Task ${taskId} not found` };
+
+  if (agent.currentTaskId && agent.currentTaskId !== taskId) {
+    const prevTask = readTask(appHome, agent.currentTaskId);
+    if (prevTask) {
+      prevTask.assignedAgentId = undefined;
+      prevTask.updatedAt = new Date().toISOString();
+      writeTask(appHome, prevTask);
+    }
+  }
+
+  agent.currentTaskId = taskId;
+  agent.updatedAt = new Date().toISOString();
+  writeAgent(appHome, agent);
+
+  task.assignedAgentId = agentId;
+  task.updatedAt = new Date().toISOString();
+  writeTask(appHome, task);
+
+  broadcastAgentChange(appHome);
+  broadcastTaskChange(appHome);
+  return { ok: true };
+}
+
+/**
+ * Start an assigned agent. Used by both the IPC handler and the autopilot
+ * dispatcher.
+ */
+export async function startAgentRun(
   appHome: string,
   terminalManager: TaskTerminalManager,
-): void {
+  agentId: string,
+): Promise<{ sessionId?: string; error?: string }> {
+  if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
+
+  const agent = readAgent(appHome, agentId);
+  if (!agent) return { error: `Agent ${agentId} not found` };
+  if (agent.status === 'running') return { error: 'Agent is already running' };
+  if (!agent.currentTaskId) return { error: 'No task assigned to agent' };
+
+  const task = readTask(appHome, agent.currentTaskId);
+  if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };
+
+  let effectiveRuntime = agent.runtime;
+  if (effectiveRuntime === 'auto') {
+    const config = readEffectiveConfig(appHome);
+    const configRuntime = config?.agent?.runtime;
+    if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
+    else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
+    else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
+    else effectiveRuntime = 'claude-code';
+  }
+
+  const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
+
+  try {
+    const sessionId = await terminalManager.create(agent.currentTaskId, {
+      runtime: effectiveRuntime,
+      cwd,
+      cols: 120,
+      rows: 30,
+    });
+
+    agent.status = 'running';
+    agent.terminalSessionId = sessionId;
+    agent.stats.lastRunAt = new Date().toISOString();
+    agent.updatedAt = new Date().toISOString();
+    writeAgent(appHome, agent);
+
+    if (task.status === 'todo') {
+      task.status = 'in_progress';
+    }
+    task.terminalSessionId = sessionId;
+    task.agentRuntime = effectiveRuntime;
+    task.updatedAt = new Date().toISOString();
+    writeTask(appHome, task);
+
+    broadcastAgentChange(appHome);
+    broadcastTaskChange(appHome);
+
+    if (task.description && (effectiveRuntime === 'claude-code' || effectiveRuntime === 'codex')) {
+      setTimeout(() => {
+        const prompt = task.description.trim() + '\n';
+        terminalManager.write(sessionId, prompt);
+      }, 1500);
+    }
+
+    return { sessionId };
+  } catch (err) {
+    return { error: String(err) };
+  }
+}
+
+// ── Registration ─────────────────────────────────────────────────────────
+
+export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, terminalManager: TaskTerminalManager): void {
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('agents:list', () => {
@@ -236,39 +334,7 @@ export function registerAgentHandlers(
   // ── Task assignment ────────────────────────────────────────────────
 
   ipcMain.handle('agents:assign-task', (_e, agentId: string, taskId: string) => {
-    if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
-    if (!isValidId(taskId)) return { error: 'Invalid task ID' };
-
-    const agent = readAgent(appHome, agentId);
-    if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Cannot reassign while agent is running' };
-
-    const task = readTask(appHome, taskId);
-    if (!task) return { error: `Task ${taskId} not found` };
-
-    // Unassign from previous task if any
-    if (agent.currentTaskId && agent.currentTaskId !== taskId) {
-      const prevTask = readTask(appHome, agent.currentTaskId);
-      if (prevTask) {
-        prevTask.assignedAgentId = undefined;
-        prevTask.updatedAt = new Date().toISOString();
-        writeTask(appHome, prevTask);
-      }
-    }
-
-    // Assign agent to task
-    agent.currentTaskId = taskId;
-    agent.updatedAt = new Date().toISOString();
-    writeAgent(appHome, agent);
-
-    // Set task's assignedAgentId
-    task.assignedAgentId = agentId;
-    task.updatedAt = new Date().toISOString();
-    writeTask(appHome, task);
-
-    broadcastAgentChange(appHome);
-    broadcastTaskChange(appHome);
-    return { ok: true };
+    return assignTaskToAgent(appHome, agentId, taskId);
   });
 
   ipcMain.handle('agents:unassign-task', (_e, agentId: string) => {
@@ -299,70 +365,7 @@ export function registerAgentHandlers(
   // ── Lifecycle: start / stop ────────────────────────────────────────
 
   ipcMain.handle('agents:start', async (_e, agentId: string) => {
-    if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
-
-    const agent = readAgent(appHome, agentId);
-    if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Agent is already running' };
-    if (!agent.currentTaskId) return { error: 'No task assigned to agent' };
-
-    const task = readTask(appHome, agent.currentTaskId);
-    if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };
-
-    // Resolve effective runtime (auto → user's preferred runtime from config)
-    let effectiveRuntime = agent.runtime;
-    if (effectiveRuntime === 'auto') {
-      const config = readEffectiveConfig(appHome);
-      const configRuntime = config?.agent?.runtime;
-      // Map config runtime IDs to agent runtime IDs
-      if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
-      else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
-      else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
-      else effectiveRuntime = 'claude-code'; // fallback
-    }
-
-    // Determine working directory
-    const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
-
-    try {
-      const sessionId = await terminalManager.create(agent.currentTaskId, {
-        runtime: effectiveRuntime,
-        cwd,
-        cols: 120,
-        rows: 30,
-      });
-
-      // Update agent state
-      agent.status = 'running';
-      agent.terminalSessionId = sessionId;
-      agent.stats.lastRunAt = new Date().toISOString();
-      agent.updatedAt = new Date().toISOString();
-      writeAgent(appHome, agent);
-
-      // Update task state
-      if (task.status === 'todo') {
-        task.status = 'in_progress';
-      }
-      task.terminalSessionId = sessionId;
-      task.agentRuntime = effectiveRuntime;
-      task.updatedAt = new Date().toISOString();
-      writeTask(appHome, task);
-
-      broadcastAgentChange(appHome);
-      broadcastTaskChange(appHome);
-
-      // If task has a description, feed it as the initial prompt after a small delay
-      if (task.description && (effectiveRuntime === 'claude-code' || effectiveRuntime === 'codex')) {
-        setTimeout(() => {
-          const prompt = task.description.trim() + '\n';
-          terminalManager.write(sessionId, prompt);
-        }, 1500);
-      }
-
-      return { sessionId };
-    } catch (err) {
-      return { error: String(err) };
-    }
+    return startAgentRun(appHome, terminalManager, agentId);
   });
 
   ipcMain.handle('agents:stop', (_e, agentId: string) => {
