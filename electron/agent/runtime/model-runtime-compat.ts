@@ -111,10 +111,7 @@ function resolveAutoMode(
       if (runtimeId === 'mastra' || runtimeId === 'claude-agent-sdk' || runtimeId === 'codex-sdk') continue;
       // Match: provider key starts with the plugin runtime ID
       if (providerKey.startsWith(runtimeId) || runtimeId.startsWith(providerKey.split('_')[0])) {
-        // Route through Mastra — the model's provider config handles the
-        // OpenAI-compatible fallback path, but preserve plugin ownership so a
-        // registered native inference provider can intercept first.
-        return { runtimeId: 'mastra', inferenceProviderRuntimeId: runtimeId };
+        return { runtimeId, inferenceProviderRuntimeId: runtimeId };
       }
     }
   }
@@ -171,26 +168,24 @@ function resolveExplicitMode(
   available: Set<string>,
 ): RuntimeResolution {
 
-  // Runtime not available — fall back to Mastra
+  // Runtime not available.
   if (!available.has(preferred)) {
-    // For plugin runtimes, add a visible notice so the user knows inference
-    // is routing through the standard pipeline instead of the plugin.
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
       return {
-        runtimeId: 'mastra',
-        fallbackNotice: `The "${preferred}" runtime is currently unavailable. Routing through the standard pipeline instead.`,
+        runtimeId: preferred,
+        inferenceProviderRuntimeId: preferred,
+        warning: `The "${preferred}" runtime is currently unavailable. Requests cannot be sent until that runtime is available.`,
       };
     }
     return { runtimeId: 'mastra' };
   }
 
-  // No model info — just use Mastra (plugin runtimes no longer have their own stream())
+  // No model info.
   if (!model || !providerType) {
-    // For plugin runtimes, still use Mastra — plugin runtimes route through their provider config
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
-      return { runtimeId: 'mastra' };
+      return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
     }
     return { runtimeId: preferred };
   }
@@ -258,8 +253,9 @@ function resolveExplicitMode(
 
     case 'mastra':
     default:
-      // If this is a known plugin runtime (not a built-in), route through Mastra
-      // but override the model's provider to use the plugin's endpoint.
+      // If this is a known plugin runtime (not a built-in), keep the plugin
+      // runtime as the owner and optionally override the model's provider to
+      // use the plugin's endpoint.
       // This enables "route any model through the plugin" behavior — the plugin
       // runtime's provider acts as a gateway that speaks OpenAI-compatible format.
       if (preferred !== 'mastra' && available.has(preferred)) {
@@ -276,22 +272,19 @@ function resolveExplicitMode(
         const modelAlreadyUsesPlugin = pluginProviderKey && modelProviderKey.startsWith(preferred);
 
         if (modelAlreadyUsesPlugin) {
-          // Model is already a plugin model — use Mastra as fallback transport
-          // while preserving plugin ownership for native inference providers.
-          return { runtimeId: 'mastra', inferenceProviderRuntimeId: preferred };
+          return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
         }
 
         // Non-plugin model with plugin runtime selected — override to route through plugin
         if (pluginProviderKey) {
           return {
-            runtimeId: 'mastra',
+            runtimeId: preferred,
             providerOverride: pluginProviderKey,
             inferenceProviderRuntimeId: preferred,
           };
         }
 
-        // Couldn't find a matching provider — pass through to Mastra
-        return { runtimeId: 'mastra' };
+        return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
       }
       // Mastra handles everything
       return { runtimeId: 'mastra' };
