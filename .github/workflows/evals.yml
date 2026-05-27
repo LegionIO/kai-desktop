@@ -91,6 +91,27 @@ jobs:
 
       - run: pnpm install
 
+      # Fail-closed gate on provider secrets. Without this the eval harness
+      # would run with `RUN_REAL_EVALS=1` but no keys, fall through to
+      # `describe.skipIf(!key)` per-test gates, and produce a `status=pass`
+      # output that reflects ZERO real calls — silent green, the worst
+      # possible outcome for a behavioural-regression watchdog. Matches
+      # the pattern in fixture-drift-check.yml lines 132-136. Exits 2 so
+      # the failure mode is visibly distinct from a harness fail (exit 1).
+      - name: Verify provider secrets are configured (fail-closed)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          missing=""
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then missing="${missing} ANTHROPIC_API_KEY"; fi
+          if [ -z "${OPENAI_API_KEY}" ]; then missing="${missing} OPENAI_API_KEY"; fi
+          if [ -n "${missing}" ]; then
+            echo "::error::Required provider secret(s) unset:${missing}. Configure them in the 'eval' GitHub Environment before running this workflow. Silent skipping has been disabled."
+            exit 2
+          fi
+          echo "All required provider secrets present."
+
       - name: Run behavioural evals
         id: run
         env:
