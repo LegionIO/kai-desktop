@@ -493,7 +493,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
       const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
       const inferenceProvider = pluginManager?.getInferenceProvider({
-        runtimeId: resolution.runtimeId,
+        runtimeId: resolution.inferenceProviderRuntimeId ?? resolution.runtimeId,
         modelProviderKey,
       }) ?? null;
       if (inferenceProvider) {

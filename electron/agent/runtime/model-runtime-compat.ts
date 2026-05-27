@@ -41,6 +41,12 @@ export type RuntimeResolution = {
    */
   providerOverride?: string;
   /**
+   * Plugin runtime that owns the selected model/request even when the concrete
+   * streaming runtime is Mastra. Used to locate a plugin inference provider
+   * before falling back to OpenAI-compatible provider routing.
+   */
+  inferenceProviderRuntimeId?: string;
+  /**
    * Non-blocking notice shown in chat when the preferred runtime is unavailable
    * and inference is falling back to the standard pipeline.
    */
@@ -106,8 +112,9 @@ function resolveAutoMode(
       // Match: provider key starts with the plugin runtime ID
       if (providerKey.startsWith(runtimeId) || runtimeId.startsWith(providerKey.split('_')[0])) {
         // Route through Mastra — the model's provider config handles the
-        // actual endpoint routing (e.g. legionio → daemon /v1/chat/completions)
-        return { runtimeId: 'mastra' };
+        // OpenAI-compatible fallback path, but preserve plugin ownership so a
+        // registered native inference provider can intercept first.
+        return { runtimeId: 'mastra', inferenceProviderRuntimeId: runtimeId };
       }
     }
   }
@@ -269,13 +276,18 @@ function resolveExplicitMode(
         const modelAlreadyUsesPlugin = pluginProviderKey && modelProviderKey.startsWith(preferred);
 
         if (modelAlreadyUsesPlugin) {
-          // Model is already a plugin model — just use Mastra directly
-          return { runtimeId: 'mastra' };
+          // Model is already a plugin model — use Mastra as fallback transport
+          // while preserving plugin ownership for native inference providers.
+          return { runtimeId: 'mastra', inferenceProviderRuntimeId: preferred };
         }
 
         // Non-plugin model with plugin runtime selected — override to route through plugin
         if (pluginProviderKey) {
-          return { runtimeId: 'mastra', providerOverride: pluginProviderKey };
+          return {
+            runtimeId: 'mastra',
+            providerOverride: pluginProviderKey,
+            inferenceProviderRuntimeId: preferred,
+          };
         }
 
         // Couldn't find a matching provider — pass through to Mastra
