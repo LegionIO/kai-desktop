@@ -17,9 +17,11 @@ import {
   FilePlusIcon,
   PencilIcon,
   ArchiveRestoreIcon,
+  BotIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
+import { useAgents } from '@/providers/AgentProvider';
 import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS } from '@/types/task';
 import { CreateTaskDialog } from './CreateTaskDialog';
@@ -58,20 +60,30 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   workspaceId,
 }) => {
   const { state, selectTask, archiveTask } = useTasks();
+  const { state: agentState } = useAgents();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
   // ── Pin state ──────────────────────────────────────────────────────────
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(PIN_STORAGE_KEY) || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(PIN_STORAGE_KEY) || '[]'));
+    } catch {
+      return new Set();
+    }
   });
 
   const togglePin = useCallback((id: string) => {
     const raw = localStorage.getItem(PIN_STORAGE_KEY) || '[]';
     let ids: string[];
-    try { ids = JSON.parse(raw); } catch { ids = []; }
+    try {
+      ids = JSON.parse(raw);
+    } catch {
+      ids = [];
+    }
     const set = new Set(ids);
-    if (set.has(id)) set.delete(id); else set.add(id);
+    if (set.has(id)) set.delete(id);
+    else set.add(id);
     const serialized = JSON.stringify([...set]);
     localStorage.setItem(PIN_STORAGE_KEY, serialized);
     setPinnedIds(set);
@@ -81,7 +93,11 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
-      try { setPinnedIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+      try {
+        setPinnedIds(new Set(JSON.parse(detail)));
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener(PIN_EVENT, handler);
     return () => window.removeEventListener(PIN_EVENT, handler);
@@ -107,7 +123,10 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
     const close = () => setContextMenu(null);
     window.addEventListener('click', close);
     window.addEventListener('contextmenu', close);
-    return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('contextmenu', close);
+    };
   }, [contextMenu]);
 
   // ── Sort and filter tasks ──────────────────────────────────────────────
@@ -121,9 +140,7 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
 
     const query = searchQuery.toLowerCase().trim();
     if (query) {
-      tasks = tasks.filter(
-        (t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query),
-      );
+      tasks = tasks.filter((t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query));
     }
     tasks.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return tasks;
@@ -158,7 +175,10 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
         <div className="flex-1" />
         <button
           type="button"
-          onClick={(e) => { e.stopPropagation(); onCreateTask?.(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onCreateTask?.();
+          }}
           className={cn(
             'flex items-center gap-1.5 rounded-lg border border-sidebar-border/60 px-2.5 py-1 text-xs font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60',
             isCreatingTask && 'border-primary/40 bg-primary/10 text-primary',
@@ -199,7 +219,9 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
             {section.label && (
               <div className="flex items-center gap-2 px-1 pb-1 pt-2">
                 <PinIcon className="h-2.5 w-2.5 text-primary/60" />
-                <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">{section.label}</span>
+                <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+                  {section.label}
+                </span>
               </div>
             )}
             {section.items.map((task) => {
@@ -229,12 +251,18 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
                     <div className="flex flex-col flex-1 min-w-0">
                       {(() => {
                         const isPending = task.title === 'New Task';
+                        const taskAgent = task.assignedAgentId
+                          ? agentState.agents.find((a) => a.id === task.assignedAgentId)
+                          : null;
+                        const reviewerCount = task.reviewerAgentIds?.length ?? 0;
                         return (
                           <>
-                            <span className={cn(
-                              'line-clamp-2 text-sm font-medium',
-                              isPending ? 'italic text-muted-foreground/50' : 'text-sidebar-foreground/95',
-                            )}>
+                            <span
+                              className={cn(
+                                'line-clamp-2 text-sm font-medium',
+                                isPending ? 'italic text-muted-foreground/50' : 'text-sidebar-foreground/95',
+                              )}
+                            >
                               {task.title}
                             </span>
                             <div className="mt-1 flex items-center text-[12px] text-muted-foreground">
@@ -249,7 +277,24 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
                               ) : (
                                 formatRelativeTime(task.updatedAt)
                               )}
+                              {reviewerCount > 0 && (
+                                <>
+                                  <span className="mx-1">·</span>
+                                  <span
+                                    className="inline-flex items-center gap-0.5 text-[10px] text-purple-400"
+                                    title={`${reviewerCount} reviewer${reviewerCount > 1 ? 's' : ''}`}
+                                  >
+                                    👥 {reviewerCount}
+                                  </span>
+                                </>
+                              )}
                             </div>
+                            {taskAgent && (
+                              <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground/60 truncate">
+                                <BotIcon className="h-3 w-3 shrink-0" />
+                                <span className="truncate max-w-[80px]">{taskAgent.name}</span>
+                              </div>
+                            )}
                           </>
                         );
                       })()}
@@ -301,46 +346,57 @@ export const TaskSidebarList: FC<TaskSidebarListProps> = ({
       </div>
 
       {/* Create task dialog */}
-      <CreateTaskDialog
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-      />
+      <CreateTaskDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} />
 
       {/* Context menu portal */}
-      {contextMenu && createPortal(
-        <div
-          className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-            onClick={() => { togglePin(contextMenu.taskId); setContextMenu(null); }}
+      {contextMenu &&
+        createPortal(
+          <div
+            className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onClick={(e) => e.stopPropagation()}
           >
-            <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedIds.has(contextMenu.taskId) ? 'Unpin' : 'Pin'}
-          </button>
-          <button
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-rename', { detail: contextMenu.taskId })); setContextMenu(null); }}
-          >
-            <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
-          </button>
-          <button
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-            onClick={() => { void archiveTask(contextMenu.taskId); setContextMenu(null); }}
-          >
-            <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Archive
-          </button>
-          <div className="my-1 h-px bg-border/60" />
-          <button
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-            onClick={() => { window.dispatchEvent(new CustomEvent('kai:request-task-delete', { detail: contextMenu.taskId })); setContextMenu(null); }}
-          >
-            <Trash2Icon className="h-4 w-4" /> Delete
-          </button>
-        </div>,
-        document.body,
-      )}
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+              onClick={() => {
+                togglePin(contextMenu.taskId);
+                setContextMenu(null);
+              }}
+            >
+              <PinIcon className="h-4 w-4 text-muted-foreground" />{' '}
+              {pinnedIds.has(contextMenu.taskId) ? 'Unpin' : 'Pin'}
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('kai:request-task-rename', { detail: contextMenu.taskId }));
+                setContextMenu(null);
+              }}
+            >
+              <PencilIcon className="h-4 w-4 text-muted-foreground" /> Rename
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+              onClick={() => {
+                void archiveTask(contextMenu.taskId);
+                setContextMenu(null);
+              }}
+            >
+              <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Archive
+            </button>
+            <div className="my-1 h-px bg-border/60" />
+            <button
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('kai:request-task-delete', { detail: contextMenu.taskId }));
+                setContextMenu(null);
+              }}
+            >
+              <Trash2Icon className="h-4 w-4" /> Delete
+            </button>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 };
