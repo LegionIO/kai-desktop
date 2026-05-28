@@ -45,6 +45,14 @@ export const branding = {
   sidebarSectionPlugins: 'Plugins',
   /** Sidebar section label for the tasks/queue tab. */
   sidebarSectionTasks: 'Tasks',
+  /**
+   * Feature gate for the Agents and Tasks UI surfaces.
+   * Set to 'true' to show the Agents tab, Tasks tab, task creation, and
+   * the "Create Task" system-prompt editor in Settings.
+   * Set to 'false' (default) to hide all of those surfaces; plan approvals
+   * stay scoped to the current chat thread instead of creating a task.
+   */
+  enableAgentsTasks: 'false',
 
   // ── Protocol & machine IDs ────────────────────────────────────────────
   /** Custom Electron protocol scheme for serving generated media (e.g. "kai-media://"). */

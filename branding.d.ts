@@ -21,6 +21,10 @@ declare const __BRAND_SIDEBAR_SECTION_THREADS: string;
 declare const __BRAND_SIDEBAR_SECTION_PLUGINS: string;
 declare const __BRAND_SIDEBAR_SECTION_TASKS: string;
 
+// ── Feature flags ─────────────────────────────────────────────────────────
+/** 'true' shows Agents + Tasks UI surfaces; 'false' hides them. */
+declare const __BRAND_ENABLE_AGENTS_TASKS: string;
+
 // ── Protocol & machine IDs ────────────────────────────────────────────────
 declare const __BRAND_MEDIA_PROTOCOL: string;
 declare const __BRAND_MCP_CLIENT_NAME: string;

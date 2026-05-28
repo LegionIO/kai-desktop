@@ -148,8 +148,8 @@ export const ToolCallDisplay: FC<{ part: ToolCallPart; onSendFeedback?: (text: s
   const handleApprove = useCallback(async () => {
     setLocalApproval('approved');
     void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
-    // Bridge: create a task queue entry from approved plan
-    if (isPlanApproval && planContent) {
+    // Bridge: create a task queue entry from approved plan (only when Agents & Tasks feature is enabled)
+    if (isPlanApproval && planContent && __BRAND_ENABLE_AGENTS_TASKS !== 'false') {
       const task = await onPlanApproved?.({
         title: planArgs?.planTitle ? String(planArgs.planTitle) : 'Untitled Plan',
         description: planContent,
@@ -869,8 +869,12 @@ const PlanApprovalCard: FC<{
       {(approvalStatus === 'approved' || (hasResult && !isError)) && (
         <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
           <CheckIcon className="h-3 w-3" />
-          <span>Plan accepted — added to Tasks</span>
-          {createdTaskId && (
+          <span>
+            {__BRAND_ENABLE_AGENTS_TASKS !== 'false'
+              ? 'Plan accepted — added to Tasks'
+              : 'Plan accepted — implementing in this chat'}
+          </span>
+          {__BRAND_ENABLE_AGENTS_TASKS !== 'false' && createdTaskId && (
             <button
               type="button"
               onClick={handleViewTask}

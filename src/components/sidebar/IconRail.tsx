@@ -23,12 +23,12 @@ type TabDef = { id: SidebarTab; icon: LucideIcon; label: string };
 
 const SCOPED_TABS: readonly TabDef[] = [
   { id: 'chats', icon: MessageSquareIcon, label: 'Chats' },
-  { id: 'tasks', icon: CheckSquareIcon, label: 'Tasks' },
+  ...(__BRAND_ENABLE_AGENTS_TASKS !== 'false' ? [{ id: 'tasks' as const, icon: CheckSquareIcon, label: 'Tasks' }] : []),
 ];
 
 const GLOBAL_TABS: readonly TabDef[] = [
   // { id: 'messages', icon: InboxIcon, label: 'Messages' },  // TODO: re-enable later
-  { id: 'agents', icon: BotIcon, label: 'Agents' },
+  ...(__BRAND_ENABLE_AGENTS_TASKS !== 'false' ? [{ id: 'agents' as const, icon: BotIcon, label: 'Agents' }] : []),
   { id: 'plugins', icon: PackageIcon, label: 'Plugins' },
 ];
 

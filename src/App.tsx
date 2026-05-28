@@ -1102,6 +1102,7 @@ function AppShell() {
   }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
 
   useEffect(() => {
+    if (__BRAND_ENABLE_AGENTS_TASKS === 'false') return;
     const handler = (e: Event) => {
       const { taskId } = (e as CustomEvent<{ taskId: string }>).detail;
       if (taskId) {
@@ -1267,14 +1268,16 @@ function AppShell() {
       }
 
       // Sidebar tab shortcuts: Cmd+1 through Cmd+5
-      const tabShortcuts: Record<string, SidebarTab> = { '1': 'chats', '2': 'tasks', '3': 'messages', '4': 'agents', '5': 'plugins' };
+      const tabShortcuts: Record<string, SidebarTab> = __BRAND_ENABLE_AGENTS_TASKS !== 'false'
+        ? { '1': 'chats', '2': 'tasks', '3': 'messages', '4': 'agents', '5': 'plugins' }
+        : { '1': 'chats', '2': 'plugins' };
       if (e.key in tabShortcuts) {
         e.preventDefault();
         const tab = tabShortcuts[e.key];
         setSidebarSection(tab);
         if (tab === 'chats') setActiveView(lastChatsViewRef.current);
-        else if (tab === 'tasks') setActiveView(TASKS_VIEW);
-        else if (tab === 'agents') setActiveView(AGENTS_VIEW);
+        else if (__BRAND_ENABLE_AGENTS_TASKS !== 'false' && tab === 'tasks') setActiveView(TASKS_VIEW);
+        else if (__BRAND_ENABLE_AGENTS_TASKS !== 'false' && tab === 'agents') setActiveView(AGENTS_VIEW);
         else if (tab === 'plugins') setActiveView(lastPluginViewRef.current);
         return;
       }
@@ -1431,7 +1434,7 @@ function AppShell() {
           </div>,
           document.body,
         )}
-        {renamingTask && tasksCtx?.state.selectedTaskId && createPortal(
+        {__BRAND_ENABLE_AGENTS_TASKS !== 'false' && renamingTask && tasksCtx?.state.selectedTaskId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTask(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
@@ -1463,7 +1466,7 @@ function AppShell() {
           </div>,
           document.body,
         )}
-        {confirmingTaskDelete && tasksCtx?.state.selectedTaskId && createPortal(
+        {__BRAND_ENABLE_AGENTS_TASKS !== 'false' && confirmingTaskDelete && tasksCtx?.state.selectedTaskId && createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingTaskDelete(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
             <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
@@ -1532,9 +1535,9 @@ function AppShell() {
                     setActiveView(lastPluginViewRef.current);
                   } else if (tab === 'chats') {
                     setActiveView(lastChatsViewRef.current);
-                  } else if (tab === 'tasks') {
+                  } else if (__BRAND_ENABLE_AGENTS_TASKS !== 'false' && tab === 'tasks') {
                     setActiveView(TASKS_VIEW);
-                  } else if (tab === 'agents') {
+                  } else if (__BRAND_ENABLE_AGENTS_TASKS !== 'false' && tab === 'agents') {
                     setActiveView(AGENTS_VIEW);
                   }
                 }}
@@ -1564,33 +1567,37 @@ function AppShell() {
                     </>
                   }
                   tasksContent={
-                    <div className="min-h-0 flex-1 overflow-y-auto">
-                      <TaskSidebarList
-                        onSelectTask={() => {
-                          setIsCreatingTask(false);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        onCreateTask={() => {
-                          tasksCtx?.selectTask(null);
-                          tasksCtx?.exitAICreation();
-                          setIsCreatingTask(true);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        onViewBoard={() => {
-                          tasksCtx?.selectTask(null);
-                          setIsCreatingTask(false);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
-                        isCreatingTask={isCreatingTask}
-                        workspaceId={activeWorkspaceId}
-                      />
-                    </div>
+                    __BRAND_ENABLE_AGENTS_TASKS !== 'false' ? (
+                      <div className="min-h-0 flex-1 overflow-y-auto">
+                        <TaskSidebarList
+                          onSelectTask={() => {
+                            setIsCreatingTask(false);
+                            setActiveView(TASKS_VIEW);
+                          }}
+                          onCreateTask={() => {
+                            tasksCtx?.selectTask(null);
+                            tasksCtx?.exitAICreation();
+                            setIsCreatingTask(true);
+                            setActiveView(TASKS_VIEW);
+                          }}
+                          onViewBoard={() => {
+                            tasksCtx?.selectTask(null);
+                            setIsCreatingTask(false);
+                            setActiveView(TASKS_VIEW);
+                          }}
+                          isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
+                          isCreatingTask={isCreatingTask}
+                          workspaceId={activeWorkspaceId}
+                        />
+                      </div>
+                    ) : null
                   }
                   agentsContent={
-                    <div className="min-h-0 flex-1 overflow-y-auto">
-                      <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
-                    </div>
+                    __BRAND_ENABLE_AGENTS_TASKS !== 'false' ? (
+                      <div className="min-h-0 flex-1 overflow-y-auto">
+                        <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
+                      </div>
+                    ) : null
                   }
                   pluginsContent={
                     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1668,7 +1675,7 @@ function AppShell() {
                   <div className="flex items-center gap-1.5">
                     <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugins</div>
                   </div>
-                ) : activeView === AGENTS_VIEW ? (
+                ) : __BRAND_ENABLE_AGENTS_TASKS !== 'false' && activeView === AGENTS_VIEW ? (
                   (() => {
                     if (agentsCtx.state.isCreatingAgent) {
                       return null;
@@ -1727,7 +1734,7 @@ function AppShell() {
                     }
                     return <div className="flex items-center gap-1.5"><div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Agents</div></div>;
                   })()
-                ) : activeView === TASKS_VIEW ? (
+                ) : __BRAND_ENABLE_AGENTS_TASKS !== 'false' && activeView === TASKS_VIEW ? (
                   (() => {
                     if (isCreatingTask) {
                       return null;
@@ -2066,7 +2073,7 @@ function AppShell() {
                   }}
                   workspaceId={activeWorkspaceId}
                 />
-              ) : activeView === TASKS_VIEW ? (
+              ) : __BRAND_ENABLE_AGENTS_TASKS !== 'false' && activeView === TASKS_VIEW ? (
                 isCreatingTask ? (
                   <TaskCreationView
                     onDone={(taskId) => {
@@ -2082,7 +2089,7 @@ function AppShell() {
                     <TaskQueue workspaceId={activeWorkspaceId} />
                   </div>
                 )
-              ) : activeView === AGENTS_VIEW ? (
+              ) : __BRAND_ENABLE_AGENTS_TASKS !== 'false' && activeView === AGENTS_VIEW ? (
                 <div className="flex flex-col flex-1 min-h-0">
                   <AgentSwarmView />
                   {agentRenameModal && (

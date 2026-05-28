@@ -187,7 +187,9 @@ const promptFields: Array<{ key: PromptKey; label: string; placeholder: string; 
   { key: 'chat', label: 'New Chat', placeholder: DEFAULT_CHAT_PROMPT, configPath: 'systemPrompt' },
   { key: 'realtimeInstructions', label: 'Voice Chat', placeholder: 'You are a helpful assistant. Respond concisely and naturally in conversation.', configPath: 'realtime.instructions' },
   { key: 'plan', label: 'Create Plan', placeholder: DEFAULT_PLAN_PROMPT, configPath: 'systemPrompts.plan' },
-  { key: 'taskPlan', label: 'Create Task', placeholder: DEFAULT_TASK_PLAN_PROMPT, configPath: 'systemPrompts.taskPlan' },
+  ...(__BRAND_ENABLE_AGENTS_TASKS !== 'false'
+    ? [{ key: 'taskPlan' as PromptKey, label: 'Create Task', placeholder: DEFAULT_TASK_PLAN_PROMPT, configPath: 'systemPrompts.taskPlan' }]
+    : []),
   { key: 'computerUse', label: 'Computer Use', placeholder: DEFAULT_COMPUTER_USE_PROMPT, configPath: 'systemPrompts.computerUse' },
 ];
 
