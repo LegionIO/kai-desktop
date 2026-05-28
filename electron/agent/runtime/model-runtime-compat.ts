@@ -172,6 +172,19 @@ function resolveExplicitMode(
   if (!available.has(preferred)) {
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
+      // Before hard-erroring, check whether a native provider key exists for
+      // this runtime (e.g. runtime 'legion' → provider 'legionio' written by
+      // legion-interlink). If so, route through Mastra using that provider
+      // rather than waiting for a plugin that will never arrive.
+      const nativeProviderKey = Object.keys(config.models.providers).find(
+        (key) => key.startsWith(preferred) || key === preferred,
+      );
+      if (nativeProviderKey) {
+        return {
+          runtimeId: 'mastra',
+          providerOverride: nativeProviderKey,
+        };
+      }
       return {
         runtimeId: preferred,
         inferenceProviderRuntimeId: preferred,
@@ -185,6 +198,14 @@ function resolveExplicitMode(
   if (!model || !providerType) {
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
+      // Same native-provider fallback: if a provider key exists for this runtime,
+      // route through Mastra rather than requiring a plugin.
+      const nativeProviderKey = Object.keys(config.models.providers).find(
+        (key) => key.startsWith(preferred) || key === preferred,
+      );
+      if (nativeProviderKey) {
+        return { runtimeId: 'mastra', providerOverride: nativeProviderKey };
+      }
       return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
     }
     return { runtimeId: preferred };
