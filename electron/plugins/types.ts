@@ -28,7 +28,6 @@ export type PluginPermission =
   | 'state:publish'
   | 'agent:generate'
   | 'agent:inference-provider'
-  | 'agent:register-runtime'
   | 'agent:register-cli-tool'
   | 'safe-storage'
   | 'browser:window'
@@ -151,7 +150,6 @@ export type PluginInstance = {
   configChangeListeners: Array<(config: AppConfig | PluginSafeConfig) => void>;
   rendererBuild: PluginRendererBuild | null;
   inferenceProvider: PluginInferenceProvider | null;
-  contributedRuntimes: PluginRuntimeContribution[];
   contributedCliTools: PluginCliToolContribution[];
 };
 
@@ -577,8 +575,6 @@ export type PluginAPI = {
     generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
     registerInferenceProvider: (provider: PluginInferenceProvider) => void;
     unregisterInferenceProvider: () => void;
-    registerRuntime: (runtime: PluginRuntimeContribution) => void;
-    unregisterRuntime: (runtimeId: string) => void;
     registerCliTool: (tool: PluginCliToolContribution) => void;
   };
 
@@ -703,21 +699,6 @@ export type PluginInferenceProvider = {
   isAvailable: () => boolean;
   /** Stream inference. Yield PluginInferenceStreamEvent objects. */
   stream: (options: PluginInferenceStreamOptions) => AsyncGenerator<PluginInferenceStreamEvent>;
-};
-
-/**
- * A runtime contributed by a plugin. Appears in the Runtimes tab alongside
- * Claude Code, Codex, and Mastra. Availability is checked dynamically.
- */
-export type PluginRuntimeContribution = {
-  /** Machine-readable id shown in the runtime selector (e.g. 'my-runtime'). */
-  id: string;
-  /** Human-readable name shown in the Runtimes tab. */
-  name: string;
-  /** Optional one-line description shown below the dropdown when this runtime is selected. */
-  description?: string;
-  /** Return true when this runtime is currently reachable/available. */
-  isAvailable: () => boolean;
 };
 
 /**

@@ -10,15 +10,13 @@ type AgentConfig = {
   autoContinueOnMaxTurns?: boolean;
 };
 
-const BUILT_IN_RUNTIME_IDS = new Set(['mastra', 'claude-agent-sdk', 'codex-sdk']);
-
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   mastra: 'Built-in runtime with full Kai feature support (memory, observer, compaction, multi-provider models).',
   'claude-agent-sdk': 'Anthropic\'s Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.',
   'codex-sdk': 'OpenAI\'s Codex agent. Thread-based execution with session resume.',
 };
 
-/** Sort order: plugin runtimes always first (pinned), then available before offline, then by priority. */
+/** Sort order: available before offline, then by priority. */
 const RUNTIME_PRIORITY: Record<string, number> = {
   'claude-agent-sdk': 1,
   'codex-sdk': 2,
@@ -27,13 +25,9 @@ const RUNTIME_PRIORITY: Record<string, number> = {
 
 function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
   return [...list].sort((a, b) => {
-    // Plugin runtimes (not built-in) are always pinned to the top
-    const aIsPlugin = !BUILT_IN_RUNTIME_IDS.has(a.id);
-    const bIsPlugin = !BUILT_IN_RUNTIME_IDS.has(b.id);
-    if (aIsPlugin !== bIsPlugin) return aIsPlugin ? -1 : 1;
-    // Within the same group: available before offline
+    // Available before offline
     if (a.available !== b.available) return a.available ? -1 : 1;
-    // Among built-ins of the same availability, sort by priority
+    // Sort by priority
     const pa = RUNTIME_PRIORITY[a.id] ?? 99;
     const pb = RUNTIME_PRIORITY[b.id] ?? 99;
     return pa - pb;
@@ -64,14 +58,6 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
     return () => { cancelled = true; };
   }, [agentConfig.runtime, fetchRuntimes]);
 
-  // Refetch when plugin UI state changes (e.g. a plugin registers/unregisters a runtime)
-  useEffect(() => {
-    if (!app.plugins?.onUIStateChanged) return;
-    return app.plugins.onUIStateChanged(() => {
-      void fetchRuntimes();
-    });
-  }, [fetchRuntimes]);
-
   const selectedRuntime = agentConfig.runtime;
   const sortedRuntimes = sortRuntimes(runtimes);
 
@@ -97,24 +83,15 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
             onChange={(e) => void updateConfig('agent.runtime', e.target.value)}
           >
             <option value="auto">Auto (prefer external runtime if available)</option>
-            {/* Plugin-contributed runtimes appear first */}
-            {runtimes
-              .filter((r) => !BUILT_IN_RUNTIME_IDS.has(r.id))
-              .map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.name}
-                </option>
-              ))}
             <option value="claude-agent-sdk">Claude Code</option>
             <option value="codex-sdk">Codex</option>
             <option value="mastra">Mastra</option>
           </select>
         </div>
 
-        {/* Runtime descriptions — built-ins use hardcoded copy, plugin runtimes use their own description */}
+        {/* Runtime descriptions */}
         {selectedRuntime !== 'auto' && (() => {
-          const desc = RUNTIME_DESCRIPTIONS[selectedRuntime]
-            ?? runtimes.find((r) => r.id === selectedRuntime)?.description;
+          const desc = RUNTIME_DESCRIPTIONS[selectedRuntime];
           return desc ? (
             <p className="text-[10px] text-muted-foreground/80 italic">{desc}</p>
           ) : null;
