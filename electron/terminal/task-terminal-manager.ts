@@ -12,6 +12,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
+import { appendOutput, getBuffer } from './output-buffer.js';
 
 // node-pty is a native addon — imported dynamically to gracefully handle
 // missing builds (e.g. in CI or unsupported platforms).
@@ -66,6 +67,7 @@ export class TaskTerminalManager {
     });
 
     proc.onData((data: string) => {
+      appendOutput(sessionId, data);
       this.broadcast('tasks:terminal-data', { sessionId, data });
     });
 
@@ -154,18 +156,12 @@ export class TaskTerminalManager {
       case 'claude-code':
         return {
           command: 'claude',
-          args: [
-            '--dangerously-skip-permissions',
-            ...(customArgs ?? []),
-          ],
+          args: ['--dangerously-skip-permissions', ...(customArgs ?? [])],
         };
       case 'codex':
         return {
           command: 'codex',
-          args: [
-            '--dangerously-bypass-approvals-and-sandbox',
-            ...(customArgs ?? []),
-          ],
+          args: ['--dangerously-bypass-approvals-and-sandbox', ...(customArgs ?? [])],
         };
       case 'mastra':
         // Mastra as a terminal agent: use the shell and let the task description
@@ -193,17 +189,10 @@ export class TaskTerminalManager {
 
 // ── IPC Handler Registration ────────────────────────────────────────────
 
-export function registerTaskTerminalHandlers(
-  ipcMain: IpcMain,
-  terminalManager: TaskTerminalManager,
-): void {
+export function registerTaskTerminalHandlers(ipcMain: IpcMain, terminalManager: TaskTerminalManager): void {
   ipcMain.handle(
     'tasks:terminal-create',
-    async (
-      _e,
-      taskId: string,
-      options: { runtime: string; cwd?: string; cols?: number; rows?: number },
-    ) => {
+    async (_e, taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => {
       try {
         const sessionId = await terminalManager.create(taskId, options);
         return { sessionId };
@@ -217,15 +206,16 @@ export function registerTaskTerminalHandlers(
     terminalManager.write(sessionId, data);
   });
 
-  ipcMain.handle(
-    'tasks:terminal-resize',
-    (_e, sessionId: string, cols: number, rows: number) => {
-      terminalManager.resize(sessionId, cols, rows);
-    },
-  );
+  ipcMain.handle('tasks:terminal-resize', (_e, sessionId: string, cols: number, rows: number) => {
+    terminalManager.resize(sessionId, cols, rows);
+  });
 
   ipcMain.handle('tasks:terminal-kill', (_e, sessionId: string) => {
     terminalManager.kill(sessionId);
     return { ok: true };
+  });
+
+  ipcMain.handle('tasks:terminal-get-buffer', (_e, sessionId: string) => {
+    return getBuffer(sessionId);
   });
 }

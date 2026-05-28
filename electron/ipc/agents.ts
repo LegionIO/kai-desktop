@@ -13,6 +13,7 @@ import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { appendOutput } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
 import { getRegisteredTools } from './agent.js';
@@ -276,6 +277,7 @@ export async function startAgentRun(
 
     // Broadcast formatted output to the terminal viewer via the standard channel
     const broadcast = (text: string) => {
+      appendOutput(virtualSessionId, text);
       for (const win of BrowserWindow.getAllWindows()) {
         win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
       }
@@ -350,6 +352,17 @@ export async function startAgentRun(
             const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
             const truncated = resultStr.length > 500 ? resultStr.slice(0, 500) + '…' : resultStr;
             broadcast(`\x1b[90m${truncated.replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+          } else if (ev.type === 'data-workspace-metadata') {
+            const wsData = ev.data as Record<string, unknown>;
+            broadcast(
+              `\x1b[90m[Workspace] ${String(wsData.toolName ?? '')} → ${String(wsData.status ?? '')}\x1b[0m\r\n`,
+            );
+          } else if (ev.type === 'data-sandbox-exit') {
+            const exitData = ev.data as Record<string, unknown>;
+            const success = exitData.success ? '✓' : '✗';
+            broadcast(
+              `\x1b[90m[Sandbox] ${success} exit=${String(exitData.exitCode)} (${String(exitData.executionTimeMs)}ms)\x1b[0m\r\n`,
+            );
           }
         }
 
@@ -379,9 +392,10 @@ export async function startAgentRun(
         // Only clear terminal from task — do NOT auto-transition status.
         // The agent or user should decide when to promote the task.
         // On error, leave as in_progress so user can retry.
+        // NOTE: We intentionally keep task.terminalSessionId so the UI can
+        // replay buffered output when the user navigates back to this task.
         const freshTask = readTask(appHome, task.id);
         if (freshTask) {
-          freshTask.terminalSessionId = undefined;
           freshTask.updatedAt = new Date().toISOString();
           writeTask(appHome, freshTask);
         }
@@ -469,7 +483,7 @@ export async function startAgentRun(
         if (exitTask) {
           const taskNow = new Date().toISOString();
           exitTask.status = nextStatus;
-          exitTask.terminalSessionId = undefined;
+          // Keep terminalSessionId so the UI can replay buffered output
           exitTask.updatedAt = taskNow;
           if (nextStatus === 'done') exitTask.completedAt = taskNow;
           writeTask(appHome, exitTask);
@@ -788,7 +802,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
             if (task) {
               const taskNow = new Date().toISOString();
               task.status = nextStatus;
-              task.terminalSessionId = undefined;
+              // Keep terminalSessionId so the UI can replay buffered output
               task.updatedAt = taskNow;
               if (nextStatus === 'done') {
                 task.completedAt = taskNow;
