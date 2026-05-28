@@ -742,16 +742,21 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <span>{assignedAgent.icon ?? '🤖'}</span>
                   <span className="font-medium">{assignedAgent.name}</span>
-                  {(terminalSessionId || assignedAgent.status === 'running') && (
+                  {assignedAgent.status === 'running' && (
                     <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-500">
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
                       Running
                     </span>
                   )}
+                  {assignedAgent.status === 'idle' && terminalSessionId && (
+                    <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      Completed
+                    </span>
+                  )}
                 </span>
               )}
               <div className="ml-auto flex items-center gap-1.5">
-                {(terminalSessionId || assignedAgent?.status === 'running') && (
+                {assignedAgent?.status === 'running' && (
                   <button
                     type="button"
                     onClick={handleStopAgent}
@@ -780,8 +785,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               !fullWidth && 'max-w-3xl',
             )}
           >
-            {/* Review Results Panel — shown when in ai_review with reviewResults */}
-            {task.status === 'ai_review' && task.reviewResults && task.reviewResults.length > 0 && (
+            {/* Review Results Panel — shown when task has reviewResults (ai_review, human_review, or done) */}
+            {task.reviewResults && task.reviewResults.length > 0 && (
               <div className="shrink-0">
                 <ReviewResultsPanel
                   task={task}
@@ -792,10 +797,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               </div>
             )}
 
-            {/* Reviewer terminal tabs — shown when in ai_review with multiple terminal sessions */}
+            {/* Reviewer terminal tabs — shown when reviewers have terminal sessions */}
             {(() => {
               const reviewerTerminals = (task.reviewResults ?? []).filter((r) => r.terminalSessionId);
-              const showTabs = task.status === 'ai_review' && reviewerTerminals.length > 0;
+              const showTabs = reviewerTerminals.length > 0;
               if (!showTabs) return null;
               return (
                 <div className="shrink-0 flex items-center gap-0.5 rounded-lg border border-border/40 bg-muted/20 p-0.5">
