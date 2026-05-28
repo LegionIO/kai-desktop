@@ -29,6 +29,28 @@ const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 /** AbortControllers for running Mastra virtual sessions (keyed by sessionId). */
 const mastraAbortControllers = new Map<string, AbortController>();
 
+/** Module-level ref to terminal manager — set during registration, used by autoRestartAgent. */
+let _terminalManager: TaskTerminalManager | null = null;
+let _appHome: string | null = null;
+
+/**
+ * Auto-restart an agent after kick-back (AI review rejection or human request changes).
+ * This runs regardless of autopilot state — it's re-executing work that was already assigned.
+ */
+async function autoRestartAgent(appHome: string, agentId: string): Promise<void> {
+  if (!_terminalManager) return;
+  try {
+    const result = await startAgentRun(appHome, _terminalManager, agentId);
+    if (result.error) {
+      console.warn(`[Agent:task] Auto-restart failed for agent ${agentId}: ${result.error}`);
+    } else {
+      console.info(`[Agent:task] Auto-restart succeeded for agent ${agentId} session=${result.sessionId}`);
+    }
+  } catch (err) {
+    console.warn(`[Agent:task] Auto-restart threw for agent ${agentId}:`, err);
+  }
+}
+
 function isValidId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
 }
@@ -419,6 +441,15 @@ async function startReviewProcess(appHome: string, task: TaskFile): Promise<void
 
   writeTask(appHome, freshTask);
   broadcastTaskChange(appHome);
+
+  // Auto-restart the assigned agent if task was kicked back (regardless of autopilot)
+  if (anyRejected && freshTask.assignedAgentId) {
+    console.info(`[Agent:task] AI review rejected — auto-restarting agent for task "${freshTask.title}"`);
+    // Import terminalManager from the outer scope via a module-level ref
+    setTimeout(() => {
+      void autoRestartAgent(appHome, freshTask.assignedAgentId!);
+    }, 500);
+  }
 }
 
 /**
@@ -1022,6 +1053,10 @@ export async function startAgentRun(
 // ── Registration ─────────────────────────────────────────────────────────
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, terminalManager: TaskTerminalManager): void {
+  // Store module-level refs for autoRestartAgent
+  _terminalManager = terminalManager;
+  _appHome = appHome;
+
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('agents:list', () => {

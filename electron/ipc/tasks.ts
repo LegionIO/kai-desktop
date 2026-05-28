@@ -161,7 +161,12 @@ export function listAllTasks(appHome: string): TaskFile[] {
 
 // ── Registration ─────────────────────────────────────────────────────────
 
-export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
+export interface TaskHandlerOptions {
+  /** Called when a task is kicked back to in_progress. Auto-restarts the assigned agent. */
+  onTaskKickedBack?: (taskId: string, assignedAgentId: string | undefined) => void;
+}
+
+export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?: TaskHandlerOptions): void {
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('tasks:list', () => {
@@ -331,6 +336,12 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
         task.updatedAt = new Date().toISOString();
         writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
         broadcastTaskChange(appHome);
+
+        // Auto-restart the assigned agent (regardless of autopilot setting)
+        if (task.assignedAgentId && options?.onTaskKickedBack) {
+          options.onTaskKickedBack(task.id, task.assignedAgentId);
+        }
+
         return { ok: true };
       } catch (err) {
         return { error: String(err) };

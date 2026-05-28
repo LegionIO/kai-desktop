@@ -854,12 +854,23 @@ if (gotSingleInstanceLock) {
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerPartitionHandlers(ipcMain);
-    registerTaskHandlers(ipcMain, APP_HOME);
-    registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerAgentEntityHandlers(ipcMain, APP_HOME, taskTerminalManager);
+
+    // Register task handlers with auto-restart callback (fires on kick-back from review)
+    registerTaskHandlers(ipcMain, APP_HOME, {
+      onTaskKickedBack: (_taskId, assignedAgentId) => {
+        if (!assignedAgentId) return;
+        console.info(`[Agent:task] Auto-restarting agent ${assignedAgentId} after kick-back`);
+        // Deferred so the kick-back write completes first
+        setTimeout(() => {
+          void startAgentRun(APP_HOME, taskTerminalManager, assignedAgentId);
+        }, 500);
+      },
+    });
+    registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);
 
     // Autopilot / orchestrator — drives task auto-assignment when enabled.
     const initialAutopilotConfig = getConfig().autopilot;
