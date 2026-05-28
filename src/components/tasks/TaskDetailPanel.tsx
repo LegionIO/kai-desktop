@@ -265,15 +265,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     // Don't clear terminalSessionId — keep terminal visible for reviewing output
   }, [assignedAgent, stopAgent]);
 
-  const handleTerminalExit = useCallback(
-    (_exitCode: number) => {
-      // Don't clear terminalSessionId — keep the terminal mounted so the
-      // output log persists for review. Just clear it from the task record
-      // so it won't try to reconnect on reload.
-      void updateTask(task.id, { terminalSessionId: undefined });
-    },
-    [task.id, updateTask],
-  );
+  const handleTerminalExit = useCallback((_exitCode: number) => {
+    // Keep terminalSessionId on the task so the buffer can be replayed
+    // when the user navigates back. The session ID is needed to look up
+    // the persisted output log.
+  }, []);
 
   const handleComposerSubmit = useCallback(() => {
     const text = input.trim();

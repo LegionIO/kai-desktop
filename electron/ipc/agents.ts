@@ -427,13 +427,14 @@ export async function startAgentRun(
           writeAgent(appHome, freshAgent);
         }
 
-        // Only clear terminal from task — do NOT auto-transition status.
-        // The agent or user should decide when to promote the task.
-        // On error, leave as in_progress so user can retry.
+        // Promote task on successful completion, leave in_progress on error
         // NOTE: We intentionally keep task.terminalSessionId so the UI can
         // replay buffered output when the user navigates back to this task.
         const freshTask = readTask(appHome, task.id);
         if (freshTask) {
+          if (!hasError && freshTask.status === 'in_progress') {
+            freshTask.status = 'human_review';
+          }
           freshTask.updatedAt = new Date().toISOString();
           writeTask(appHome, freshTask);
         }
