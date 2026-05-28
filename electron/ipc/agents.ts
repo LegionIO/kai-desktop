@@ -433,7 +433,7 @@ export async function startAgentRun(
         const freshTask = readTask(appHome, task.id);
         if (freshTask) {
           if (!hasError && freshTask.status === 'in_progress') {
-            freshTask.status = 'human_review';
+            freshTask.status = 'ai_review';
           }
           freshTask.updatedAt = new Date().toISOString();
           writeTask(appHome, freshTask);
