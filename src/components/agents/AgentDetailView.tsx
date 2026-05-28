@@ -100,8 +100,8 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
   const handleNavigateToTask = useCallback(() => {
     if (!agent.currentTaskId) return;
     window.dispatchEvent(
-      new CustomEvent('kai:navigate', {
-        detail: { tab: 'tasks', selectedId: agent.currentTaskId },
+      new CustomEvent('kai:open-task', {
+        detail: { taskId: agent.currentTaskId },
       }),
     );
   }, [agent.currentTaskId]);
@@ -159,8 +159,8 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
                 type="button"
                 onClick={() => {
                   window.dispatchEvent(
-                    new CustomEvent('kai:navigate', {
-                      detail: { view: 'task', taskId: currentTask.id },
+                    new CustomEvent('kai:open-task', {
+                      detail: { taskId: currentTask.id },
                     }),
                   );
                 }}
@@ -198,9 +198,7 @@ export const AgentDetailView: FC<AgentDetailViewProps> = ({ agent }) => {
                 <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
                   Currently working on
                 </p>
-                <p className="truncate text-sm text-foreground">
-                  Open task
-                </p>
+                <p className="truncate text-sm text-foreground">Open task</p>
               </div>
               <ArrowRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--brand-accent)]" />
             </button>
