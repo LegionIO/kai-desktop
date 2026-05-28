@@ -534,7 +534,22 @@ export async function startAgentRun(
   const agent = readAgent(appHome, agentId);
   if (!agent) return { error: `Agent ${agentId} not found` };
   if (agent.status === 'running') return { error: 'Agent is already running' };
-  if (!agent.currentTaskId) return { error: 'No task assigned to agent' };
+
+  // If agent has no currentTaskId, try to find the task that's assigned to this agent.
+  // This happens after kick-back: task.assignedAgentId still points here but
+  // agent.currentTaskId was cleared on the previous run's completion.
+  if (!agent.currentTaskId) {
+    const tasks = listAllTasks(appHome);
+    const assignedTask = tasks.find((t) => t.assignedAgentId === agentId && t.status === 'in_progress');
+    if (assignedTask) {
+      agent.currentTaskId = assignedTask.id;
+      agent.updatedAt = new Date().toISOString();
+      writeAgent(appHome, agent);
+      console.info(`[Agent:task] Re-linked agent "${agent.name}" to task "${assignedTask.title}" for restart`);
+    } else {
+      return { error: 'No task assigned to agent' };
+    }
+  }
 
   const task = readTask(appHome, agent.currentTaskId);
   if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };

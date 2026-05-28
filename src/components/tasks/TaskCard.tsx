@@ -199,12 +199,9 @@ export const TaskCard: FC<TaskCardProps> = memo(
                   <CheckIcon className="h-3.5 w-3.5" />
                   <span>Approve</span>
                 </ContextMenu.Item>
-                <ContextMenu.Item
-                  className={itemClassName}
-                  onSelect={() => void updateTaskStatus(task.id, 'in_progress')}
-                >
+                <ContextMenu.Item className={itemClassName} onSelect={() => onClick()}>
                   <RotateCcwIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span>Request Changes</span>
+                  <span>Request Changes…</span>
                 </ContextMenu.Item>
               </>
             )}
