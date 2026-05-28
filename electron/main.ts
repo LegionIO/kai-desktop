@@ -62,6 +62,7 @@ import { TaskDispatcher } from './agent/task-dispatcher.js';
 import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
+import { initOutputBuffer, flushAll as flushOutputBuffers } from './terminal/output-buffer.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
@@ -105,6 +106,9 @@ function resolveUserDataDir(): string {
 }
 
 const APP_HOME = resolveUserDataDir();
+
+// Initialize terminal output buffer persistence (must be before any terminal usage)
+initOutputBuffer(APP_HOME);
 
 // ── OTA Bootstrap ────────────────────────────────────────────────────────
 // Check for crash-based rollback BEFORE resolving code paths, so a broken
@@ -1367,5 +1371,6 @@ app.on('before-quit', () => {
   cleanupDictation();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
+  flushOutputBuffers();
   taskDispatcherRef?.stop();
 });
