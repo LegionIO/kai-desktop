@@ -263,10 +263,10 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                 </div>
               )}
 
-              {/* Start/Stop toolbar */}
-              {assignedAgent && (
+              {/* Start/Stop toolbar — only in states where execution is relevant */}
+              {assignedAgent && (task.status === 'todo' || task.status === 'in_progress') && (
                 <div className="shrink-0 flex items-center gap-2">
-                  {terminalSessionId ? (
+                  {assignedAgent.status === 'running' ? (
                     <button
                       type="button"
                       onClick={() => void handleStopAgent()}

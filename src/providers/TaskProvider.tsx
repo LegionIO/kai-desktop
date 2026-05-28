@@ -312,13 +312,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         console.warn(`[TaskProvider] Rejected invalid status transition for task ${id}: ${task.status} → ${status}`);
         return;
       }
-      // Kill terminal when marking as done
+      // When marking as done, don't kill or clear terminal — preserve output for review
       if (status === 'done') {
-        if (task?.terminalSessionId) {
-          void app.tasks.terminalKill(task.terminalSessionId);
-          await updateTask(id, { status, terminalSessionId: undefined, completedAt: now });
-          return;
-        }
+        await updateTask(id, { status, completedAt: now });
+        return;
         await updateTask(id, { status, completedAt: now });
         return;
       }

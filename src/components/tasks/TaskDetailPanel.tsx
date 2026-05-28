@@ -867,7 +867,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                             </p>
                             <p className="text-xs text-white/30">No terminal output for this runtime</p>
                           </>
-                        ) : (
+                        ) : task.status === 'todo' || task.status === 'in_progress' ? (
                           <>
                             <p className="text-sm text-white/40">
                               {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
@@ -892,6 +892,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                               </div>
                             )}
                           </>
+                        ) : (
+                          <p className="text-sm text-white/40">No execution output available</p>
                         )}
                       </div>
                     </div>

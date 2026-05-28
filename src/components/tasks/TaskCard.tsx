@@ -100,6 +100,12 @@ export const TaskCard: FC<TaskCardProps> = memo(
                 </span>
               )}
 
+              {task.reviewerAgentIds && task.reviewerAgentIds.length > 0 && (
+                <span className="flex items-center gap-0.5 rounded-full bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-400">
+                  👥 {task.reviewerAgentIds.length}
+                </span>
+              )}
+
               {task.agentRuntime && !assignedAgent && <TerminalIcon className="h-3 w-3 text-muted-foreground" />}
 
               {task.sourceConversationId && <MessageSquareIcon className="h-3 w-3 text-muted-foreground" />}
