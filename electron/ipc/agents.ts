@@ -323,7 +323,7 @@ export async function startAgentRun(
         );
         broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
 
-        const dbPath = join(appHome, 'data');
+        const dbPath = join(appHome, 'data', 'task-agent-memory.db');
         const tools = getRegisteredTools(); // Full tool registry (file I/O, shell, MCP, etc.)
 
         const stream = streamAgentResponse(
