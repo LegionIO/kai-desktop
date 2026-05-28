@@ -102,7 +102,12 @@ export class TaskTerminalManager {
 
   write(sessionId: string, data: string): void {
     const term = this.terminals.get(sessionId);
-    if (!term) throw new Error(`Terminal session ${sessionId} not found`);
+    if (!term) {
+      // Virtual sessions (mastra-*, review-*) don't have real PTYs — silently ignore writes.
+      // Only throw for real PTY sessions that genuinely went away (reconciler uses isAlive() instead).
+      if (sessionId.startsWith('mastra-') || sessionId.startsWith('review-')) return;
+      throw new Error(`Terminal session ${sessionId} not found`);
+    }
     term.process.write(data);
   }
 

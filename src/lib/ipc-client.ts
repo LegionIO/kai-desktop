@@ -206,6 +206,7 @@ type AppAPI = {
     update: (id: string, updates: Partial<TaskFile>) => Promise<TaskFile>;
     delete: (id: string) => Promise<{ ok: boolean }>;
     unarchive: (id: string) => Promise<TaskFile>;
+    kickBack: (id: string, reason: string, source: 'ai' | 'human') => Promise<{ ok: boolean }>;
     getOrder: () => Promise<KaiTaskOrder | null>;
     saveOrder: (order: KaiTaskOrder) => Promise<{ ok: boolean }>;
     onChanged: (callback: (tasks: TaskFile[]) => void) => () => void;
