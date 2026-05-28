@@ -16,12 +16,13 @@ import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '..
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
+import { didHitStepLimit } from './step-limit.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
 export type StreamEvent = {
   conversationId: string;
-  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'tool-approval-required' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment' | 'retry';
+  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'tool-approval-required' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment' | 'retry' | 'step-progress' | 'max-steps-reached';
   messageMeta?: Record<string, unknown>;
   text?: string;
   toolCallId?: string;
@@ -41,6 +42,12 @@ export type StreamEvent = {
   };
   errorCategory?: string;
   errorStatusCode?: number;
+  stepInfo?: {
+    currentStep: number;
+    maxSteps: number;
+    hitLimit: boolean;
+    taskComplete: boolean;
+  };
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -768,9 +775,11 @@ async function* generateWithSyntheticEvents(
   const MAX_RETRIES = 4;
   const BASE_DELAY_MS = 500;
   const MAX_DELAY_MS = 32_000;
+  const maxStepsLimit = config.agent?.maxTurns ?? config.advanced.maxSteps;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     const eventQueue: StreamEvent[] = [];
+    let currentStepCount = 0;
 
     try {
       const agent = await buildAgent(activeModelConfig);
@@ -781,7 +790,7 @@ async function* generateWithSyntheticEvents(
       const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
       const generateOptions = {
-        maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
+        maxSteps: maxStepsLimit,
         abortSignal: options?.abortSignal,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
@@ -792,6 +801,19 @@ async function* generateWithSyntheticEvents(
             toolCalls?: Array<{ toolCallId: string; toolName: string; args: unknown }>;
             toolResults?: Array<{ toolCallId: string; toolName: string; result: unknown }>;
           };
+
+          // Track step progress
+          currentStepCount += 1;
+          eventQueue.push({
+            conversationId,
+            type: 'step-progress',
+            stepInfo: {
+              currentStep: currentStepCount,
+              maxSteps: maxStepsLimit,
+              hitLimit: false,
+              taskComplete: false,
+            },
+          });
 
           if (s.toolCalls) {
             for (const tc of s.toolCalls) {
@@ -842,6 +864,31 @@ async function* generateWithSyntheticEvents(
       terminalFinishReason = typeof fullResult.finishReason === 'string'
         ? fullResult.finishReason
         : fullResult.finishReason?.unified;
+
+      // Check if max steps were reached.
+      // The AI SDK / Mastra never emits a 'max-steps' finishReason; instead the
+      // stream terminates with the last step's finishReason ('tool-calls',
+      // 'length', or 'stop') once `maxSteps` is hit. See `didHitStepLimit` for
+      // the predicate.
+      const hitStepLimit = didHitStepLimit({
+        currentStepCount,
+        maxStepsLimit,
+        terminalFinishReason,
+      });
+
+      if (hitStepLimit) {
+        console.warn(`[Agent] Max steps reached for ${conversationId}: ${currentStepCount}/${maxStepsLimit}`);
+        yield {
+          conversationId,
+          type: 'max-steps-reached',
+          stepInfo: {
+            currentStep: currentStepCount,
+            maxSteps: maxStepsLimit,
+            hitLimit: true,
+            taskComplete: false,
+          },
+        };
+      }
 
       console.info(`[Agent] Generate completed for ${conversationId}`);
       break;

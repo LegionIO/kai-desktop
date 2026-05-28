@@ -77,6 +77,18 @@ function buildPluginAgentRuntime(pr: PluginRuntimeContribution): AgentRuntime {
   };
 }
 
+function buildUnavailablePluginAgentRuntime(runtimeId: string): AgentRuntime {
+  return {
+    id: runtimeId as RuntimeId,
+    name: runtimeId,
+    capabilities: PLUGIN_RUNTIME_CAPABILITIES,
+    isAvailable: () => Promise.resolve(false),
+    async *stream() {
+      throw new Error(`Plugin runtime '${runtimeId}' is selected but unavailable.`);
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -107,6 +119,9 @@ export async function resolveRuntime(config: AppConfig): Promise<AgentRuntime> {
     const pluginRuntime = pluginRuntimes.find((r) => r.id === preferred);
     if (pluginRuntime && pluginRuntime.isAvailable()) {
       return buildPluginAgentRuntime(pluginRuntime);
+    }
+    if (preferred !== 'mastra' && preferred !== 'claude-agent-sdk' && preferred !== 'codex-sdk') {
+      return buildUnavailablePluginAgentRuntime(preferred);
     }
     console.warn(`[Runtime] Requested runtime '${preferred}' is not available, falling back to Mastra.`);
     return getMastraOrThrow();
@@ -179,6 +194,15 @@ export async function resolveRuntimeForStream(
   const pluginRuntime = pluginRuntimes.find((r) => r.id === resolution.runtimeId);
   if (pluginRuntime) {
     return { runtime: buildPluginAgentRuntime(pluginRuntime), resolution };
+  }
+
+  if (
+    resolution.runtimeId !== 'mastra'
+    && resolution.runtimeId !== 'claude-agent-sdk'
+    && resolution.runtimeId !== 'codex-sdk'
+    && resolution.runtimeId !== 'auto'
+  ) {
+    return { runtime: buildUnavailablePluginAgentRuntime(resolution.runtimeId), resolution };
   }
 
   return { runtime: getMastraOrThrow(), resolution: { runtimeId: 'mastra' } };

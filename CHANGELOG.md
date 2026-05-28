@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.92] - 2026-05-27
+
+### Fixed
+- Keep plugin-owned runtime requests on the plugin runtime instead of labeling them as Mastra with plugin-provider fallback metadata.
+- Fail closed when a plugin runtime such as LegionIO is selected but its inference provider is missing or fails before emitting text.
+- Omit the model override for provider-default plugin models, allowing LegionIO's synthetic `Legionio` model to let the daemon choose the concrete model.
+
 ## [1.0.89] - 2026-05-27
 
 ### Fixed

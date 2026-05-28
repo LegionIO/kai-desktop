@@ -61,7 +61,7 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
     let cancelled = false;
     (async () => {
       try {
-        const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
+        const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
         if (cancelled || !conv) return;
         const s: ThreadSettings = {
           selectedModelKey: conv.selectedModelKey ?? null,
@@ -84,7 +84,9 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [open, conversationId]);
 
   // Keep modal in sync if composer changes settings for the active conversation
@@ -94,7 +96,7 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as Record<string, unknown> & { conversationId: string };
       if (detail.conversationId !== conversationId) return;
-      setSettings((prev) => prev ? { ...prev, ...detail } as ThreadSettings : prev);
+      setSettings((prev) => (prev ? ({ ...prev, ...detail } as ThreadSettings) : prev));
     };
     window.addEventListener('thread-settings-changed', handler);
     return () => window.removeEventListener('thread-settings-changed', handler);
@@ -104,58 +106,74 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    app.agent.getAvailableRuntimes()
-      .then((list: RuntimeInfo[]) => { if (!cancelled) setRuntimes(list); })
+    app.agent
+      .getAvailableRuntimes()
+      .then((list: RuntimeInfo[]) => {
+        if (!cancelled) setRuntimes(list);
+      })
       .catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   // Persist a setting change
-  const persistSetting = useCallback(async (field: string, value: unknown) => {
-    if (!conversationId) return;
-    try {
-      const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
-      if (!conv) return;
-      await app.conversations.put({
-        ...conv,
-        [field]: value,
-        updatedAt: new Date().toISOString(),
-      } as ConversationRecord);
-    } catch {
-      // Persist failed silently
-    }
-  }, [conversationId]);
+  const persistSetting = useCallback(
+    async (field: string, value: unknown) => {
+      if (!conversationId) return;
+      try {
+        const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
+        if (!conv) return;
+        await app.conversations.put({
+          ...conv,
+          [field]: value,
+          updatedAt: new Date().toISOString(),
+        } as ConversationRecord);
+      } catch {
+        // Persist failed silently
+      }
+    },
+    [conversationId],
+  );
 
   // Update local state + persist + notify active conversation
-  const updateSetting = useCallback(<K extends keyof ThreadSettings>(field: K, value: ThreadSettings[K]) => {
-    setSettings((prev) => prev ? { ...prev, [field]: value } : prev);
+  const updateSetting = useCallback(
+    <K extends keyof ThreadSettings>(field: K, value: ThreadSettings[K]) => {
+      setSettings((prev) => (prev ? { ...prev, [field]: value } : prev));
 
-    // Map field names to ConversationRecord field names
-    void persistSetting(field, value);
+      // Map field names to ConversationRecord field names
+      void persistSetting(field, value);
 
-    // When the runtime override changes, also update the global agent.runtime so
-    // new conversations inherit the user's preference instead of reverting to the
-    // previous global default on restart.
-    if (field === 'runtimeOverride') {
-      const runtime = (value as string | null) ?? 'auto';
-      void app.config.set('agent.runtime', runtime);
-    }
+      // When the runtime override changes, also update the global agent.runtime so
+      // new conversations inherit the user's preference instead of reverting to the
+      // previous global default on restart.
+      if (field === 'runtimeOverride') {
+        const runtime = (value as string | null) ?? 'auto';
+        void app.config.set('agent.runtime', runtime);
+      }
 
-    // Notify App.tsx if this is the active conversation
-    if (isActiveConversation && conversationId) {
-      window.dispatchEvent(new CustomEvent('thread-settings-changed', {
-        detail: { conversationId, [field]: value },
-      }));
-    }
-  }, [conversationId, isActiveConversation, persistSetting]);
+      // Notify App.tsx if this is the active conversation
+      if (isActiveConversation && conversationId) {
+        window.dispatchEvent(
+          new CustomEvent('thread-settings-changed', {
+            detail: { conversationId, [field]: value },
+          }),
+        );
+      }
+    },
+    [conversationId, isActiveConversation, persistSetting],
+  );
 
   // System prompt debounced flush
-  const flushPrompt = useCallback((value: string) => {
-    if (promptTimerRef.current) clearTimeout(promptTimerRef.current);
-    promptTimerRef.current = null;
-    const trimmed = value.trim() || null;
-    updateSetting('systemPromptOverride', trimmed);
-  }, [updateSetting]);
+  const flushPrompt = useCallback(
+    (value: string) => {
+      if (promptTimerRef.current) clearTimeout(promptTimerRef.current);
+      promptTimerRef.current = null;
+      const trimmed = value.trim() || null;
+      updateSetting('systemPromptOverride', trimmed);
+    },
+    [updateSetting],
+  );
 
   const handlePromptChange = (value: string) => {
     setPromptDraft(value);
@@ -168,23 +186,26 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
   const models = ((config?.models as { catalog?: CatalogModel[] })?.catalog ?? []) as CatalogModel[];
   const profiles = (config?.profiles as ProfileEntry[] | undefined) ?? [];
   const globalTemp = (config?.advanced as { temperature?: number } | undefined)?.temperature ?? 0.7;
-  const globalMaxSteps = (config?.advanced as { maxSteps?: number } | undefined)?.maxSteps ?? 10;
+  const globalMaxSteps = (config?.advanced as { maxSteps?: number } | undefined)?.maxSteps ?? 25;
   const globalMaxRetries = (config?.advanced as { maxRetries?: number } | undefined)?.maxRetries ?? 2;
   const defaultProfileKey = config?.defaultProfileKey as string | undefined;
   const globalExecutionMode = (config as { executionMode?: string } | undefined)?.executionMode ?? 'auto';
-  const globalRuntime = ((config as { agent?: { runtime?: string } } | undefined)?.agent?.runtime) ?? 'auto';
+  const globalRuntime = (config as { agent?: { runtime?: string } } | undefined)?.agent?.runtime ?? 'auto';
 
   // Determine effective defaults from the active profile (if one is selected)
   const activeProfileKey = settings?.selectedProfileKey ?? defaultProfileKey;
   const activeProfile = activeProfileKey ? profiles.find((p) => p.key === activeProfileKey) : undefined;
   const effectiveTemp = (activeProfile as { temperature?: number } | undefined)?.temperature ?? globalTemp;
-  const effectiveReasoningEffort = (activeProfile as { reasoningEffort?: string } | undefined)?.reasoningEffort ?? 'medium';
+  const effectiveReasoningEffort =
+    (activeProfile as { reasoningEffort?: string } | undefined)?.reasoningEffort ?? 'medium';
 
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
       onClick={onClose}
-      onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') onClose();
+      }}
       role="dialog"
       tabIndex={-1}
     >
@@ -195,7 +216,7 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border/50 px-5 py-3.5">
-          <h2 className="text-sm font-semibold">Thread Settings</h2>
+          <h2 className="text-sm font-semibold">Chat Settings</h2>
           <button
             type="button"
             onClick={onClose}
@@ -252,10 +273,17 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                       }
                     }}
                   >
-                    <option value="">Default{defaultProfileKey ? ` (${profiles.find((p) => p.key === defaultProfileKey)?.name ?? defaultProfileKey})` : ''}</option>
+                    <option value="">
+                      Default
+                      {defaultProfileKey
+                        ? ` (${profiles.find((p) => p.key === defaultProfileKey)?.name ?? defaultProfileKey})`
+                        : ''}
+                    </option>
                     <option value="__none__">None (no profile)</option>
                     {profiles.map((p) => (
-                      <option key={p.key} value={p.key}>{p.name}</option>
+                      <option key={p.key} value={p.key}>
+                        {p.name}
+                      </option>
                     ))}
                   </select>
                 </div>
@@ -282,7 +310,9 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                   >
                     <option value="">Default (from profile)</option>
                     {models.map((m) => (
-                      <option key={m.key} value={m.key}>{m.displayName}</option>
+                      <option key={m.key} value={m.key}>
+                        {m.displayName}
+                      </option>
                     ))}
                   </select>
                 </div>
@@ -311,7 +341,8 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                     <option value="auto">Auto (prefer external if available)</option>
                     {runtimes.map((r) => (
                       <option key={r.id} value={r.id} disabled={!r.available}>
-                        {r.name}{!r.available ? ' (unavailable)' : ''}
+                        {r.name}
+                        {!r.available ? ' (unavailable)' : ''}
                       </option>
                     ))}
                   </select>
@@ -337,7 +368,8 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                 <div>
                   <div className="flex items-center justify-between mb-0.5">
                     <label className="text-[10px] text-muted-foreground">
-                      Temperature: {settings.temperature !== null ? settings.temperature.toFixed(2) : `Default (${effectiveTemp})`}
+                      Temperature:{' '}
+                      {settings.temperature !== null ? settings.temperature.toFixed(2) : `Default (${effectiveTemp})`}
                     </label>
                     {settings.temperature !== null && (
                       <button
@@ -383,7 +415,9 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                   <select
                     className={selectClass}
                     value={settings.reasoningEffort ?? ''}
-                    onChange={(e) => updateSetting('reasoningEffort', (e.target.value || null) as ReasoningEffort | null)}
+                    onChange={(e) =>
+                      updateSetting('reasoningEffort', (e.target.value || null) as ReasoningEffort | null)
+                    }
                   >
                     <option value="">Default ({effectiveReasoningEffort})</option>
                     <option value="low">Low</option>
@@ -411,7 +445,9 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                   <select
                     className={selectClass}
                     value={settings.executionMode ?? ''}
-                    onChange={(e) => updateSetting('executionMode', (e.target.value || null) as 'auto' | 'plan-first' | null)}
+                    onChange={(e) =>
+                      updateSetting('executionMode', (e.target.value || null) as 'auto' | 'plan-first' | null)
+                    }
                   >
                     <option value="">Default ({globalExecutionMode})</option>
                     <option value="auto">Auto</option>
@@ -502,8 +538,13 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                 <textarea
                   className="h-[120px] w-full resize-none overflow-y-auto rounded-xl border border-border/70 bg-card/80 p-3 text-xs font-mono outline-none focus:ring-1 focus:ring-ring"
                   value={promptDraft}
-                  onFocus={() => { promptFocusedRef.current = true; }}
-                  onBlur={() => { promptFocusedRef.current = false; flushPrompt(promptDraft); }}
+                  onFocus={() => {
+                    promptFocusedRef.current = true;
+                  }}
+                  onBlur={() => {
+                    promptFocusedRef.current = false;
+                    flushPrompt(promptDraft);
+                  }}
                   onChange={(e) => handlePromptChange(e.target.value)}
                   placeholder="Leave empty to use the profile/global system prompt..."
                 />

@@ -87,6 +87,7 @@ import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
+import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 
 /**
  * Resolve the directory used to persist app config, conversations, skills, etc.
@@ -1323,6 +1324,10 @@ if (gotSingleInstanceLock) {
             )
             .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
         }
+
+        // Initialize subagent cleanup cron job
+        const dbPath = join(APP_HOME, 'data', 'memory.db');
+        initializeSubagentCleanup(getConfig, APP_HOME, dbPath);
       })
       .catch((err) => {
         console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);

@@ -20,7 +20,7 @@
       "@/*": ["./src/*"],
       "@/test-utils/*": ["./test-utils/*"]
     },
-    "types": ["node"]
+    "types": ["node", "@testing-library/jest-dom"]
   },
   "include": [
     "branding.d.ts",

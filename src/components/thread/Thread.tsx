@@ -1,4 +1,14 @@
-import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext, type FC, type PropsWithChildren } from 'react';
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useMemo,
+  createContext,
+  useContext,
+  type FC,
+  type PropsWithChildren,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
   ThreadPrimitive,
@@ -26,7 +36,6 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   BanIcon,
-
   Volume2Icon,
   SquareIcon,
   ChevronUpIcon,
@@ -41,7 +50,13 @@ import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { useAttachments } from '@/providers/AttachmentContext';
-import { useBranchNav, useCurrentWorkingDirectory, useRuntimeConversationId, type TokenUsageData } from '@/providers/RuntimeProvider';
+import {
+  useBranchNav,
+  useCurrentWorkingDirectory,
+  useRuntimeConversationId,
+  useStepTracking,
+  type TokenUsageData,
+} from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { useRealtime } from '@/providers/RealtimeProvider';
 import { MarkdownText } from './MarkdownText';
@@ -50,6 +65,8 @@ import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
+import { StepProgress } from './StepProgress';
+import { IncompleteTaskBanner } from './IncompleteTaskBanner';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
 import { ComposerInput } from './ComposerInput';
@@ -72,7 +89,13 @@ import { ComputerSetupPanel } from './ComputerSetupPanel';
 import { ComputerSettingsButton } from './ComputerSettingsButton';
 import type { ExecutionMode } from './ChatSettingsButton';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
-import { shouldShowComputerSetup, isComputerSessionTerminal, type ComputerSession, type ComputerUseTarget, type ComputerUseApprovalMode } from '../../../shared/computer-use';
+import {
+  shouldShowComputerSetup,
+  isComputerSessionTerminal,
+  type ComputerSession,
+  type ComputerUseTarget,
+  type ComputerUseApprovalMode,
+} from '../../../shared/computer-use';
 import { getResponseTiming, formatElapsed } from '@/lib/response-timing';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { SPINNER_VERBS } from '@/config/spinner-verbs';
@@ -81,8 +104,16 @@ import { useTasksOptional } from '@/providers/TaskProvider';
 export type ThreadMode = 'chat' | 'computer';
 
 /** Lightweight context so deeply-nested message components can read thread-level metadata. */
-type ThreadMetaState = { selectedModelKey: string | null; resolvedRuntime: string | null; reasoningEffort: string | null };
-const ThreadMetaContext = createContext<ThreadMetaState>({ selectedModelKey: null, resolvedRuntime: null, reasoningEffort: null });
+type ThreadMetaState = {
+  selectedModelKey: string | null;
+  resolvedRuntime: string | null;
+  reasoningEffort: string | null;
+};
+const ThreadMetaContext = createContext<ThreadMetaState>({
+  selectedModelKey: null,
+  resolvedRuntime: null,
+  reasoningEffort: null,
+});
 const useThreadMeta = () => useContext(ThreadMetaContext);
 
 export const Thread: FC<{
@@ -98,7 +129,20 @@ export const Thread: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({
+  mode,
+  onChangeMode,
+  selectedModelKey,
+  onSelectModel,
+  reasoningEffort,
+  onChangeReasoningEffort,
+  executionMode,
+  onChangeExecutionMode,
+  selectedProfileKey,
+  onSelectProfile,
+  fallbackEnabled,
+  onToggleFallback,
+}) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { callState } = useRealtime();
@@ -106,6 +150,7 @@ export const Thread: FC<{
   // useRuntimeConversationId updates in the same React batch as setTree/setHeadId,
   // so the scroll fires only after the new thread's messages are already in the DOM.
   const runtimeConversationId = useRuntimeConversationId();
+  const { stepInfo, showIncompleteTaskBanner, onContinueTask, onAdjustSettings, onDismissBanner } = useStepTracking();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
 
@@ -120,7 +165,7 @@ export const Thread: FC<{
       viewport.scrollTop = viewport.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  // intentional: only scroll when the active conversation changes, not on every dep update
+    // intentional: only scroll when the active conversation changes, not on every dep update
   }, [runtimeConversationId]);
   // Track whether the splash should hide instantly (loading existing thread)
   // vs fade out gradually (user just sent first message in new thread).
@@ -138,7 +183,6 @@ export const Thread: FC<{
     if (count === 0) setSplashInstantHide(false);
   }, [threadRuntime]);
 
-
   useEffect(() => {
     if (!window.app?.onFind) return;
     const cleanup = window.app.onFind(() => setSearchOpen(true));
@@ -149,10 +193,15 @@ export const Thread: FC<{
   const [resolvedRuntime, setResolvedRuntime] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    app.agent.getActiveRuntime()
-      .then((id) => { if (!cancelled) setResolvedRuntime(id as string); })
+    app.agent
+      .getActiveRuntime()
+      .then((id) => {
+        if (!cancelled) setResolvedRuntime(id as string);
+      })
       .catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [selectedModelKey]); // re-fetch when model changes as runtime may change with it
 
   const threadMeta = useMemo<ThreadMetaState>(
@@ -162,37 +211,68 @@ export const Thread: FC<{
 
   return (
     <ThreadMetaContext.Provider value={threadMeta}>
-    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col" id="kai-chat-viewport">
-      <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
-      <div
-        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
-        style={{
-          opacity: hasMessages ? 1 : 0,
-          transitionDuration: hasMessages ? '0ms' : '50ms',
-          transitionDelay: hasMessages ? '0ms' : '0ms',
-        }}
-      />
-      <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
-      <FallbackBanner />
-      <ComputerUseFallbackBanner />
-      {mode === 'chat' ? (
-        <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
-          <PinnedUserMessage viewportRef={viewportRef} />
-          <div className="flex min-h-full flex-col">
-            <div className="flex-1">
-              <div className={cn('relative z-10 mx-auto flex w-full flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20', !fullWidth && 'max-w-3xl')}>
-                <ThreadPrimitive.Messages
-                  components={{
-                    UserMessage,
-                    AssistantMessage,
-                  }}
-                />
+      <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col" id="kai-chat-viewport">
+        <SplashBackground visible={!hasMessages} instant={splashInstantHide} />
+        <div
+          className="pointer-events-none absolute inset-x-0 top-0 z-20 h-16 bg-gradient-to-b from-background from-55% to-transparent transition-opacity ease-out md:h-20"
+          style={{
+            opacity: hasMessages ? 1 : 0,
+            transitionDuration: hasMessages ? '0ms' : '50ms',
+            transitionDelay: hasMessages ? '0ms' : '0ms',
+          }}
+        />
+        <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
+        <FallbackBanner />
+        <ComputerUseFallbackBanner />
+        {mode === 'chat' ? (
+          <ThreadPrimitive.Viewport ref={viewportRef} className="relative min-h-0 flex-1 overflow-y-auto">
+            <PinnedUserMessage viewportRef={viewportRef} />
+            <div className="flex min-h-full flex-col">
+              <div className="flex-1">
+                <div
+                  className={cn(
+                    'relative z-10 mx-auto flex w-full flex-col px-3 pr-5 pt-16 md:px-6 md:pr-8 md:pt-20',
+                    !fullWidth && 'max-w-3xl',
+                  )}
+                >
+                  <ThreadPrimitive.Messages
+                    components={{
+                      UserMessage,
+                      AssistantMessage,
+                    }}
+                  />
 
-                <div className="min-h-2" />
+                  <div className="min-h-2" />
+                </div>
+              </div>
+              <div className="sticky bottom-0 z-20">
+                {hasMessages && (
+                  <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />
+                )}
+                {callState.isInCall ? (
+                  <CallOverlay />
+                ) : (
+                  <Composer
+                    mode={mode}
+                    onChangeMode={onChangeMode}
+                    selectedModelKey={selectedModelKey}
+                    onSelectModel={onSelectModel}
+                    reasoningEffort={reasoningEffort}
+                    onChangeReasoningEffort={onChangeReasoningEffort}
+                    executionMode={executionMode}
+                    onChangeExecutionMode={onChangeExecutionMode}
+                    selectedProfileKey={selectedProfileKey}
+                    onSelectProfile={onSelectProfile}
+                    fallbackEnabled={fallbackEnabled}
+                    onToggleFallback={onToggleFallback}
+                  />
+                )}
               </div>
             </div>
-            <div className="sticky bottom-0 z-20">
-              {hasMessages && <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-[15] h-56 bg-gradient-to-t from-background from-25% via-background/70 via-55% to-transparent md:h-64" />}
+          </ThreadPrimitive.Viewport>
+        ) : (
+          <>
+            <ComputerTabSurface />
             {callState.isInCall ? (
               <CallOverlay />
             ) : (
@@ -211,33 +291,9 @@ export const Thread: FC<{
                 onToggleFallback={onToggleFallback}
               />
             )}
-          </div>
-          </div>
-        </ThreadPrimitive.Viewport>
-      ) : (
-        <>
-          <ComputerTabSurface />
-          {callState.isInCall ? (
-            <CallOverlay />
-          ) : (
-            <Composer
-              mode={mode}
-              onChangeMode={onChangeMode}
-              selectedModelKey={selectedModelKey}
-              onSelectModel={onSelectModel}
-              reasoningEffort={reasoningEffort}
-              onChangeReasoningEffort={onChangeReasoningEffort}
-              executionMode={executionMode}
-              onChangeExecutionMode={onChangeExecutionMode}
-              selectedProfileKey={selectedProfileKey}
-              onSelectProfile={onSelectProfile}
-              fallbackEnabled={fallbackEnabled}
-              onToggleFallback={onToggleFallback}
-            />
-          )}
-        </>
-      )}
-    </ThreadPrimitive.Root>
+          </>
+        )}
+      </ThreadPrimitive.Root>
     </ThreadMetaContext.Provider>
   );
 };
@@ -248,7 +304,8 @@ function useActiveConversationId(): string | null {
   useEffect(() => {
     let cancelled = false;
 
-    app.conversations.getActiveId()
+    app.conversations
+      .getActiveId()
       .then((id) => {
         if (!cancelled) setActiveConversationId(id as string | null);
       })
@@ -294,7 +351,9 @@ const ComputerTabSurface: FC = () => {
             <div className="flex min-h-full flex-1 items-center justify-center rounded-2xl border border-dashed border-border/60 bg-card/20 px-6 py-8">
               <div className="max-w-md text-center">
                 <MonitorIcon className="mx-auto h-8 w-8 text-muted-foreground/40" />
-                <div className="mt-3 text-sm font-medium">{activeConversationId ? 'No Active Session' : 'Select a Chat'}</div>
+                <div className="mt-3 text-sm font-medium">
+                  {activeConversationId ? 'No Active Session' : 'Select a Chat'}
+                </div>
                 <p className="mt-1.5 text-xs text-muted-foreground">
                   {activeConversationId
                     ? 'Configure a goal and start a session using the controls below.'
@@ -331,7 +390,15 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
     setLoading(true);
     setError(null);
     try {
-      const result = await (window.app as unknown as Record<string, unknown> & { fs: { listDirectory: (p: string) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }> } }).fs.listDirectory(dirPath);
+      const result = await (
+        window.app as unknown as Record<string, unknown> & {
+          fs: {
+            listDirectory: (
+              p: string,
+            ) => Promise<{ path?: string; entries: Array<{ name: string; isDirectory: boolean }>; error?: string }>;
+          };
+        }
+      ).fs.listDirectory(dirPath);
       if (result.error) {
         setError(result.error);
         setEntries([]);
@@ -350,7 +417,9 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
     }
   }, []);
 
-  useEffect(() => { void loadDirectory(currentPath); }, []);
+  useEffect(() => {
+    void loadDirectory(currentPath);
+  }, []);
 
   const navigateTo = (dirName: string) => {
     const next = currentPath === '/' ? `/${dirName}` : `${currentPath}/${dirName}`;
@@ -389,7 +458,10 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
         </div>
       </div>
       <div className="border-b border-border/40 bg-muted/20 px-4 py-1.5">
-        <span className="block truncate text-[11px] font-mono text-muted-foreground" title={resolvedPath || currentPath}>
+        <span
+          className="block truncate text-[11px] font-mono text-muted-foreground"
+          title={resolvedPath || currentPath}
+        >
           {resolvedPath || currentPath}
         </span>
       </div>
@@ -404,23 +476,23 @@ const DirectoryBrowser: FC<{ onSelect: (path: string) => void; onCancel: () => v
             <span className="text-muted-foreground">..</span>
           </button>
         )}
-        {loading && (
-          <div className="px-4 py-6 text-center text-xs text-muted-foreground">Loading...</div>
-        )}
-        {error && (
-          <div className="px-4 py-3 text-xs text-red-400">{error}</div>
-        )}
-        {!loading && !error && entries.filter((e) => e.isDirectory).map((entry) => (
-          <button
-            key={entry.name}
-            type="button"
-            onClick={() => navigateTo(entry.name)}
-            className="flex w-full items-center gap-2 px-4 py-2 text-xs transition-colors hover:bg-muted/50"
-          >
-            <FolderOpenIcon className="h-3.5 w-3.5 text-primary/70" />
-            <span className="truncate">{entry.name}</span>
-          </button>
-        ))}
+        {loading && <div className="px-4 py-6 text-center text-xs text-muted-foreground">Loading...</div>}
+        {error && <div className="px-4 py-3 text-xs text-red-400">{error}</div>}
+        {!loading &&
+          !error &&
+          entries
+            .filter((e) => e.isDirectory)
+            .map((entry) => (
+              <button
+                key={entry.name}
+                type="button"
+                onClick={() => navigateTo(entry.name)}
+                className="flex w-full items-center gap-2 px-4 py-2 text-xs transition-colors hover:bg-muted/50"
+              >
+                <FolderOpenIcon className="h-3.5 w-3.5 text-primary/70" />
+                <span className="truncate">{entry.name}</span>
+              </button>
+            ))}
         {!loading && !error && entries.filter((e) => e.isDirectory).length === 0 && (
           <div className="px-4 py-3 text-xs text-muted-foreground">No subdirectories</div>
         )}
@@ -601,9 +673,7 @@ const PinnedUserMessage: FC<{ viewportRef: React.RefObject<HTMLDivElement | null
   return (
     <div
       className={`pointer-events-none sticky top-0 z-[35] transition-all duration-200 ${
-        visible
-          ? 'pt-14 md:pt-16 translate-y-0 opacity-100'
-          : 'h-0 overflow-hidden opacity-0'
+        visible ? 'pt-14 md:pt-16 translate-y-0 opacity-100' : 'h-0 overflow-hidden opacity-0'
       }`}
     >
       <div className={cn('mx-auto flex w-full justify-end px-3 pr-5 md:px-6 md:pr-8', !fullWidth && 'max-w-3xl')}>
@@ -652,7 +722,7 @@ const UserMessage: FC = () => {
   const message = useMessage();
   const { config } = useConfig();
   const ttsEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
+    ? (((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true)
     : true;
   return (
     <MessagePrimitive.Root className="group mb-6 flex justify-end" data-pinned-sentinel>
@@ -666,7 +736,9 @@ const UserMessage: FC = () => {
         >
           <MessagePrimitive.Content components={userContentComponents} />
         </div>
-        <div className={`flex items-center justify-end gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        <div
+          className={`flex items-center justify-end gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+        >
           <MessageTimestamp date={message.createdAt} align="right" />
           <ActionBarPrimitive.Root className="flex items-center gap-1">
             <CopyButton />
@@ -740,9 +812,7 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
           <span className="text-xs font-medium truncate max-w-[200px]">{filename}</span>
           <span className="text-[10px] opacity-60">{mimeType}</span>
         </div>
-        {isPreviewable && (
-          <span className="text-[10px] opacity-50 ml-auto shrink-0">Click to preview</span>
-        )}
+        {isPreviewable && <span className="text-[10px] opacity-50 ml-auto shrink-0">Click to preview</span>}
       </button>
       {previewOpen && data && <FilePreviewModal src={data} onClose={() => setPreviewOpen(false)} />}
     </>
@@ -752,7 +822,9 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
 const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
   // Close on Escape key
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
@@ -814,9 +886,12 @@ const ToolFallback: FC<{
 }> = (props) => {
   const hasResult = props.result !== undefined;
   const isPendingApproval = props.approvalStatus === 'pending' && !hasResult;
-  const isError = props.isError || (hasResult && props.result && typeof props.result === 'object' && (
-    (props.result as Record<string, unknown>).error || (props.result as Record<string, unknown>).isError === true
-  ));
+  const isError =
+    props.isError ||
+    (hasResult &&
+      props.result &&
+      typeof props.result === 'object' &&
+      ((props.result as Record<string, unknown>).error || (props.result as Record<string, unknown>).isError === true));
   const isRunning = !hasResult && !isPendingApproval;
   const dotColor = isPendingApproval
     ? 'bg-amber-400 animate-pulse'
@@ -828,23 +903,29 @@ const ToolFallback: FC<{
 
   // Bridge: create task queue entry when a plan is approved
   const taskCtx = useTasksOptional();
-  const handlePlanApproved = useCallback(async (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => {
-    const task = await taskCtx?.createTaskFromPlan({
-      title: data.title,
-      description: data.description,
-      planFileName: data.planFileName,
-      sourceToolCallId: data.toolCallId,
-    });
-    return task ?? null;
-  }, [taskCtx]);
+  const handlePlanApproved = useCallback(
+    async (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => {
+      const task = await taskCtx?.createTaskFromPlan({
+        title: data.title,
+        description: data.description,
+        planFileName: data.planFileName,
+        sourceToolCallId: data.toolCallId,
+      });
+      return task ?? null;
+    },
+    [taskCtx],
+  );
 
   const threadRuntime = useThreadRuntime();
-  const handleSendFeedback = useCallback((text: string) => {
-    threadRuntime.append({
-      role: 'user',
-      content: [{ type: 'text', text }],
-    });
-  }, [threadRuntime]);
+  const handleSendFeedback = useCallback(
+    (text: string) => {
+      threadRuntime.append({
+        role: 'user',
+        content: [{ type: 'text', text }],
+      });
+    },
+    [threadRuntime],
+  );
 
   // Render sub-agent tool calls with the specialized component
   if (props.toolName === 'sub_agent') {
@@ -891,11 +972,7 @@ const ToolFallback: FC<{
 };
 
 /** Wraps consecutive tool calls */
-const ToolGroupWrapper: FC<PropsWithChildren> = ({ children }) => (
-  <div className="space-y-0">
-    {children}
-  </div>
-);
+const ToolGroupWrapper: FC<PropsWithChildren> = ({ children }) => <div className="space-y-0">{children}</div>;
 
 /* ── Hoisted components for MessagePrimitive.Content (stable refs prevent remounting) ── */
 
@@ -915,7 +992,9 @@ const AssistantTextPart: FC<{ text: string }> = ({ text }) => {
   return (
     <div className="timeline-item py-0.5">
       <span className="timeline-dot bg-[oklch(0.55_0.01_0)]" />
-      <div className="min-w-0 flex-1"><MarkdownText text={text} /></div>
+      <div className="min-w-0 flex-1">
+        <MarkdownText text={text} />
+      </div>
     </div>
   );
 };
@@ -972,11 +1051,7 @@ const ThinkingSpinnerText: FC = () => {
     };
   }, [cursorPos]);
 
-  return (
-    <span className="text-xs font-mono whitespace-pre thinking-verb-shimmer">
-      {displayText}
-    </span>
-  );
+  return <span className="text-xs font-mono whitespace-pre thinking-verb-shimmer">{displayText}</span>;
 };
 
 const ThinkingSpinner: FC = () => {
@@ -1024,8 +1099,8 @@ const AssistantMessage: FC = () => {
   const message = useMessage();
   const isRunning = message.status?.type === 'running';
   const content = message.content ?? [];
-  const hasContent = content.some((p: { type: string; text?: string }) =>
-    p.type === 'tool-call' || (p.type === 'text' && p.text?.trim()),
+  const hasContent = content.some(
+    (p: { type: string; text?: string }) => p.type === 'tool-call' || (p.type === 'text' && p.text?.trim()),
   );
   const isEmpty = !isRunning && !hasContent;
 
@@ -1035,37 +1110,49 @@ const AssistantMessage: FC = () => {
   //  - A regular tool is "done" when result !== undefined AND finishedAt !== undefined.
   //  - A sub_agent tool is always treated as "handled" — it has its own inline UI and
   //    streams partial results early, so we never want it to suppress the parent spinner.
-  const allToolsDone = isRunning && hasContent && content.every(
-    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
-      p.type !== 'tool-call' ||
-      p.toolName === 'sub_agent' || p.toolName === 'agent' ||
-      (p.result !== undefined && p.finishedAt !== undefined),
-  );
+  const allToolsDone =
+    isRunning &&
+    hasContent &&
+    content.every(
+      (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+        p.type !== 'tool-call' ||
+        p.toolName === 'sub_agent' ||
+        p.toolName === 'agent' ||
+        (p.result !== undefined && p.finishedAt !== undefined),
+    );
 
   // A sub_agent (or SDK 'agent') is actively running when it has no result yet (or result but no finishedAt)
-  const hasRunnningSubAgent = isRunning && content.some(
-    (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
-      p.type === 'tool-call' && (p.toolName === 'sub_agent' || p.toolName === 'agent') && p.finishedAt === undefined,
-  );
+  const hasRunnningSubAgent =
+    isRunning &&
+    content.some(
+      (p: { type: string; toolName?: string; result?: unknown; finishedAt?: string }) =>
+        p.type === 'tool-call' && (p.toolName === 'sub_agent' || p.toolName === 'agent') && p.finishedAt === undefined,
+    );
 
   // Any regular tool (non-agent) is actively executing when it has no result yet and isn't pending approval
-  const hasRunningTool = isRunning && content.some(
-    (p: { type: string; toolName?: string; result?: unknown; approvalStatus?: string }) =>
-      p.type === 'tool-call' &&
-      p.toolName !== 'sub_agent' && p.toolName !== 'agent' &&
-      p.result === undefined &&
-      p.approvalStatus !== 'pending',
-  );
+  const hasRunningTool =
+    isRunning &&
+    content.some(
+      (p: { type: string; toolName?: string; result?: unknown; approvalStatus?: string }) =>
+        p.type === 'tool-call' &&
+        p.toolName !== 'sub_agent' &&
+        p.toolName !== 'agent' &&
+        p.result === undefined &&
+        p.approvalStatus !== 'pending',
+    );
 
   // Detect paused-for-input — a tool is awaiting user approval/answer
-  const isAwaitingInput = isRunning && content.some(
-    (p: { type: string; approvalStatus?: string; result?: unknown }) =>
-      p.type === 'tool-call' && p.approvalStatus === 'pending' && p.result === undefined,
-  );
+  const isAwaitingInput =
+    isRunning &&
+    content.some(
+      (p: { type: string; approvalStatus?: string; result?: unknown }) =>
+        p.type === 'tool-call' && p.approvalStatus === 'pending' && p.result === undefined,
+    );
 
   // Check if this message has an interrupt (source: 'interrupt' or 'unspoken')
-  const hasInterrupt = content.some((p: { type: string; source?: string }) =>
-    p.type === 'text' && (p.source === 'interrupt' || p.source === 'unspoken'),
+  const hasInterrupt = content.some(
+    (p: { type: string; source?: string }) =>
+      p.type === 'text' && (p.source === 'interrupt' || p.source === 'unspoken'),
   );
 
   // Extract pipeline enrichments stored as a content part
@@ -1075,8 +1162,11 @@ const AssistantMessage: FC = () => {
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
 
   // Extract max-turns-reached content parts for interactive continue card
-  const maxTurnsParts = (content.filter((p: { type: string }) => p.type === 'max-turns-reached') as unknown) as
-    Array<{ type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }>;
+  const maxTurnsParts = content.filter((p: { type: string }) => p.type === 'max-turns-reached') as unknown as Array<{
+    type: 'max-turns-reached';
+    text: string;
+    status: 'pending' | 'continued';
+  }>;
 
   // Mark first/last .timeline-item so CSS can clip the line at the dots
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1137,7 +1227,8 @@ const AssistantMessage: FC = () => {
               {content.map((part: { type: string; text?: string; source?: string }, idx: number) => {
                 if (part.type !== 'text') return null;
                 if (part.source === 'interrupt') return <InterruptDivider key={`interrupt-${idx}`} />;
-                if (part.source === 'unspoken') return <UnspokenTextPart key={`unspoken-${idx}`} text={part.text ?? ''} />;
+                if (part.source === 'unspoken')
+                  return <UnspokenTextPart key={`unspoken-${idx}`} text={part.text ?? ''} />;
                 return <AssistantTextPart key={`text-${idx}`} text={part.text ?? ''} />;
               })}
             </>
@@ -1162,7 +1253,9 @@ const AssistantMessage: FC = () => {
             <MaxTurnsContinueCard key={`max-turns-${i}`} part={part} messageId={message.id} />
           ))}
         </div>
-        <div className={`flex items-center gap-1 mt-1.5 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        <div
+          className={`flex items-center gap-1 mt-1.5 transition-opacity ${isRunning && !isAwaitingInput ? 'opacity-0 pointer-events-none' : message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+        >
           <AssistantActionBar />
           {!isRunning && <MessageInfoIndicator />}
           <MessageTimestamp date={message.createdAt} align="left" />
@@ -1175,7 +1268,7 @@ const AssistantMessage: FC = () => {
 const AssistantActionBar: FC = () => {
   const { config } = useConfig();
   const ttsEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true
+    ? (((config as Record<string, unknown>).audio as { tts?: { enabled?: boolean } })?.tts?.enabled ?? true)
     : true;
   return (
     <ActionBarPrimitive.Root className="flex items-center gap-1">
@@ -1219,7 +1312,9 @@ const MessageInfoIndicator: FC = () => {
   const responseTiming = getResponseTiming(message);
 
   // Access the original StoredMessage via assistant-ui's external store binding
-  const storedMessage = getExternalStoreMessage<{ tokenUsage?: TokenUsageData; messageMeta?: Record<string, unknown> }>(message);
+  const storedMessage = getExternalStoreMessage<{ tokenUsage?: TokenUsageData; messageMeta?: Record<string, unknown> }>(
+    message,
+  );
   const stored = Array.isArray(storedMessage) ? storedMessage[0] : storedMessage;
   const meta = stored?.messageMeta;
 
@@ -1235,8 +1330,11 @@ const MessageInfoIndicator: FC = () => {
   // Only show a model if the daemon explicitly reports one via sourceModelDisplayName.
   const sourceModel = meta?.sourceModel as string | undefined;
   const modelKey = persistedRuntimeId
-    ? (sourceModel ?? null)  // inference provider: only show if daemon reported it
-    : (selectedModelKey ?? (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ?? sourceModel ?? null);
+    ? (sourceModel ?? null) // inference provider: only show if daemon reported it
+    : (selectedModelKey ??
+      (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey ??
+      sourceModel ??
+      null);
 
   // Runtime
   const effectiveRuntimeId = persistedRuntimeId ?? resolvedRuntime;
@@ -1244,8 +1342,9 @@ const MessageInfoIndicator: FC = () => {
   // Effort
   const effectiveEffort = persistedEffort ?? reasoningEffort;
 
-  const elapsedMs = responseTiming?.durationMs
-    ?? (responseTiming?.startedAt && responseTiming?.finishedAt
+  const elapsedMs =
+    responseTiming?.durationMs ??
+    (responseTiming?.startedAt && responseTiming?.finishedAt
       ? Math.max(0, new Date(responseTiming.finishedAt).getTime() - new Date(responseTiming.startedAt).getTime())
       : undefined);
 
@@ -1256,17 +1355,25 @@ const MessageInfoIndicator: FC = () => {
   if (!modelKey && !effectiveRuntimeId && elapsedMs == null && !effectiveEffort && !tokenUsage) return null;
 
   // Look up catalog display name as fallback when no persisted display name
-  const catalog = (config as { models?: { catalog?: Array<{ key: string; displayName: string; provider: string; modelName: string }> } })?.models?.catalog;
-  const catalogEntry = !persistedModelDisplay && modelKey
-    ? catalog?.find((m) => m.key === modelKey)
-      ?? catalog?.find((m) => `${m.provider}:${m.modelName}` === modelKey)
-      ?? catalog?.find((m) => m.modelName === modelKey || m.modelName === modelKey.split(':').slice(1).join(':'))
-    : undefined;
-  const modelDisplay = persistedModelDisplay
-    ?? catalogEntry?.displayName
-    ?? (modelKey ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey) : null);
-  const runtimeDisplay = effectiveRuntimeId ? RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId : null;
-  const effortDisplay = effectiveEffort ? EFFORT_DISPLAY_NAMES[effectiveEffort] ?? effectiveEffort : null;
+  const catalog = (
+    config as {
+      models?: { catalog?: Array<{ key: string; displayName: string; provider: string; modelName: string }> };
+    }
+  )?.models?.catalog;
+  const catalogEntry =
+    !persistedModelDisplay && modelKey
+      ? (catalog?.find((m) => m.key === modelKey) ??
+        catalog?.find((m) => `${m.provider}:${m.modelName}` === modelKey) ??
+        catalog?.find((m) => m.modelName === modelKey || m.modelName === modelKey.split(':').slice(1).join(':')))
+      : undefined;
+  const modelDisplay =
+    persistedModelDisplay ??
+    catalogEntry?.displayName ??
+    (modelKey
+      ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey)
+      : null);
+  const runtimeDisplay = effectiveRuntimeId ? (RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId) : null;
+  const effortDisplay = effectiveEffort ? (EFFORT_DISPLAY_NAMES[effectiveEffort] ?? effectiveEffort) : null;
   const elapsedDisplay = elapsedMs != null ? formatElapsed(Math.max(1, elapsedMs)) : null;
 
   return (
@@ -1297,7 +1404,8 @@ const MessageInfoIndicator: FC = () => {
               <span className="tabular-nums">
                 {formatCompactTokens(tokenUsage.totalTokens)}
                 <span className="text-popover-foreground/35 ml-1">
-                  ({formatCompactTokens(tokenUsage.inputTokens)} in · {formatCompactTokens(tokenUsage.outputTokens)} out)
+                  ({formatCompactTokens(tokenUsage.inputTokens)} in · {formatCompactTokens(tokenUsage.outputTokens)}{' '}
+                  out)
                 </span>
               </span>
             </>
@@ -1306,7 +1414,8 @@ const MessageInfoIndicator: FC = () => {
             <>
               <span className="text-popover-foreground/50">Cache</span>
               <span className="tabular-nums">
-                {formatCompactTokens(tokenUsage.cacheReadTokens)} read · {formatCompactTokens(tokenUsage.cacheWriteTokens)} write
+                {formatCompactTokens(tokenUsage.cacheReadTokens)} read ·{' '}
+                {formatCompactTokens(tokenUsage.cacheWriteTokens)} write
                 {tokenUsage.totalTokens > 0 && tokenUsage.cacheReadTokens > 0 && (
                   <span className="text-emerald-400/70 ml-1">
                     ({Math.round((tokenUsage.cacheReadTokens / tokenUsage.totalTokens) * 100)}% hit)
@@ -1327,7 +1436,10 @@ const MessageInfoIndicator: FC = () => {
       side="right"
       delayDuration={150}
     >
-      <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
+      <button
+        type="button"
+        className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+      >
         <InfoIcon className="h-3.5 w-3.5 text-muted-foreground" />
       </button>
     </Tooltip>
@@ -1370,8 +1482,11 @@ const CopyButton: FC = () => {
   const aui = useAui();
   const message = useMessage();
   const [copied, setCopied] = useState(false);
-  const hasCopyableContent = (message.role !== 'assistant' || message.status?.type !== 'running')
-    && message.content.some((part: { type: string; text?: string }) => part.type === 'text' && (part.text?.length ?? 0) > 0);
+  const hasCopyableContent =
+    (message.role !== 'assistant' || message.status?.type !== 'running') &&
+    message.content.some(
+      (part: { type: string; text?: string }) => part.type === 'text' && (part.text?.length ?? 0) > 0,
+    );
 
   const handleCopy = useCallback(async () => {
     const valueToCopy = aui.message().getCopyText();
@@ -1391,8 +1506,18 @@ const CopyButton: FC = () => {
 
   return (
     <Tooltip content="Copy">
-      <button type="button" className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors" onClick={() => { void handleCopy(); }}>
-        {copied ? <CheckIcon className="h-3.5 w-3.5 text-green-500" /> : <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+      <button
+        type="button"
+        className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
+        onClick={() => {
+          void handleCopy();
+        }}
+      >
+        {copied ? (
+          <CheckIcon className="h-3.5 w-3.5 text-green-500" />
+        ) : (
+          <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />
+        )}
       </button>
     </Tooltip>
   );
@@ -1407,9 +1532,7 @@ const SpeakButton: FC = () => {
   if (isSpeaking) {
     return (
       <Tooltip content="Stop speaking">
-        <ActionBarPrimitive.StopSpeaking
-          className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-        >
+        <ActionBarPrimitive.StopSpeaking className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
           <SquareIcon className="h-3 w-3 text-primary" />
         </ActionBarPrimitive.StopSpeaking>
       </Tooltip>
@@ -1418,9 +1541,7 @@ const SpeakButton: FC = () => {
 
   return (
     <Tooltip content="Read">
-      <ActionBarPrimitive.Speak
-        className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors"
-      >
+      <ActionBarPrimitive.Speak className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
         <Volume2Icon className="h-3.5 w-3.5 text-muted-foreground" />
       </ActionBarPrimitive.Speak>
     </Tooltip>
@@ -1484,7 +1605,20 @@ const Composer: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({
+  mode,
+  onChangeMode,
+  selectedModelKey,
+  onSelectModel,
+  reasoningEffort,
+  onChangeReasoningEffort,
+  executionMode,
+  onChangeExecutionMode,
+  selectedProfileKey,
+  onSelectProfile,
+  fallbackEnabled,
+  onToggleFallback,
+}) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments, removeAttachment } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
@@ -1496,28 +1630,32 @@ const Composer: FC<{
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
-    ? ((config as Record<string, unknown>).computerUse as { enabled?: boolean })?.enabled ?? false
+    ? (((config as Record<string, unknown>).computerUse as { enabled?: boolean })?.enabled ?? false)
     : false;
-  const computerConfig = (config as Record<string, unknown> | null)?.computerUse as {
-    defaultTarget?: ComputerUseTarget;
-    approvalModeDefault?: ComputerUseApprovalMode;
-  } | undefined;
+  const computerConfig = (config as Record<string, unknown> | null)?.computerUse as
+    | {
+        defaultTarget?: ComputerUseTarget;
+        approvalModeDefault?: ComputerUseApprovalMode;
+      }
+    | undefined;
   const [computerUseToggled, setComputerUseToggled] = useState(false);
   const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(() => {
     const configured = computerConfig?.defaultTarget ?? 'isolated-browser';
-    return (configured === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : configured;
+    return configured === 'local-macos' && app.platform.os !== 'darwin' ? 'isolated-browser' : configured;
   });
-  const [computerApprovalMode, setComputerApprovalMode] = useState<ComputerUseApprovalMode>(computerConfig?.approvalModeDefault ?? 'autonomous');
+  const [computerApprovalMode, setComputerApprovalMode] = useState<ComputerUseApprovalMode>(
+    computerConfig?.approvalModeDefault ?? 'autonomous',
+  );
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
 
   useEffect(() => {
     const target = computerConfig?.defaultTarget ?? 'isolated-browser';
-    setComputerTarget((target === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : target);
+    setComputerTarget(target === 'local-macos' && app.platform.os !== 'darwin' ? 'isolated-browser' : target);
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.defaultTarget, computerConfig?.approvalModeDefault]);
 
   const recordingEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true
+    ? (((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true)
     : true;
   const {
     recordingState,
@@ -1534,14 +1672,17 @@ const Composer: FC<{
 
   const isRecording = recordingState === 'recording' || recordingState === 'transcribing';
 
-
-  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
   const [cwdPopoverOpen, setCwdPopoverOpen] = useState(false);
   const cwdRootRef = useRef<HTMLDivElement>(null);
   const cwdPopover = usePopoverAlign();
-  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({ popoverOpen: cwdPopoverOpen });
+  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({
+    popoverOpen: cwdPopoverOpen,
+  });
   const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
 
   // Close CWD popover on outside click
@@ -1576,33 +1717,61 @@ const Composer: FC<{
       return;
     }
     try {
-      const result = await app.dialog.openFile({ filters }) as { canceled: boolean; files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }> };
+      const result = (await app.dialog.openFile({ filters })) as {
+        canceled: boolean;
+        files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+      };
       if (!result.canceled && result.files) addAttachments(result.files);
-    } catch (err) { console.error('Attach failed:', err); }
+    } catch (err) {
+      console.error('Attach failed:', err);
+    }
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
-    const readers: Promise<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>[] = [];
+    const readers: Promise<{
+      name: string;
+      mime: string;
+      isImage: boolean;
+      size: number;
+      dataUrl: string;
+      text?: string;
+    }>[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      readers.push(new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          const isImage = file.type.startsWith('image/');
-          const isText = file.type.startsWith('text/') || file.type === 'application/json';
-          if (isText) {
-            const textReader = new FileReader();
-            textReader.onload = () => resolve({ name: file.name, mime: file.type || 'application/octet-stream', isImage, size: file.size, dataUrl, text: textReader.result as string });
-            textReader.readAsText(file);
-          } else {
-            resolve({ name: file.name, mime: file.type || 'application/octet-stream', isImage, size: file.size, dataUrl });
-          }
-        };
-        reader.readAsDataURL(file);
-      }));
+      readers.push(
+        new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            const isImage = file.type.startsWith('image/');
+            const isText = file.type.startsWith('text/') || file.type === 'application/json';
+            if (isText) {
+              const textReader = new FileReader();
+              textReader.onload = () =>
+                resolve({
+                  name: file.name,
+                  mime: file.type || 'application/octet-stream',
+                  isImage,
+                  size: file.size,
+                  dataUrl,
+                  text: textReader.result as string,
+                });
+              textReader.readAsText(file);
+            } else {
+              resolve({
+                name: file.name,
+                mime: file.type || 'application/octet-stream',
+                isImage,
+                size: file.size,
+                dataUrl,
+              });
+            }
+          };
+          reader.readAsDataURL(file);
+        }),
+      );
     }
     void Promise.all(readers).then((results) => addAttachments(results));
     // Reset so the same file can be re-selected
@@ -1635,11 +1804,13 @@ const Composer: FC<{
 
       // Active non-terminal session → send guidance
       if (activeComputerSession && !isComputerSessionTerminal(activeComputerSession.status)) {
-        void sendGuidance(activeComputerSession.id, composerText.trim()).then(() => {
-          composerRuntime.setText('');
-        }).finally(() => {
-          setIsStartingComputerSession(false);
-        });
+        void sendGuidance(activeComputerSession.id, composerText.trim())
+          .then(() => {
+            composerRuntime.setText('');
+          })
+          .finally(() => {
+            setIsStartingComputerSession(false);
+          });
         return;
       }
 
@@ -1658,20 +1829,34 @@ const Composer: FC<{
             reasoningEffort,
           });
 
-      void promise.then(() => {
-        composerRuntime.setText('');
-      }).finally(() => {
-        setIsStartingComputerSession(false);
-      });
+      void promise
+        .then(() => {
+          composerRuntime.setText('');
+        })
+        .finally(() => {
+          setIsStartingComputerSession(false);
+        });
       return;
     }
 
     composerRuntime.send();
   }, [
-    attachments.length, composerRuntime, composerText, computerUseToggled, mode,
-    activeConversationId, activeComputerSession, startSession, continueSession, sendGuidance,
-    computerTarget, computerApprovalMode, selectedModelKey, selectedProfileKey,
-    fallbackEnabled, reasoningEffort,
+    attachments.length,
+    composerRuntime,
+    composerText,
+    computerUseToggled,
+    mode,
+    activeConversationId,
+    activeComputerSession,
+    startSession,
+    continueSession,
+    sendGuidance,
+    computerTarget,
+    computerApprovalMode,
+    selectedModelKey,
+    selectedProfileKey,
+    fallbackEnabled,
+    reasoningEffort,
   ]);
 
   const canSend = composerText.trim().length > 0 || attachments.length > 0;
@@ -1690,7 +1875,8 @@ const Composer: FC<{
   }, [cancelRecording]);
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
-  const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
+  const menuItemClassName =
+    'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   // When recording, show the RecordingOverlay instead of the normal composer
   if (isRecording) {
@@ -1736,7 +1922,10 @@ const Composer: FC<{
         {mode === 'chat' && hasFileAttachments && (
           <div className="mb-3 flex flex-wrap gap-2">
             {attachments.map((file, i) => (
-              <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs">
+              <div
+                key={`${file.name}-${i}`}
+                className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs"
+              >
                 {file.isImage ? (
                   <img src={file.dataUrl} alt={file.name} className="h-10 w-10 rounded object-cover" />
                 ) : (
@@ -1761,10 +1950,13 @@ const Composer: FC<{
         {mode === 'computer' && !showComputerSetup ? (
           /* Guidance composer — shown when a session is active */
           activeComputerSession ? (
-            <GuidanceComposer sessionId={activeComputerSession.id} onReturnToChat={() => {
-              setComputerUseToggled(false);
-              onChangeMode('chat');
-            }} />
+            <GuidanceComposer
+              sessionId={activeComputerSession.id}
+              onReturnToChat={() => {
+                setComputerUseToggled(false);
+                onChangeMode('chat');
+              }}
+            />
           ) : null
         ) : (
           <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
@@ -1781,10 +1973,10 @@ const Composer: FC<{
                   fallbackEnabled={fallbackEnabled}
                   onToggleFallback={onToggleFallback}
                   activeComputerSession={activeComputerSession}
-                  onOpenPopout={() => { void app.computerUse.openSetupWindow(activeConversationId ?? undefined); }}
-                  renderRecording={recordingEnabled ? () => (
-                    <RecordingButton onStart={startRecording} />
-                  ) : undefined}
+                  onOpenPopout={() => {
+                    void app.computerUse.openSetupWindow(activeConversationId ?? undefined);
+                  }}
+                  renderRecording={recordingEnabled ? () => <RecordingButton onStart={startRecording} /> : undefined}
                 />
                 <div className="mt-2 flex justify-end">
                   <Tooltip content="Return to chat">
@@ -1805,7 +1997,13 @@ const Composer: FC<{
             ) : (
               <>
                 <ComposerInput
-                  placeholder={computerUseToggled ? (activeComputerSession && isComputerSessionTerminal(activeComputerSession.status) ? 'Continue the session with a follow-up...' : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`) : 'Discuss your thoughts and ideas...'}
+                  placeholder={
+                    computerUseToggled
+                      ? activeComputerSession && isComputerSessionTerminal(activeComputerSession.status)
+                        ? 'Continue the session with a follow-up...'
+                        : `What should ${__BRAND_PRODUCT_NAME} do on your computer?`
+                      : 'Discuss your thoughts and ideas...'
+                  }
                   className="min-h-[48px] max-h-[220px] w-full overflow-y-auto px-1 py-0.5 text-base md:text-[15px]"
                   autoFocus
                 />
@@ -1814,7 +2012,10 @@ const Composer: FC<{
                     <DropdownMenu.Root>
                       <Tooltip content="Add files" side="top" sideOffset={8}>
                         <DropdownMenu.Trigger asChild>
-                          <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
+                          <button
+                            type="button"
+                            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground"
+                          >
                             <PlusIcon className="h-4 w-4" />
                           </button>
                         </DropdownMenu.Trigger>
@@ -1825,20 +2026,74 @@ const Composer: FC<{
                           sideOffset={8}
                           className="z-50 min-w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                         >
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }]); }}>
+                          <DropdownMenu.Item
+                            className={menuItemClassName}
+                            onSelect={() => {
+                              void handleAttachFiles([
+                                { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+                              ]);
+                            }}
+                          >
                             <ImageIcon className="h-4 w-4 text-muted-foreground" />
                             <span>Image</span>
                           </DropdownMenu.Item>
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'PDF', extensions: ['pdf'] }]); }}>
+                          <DropdownMenu.Item
+                            className={menuItemClassName}
+                            onSelect={() => {
+                              void handleAttachFiles([{ name: 'PDF', extensions: ['pdf'] }]);
+                            }}
+                          >
                             <FileIcon className="h-4 w-4 text-muted-foreground" />
                             <span>PDF</span>
                           </DropdownMenu.Item>
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Documents', extensions: ['txt', 'md', 'json', 'csv', 'html', 'htm', 'js', 'jsx', 'ts', 'tsx', 'css', 'scss', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'hpp', 'sh', 'yaml', 'yml', 'toml', 'xml'] }]); }}>
+                          <DropdownMenu.Item
+                            className={menuItemClassName}
+                            onSelect={() => {
+                              void handleAttachFiles([
+                                {
+                                  name: 'Documents',
+                                  extensions: [
+                                    'txt',
+                                    'md',
+                                    'json',
+                                    'csv',
+                                    'html',
+                                    'htm',
+                                    'js',
+                                    'jsx',
+                                    'ts',
+                                    'tsx',
+                                    'css',
+                                    'scss',
+                                    'py',
+                                    'rb',
+                                    'go',
+                                    'rs',
+                                    'java',
+                                    'c',
+                                    'cpp',
+                                    'h',
+                                    'hpp',
+                                    'sh',
+                                    'yaml',
+                                    'yml',
+                                    'toml',
+                                    'xml',
+                                  ],
+                                },
+                              ]);
+                            }}
+                          >
                             <FileTextIcon className="h-4 w-4 text-muted-foreground" />
                             <span>Text / Document</span>
                           </DropdownMenu.Item>
                           <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                          <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles(); }}>
+                          <DropdownMenu.Item
+                            className={menuItemClassName}
+                            onSelect={() => {
+                              void handleAttachFiles();
+                            }}
+                          >
                             <FileIcon className="h-4 w-4 text-muted-foreground" />
                             <span>Any File</span>
                           </DropdownMenu.Item>
@@ -1847,16 +2102,22 @@ const Composer: FC<{
                     </DropdownMenu.Root>
                     {/* Working directory split button */}
                     <div ref={cwdRootRef} {...cwdContainerProps} className="relative flex items-center">
-                      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
-                        currentWorkingDirectory
-                          ? 'border-primary/50 bg-primary/10'
-                          : 'border-border/50 bg-muted/40'
-                      }`}>
+                      <div
+                        className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+                          currentWorkingDirectory ? 'border-primary/50 bg-primary/10' : 'border-border/50 bg-muted/40'
+                        }`}
+                      >
                         {/* Left segment: folder icon — opens picker */}
-                        <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Working directory'} side="top" sideOffset={8}>
+                        <Tooltip
+                          content={currentWorkingDirectory ? (cwdName ?? 'Working directory') : 'Working directory'}
+                          side="top"
+                          sideOffset={8}
+                        >
                           <button
                             type="button"
-                            onClick={() => { void handleAttachDirectory(); }}
+                            onClick={() => {
+                              void handleAttachDirectory();
+                            }}
                             className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
                               currentWorkingDirectory
                                 ? 'hover:bg-primary/15 text-primary'
@@ -1868,16 +2129,20 @@ const Composer: FC<{
                         </Tooltip>
                         {/* Right segment: chevron — opens CWD popover (only when set) */}
                         {currentWorkingDirectory && (
-                          <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-                            cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
-                          }`}>
+                          <div
+                            className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+                              cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+                            }`}
+                          >
                             <Tooltip content="Directory settings" side="top" sideOffset={8}>
                               <button
                                 type="button"
                                 onClick={() => setCwdPopoverOpen((o) => !o)}
                                 className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
                               >
-                                <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
+                                <ChevronUpIcon
+                                  className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`}
+                                />
                               </button>
                             </Tooltip>
                           </div>
@@ -1886,19 +2151,35 @@ const Composer: FC<{
 
                       {/* CWD popover */}
                       {cwdPopoverOpen && currentWorkingDirectory && (
-                        <div ref={cwdPopover.ref} style={cwdPopover.style} className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+                        <div
+                          ref={cwdPopover.ref}
+                          style={cwdPopover.style}
+                          className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl"
+                        >
                           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
                             <FolderOpenIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Working Directory</span>
+                            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+                              Working Directory
+                            </span>
                           </div>
                           <div className="px-3 py-2">
-                            <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>{cwdName}</p>
-                            <p className="mt-0.5 text-[10px] text-muted-foreground truncate" title={currentWorkingDirectory}>{currentWorkingDirectory}</p>
+                            <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>
+                              {cwdName}
+                            </p>
+                            <p
+                              className="mt-0.5 text-[10px] text-muted-foreground truncate"
+                              title={currentWorkingDirectory}
+                            >
+                              {currentWorkingDirectory}
+                            </p>
                           </div>
                           <div className="border-t border-border/50 mx-1.5 mt-0.5" />
                           <button
                             type="button"
-                            onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                            onClick={() => {
+                              void setCurrentWorkingDirectory(null);
+                              setCwdPopoverOpen(false);
+                            }}
                             className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
                           >
                             <XIcon className="h-3.5 w-3.5" />
@@ -1909,57 +2190,62 @@ const Composer: FC<{
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 md:gap-2">
-                  <ChatSettingsButton
-                    reasoningEffort={reasoningEffort}
-                    onChangeReasoningEffort={onChangeReasoningEffort}
-                    executionMode={executionMode}
-                    onChangeExecutionMode={onChangeExecutionMode}
-                    selectedModelKey={selectedModelKey}
-                    onSelectModel={onSelectModel}
-                    selectedProfileKey={selectedProfileKey}
-                    onSelectProfile={onSelectProfile}
-                    fallbackEnabled={fallbackEnabled}
-                    onToggleFallback={onToggleFallback}
-                  />
-                  {computerUseEnabled && (
-                    <ComputerSettingsButton
-                      target={computerTarget}
-                      onChangeTarget={setComputerTarget}
-                      approvalMode={computerApprovalMode}
-                      onChangeApprovalMode={setComputerApprovalMode}
-                      toggled={computerUseToggled}
-                      onToggle={() => {
-                        const next = !computerUseToggled;
-                        setComputerUseToggled(next);
-                        if (next && activeComputerSession && !isComputerSessionTerminal(activeComputerSession.status) && activeComputerSession.surface === 'docked') {
-                          onChangeMode('computer');
-                        }
-                      }}
+                    <ChatSettingsButton
+                      reasoningEffort={reasoningEffort}
+                      onChangeReasoningEffort={onChangeReasoningEffort}
+                      executionMode={executionMode}
+                      onChangeExecutionMode={onChangeExecutionMode}
+                      selectedModelKey={selectedModelKey}
+                      onSelectModel={onSelectModel}
+                      selectedProfileKey={selectedProfileKey}
+                      onSelectProfile={onSelectProfile}
+                      fallbackEnabled={fallbackEnabled}
+                      onToggleFallback={onToggleFallback}
                     />
-                  )}
-                  <CallButton />
-                  {recordingEnabled && <RecordingButton onStart={startRecording} />}
-                  <ThreadPrimitive.If running={false}>
-                    <Tooltip content="Send message" side="top" sideOffset={8}>
-                      <button
-                        type="button"
-                        onClick={handleSend}
-                        disabled={!canSend || isStartingComputerSession}
-                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
-                      >
-                        {isStartingComputerSession ? (
-                          <LoaderIcon className="h-4 w-4 animate-spin" />
-                        ) : computerUseToggled ? (
-                          <MonitorIcon className="h-4 w-4" />
-                        ) : (
-                          <SendHorizontalIcon className="h-4 w-4" />
-                        )}
-                      </button>
-                    </Tooltip>
-                  </ThreadPrimitive.If>
-                  <ThreadPrimitive.If running>
-                    <StopButton />
-                  </ThreadPrimitive.If>
+                    {computerUseEnabled && (
+                      <ComputerSettingsButton
+                        target={computerTarget}
+                        onChangeTarget={setComputerTarget}
+                        approvalMode={computerApprovalMode}
+                        onChangeApprovalMode={setComputerApprovalMode}
+                        toggled={computerUseToggled}
+                        onToggle={() => {
+                          const next = !computerUseToggled;
+                          setComputerUseToggled(next);
+                          if (
+                            next &&
+                            activeComputerSession &&
+                            !isComputerSessionTerminal(activeComputerSession.status) &&
+                            activeComputerSession.surface === 'docked'
+                          ) {
+                            onChangeMode('computer');
+                          }
+                        }}
+                      />
+                    )}
+                    <CallButton />
+                    {recordingEnabled && <RecordingButton onStart={startRecording} />}
+                    <ThreadPrimitive.If running={false}>
+                      <Tooltip content="Send message" side="top" sideOffset={8}>
+                        <button
+                          type="button"
+                          onClick={handleSend}
+                          disabled={!canSend || isStartingComputerSession}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                        >
+                          {isStartingComputerSession ? (
+                            <LoaderIcon className="h-4 w-4 animate-spin" />
+                          ) : computerUseToggled ? (
+                            <MonitorIcon className="h-4 w-4" />
+                          ) : (
+                            <SendHorizontalIcon className="h-4 w-4" />
+                          )}
+                        </button>
+                      </Tooltip>
+                    </ThreadPrimitive.If>
+                    <ThreadPrimitive.If running>
+                      <StopButton />
+                    </ThreadPrimitive.If>
                   </div>
                 </div>
               </>

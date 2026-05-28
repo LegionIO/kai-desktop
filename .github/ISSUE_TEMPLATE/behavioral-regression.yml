@@ -1,0 +1,99 @@
+name: Behavioral regression
+description: A nightly real-API smoke test detected a behavioral regression in provider integration.
+title: '[regression] <test-id>: <one-line-symptom>'
+labels:
+  - behavioral-regression
+  - severity:auto
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Summary
+
+        This issue was auto-created by the nightly real-API workflow when a smoke
+        test in `electron/__tests__/integration-real/` failed. The workflow fills
+        in the fields below from the failing run; humans should review, triage,
+        and adjust severity.
+
+        **Triage checklist**
+        - [ ] Reproduce locally with `RUN_REAL_API_TESTS=1 ANTHROPIC_API_KEY=... OPENAI_API_KEY=... pnpm test:integration:real`
+        - [ ] Confirm provider model version vs. last known-good
+        - [ ] Decide severity: low / medium / high / critical
+        - [ ] Either fix the integration code, update the smoke test, or open
+              an upstream issue with the provider
+
+  - type: input
+    id: test-id
+    attributes:
+      label: Test ID
+      description: Stable id from `electron/__tests__/integration-real/<file>.real.test.ts`. Used by the workflow's dedup search.
+      placeholder: real.streaming.anthropic.haiku
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Maintainer-set severity. Workflow leaves this on the default `auto` until a human triages.
+      options:
+        - auto
+        - low
+        - medium
+        - high
+        - critical
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: error-class
+    attributes:
+      label: Error class
+      description: First line of the thrown error or the failing assertion.
+      placeholder: 'AssertionError: expected output to contain "21"'
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model version
+      description: Model identifier the test exercised when it failed.
+      placeholder: claude-3-5-haiku-latest
+    validations:
+      required: true
+
+  - type: input
+    id: run-url
+    attributes:
+      label: Run URL
+      description: Link to the GitHub Actions run that detected the regression.
+    validations:
+      required: true
+
+  - type: textarea
+    id: request-excerpt
+    attributes:
+      label: Request excerpt
+      description: Last 50 lines of the request payload sent to the provider.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: response-excerpt
+    attributes:
+      label: Response excerpt
+      description: Last 50 lines of the provider response (or the error body).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: maintainer-notes
+    attributes:
+      label: Maintainer notes
+      description: Free-form. Use this for triage decisions, links to related issues, and the eventual fix summary.
+    validations:
+      required: false
