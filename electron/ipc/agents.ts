@@ -382,9 +382,9 @@ export async function startAgentRun(
 
         for await (const event of stream) {
           const ev = event as Record<string, unknown>;
-          if (ev.type === 'text-delta' && ev.textDelta) {
+          if (ev.type === 'text-delta' && ev.text) {
             // Convert newlines to terminal-friendly \r\n
-            const text = String(ev.textDelta).replace(/\n/g, '\r\n');
+            const text = String(ev.text).replace(/\n/g, '\r\n');
             broadcast(text);
           } else if (ev.type === 'tool-call') {
             broadcast(
@@ -405,6 +405,11 @@ export async function startAgentRun(
             broadcast(
               `\x1b[90m[Sandbox] ${success} exit=${String(exitData.exitCode)} (${String(exitData.executionTimeMs)}ms)\x1b[0m\r\n`,
             );
+          } else if (ev.type === 'step-progress') {
+            const stepInfo = ev.stepInfo as Record<string, unknown> | undefined;
+            if (stepInfo) {
+              broadcast(`\x1b[90m[Step ${stepInfo.currentStep}/${stepInfo.maxSteps}]\x1b[0m\r\n`);
+            }
           }
         }
 
