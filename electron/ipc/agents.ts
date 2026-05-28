@@ -827,28 +827,17 @@ export async function startAgentRun(
           broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
         }
       } finally {
-        // Mark agent idle
+        // Mark agent idle (if promote_task/block_task didn't already do it)
         const freshAgent = readAgent(appHome, agentId);
         if (freshAgent && freshAgent.status === 'running') {
           freshAgent.status = 'idle';
           freshAgent.terminalSessionId = undefined;
-          if (!hasError) {
-            freshAgent.stats.tasksCompleted = (freshAgent.stats.tasksCompleted ?? 0) + 1;
-          }
           freshAgent.updatedAt = new Date().toISOString();
           writeAgent(appHome, freshAgent);
         }
 
-        // Do NOT auto-promote task status. The agent must explicitly call
-        // the promote_task tool to move from in_progress → ai_review.
-        // If it doesn't, the task stays in_progress for the user to decide.
-        // NOTE: We intentionally keep task.terminalSessionId so the UI can
-        // replay buffered output when the user navigates back to this task.
-        const freshTask = readTask(appHome, task.id);
-        if (freshTask) {
-          freshTask.updatedAt = new Date().toISOString();
-          writeTask(appHome, freshTask);
-        }
+        // Don't touch task status — promote_task/block_task handle that.
+        // Just broadcast final state to ensure UI is in sync.
         broadcastAgentChange(appHome);
         broadcastTaskChange(appHome);
 
