@@ -308,10 +308,19 @@ export async function startAgentRun(
       .filter(Boolean)
       .join('\n');
 
+    // Build the user message — include review feedback if task was kicked back
+    let userMessage = task.description ?? 'No task description provided.';
+    if (task.reviewNotes && task.reviewNotes.length > 0) {
+      const feedbackSection = task.reviewNotes
+        .map((note) => `[${note.source.toUpperCase()} review — ${note.timestamp}]\n${note.content}`)
+        .join('\n\n');
+      userMessage += `\n\n---\n## Review Feedback (address these issues)\n\n${feedbackSection}`;
+    }
+
     // Build messages with task description as user message
     const messages: Array<{ role: string; content: string }> = [
       { role: 'system', content: taskSystemPrompt },
-      { role: 'user', content: task.description ?? 'No task description provided.' },
+      { role: 'user', content: userMessage },
     ];
 
     broadcast(`\x1b[1;36m[Mastra Agent]\x1b[0m Starting task: ${task.title}\r\n`);

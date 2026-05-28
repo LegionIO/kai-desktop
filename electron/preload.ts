@@ -335,6 +335,8 @@ const appAPI = {
     update: (id: string, updates: unknown) => ipcRenderer.invoke('tasks:update', id, updates),
     delete: (id: string) => ipcRenderer.invoke('tasks:delete', id),
     unarchive: (id: string) => ipcRenderer.invoke('tasks:unarchive', id),
+    kickBack: (id: string, reason: string, source: 'ai' | 'human') =>
+      ipcRenderer.invoke('tasks:kick-back', id, reason, source),
     getOrder: () => ipcRenderer.invoke('tasks:get-order'),
     saveOrder: (order: unknown) => ipcRenderer.invoke('tasks:save-order', order),
     onChanged: (callback: (tasks: unknown[]) => void) => {

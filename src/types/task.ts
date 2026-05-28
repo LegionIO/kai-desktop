@@ -4,7 +4,14 @@
  * Core types are re-exported from the shared module to keep main/renderer in sync.
  */
 
-export type { TaskFile, KaiTaskMetadata, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
+export type {
+  TaskFile,
+  KaiTaskMetadata,
+  KaiTaskOrder,
+  TaskConversationMessage,
+  TaskStreamEvent,
+  TaskReviewNote,
+} from '../../shared/task-types';
 export type { KaiTaskStatus } from '../../shared/task-types';
 
 import type { KaiTaskStatus } from '../../shared/task-types';
@@ -12,13 +19,7 @@ import type { KaiTaskStatus } from '../../shared/task-types';
 // ── Column Definitions ────────────────────────────────────────────────────
 
 /** Ordered list of status rows in the task queue. */
-export const KAI_TASK_STATUS_COLUMNS: KaiTaskStatus[] = [
-  'todo',
-  'in_progress',
-  'ai_review',
-  'human_review',
-  'done',
-];
+export const KAI_TASK_STATUS_COLUMNS: KaiTaskStatus[] = ['todo', 'in_progress', 'ai_review', 'human_review', 'done'];
 
 /** Human-readable labels for each lane. */
 export const KAI_TASK_STATUS_LABELS: Record<KaiTaskStatus, string> = {

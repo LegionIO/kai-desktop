@@ -18,6 +18,18 @@ export interface TaskConversationMessage {
   timestamp: string;
 }
 
+/** A review feedback note — added when a task is kicked back from review. */
+export interface TaskReviewNote {
+  /** Who wrote this note: 'ai' (AI reviewer) or 'human' (manual). */
+  source: 'ai' | 'human';
+  /** The feedback/reasoning for why the task was kicked back. */
+  content: string;
+  /** ISO timestamp when the note was added. */
+  timestamp: string;
+  /** Which status the task was in when kicked back (ai_review or human_review). */
+  fromStatus: KaiTaskStatus;
+}
+
 export interface TaskFile {
   id: string;
   title: string;
@@ -29,6 +41,8 @@ export interface TaskFile {
   startedAt?: string;
   /** ISO timestamp set when the task is marked done. */
   completedAt?: string;
+  /** Review feedback entries — accumulated when a task is kicked back from review. */
+  reviewNotes?: TaskReviewNote[];
   sourceConversationId?: string;
   sourceToolCallId?: string;
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
