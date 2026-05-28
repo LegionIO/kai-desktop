@@ -8,10 +8,11 @@
 
 import { type FC, useState, useEffect, useCallback } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { ExternalLinkIcon, FileCodeIcon, TerminalIcon } from 'lucide-react';
+import { ExternalLinkIcon, FileCodeIcon, TerminalIcon, PlayIcon, SquareIcon, CheckCircle2Icon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
+import { ReviewResultsPanel } from './ReviewResultsPanel';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
@@ -25,8 +26,9 @@ interface TaskDetailModalProps {
 }
 
 export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenChange, onOpenFullView }) => {
-  const { state: agentState } = useAgents();
+  const { state: agentState, startAgent, stopAgent } = useAgents();
   const { updateTask } = useTasks();
+  const [isStartingAgent, setIsStartingAgent] = useState(false);
 
   const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
   const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
@@ -54,39 +56,89 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
     void updateTask(task.id, { terminalSessionId: undefined });
   }, [task, updateTask]);
 
+  const handleStartAgent = useCallback(async () => {
+    if (!task?.assignedAgentId) return;
+    setIsStartingAgent(true);
+    try {
+      const result = await startAgent(task.assignedAgentId);
+      if (result?.sessionId) setTerminalSessionId(result.sessionId);
+    } catch (err) {
+      console.error('[TaskDetailModal] start agent failed:', err);
+    } finally {
+      setIsStartingAgent(false);
+    }
+  }, [task, startAgent]);
+
+  const handleStopAgent = useCallback(async () => {
+    if (!task?.assignedAgentId) return;
+    await stopAgent(task.assignedAgentId);
+  }, [task, stopAgent]);
+
   if (!task) return null;
 
-  const assignedAgent = task.assignedAgentId
-    ? agentState.agents.find((a) => a.id === task.assignedAgentId)
-    : null;
+  const assignedAgent = task.assignedAgentId ? agentState.agents.find((a) => a.id === task.assignedAgentId) : null;
+
+  const reviewerAgents = (task.reviewerAgentIds ?? [])
+    .map((id) => agentState.agents.find((a) => a.id === id))
+    .filter(Boolean);
 
   const fmtDate = (iso: string) =>
     new Date(iso).toLocaleString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric',
-      hour: 'numeric', minute: '2-digit',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
     });
 
   const leftRows: Array<{ label: string; value: React.ReactNode }> = [
     {
       label: 'Status',
       value: (
-        <span className={cn('inline-flex items-center rounded-full px-2 py-px text-xs font-medium', KAI_TASK_STATUS_COLORS[task.status])}>
+        <span
+          className={cn(
+            'inline-flex items-center rounded-full px-2 py-px text-xs font-medium',
+            KAI_TASK_STATUS_COLORS[task.status],
+          )}
+        >
           {KAI_TASK_STATUS_LABELS[task.status]}
         </span>
       ),
     },
     {
       label: 'Agent',
-      value: assignedAgent
-        ? <span className="text-xs text-foreground/80">{assignedAgent.icon ?? '🤖'} {assignedAgent.name}</span>
-        : <span className="text-xs text-muted-foreground/30">—</span>,
+      value: assignedAgent ? (
+        <span className="text-xs text-foreground/80">
+          {assignedAgent.icon ?? '🤖'} {assignedAgent.name}
+        </span>
+      ) : (
+        <span className="text-xs text-muted-foreground/30">—</span>
+      ),
+    },
+    {
+      label: 'Review',
+      value:
+        reviewerAgents.length > 0 ? (
+          <div className="flex items-center gap-1 flex-wrap">
+            {reviewerAgents.map((agent) => (
+              <span
+                key={agent!.id}
+                className="inline-flex items-center rounded-full bg-purple-500/10 px-1.5 py-px text-[10px] font-medium text-purple-400"
+              >
+                {agent!.icon ?? '🤖'} {agent!.name}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground/30">—</span>
+        ),
     },
   ];
 
   const rightRows: Array<{ label: string; value: string | null }> = [
-    { label: 'Created',   value: fmtDate(task.createdAt) },
-    { label: 'Updated',   value: fmtDate(task.updatedAt) },
-    { label: 'Started',   value: task.startedAt ? fmtDate(task.startedAt) : null },
+    { label: 'Created', value: fmtDate(task.createdAt) },
+    { label: 'Updated', value: fmtDate(task.updatedAt) },
+    { label: 'Started', value: task.startedAt ? fmtDate(task.startedAt) : null },
     { label: 'Completed', value: task.completedAt ? fmtDate(task.completedAt) : null },
   ];
 
@@ -99,16 +151,12 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
           style={{ height: 'min(90vh, 860px)' }}
         >
           <Dialog.Title className="sr-only">{task.title}</Dialog.Title>
-          <Dialog.Description className="sr-only">
-            Preview of task: {task.title}
-          </Dialog.Description>
+          <Dialog.Description className="sr-only">Preview of task: {task.title}</Dialog.Description>
 
           {/* Header */}
           <div className="shrink-0 px-6 pt-6 pb-0">
             <div className="flex items-start justify-between gap-3">
-              <h2 className="text-lg font-semibold text-foreground leading-tight">
-                {task.title}
-              </h2>
+              <h2 className="text-lg font-semibold text-foreground leading-tight">{task.title}</h2>
               <button
                 type="button"
                 onClick={() => onOpenFullView(task.id)}
@@ -133,10 +181,11 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                 {rightRows.map(({ label, value }) => (
                   <div key={label} className="flex h-[18px] items-center gap-2">
                     <span className="w-18 shrink-0 text-xs text-muted-foreground/70">{label}</span>
-                    {value
-                      ? <span className="text-xs text-foreground/80">{value}</span>
-                      : <span className="text-xs text-muted-foreground/30">—</span>
-                    }
+                    {value ? (
+                      <span className="text-xs text-foreground/80">{value}</span>
+                    ) : (
+                      <span className="text-xs text-muted-foreground/30">—</span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -169,9 +218,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
               >
                 <TerminalIcon className="h-3.5 w-3.5" />
                 Agent
-                {terminalSessionId && (
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                )}
+                {terminalSessionId && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
               </button>
             </div>
           </div>
@@ -193,9 +240,57 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
             </div>
           ) : (
             /* Agent tab */
-            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5">
+            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5 gap-3 overflow-y-auto">
+              {/* Completion summary */}
+              {task.completionSummary && (task.status === 'human_review' || task.status === 'done') && (
+                <div className="shrink-0 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
+                  <div className="mb-1.5 flex items-center gap-2">
+                    <CheckCircle2Icon className="h-3.5 w-3.5 text-emerald-500" />
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+                      {task.status === 'human_review' ? 'Ready for review' : 'Completion summary'}
+                    </span>
+                  </div>
+                  <div className="text-xs text-foreground/90 leading-relaxed">
+                    <MarkdownText text={task.completionSummary} />
+                  </div>
+                </div>
+              )}
+
+              {/* Review results */}
+              {(task.reviewResults ?? []).length > 0 && (
+                <div className="shrink-0">
+                  <ReviewResultsPanel task={task} />
+                </div>
+              )}
+
+              {/* Start/Stop toolbar — only in states where execution is relevant */}
+              {assignedAgent && (task.status === 'todo' || task.status === 'in_progress') && (
+                <div className="shrink-0 flex items-center gap-2">
+                  {assignedAgent.status === 'running' ? (
+                    <button
+                      type="button"
+                      onClick={() => void handleStopAgent()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-500 transition-colors hover:bg-red-500/20"
+                    >
+                      <SquareIcon className="h-3 w-3" />
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void handleStartAgent()}
+                      disabled={isStartingAgent}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-500 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
+                    >
+                      <PlayIcon className="h-3 w-3" />
+                      {isStartingAgent ? 'Starting...' : 'Start'}
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Terminal — always rendered; dark overlay when no session */}
-              <div className="relative min-h-0 flex-1">
+              <div className="relative min-h-[200px] flex-1">
                 {terminalSessionId ? (
                   <TaskTerminal
                     sessionId={terminalSessionId}

@@ -1,6 +1,12 @@
 import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
-import { Workspace, LocalFilesystem, LocalSandbox, createWorkspaceTools, WORKSPACE_TOOLS } from '@mastra/core/workspace';
+import {
+  Workspace,
+  LocalFilesystem,
+  LocalSandbox,
+  createWorkspaceTools,
+  WORKSPACE_TOOLS,
+} from '@mastra/core/workspace';
 import type { BackgroundProcessConfig } from '@mastra/core/workspace';
 import { toStandardSchema as toJsonStandardSchema } from '@mastra/schema-compat/adapters/json-schema';
 import { openai as openaiProvider } from '@ai-sdk/openai';
@@ -22,7 +28,24 @@ export type { ReasoningEffort } from './model-catalog.js';
 
 export type StreamEvent = {
   conversationId: string;
-  type: 'text-delta' | 'observer-message' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'tool-approval-required' | 'error' | 'done' | 'compaction' | 'context-usage' | 'model-fallback' | 'enrichment' | 'retry' | 'step-progress' | 'max-steps-reached';
+  type:
+    | 'text-delta'
+    | 'observer-message'
+    | 'tool-call'
+    | 'tool-result'
+    | 'tool-error'
+    | 'tool-progress'
+    | 'tool-compaction'
+    | 'tool-approval-required'
+    | 'error'
+    | 'done'
+    | 'compaction'
+    | 'context-usage'
+    | 'model-fallback'
+    | 'enrichment'
+    | 'retry'
+    | 'step-progress'
+    | 'max-steps-reached';
   messageMeta?: Record<string, unknown>;
   text?: string;
   toolCallId?: string;
@@ -97,15 +120,14 @@ function shouldRetryWithoutTemperature(
   const message = messageParts.join('\n').toLowerCase();
   if (!message.includes('temperature')) return false;
 
-  return /unsupported parameter:\s*'temperature'/.test(message)
-    || message.includes('temperature is not supported')
-    || /only (?:the )?default \(1\) value is supported/.test(message);
+  return (
+    /unsupported parameter:\s*'temperature'/.test(message) ||
+    message.includes('temperature is not supported') ||
+    /only (?:the )?default \(1\) value is supported/.test(message)
+  );
 }
 
-function shouldRetryWithSanitizedMessages(
-  error: unknown,
-  emittedAnyOutput: boolean,
-): boolean {
+function shouldRetryWithSanitizedMessages(error: unknown, emittedAnyOutput: boolean): boolean {
   if (emittedAnyOutput) return false;
 
   const message = getErrorMessage(error).toLowerCase();
@@ -146,7 +168,12 @@ function toMastraTools(
   tools: ToolDefinition[],
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
+    onToolExecutionStart?: (state: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      cancel: () => void;
+    }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
     augmentToolResult?: (state: {
       toolCallId: string;
@@ -165,9 +192,10 @@ function toMastraTools(
       inputSchema: toMastraInputSchema(tool.inputSchema),
       execute: async (input, options) => {
         const mastraOptions = options as MastraToolExecutionOptions | undefined;
-        const toolCallId = typeof mastraOptions?.toolCallId === 'string'
-          ? mastraOptions.toolCallId
-          : `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const toolCallId =
+          typeof mastraOptions?.toolCallId === 'string'
+            ? mastraOptions.toolCallId
+            : `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const localAbortController = new AbortController();
         const cancel = (): void => {
           if (!localAbortController.signal.aborted) {
@@ -259,9 +287,7 @@ function buildProviderOptions(
       openaiOptions.store = false;
     }
 
-    return Object.keys(openaiOptions).length > 0
-      ? { openai: openaiOptions }
-      : undefined;
+    return Object.keys(openaiOptions).length > 0 ? { openai: openaiOptions } : undefined;
   }
 
   // Anthropic (direct or Bedrock with Claude models): map reasoning effort to thinking config
@@ -281,9 +307,7 @@ function buildProviderOptions(
 }
 
 function compactToolArgs<T extends Record<string, unknown>>(args: T): T {
-  return Object.fromEntries(
-    Object.entries(args).filter(([, value]) => value !== undefined),
-  ) as T;
+  return Object.fromEntries(Object.entries(args).filter(([, value]) => value !== undefined)) as T;
 }
 
 function getStringOption(tool: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -336,13 +360,15 @@ function normalizeSearchContextSize(value?: string): 'low' | 'medium' | 'high' |
   return undefined;
 }
 
-function normalizeApproximateLocation(value?: Record<string, unknown>): {
-  type: 'approximate';
-  country?: string;
-  city?: string;
-  region?: string;
-  timezone?: string;
-} | undefined {
+function normalizeApproximateLocation(value?: Record<string, unknown>):
+  | {
+      type: 'approximate';
+      country?: string;
+      city?: string;
+      region?: string;
+      timezone?: string;
+    }
+  | undefined {
   if (!value) return undefined;
   const type = value.type === 'approximate' ? 'approximate' : undefined;
   if (!type) return undefined;
@@ -390,22 +416,30 @@ function createOpenAIProviderTool(tool: Record<string, unknown>) {
     const filters = normalizeOpenAIWebSearchFilters(getRecordOption(tool, 'filters'));
     return {
       name: providerToolName(tool, 'web_search'),
-      tool: openaiProvider.tools.webSearch(compactToolArgs({
-        externalWebAccess: getBooleanOption(tool, 'externalWebAccess', 'external_web_access'),
-        filters,
-        searchContextSize: normalizeSearchContextSize(getStringOption(tool, 'searchContextSize', 'search_context_size')),
-        userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
-      })),
+      tool: openaiProvider.tools.webSearch(
+        compactToolArgs({
+          externalWebAccess: getBooleanOption(tool, 'externalWebAccess', 'external_web_access'),
+          filters,
+          searchContextSize: normalizeSearchContextSize(
+            getStringOption(tool, 'searchContextSize', 'search_context_size'),
+          ),
+          userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
+        }),
+      ),
     };
   }
 
   if (type === 'web_search_preview') {
     return {
       name: providerToolName(tool, 'web_search_preview'),
-      tool: openaiProvider.tools.webSearchPreview(compactToolArgs({
-        searchContextSize: normalizeSearchContextSize(getStringOption(tool, 'searchContextSize', 'search_context_size')),
-        userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
-      })),
+      tool: openaiProvider.tools.webSearchPreview(
+        compactToolArgs({
+          searchContextSize: normalizeSearchContextSize(
+            getStringOption(tool, 'searchContextSize', 'search_context_size'),
+          ),
+          userLocation: normalizeApproximateLocation(getRecordOption(tool, 'userLocation', 'user_location')),
+        }),
+      ),
     };
   }
 
@@ -439,8 +473,10 @@ function createAnthropicProviderTool(tool: Record<string, unknown>) {
 }
 
 function isAnthropicProviderModel(modelConfig: LLMModelConfig): boolean {
-  return modelConfig.provider === 'anthropic'
-    || (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName));
+  return (
+    modelConfig.provider === 'anthropic' ||
+    (modelConfig.provider === 'amazon-bedrock' && /anthropic|claude/i.test(modelConfig.modelName))
+  );
 }
 
 function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, unknown> {
@@ -448,11 +484,12 @@ function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, 
   for (const configuredTool of modelConfig.providerTools ?? []) {
     if (!configuredTool || typeof configuredTool !== 'object' || Array.isArray(configuredTool)) continue;
 
-    const providerTool = modelConfig.provider === 'openai-compatible' && shouldUseOpenAIResponsesApi(modelConfig)
-      ? createOpenAIProviderTool(configuredTool)
-      : isAnthropicProviderModel(modelConfig)
-        ? createAnthropicProviderTool(configuredTool)
-        : null;
+    const providerTool =
+      modelConfig.provider === 'openai-compatible' && shouldUseOpenAIResponsesApi(modelConfig)
+        ? createOpenAIProviderTool(configuredTool)
+        : isAnthropicProviderModel(modelConfig)
+          ? createAnthropicProviderTool(configuredTool)
+          : null;
 
     if (providerTool) {
       result[providerTool.name] = providerTool.tool;
@@ -496,29 +533,31 @@ function extractStreamFinishReason(payload?: Record<string, unknown>): string | 
 }
 
 function isExpectedMastraStructuralEvent(type: string): boolean {
-  return type === 'start'
-    || type === 'abort'
-    || type === 'text-start'
-    || type === 'text-end'
-    || type === 'step-start'
-    || type === 'stream-start'
-    || type === 'response-metadata'
-    || type === 'reasoning'
-    || type === 'reasoning-start'
-    || type === 'reasoning-delta'
-    || type === 'reasoning-end'
-    || type === 'reasoning-signature'
-    || type === 'redacted-reasoning'
-    || type === 'source'
-    || type === 'file'
-    || type === 'tool-call-streaming-start'
-    || type === 'tool-call-input-streaming-start'
-    || type === 'tool-call-input-streaming-end'
-    || type === 'tool-call-delta'
-    || type === 'tool-input-start'
-    || type === 'tool-input-delta'
-    || type === 'tool-input-end'
-    || type === 'raw';
+  return (
+    type === 'start' ||
+    type === 'abort' ||
+    type === 'text-start' ||
+    type === 'text-end' ||
+    type === 'step-start' ||
+    type === 'stream-start' ||
+    type === 'response-metadata' ||
+    type === 'reasoning' ||
+    type === 'reasoning-start' ||
+    type === 'reasoning-delta' ||
+    type === 'reasoning-end' ||
+    type === 'reasoning-signature' ||
+    type === 'redacted-reasoning' ||
+    type === 'source' ||
+    type === 'file' ||
+    type === 'tool-call-streaming-start' ||
+    type === 'tool-call-input-streaming-start' ||
+    type === 'tool-call-input-streaming-end' ||
+    type === 'tool-call-delta' ||
+    type === 'tool-input-start' ||
+    type === 'tool-input-delta' ||
+    type === 'tool-input-end' ||
+    type === 'raw'
+  );
 }
 
 /** Mutating workspace tool names — used for plan-mode filtering. */
@@ -577,8 +616,8 @@ function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: stri
   if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof normalized.path === 'string') {
     normalized.path = normalizeWorkspacePath(cwd, normalized.path);
   } else if (
-    (toolName === WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES || toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP)
-    && (normalized.path === undefined || normalized.path === null)
+    (toolName === WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES || toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP) &&
+    (normalized.path === undefined || normalized.path === null)
   ) {
     normalized.path = cwd;
   }
@@ -670,19 +709,36 @@ export async function* streamAgentResponse(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
+    onToolExecutionStart?: (state: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      cancel: () => void;
+    }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-    augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
+    augmentToolResult?: (state: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      result: unknown;
+    }) => Promise<unknown> | unknown;
   },
 ): AsyncGenerator<StreamEvent> {
   const msgArray = messages as Array<{ role?: string; content?: unknown }>;
-  const apiSurface = modelConfig.provider === 'openai-compatible'
-    ? (shouldUseOpenAIResponsesApi(modelConfig) ? 'responses' : 'chat')
-    : modelConfig.provider === 'anthropic'
-      ? 'messages'
-      : 'native';
-  console.info(`[Agent:upstream] conv=${conversationId} model=${modelConfig.modelName} provider=${modelConfig.provider} apiSurface=${apiSurface} endpoint=${modelConfig.endpoint ?? 'default'}`);
-  console.info(`[Agent:upstream] messageCount=${msgArray.length} roles=[${msgArray.map((m) => m.role ?? '?').join(',')}]`);
+  const apiSurface =
+    modelConfig.provider === 'openai-compatible'
+      ? shouldUseOpenAIResponsesApi(modelConfig)
+        ? 'responses'
+        : 'chat'
+      : modelConfig.provider === 'anthropic'
+        ? 'messages'
+        : 'native';
+  console.info(
+    `[Agent:upstream] conv=${conversationId} model=${modelConfig.modelName} provider=${modelConfig.provider} apiSurface=${apiSurface} endpoint=${modelConfig.endpoint ?? 'default'}`,
+  );
+  console.info(
+    `[Agent:upstream] messageCount=${msgArray.length} roles=[${msgArray.map((m) => m.role ?? '?').join(',')}]`,
+  );
 
   const memory = getSharedMemory(config, dbPath);
 
@@ -706,12 +762,17 @@ export async function* streamAgentResponse(
   );
 
   // Wrap custom (non-workspace) tools through the bridge
-  const mastraCustomTools = toMastraTools(conversationId, tools, {
-    emitEvent: options?.emitEvent,
-    onToolExecutionStart: options?.onToolExecutionStart,
-    onToolExecutionEnd: options?.onToolExecutionEnd,
-    augmentToolResult: options?.augmentToolResult,
-  }, { cwd: effectiveCwd });
+  const mastraCustomTools = toMastraTools(
+    conversationId,
+    tools,
+    {
+      emitEvent: options?.emitEvent,
+      onToolExecutionStart: options?.onToolExecutionStart,
+      onToolExecutionEnd: options?.onToolExecutionEnd,
+      augmentToolResult: options?.augmentToolResult,
+    },
+    { cwd: effectiveCwd },
+  );
   const providerDefinedTools = buildProviderDefinedTools(modelConfig);
 
   // Merge: workspace tools (native Mastra) + custom tools (bridged)
@@ -742,9 +803,29 @@ export async function* streamAgentResponse(
   const sanitizedMessages = sanitizeMessagesForModel(messages, targetModelId);
 
   if (useGenerate) {
-    yield* generateWithSyntheticEvents(buildAgent, conversationId, sanitizedMessages, modelConfig, config, memory, modelSettings, providerOptions, options);
+    yield* generateWithSyntheticEvents(
+      buildAgent,
+      conversationId,
+      sanitizedMessages,
+      modelConfig,
+      config,
+      memory,
+      modelSettings,
+      providerOptions,
+      options,
+    );
   } else {
-    yield* streamWithRealEvents(buildAgent, conversationId, sanitizedMessages, modelConfig, config, memory, modelSettings, providerOptions, options);
+    yield* streamWithRealEvents(
+      buildAgent,
+      conversationId,
+      sanitizedMessages,
+      modelConfig,
+      config,
+      memory,
+      modelSettings,
+      providerOptions,
+      options,
+    );
   }
 }
 
@@ -861,9 +942,8 @@ async function* generateWithSyntheticEvents(
           text: fullResult.text,
         };
       }
-      terminalFinishReason = typeof fullResult.finishReason === 'string'
-        ? fullResult.finishReason
-        : fullResult.finishReason?.unified;
+      terminalFinishReason =
+        typeof fullResult.finishReason === 'string' ? fullResult.finishReason : fullResult.finishReason?.unified;
 
       // Check if max steps were reached.
       // The AI SDK / Mastra never emits a 'max-steps' finishReason; instead the
@@ -898,13 +978,19 @@ async function* generateWithSyntheticEvents(
         compatibilityRetried = true;
         activeModelSettings = omitTemperature(activeModelSettings);
         activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
-        console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility error:`, getErrorMessage(error));
+        console.warn(
+          `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
+          getErrorMessage(error),
+        );
         continue;
       }
       if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
         sanitizationRetried = true;
         activeMessages = deepSanitizeMessages(activeMessages);
-        console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`, getErrorMessage(error));
+        console.warn(
+          `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
+          getErrorMessage(error),
+        );
         continue;
       }
 
@@ -913,7 +999,10 @@ async function* generateWithSyntheticEvents(
 
       if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
         const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
-        console.warn(`[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`, errorInfo.message);
+        console.warn(
+          `[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
+          errorInfo.message,
+        );
 
         yield {
           conversationId,
@@ -991,8 +1080,7 @@ async function* streamWithRealEvents(
   const BASE_DELAY_MS = 500;
   const MAX_DELAY_MS = 32_000;
 
-  compatibilityLoop:
-  while (true) {
+  compatibilityLoop: while (true) {
     let requestCompleted = false;
     let compatibilityRetryRequested = false;
     let sanitizationRetryRequested = false;
@@ -1085,19 +1173,28 @@ async function* streamWithRealEvents(
           } else if (type === 'error') {
             const rawError = payload?.error ?? payload ?? 'Unknown stream error';
             const errorMessage = getErrorMessage(rawError);
-            if (!compatibilityRetried && shouldRetryWithoutTemperature(rawError, activeModelSettings, emittedAnyOutput)) {
+            if (
+              !compatibilityRetried &&
+              shouldRetryWithoutTemperature(rawError, activeModelSettings, emittedAnyOutput)
+            ) {
               compatibilityRetried = true;
               activeModelSettings = omitTemperature(activeModelSettings);
               activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
               compatibilityRetryRequested = true;
-              console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`, errorMessage);
+              console.warn(
+                `[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`,
+                errorMessage,
+              );
               break;
             }
             if (!sanitizationRetried && shouldRetryWithSanitizedMessages(rawError, emittedAnyOutput)) {
               sanitizationRetried = true;
               activeMessages = deepSanitizeMessages(activeMessages);
               sanitizationRetryRequested = true;
-              console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`, errorMessage);
+              console.warn(
+                `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`,
+                errorMessage,
+              );
               break;
             }
 
@@ -1146,7 +1243,8 @@ async function* streamWithRealEvents(
           } else if (type && isExpectedMastraStructuralEvent(type)) {
             continue;
           } else if (type) {
-            console.info(`[Agent] Unknown stream event type: ${type}`, payload);
+            // Silently ignore workspace metadata and sandbox events — they are
+            // handled by the task agent stream consumer in agents.ts
           }
         }
 
@@ -1165,7 +1263,10 @@ async function* streamWithRealEvents(
           compatibilityRetried = true;
           activeModelSettings = omitTemperature(activeModelSettings);
           activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
-          console.warn(`[Agent] Retrying ${conversationId} without temperature after compatibility error:`, getErrorMessage(error));
+          console.warn(
+            `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
+            getErrorMessage(error),
+          );
           continue compatibilityLoop;
         }
 
@@ -1173,7 +1274,10 @@ async function* streamWithRealEvents(
         if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
           sanitizationRetried = true;
           activeMessages = deepSanitizeMessages(activeMessages);
-          console.warn(`[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`, getErrorMessage(error));
+          console.warn(
+            `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
+            getErrorMessage(error),
+          );
           continue compatibilityLoop;
         }
 
@@ -1183,7 +1287,10 @@ async function* streamWithRealEvents(
         // Only retry transient errors when no content has been emitted
         if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
           const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
-          console.warn(`[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`, errorInfo.message);
+          console.warn(
+            `[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
+            errorInfo.message,
+          );
 
           // Emit retry event so UI can show progress
           yield {
@@ -1275,9 +1382,19 @@ export async function* streamWithFallback(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: { toolCallId: string; toolName: string; args: unknown; cancel: () => void }) => void | Promise<void>;
+    onToolExecutionStart?: (state: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      cancel: () => void;
+    }) => void | Promise<void>;
     onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-    augmentToolResult?: (state: { toolCallId: string; toolName: string; args: unknown; result: unknown }) => Promise<unknown> | unknown;
+    augmentToolResult?: (state: {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      result: unknown;
+    }) => Promise<unknown> | unknown;
   },
 ): AsyncGenerator<StreamEvent> {
   const modelChain: ModelCatalogEntry[] = [
@@ -1310,7 +1427,9 @@ export async function* streamWithFallback(
     let discardPartialAssistant = false;
 
     try {
-      console.info(`[Fallback] Attempt ${attempt + 1}/${modelChain.length}: model=${entry.modelConfig.modelName} key=${entry.key}`);
+      console.info(
+        `[Fallback] Attempt ${attempt + 1}/${modelChain.length}: model=${entry.modelConfig.modelName} key=${entry.key}`,
+      );
 
       const innerStream = streamAgentResponse(
         conversationId,

@@ -51,9 +51,18 @@ import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
-import { registerAgentHandlers as registerAgentEntityHandlers } from './ipc/agents.js';
+import {
+  registerAgentHandlers as registerAgentEntityHandlers,
+  listAllAgents,
+  assignTaskToAgent,
+  startAgentRun,
+} from './ipc/agents.js';
+import { listAllTasks } from './ipc/tasks.js';
+import { TaskDispatcher } from './agent/task-dispatcher.js';
+import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
+import { initOutputBuffer, flushAll as flushOutputBuffers } from './terminal/output-buffer.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { registerUsageHandlers } from './ipc/usage.js';
@@ -97,6 +106,9 @@ function resolveUserDataDir(): string {
 }
 
 const APP_HOME = resolveUserDataDir();
+
+// Initialize terminal output buffer persistence (must be before any terminal usage)
+initOutputBuffer(APP_HOME);
 
 // ── OTA Bootstrap ────────────────────────────────────────────────────────
 // Check for crash-based rollback BEFORE resolving code paths, so a broken
@@ -212,6 +224,7 @@ if (!gotSingleInstanceLock) {
 // Module-level ref for cleanup in before-quit handler
 let pluginManagerRef: PluginManager | null = null;
 let taskTerminalManagerRef: TaskTerminalManager | null = null;
+let taskDispatcherRef: TaskDispatcher | null = null;
 
 function ensureAppHome(): void {
   const dirs = [
@@ -670,6 +683,7 @@ if (gotSingleInstanceLock) {
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
     let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
+    let lastAutopilotFingerprint = JSON.stringify(getConfig().autopilot ?? {});
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
@@ -790,6 +804,24 @@ if (gotSingleInstanceLock) {
         lastLaunchAtLoginFp = newLaunchAtLoginFp;
         app.setLoginItemSettings({ openAtLogin: config.launchAtLogin ?? false });
       }
+
+      // Autopilot config — react to external changes (e.g. settings UI flips
+      // the toggle via config:set rather than the orchestrator IPC).
+      const newAutopilotFp = JSON.stringify(config.autopilot ?? {});
+      if (newAutopilotFp !== lastAutopilotFingerprint) {
+        lastAutopilotFingerprint = newAutopilotFp;
+        if (taskDispatcherRef) {
+          const next = config.autopilot;
+          if (next) {
+            taskDispatcherRef.updateConfig(next);
+            if (next.enabled) {
+              taskDispatcherRef.start();
+            } else {
+              taskDispatcherRef.stop();
+            }
+          }
+        }
+      }
     };
 
     // Register IPC handlers (capture must be installed first for web UI bridge)
@@ -828,6 +860,25 @@ if (gotSingleInstanceLock) {
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
     registerAgentEntityHandlers(ipcMain, APP_HOME, taskTerminalManager);
+
+    // Autopilot / orchestrator — drives task auto-assignment when enabled.
+    const initialAutopilotConfig = getConfig().autopilot;
+    const taskDispatcher = new TaskDispatcher(
+      {
+        listTasks: () => listAllTasks(APP_HOME),
+        listAgents: () => listAllAgents(APP_HOME),
+        assignTask: (agentId, taskId) => assignTaskToAgent(APP_HOME, agentId, taskId),
+        startAgent: (agentId) => startAgentRun(APP_HOME, taskTerminalManager, agentId),
+        getConfig: () => getConfig().autopilot ?? null,
+        broadcastState: broadcastOrchestratorState,
+      },
+      initialAutopilotConfig,
+    );
+    registerOrchestratorHandlers(ipcMain, taskDispatcher, APP_HOME, { setConfig });
+    if (initialAutopilotConfig?.enabled) {
+      taskDispatcher.start();
+    }
+    taskDispatcherRef = taskDispatcher;
     registerUsageHandlers(ipcMain, APP_HOME);
     registerAutoUpdateHandlers(ipcMain, () => {
       updateDownloaded = true;
@@ -1320,4 +1371,6 @@ app.on('before-quit', () => {
   cleanupDictation();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
+  flushOutputBuffers();
+  taskDispatcherRef?.stop();
 });

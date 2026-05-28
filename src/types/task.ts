@@ -4,7 +4,15 @@
  * Core types are re-exported from the shared module to keep main/renderer in sync.
  */
 
-export type { TaskFile, KaiTaskMetadata, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
+export type {
+  TaskFile,
+  KaiTaskMetadata,
+  KaiTaskOrder,
+  TaskConversationMessage,
+  TaskStreamEvent,
+  TaskReviewNote,
+  TaskReviewResult,
+} from '../../shared/task-types';
 export type { KaiTaskStatus } from '../../shared/task-types';
 
 import type { KaiTaskStatus } from '../../shared/task-types';
@@ -15,6 +23,7 @@ import type { KaiTaskStatus } from '../../shared/task-types';
 export const KAI_TASK_STATUS_COLUMNS: KaiTaskStatus[] = [
   'todo',
   'in_progress',
+  'blocked',
   'ai_review',
   'human_review',
   'done',
@@ -24,6 +33,7 @@ export const KAI_TASK_STATUS_COLUMNS: KaiTaskStatus[] = [
 export const KAI_TASK_STATUS_LABELS: Record<KaiTaskStatus, string> = {
   todo: 'Todo',
   in_progress: 'In Progress',
+  blocked: 'Blocked',
   ai_review: 'AI Review',
   human_review: 'Human Review',
   done: 'Done',
@@ -33,6 +43,7 @@ export const KAI_TASK_STATUS_LABELS: Record<KaiTaskStatus, string> = {
 export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'bg-sky-500/10 text-sky-600',
   in_progress: 'bg-amber-500/10 text-amber-500',
+  blocked: 'bg-red-500/10 text-red-500',
   ai_review: 'bg-rose-500/10 text-rose-500',
   human_review: 'bg-purple-500/10 text-purple-400',
   done: 'bg-emerald-500/10 text-emerald-500',
@@ -42,6 +53,7 @@ export const KAI_TASK_STATUS_COLORS: Record<KaiTaskStatus, string> = {
 export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'border-t-sky-500',
   in_progress: 'border-t-amber-500',
+  blocked: 'border-t-red-500',
   ai_review: 'border-t-rose-500',
   human_review: 'border-t-purple-400',
   done: 'border-t-emerald-500',
@@ -51,6 +63,7 @@ export const KAI_TASK_STATUS_BORDER_COLORS: Record<KaiTaskStatus, string> = {
 export const KAI_TASK_STATUS_OUTER_BORDER_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'border-sky-500/20',
   in_progress: 'border-amber-500/20',
+  blocked: 'border-red-500/20',
   ai_review: 'border-rose-500/20',
   human_review: 'border-purple-400/20',
   done: 'border-emerald-500/20',

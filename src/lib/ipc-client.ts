@@ -15,7 +15,23 @@ type AppAPI = {
     onChanged: (callback: (config: unknown) => void) => () => void;
   };
   agent: {
-    stream: (conversationId: string, messages: unknown[], modelKey?: string, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', profileKey?: string, fallbackEnabled?: boolean, cwd?: string, executionMode?: 'auto' | 'plan-first', threadOverrides?: { temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null }) => Promise<unknown>;
+    stream: (
+      conversationId: string,
+      messages: unknown[],
+      modelKey?: string,
+      reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh',
+      profileKey?: string,
+      fallbackEnabled?: boolean,
+      cwd?: string,
+      executionMode?: 'auto' | 'plan-first',
+      threadOverrides?: {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+      },
+    ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
@@ -48,27 +64,37 @@ type AppAPI = {
     browseDirectory: () => Promise<{ path: string; name: string } | null>;
   };
   memory: {
-    clear: (options: { working?: boolean; observational?: boolean; semantic?: boolean; all?: boolean }) =>
-      Promise<{ success?: boolean; cleared?: string[]; error?: string }>;
-    testEmbedding: () =>
-      Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>;
+    clear: (options: {
+      working?: boolean;
+      observational?: boolean;
+      semantic?: boolean;
+      all?: boolean;
+    }) => Promise<{ success?: boolean; cleared?: string[]; error?: string }>;
+    testEmbedding: () => Promise<{ ok?: boolean; model?: string; dimensions?: number; error?: string }>;
   };
   mcp: {
-    testConnection: (server: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }) =>
-      Promise<{ status: string; toolCount: number; error?: string }>;
+    testConnection: (server: {
+      name: string;
+      url?: string;
+      command?: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }) => Promise<{ status: string; toolCount: number; error?: string }>;
   };
   cliTools: {
     checkBinaries: (binaryNames: string[]) => Promise<Record<string, boolean>>;
   };
   skills: {
-    list: () => Promise<Array<{
-      name: string;
-      description: string;
-      version?: string;
-      type: string;
-      enabled: boolean;
-      dir: string;
-    }>>;
+    list: () => Promise<
+      Array<{
+        name: string;
+        description: string;
+        version?: string;
+        type: string;
+        enabled: boolean;
+        dir: string;
+      }>
+    >;
     get: (name: string) => Promise<{
       manifest?: Record<string, unknown>;
       files?: Record<string, string>;
@@ -80,50 +106,56 @@ type AppAPI = {
   };
   plugins: {
     getUIState: () => Promise<unknown>;
-    list: () => Promise<Array<{
-      name: string;
-      displayName: string;
-      version: string;
-      description: string;
-      state: string;
-      brandRequired: boolean;
-      error?: string;
-    }>>;
+    list: () => Promise<
+      Array<{
+        name: string;
+        displayName: string;
+        version: string;
+        description: string;
+        state: string;
+        brandRequired: boolean;
+        error?: string;
+      }>
+    >;
     getConfig: (pluginName: string) => Promise<Record<string, unknown>>;
     setConfig: (pluginName: string, path: string, value: unknown) => Promise<{ success: boolean }>;
     modalAction: (pluginName: string, modalId: string, action: string, data?: unknown) => Promise<unknown>;
     bannerAction: (pluginName: string, bannerId: string, action: string, data?: unknown) => Promise<unknown>;
     action: (pluginName: string, targetId: string, action: string, data?: unknown) => Promise<unknown>;
-    marketplaceCatalog: () => Promise<Array<{
-      name: string;
-      displayName: string;
-      description: string;
-      repo: string;
-      ref: string;
-      version: string;
-      author?: string;
-      tags?: string[];
-      icon?: string;
-      installed: boolean;
-      installedVersion?: string;
-      marketplaceUrl: string;
-    }>>;
+    marketplaceCatalog: () => Promise<
+      Array<{
+        name: string;
+        displayName: string;
+        description: string;
+        repo: string;
+        ref: string;
+        version: string;
+        author?: string;
+        tags?: string[];
+        icon?: string;
+        installed: boolean;
+        installedVersion?: string;
+        marketplaceUrl: string;
+      }>
+    >;
     marketplaceInstall: (pluginName: string) => Promise<{ success: boolean }>;
     marketplaceUninstall: (pluginName: string) => Promise<{ success: boolean }>;
-    marketplaceRefresh: () => Promise<Array<{
-      name: string;
-      displayName: string;
-      description: string;
-      repo: string;
-      ref: string;
-      version: string;
-      author?: string;
-      tags?: string[];
-      icon?: string;
-      installed: boolean;
-      installedVersion?: string;
-      marketplaceUrl: string;
-    }>>;
+    marketplaceRefresh: () => Promise<
+      Array<{
+        name: string;
+        displayName: string;
+        description: string;
+        repo: string;
+        ref: string;
+        version: string;
+        author?: string;
+        tags?: string[];
+        icon?: string;
+        installed: boolean;
+        installedVersion?: string;
+        marketplaceUrl: string;
+      }>
+    >;
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
     getAvailableUpdateCount: () => Promise<number>;
     onUpdatesAvailable: (callback: (data: { count: number }) => void) => () => void;
@@ -177,14 +209,22 @@ type AppAPI = {
     getOrder: () => Promise<KaiTaskOrder | null>;
     saveOrder: (order: KaiTaskOrder) => Promise<{ ok: boolean }>;
     onChanged: (callback: (tasks: TaskFile[]) => void) => () => void;
-    terminalCreate: (taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => Promise<{ sessionId?: string; error?: string }>;
+    terminalCreate: (
+      taskId: string,
+      options: { runtime: string; cwd?: string; cols?: number; rows?: number },
+    ) => Promise<{ sessionId?: string; error?: string }>;
     terminalWrite: (sessionId: string, data: string) => Promise<void>;
     terminalResize: (sessionId: string, cols: number, rows: number) => Promise<void>;
     terminalKill: (sessionId: string) => Promise<{ ok: boolean }>;
+    terminalGetBuffer: (sessionId: string) => Promise<string[]>;
     onTerminalData: (callback: (event: { sessionId: string; data: string }) => void) => () => void;
     onTerminalExit: (callback: (event: { sessionId: string; exitCode: number }) => void) => () => void;
     // AI plan generation
-    streamPlan: (taskId: string, userMessage: string, history?: TaskConversationMessage[]) => Promise<{ taskId: string }>;
+    streamPlan: (
+      taskId: string,
+      userMessage: string,
+      history?: TaskConversationMessage[],
+    ) => Promise<{ taskId: string }>;
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
@@ -199,7 +239,10 @@ type AppAPI = {
     unassignTask: (agentId: string) => Promise<{ ok: boolean; error?: string }>;
     start: (agentId: string) => Promise<{ sessionId?: string; error?: string }>;
     stop: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
-    synthesizePrompt: (agentId: string, userDescription: string) => Promise<{ ok?: boolean; matchedRole?: string | null; error?: string }>;
+    synthesizePrompt: (
+      agentId: string,
+      userDescription: string,
+    ) => Promise<{ ok?: boolean; matchedRole?: string | null; error?: string }>;
     onChanged: (callback: (agents: AgentFile[]) => void) => () => void;
   };
   platform: {
@@ -217,19 +260,31 @@ type AppAPI = {
     getSession: (sessionId: string) => Promise<unknown>;
     setSurface: (sessionId: string, surface: ComputerUseSurface) => Promise<unknown>;
     sendGuidance: (sessionId: string, text: string) => Promise<unknown>;
-    updateSessionSettings: (sessionId: string, settings: { modelKey?: string | null; profileKey?: string | null; fallbackEnabled?: boolean; reasoningEffort?: string }) => Promise<unknown>;
+    updateSessionSettings: (
+      sessionId: string,
+      settings: {
+        modelKey?: string | null;
+        profileKey?: string | null;
+        fallbackEnabled?: boolean;
+        reasoningEffort?: string;
+      },
+    ) => Promise<unknown>;
     continueSession: (sessionId: string, newGoal: string) => Promise<unknown>;
     markSessionsSeen: (conversationId: string) => Promise<unknown>;
     openSetupWindow: (conversationId?: string | null) => Promise<unknown>;
     getLocalMacosPermissions: () => Promise<ComputerUsePermissions>;
     requestLocalMacosPermissions: () => Promise<ComputerUsePermissionRequestResult>;
     requestSingleLocalMacosPermission: (section: ComputerUsePermissionSection) => Promise<ComputerUsePermissions>;
-    openLocalMacosPrivacySettings: (section?: ComputerUsePermissionSection) => Promise<{ opened: ComputerUsePermissionSection | null }>;
+    openLocalMacosPrivacySettings: (
+      section?: ComputerUsePermissionSection,
+    ) => Promise<{ opened: ComputerUsePermissionSection | null }>;
     probeInputMonitoring: (timeoutMs?: number) => Promise<{ inputMonitoringGranted: boolean }>;
     checkFullScreenApps: () => Promise<{ apps: string[]; problematicApps: string[] }>;
     exitFullScreenApps: (appNames: string[]) => Promise<{ exited: string[]; failed: string[] }>;
     listRunningApps: () => Promise<{ apps: string[] }>;
-    listDisplays: () => Promise<{ displays: Array<{ name: string; displayId: string; pixelWidth: number; pixelHeight: number; isPrimary: boolean }> }>;
+    listDisplays: () => Promise<{
+      displays: Array<{ name: string; displayId: string; pixelWidth: number; pixelHeight: number; isPrimary: boolean }>;
+    }>;
     focusSession: (sessionId: string) => Promise<unknown>;
     overlayMouseEnter: () => void;
     overlayMouseLeave: () => void;
@@ -250,7 +305,13 @@ type AppAPI = {
     startMonitor: (deviceIds?: string[]) => Promise<Record<string, { ok?: boolean; error?: string }>>;
     getLevel: () => Promise<Record<string, number>>;
     stopMonitor: () => Promise<{ ok?: boolean }>;
-    liveStart: (config: { subscriptionKey: string; region?: string; endpoint?: string; language: string; deviceId?: string }) => Promise<{ ok?: boolean; error?: string }>;
+    liveStart: (config: {
+      subscriptionKey: string;
+      region?: string;
+      endpoint?: string;
+      language: string;
+      deviceId?: string;
+    }) => Promise<{ ok?: boolean; error?: string }>;
     liveMicStart: (deviceId?: string) => Promise<{ ok?: boolean; error?: string }>;
     liveMicDrain: () => Promise<string[]>;
     liveMicStop: () => Promise<{ ok?: boolean }>;
@@ -272,14 +333,16 @@ type AppAPI = {
   autoUpdate: {
     check: () => Promise<{ ok?: boolean; error?: string }>;
     install: () => Promise<void>;
-    onStatus: (callback: (status: {
-      state: string;
-      version?: string;
-      percent?: number;
-      transferred?: number;
-      total?: number;
-      bytesPerSecond?: number;
-    }) => void) => () => void;
+    onStatus: (
+      callback: (status: {
+        state: string;
+        version?: string;
+        percent?: number;
+        transferred?: number;
+        total?: number;
+        bytesPerSecond?: number;
+      }) => void,
+    ) => () => void;
   };
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;

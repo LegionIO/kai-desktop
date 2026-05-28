@@ -11,15 +11,22 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdir
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
-import type { TaskFile } from '../../shared/task-types.js';
+import type { TaskFile, TaskReviewResult } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { z } from 'zod';
+import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
+import { getRegisteredTools } from './agent.js';
+import { resolveModelCatalog } from '../agent/model-catalog.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+
+/** AbortControllers for running Mastra virtual sessions (keyed by sessionId). */
+const mastraAbortControllers = new Map<string, AbortController>();
 
 function isValidId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
@@ -76,11 +83,7 @@ function readAgent(appHome: string, id: string): AgentFile | null {
 }
 
 function writeAgent(appHome: string, agent: AgentFile): void {
-  writeFileSync(
-    join(getAgentsDir(appHome), `${agent.id}.json`),
-    JSON.stringify(agent, null, 2),
-    'utf-8',
-  );
+  writeFileSync(join(getAgentsDir(appHome), `${agent.id}.json`), JSON.stringify(agent, null, 2), 'utf-8');
 }
 
 function readTask(appHome: string, id: string): TaskFile | null {
@@ -99,11 +102,7 @@ function readTask(appHome: string, id: string): TaskFile | null {
 }
 
 function writeTask(appHome: string, task: TaskFile): void {
-  writeFileSync(
-    join(getTasksDir(appHome), `${task.id}.json`),
-    JSON.stringify(task, null, 2),
-    'utf-8',
-  );
+  writeFileSync(join(getTasksDir(appHome), `${task.id}.json`), JSON.stringify(task, null, 2), 'utf-8');
 }
 
 function broadcastAgentChange(appHome: string): void {
@@ -128,13 +127,823 @@ function broadcastTaskChange(appHome: string): void {
   }
 }
 
-// ── Registration ─────────────────────────────────────────────────────────
+// ── Multi-Reviewer Process ──────────────────────────────────────────────────
 
-export function registerAgentHandlers(
-  ipcMain: IpcMain,
+/**
+ * Run a single reviewer agent against a task. Returns the review result.
+ * Each reviewer gets its own virtual terminal session for output isolation.
+ */
+async function runSingleReviewer(
+  appHome: string,
+  task: TaskFile,
+  reviewerAgentId: string,
+  executorOutput: string,
+): Promise<TaskReviewResult> {
+  const agent = readAgent(appHome, reviewerAgentId);
+  const agentName = agent?.name ?? 'Unknown Reviewer';
+  const virtualSessionId = `review-${task.id}-${reviewerAgentId}-${randomUUID()}`;
+
+  // Initialize result
+  const result: TaskReviewResult = {
+    agentId: reviewerAgentId,
+    agentName,
+    status: 'pending',
+    terminalSessionId: virtualSessionId,
+  };
+
+  // Update the task's reviewResults with the session ID
+  const freshTask = readTask(appHome, task.id);
+  if (freshTask?.reviewResults) {
+    const idx = freshTask.reviewResults.findIndex((r) => r.agentId === reviewerAgentId);
+    if (idx >= 0) {
+      freshTask.reviewResults[idx].terminalSessionId = virtualSessionId;
+      writeTask(appHome, freshTask);
+      broadcastTaskChange(appHome);
+    }
+  }
+
+  const broadcast = (text: string) => {
+    appendOutput(virtualSessionId, text);
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
+    }
+  };
+
+  broadcast(`\x1b[1;35m[Reviewer: ${agentName}]\x1b[0m Starting review of task: ${task.title}\r\n`);
+  broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+
+  try {
+    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const config = readEffectiveConfig(appHome);
+
+    const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
+    const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
+    const modelEntry = defaultKey
+      ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+      : (catalog.defaultEntry ?? catalog.entries[0]);
+
+    if (!modelEntry) {
+      broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m No model configured for reviewer.\r\n`);
+      result.status = 'rejected';
+      result.feedback = 'Review failed: no model configured.';
+      result.timestamp = new Date().toISOString();
+      return result;
+    }
+
+    broadcast(
+      `\x1b[90mUsing model: ${modelEntry.modelConfig.modelName} (${modelEntry.modelConfig.provider})\x1b[0m\r\n`,
+    );
+    broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
+
+    // Build reviewer system prompt
+    const reviewSystemPrompt = [
+      agent?.instructions ?? 'You are a code reviewer. Review work for quality, correctness, and completeness.',
+      '',
+      '## Review Mode',
+      '',
+      'You are reviewing work done on a task. Your job is to:',
+      '1. Read the task description carefully.',
+      "2. Review the executor's output to verify the work was done correctly.",
+      '3. Check for quality, correctness, completeness, and potential issues.',
+      '4. Call `approve_review` if the work is satisfactory.',
+      '5. Call `reject_review` with specific, actionable feedback if the work needs improvement.',
+      '',
+      'You MUST call exactly one of: `approve_review` or `reject_review`. Do NOT end without calling one.',
+    ].join('\n');
+
+    // Build user message with task info and executor output
+    const userMessage = [
+      '## Task Under Review',
+      '',
+      `**Title:** ${task.title}`,
+      '',
+      `**Description:** ${task.description ?? 'No description'}`,
+      '',
+      `**Completion Summary:** ${task.completionSummary ?? 'No summary provided'}`,
+      '',
+      '## Executor Terminal Output',
+      '',
+      '```',
+      executorOutput.slice(0, 50000), // Limit to 50k chars to avoid context overflow
+      '```',
+    ].join('\n');
+
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: reviewSystemPrompt },
+      { role: 'user', content: userMessage },
+    ];
+
+    // Review outcome tracking
+    let reviewDecision: 'approved' | 'rejected' | null = null;
+    let reviewFeedback: string | undefined;
+
+    // Review tools
+    const reviewTools = [
+      {
+        name: 'approve_review',
+        description: 'Approve the reviewed work. Call this when the task was completed correctly and satisfactorily.',
+        inputSchema: z.object({
+          comment: z.string().optional().describe('Optional brief comment on the quality of the work'),
+        }),
+        execute: async (input: unknown) => {
+          const { comment } = input as { comment?: string };
+          reviewDecision = 'approved';
+          reviewFeedback = comment;
+          return { success: true, decision: 'approved', message: 'Review approved.' };
+        },
+      },
+      {
+        name: 'reject_review',
+        description: 'Reject the reviewed work. Call this when the task has issues that need to be addressed.',
+        inputSchema: z.object({
+          reason: z.string().describe('Specific, actionable feedback on what needs to be fixed'),
+        }),
+        execute: async (input: unknown) => {
+          const { reason } = input as { reason: string };
+          reviewDecision = 'rejected';
+          reviewFeedback = reason;
+          return { success: true, decision: 'rejected', message: 'Review rejected with feedback.' };
+        },
+      },
+    ];
+
+    const dbPath = join(appHome, 'data', 'task-agent-memory.db');
+
+    const reviewConfig = {
+      ...(config as Record<string, unknown>),
+      advanced: {
+        ...(((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}),
+        maxSteps: 10, // Reviewers shouldn't need many steps
+      },
+      agent: {
+        ...(((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}),
+        maxTurns: 10,
+      },
+    };
+
+    const stream = streamAgentResponse(
+      `review-${task.id}-${reviewerAgentId}`,
+      messages as unknown[],
+      modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+      reviewConfig as unknown as Parameters<typeof streamAgentResponse>[3],
+      reviewTools as unknown as Parameters<typeof streamAgentResponse>[4],
+      dbPath,
+      { cwd: process.env.HOME ?? '/tmp' },
+    );
+
+    for await (const event of stream) {
+      const ev = event as Record<string, unknown>;
+      if (ev.type === 'text-delta' && ev.text) {
+        const text = String(ev.text).replace(/\n/g, '\r\n');
+        broadcast(text);
+      } else if (ev.type === 'tool-call') {
+        broadcast(
+          `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 200)})\r\n`,
+        );
+      } else if (ev.type === 'tool-result') {
+        const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
+        const truncated = resultStr.length > 300 ? resultStr.slice(0, 300) + '…' : resultStr;
+        broadcast(`\x1b[90m${truncated.replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+      }
+    }
+
+    // Determine final result
+    if (reviewDecision === 'approved') {
+      result.status = 'approved';
+      result.feedback = reviewFeedback;
+      broadcast(`\r\n\x1b[1;32m[Reviewer: ${agentName}]\x1b[0m ✓ APPROVED\r\n`);
+    } else if (reviewDecision === 'rejected') {
+      result.status = 'rejected';
+      result.feedback = reviewFeedback;
+      broadcast(`\r\n\x1b[1;31m[Reviewer: ${agentName}]\x1b[0m ✗ REJECTED: ${reviewFeedback}\r\n`);
+    } else {
+      // Agent didn't call either tool — treat as rejection with generic feedback
+      result.status = 'rejected';
+      result.feedback = 'Reviewer did not provide an explicit decision. Treating as rejection.';
+      broadcast(`\r\n\x1b[1;33m[Reviewer: ${agentName}]\x1b[0m ⚠ No decision made — defaulting to REJECTED\r\n`);
+    }
+    result.timestamp = new Date().toISOString();
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m Reviewer failed: ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
+    result.status = 'rejected';
+    result.feedback = `Review process error: ${errMsg}`;
+    result.timestamp = new Date().toISOString();
+  }
+
+  // Broadcast terminal exit for this reviewer's session
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
+  }
+
+  return result;
+}
+
+/**
+ * Start the multi-reviewer process for a task in ai_review status.
+ * Supports parallel (all at once) and sequential (one-by-one) modes.
+ * Runs in the background — does not block the caller.
+ */
+async function startReviewProcess(appHome: string, task: TaskFile): Promise<void> {
+  const reviewerIds = task.reviewerAgentIds ?? [];
+  if (reviewerIds.length === 0) return;
+
+  const mode = task.reviewMode ?? 'parallel';
+
+  // Get the executor's terminal output for reviewers to examine
+  const executorSessionId = task.terminalSessionId;
+  const executorOutputChunks = executorSessionId ? getBuffer(executorSessionId) : [];
+  const executorOutput = executorOutputChunks.join('');
+
+  let results: TaskReviewResult[];
+
+  if (mode === 'parallel') {
+    // Run all reviewers simultaneously
+    results = await Promise.all(reviewerIds.map((rid) => runSingleReviewer(appHome, task, rid, executorOutput)));
+  } else {
+    // Sequential mode: run one at a time, stop on first rejection
+    results = [];
+    for (const rid of reviewerIds) {
+      const result = await runSingleReviewer(appHome, task, rid, executorOutput);
+      results.push(result);
+
+      if (result.status === 'rejected') {
+        // First rejection stops the chain — remaining reviewers stay pending
+        const remaining = reviewerIds.slice(results.length);
+        for (const remainingId of remaining) {
+          const remainingAgent = readAgent(appHome, remainingId);
+          results.push({
+            agentId: remainingId,
+            agentName: remainingAgent?.name ?? 'Unknown Reviewer',
+            status: 'pending',
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  // Update the task with final review results
+  const freshTask = readTask(appHome, task.id);
+  if (!freshTask) return;
+
+  freshTask.reviewResults = results;
+  freshTask.updatedAt = new Date().toISOString();
+
+  const allApproved = results.every((r) => r.status === 'approved');
+  const anyRejected = results.some((r) => r.status === 'rejected');
+
+  if (allApproved) {
+    // All reviewers approved — promote to human_review
+    freshTask.status = 'human_review';
+  } else if (anyRejected) {
+    // At least one rejection — kick back to in_progress with merged feedback
+    freshTask.status = 'in_progress';
+    if (!freshTask.reviewNotes) freshTask.reviewNotes = [];
+    for (const r of results) {
+      if (r.status === 'rejected' && r.feedback) {
+        freshTask.reviewNotes.push({
+          source: 'ai',
+          content: `[${r.agentName}] ${r.feedback}`,
+          timestamp: r.timestamp ?? new Date().toISOString(),
+          fromStatus: 'ai_review',
+        });
+      }
+    }
+  }
+
+  writeTask(appHome, freshTask);
+  broadcastTaskChange(appHome);
+}
+
+/**
+ * Decide what state a task should land in once its agent terminal has exited.
+ *
+ * Exit code conventions:
+ *   - 0           → clean exit (success)
+ *   - 124         → timeout (treated as crash by convention)
+ *   - >1 or <0    → crash / abnormal termination
+ *   - 1           → soft failure; treat as needing human review
+ *   - undefined   → terminal vanished without an exit code recorded
+ */
+function analyzeCompletion(
+  exitCode: number | undefined,
+  options: { requireHumanReview?: boolean },
+): { nextStatus: 'human_review' | 'done'; isCrash: boolean } {
+  if (exitCode === undefined) {
+    // Unknown — be conservative and route to human review.
+    return { nextStatus: 'human_review', isCrash: false };
+  }
+  if (exitCode === 124) {
+    return { nextStatus: 'human_review', isCrash: true };
+  }
+  if (exitCode > 1 || exitCode < 0) {
+    return { nextStatus: 'human_review', isCrash: true };
+  }
+  if (exitCode === 0) {
+    return {
+      nextStatus: options.requireHumanReview ? 'human_review' : 'done',
+      isCrash: false,
+    };
+  }
+  // exitCode === 1 — soft failure, hand to a human.
+  return { nextStatus: 'human_review', isCrash: false };
+}
+
+/** Returns true if the same calendar day in UTC. */
+function isSameUtcDay(a: string | undefined, b: Date): boolean {
+  if (!a) return false;
+  const d = new Date(a);
+  if (Number.isNaN(d.getTime())) return false;
+  return (
+    d.getUTCFullYear() === b.getUTCFullYear() &&
+    d.getUTCMonth() === b.getUTCMonth() &&
+    d.getUTCDate() === b.getUTCDate()
+  );
+}
+
+// ── Exported helpers (used by the orchestrator) ─────────────────────────
+
+export { listAllAgents };
+
+/**
+ * Assign a task to an agent. Used by both the IPC handler and the autopilot
+ * dispatcher. Returns `{ ok: true }` on success or `{ error }` on failure.
+ */
+export function assignTaskToAgent(appHome: string, agentId: string, taskId: string): { ok?: boolean; error?: string } {
+  if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
+  if (!isValidId(taskId)) return { error: 'Invalid task ID' };
+
+  const agent = readAgent(appHome, agentId);
+  if (!agent) return { error: `Agent ${agentId} not found` };
+  if (agent.status === 'running') return { error: 'Cannot reassign while agent is running' };
+
+  const task = readTask(appHome, taskId);
+  if (!task) return { error: `Task ${taskId} not found` };
+
+  if (agent.currentTaskId && agent.currentTaskId !== taskId) {
+    const prevTask = readTask(appHome, agent.currentTaskId);
+    if (prevTask) {
+      prevTask.assignedAgentId = undefined;
+      prevTask.updatedAt = new Date().toISOString();
+      writeTask(appHome, prevTask);
+    }
+  }
+
+  // Clear the previous agent that was assigned to this task (if different)
+  if (task.assignedAgentId && task.assignedAgentId !== agentId) {
+    const prevAgent = readAgent(appHome, task.assignedAgentId);
+    if (prevAgent && prevAgent.currentTaskId === taskId) {
+      prevAgent.currentTaskId = undefined;
+      prevAgent.updatedAt = new Date().toISOString();
+      writeAgent(appHome, prevAgent);
+    }
+  }
+
+  agent.currentTaskId = taskId;
+  agent.updatedAt = new Date().toISOString();
+  writeAgent(appHome, agent);
+
+  task.assignedAgentId = agentId;
+  task.updatedAt = new Date().toISOString();
+  writeTask(appHome, task);
+
+  broadcastAgentChange(appHome);
+  broadcastTaskChange(appHome);
+  return { ok: true };
+}
+
+/**
+ * Start an assigned agent. Used by both the IPC handler and the autopilot
+ * dispatcher.
+ */
+export async function startAgentRun(
   appHome: string,
   terminalManager: TaskTerminalManager,
-): void {
+  agentId: string,
+): Promise<{ sessionId?: string; error?: string }> {
+  if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
+
+  const agent = readAgent(appHome, agentId);
+  if (!agent) return { error: `Agent ${agentId} not found` };
+  if (agent.status === 'running') return { error: 'Agent is already running' };
+  if (!agent.currentTaskId) return { error: 'No task assigned to agent' };
+
+  const task = readTask(appHome, agent.currentTaskId);
+  if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };
+
+  let effectiveRuntime = agent.runtime;
+  if (effectiveRuntime === 'auto') {
+    const config = readEffectiveConfig(appHome);
+    const configRuntime = config?.agent?.runtime;
+    if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
+    else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
+    else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
+    else effectiveRuntime = 'claude-code';
+  }
+
+  const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
+
+  // Mastra runtime uses the built-in Mastra agent system, not a terminal PTY.
+  // We create a virtual session ID so the UI can display streaming output,
+  // then run the task through streamAgentResponse.
+  if (effectiveRuntime === 'mastra') {
+    const virtualSessionId = `mastra-${randomUUID()}`;
+
+    agent.status = 'running';
+    agent.terminalSessionId = virtualSessionId;
+    agent.stats.lastRunAt = new Date().toISOString();
+    agent.updatedAt = new Date().toISOString();
+    writeAgent(appHome, agent);
+
+    if (task.status === 'todo') {
+      task.status = 'in_progress';
+      if (!task.startedAt) task.startedAt = new Date().toISOString();
+    }
+    task.terminalSessionId = virtualSessionId;
+    task.agentRuntime = effectiveRuntime;
+    task.updatedAt = new Date().toISOString();
+    writeTask(appHome, task);
+
+    broadcastAgentChange(appHome);
+    broadcastTaskChange(appHome);
+
+    // Broadcast formatted output to the terminal viewer via the standard channel
+    const broadcast = (text: string) => {
+      appendOutput(virtualSessionId, text);
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
+      }
+    };
+
+    // Run the Mastra agent asynchronously
+    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const config = readEffectiveConfig(appHome);
+
+    // Build task-aware system prompt that ensures the agent completes the full task
+    const taskSystemPrompt = [
+      agent.instructions ?? '',
+      '',
+      '## Task Execution Mode',
+      '',
+      'You are executing a task from the task board. You MUST:',
+      '1. Complete the ENTIRE task described below — do not stop after one step.',
+      '2. Use workspace tools (file read/write/edit, shell commands) to accomplish the task.',
+      '3. Verify your work is correct (read files you created, check output).',
+      '4. Continue making tool calls until the task is fully complete.',
+      '5. Do NOT just update memory or acknowledge the task — actually DO the work.',
+      '6. When DONE, call the `promote_task` tool with a summary of what you accomplished.',
+      '7. If BLOCKED (missing info, access denied, dependency), call `block_task` with the reason.',
+      '8. Do NOT end your response without calling either `promote_task` or `block_task`.',
+      '',
+      `Working directory: ${cwd}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    // Build the user message — include review feedback if task was kicked back
+    let userMessage = task.description ?? 'No task description provided.';
+    if (task.reviewNotes && task.reviewNotes.length > 0) {
+      const feedbackSection = task.reviewNotes
+        .map((note) => `[${note.source.toUpperCase()} review — ${note.timestamp}]\n${note.content}`)
+        .join('\n\n');
+      userMessage += `\n\n---\n## Review Feedback (address these issues)\n\n${feedbackSection}`;
+    }
+
+    // Build messages with task description as user message
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: taskSystemPrompt },
+      { role: 'user', content: userMessage },
+    ];
+
+    broadcast(`\x1b[1;36m[Mastra Agent]\x1b[0m Starting task: ${task.title}\r\n`);
+    broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+
+    // Run in background — don't await (would block IPC)
+    const abortController = new AbortController();
+    mastraAbortControllers.set(virtualSessionId, abortController);
+
+    void (async () => {
+      let hasError = false;
+      try {
+        // Resolve the model using the same catalog resolution as the main chat
+        // This ensures correct provider endpoint, API key, and TLS settings
+        const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
+        const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
+        const modelEntry = defaultKey
+          ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+          : (catalog.defaultEntry ?? catalog.entries[0]);
+
+        if (!modelEntry) {
+          broadcast(
+            `\r\n\x1b[1;31m[Error]\x1b[0m No model configured. Please set a default model in Settings → Models.\r\n`,
+          );
+          hasError = true;
+          return;
+        }
+
+        broadcast(
+          `\x1b[90mUsing model: ${modelEntry.modelConfig.modelName} (${modelEntry.modelConfig.provider})\x1b[0m\r\n`,
+        );
+        broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
+
+        const dbPath = join(appHome, 'data', 'task-agent-memory.db');
+        const registeredTools = getRegisteredTools();
+
+        // Add task lifecycle tools that let the agent explicitly promote/block the task
+        const taskLifecycleTools = [
+          {
+            name: 'promote_task',
+            description:
+              'Call this tool when you have COMPLETED the task successfully and want to submit it for review. ' +
+              'This moves the task to AI Review status. Only call this after you have verified your work is correct.',
+            inputSchema: z.object({
+              summary: z.string().describe('Brief summary of what was accomplished (1-3 sentences)'),
+            }),
+            execute: async (input: unknown) => {
+              const { summary } = input as { summary: string };
+              const t = readTask(appHome, task.id);
+              if (t && t.status === 'in_progress') {
+                t.completionSummary = summary;
+                t.updatedAt = new Date().toISOString();
+
+                // Multi-reviewer: check if reviewerAgentIds has entries
+                const hasReviewers = t.reviewerAgentIds && t.reviewerAgentIds.length > 0;
+
+                if (!hasReviewers) {
+                  // No reviewers assigned — skip AI review, go directly to human_review
+                  t.status = 'human_review';
+                  writeTask(appHome, t);
+                  broadcastTaskChange(appHome);
+                } else {
+                  // Move to ai_review and start the multi-reviewer process
+                  t.status = 'ai_review';
+                  t.reviewResults = t.reviewerAgentIds!.map((rid) => {
+                    const reviewerAgent = readAgent(appHome, rid);
+                    return {
+                      agentId: rid,
+                      agentName: reviewerAgent?.name ?? 'Unknown Reviewer',
+                      status: 'pending' as const,
+                    };
+                  });
+                  writeTask(appHome, t);
+                  broadcastTaskChange(appHome);
+
+                  // Start the review process in the background
+                  void startReviewProcess(appHome, t);
+                }
+
+                // Also mark agent as idle immediately (task is done)
+                const ag = readAgent(appHome, agentId);
+                if (ag && ag.status === 'running') {
+                  ag.status = 'idle';
+                  ag.stats.tasksCompleted = (ag.stats.tasksCompleted ?? 0) + 1;
+                  ag.updatedAt = new Date().toISOString();
+                  writeAgent(appHome, ag);
+                  broadcastAgentChange(appHome);
+                }
+
+                const newStatus = hasReviewers ? 'ai_review' : 'human_review';
+                return {
+                  success: true,
+                  newStatus,
+                  message: `Task promoted to ${newStatus === 'ai_review' ? 'AI Review' : 'Human Review'}.`,
+                };
+              }
+              return { success: false, message: `Task is in status '${t?.status}', cannot promote.` };
+            },
+          },
+          {
+            name: 'block_task',
+            description:
+              'Call this tool when the task CANNOT be completed due to a blocker (missing info, dependency, access issue, etc). ' +
+              'Provide the reason so the blocker can be resolved later.',
+            inputSchema: z.object({
+              reason: z.string().describe('Why the task is blocked and what is needed to unblock it'),
+            }),
+            execute: async (input: unknown) => {
+              const { reason } = input as { reason: string };
+              const t = readTask(appHome, task.id);
+              if (t) {
+                t.status = 'blocked';
+                if (!t.reviewNotes) t.reviewNotes = [];
+                t.reviewNotes.push({
+                  source: 'ai',
+                  content: reason,
+                  timestamp: new Date().toISOString(),
+                  fromStatus: 'in_progress',
+                });
+                t.updatedAt = new Date().toISOString();
+                writeTask(appHome, t);
+                broadcastTaskChange(appHome);
+
+                // Also mark agent as idle immediately
+                const ag = readAgent(appHome, agentId);
+                if (ag && ag.status === 'running') {
+                  ag.status = 'idle';
+                  ag.updatedAt = new Date().toISOString();
+                  writeAgent(appHome, ag);
+                  broadcastAgentChange(appHome);
+                }
+
+                return { success: true, newStatus: 'blocked', message: 'Task marked as blocked.' };
+              }
+              return { success: false, message: 'Task not found.' };
+            },
+          },
+        ];
+
+        const tools = [...registeredTools, ...taskLifecycleTools];
+
+        // Ensure maxSteps is set for multi-turn task execution (default 25 if not configured)
+        const taskConfig = {
+          ...(config as Record<string, unknown>),
+          advanced: {
+            ...(((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}),
+            maxSteps: (((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}).maxSteps ?? 25,
+          },
+          agent: {
+            ...(((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}),
+            maxTurns: (((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}).maxTurns ?? 25,
+          },
+        };
+
+        const stream = streamAgentResponse(
+          `task-${task.id}`,
+          messages as unknown[],
+          modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+          taskConfig as unknown as Parameters<typeof streamAgentResponse>[3],
+          tools as unknown as Parameters<typeof streamAgentResponse>[4],
+          dbPath,
+          { cwd: cwd, abortSignal: abortController.signal },
+        );
+
+        for await (const event of stream) {
+          const ev = event as Record<string, unknown>;
+          if (ev.type === 'text-delta' && ev.text) {
+            // Convert newlines to terminal-friendly \r\n
+            const text = String(ev.text).replace(/\n/g, '\r\n');
+            broadcast(text);
+          } else if (ev.type === 'tool-call') {
+            broadcast(
+              `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 100)})\r\n`,
+            );
+          } else if (ev.type === 'tool-result') {
+            const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
+            const truncated = resultStr.length > 500 ? resultStr.slice(0, 500) + '…' : resultStr;
+            broadcast(`\x1b[90m${truncated.replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+          } else if (ev.type === 'data-workspace-metadata') {
+            const wsData = ev.data as Record<string, unknown>;
+            broadcast(
+              `\x1b[90m[Workspace] ${String(wsData.toolName ?? '')} → ${String(wsData.status ?? '')}\x1b[0m\r\n`,
+            );
+          } else if (ev.type === 'data-sandbox-exit') {
+            const exitData = ev.data as Record<string, unknown>;
+            const success = exitData.success ? '✓' : '✗';
+            broadcast(
+              `\x1b[90m[Sandbox] ${success} exit=${String(exitData.exitCode)} (${String(exitData.executionTimeMs)}ms)\x1b[0m\r\n`,
+            );
+          } else if (ev.type === 'step-progress') {
+            const stepInfo = ev.stepInfo as Record<string, unknown> | undefined;
+            if (stepInfo) {
+              broadcast(`\x1b[90m[Step ${stepInfo.currentStep}/${stepInfo.maxSteps}]\x1b[0m\r\n`);
+            }
+          }
+        }
+
+        broadcast(`\r\n\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+        broadcast(`\x1b[1;32m[Mastra Agent]\x1b[0m Task completed.\r\n`);
+      } catch (err) {
+        hasError = true;
+        // Check if this was an intentional abort (user clicked Stop)
+        if (abortController.signal.aborted) {
+          broadcast(`\r\n\x1b[1;33m[Mastra Agent]\x1b[0m Stopped by user.\r\n`);
+        } else {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
+          if (err instanceof Error && err.cause) {
+            broadcast(`\x1b[90mCause: ${String(err.cause).replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+          }
+          broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
+        }
+      } finally {
+        // Mark agent idle (if promote_task/block_task didn't already do it)
+        const freshAgent = readAgent(appHome, agentId);
+        if (freshAgent && freshAgent.status === 'running') {
+          freshAgent.status = 'idle';
+          freshAgent.terminalSessionId = undefined;
+          freshAgent.updatedAt = new Date().toISOString();
+          writeAgent(appHome, freshAgent);
+        }
+
+        // Don't touch task status — promote_task/block_task handle that.
+        // Just broadcast final state to ensure UI is in sync.
+        broadcastAgentChange(appHome);
+        broadcastTaskChange(appHome);
+
+        // Broadcast terminal exit so the UI knows it's done
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
+        }
+
+        // Clean up abort controller
+        mastraAbortControllers.delete(virtualSessionId);
+      }
+    })();
+
+    return { sessionId: virtualSessionId };
+  }
+
+  try {
+    const sessionId = await terminalManager.create(agent.currentTaskId, {
+      runtime: effectiveRuntime,
+      cwd,
+      cols: 120,
+      rows: 30,
+      customArgs: agent.config.customArgs,
+      env: agent.config.env,
+    });
+
+    agent.status = 'running';
+    agent.terminalSessionId = sessionId;
+    agent.stats.lastRunAt = new Date().toISOString();
+    agent.updatedAt = new Date().toISOString();
+    writeAgent(appHome, agent);
+
+    if (task.status === 'todo') {
+      task.status = 'in_progress';
+    }
+    task.terminalSessionId = sessionId;
+    task.agentRuntime = effectiveRuntime;
+    task.updatedAt = new Date().toISOString();
+    writeTask(appHome, task);
+
+    broadcastAgentChange(appHome);
+    broadcastTaskChange(appHome);
+
+    // Only auto-write task description to agent-backed runtimes (claude-code, codex)
+    // that accept text prompts. Shell-backed runtimes (mastra/default) would execute
+    // the description as a shell command — a security risk.
+    const promptableRuntimes = ['claude-code', 'codex'];
+    if (task.description && promptableRuntimes.includes(effectiveRuntime)) {
+      setTimeout(() => {
+        const prompt = task.description.trim() + '\n';
+        terminalManager.write(sessionId, prompt);
+      }, 1500);
+    }
+
+    // Register immediate exit callback for fast reconciliation
+    terminalManager.onSessionExit(sessionId, (exitCode: number) => {
+      const freshAgent = readAgent(appHome, agentId);
+      if (!freshAgent || freshAgent.status !== 'running') return;
+
+      const requireHumanReview =
+        (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
+      const { nextStatus, isCrash } = analyzeCompletion(exitCode, { requireHumanReview });
+
+      freshAgent.terminalSessionId = undefined;
+      freshAgent.updatedAt = new Date().toISOString();
+
+      if (isCrash) {
+        const now = new Date();
+        if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
+          freshAgent.stats.crashCount = 0;
+        }
+        freshAgent.stats.crashCount += 1;
+        freshAgent.stats.lastCrashAt = now.toISOString();
+
+        const cap = freshAgent.config.maxCrashesPerDay ?? 5;
+        freshAgent.status = freshAgent.stats.crashCount >= cap ? 'error' : 'idle';
+      } else {
+        freshAgent.status = 'idle';
+        freshAgent.stats.tasksCompleted += 1;
+      }
+      writeAgent(appHome, freshAgent);
+
+      if (freshAgent.currentTaskId) {
+        const exitTask = readTask(appHome, freshAgent.currentTaskId);
+        if (exitTask) {
+          const taskNow = new Date().toISOString();
+          exitTask.status = nextStatus;
+          // Keep terminalSessionId so the UI can replay buffered output
+          exitTask.updatedAt = taskNow;
+          if (nextStatus === 'done') exitTask.completedAt = taskNow;
+          writeTask(appHome, exitTask);
+          broadcastTaskChange(appHome);
+        }
+      }
+      broadcastAgentChange(appHome);
+    });
+
+    return { sessionId };
+  } catch (err) {
+    return { error: String(err) };
+  }
+}
+
+// ── Registration ─────────────────────────────────────────────────────────
+
+export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, terminalManager: TaskTerminalManager): void {
   // ── CRUD ────────────────────────────────────────────────────────────
 
   ipcMain.handle('agents:list', () => {
@@ -186,6 +995,10 @@ export function registerAgentHandlers(
 
   ipcMain.handle('agents:update', (_e, id: string, updates: Partial<AgentFile>) => {
     if (!isValidId(id)) return { error: 'Invalid agent ID' };
+    // Validate nested IDs to prevent path traversal via persisted references
+    if (updates.currentTaskId && !isValidId(updates.currentTaskId)) {
+      return { error: 'Invalid task ID in update' };
+    }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };
     try {
@@ -236,39 +1049,7 @@ export function registerAgentHandlers(
   // ── Task assignment ────────────────────────────────────────────────
 
   ipcMain.handle('agents:assign-task', (_e, agentId: string, taskId: string) => {
-    if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
-    if (!isValidId(taskId)) return { error: 'Invalid task ID' };
-
-    const agent = readAgent(appHome, agentId);
-    if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Cannot reassign while agent is running' };
-
-    const task = readTask(appHome, taskId);
-    if (!task) return { error: `Task ${taskId} not found` };
-
-    // Unassign from previous task if any
-    if (agent.currentTaskId && agent.currentTaskId !== taskId) {
-      const prevTask = readTask(appHome, agent.currentTaskId);
-      if (prevTask) {
-        prevTask.assignedAgentId = undefined;
-        prevTask.updatedAt = new Date().toISOString();
-        writeTask(appHome, prevTask);
-      }
-    }
-
-    // Assign agent to task
-    agent.currentTaskId = taskId;
-    agent.updatedAt = new Date().toISOString();
-    writeAgent(appHome, agent);
-
-    // Set task's assignedAgentId
-    task.assignedAgentId = agentId;
-    task.updatedAt = new Date().toISOString();
-    writeTask(appHome, task);
-
-    broadcastAgentChange(appHome);
-    broadcastTaskChange(appHome);
-    return { ok: true };
+    return assignTaskToAgent(appHome, agentId, taskId);
   });
 
   ipcMain.handle('agents:unassign-task', (_e, agentId: string) => {
@@ -276,12 +1057,23 @@ export function registerAgentHandlers(
 
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Cannot unassign while agent is running' };
+
+    // If agent is running, stop it first
+    if (agent.status === 'running' && agent.terminalSessionId) {
+      terminalManager.kill(agent.terminalSessionId);
+      agent.terminalSessionId = undefined;
+      agent.status = 'idle';
+    } else if (agent.status === 'running') {
+      // Force idle if terminal is already gone
+      agent.status = 'idle';
+    }
 
     if (agent.currentTaskId) {
       const task = readTask(appHome, agent.currentTaskId);
       if (task) {
         task.assignedAgentId = undefined;
+        task.terminalSessionId = undefined;
+        task.status = task.status === 'in_progress' ? 'todo' : task.status;
         task.updatedAt = new Date().toISOString();
         writeTask(appHome, task);
         broadcastTaskChange(appHome);
@@ -299,70 +1091,7 @@ export function registerAgentHandlers(
   // ── Lifecycle: start / stop ────────────────────────────────────────
 
   ipcMain.handle('agents:start', async (_e, agentId: string) => {
-    if (!isValidId(agentId)) return { error: 'Invalid agent ID' };
-
-    const agent = readAgent(appHome, agentId);
-    if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Agent is already running' };
-    if (!agent.currentTaskId) return { error: 'No task assigned to agent' };
-
-    const task = readTask(appHome, agent.currentTaskId);
-    if (!task) return { error: `Assigned task ${agent.currentTaskId} not found` };
-
-    // Resolve effective runtime (auto → user's preferred runtime from config)
-    let effectiveRuntime = agent.runtime;
-    if (effectiveRuntime === 'auto') {
-      const config = readEffectiveConfig(appHome);
-      const configRuntime = config?.agent?.runtime;
-      // Map config runtime IDs to agent runtime IDs
-      if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
-      else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
-      else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
-      else effectiveRuntime = 'claude-code'; // fallback
-    }
-
-    // Determine working directory
-    const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
-
-    try {
-      const sessionId = await terminalManager.create(agent.currentTaskId, {
-        runtime: effectiveRuntime,
-        cwd,
-        cols: 120,
-        rows: 30,
-      });
-
-      // Update agent state
-      agent.status = 'running';
-      agent.terminalSessionId = sessionId;
-      agent.stats.lastRunAt = new Date().toISOString();
-      agent.updatedAt = new Date().toISOString();
-      writeAgent(appHome, agent);
-
-      // Update task state
-      if (task.status === 'todo') {
-        task.status = 'in_progress';
-      }
-      task.terminalSessionId = sessionId;
-      task.agentRuntime = effectiveRuntime;
-      task.updatedAt = new Date().toISOString();
-      writeTask(appHome, task);
-
-      broadcastAgentChange(appHome);
-      broadcastTaskChange(appHome);
-
-      // If task has a description, feed it as the initial prompt after a small delay
-      if (task.description && (effectiveRuntime === 'claude-code' || effectiveRuntime === 'codex')) {
-        setTimeout(() => {
-          const prompt = task.description.trim() + '\n';
-          terminalManager.write(sessionId, prompt);
-        }, 1500);
-      }
-
-      return { sessionId };
-    } catch (err) {
-      return { error: String(err) };
-    }
+    return startAgentRun(appHome, terminalManager, agentId);
   });
 
   ipcMain.handle('agents:stop', (_e, agentId: string) => {
@@ -370,24 +1099,33 @@ export function registerAgentHandlers(
 
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status !== 'running') return { error: 'Agent is not running' };
 
-    // Kill terminal
+    // Kill terminal if one exists (regardless of agent.status)
     if (agent.terminalSessionId) {
+      // For Mastra virtual sessions, abort the streaming generator
+      const abortCtrl = mastraAbortControllers.get(agent.terminalSessionId);
+      if (abortCtrl) {
+        abortCtrl.abort();
+        mastraAbortControllers.delete(agent.terminalSessionId);
+      }
+      // For PTY sessions, kill the process
       terminalManager.kill(agent.terminalSessionId);
     }
 
-    // Update agent state
+    // Force agent to idle
     agent.status = 'idle';
     agent.terminalSessionId = undefined;
     agent.updatedAt = new Date().toISOString();
     writeAgent(appHome, agent);
 
-    // Clear terminal from task
+    // Update task: clear terminal, move to human_review if in_progress
     if (agent.currentTaskId) {
       const task = readTask(appHome, agent.currentTaskId);
       if (task) {
         task.terminalSessionId = undefined;
+        if (task.status === 'in_progress') {
+          task.status = 'human_review';
+        }
         task.updatedAt = new Date().toISOString();
         writeTask(appHome, task);
         broadcastTaskChange(appHome);
@@ -467,28 +1205,62 @@ export function registerAgentHandlers(
         try {
           terminalManager.write(agent.terminalSessionId, '');
         } catch {
-          // Terminal is gone — update agent status
+          // Terminal is gone — read fresh agent state and reconcile.
           const freshAgent = readAgent(appHome, agent.id);
-          if (freshAgent && freshAgent.status === 'running') {
-            freshAgent.status = 'idle';
-            freshAgent.terminalSessionId = undefined;
-            freshAgent.updatedAt = new Date().toISOString();
-            freshAgent.stats.tasksCompleted += 1;
-            writeAgent(appHome, freshAgent);
+          if (!freshAgent || freshAgent.status !== 'running') continue;
 
-            // Move task to human_review
-            if (freshAgent.currentTaskId) {
-              const task = readTask(appHome, freshAgent.currentTaskId);
-              if (task) {
-                task.status = 'human_review';
-                task.terminalSessionId = undefined;
-                task.updatedAt = new Date().toISOString();
-                writeTask(appHome, task);
-                broadcastTaskChange(appHome);
-              }
+          const sessionId = freshAgent.terminalSessionId;
+          const exitCode = sessionId ? terminalManager.consumeExitCode(sessionId) : undefined;
+
+          // Optional per-agent override: route every completion through human review.
+          const requireHumanReview =
+            (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
+
+          const { nextStatus, isCrash } = analyzeCompletion(exitCode, {
+            requireHumanReview,
+          });
+
+          // Update agent
+          freshAgent.terminalSessionId = undefined;
+          freshAgent.updatedAt = new Date().toISOString();
+
+          if (isCrash) {
+            const now = new Date();
+            // Reset crash counter at UTC day boundary
+            if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
+              freshAgent.stats.crashCount = 0;
             }
-            broadcastAgentChange(appHome);
+            freshAgent.stats.crashCount += 1;
+            freshAgent.stats.lastCrashAt = now.toISOString();
+
+            const cap = freshAgent.config.maxCrashesPerDay ?? 5;
+            if (freshAgent.stats.crashCount >= cap) {
+              freshAgent.status = 'error';
+            } else {
+              freshAgent.status = 'idle';
+            }
+          } else {
+            freshAgent.status = 'idle';
+            freshAgent.stats.tasksCompleted += 1;
           }
+          writeAgent(appHome, freshAgent);
+
+          // Move task to next status
+          if (freshAgent.currentTaskId) {
+            const task = readTask(appHome, freshAgent.currentTaskId);
+            if (task) {
+              const taskNow = new Date().toISOString();
+              task.status = nextStatus;
+              // Keep terminalSessionId so the UI can replay buffered output
+              task.updatedAt = taskNow;
+              if (nextStatus === 'done') {
+                task.completedAt = taskNow;
+              }
+              writeTask(appHome, task);
+              broadcastTaskChange(appHome);
+            }
+          }
+          broadcastAgentChange(appHome);
         }
       }
     }

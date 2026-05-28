@@ -53,6 +53,8 @@ export interface AgentFile {
   updatedAt: string;
   /** Optional workspace scope (agents are global by default). */
   workspaceId?: string;
+  /** Free-form list of capability tags used by the orchestrator for matching. */
+  capabilities?: string[];
 }
 
 /** Payload for creating a new agent. */

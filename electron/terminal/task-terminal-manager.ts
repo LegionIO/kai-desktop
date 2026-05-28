@@ -12,6 +12,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
+import { appendOutput, getBuffer } from './output-buffer.js';
 
 // node-pty is a native addon — imported dynamically to gracefully handle
 // missing builds (e.g. in CI or unsupported platforms).
@@ -27,6 +28,18 @@ interface TaskTerminal {
 
 export class TaskTerminalManager {
   private terminals = new Map<string, TaskTerminal>();
+  /** Exit codes for recently-exited sessions, keyed by sessionId. */
+  private exitCodes = new Map<string, number>();
+  /** Callbacks invoked immediately when a terminal session exits. */
+  private exitCallbacks = new Map<string, (exitCode: number) => void>();
+
+  /**
+   * Register a callback to be notified immediately when a terminal session exits.
+   * The callback is automatically removed after it fires.
+   */
+  onSessionExit(sessionId: string, callback: (exitCode: number) => void): void {
+    this.exitCallbacks.set(sessionId, callback);
+  }
 
   async create(
     taskId: string,
@@ -35,28 +48,39 @@ export class TaskTerminalManager {
       cwd?: string;
       cols?: number;
       rows?: number;
+      customArgs?: string[];
+      env?: Record<string, string>;
     },
   ): Promise<string> {
     // Dynamic import so a missing native build doesn't crash the whole app
     const pty = await import('@lydell/node-pty');
 
     const sessionId = randomUUID();
-    const shell = this.getShellCommand(options.runtime);
+    const shell = this.getShellCommand(options.runtime, options.customArgs);
 
     const proc = pty.spawn(shell.command, shell.args, {
       name: 'xterm-256color',
       cols: options.cols ?? 80,
       rows: options.rows ?? 24,
       cwd: options.cwd ?? homedir(),
-      env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
+      env: { ...process.env, ...options.env, TERM: 'xterm-256color' } as Record<string, string>,
     });
 
     proc.onData((data: string) => {
+      appendOutput(sessionId, data);
       this.broadcast('tasks:terminal-data', { sessionId, data });
     });
 
     proc.onExit(({ exitCode }: { exitCode: number }) => {
       this.terminals.delete(sessionId);
+      this.exitCodes.set(sessionId, exitCode);
+      const cb = this.exitCallbacks.get(sessionId);
+      this.exitCallbacks.delete(sessionId);
+      // If a callback consumed the exit, clean up the code immediately
+      if (cb) {
+        cb(exitCode);
+        this.exitCodes.delete(sessionId);
+      }
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
 
@@ -96,6 +120,23 @@ export class TaskTerminalManager {
     }
   }
 
+  /** Read the exit code for a session without removing it from the cache. */
+  getExitCode(sessionId: string): number | undefined {
+    return this.exitCodes.get(sessionId);
+  }
+
+  /**
+   * Read and clear the exit code for a session.
+   * Returns undefined if the session never exited or was already consumed.
+   */
+  consumeExitCode(sessionId: string): number | undefined {
+    const code = this.exitCodes.get(sessionId);
+    if (code !== undefined) {
+      this.exitCodes.delete(sessionId);
+    }
+    return code;
+  }
+
   /** Clean up all terminals (app shutdown). */
   dispose(): void {
     for (const [, term] of this.terminals) {
@@ -106,22 +147,36 @@ export class TaskTerminalManager {
       }
     }
     this.terminals.clear();
+    this.exitCodes.clear();
+    this.exitCallbacks.clear();
   }
 
-  private getShellCommand(runtime: string): { command: string; args: string[] } {
+  private getShellCommand(runtime: string, customArgs?: string[]): { command: string; args: string[] } {
     switch (runtime) {
       case 'claude-code':
-        return { command: 'claude', args: ['--permission-mode', 'bypassPermissions'] };
+        return {
+          command: 'claude',
+          args: ['--dangerously-skip-permissions', ...(customArgs ?? [])],
+        };
       case 'codex':
-        return { command: 'codex', args: [] };
+        return {
+          command: 'codex',
+          args: ['--dangerously-bypass-approvals-and-sandbox', ...(customArgs ?? [])],
+        };
       case 'mastra':
-        return { command: 'npx', args: ['mastra', 'dev'] };
+        // Mastra as a terminal agent: use the shell and let the task description
+        // be processed as a command or prompt. The actual Mastra agent stream is
+        // handled via the runtime system, not the terminal PTY.
+        return {
+          command: process.env.SHELL ?? '/bin/zsh',
+          args: [...(customArgs ?? [])],
+        };
       default:
         // Fall back to user's shell (platform-aware)
         if (process.platform === 'win32') {
-          return { command: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe', args: [] };
+          return { command: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe', args: [...(customArgs ?? [])] };
         }
-        return { command: process.env.SHELL ?? '/bin/zsh', args: [] };
+        return { command: process.env.SHELL ?? '/bin/zsh', args: [...(customArgs ?? [])] };
     }
   }
 
@@ -134,17 +189,10 @@ export class TaskTerminalManager {
 
 // ── IPC Handler Registration ────────────────────────────────────────────
 
-export function registerTaskTerminalHandlers(
-  ipcMain: IpcMain,
-  terminalManager: TaskTerminalManager,
-): void {
+export function registerTaskTerminalHandlers(ipcMain: IpcMain, terminalManager: TaskTerminalManager): void {
   ipcMain.handle(
     'tasks:terminal-create',
-    async (
-      _e,
-      taskId: string,
-      options: { runtime: string; cwd?: string; cols?: number; rows?: number },
-    ) => {
+    async (_e, taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => {
       try {
         const sessionId = await terminalManager.create(taskId, options);
         return { sessionId };
@@ -158,15 +206,16 @@ export function registerTaskTerminalHandlers(
     terminalManager.write(sessionId, data);
   });
 
-  ipcMain.handle(
-    'tasks:terminal-resize',
-    (_e, sessionId: string, cols: number, rows: number) => {
-      terminalManager.resize(sessionId, cols, rows);
-    },
-  );
+  ipcMain.handle('tasks:terminal-resize', (_e, sessionId: string, cols: number, rows: number) => {
+    terminalManager.resize(sessionId, cols, rows);
+  });
 
   ipcMain.handle('tasks:terminal-kill', (_e, sessionId: string) => {
     terminalManager.kill(sessionId);
     return { ok: true };
+  });
+
+  ipcMain.handle('tasks:terminal-get-buffer', (_e, sessionId: string) => {
+    return getBuffer(sessionId);
   });
 }

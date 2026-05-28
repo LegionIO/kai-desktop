@@ -3,7 +3,14 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types.js';
+import type {
+  TaskFile,
+  KaiTaskOrder,
+  TaskConversationMessage,
+  TaskStreamEvent,
+  TaskReviewNote,
+} from '../../shared/task-types.js';
+import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
@@ -83,7 +90,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     // Returns every task including archived — used by the archived filter view.
     const dir = getTasksDir(appHome);
     let files: string[];
-    try { files = readdirSync(dir); } catch { return []; }
+    try {
+      files = readdirSync(dir);
+    } catch {
+      return [];
+    }
     return files
       .filter((f) => f.endsWith('.json') && f !== 'order.json')
       .map((f) => {
@@ -116,26 +127,19 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     }
   });
 
-  ipcMain.handle(
-    'tasks:create',
-    (_e, taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => {
-      try {
-        const id = randomUUID();
-        const now = new Date().toISOString();
-        const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
-        writeFileSync(
-          join(getTasksDir(appHome), `${id}.json`),
-          JSON.stringify(task, null, 2),
-          'utf-8',
-        );
-        broadcastTaskChange(appHome);
-        return task;
-      } catch (err) {
-        console.error('[tasks] Failed to create task:', err);
-        return { error: String(err) };
-      }
-    },
-  );
+  ipcMain.handle('tasks:create', (_e, taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => {
+    try {
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
+      writeFileSync(join(getTasksDir(appHome), `${id}.json`), JSON.stringify(task, null, 2), 'utf-8');
+      broadcastTaskChange(appHome);
+      return task;
+    } catch (err) {
+      console.error('[tasks] Failed to create task:', err);
+      return { error: String(err) };
+    }
+  });
 
   ipcMain.handle('tasks:update', (_e, id: string, updates: Partial<TaskFile>) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
@@ -145,6 +149,14 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     }
     try {
       const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+      // Validate state machine transition
+      if (updates.status && existing.status !== updates.status) {
+        if (!isValidTransition(existing.status, updates.status)) {
+          return { error: `Invalid transition: ${existing.status} → ${updates.status}` };
+        }
+      }
+
       // Don't bump updatedAt for operational/bookkeeping-only fields.
       // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
       const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
@@ -153,9 +165,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
         'completedAt',
         'archivedAt',
       ];
-      const isMeaningful = Object.keys(updates).some(
-        (k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile),
-      );
+      const isMeaningful = Object.keys(updates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
       const updated: TaskFile = {
         ...existing,
         ...updates,
@@ -201,6 +211,42 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
     }
   });
 
+  // ── Kick-back (return to in_progress with feedback) ───────────────
+
+  ipcMain.handle('tasks:kick-back', (_e, id: string, reason: string, source: 'ai' | 'human') => {
+    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+    const filePath = join(getTasksDir(appHome), `${id}.json`);
+    if (!existsSync(filePath)) return { error: `Task ${id} not found` };
+
+    try {
+      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+
+      // Only allow kick-back from review statuses
+      if (task.status !== 'ai_review' && task.status !== 'human_review') {
+        return { error: `Cannot kick back from status: ${task.status}` };
+      }
+
+      // Add the review note
+      const note: TaskReviewNote = {
+        source,
+        content: reason,
+        timestamp: new Date().toISOString(),
+        fromStatus: task.status,
+      };
+      if (!task.reviewNotes) task.reviewNotes = [];
+      task.reviewNotes.push(note);
+
+      // Move back to in_progress
+      task.status = 'in_progress';
+      task.updatedAt = new Date().toISOString();
+      writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+      broadcastTaskChange(appHome);
+      return { ok: true };
+    } catch (err) {
+      return { error: String(err) };
+    }
+  });
+
   // ── Column ordering ────────────────────────────────────────────────
 
   ipcMain.handle('tasks:get-order', () => {
@@ -215,11 +261,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle('tasks:save-order', (_e, order: KaiTaskOrder) => {
     try {
-      writeFileSync(
-        join(getTasksDir(appHome), 'order.json'),
-        JSON.stringify(order, null, 2),
-        'utf-8',
-      );
+      writeFileSync(join(getTasksDir(appHome), 'order.json'), JSON.stringify(order, null, 2), 'utf-8');
       return { ok: true };
     } catch (err) {
       console.error('[tasks] Failed to save order:', err);
@@ -231,12 +273,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle(
     'tasks:stream-plan',
-    async (
-      _e,
-      taskId: string,
-      userMessage: string,
-      existingHistory?: TaskConversationMessage[],
-    ) => {
+    async (_e, taskId: string, userMessage: string, existingHistory?: TaskConversationMessage[]) => {
       // Cancel any existing stream for this task
       const existing = activeTaskStreams.get(taskId);
       if (existing) existing.abort();
@@ -259,9 +296,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
       const { resolveModelCatalog } = await import('../agent/model-catalog.js');
       const catalog = resolveModelCatalog(config);
       // Prefer a fast/cheap model (Haiku) for plan generation
-      const haikuModel = catalog.entries.find((e) =>
-        e.modelConfig.modelName.toLowerCase().includes('haiku'),
-      );
+      const haikuModel = catalog.entries.find((e) => e.modelConfig.modelName.toLowerCase().includes('haiku'));
       const modelEntry = haikuModel ?? catalog.defaultEntry;
       if (!modelEntry) {
         broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No model configured' });

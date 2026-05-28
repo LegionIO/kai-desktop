@@ -2,7 +2,7 @@
  * Types shared between main and renderer process for Tasks.
  */
 
-export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
+export type KaiTaskStatus = 'todo' | 'in_progress' | 'blocked' | 'ai_review' | 'human_review' | 'done';
 
 export interface KaiTaskMetadata {
   category?: 'feature' | 'bug_fix' | 'refactoring' | 'docs' | 'other';
@@ -18,6 +18,28 @@ export interface TaskConversationMessage {
   timestamp: string;
 }
 
+/** A review feedback note — added when a task is kicked back from review. */
+export interface TaskReviewNote {
+  /** Who wrote this note: 'ai' (AI reviewer) or 'human' (manual). */
+  source: 'ai' | 'human';
+  /** The feedback/reasoning for why the task was kicked back. */
+  content: string;
+  /** ISO timestamp when the note was added. */
+  timestamp: string;
+  /** Which status the task was in when kicked back (ai_review or human_review). */
+  fromStatus: KaiTaskStatus;
+}
+
+/** Tracks an individual reviewer's result during the AI review phase. */
+export interface TaskReviewResult {
+  agentId: string;
+  agentName: string;
+  status: 'pending' | 'approved' | 'rejected';
+  feedback?: string;
+  timestamp?: string;
+  terminalSessionId?: string;
+}
+
 export interface TaskFile {
   id: string;
   title: string;
@@ -29,6 +51,8 @@ export interface TaskFile {
   startedAt?: string;
   /** ISO timestamp set when the task is marked done. */
   completedAt?: string;
+  /** Review feedback entries — accumulated when a task is kicked back from review. */
+  reviewNotes?: TaskReviewNote[];
   sourceConversationId?: string;
   sourceToolCallId?: string;
   agentRuntime?: 'claude-code' | 'codex' | 'mastra' | string;
@@ -36,12 +60,24 @@ export interface TaskFile {
   metadata?: KaiTaskMetadata;
   /** The agent assigned to work on this task. */
   assignedAgentId?: string;
+  /** Reviewer agent IDs — zero to many. All must approve for promotion. */
+  reviewerAgentIds?: string[];
+  /** Review execution mode: parallel (all at once) or sequential (one after another). */
+  reviewMode?: 'parallel' | 'sequential';
+  /** Tracks individual reviewer results during AI review phase. */
+  reviewResults?: TaskReviewResult[];
   /** The workspace this task belongs to. Undefined = legacy/unscoped. */
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */
   conversationHistory?: TaskConversationMessage[];
   /** ISO timestamp set when the task is archived. Archived tasks are hidden from normal views. */
   archivedAt?: string;
+  /** Optional priority used by the orchestrator when ranking tasks. Higher = sooner. */
+  priority?: number;
+  /** AI-generated summary written when the task completes. */
+  completionSummary?: string;
+  /** The exit code from the last terminal session for this task. */
+  lastExitCode?: number;
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */
