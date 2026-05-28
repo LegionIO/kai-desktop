@@ -24,6 +24,9 @@ import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 
+/** AbortControllers for running Mastra virtual sessions (keyed by sessionId). */
+const mastraAbortControllers = new Map<string, AbortController>();
+
 function isValidId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
 }
@@ -301,6 +304,9 @@ export async function startAgentRun(
     broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
 
     // Run in background — don't await (would block IPC)
+    const abortController = new AbortController();
+    mastraAbortControllers.set(virtualSessionId, abortController);
+
     void (async () => {
       let hasError = false;
       try {
@@ -335,7 +341,7 @@ export async function startAgentRun(
           config as unknown as Parameters<typeof streamAgentResponse>[3],
           tools as unknown as Parameters<typeof streamAgentResponse>[4],
           dbPath,
-          { cwd: cwd },
+          { cwd: cwd, abortSignal: abortController.signal },
         );
 
         for await (const event of stream) {
@@ -370,12 +376,17 @@ export async function startAgentRun(
         broadcast(`\x1b[1;32m[Mastra Agent]\x1b[0m Task completed.\r\n`);
       } catch (err) {
         hasError = true;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
-        if (err instanceof Error && err.cause) {
-          broadcast(`\x1b[90mCause: ${String(err.cause).replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+        // Check if this was an intentional abort (user clicked Stop)
+        if (abortController.signal.aborted) {
+          broadcast(`\r\n\x1b[1;33m[Mastra Agent]\x1b[0m Stopped by user.\r\n`);
+        } else {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
+          if (err instanceof Error && err.cause) {
+            broadcast(`\x1b[90mCause: ${String(err.cause).replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+          }
+          broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
         }
-        broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
       } finally {
         // Mark agent idle
         const freshAgent = readAgent(appHome, agentId);
@@ -406,6 +417,9 @@ export async function startAgentRun(
         for (const win of BrowserWindow.getAllWindows()) {
           win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
         }
+
+        // Clean up abort controller
+        mastraAbortControllers.delete(virtualSessionId);
       }
     })();
 
@@ -660,6 +674,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
     // Kill terminal if one exists (regardless of agent.status)
     if (agent.terminalSessionId) {
+      // For Mastra virtual sessions, abort the streaming generator
+      const abortCtrl = mastraAbortControllers.get(agent.terminalSessionId);
+      if (abortCtrl) {
+        abortCtrl.abort();
+        mastraAbortControllers.delete(agent.terminalSessionId);
+      }
+      // For PTY sessions, kill the process
       terminalManager.kill(agent.terminalSessionId);
     }
 

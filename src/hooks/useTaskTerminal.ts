@@ -76,36 +76,43 @@ export function useTaskTerminal({ sessionId, onExit }: UseTaskTerminalOptions) {
     const xterm = xtermRef.current;
     if (!xterm) return;
 
-    // Track whether we've finished initial replay to avoid writing data twice
-    let replayDone = false;
-    // Set of chunk indices we've seen live (to deduplicate)
-    let liveChunkCount = 0;
-
-    // Clear terminal and replay buffered output (covers navigation away/back)
+    // Clear terminal before replaying buffer to avoid stale content
     xterm.clear();
+    xterm.reset();
+
+    let cancelled = false;
+
+    // Step 1: Load buffer and write it. THEN subscribe to live events.
+    // This ensures no overlap between buffer replay and live subscription.
     void app.tasks.terminalGetBuffer(sessionId).then((buffer) => {
+      if (cancelled) return;
       if (buffer.length > 0 && xtermRef.current) {
         for (const chunk of buffer) {
           xtermRef.current.write(chunk);
         }
       }
-      liveChunkCount = buffer.length;
-      replayDone = true;
-    });
 
-    // Receive live data from PTY — only write chunks that arrive AFTER replay
-    const unsubData = app.tasks.onTerminalData((event) => {
-      if (event.sessionId === sessionId && replayDone) {
-        xtermRef.current?.write(event.data);
-      }
-    });
+      if (cancelled) return;
 
-    // Handle PTY exit
-    const unsubExit = app.tasks.onTerminalExit((event) => {
-      if (event.sessionId === sessionId) {
-        xtermRef.current?.write(`\r\n\x1b[90m[Process exited with code ${event.exitCode}]\x1b[0m\r\n`);
-        onExit?.(event.exitCode);
-      }
+      // Step 2: NOW subscribe to live events (after replay is complete)
+      const unsubData = app.tasks.onTerminalData((event) => {
+        if (event.sessionId === sessionId) {
+          xtermRef.current?.write(event.data);
+        }
+      });
+
+      const unsubExit = app.tasks.onTerminalExit((event) => {
+        if (event.sessionId === sessionId) {
+          xtermRef.current?.write(`\r\n\x1b[90m[Process exited with code ${event.exitCode}]\x1b[0m\r\n`);
+          onExit?.(event.exitCode);
+        }
+      });
+
+      // Store unsub functions so cleanup can reach them
+      cleanupRef.current = () => {
+        unsubData();
+        unsubExit();
+      };
     });
 
     // Send user input to PTY
@@ -113,9 +120,12 @@ export function useTaskTerminal({ sessionId, onExit }: UseTaskTerminalOptions) {
       void app.tasks.terminalWrite(sessionId, data);
     });
 
+    // Ref to hold late-bound cleanup
+    const cleanupRef = { current: null as (() => void) | null };
+
     return () => {
-      unsubData();
-      unsubExit();
+      cancelled = true;
+      cleanupRef.current?.();
       disposable?.dispose();
     };
   }, [sessionId, onExit]);
