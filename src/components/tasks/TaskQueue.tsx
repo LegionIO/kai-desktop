@@ -74,7 +74,7 @@ interface TaskQueueProps {
 }
 
 export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
-  const { state, reorderTasks, selectTask, deleteTask } = useTasks();
+  const { state, reorderTasks, moveTaskToColumn, updateTaskStatus, selectTask, deleteTask } = useTasks();
   const fullWidth = useFullWidthContent();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);
@@ -85,13 +85,21 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
   // ── Pin state ──────────────────────────────────────────────────────────
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(PIN_STORAGE_KEY) || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(PIN_STORAGE_KEY) || '[]'));
+    } catch {
+      return new Set();
+    }
   });
 
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
-      try { setPinnedIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+      try {
+        setPinnedIds(new Set(JSON.parse(detail)));
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener('pinned-tasks-changed', handler);
     return () => window.removeEventListener('pinned-tasks-changed', handler);
@@ -107,7 +115,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     try {
       const all = await app.tasks.listAll();
       setArchivedTasks(all.filter((t) => !!t.archivedAt));
-    } catch { /* ignore */ } finally {
+    } catch {
+      /* ignore */
+    } finally {
       setArchivedLoading(false);
     }
   }, []);
@@ -127,14 +137,19 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; taskId: string } | null>(null);
 
-  useEffect(() => { if (filterMode !== 'archived') setSelectedIds(new Set()); }, [filterMode]);
+  useEffect(() => {
+    if (filterMode !== 'archived') setSelectedIds(new Set());
+  }, [filterMode]);
 
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
     window.addEventListener('click', close);
     window.addEventListener('contextmenu', close);
-    return () => { window.removeEventListener('click', close); window.removeEventListener('contextmenu', close); };
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('contextmenu', close);
+    };
   }, [contextMenu]);
 
   const sensors = useSensors(
@@ -147,12 +162,17 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const tasksByStatus = useMemo(() => {
     const query = searchQuery.toLowerCase().trim();
     const grouped: Record<KaiTaskStatus, TaskFile[]> = {
-      todo: [], in_progress: [], ai_review: [], human_review: [], done: [],
+      todo: [],
+      in_progress: [],
+      ai_review: [],
+      human_review: [],
+      done: [],
     };
 
     for (const task of state.tasks) {
       if (workspaceId && task.workspaceId !== workspaceId) continue;
-      if (query && !task.title.toLowerCase().includes(query) && !task.description.toLowerCase().includes(query)) continue;
+      if (query && !task.title.toLowerCase().includes(query) && !task.description.toLowerCase().includes(query))
+        continue;
 
       if (filterMode === 'pinned' && !pinnedIds.has(task.id)) continue;
       if (filterMode === 'recent') {
@@ -181,13 +201,15 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     let tasks = [...archivedTasks];
     if (workspaceId) tasks = tasks.filter((t) => t.workspaceId === workspaceId);
     const query = searchQuery.toLowerCase().trim();
-    if (query) tasks = tasks.filter((t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query));
+    if (query)
+      tasks = tasks.filter((t) => t.title.toLowerCase().includes(query) || t.description.toLowerCase().includes(query));
     return tasks;
   }, [archivedTasks, searchQuery, workspaceId]);
 
   // Bulk helpers
   const isSelecting = selectedIds.size > 0;
-  const allSelected = isSelecting && filteredArchived.length > 0 && filteredArchived.every((t) => selectedIds.has(t.id));
+  const allSelected =
+    isSelecting && filteredArchived.length > 0 && filteredArchived.every((t) => selectedIds.has(t.id));
   const someSelected = isSelecting && !allSelected;
 
   const toggleSelectAll = useCallback(() => {
@@ -209,27 +231,60 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
   // ── Drag handlers ──────────────────────────────────────────────────────
 
-  const handleDragStart = useCallback((event: DragStartEvent) => {
-    const task = state.tasks.find((t) => t.id === event.active.id);
-    if (task) setActiveTask(task);
-  }, [state.tasks]);
+  const handleDragStart = useCallback(
+    (event: DragStartEvent) => {
+      const task = state.tasks.find((t) => t.id === event.active.id);
+      if (task) setActiveTask(task);
+    },
+    [state.tasks],
+  );
 
-  const handleDragEnd = useCallback((event: DragEndEvent) => {
-    const { active, over } = event;
-    setActiveTask(null);
-    if (!over || !active || active.id === over.id) return;
-    const task = state.tasks.find((t) => t.id === active.id);
-    const overTask = state.tasks.find((t) => t.id === over.id);
-    if (!task || !overTask || task.status !== overTask.status) return;
-    reorderTasks(task.status, active.id as string, over.id as string);
-  }, [state.tasks, reorderTasks]);
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      setActiveTask(null);
+      if (!over || !active) return;
 
-  const handleTaskClick = useCallback((task: TaskFile) => { setModalTaskId(task.id); }, []);
+      const task = state.tasks.find((t) => t.id === active.id);
+      if (!task) return;
 
-  const handleOpenFullView = useCallback((taskId: string) => {
-    setModalTaskId(null);
-    selectTask(taskId);
-  }, [selectTask]);
+      // Check if dropped on a column (cross-column move)
+      const overId = String(over.id);
+      if (overId.startsWith('column-')) {
+        const targetStatus = overId.replace('column-', '') as KaiTaskStatus;
+        if (task.status !== targetStatus) {
+          void updateTaskStatus(task.id, targetStatus);
+        }
+        return;
+      }
+
+      // Dropped on another task card
+      if (active.id === over.id) return;
+      const overTask = state.tasks.find((t) => t.id === over.id);
+      if (!overTask) return;
+
+      if (task.status === overTask.status) {
+        // Same column — reorder
+        reorderTasks(task.status, active.id as string, over.id as string);
+      } else {
+        // Cross-column: move to the target task's column
+        void updateTaskStatus(task.id, overTask.status);
+      }
+    },
+    [state.tasks, reorderTasks, updateTaskStatus],
+  );
+
+  const handleTaskClick = useCallback((task: TaskFile) => {
+    setModalTaskId(task.id);
+  }, []);
+
+  const handleOpenFullView = useCallback(
+    (taskId: string) => {
+      setModalTaskId(null);
+      selectTask(taskId);
+    },
+    [selectTask],
+  );
 
   const selectedTask = useMemo(
     () => state.tasks.find((t) => t.id === state.selectedTaskId) ?? null,
@@ -244,7 +299,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   }, [isQueueVisible]);
 
   const modalTask = useMemo(
-    () => (modalTaskId ? state.tasks.find((t) => t.id === modalTaskId) ?? null : null),
+    () => (modalTaskId ? (state.tasks.find((t) => t.id === modalTaskId) ?? null) : null),
     [state.tasks, modalTaskId],
   );
 
@@ -268,7 +323,6 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
   return (
     <div className="flex flex-col h-full min-h-0">
-
       {/* Fixed toolbar */}
       <div className="shrink-0 pt-6 pb-2">
         <div className={cn('mx-auto w-full px-4', !fullWidth && 'max-w-3xl')}>
@@ -281,7 +335,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') setSearchQuery('');
+                }}
                 placeholder="Search tasks…"
                 className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
               />
@@ -369,7 +425,12 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
 
           {/* Floating selection bar */}
           {isSelecting && (
-            <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center', !fullWidth && 'max-w-3xl')}>
+            <div
+              className={cn(
+                'absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center',
+                !fullWidth && 'max-w-3xl',
+              )}
+            >
               <button
                 type="button"
                 onClick={toggleSelectAll}
@@ -388,9 +449,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                   <div className="h-4 w-4 rounded border-2 border-muted-foreground/40" />
                 )}
               </button>
-              <span className="flex-1 ml-2 text-sm font-medium text-foreground">
-                {selectedIds.size} selected
-              </span>
+              <span className="flex-1 ml-2 text-sm font-medium text-foreground">{selectedIds.size} selected</span>
               <div className="flex items-center gap-2">
                 <Tooltip content="Unarchive selected" side="bottom">
                   <button
@@ -454,7 +513,8 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                             e.stopPropagation();
                             setSelectedIds((prev) => {
                               const next = new Set(prev);
-                              if (next.has(task.id)) next.delete(task.id); else next.add(task.id);
+                              if (next.has(task.id)) next.delete(task.id);
+                              else next.add(task.id);
                               return next;
                             });
                           }}
@@ -464,10 +524,12 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                               <CheckIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
                             </div>
                           ) : (
-                            <div className={cn(
-                              'h-4 w-4 shrink-0 rounded border-2 border-muted-foreground/40 transition-opacity',
-                              isHovered || isSelecting ? 'opacity-100' : 'opacity-0',
-                            )} />
+                            <div
+                              className={cn(
+                                'h-4 w-4 shrink-0 rounded border-2 border-muted-foreground/40 transition-opacity',
+                                isHovered || isSelecting ? 'opacity-100' : 'opacity-0',
+                              )}
+                            />
                           )}
                         </div>
 
@@ -481,16 +543,23 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
                           )}
                           onMouseEnter={() => setHoveredId(task.id)}
                           onMouseLeave={() => setHoveredId(null)}
-                          onClick={() => setSelectedIds((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(task.id)) next.delete(task.id); else next.add(task.id);
-                            return next;
-                          })}
-                          onKeyDown={(e) => e.key === 'Enter' && setSelectedIds((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(task.id)) next.delete(task.id); else next.add(task.id);
-                            return next;
-                          })}
+                          onClick={() =>
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(task.id)) next.delete(task.id);
+                              else next.add(task.id);
+                              return next;
+                            })
+                          }
+                          onKeyDown={(e) =>
+                            e.key === 'Enter' &&
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(task.id)) next.delete(task.id);
+                              else next.add(task.id);
+                              return next;
+                            })
+                          }
                           onContextMenu={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
@@ -539,68 +608,76 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
           </div>
 
           {/* Archived context menu */}
-          {contextMenu && createPortal(
-            <div
-              className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
-              style={{ left: contextMenu.x, top: contextMenu.y }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <button
-                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-                onClick={() => {
-                  void app.tasks.unarchive(contextMenu.taskId).then(() => void loadArchivedTasks());
-                  setContextMenu(null);
-                }}
-              >
-                <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Unarchive
-              </button>
-              <div className="my-1 h-px bg-border/60" />
-              <button
-                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-                onClick={() => {
-                  void deleteTask(contextMenu.taskId).then(() => void loadArchivedTasks());
-                  setContextMenu(null);
-                }}
-              >
-                <Trash2Icon className="h-4 w-4" /> Delete
-              </button>
-            </div>,
-            document.body,
-          )}
-
-          {/* Bulk delete confirmation */}
-          {bulkDeleteOpen && createPortal(
-            <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-              <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          {contextMenu &&
+            createPortal(
               <div
-                className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
+                style={{ left: contextMenu.x, top: contextMenu.y }}
                 onClick={(e) => e.stopPropagation()}
               >
-                <h2 className="text-sm font-semibold text-foreground">Delete tasks</h2>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  {`This will permanently delete ${selectedIds.size} task${selectedIds.size === 1 ? '' : 's'}. This cannot be undone.`}
-                </p>
-                <div className="mt-5 flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setBulkDeleteOpen(false)}
-                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setBulkDeleteOpen(false); void handleBulkDelete(); }}
-                    className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-                  >
-                    <Trash2Icon className="h-3 w-3" />
-                    Delete
-                  </button>
+                <button
+                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+                  onClick={() => {
+                    void app.tasks.unarchive(contextMenu.taskId).then(() => void loadArchivedTasks());
+                    setContextMenu(null);
+                  }}
+                >
+                  <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" /> Unarchive
+                </button>
+                <div className="my-1 h-px bg-border/60" />
+                <button
+                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+                  onClick={() => {
+                    void deleteTask(contextMenu.taskId).then(() => void loadArchivedTasks());
+                    setContextMenu(null);
+                  }}
+                >
+                  <Trash2Icon className="h-4 w-4" /> Delete
+                </button>
+              </div>,
+              document.body,
+            )}
+
+          {/* Bulk delete confirmation */}
+          {bulkDeleteOpen &&
+            createPortal(
+              <div
+                className="fixed inset-0 z-50 flex items-center justify-center"
+                onClick={() => setBulkDeleteOpen(false)}
+              >
+                <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                <div
+                  className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h2 className="text-sm font-semibold text-foreground">Delete tasks</h2>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {`This will permanently delete ${selectedIds.size} task${selectedIds.size === 1 ? '' : 's'}. This cannot be undone.`}
+                  </p>
+                  <div className="mt-5 flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setBulkDeleteOpen(false)}
+                      className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBulkDeleteOpen(false);
+                        void handleBulkDelete();
+                      }}
+                      className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                    >
+                      <Trash2Icon className="h-3 w-3" />
+                      Delete
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </div>,
-            document.body,
-          )}
+              </div>,
+              document.body,
+            )}
         </div>
       ) : (
         /* ── Board view (all / recent / pinned) ──────────────────────────── */
@@ -642,7 +719,9 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
       <TaskDetailModal
         task={modalTask}
         open={!!modalTask}
-        onOpenChange={(open) => { if (!open) setModalTaskId(null); }}
+        onOpenChange={(open) => {
+          if (!open) setModalTaskId(null);
+        }}
         onOpenFullView={handleOpenFullView}
       />
     </div>
