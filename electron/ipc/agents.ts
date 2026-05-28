@@ -11,10 +11,10 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdir
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
-import type { TaskFile } from '../../shared/task-types.js';
+import type { TaskFile, TaskReviewResult } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { z } from 'zod';
-import { appendOutput } from '../terminal/output-buffer.js';
+import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
 import { getRegisteredTools } from './agent.js';
@@ -125,6 +125,295 @@ function broadcastTaskChange(appHome: string): void {
   } catch (err) {
     console.error('[agents] Failed to broadcast task change:', err);
   }
+}
+
+// ── Multi-Reviewer Process ──────────────────────────────────────────────────
+
+/**
+ * Run a single reviewer agent against a task. Returns the review result.
+ * Each reviewer gets its own virtual terminal session for output isolation.
+ */
+async function runSingleReviewer(
+  appHome: string,
+  task: TaskFile,
+  reviewerAgentId: string,
+  executorOutput: string,
+): Promise<TaskReviewResult> {
+  const agent = readAgent(appHome, reviewerAgentId);
+  const agentName = agent?.name ?? 'Unknown Reviewer';
+  const virtualSessionId = `review-${task.id}-${reviewerAgentId}-${randomUUID()}`;
+
+  // Initialize result
+  const result: TaskReviewResult = {
+    agentId: reviewerAgentId,
+    agentName,
+    status: 'pending',
+    terminalSessionId: virtualSessionId,
+  };
+
+  // Update the task's reviewResults with the session ID
+  const freshTask = readTask(appHome, task.id);
+  if (freshTask?.reviewResults) {
+    const idx = freshTask.reviewResults.findIndex((r) => r.agentId === reviewerAgentId);
+    if (idx >= 0) {
+      freshTask.reviewResults[idx].terminalSessionId = virtualSessionId;
+      writeTask(appHome, freshTask);
+      broadcastTaskChange(appHome);
+    }
+  }
+
+  const broadcast = (text: string) => {
+    appendOutput(virtualSessionId, text);
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
+    }
+  };
+
+  broadcast(`\x1b[1;35m[Reviewer: ${agentName}]\x1b[0m Starting review of task: ${task.title}\r\n`);
+  broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+
+  try {
+    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const config = readEffectiveConfig(appHome);
+
+    const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
+    const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
+    const modelEntry = defaultKey
+      ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+      : (catalog.defaultEntry ?? catalog.entries[0]);
+
+    if (!modelEntry) {
+      broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m No model configured for reviewer.\r\n`);
+      result.status = 'rejected';
+      result.feedback = 'Review failed: no model configured.';
+      result.timestamp = new Date().toISOString();
+      return result;
+    }
+
+    broadcast(
+      `\x1b[90mUsing model: ${modelEntry.modelConfig.modelName} (${modelEntry.modelConfig.provider})\x1b[0m\r\n`,
+    );
+    broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
+
+    // Build reviewer system prompt
+    const reviewSystemPrompt = [
+      agent?.instructions ?? 'You are a code reviewer. Review work for quality, correctness, and completeness.',
+      '',
+      '## Review Mode',
+      '',
+      'You are reviewing work done on a task. Your job is to:',
+      '1. Read the task description carefully.',
+      "2. Review the executor's output to verify the work was done correctly.",
+      '3. Check for quality, correctness, completeness, and potential issues.',
+      '4. Call `approve_review` if the work is satisfactory.',
+      '5. Call `reject_review` with specific, actionable feedback if the work needs improvement.',
+      '',
+      'You MUST call exactly one of: `approve_review` or `reject_review`. Do NOT end without calling one.',
+    ].join('\n');
+
+    // Build user message with task info and executor output
+    const userMessage = [
+      '## Task Under Review',
+      '',
+      `**Title:** ${task.title}`,
+      '',
+      `**Description:** ${task.description ?? 'No description'}`,
+      '',
+      `**Completion Summary:** ${task.completionSummary ?? 'No summary provided'}`,
+      '',
+      '## Executor Terminal Output',
+      '',
+      '```',
+      executorOutput.slice(0, 50000), // Limit to 50k chars to avoid context overflow
+      '```',
+    ].join('\n');
+
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: reviewSystemPrompt },
+      { role: 'user', content: userMessage },
+    ];
+
+    // Review outcome tracking
+    let reviewDecision: 'approved' | 'rejected' | null = null;
+    let reviewFeedback: string | undefined;
+
+    // Review tools
+    const reviewTools = [
+      {
+        name: 'approve_review',
+        description: 'Approve the reviewed work. Call this when the task was completed correctly and satisfactorily.',
+        inputSchema: z.object({
+          comment: z.string().optional().describe('Optional brief comment on the quality of the work'),
+        }),
+        execute: async (input: unknown) => {
+          const { comment } = input as { comment?: string };
+          reviewDecision = 'approved';
+          reviewFeedback = comment;
+          return { success: true, decision: 'approved', message: 'Review approved.' };
+        },
+      },
+      {
+        name: 'reject_review',
+        description: 'Reject the reviewed work. Call this when the task has issues that need to be addressed.',
+        inputSchema: z.object({
+          reason: z.string().describe('Specific, actionable feedback on what needs to be fixed'),
+        }),
+        execute: async (input: unknown) => {
+          const { reason } = input as { reason: string };
+          reviewDecision = 'rejected';
+          reviewFeedback = reason;
+          return { success: true, decision: 'rejected', message: 'Review rejected with feedback.' };
+        },
+      },
+    ];
+
+    const dbPath = join(appHome, 'data', 'task-agent-memory.db');
+
+    const reviewConfig = {
+      ...(config as Record<string, unknown>),
+      advanced: {
+        ...(((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}),
+        maxSteps: 10, // Reviewers shouldn't need many steps
+      },
+      agent: {
+        ...(((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}),
+        maxTurns: 10,
+      },
+    };
+
+    const stream = streamAgentResponse(
+      `review-${task.id}-${reviewerAgentId}`,
+      messages as unknown[],
+      modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+      reviewConfig as unknown as Parameters<typeof streamAgentResponse>[3],
+      reviewTools as unknown as Parameters<typeof streamAgentResponse>[4],
+      dbPath,
+      { cwd: process.env.HOME ?? '/tmp' },
+    );
+
+    for await (const event of stream) {
+      const ev = event as Record<string, unknown>;
+      if (ev.type === 'text-delta' && ev.text) {
+        const text = String(ev.text).replace(/\n/g, '\r\n');
+        broadcast(text);
+      } else if (ev.type === 'tool-call') {
+        broadcast(
+          `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 200)})\r\n`,
+        );
+      } else if (ev.type === 'tool-result') {
+        const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
+        const truncated = resultStr.length > 300 ? resultStr.slice(0, 300) + '…' : resultStr;
+        broadcast(`\x1b[90m${truncated.replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+      }
+    }
+
+    // Determine final result
+    if (reviewDecision === 'approved') {
+      result.status = 'approved';
+      result.feedback = reviewFeedback;
+      broadcast(`\r\n\x1b[1;32m[Reviewer: ${agentName}]\x1b[0m ✓ APPROVED\r\n`);
+    } else if (reviewDecision === 'rejected') {
+      result.status = 'rejected';
+      result.feedback = reviewFeedback;
+      broadcast(`\r\n\x1b[1;31m[Reviewer: ${agentName}]\x1b[0m ✗ REJECTED: ${reviewFeedback}\r\n`);
+    } else {
+      // Agent didn't call either tool — treat as rejection with generic feedback
+      result.status = 'rejected';
+      result.feedback = 'Reviewer did not provide an explicit decision. Treating as rejection.';
+      broadcast(`\r\n\x1b[1;33m[Reviewer: ${agentName}]\x1b[0m ⚠ No decision made — defaulting to REJECTED\r\n`);
+    }
+    result.timestamp = new Date().toISOString();
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m Reviewer failed: ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
+    result.status = 'rejected';
+    result.feedback = `Review process error: ${errMsg}`;
+    result.timestamp = new Date().toISOString();
+  }
+
+  // Broadcast terminal exit for this reviewer's session
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
+  }
+
+  return result;
+}
+
+/**
+ * Start the multi-reviewer process for a task in ai_review status.
+ * Supports parallel (all at once) and sequential (one-by-one) modes.
+ * Runs in the background — does not block the caller.
+ */
+async function startReviewProcess(appHome: string, task: TaskFile): Promise<void> {
+  const reviewerIds = task.reviewerAgentIds ?? [];
+  if (reviewerIds.length === 0) return;
+
+  const mode = task.reviewMode ?? 'parallel';
+
+  // Get the executor's terminal output for reviewers to examine
+  const executorSessionId = task.terminalSessionId;
+  const executorOutputChunks = executorSessionId ? getBuffer(executorSessionId) : [];
+  const executorOutput = executorOutputChunks.join('');
+
+  let results: TaskReviewResult[];
+
+  if (mode === 'parallel') {
+    // Run all reviewers simultaneously
+    results = await Promise.all(reviewerIds.map((rid) => runSingleReviewer(appHome, task, rid, executorOutput)));
+  } else {
+    // Sequential mode: run one at a time, stop on first rejection
+    results = [];
+    for (const rid of reviewerIds) {
+      const result = await runSingleReviewer(appHome, task, rid, executorOutput);
+      results.push(result);
+
+      if (result.status === 'rejected') {
+        // First rejection stops the chain — remaining reviewers stay pending
+        const remaining = reviewerIds.slice(results.length);
+        for (const remainingId of remaining) {
+          const remainingAgent = readAgent(appHome, remainingId);
+          results.push({
+            agentId: remainingId,
+            agentName: remainingAgent?.name ?? 'Unknown Reviewer',
+            status: 'pending',
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  // Update the task with final review results
+  const freshTask = readTask(appHome, task.id);
+  if (!freshTask) return;
+
+  freshTask.reviewResults = results;
+  freshTask.updatedAt = new Date().toISOString();
+
+  const allApproved = results.every((r) => r.status === 'approved');
+  const anyRejected = results.some((r) => r.status === 'rejected');
+
+  if (allApproved) {
+    // All reviewers approved — promote to human_review
+    freshTask.status = 'human_review';
+  } else if (anyRejected) {
+    // At least one rejection — kick back to in_progress with merged feedback
+    freshTask.status = 'in_progress';
+    if (!freshTask.reviewNotes) freshTask.reviewNotes = [];
+    for (const r of results) {
+      if (r.status === 'rejected' && r.feedback) {
+        freshTask.reviewNotes.push({
+          source: 'ai',
+          content: `[${r.agentName}] ${r.feedback}`,
+          timestamp: r.timestamp ?? new Date().toISOString(),
+          fromStatus: 'ai_review',
+        });
+      }
+    }
+  }
+
+  writeTask(appHome, freshTask);
+  broadcastTaskChange(appHome);
 }
 
 /**
@@ -375,12 +664,34 @@ export async function startAgentRun(
               const { summary } = input as { summary: string };
               const t = readTask(appHome, task.id);
               if (t && t.status === 'in_progress') {
-                // Respect skipAiReview setting — go directly to human_review if set
-                t.status = t.skipAiReview ? 'human_review' : 'ai_review';
                 t.completionSummary = summary;
                 t.updatedAt = new Date().toISOString();
-                writeTask(appHome, t);
-                broadcastTaskChange(appHome);
+
+                // Multi-reviewer: check if reviewerAgentIds has entries
+                const hasReviewers = t.reviewerAgentIds && t.reviewerAgentIds.length > 0;
+
+                if (!hasReviewers) {
+                  // No reviewers assigned — skip AI review, go directly to human_review
+                  t.status = 'human_review';
+                  writeTask(appHome, t);
+                  broadcastTaskChange(appHome);
+                } else {
+                  // Move to ai_review and start the multi-reviewer process
+                  t.status = 'ai_review';
+                  t.reviewResults = t.reviewerAgentIds!.map((rid) => {
+                    const reviewerAgent = readAgent(appHome, rid);
+                    return {
+                      agentId: rid,
+                      agentName: reviewerAgent?.name ?? 'Unknown Reviewer',
+                      status: 'pending' as const,
+                    };
+                  });
+                  writeTask(appHome, t);
+                  broadcastTaskChange(appHome);
+
+                  // Start the review process in the background
+                  void startReviewProcess(appHome, t);
+                }
 
                 // Also mark agent as idle immediately (task is done)
                 const ag = readAgent(appHome, agentId);
@@ -392,7 +703,7 @@ export async function startAgentRun(
                   broadcastAgentChange(appHome);
                 }
 
-                const newStatus = t.skipAiReview ? 'human_review' : 'ai_review';
+                const newStatus = hasReviewers ? 'ai_review' : 'human_review';
                 return {
                   success: true,
                   newStatus,

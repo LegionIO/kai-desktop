@@ -30,6 +30,16 @@ export interface TaskReviewNote {
   fromStatus: KaiTaskStatus;
 }
 
+/** Tracks an individual reviewer's result during the AI review phase. */
+export interface TaskReviewResult {
+  agentId: string;
+  agentName: string;
+  status: 'pending' | 'approved' | 'rejected';
+  feedback?: string;
+  timestamp?: string;
+  terminalSessionId?: string;
+}
+
 export interface TaskFile {
   id: string;
   title: string;
@@ -50,10 +60,12 @@ export interface TaskFile {
   metadata?: KaiTaskMetadata;
   /** The agent assigned to work on this task. */
   assignedAgentId?: string;
-  /** The agent assigned to review this task (AI review phase). */
-  reviewerAgentId?: string;
-  /** If true, skip AI review and go directly to human_review on promote. */
-  skipAiReview?: boolean;
+  /** Reviewer agent IDs — zero to many. All must approve for promotion. */
+  reviewerAgentIds?: string[];
+  /** Review execution mode: parallel (all at once) or sequential (one after another). */
+  reviewMode?: 'parallel' | 'sequential';
+  /** Tracks individual reviewer results during AI review phase. */
+  reviewResults?: TaskReviewResult[];
   /** The workspace this task belongs to. Undefined = legacy/unscoped. */
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */
