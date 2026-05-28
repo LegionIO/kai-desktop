@@ -15,6 +15,7 @@ import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
+import { getRegisteredTools } from './agent.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -304,14 +305,14 @@ export async function startAgentRun(
           provider: 'anthropic',
         };
         const dbPath = join(appHome, 'data');
-        const tools: unknown[] = []; // Task agents use built-in workspace tools
+        const tools = getRegisteredTools(); // Full tool registry (file I/O, shell, MCP, etc.)
 
         const stream = streamAgentResponse(
           `task-${task.id}`,
           messages as unknown[],
           modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
           config as unknown as Parameters<typeof streamAgentResponse>[3],
-          tools as Parameters<typeof streamAgentResponse>[4],
+          tools as unknown as Parameters<typeof streamAgentResponse>[4],
           dbPath,
           { cwd: cwd },
         );
