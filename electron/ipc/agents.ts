@@ -248,6 +248,32 @@ export async function startAgentRun(
 
   const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
 
+  // Mastra runtime uses the built-in Mastra agent system, not a terminal PTY.
+  // Mark task as in_progress but don't spawn a terminal.
+  if (effectiveRuntime === 'mastra') {
+    agent.status = 'running';
+    agent.stats.lastRunAt = new Date().toISOString();
+    agent.updatedAt = new Date().toISOString();
+    writeAgent(appHome, agent);
+
+    if (task.status === 'todo') {
+      task.status = 'in_progress';
+      if (!task.startedAt) task.startedAt = new Date().toISOString();
+    }
+    task.agentRuntime = effectiveRuntime;
+    task.updatedAt = new Date().toISOString();
+    writeTask(appHome, task);
+
+    broadcastAgentChange(appHome);
+    broadcastTaskChange(appHome);
+
+    // TODO: Wire into the actual Mastra agent streaming system
+    // For now, the agent is marked running and can be stopped manually.
+    // The Mastra runtime (electron/agent/runtime/mastra-runtime.ts) handles
+    // actual agent streaming via streamAgentResponse().
+    return { sessionId: undefined };
+  }
+
   try {
     const sessionId = await terminalManager.create(agent.currentTaskId, {
       runtime: effectiveRuntime,
@@ -451,12 +477,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status === 'running') return { error: 'Cannot unassign while agent is running' };
+
+    // If agent is running, stop it first
+    if (agent.status === 'running' && agent.terminalSessionId) {
+      terminalManager.kill(agent.terminalSessionId);
+      agent.terminalSessionId = undefined;
+      agent.status = 'idle';
+    } else if (agent.status === 'running') {
+      // Force idle if terminal is already gone
+      agent.status = 'idle';
+    }
 
     if (agent.currentTaskId) {
       const task = readTask(appHome, agent.currentTaskId);
       if (task) {
         task.assignedAgentId = undefined;
+        task.terminalSessionId = undefined;
+        task.status = task.status === 'in_progress' ? 'todo' : task.status;
         task.updatedAt = new Date().toISOString();
         writeTask(appHome, task);
         broadcastTaskChange(appHome);
@@ -482,24 +519,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
-    if (agent.status !== 'running') return { error: 'Agent is not running' };
 
-    // Kill terminal
+    // Kill terminal if one exists (regardless of agent.status)
     if (agent.terminalSessionId) {
       terminalManager.kill(agent.terminalSessionId);
     }
 
-    // Update agent state
+    // Force agent to idle
     agent.status = 'idle';
     agent.terminalSessionId = undefined;
     agent.updatedAt = new Date().toISOString();
     writeAgent(appHome, agent);
 
-    // Clear terminal from task
+    // Update task: clear terminal, move to human_review if in_progress
     if (agent.currentTaskId) {
       const task = readTask(appHome, agent.currentTaskId);
       if (task) {
         task.terminalSessionId = undefined;
+        if (task.status === 'in_progress') {
+          task.status = 'human_review';
+        }
         task.updatedAt = new Date().toISOString();
         writeTask(appHome, task);
         broadcastTaskChange(appHome);
@@ -588,8 +627,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
           // Optional per-agent override: route every completion through human review.
           const requireHumanReview =
-            (freshAgent.config as { requireHumanReview?: boolean } | undefined)
-              ?.requireHumanReview === true;
+            (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
 
           const { nextStatus, isCrash } = analyzeCompletion(exitCode, {
             requireHumanReview,

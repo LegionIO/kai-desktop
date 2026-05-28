@@ -426,8 +426,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   {/* Completion summary — shown when autopilot or agent has reported a wrap-up */}
                   {(() => {
                     const summary = (task as unknown as { completionSummary?: string }).completionSummary;
-                    const showSummary =
-                      !!summary && (task.status === 'human_review' || task.status === 'done');
+                    const showSummary = !!summary && (task.status === 'human_review' || task.status === 'done');
                     if (!showSummary) return null;
                     return (
                       <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
@@ -736,7 +735,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 </span>
               )}
               <div className="ml-auto flex items-center gap-1.5">
-                {terminalSessionId && (
+                {(terminalSessionId || assignedAgent?.status === 'running') && (
                   <button
                     type="button"
                     onClick={handleStopAgent}
@@ -746,7 +745,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     Stop Agent
                   </button>
                 )}
-                {!terminalSessionId && assignedAgent && (
+                {assignedAgent && assignedAgent.status !== 'running' && (
                   <button
                     type="button"
                     onClick={() => void unassignTask(assignedAgent.id)}
@@ -789,7 +788,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                         </button>
                       ) : (
                         <div className="inline-flex items-center gap-2">
-                          <AgentAssignDropdown taskId={task.id} currentAgentId={task.assignedAgentId} variant="button" />
+                          <AgentAssignDropdown
+                            taskId={task.id}
+                            currentAgentId={task.assignedAgentId}
+                            variant="button"
+                          />
                         </div>
                       )}
                     </div>
