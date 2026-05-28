@@ -37,11 +37,18 @@ export interface TransitionRule {
  *                              done ──▶ todo (reopen)
  */
 export const TASK_TRANSITIONS: readonly TransitionRule[] = [
+  // ── Forward flow ──────────────────────────────────────────────────────
   {
     from: 'todo',
     to: 'in_progress',
     trigger: 'both',
     condition: 'Agent started or user manually moves task into work',
+  },
+  {
+    from: 'todo',
+    to: 'done',
+    trigger: 'manual',
+    condition: 'User marks task done without executing (e.g. already completed)',
   },
   {
     from: 'in_progress',
@@ -62,6 +69,12 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     condition: 'Agent finished cleanly with no review required',
   },
   {
+    from: 'in_progress',
+    to: 'todo',
+    trigger: 'manual',
+    condition: 'User moves task back to backlog',
+  },
+  {
     from: 'ai_review',
     to: 'human_review',
     trigger: 'both',
@@ -80,6 +93,12 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     condition: 'AI review found problems and sent the task back for more work',
   },
   {
+    from: 'ai_review',
+    to: 'todo',
+    trigger: 'manual',
+    condition: 'User moves task back to backlog',
+  },
+  {
     from: 'human_review',
     to: 'done',
     trigger: 'manual',
@@ -92,10 +111,22 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     condition: 'Human requested additional work',
   },
   {
+    from: 'human_review',
+    to: 'todo',
+    trigger: 'manual',
+    condition: 'User moves task back to backlog',
+  },
+  {
     from: 'done',
     to: 'todo',
     trigger: 'manual',
     condition: 'Reopen a completed task',
+  },
+  {
+    from: 'done',
+    to: 'in_progress',
+    trigger: 'manual',
+    condition: 'Reopen and immediately resume work',
   },
 ] as const;
 
