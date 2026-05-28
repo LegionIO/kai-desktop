@@ -348,11 +348,24 @@ export async function startAgentRun(
         const dbPath = join(appHome, 'data', 'task-agent-memory.db');
         const tools = getRegisteredTools(); // Full tool registry (file I/O, shell, MCP, etc.)
 
+        // Ensure maxSteps is set for multi-turn task execution (default 25 if not configured)
+        const taskConfig = {
+          ...(config as Record<string, unknown>),
+          advanced: {
+            ...(((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}),
+            maxSteps: (((config as Record<string, unknown>).advanced as Record<string, unknown>) ?? {}).maxSteps ?? 25,
+          },
+          agent: {
+            ...(((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}),
+            maxTurns: (((config as Record<string, unknown>).agent as Record<string, unknown>) ?? {}).maxTurns ?? 25,
+          },
+        };
+
         const stream = streamAgentResponse(
           `task-${task.id}`,
           messages as unknown[],
           modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
-          config as unknown as Parameters<typeof streamAgentResponse>[3],
+          taskConfig as unknown as Parameters<typeof streamAgentResponse>[3],
           tools as unknown as Parameters<typeof streamAgentResponse>[4],
           dbPath,
           { cwd: cwd, abortSignal: abortController.signal },
