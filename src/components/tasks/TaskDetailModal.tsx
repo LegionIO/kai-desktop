@@ -290,7 +290,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
               )}
 
               {/* Terminal — always rendered; dark overlay when no session */}
-              <div className="relative min-h-0 flex-1">
+              <div className="relative min-h-[200px] flex-1">
                 {terminalSessionId ? (
                   <TaskTerminal
                     sessionId={terminalSessionId}
