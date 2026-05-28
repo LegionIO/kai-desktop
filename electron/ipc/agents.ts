@@ -249,9 +249,13 @@ export async function startAgentRun(
   const cwd = agent.config.cwd ?? task.metadata?.cwd ?? process.env.HOME ?? '/tmp';
 
   // Mastra runtime uses the built-in Mastra agent system, not a terminal PTY.
-  // Mark task as in_progress but don't spawn a terminal.
+  // We create a virtual session ID so the UI can display streaming output,
+  // then run the task through streamAgentResponse.
   if (effectiveRuntime === 'mastra') {
+    const virtualSessionId = `mastra-${randomUUID()}`;
+
     agent.status = 'running';
+    agent.terminalSessionId = virtualSessionId;
     agent.stats.lastRunAt = new Date().toISOString();
     agent.updatedAt = new Date().toISOString();
     writeAgent(appHome, agent);
@@ -260,6 +264,7 @@ export async function startAgentRun(
       task.status = 'in_progress';
       if (!task.startedAt) task.startedAt = new Date().toISOString();
     }
+    task.terminalSessionId = virtualSessionId;
     task.agentRuntime = effectiveRuntime;
     task.updatedAt = new Date().toISOString();
     writeTask(appHome, task);
@@ -267,11 +272,99 @@ export async function startAgentRun(
     broadcastAgentChange(appHome);
     broadcastTaskChange(appHome);
 
-    // TODO: Wire into the actual Mastra agent streaming system
-    // For now, the agent is marked running and can be stopped manually.
-    // The Mastra runtime (electron/agent/runtime/mastra-runtime.ts) handles
-    // actual agent streaming via streamAgentResponse().
-    return { sessionId: undefined };
+    // Broadcast formatted output to the terminal viewer via the standard channel
+    const broadcast = (text: string) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
+      }
+    };
+
+    // Run the Mastra agent asynchronously
+    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const config = readEffectiveConfig(appHome);
+
+    // Build a simple user message from the task description
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'user', content: task.description ?? 'No task description provided.' },
+    ];
+
+    // Add agent instructions as system context if available
+    if (agent.instructions) {
+      messages.unshift({ role: 'system', content: agent.instructions });
+    }
+
+    broadcast(`\x1b[1;36m[Mastra Agent]\x1b[0m Starting task: ${task.title}\r\n`);
+    broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+
+    // Run in background — don't await (would block IPC)
+    void (async () => {
+      try {
+        const modelConfig = config?.models?.catalog?.[0] ?? {
+          modelName: 'claude-sonnet-4-20250514',
+          provider: 'anthropic',
+        };
+        const dbPath = join(appHome, 'data');
+        const tools: unknown[] = []; // Task agents use built-in workspace tools
+
+        const stream = streamAgentResponse(
+          `task-${task.id}`,
+          messages as unknown[],
+          modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+          config as unknown as Parameters<typeof streamAgentResponse>[3],
+          tools as Parameters<typeof streamAgentResponse>[4],
+          dbPath,
+          { cwd: cwd },
+        );
+
+        for await (const event of stream) {
+          const ev = event as Record<string, unknown>;
+          if (ev.type === 'text-delta' && ev.textDelta) {
+            // Convert newlines to terminal-friendly \r\n
+            const text = String(ev.textDelta).replace(/\n/g, '\r\n');
+            broadcast(text);
+          } else if (ev.type === 'tool-call') {
+            broadcast(
+              `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 100)})\r\n`,
+            );
+          } else if (ev.type === 'tool-result') {
+            const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
+            const truncated = resultStr.length > 500 ? resultStr.slice(0, 500) + '…' : resultStr;
+            broadcast(`\x1b[90m${truncated.replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+          }
+        }
+
+        broadcast(`\r\n\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
+        broadcast(`\x1b[1;32m[Mastra Agent]\x1b[0m Task completed.\r\n`);
+      } catch (err) {
+        broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${String(err)}\r\n`);
+      } finally {
+        // Reconcile: mark agent idle, move task to human_review
+        const freshAgent = readAgent(appHome, agentId);
+        if (freshAgent && freshAgent.status === 'running') {
+          freshAgent.status = 'idle';
+          freshAgent.terminalSessionId = undefined;
+          freshAgent.stats.tasksCompleted = (freshAgent.stats.tasksCompleted ?? 0) + 1;
+          freshAgent.updatedAt = new Date().toISOString();
+          writeAgent(appHome, freshAgent);
+        }
+        const freshTask = readTask(appHome, task.id);
+        if (freshTask && freshTask.status === 'in_progress') {
+          freshTask.status = 'human_review';
+          freshTask.terminalSessionId = undefined;
+          freshTask.updatedAt = new Date().toISOString();
+          writeTask(appHome, freshTask);
+        }
+        broadcastAgentChange(appHome);
+        broadcastTaskChange(appHome);
+
+        // Broadcast terminal exit so the UI knows it's done
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
+        }
+      }
+    })();
+
+    return { sessionId: virtualSessionId };
   }
 
   try {
