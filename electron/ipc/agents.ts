@@ -16,6 +16,7 @@ import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
 import { getRegisteredTools } from './agent.js';
+import { resolveModelCatalog } from '../agent/model-catalog.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -299,18 +300,36 @@ export async function startAgentRun(
 
     // Run in background — don't await (would block IPC)
     void (async () => {
+      let hasError = false;
       try {
-        const modelConfig = config?.models?.catalog?.[0] ?? {
-          modelName: 'claude-sonnet-4-20250514',
-          provider: 'anthropic',
-        };
+        // Resolve the model using the same catalog resolution as the main chat
+        // This ensures correct provider endpoint, API key, and TLS settings
+        const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
+        const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
+        const modelEntry = defaultKey
+          ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+          : (catalog.defaultEntry ?? catalog.entries[0]);
+
+        if (!modelEntry) {
+          broadcast(
+            `\r\n\x1b[1;31m[Error]\x1b[0m No model configured. Please set a default model in Settings → Models.\r\n`,
+          );
+          hasError = true;
+          return;
+        }
+
+        broadcast(
+          `\x1b[90mUsing model: ${modelEntry.modelConfig.modelName} (${modelEntry.modelConfig.provider})\x1b[0m\r\n`,
+        );
+        broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
+
         const dbPath = join(appHome, 'data');
         const tools = getRegisteredTools(); // Full tool registry (file I/O, shell, MCP, etc.)
 
         const stream = streamAgentResponse(
           `task-${task.id}`,
           messages as unknown[],
-          modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+          modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
           config as unknown as Parameters<typeof streamAgentResponse>[3],
           tools as unknown as Parameters<typeof streamAgentResponse>[4],
           dbPath,
@@ -337,20 +356,31 @@ export async function startAgentRun(
         broadcast(`\r\n\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
         broadcast(`\x1b[1;32m[Mastra Agent]\x1b[0m Task completed.\r\n`);
       } catch (err) {
-        broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${String(err)}\r\n`);
+        hasError = true;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m ${errMsg.replace(/\n/g, '\r\n')}\r\n`);
+        if (err instanceof Error && err.cause) {
+          broadcast(`\x1b[90mCause: ${String(err.cause).replace(/\n/g, '\r\n')}\x1b[0m\r\n`);
+        }
+        broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
       } finally {
-        // Reconcile: mark agent idle, move task to human_review
+        // Mark agent idle
         const freshAgent = readAgent(appHome, agentId);
         if (freshAgent && freshAgent.status === 'running') {
           freshAgent.status = 'idle';
           freshAgent.terminalSessionId = undefined;
-          freshAgent.stats.tasksCompleted = (freshAgent.stats.tasksCompleted ?? 0) + 1;
+          if (!hasError) {
+            freshAgent.stats.tasksCompleted = (freshAgent.stats.tasksCompleted ?? 0) + 1;
+          }
           freshAgent.updatedAt = new Date().toISOString();
           writeAgent(appHome, freshAgent);
         }
+
+        // Only clear terminal from task — do NOT auto-transition status.
+        // The agent or user should decide when to promote the task.
+        // On error, leave as in_progress so user can retry.
         const freshTask = readTask(appHome, task.id);
-        if (freshTask && freshTask.status === 'in_progress') {
-          freshTask.status = 'human_review';
+        if (freshTask) {
           freshTask.terminalSessionId = undefined;
           freshTask.updatedAt = new Date().toISOString();
           writeTask(appHome, freshTask);

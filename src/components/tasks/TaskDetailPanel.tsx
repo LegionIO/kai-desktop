@@ -264,7 +264,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const handleTerminalExit = useCallback(
     (_exitCode: number) => {
-      setTerminalSessionId(null);
+      // Don't clear terminalSessionId — keep the terminal mounted so the
+      // output log persists for review. Just clear it from the task record
+      // so it won't try to reconnect on reload.
       void updateTask(task.id, { terminalSessionId: undefined });
     },
     [task.id, updateTask],
