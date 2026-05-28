@@ -871,6 +871,29 @@ if (gotSingleInstanceLock) {
         startAgent: (agentId) => startAgentRun(APP_HOME, taskTerminalManager, agentId),
         getConfig: () => getConfig().autopilot ?? null,
         broadcastState: broadcastOrchestratorState,
+        unassignTask: async (agentId: string, taskId: string) => {
+          // Clear agent's task reference
+          const agentPath = join(APP_HOME, 'data', 'agents', `${agentId}.json`);
+          if (existsSync(agentPath)) {
+            const agent = JSON.parse(readFileSync(agentPath, 'utf-8'));
+            if (agent.currentTaskId === taskId) {
+              agent.currentTaskId = undefined;
+              agent.status = 'idle';
+              agent.updatedAt = new Date().toISOString();
+              writeFileSync(agentPath, JSON.stringify(agent, null, 2), 'utf-8');
+            }
+          }
+          // Clear task's agent reference
+          const taskPath = join(APP_HOME, 'data', 'tasks', `${taskId}.json`);
+          if (existsSync(taskPath)) {
+            const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
+            if (task.assignedAgentId === agentId) {
+              task.assignedAgentId = undefined;
+              task.updatedAt = new Date().toISOString();
+              writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+            }
+          }
+        },
       },
       initialAutopilotConfig,
     );

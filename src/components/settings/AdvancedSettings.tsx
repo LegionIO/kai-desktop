@@ -1,7 +1,6 @@
 import { type FC, useState, useEffect } from 'react';
 import { InfoIcon, AlertTriangleIcon, TrendingUpIcon, CheckCircle2Icon } from 'lucide-react';
-import { app } from '@/lib/ipc-client';
-import { Toggle, NumberField, settingsSelectClass, type SettingsProps } from './shared';
+import { Toggle, NumberField, type SettingsProps } from './shared';
 
 type StepUsageStats = {
   totalResponses: number;

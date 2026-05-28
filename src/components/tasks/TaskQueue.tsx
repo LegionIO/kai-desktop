@@ -76,7 +76,7 @@ interface TaskQueueProps {
 }
 
 export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
-  const { state, reorderTasks, moveTaskToColumn, updateTaskStatus, selectTask, deleteTask } = useTasks();
+  const { state, reorderTasks, updateTaskStatus, selectTask, deleteTask } = useTasks();
   const fullWidth = useFullWidthContent();
 
   const [activeTask, setActiveTask] = useState<TaskFile | null>(null);

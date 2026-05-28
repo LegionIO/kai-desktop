@@ -445,6 +445,12 @@ const autopilotConfigSchema = z.object({
   maxConcurrentAgents: z.number().min(1).max(10).default(3),
   matchingStrategy: z.enum(['simple', 'ai-scored']).default('simple'),
   requireHumanReview: z.boolean().default(true),
+  /**
+   * When true, agents spawned by autopilot run with --dangerously-skip-permissions
+   * (Claude) or --dangerously-bypass-approvals-and-sandbox (Codex). When false,
+   * agents run in interactive/approval mode. Requires user confirmation on first enable.
+   */
+  dangerousMode: z.boolean().default(false),
 });
 
 export type AutopilotConfig = z.infer<typeof autopilotConfigSchema>;

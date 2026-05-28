@@ -1,6 +1,17 @@
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import { SearchIcon, PackageIcon, XIcon, PinIcon, EllipsisVerticalIcon, Trash2Icon, LoaderIcon, DownloadIcon, PlusIcon, Settings2Icon } from 'lucide-react';
+import {
+  SearchIcon,
+  PackageIcon,
+  XIcon,
+  PinIcon,
+  EllipsisVerticalIcon,
+  Trash2Icon,
+  LoaderIcon,
+  DownloadIcon,
+  PlusIcon,
+  Settings2Icon,
+} from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
@@ -35,10 +46,7 @@ type PluginListEntry = {
 
 interface InstalledPluginsListProps {
   activeView: string;
-  onNavigate: (
-    pluginName: string,
-    target: PluginNavigationTarget,
-  ) => void;
+  onNavigate: (pluginName: string, target: PluginNavigationTarget) => void;
   onOpenMarketplace: () => void;
   onOpenPlugins: () => void;
   onOpenPluginError: (pluginName: string) => void;
@@ -59,12 +67,16 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   onOpenPluginSettings,
   pluginBrandRequired,
 }) => {
-  const { uiState, pluginUpdateCount } = usePlugins();
+  const { uiState } = usePlugins();
   const [plugins, setPlugins] = useState<PluginListEntry[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [pinnedNames, setPinnedNames] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(PINNED_PLUGINS_KEY) || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(PINNED_PLUGINS_KEY) || '[]'));
+    } catch {
+      return new Set();
+    }
   });
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; pluginName: string } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -79,7 +91,9 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
         setHasLoaded(true);
       }
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [uiState]);
 
   // Refresh marketplace catalog in the background when the panel is shown (throttled to 30 min)
@@ -91,7 +105,11 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
-      try { setPinnedNames(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+      try {
+        setPinnedNames(new Set(JSON.parse(detail)));
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener('pinned-plugins-changed', handler);
     return () => window.removeEventListener('pinned-plugins-changed', handler);
@@ -100,7 +118,8 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   const togglePin = useCallback((name: string) => {
     setPinnedNames((prev) => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name); else next.add(name);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
       const serialized = JSON.stringify([...next]);
       localStorage.setItem(PINNED_PLUGINS_KEY, serialized);
       window.dispatchEvent(new CustomEvent('pinned-plugins-changed', { detail: serialized }));
@@ -108,19 +127,22 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     });
   }, []);
 
-  const handleUninstall = useCallback(async (pluginName: string) => {
-    setIsUninstalling(true);
-    try {
-      await app.plugins.marketplaceUninstall(pluginName);
-      // Navigate away from the plugin view if we were looking at it
-      onOpenMarketplace();
-    } catch (err) {
-      console.error('[InstalledPluginsList] Uninstall failed:', err);
-    } finally {
-      setIsUninstalling(false);
-      setConfirmUninstall(null);
-    }
-  }, [onOpenMarketplace]);
+  const handleUninstall = useCallback(
+    async (pluginName: string) => {
+      setIsUninstalling(true);
+      try {
+        await app.plugins.marketplaceUninstall(pluginName);
+        // Navigate away from the plugin view if we were looking at it
+        onOpenMarketplace();
+      } catch (err) {
+        console.error('[InstalledPluginsList] Uninstall failed:', err);
+      } finally {
+        setIsUninstalling(false);
+        setConfirmUninstall(null);
+      }
+    },
+    [onOpenMarketplace],
+  );
 
   const handleContextMenu = useCallback((e: React.MouseEvent, pluginName: string) => {
     e.preventDefault();
@@ -157,10 +179,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   const filteredPlugins = isSearchActive
     ? plugins.filter((p) => {
         const q = searchQuery.toLowerCase();
-        return (
-          (p.displayName || p.name).toLowerCase().includes(q) ||
-          p.description.toLowerCase().includes(q)
-        );
+        return (p.displayName || p.name).toLowerCase().includes(q) || p.description.toLowerCase().includes(q);
       })
     : plugins;
 
@@ -172,11 +191,12 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
     const isErrored = plugin.state === 'error';
     const isPinned = pinnedNames.has(plugin.name);
 
-    const isActive = navItem?.target.type === 'panel'
-      ? activeView === `plugin-panel:${plugin.name}:${navItem.target.panelId}`
-      : isErrored && activeView === `plugin-error:${plugin.name}`
-        ? true
-        : !navItem && !isErrored && activeView === `plugin-panel:${plugin.name}:default`;
+    const isActive =
+      navItem?.target.type === 'panel'
+        ? activeView === `plugin-panel:${plugin.name}:${navItem.target.panelId}`
+        : isErrored && activeView === `plugin-error:${plugin.name}`
+          ? true
+          : !navItem && !isErrored && activeView === `plugin-panel:${plugin.name}:default`;
 
     return (
       <div key={plugin.name} className="mb-1.5">
@@ -203,31 +223,31 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
           onContextMenu={(e) => handleContextMenu(e, plugin.name)}
           className={cn(
             'group flex w-full items-start gap-2.5 rounded-xl px-3 py-2.5 text-left transition-all cursor-pointer relative',
-            isActive
-              ? 'shadow-[inset_0_0_0_1px_var(--app-active-item-ring)]'
-              : 'hover:bg-sidebar-accent/65',
+            isActive ? 'shadow-[inset_0_0_0_1px_var(--app-active-item-ring)]' : 'hover:bg-sidebar-accent/65',
           )}
           style={isActive ? { backgroundColor: 'var(--app-active-item)' } : undefined}
         >
           {/* Icon */}
-          <span className={cn(
-            'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center',
-            isActive ? 'text-primary' : 'text-muted-foreground',
-          )}>
+          <span
+            className={cn(
+              'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center',
+              isActive ? 'text-primary' : 'text-muted-foreground',
+            )}
+          >
             {getPluginNavigationIcon(plugin.icon ?? navItem?.icon)}
           </span>
 
           {/* Text content */}
           <div className="flex-1 min-w-0">
-            <span className={cn(
-              'line-clamp-2 text-sm font-medium',
-              isActive ? 'text-primary' : 'text-sidebar-foreground/95',
-            )}>
+            <span
+              className={cn(
+                'line-clamp-2 text-sm font-medium',
+                isActive ? 'text-primary' : 'text-sidebar-foreground/95',
+              )}
+            >
               {plugin.displayName || plugin.name}
             </span>
-            <span className="mt-1 flex items-center text-[12px] text-muted-foreground">
-              {plugin.version}
-            </span>
+            <span className="mt-1 flex items-center text-[12px] text-muted-foreground">{plugin.version}</span>
           </div>
 
           {/* Right side indicators */}
@@ -335,7 +355,9 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
               <div>
                 <div className="flex items-center gap-2 px-1 pb-1 pt-2">
                   <PinIcon className="h-2.5 w-2.5 text-primary/60" />
-                  <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">Pinned</span>
+                  <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+                    Pinned
+                  </span>
                 </div>
                 {pinned.map(renderPluginItem)}
               </div>
@@ -346,91 +368,108 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
       </div>
 
       {/* Context menu */}
-      {contextMenu && (() => {
-        const _ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
-        return createPortal(
-          <div
-            ref={contextMenuRef}
-            className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
-            style={{ left: contextMenu.x, top: contextMenu.y }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-              onClick={() => { togglePin(contextMenu.pluginName); setContextMenu(null); }}
+      {contextMenu &&
+        (() => {
+          const _ctxPlugin = plugins.find((p) => p.name === contextMenu.pluginName);
+          return createPortal(
+            <div
+              ref={contextMenuRef}
+              className="fixed z-[9999] min-w-[180px] rounded-2xl border border-border bg-popover p-1.5 shadow-2xl"
+              style={{ left: contextMenu.x, top: contextMenu.y }}
+              onClick={(e) => e.stopPropagation()}
             >
-              <PinIcon className="h-4 w-4 text-muted-foreground" /> {pinnedNames.has(contextMenu.pluginName) ? 'Unpin' : 'Pin'}
-            </button>
-            <button
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-              onClick={() => { onOpenPluginSettings(contextMenu.pluginName); setContextMenu(null); }}
-            >
-              <Settings2Icon className="h-4 w-4 text-muted-foreground" /> Settings
-            </button>
-            {!pluginBrandRequired.has(contextMenu.pluginName) && (
-              <>
-                <div className="my-1 h-px bg-border/60" />
-                <button
-                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-                  onClick={() => { setConfirmUninstall(contextMenu.pluginName); setContextMenu(null); }}
-                >
-                  <Trash2Icon className="h-4 w-4" /> Uninstall
-                </button>
-              </>
-            )}
-          </div>,
-          document.body,
-        );
-      })()}
+              <button
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+                onClick={() => {
+                  togglePin(contextMenu.pluginName);
+                  setContextMenu(null);
+                }}
+              >
+                <PinIcon className="h-4 w-4 text-muted-foreground" />{' '}
+                {pinnedNames.has(contextMenu.pluginName) ? 'Unpin' : 'Pin'}
+              </button>
+              <button
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+                onClick={() => {
+                  onOpenPluginSettings(contextMenu.pluginName);
+                  setContextMenu(null);
+                }}
+              >
+                <Settings2Icon className="h-4 w-4 text-muted-foreground" /> Settings
+              </button>
+              {!pluginBrandRequired.has(contextMenu.pluginName) && (
+                <>
+                  <div className="my-1 h-px bg-border/60" />
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+                    onClick={() => {
+                      setConfirmUninstall(contextMenu.pluginName);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <Trash2Icon className="h-4 w-4" /> Uninstall
+                  </button>
+                </>
+              )}
+            </div>,
+            document.body,
+          );
+        })()}
 
       {/* Uninstall confirmation modal */}
-      {confirmUninstall && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmUninstall(null)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      {confirmUninstall &&
+        createPortal(
           <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 flex items-center justify-center"
+            onClick={() => setConfirmUninstall(null)}
           >
-            <h2 className="text-sm font-semibold text-foreground">Uninstall plugin</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              This will uninstall{' '}
-              <span className="font-medium text-foreground">
-                {plugins.find((p) => p.name === confirmUninstall)?.displayName || confirmUninstall}
-              </span>
-              . This cannot be undone.
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmUninstall(null)}
-                disabled={isUninstalling}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { void handleUninstall(confirmUninstall); }}
-                disabled={isUninstalling}
-                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {isUninstalling ? (
-                  <>
-                    <LoaderIcon className="h-3 w-3 animate-spin" />
-                    Uninstalling...
-                  </>
-                ) : (
-                  <>
-                    <Trash2Icon className="h-3 w-3" />
-                    Uninstall
-                  </>
-                )}
-              </button>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-sm font-semibold text-foreground">Uninstall plugin</h2>
+              <p className="mt-2 text-xs text-muted-foreground">
+                This will uninstall{' '}
+                <span className="font-medium text-foreground">
+                  {plugins.find((p) => p.name === confirmUninstall)?.displayName || confirmUninstall}
+                </span>
+                . This cannot be undone.
+              </p>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmUninstall(null)}
+                  disabled={isUninstalling}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleUninstall(confirmUninstall);
+                  }}
+                  disabled={isUninstalling}
+                  className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+                >
+                  {isUninstalling ? (
+                    <>
+                      <LoaderIcon className="h-3 w-3 animate-spin" />
+                      Uninstalling...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2Icon className="h-3 w-3" />
+                      Uninstall
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
-          </div>
-        </div>,
-        document.body,
-      )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 };

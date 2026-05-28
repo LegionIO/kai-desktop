@@ -65,8 +65,6 @@ import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
 import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
-import { StepProgress } from './StepProgress';
-import { IncompleteTaskBanner } from './IncompleteTaskBanner';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
 import { ComposerInput } from './ComposerInput';
@@ -150,7 +148,7 @@ export const Thread: FC<{
   // useRuntimeConversationId updates in the same React batch as setTree/setHeadId,
   // so the scroll fires only after the new thread's messages are already in the DOM.
   const runtimeConversationId = useRuntimeConversationId();
-  const { stepInfo, showIncompleteTaskBanner, onContinueTask, onAdjustSettings, onDismissBanner } = useStepTracking();
+  useStepTracking();
   const threadRuntime = useThreadRuntime();
   const [hasMessages, setHasMessages] = useState(() => threadRuntime.getState().messages.length > 0);
 

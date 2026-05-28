@@ -152,6 +152,7 @@ describe('preload bridge contract', () => {
 });
 
 // Local shape map — keyof drives the `it.each` type narrowing above.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- used as a type via keyof
 const exposedAPIShape = {
   config: 1,
   agent: 1,

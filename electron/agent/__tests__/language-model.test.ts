@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { httpMock } from '../../../vitest.setup.js';
-import { mockAnthropic, mockOpenAI, mockAzure, mockBedrock } from '../../__tests__/setup/msw.js';
+import { mockAnthropic, mockOpenAI, mockAzure, mockBedrock as _mockBedrock } from '../../__tests__/setup/msw.js';
 
 // Stub the electron module — only `app.getVersion()` is read at module load by
 // the brand-user-agent helper. In test mode there is no Electron runtime, so

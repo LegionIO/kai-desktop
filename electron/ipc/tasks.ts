@@ -3,6 +3,7 @@ import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { z } from 'zod';
 import type {
   TaskFile,
   KaiTaskOrder,
@@ -17,8 +18,87 @@ import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
+// ── Validation Schemas ──────────────────────────────────────────────────
+
+const MAX_TITLE_LENGTH = 500;
+const MAX_DESCRIPTION_LENGTH = 50_000;
+const MAX_HISTORY_LENGTH = 200_000;
+const MAX_USER_MESSAGE_LENGTH = 50_000;
+
+const kaiTaskStatusSchema = z.enum(['todo', 'in_progress', 'blocked', 'ai_review', 'human_review', 'done']);
+
+const taskCreateSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH),
+    description: z.string().max(MAX_DESCRIPTION_LENGTH).default(''),
+    status: kaiTaskStatusSchema.default('todo'),
+    metadata: z
+      .object({
+        category: z.enum(['feature', 'bug_fix', 'refactoring', 'docs', 'other']).optional(),
+        labels: z.array(z.string().max(100)).max(20).optional(),
+        planFileName: z.string().max(200).optional(),
+        cwd: z.string().max(500).optional(),
+      })
+      .optional(),
+    sourceConversationId: z.string().max(100).optional(),
+    sourceToolCallId: z.string().max(100).optional(),
+    workspaceId: z.string().max(100).optional(),
+    assignedAgentId: z.string().max(100).optional(),
+    reviewerAgentIds: z.array(z.string().max(100)).max(10).optional(),
+    reviewMode: z.enum(['parallel', 'sequential']).optional(),
+    priority: z.number().int().min(-100).max(100).optional(),
+  })
+  .passthrough(); // allow additional fields for forward compat
+
+const taskOrderSchema = z
+  .record(
+    kaiTaskStatusSchema,
+    z
+      .array(
+        z
+          .string()
+          .regex(/^[a-f0-9-]{36}$/)
+          .max(36),
+      )
+      .max(1000),
+  )
+  .refine((obj) => {
+    // Ensure only valid status keys
+    const validKeys = new Set(['todo', 'in_progress', 'blocked', 'ai_review', 'human_review', 'done']);
+    return Object.keys(obj).every((k) => validKeys.has(k));
+  }, 'Invalid status key in order');
+
+const conversationMessageSchema = z.object({
+  role: z.enum(['user', 'assistant']),
+  content: z.string().max(MAX_HISTORY_LENGTH),
+  timestamp: z.string().optional(),
+});
+
 /** Active plan generation streams, keyed by taskId. */
 const activeTaskStreams = new Map<string, { abort: () => void }>();
+
+// ── Async Mutex ─────────────────────────────────────────────────────────
+
+/**
+ * Per-task async mutex to prevent concurrent read-modify-write races.
+ * Each task ID maps to the tail of a promise chain; new writes await the
+ * previous write before proceeding.
+ */
+const taskLocks = new Map<string, Promise<void>>();
+
+function withTaskLock<T>(taskId: string, fn: () => Promise<T> | T): Promise<T> {
+  const prev = taskLocks.get(taskId) ?? Promise.resolve();
+  const next = prev.then(fn, fn); // run fn regardless of prev success/failure
+  // Store the void-ified chain so subsequent callers wait
+  taskLocks.set(
+    taskId,
+    next.then(
+      () => {},
+      () => {},
+    ),
+  );
+  return next;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -38,6 +118,7 @@ function broadcastTaskChange(appHome: string): void {
   try {
     const tasks = listAllTasks(appHome);
     for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
       win.webContents.send('tasks:changed', tasks);
     }
   } catch (err) {
@@ -47,6 +128,7 @@ function broadcastTaskChange(appHome: string): void {
 
 function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
     win.webContents.send('tasks:stream-event', event);
   }
 }
@@ -128,6 +210,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   });
 
   ipcMain.handle('tasks:create', (_e, taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => {
+    const parsed = taskCreateSchema.safeParse(taskData);
+    if (!parsed.success) {
+      return { error: `Invalid task data: ${parsed.error.issues[0]?.message ?? 'validation failed'}` };
+    }
+
     try {
       const id = randomUUID();
       const now = new Date().toISOString();
@@ -143,41 +230,43 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle('tasks:update', (_e, id: string, updates: Partial<TaskFile>) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
-    const filePath = join(getTasksDir(appHome), `${id}.json`);
-    if (!existsSync(filePath)) {
-      return { error: `Task ${id} not found` };
-    }
-    try {
-      const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-
-      // Validate state machine transition
-      if (updates.status && existing.status !== updates.status) {
-        if (!isValidTransition(existing.status, updates.status)) {
-          return { error: `Invalid transition: ${existing.status} → ${updates.status}` };
-        }
+    return withTaskLock(id, () => {
+      const filePath = join(getTasksDir(appHome), `${id}.json`);
+      if (!existsSync(filePath)) {
+        return { error: `Task ${id} not found` };
       }
+      try {
+        const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
 
-      // Don't bump updatedAt for operational/bookkeeping-only fields.
-      // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
-      const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
-        'terminalSessionId',
-        'startedAt',
-        'completedAt',
-        'archivedAt',
-      ];
-      const isMeaningful = Object.keys(updates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
-      const updated: TaskFile = {
-        ...existing,
-        ...updates,
-        id, // prevent ID mutation
-        ...(isMeaningful && { updatedAt: new Date().toISOString() }),
-      };
-      writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
-      broadcastTaskChange(appHome);
-      return updated;
-    } catch {
-      return { error: `Failed to update task ${id}` };
-    }
+        // Validate state machine transition
+        if (updates.status && existing.status !== updates.status) {
+          if (!isValidTransition(existing.status, updates.status)) {
+            return { error: `Invalid transition: ${existing.status} → ${updates.status}` };
+          }
+        }
+
+        // Don't bump updatedAt for operational/bookkeeping-only fields.
+        // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
+        const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
+          'terminalSessionId',
+          'startedAt',
+          'completedAt',
+          'archivedAt',
+        ];
+        const isMeaningful = Object.keys(updates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
+        const updated: TaskFile = {
+          ...existing,
+          ...updates,
+          id, // prevent ID mutation
+          ...(isMeaningful && { updatedAt: new Date().toISOString() }),
+        };
+        writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+        broadcastTaskChange(appHome);
+        return updated;
+      } catch {
+        return { error: `Failed to update task ${id}` };
+      }
+    }); // end withTaskLock
   });
 
   ipcMain.handle('tasks:unarchive', (_e, id: string) => {
@@ -215,36 +304,38 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
 
   ipcMain.handle('tasks:kick-back', (_e, id: string, reason: string, source: 'ai' | 'human') => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
-    const filePath = join(getTasksDir(appHome), `${id}.json`);
-    if (!existsSync(filePath)) return { error: `Task ${id} not found` };
+    return withTaskLock(id, () => {
+      const filePath = join(getTasksDir(appHome), `${id}.json`);
+      if (!existsSync(filePath)) return { error: `Task ${id} not found` };
 
-    try {
-      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      try {
+        const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
 
-      // Only allow kick-back from review statuses
-      if (task.status !== 'ai_review' && task.status !== 'human_review') {
-        return { error: `Cannot kick back from status: ${task.status}` };
+        // Only allow kick-back from review statuses
+        if (task.status !== 'ai_review' && task.status !== 'human_review') {
+          return { error: `Cannot kick back from status: ${task.status}` };
+        }
+
+        // Add the review note
+        const note: TaskReviewNote = {
+          source,
+          content: reason,
+          timestamp: new Date().toISOString(),
+          fromStatus: task.status,
+        };
+        if (!task.reviewNotes) task.reviewNotes = [];
+        task.reviewNotes.push(note);
+
+        // Move back to in_progress
+        task.status = 'in_progress';
+        task.updatedAt = new Date().toISOString();
+        writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+        broadcastTaskChange(appHome);
+        return { ok: true };
+      } catch (err) {
+        return { error: String(err) };
       }
-
-      // Add the review note
-      const note: TaskReviewNote = {
-        source,
-        content: reason,
-        timestamp: new Date().toISOString(),
-        fromStatus: task.status,
-      };
-      if (!task.reviewNotes) task.reviewNotes = [];
-      task.reviewNotes.push(note);
-
-      // Move back to in_progress
-      task.status = 'in_progress';
-      task.updatedAt = new Date().toISOString();
-      writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
-      broadcastTaskChange(appHome);
-      return { ok: true };
-    } catch (err) {
-      return { error: String(err) };
-    }
+    }); // end withTaskLock
   });
 
   // ── Column ordering ────────────────────────────────────────────────
@@ -260,6 +351,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   });
 
   ipcMain.handle('tasks:save-order', (_e, order: KaiTaskOrder) => {
+    const parsed = taskOrderSchema.safeParse(order);
+    if (!parsed.success) {
+      return { error: `Invalid order data: ${parsed.error.issues[0]?.message ?? 'validation failed'}` };
+    }
+
     try {
       writeFileSync(join(getTasksDir(appHome), 'order.json'), JSON.stringify(order, null, 2), 'utf-8');
       return { ok: true };
@@ -274,6 +370,28 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   ipcMain.handle(
     'tasks:stream-plan',
     async (_e, taskId: string, userMessage: string, existingHistory?: TaskConversationMessage[]) => {
+      // Validate taskId to prevent path traversal
+      if (!isValidTaskId(taskId)) {
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', error: 'Invalid task ID' });
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done' });
+        return { taskId };
+      }
+
+      if (!userMessage || typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
+        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        return { taskId };
+      }
+
+      if (existingHistory) {
+        const historyCheck = z.array(conversationMessageSchema).max(100).safeParse(existingHistory);
+        if (!historyCheck.success) {
+          broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Invalid conversation history' });
+          broadcastTaskStreamEvent({ taskId, type: 'done' });
+          return { taskId };
+        }
+      }
+
       // Cancel any existing stream for this task
       const existing = activeTaskStreams.get(taskId);
       if (existing) existing.abort();
@@ -387,6 +505,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string): void {
   // ── AI title generation ─────────────────────────────────────────────
 
   ipcMain.handle('tasks:generate-title', async (_e, userMessage: string) => {
+    if (!userMessage || typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
+      return { title: null };
+    }
+
     let config: AppConfig;
     try {
       const { readEffectiveConfig } = await import('./config.js');

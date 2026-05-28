@@ -50,13 +50,19 @@ export class TaskTerminalManager {
       rows?: number;
       customArgs?: string[];
       env?: Record<string, string>;
+      /** When true, pass --dangerously-* flags to CLI agents. Defaults to false. */
+      dangerousMode?: boolean;
     },
   ): Promise<string> {
     // Dynamic import so a missing native build doesn't crash the whole app
     const pty = await import('@lydell/node-pty');
 
+    // Validate runtime against allowlist
+    const ALLOWED_RUNTIMES = ['claude-code', 'codex', 'mastra'];
+    const runtime = ALLOWED_RUNTIMES.includes(options.runtime) ? options.runtime : 'shell';
+
     const sessionId = randomUUID();
-    const shell = this.getShellCommand(options.runtime, options.customArgs);
+    const shell = this.getShellCommand(runtime, options.customArgs, options.dangerousMode ?? false);
 
     const proc = pty.spawn(shell.command, shell.args, {
       name: 'xterm-256color',
@@ -95,7 +101,14 @@ export class TaskTerminalManager {
   }
 
   write(sessionId: string, data: string): void {
-    this.terminals.get(sessionId)?.process.write(data);
+    const term = this.terminals.get(sessionId);
+    if (!term) throw new Error(`Terminal session ${sessionId} not found`);
+    term.process.write(data);
+  }
+
+  /** Returns true if a terminal session is still alive and tracked. */
+  isAlive(sessionId: string): boolean {
+    return this.terminals.has(sessionId);
   }
 
   resize(sessionId: string, cols: number, rows: number): void {
@@ -151,17 +164,21 @@ export class TaskTerminalManager {
     this.exitCallbacks.clear();
   }
 
-  private getShellCommand(runtime: string, customArgs?: string[]): { command: string; args: string[] } {
+  private getShellCommand(
+    runtime: string,
+    customArgs?: string[],
+    dangerousMode?: boolean,
+  ): { command: string; args: string[] } {
     switch (runtime) {
       case 'claude-code':
         return {
           command: 'claude',
-          args: ['--dangerously-skip-permissions', ...(customArgs ?? [])],
+          args: [...(dangerousMode ? ['--dangerously-skip-permissions'] : []), ...(customArgs ?? [])],
         };
       case 'codex':
         return {
           command: 'codex',
-          args: ['--dangerously-bypass-approvals-and-sandbox', ...(customArgs ?? [])],
+          args: [...(dangerousMode ? ['--dangerously-bypass-approvals-and-sandbox'] : []), ...(customArgs ?? [])],
         };
       case 'mastra':
         // Mastra as a terminal agent: use the shell and let the task description
@@ -182,6 +199,7 @@ export class TaskTerminalManager {
 
   private broadcast(channel: string, data: unknown): void {
     for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
       win.webContents.send(channel, data);
     }
   }
@@ -194,7 +212,16 @@ export function registerTaskTerminalHandlers(ipcMain: IpcMain, terminalManager: 
     'tasks:terminal-create',
     async (_e, taskId: string, options: { runtime: string; cwd?: string; cols?: number; rows?: number }) => {
       try {
-        const sessionId = await terminalManager.create(taskId, options);
+        // Only allow safe options from renderer — strip dangerous fields
+        // (IPC JSON deserialization doesn't enforce TypeScript types, so extra
+        // properties like dangerousMode or customArgs could be smuggled in)
+        const safeOptions = {
+          runtime: options.runtime,
+          cwd: options.cwd,
+          cols: options.cols,
+          rows: options.rows,
+        };
+        const sessionId = await terminalManager.create(taskId, safeOptions);
         return { sessionId };
       } catch (err) {
         return { error: String(err) };

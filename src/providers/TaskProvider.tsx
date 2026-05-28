@@ -316,8 +316,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       if (status === 'done') {
         await updateTask(id, { status, completedAt: now });
         return;
-        await updateTask(id, { status, completedAt: now });
-        return;
       }
       // Stamp startedAt on first transition to in_progress
       if (status === 'in_progress' && !task?.startedAt) {
@@ -395,18 +393,21 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         );
         return;
       }
-      // Optimistic status update
-      const statusUpdates: Partial<TaskFile> =
-        targetStatus === 'done'
-          ? (() => {
-              const task = state.tasks.find((t) => t.id === taskId);
-              if (task?.terminalSessionId) {
-                void app.tasks.terminalKill(task.terminalSessionId);
-                return { status: targetStatus, terminalSessionId: undefined };
-              }
-              return { status: targetStatus };
-            })()
-          : { status: targetStatus };
+      // Build status updates with proper timestamps
+      const now = new Date().toISOString();
+      const task = state.tasks.find((t) => t.id === taskId);
+      const statusUpdates: Partial<TaskFile> = { status: targetStatus };
+
+      if (targetStatus === 'done') {
+        statusUpdates.completedAt = now;
+        if (task?.terminalSessionId) {
+          void app.tasks.terminalKill(task.terminalSessionId);
+          statusUpdates.terminalSessionId = undefined;
+        }
+      }
+      if (targetStatus === 'in_progress' && !task?.startedAt) {
+        statusUpdates.startedAt = now;
+      }
 
       dispatch({ type: 'UPDATE_TASK', id: taskId, updates: statusUpdates });
 

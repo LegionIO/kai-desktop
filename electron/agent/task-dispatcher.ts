@@ -14,6 +14,8 @@
 import type { AgentFile, AgentRole } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
 
+const TICK_TIMEOUT_MS = 120_000; // 2 minutes max per tick
+
 // ── Public types ─────────────────────────────────────────────────────────
 
 export interface DispatcherConfig {
@@ -72,6 +74,8 @@ export interface DispatcherDeps {
   ) => Promise<{ sessionId?: string; error?: string }> | { sessionId?: string; error?: string };
   /** Returns the latest dispatcher config from app config. */
   getConfig: () => DispatcherConfig | null | undefined;
+  /** Rollback assignment on start failure. */
+  unassignTask?: (agentId: string, taskId: string) => Promise<void> | void;
   /** Optional broadcast callback fired whenever state changes. */
   broadcastState?: (state: TaskDispatcherState) => void;
 }
@@ -368,107 +372,19 @@ export class TaskDispatcher {
     if (this.tickInFlight) return [];
     this.tickInFlight = true;
     const decisions: DispatchDecision[] = [];
+    let aborted = false;
+
+    const deadline = new Promise<never>((_, reject) =>
+      setTimeout(() => {
+        aborted = true;
+        reject(new Error('tick timeout'));
+      }, TICK_TIMEOUT_MS),
+    );
 
     try {
-      // Re-read config each tick so external changes take effect.
-      const fresh = this.deps.getConfig();
-      if (fresh) {
-        this.config = { ...this.config, ...fresh };
-      }
-
-      const tasks = await this.deps.listTasks();
-      const agents = await this.deps.listAgents();
-
-      const running = agents.filter((a) => a.status === 'running');
-      const slotsAvailable = Math.max(0, this.config.maxConcurrentAgents - running.length);
-      if (slotsAvailable === 0) {
-        this.lastTickAt = new Date().toISOString();
-        this.broadcast();
-        return decisions;
-      }
-
-      const candidateTasks = tasks
-        .filter((t) => t.status === 'todo' && !t.assignedAgentId && !t.archivedAt)
-        .sort((a, b) => {
-          const pa = a.priority ?? 0;
-          const pb = b.priority ?? 0;
-          if (pa !== pb) return pb - pa; // higher priority first
-          return a.createdAt.localeCompare(b.createdAt); // older first
-        });
-
-      const candidateAgents = agents.filter((a) => a.status === 'idle' && !a.currentTaskId);
-
-      if (candidateTasks.length === 0 || candidateAgents.length === 0) {
-        this.lastTickAt = new Date().toISOString();
-        this.broadcast();
-        return decisions;
-      }
-
-      // Score every (task, agent) pair.
-      type Pair = { task: TaskFile; agent: AgentFile; score: number; reason: string };
-      const pairs: Pair[] = [];
-      for (const task of candidateTasks) {
-        for (const agent of candidateAgents) {
-          const result =
-            this.config.matchingStrategy === 'ai-scored' ? await scoreAi(task, agent) : scoreSimple(task, agent);
-          pairs.push({ task, agent, score: result.score, reason: result.reason });
-        }
-      }
-      pairs.sort((a, b) => b.score - a.score);
-
-      // Greedy assignment — each task and agent used at most once.
-      const usedTasks = new Set<string>();
-      const usedAgents = new Set<string>();
-      let remainingSlots = slotsAvailable;
-
-      for (const pair of pairs) {
-        if (remainingSlots <= 0) break;
-        if (usedTasks.has(pair.task.id) || usedAgents.has(pair.agent.id)) continue;
-
-        const decision: DispatchDecision = {
-          at: new Date().toISOString(),
-          taskId: pair.task.id,
-          agentId: pair.agent.id,
-          taskTitle: pair.task.title,
-          agentName: pair.agent.name,
-          score: pair.score,
-          reason: pair.reason,
-          assigned: false,
-          started: false,
-        };
-
-        try {
-          const assignResult = await this.deps.assignTask(pair.agent.id, pair.task.id);
-          if (assignResult && typeof assignResult === 'object' && 'error' in assignResult && assignResult.error) {
-            decision.error = String(assignResult.error);
-          } else {
-            decision.assigned = true;
-            usedTasks.add(pair.task.id);
-            usedAgents.add(pair.agent.id);
-            remainingSlots -= 1;
-          }
-        } catch (err) {
-          decision.error = `assign threw: ${String(err)}`;
-        }
-
-        if (decision.assigned && this.config.autoStart) {
-          try {
-            const startResult = await this.deps.startAgent(pair.agent.id);
-            if (startResult && 'error' in startResult && startResult.error) {
-              decision.error = `start failed: ${startResult.error}`;
-            } else if (startResult && 'sessionId' in startResult && startResult.sessionId) {
-              decision.started = true;
-            }
-          } catch (err) {
-            decision.error = `start threw: ${String(err)}`;
-          }
-        }
-
-        decisions.push(decision);
-        this.recordDecision(decision);
-      }
+      await Promise.race([this.tickBody(decisions, () => aborted), deadline]);
     } catch (err) {
-      console.error('[task-dispatcher] Tick failed:', err);
+      if (!aborted) console.error('[task-dispatcher] Tick failed:', err);
     } finally {
       this.lastTickAt = new Date().toISOString();
       this.tickInFlight = false;
@@ -476,6 +392,147 @@ export class TaskDispatcher {
     }
 
     return decisions;
+  }
+
+  private async tickBody(decisions: DispatchDecision[], isAborted: () => boolean): Promise<void> {
+    // Re-read config each tick so external changes take effect.
+    const fresh = this.deps.getConfig();
+    if (fresh) {
+      this.config = { ...this.config, ...fresh };
+    }
+
+    const tasks = await this.deps.listTasks();
+    const agents = await this.deps.listAgents();
+
+    const running = agents.filter((a) => a.status === 'running');
+    const slotsAvailable = Math.max(0, this.config.maxConcurrentAgents - running.length);
+    if (slotsAvailable === 0) {
+      return;
+    }
+
+    const candidateTasks = tasks
+      .filter((t) => t.status === 'todo' && !t.assignedAgentId && !t.archivedAt)
+      .sort((a, b) => {
+        const pa = a.priority ?? 0;
+        const pb = b.priority ?? 0;
+        if (pa !== pb) return pb - pa; // higher priority first
+        return a.createdAt.localeCompare(b.createdAt); // older first
+      });
+
+    const candidateAgents = agents.filter((a) => a.status === 'idle' && !a.currentTaskId);
+
+    // Also pick up in_progress tasks whose assigned agent is idle (review rejection retry)
+    const retryTasks = tasks
+      .filter((t) => t.status === 'in_progress' && t.assignedAgentId && !t.archivedAt)
+      .filter((t) => {
+        const agent = agents.find((a) => a.id === t.assignedAgentId);
+        return agent && agent.status === 'idle';
+      });
+
+    if ((candidateTasks.length === 0 && retryTasks.length === 0) || candidateAgents.length === 0) {
+      return;
+    }
+
+    // Score every (task, agent) pair.
+    type Pair = { task: TaskFile; agent: AgentFile; score: number; reason: string };
+    const pairs: Pair[] = [];
+    for (const task of candidateTasks) {
+      if (isAborted()) break;
+      for (const agent of candidateAgents) {
+        if (isAborted()) break;
+        const result =
+          this.config.matchingStrategy === 'ai-scored' ? await scoreAi(task, agent) : scoreSimple(task, agent);
+        pairs.push({ task, agent, score: result.score, reason: result.reason });
+      }
+    }
+
+    if (isAborted()) return;
+
+    // Score retry tasks with their already-assigned agent (high priority)
+    for (const task of retryTasks) {
+      if (isAborted()) break;
+      const agent = candidateAgents.find((a) => a.id === task.assignedAgentId);
+      if (agent) {
+        pairs.push({ task, agent, score: 0.9, reason: 'review-retry: pre-assigned agent' });
+      }
+    }
+
+    if (isAborted()) return;
+
+    pairs.sort((a, b) => b.score - a.score);
+
+    // Greedy assignment — each task and agent used at most once.
+    const usedTasks = new Set<string>();
+    const usedAgents = new Set<string>();
+    let remainingSlots = slotsAvailable;
+
+    for (const pair of pairs) {
+      if (isAborted()) break;
+      if (remainingSlots <= 0) break;
+      if (usedTasks.has(pair.task.id) || usedAgents.has(pair.agent.id)) continue;
+
+      const decision: DispatchDecision = {
+        at: new Date().toISOString(),
+        taskId: pair.task.id,
+        agentId: pair.agent.id,
+        taskTitle: pair.task.title,
+        agentName: pair.agent.name,
+        score: pair.score,
+        reason: pair.reason,
+        assigned: false,
+        started: false,
+      };
+
+      try {
+        const assignResult = await this.deps.assignTask(pair.agent.id, pair.task.id);
+        if (assignResult && typeof assignResult === 'object' && 'error' in assignResult && assignResult.error) {
+          decision.error = String(assignResult.error);
+        } else {
+          decision.assigned = true;
+          usedTasks.add(pair.task.id);
+          usedAgents.add(pair.agent.id);
+          remainingSlots -= 1;
+        }
+      } catch (err) {
+        decision.error = `assign threw: ${String(err)}`;
+      }
+
+      if (decision.assigned && this.config.autoStart) {
+        try {
+          const startResult = await this.deps.startAgent(pair.agent.id);
+          if (startResult && 'error' in startResult && startResult.error) {
+            decision.error = `start failed: ${startResult.error}`;
+            // Rollback: unassign so dispatcher can retry next tick
+            if (this.deps.unassignTask) {
+              try {
+                await this.deps.unassignTask(pair.agent.id, pair.task.id);
+              } catch {}
+            }
+            usedTasks.delete(pair.task.id);
+            usedAgents.delete(pair.agent.id);
+            remainingSlots += 1;
+            decision.assigned = false;
+          } else if (startResult && 'sessionId' in startResult && startResult.sessionId) {
+            decision.started = true;
+          }
+        } catch (err) {
+          decision.error = `start threw: ${String(err)}`;
+          // Rollback: unassign so dispatcher can retry next tick
+          if (this.deps.unassignTask) {
+            try {
+              await this.deps.unassignTask(pair.agent.id, pair.task.id);
+            } catch {}
+          }
+          usedTasks.delete(pair.task.id);
+          usedAgents.delete(pair.agent.id);
+          remainingSlots += 1;
+          decision.assigned = false;
+        }
+      }
+
+      decisions.push(decision);
+      this.recordDecision(decision);
+    }
   }
 
   private recordDecision(decision: DispatchDecision): void {

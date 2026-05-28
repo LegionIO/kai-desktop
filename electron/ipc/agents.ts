@@ -13,6 +13,7 @@ import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
 import type { TaskFile, TaskReviewResult } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { analyzeCompletion as analyzeCompletionCore } from '../agent/task-completion.js';
 import { z } from 'zod';
 import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
@@ -109,6 +110,7 @@ function broadcastAgentChange(appHome: string): void {
   try {
     const agents = listAllAgents(appHome);
     for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
       win.webContents.send('agents:changed', agents);
     }
   } catch (err) {
@@ -120,6 +122,7 @@ function broadcastTaskChange(appHome: string): void {
   try {
     const tasks = listAllTasks(appHome);
     for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
       win.webContents.send('tasks:changed', tasks);
     }
   } catch (err) {
@@ -165,6 +168,7 @@ async function runSingleReviewer(
   const broadcast = (text: string) => {
     appendOutput(virtualSessionId, text);
     for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue;
       win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
     }
   };
@@ -333,6 +337,7 @@ async function runSingleReviewer(
 
   // Broadcast terminal exit for this reviewer's session
   for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
     win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
   }
 
@@ -417,37 +422,39 @@ async function startReviewProcess(appHome: string, task: TaskFile): Promise<void
 }
 
 /**
- * Decide what state a task should land in once its agent terminal has exited.
+ * Wrapper around the consolidated task-completion module.
  *
- * Exit code conventions:
- *   - 0           → clean exit (success)
- *   - 124         → timeout (treated as crash by convention)
- *   - >1 or <0    → crash / abnormal termination
- *   - 1           → soft failure; treat as needing human review
- *   - undefined   → terminal vanished without an exit code recorded
+ * Handles the `undefined` exit code case (terminal vanished) and adapts the
+ * new pipeline's result shape for callers that expect `{ nextStatus, isCrash }`.
  */
 function analyzeCompletion(
   exitCode: number | undefined,
-  options: { requireHumanReview?: boolean },
-): { nextStatus: 'human_review' | 'done'; isCrash: boolean } {
+  options: {
+    requireHumanReview?: boolean;
+    reviewerAgentIds?: string[];
+    retryCount?: number;
+  },
+): { nextStatus: string; isCrash: boolean; shouldRetry?: boolean; blockedReason?: string } {
   if (exitCode === undefined) {
     // Unknown — be conservative and route to human review.
     return { nextStatus: 'human_review', isCrash: false };
   }
-  if (exitCode === 124) {
-    return { nextStatus: 'human_review', isCrash: true };
-  }
-  if (exitCode > 1 || exitCode < 0) {
-    return { nextStatus: 'human_review', isCrash: true };
-  }
-  if (exitCode === 0) {
-    return {
-      nextStatus: options.requireHumanReview ? 'human_review' : 'done',
-      isCrash: false,
-    };
-  }
-  // exitCode === 1 — soft failure, hand to a human.
-  return { nextStatus: 'human_review', isCrash: false };
+  const result = analyzeCompletionCore(
+    exitCode,
+    {} as never, // agent (unused in new impl)
+    {} as never, // task (unused in new impl)
+    {
+      requireHumanReview: options.requireHumanReview ?? false,
+      reviewerAgentIds: options.reviewerAgentIds,
+      retryCount: options.retryCount,
+    },
+  );
+  return {
+    nextStatus: result.nextStatus,
+    isCrash: result.wasCrash ?? false,
+    shouldRetry: result.shouldRetry,
+    blockedReason: result.blockedReason,
+  };
 }
 
 /** Returns true if the same calendar day in UTC. */
@@ -549,6 +556,9 @@ export async function startAgentRun(
   // then run the task through streamAgentResponse.
   if (effectiveRuntime === 'mastra') {
     const virtualSessionId = `mastra-${randomUUID()}`;
+    console.info(
+      `[Agent:task] Starting Mastra agent "${agent.name}" on task "${task.title}" session=${virtualSessionId}`,
+    );
 
     agent.status = 'running';
     agent.terminalSessionId = virtualSessionId;
@@ -572,6 +582,7 @@ export async function startAgentRun(
     const broadcast = (text: string) => {
       appendOutput(virtualSessionId, text);
       for (const win of BrowserWindow.getAllWindows()) {
+        if (win.isDestroyed()) continue;
         win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
       }
     };
@@ -624,7 +635,7 @@ export async function startAgentRun(
     mastraAbortControllers.set(virtualSessionId, abortController);
 
     void (async () => {
-      let hasError = false;
+      let _hasError = false;
       try {
         // Resolve the model using the same catalog resolution as the main chat
         // This ensures correct provider endpoint, API key, and TLS settings
@@ -638,7 +649,7 @@ export async function startAgentRun(
           broadcast(
             `\r\n\x1b[1;31m[Error]\x1b[0m No model configured. Please set a default model in Settings → Models.\r\n`,
           );
-          hasError = true;
+          _hasError = true;
           return;
         }
 
@@ -664,6 +675,7 @@ export async function startAgentRun(
               const { summary } = input as { summary: string };
               const t = readTask(appHome, task.id);
               if (t && t.status === 'in_progress') {
+                console.info(`[Agent:task] promote_task called for "${t.title}" summary="${summary?.slice(0, 80)}..."`);
                 t.completionSummary = summary;
                 t.updatedAt = new Date().toISOString();
 
@@ -697,6 +709,7 @@ export async function startAgentRun(
                 const ag = readAgent(appHome, agentId);
                 if (ag && ag.status === 'running') {
                   ag.status = 'idle';
+                  ag.currentTaskId = undefined;
                   ag.stats.tasksCompleted = (ag.stats.tasksCompleted ?? 0) + 1;
                   ag.updatedAt = new Date().toISOString();
                   writeAgent(appHome, ag);
@@ -725,6 +738,8 @@ export async function startAgentRun(
               const { reason } = input as { reason: string };
               const t = readTask(appHome, task.id);
               if (t) {
+                console.info(`[Agent:task] block_task called for "${t.title}" reason="${reason?.slice(0, 80)}"`);
+
                 t.status = 'blocked';
                 if (!t.reviewNotes) t.reviewNotes = [];
                 t.reviewNotes.push({
@@ -741,6 +756,7 @@ export async function startAgentRun(
                 const ag = readAgent(appHome, agentId);
                 if (ag && ag.status === 'running') {
                   ag.status = 'idle';
+                  ag.currentTaskId = undefined;
                   ag.updatedAt = new Date().toISOString();
                   writeAgent(appHome, ag);
                   broadcastAgentChange(appHome);
@@ -814,7 +830,7 @@ export async function startAgentRun(
         broadcast(`\r\n\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
         broadcast(`\x1b[1;32m[Mastra Agent]\x1b[0m Task completed.\r\n`);
       } catch (err) {
-        hasError = true;
+        _hasError = true;
         // Check if this was an intentional abort (user clicked Stop)
         if (abortController.signal.aborted) {
           broadcast(`\r\n\x1b[1;33m[Mastra Agent]\x1b[0m Stopped by user.\r\n`);
@@ -830,10 +846,16 @@ export async function startAgentRun(
         // Mark agent idle (if promote_task/block_task didn't already do it)
         const freshAgent = readAgent(appHome, agentId);
         if (freshAgent && freshAgent.status === 'running') {
+          console.info(
+            `[Agent:task] Mastra stream ended, marking agent "${freshAgent.name}" idle (promote/block not called)`,
+          );
           freshAgent.status = 'idle';
+          freshAgent.currentTaskId = undefined;
           freshAgent.terminalSessionId = undefined;
           freshAgent.updatedAt = new Date().toISOString();
           writeAgent(appHome, freshAgent);
+        } else {
+          console.info(`[Agent:task] Mastra stream ended, agent already idle/stopped (status=${freshAgent?.status})`);
         }
 
         // Don't touch task status — promote_task/block_task handle that.
@@ -843,6 +865,7 @@ export async function startAgentRun(
 
         // Broadcast terminal exit so the UI knows it's done
         for (const win of BrowserWindow.getAllWindows()) {
+          if (win.isDestroyed()) continue;
           win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
         }
 
@@ -854,14 +877,21 @@ export async function startAgentRun(
     return { sessionId: virtualSessionId };
   }
 
+  const config = readEffectiveConfig(appHome);
+  const dangerousMode = config?.autopilot?.dangerousMode === true;
+
+  // Filter out any --dangerously-* flags that a renderer might try to inject
+  const safeArgs = (agent.config?.customArgs ?? []).filter((arg: string) => !arg.startsWith('--dangerously'));
+
   try {
     const sessionId = await terminalManager.create(agent.currentTaskId, {
       runtime: effectiveRuntime,
       cwd,
       cols: 120,
       rows: 30,
-      customArgs: agent.config.customArgs,
+      customArgs: safeArgs,
       env: agent.config.env,
+      dangerousMode,
     });
 
     agent.status = 'running';
@@ -894,15 +924,31 @@ export async function startAgentRun(
 
     // Register immediate exit callback for fast reconciliation
     terminalManager.onSessionExit(sessionId, (exitCode: number) => {
+      console.info(`[Agent:task] PTY exit code=${exitCode} session=${sessionId} agent=${agentId}`);
       const freshAgent = readAgent(appHome, agentId);
       if (!freshAgent || freshAgent.status !== 'running') return;
 
+      // Read task to get reviewerAgentIds and retryCount for the completion pipeline
+      const completedTaskId = freshAgent.currentTaskId;
+      const exitTask = completedTaskId ? readTask(appHome, completedTaskId) : null;
+
+      // Determine requireHumanReview: agent-level override takes priority, then app config (default true)
+      const appConfig = readEffectiveConfig(appHome);
+      const agentRequiresReview = (freshAgent.config as { requireHumanReview?: boolean } | undefined)
+        ?.requireHumanReview;
       const requireHumanReview =
-        (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
-      const { nextStatus, isCrash } = analyzeCompletion(exitCode, { requireHumanReview });
+        agentRequiresReview !== undefined ? agentRequiresReview : (appConfig?.autopilot?.requireHumanReview ?? true);
+      const { nextStatus, isCrash, shouldRetry, blockedReason } = analyzeCompletion(exitCode, {
+        requireHumanReview,
+        reviewerAgentIds: exitTask?.reviewerAgentIds,
+        retryCount: exitTask?.retryCount,
+      });
 
       freshAgent.terminalSessionId = undefined;
       freshAgent.updatedAt = new Date().toISOString();
+
+      // Clear currentTaskId so the dispatcher considers this agent eligible again
+      freshAgent.currentTaskId = undefined;
 
       if (isCrash) {
         const now = new Date();
@@ -916,20 +962,37 @@ export async function startAgentRun(
         freshAgent.status = freshAgent.stats.crashCount >= cap ? 'error' : 'idle';
       } else {
         freshAgent.status = 'idle';
-        freshAgent.stats.tasksCompleted += 1;
+        if (!shouldRetry) freshAgent.stats.tasksCompleted += 1;
       }
       writeAgent(appHome, freshAgent);
 
-      if (freshAgent.currentTaskId) {
-        const exitTask = readTask(appHome, freshAgent.currentTaskId);
-        if (exitTask) {
-          const taskNow = new Date().toISOString();
-          exitTask.status = nextStatus;
-          // Keep terminalSessionId so the UI can replay buffered output
+      if (completedTaskId && exitTask) {
+        const taskNow = new Date().toISOString();
+        if (shouldRetry) {
+          // Timeout auto-retry: increment retryCount, keep in_progress
+          exitTask.retryCount = (exitTask.retryCount ?? 0) + 1;
+          exitTask.updatedAt = taskNow;
+        } else {
+          exitTask.status = nextStatus as typeof exitTask.status;
           exitTask.updatedAt = taskNow;
           if (nextStatus === 'done') exitTask.completedAt = taskNow;
-          writeTask(appHome, exitTask);
-          broadcastTaskChange(appHome);
+          if (nextStatus === 'blocked' && blockedReason) {
+            if (!exitTask.reviewNotes) exitTask.reviewNotes = [];
+            exitTask.reviewNotes.push({
+              source: 'ai',
+              content: blockedReason,
+              timestamp: taskNow,
+              fromStatus: 'in_progress',
+            });
+          }
+        }
+        exitTask.lastExitCode = exitCode;
+        writeTask(appHome, exitTask);
+        broadcastTaskChange(appHome);
+
+        // Kick off AI review process if task transitioned to ai_review
+        if (nextStatus === 'ai_review' && exitTask.reviewerAgentIds && exitTask.reviewerAgentIds.length > 0) {
+          void startReviewProcess(appHome, exitTask);
         }
       }
       broadcastAgentChange(appHome);
@@ -1112,15 +1175,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
       terminalManager.kill(agent.terminalSessionId);
     }
 
-    // Force agent to idle
+    // Capture currentTaskId before clearing — we need it for task cleanup below
+    const taskId = agent.currentTaskId;
+
+    // Force agent to idle and clear task assignment
     agent.status = 'idle';
+    agent.currentTaskId = undefined;
     agent.terminalSessionId = undefined;
     agent.updatedAt = new Date().toISOString();
     writeAgent(appHome, agent);
 
     // Update task: clear terminal, move to human_review if in_progress
-    if (agent.currentTaskId) {
-      const task = readTask(appHome, agent.currentTaskId);
+    if (taskId) {
+      const task = readTask(appHome, taskId);
       if (task) {
         task.terminalSessionId = undefined;
         if (task.status === 'in_progress') {
@@ -1200,68 +1267,99 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     const agents = listAllAgents(appHome);
     for (const agent of agents) {
       if (agent.status === 'running' && agent.terminalSessionId) {
-        // The terminal manager removes entries on exit, so if write throws
-        // or does nothing on a missing session, the terminal is gone.
-        try {
-          terminalManager.write(agent.terminalSessionId, '');
-        } catch {
-          // Terminal is gone — read fresh agent state and reconcile.
-          const freshAgent = readAgent(appHome, agent.id);
-          if (!freshAgent || freshAgent.status !== 'running') continue;
+        // Skip Mastra virtual sessions — they're not real PTYs and are never
+        // registered in the terminal manager. Their lifecycle is managed by
+        // the async IIFE in startAgentRun, not the reconciler.
+        if (agent.terminalSessionId.startsWith('mastra-')) continue;
 
-          const sessionId = freshAgent.terminalSessionId;
-          const exitCode = sessionId ? terminalManager.consumeExitCode(sessionId) : undefined;
+        // Check if the terminal session is still alive. If not, the process
+        // has exited and we need to reconcile the agent/task state.
+        if (terminalManager.isAlive(agent.terminalSessionId)) continue;
 
-          // Optional per-agent override: route every completion through human review.
-          const requireHumanReview =
-            (freshAgent.config as { requireHumanReview?: boolean } | undefined)?.requireHumanReview === true;
+        console.info(
+          `[Reconciler] Agent "${agent.name}" (${agent.id}) terminal ${agent.terminalSessionId} is dead, reconciling`,
+        );
 
-          const { nextStatus, isCrash } = analyzeCompletion(exitCode, {
-            requireHumanReview,
-          });
+        // Terminal is gone — read fresh agent state and reconcile.
+        const freshAgent = readAgent(appHome, agent.id);
+        if (!freshAgent || freshAgent.status !== 'running') continue;
 
-          // Update agent
-          freshAgent.terminalSessionId = undefined;
-          freshAgent.updatedAt = new Date().toISOString();
+        const sessionId = freshAgent.terminalSessionId;
+        const exitCode = sessionId ? terminalManager.consumeExitCode(sessionId) : undefined;
 
-          if (isCrash) {
-            const now = new Date();
-            // Reset crash counter at UTC day boundary
-            if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
-              freshAgent.stats.crashCount = 0;
-            }
-            freshAgent.stats.crashCount += 1;
-            freshAgent.stats.lastCrashAt = now.toISOString();
+        // Determine requireHumanReview: agent-level override takes priority, then app config (default true)
+        const appConfig = readEffectiveConfig(appHome);
+        const agentRequiresReview = (freshAgent.config as { requireHumanReview?: boolean } | undefined)
+          ?.requireHumanReview;
+        const requireHumanReview =
+          agentRequiresReview !== undefined ? agentRequiresReview : (appConfig?.autopilot?.requireHumanReview ?? true);
 
-            const cap = freshAgent.config.maxCrashesPerDay ?? 5;
-            if (freshAgent.stats.crashCount >= cap) {
-              freshAgent.status = 'error';
-            } else {
-              freshAgent.status = 'idle';
-            }
+        // Read task for completion pipeline context
+        const completedTaskId = freshAgent.currentTaskId;
+        const exitTask = completedTaskId ? readTask(appHome, completedTaskId) : null;
+
+        const { nextStatus, isCrash, shouldRetry, blockedReason } = analyzeCompletion(exitCode, {
+          requireHumanReview,
+          reviewerAgentIds: exitTask?.reviewerAgentIds,
+          retryCount: exitTask?.retryCount,
+        });
+
+        // Update agent
+        freshAgent.terminalSessionId = undefined;
+        freshAgent.currentTaskId = undefined;
+        freshAgent.updatedAt = new Date().toISOString();
+
+        if (isCrash) {
+          const now = new Date();
+          // Reset crash counter at UTC day boundary
+          if (!isSameUtcDay(freshAgent.stats.lastCrashAt, now)) {
+            freshAgent.stats.crashCount = 0;
+          }
+          freshAgent.stats.crashCount += 1;
+          freshAgent.stats.lastCrashAt = now.toISOString();
+
+          const cap = freshAgent.config.maxCrashesPerDay ?? 5;
+          if (freshAgent.stats.crashCount >= cap) {
+            freshAgent.status = 'error';
           } else {
             freshAgent.status = 'idle';
-            freshAgent.stats.tasksCompleted += 1;
           }
-          writeAgent(appHome, freshAgent);
+        } else {
+          freshAgent.status = 'idle';
+          if (!shouldRetry) freshAgent.stats.tasksCompleted += 1;
+        }
+        writeAgent(appHome, freshAgent);
 
-          // Move task to next status
-          if (freshAgent.currentTaskId) {
-            const task = readTask(appHome, freshAgent.currentTaskId);
-            if (task) {
-              const taskNow = new Date().toISOString();
-              task.status = nextStatus;
-              // Keep terminalSessionId so the UI can replay buffered output
-              task.updatedAt = taskNow;
-              if (nextStatus === 'done') {
-                task.completedAt = taskNow;
-              }
-              writeTask(appHome, task);
-              broadcastTaskChange(appHome);
+        // Move task to next status
+        if (completedTaskId && exitTask) {
+          const taskNow = new Date().toISOString();
+          if (shouldRetry) {
+            exitTask.retryCount = (exitTask.retryCount ?? 0) + 1;
+            exitTask.updatedAt = taskNow;
+          } else {
+            exitTask.status = nextStatus as typeof exitTask.status;
+            exitTask.updatedAt = taskNow;
+            if (nextStatus === 'done') exitTask.completedAt = taskNow;
+            if (nextStatus === 'blocked' && blockedReason) {
+              if (!exitTask.reviewNotes) exitTask.reviewNotes = [];
+              exitTask.reviewNotes.push({
+                source: 'ai',
+                content: blockedReason,
+                timestamp: taskNow,
+                fromStatus: 'in_progress',
+              });
             }
           }
-          broadcastAgentChange(appHome);
+          exitTask.lastExitCode = exitCode ?? -1;
+          writeTask(appHome, exitTask);
+          broadcastTaskChange(appHome);
+
+          // Kick off AI review process if task transitioned to ai_review
+          if (nextStatus === 'ai_review' && exitTask.reviewerAgentIds && exitTask.reviewerAgentIds.length > 0) {
+            void startReviewProcess(appHome, exitTask);
+          }
         }
+        broadcastAgentChange(appHome);
       }
     }
   }, 5000);

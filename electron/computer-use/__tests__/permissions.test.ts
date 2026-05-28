@@ -130,7 +130,7 @@ describe('createPermissionsService factory', () => {
     const stubA = createSwiftHelperStub();
     const stubB = createSwiftHelperStub();
     const svcA = createPermissionsService({ helperRunner: stubA.runner });
-    const svcB = createPermissionsService({ helperRunner: stubB.runner });
+    const _svcB = createPermissionsService({ helperRunner: stubB.runner });
 
     stubA.setNext({ ok: true, data: { screenRecordingGranted: true } });
     await svcA.check('permissions');

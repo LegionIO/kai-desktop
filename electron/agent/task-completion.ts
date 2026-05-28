@@ -12,26 +12,33 @@ import type { KaiTaskStatus, TaskFile } from '../../shared/task-types.js';
 export interface CompletionAnalysisConfig {
   /** When true, exit-code-zero runs go to human_review rather than done. */
   requireHumanReview: boolean;
+  /** Agent IDs assigned as reviewers for this task. */
+  reviewerAgentIds?: string[];
+  /** Current retry count for the task. */
+  retryCount?: number;
 }
 
 export interface CompletionResult {
   /** What status the task should transition to. */
-  nextStatus: Exclude<KaiTaskStatus, 'todo' | 'in_progress'>;
+  nextStatus: KaiTaskStatus;
   /** True when the exit code looked like a crash (>1 or negative). */
   wasCrash?: boolean;
   /** True when the exit code looked like a timeout (124). */
   wasTimeout?: boolean;
+  /** When true, caller should restart the agent (timeout retry). */
+  shouldRetry?: boolean;
+  /** Reason string for blocked state. */
+  blockedReason?: string;
 }
 
 /**
  * Decide the post-run task status based on an agent's terminal exit code.
  *
  * Convention:
- *   - exit > 1 or exit < 0  → crash       → human_review
- *   - exit === 124          → timeout     → human_review (matches GNU `timeout`)
- *   - exit === 0 + review   → success but human review required → human_review
- *   - exit === 0 + !review  → clean success                     → done
- *   - exit === 1 (anything else nonzero) → ai_review (soft failure / retry candidate)
+ *   - exit === 124          → timeout: retry up to 2×, then block
+ *   - exit > 1 or exit < 0  → crash → blocked
+ *   - exit === 0            → success: reviewers → ai_review, else human_review or done
+ *   - exit === 1            → soft failure → ai_review (retry candidate)
  */
 export function analyzeCompletion(
   exitCode: number,
@@ -39,19 +46,33 @@ export function analyzeCompletion(
   _task: TaskFile,
   config: CompletionAnalysisConfig,
 ): CompletionResult {
+  // Timeout: auto-retry up to 2 times, then block
   if (exitCode === 124) {
-    return { nextStatus: 'human_review', wasTimeout: true };
+    const retryCount = config.retryCount ?? 0;
+    if (retryCount < 2) {
+      return { nextStatus: 'in_progress', wasTimeout: true, shouldRetry: true };
+    }
+    return { nextStatus: 'blocked', wasTimeout: true, blockedReason: `Timeout after ${retryCount + 1} attempts` };
   }
 
+  // Crash: immediately block
   if (exitCode > 1 || exitCode < 0) {
-    return { nextStatus: 'human_review', wasCrash: true };
+    return { nextStatus: 'blocked', wasCrash: true, blockedReason: `Process crashed (exit code ${exitCode})` };
   }
 
+  // Success: route through review pipeline
   if (exitCode === 0) {
-    return { nextStatus: config.requireHumanReview ? 'human_review' : 'done' };
+    // AI review takes priority when reviewers are assigned
+    if (config.reviewerAgentIds && config.reviewerAgentIds.length > 0) {
+      return { nextStatus: 'ai_review' };
+    }
+    if (config.requireHumanReview) {
+      return { nextStatus: 'human_review' };
+    }
+    return { nextStatus: 'done' };
   }
 
-  // Anything else (typically exit 1) — surface for AI/human review.
+  // Soft failure (exit 1): route to AI review for retry/analysis
   return { nextStatus: 'ai_review' };
 }
 

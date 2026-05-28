@@ -23,6 +23,7 @@ import type { TaskFile, KaiTaskStatus } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
+import { getValidManualTransitions } from '../../../shared/task-state-machine';
 
 /** Subtle status-tinted background for task cards. */
 const CARD_BG_COLORS: Record<KaiTaskStatus, string> = {
@@ -33,8 +34,6 @@ const CARD_BG_COLORS: Record<KaiTaskStatus, string> = {
   human_review: 'bg-purple-400/5',
   done: 'bg-emerald-500/5',
 };
-
-const STATUS_OPTIONS: KaiTaskStatus[] = ['todo', 'in_progress', 'blocked', 'ai_review', 'human_review', 'done'];
 
 interface TaskCardProps {
   task: TaskFile;
@@ -61,7 +60,7 @@ const itemClassName =
 export const TaskCard: FC<TaskCardProps> = memo(
   ({ task, onClick, isSelected }) => {
     const { state: agentState, assignTask, unassignTask } = useAgents();
-    const { updateTask, deleteTask } = useTasks();
+    const { updateTaskStatus, deleteTask } = useTasks();
 
     const assignedAgent = task.assignedAgentId
       ? (agentState.agents.find((a) => a.id === task.assignedAgentId) ?? null)
@@ -167,11 +166,11 @@ export const TaskCard: FC<TaskCardProps> = memo(
                   sideOffset={4}
                   className="z-50 min-w-[180px] rounded-xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                 >
-                  {STATUS_OPTIONS.filter((s) => s !== task.status).map((status) => (
+                  {getValidManualTransitions(task.status).map((status) => (
                     <ContextMenu.Item
                       key={status}
                       className={itemClassName}
-                      onSelect={() => void updateTask(task.id, { status })}
+                      onSelect={() => void updateTaskStatus(task.id, status)}
                     >
                       <span
                         className={cn(
@@ -210,6 +209,7 @@ export const TaskCard: FC<TaskCardProps> = memo(
     prev.task.assignedAgentId === next.task.assignedAgentId &&
     prev.task.sourceConversationId === next.task.sourceConversationId &&
     prev.task.terminalSessionId === next.task.terminalSessionId &&
+    prev.task.reviewerAgentIds === next.task.reviewerAgentIds &&
     prev.isSelected === next.isSelected,
 );
 
