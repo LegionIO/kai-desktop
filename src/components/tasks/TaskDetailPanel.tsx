@@ -41,6 +41,8 @@ import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { TaskTerminal } from './TaskTerminal';
 import { AgentAssignDropdown } from './AgentAssignDropdown';
 import { TaskStatusDropdown } from './TaskStatusDropdown';
+import { ReviewerAssignment } from './ReviewerAssignment';
+import { ReviewResultsPanel } from './ReviewResultsPanel';
 import type { TaskFile } from '@/types/task';
 
 interface TaskDetailPanelProps {
@@ -64,6 +66,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   // ── Tab state ─────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
+
+  // ── Reviewer terminal tab state ───────────────────────────────────────
+  // null = show executor terminal, string = show reviewer terminal by sessionId
+  const [activeTerminalTab, setActiveTerminalTab] = useState<string | null>(null);
 
   // ── Composer state (plan tab) ─────────────────────────────────────────
   const [input, setInput] = useState('');
@@ -331,6 +337,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     {
       label: 'Agent',
       value: <AgentAssignDropdown taskId={task.id} currentAgentId={task.assignedAgentId} variant="inline" />,
+    },
+    {
+      label: 'Reviewers',
+      value: (
+        <ReviewerAssignment
+          task={task}
+          onUpdate={(ids, mode) => void updateTask(task.id, { reviewerAgentIds: ids, reviewMode: mode })}
+        />
+      ),
     },
   ];
 
@@ -765,52 +780,119 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               !fullWidth && 'max-w-3xl',
             )}
           >
+            {/* Review Results Panel — shown when in ai_review with reviewResults */}
+            {task.status === 'ai_review' && task.reviewResults && task.reviewResults.length > 0 && (
+              <div className="shrink-0">
+                <ReviewResultsPanel
+                  task={task}
+                  onViewTerminal={(sessionId) => {
+                    setActiveTerminalTab(sessionId);
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Reviewer terminal tabs — shown when in ai_review with multiple terminal sessions */}
+            {(() => {
+              const reviewerTerminals = (task.reviewResults ?? []).filter((r) => r.terminalSessionId);
+              const showTabs = task.status === 'ai_review' && reviewerTerminals.length > 0;
+              if (!showTabs) return null;
+              return (
+                <div className="shrink-0 flex items-center gap-0.5 rounded-lg border border-border/40 bg-muted/20 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTerminalTab(null)}
+                    className={cn(
+                      'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
+                      activeTerminalTab === null
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground/80',
+                    )}
+                  >
+                    <span className="flex items-center gap-1">
+                      <TerminalIcon className="h-3 w-3" />
+                      Executor
+                    </span>
+                  </button>
+                  {reviewerTerminals.map((r) => (
+                    <button
+                      key={r.agentId}
+                      type="button"
+                      onClick={() => setActiveTerminalTab(r.terminalSessionId!)}
+                      className={cn(
+                        'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
+                        activeTerminalTab === r.terminalSessionId
+                          ? 'bg-background text-foreground shadow-sm'
+                          : 'text-muted-foreground hover:text-foreground/80',
+                      )}
+                    >
+                      <span className="flex items-center gap-1">
+                        <span className="shrink-0 text-xs">{r.agentName.slice(0, 2) === '🤖' ? '🤖' : '🔍'}</span>
+                        <span className="max-w-[60px] truncate">{r.agentName}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+
             {/* Terminal — always rendered; overlay when no session */}
             <div className="relative min-h-0 flex-1">
-              {terminalSessionId ? (
-                <TaskTerminal sessionId={terminalSessionId} onExit={handleTerminalExit} className="h-full rounded-xl" />
-              ) : (
-                <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border/50 bg-[#1a1a2e]">
-                  <div className="flex flex-1 items-center justify-center">
-                    <div className="flex flex-col items-center gap-3 text-center">
-                      <TerminalIcon className="h-8 w-8 text-white/20" />
-                      {assignedAgent?.status === 'running' ? (
-                        <>
-                          <p className="text-sm text-white/40">
-                            Agent is running ({task.agentRuntime ?? 'unknown'} runtime)
-                          </p>
-                          <p className="text-xs text-white/30">No terminal output for this runtime</p>
-                        </>
-                      ) : (
-                        <>
-                          <p className="text-sm text-white/40">
-                            {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
-                          </p>
-                          {assignedAgent ? (
-                            <button
-                              type="button"
-                              onClick={handleStartAgent}
-                              disabled={isStartingAgent}
-                              className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
-                            >
-                              <PlayIcon className="h-3.5 w-3.5" />
-                              {isStartingAgent ? 'Starting…' : `Start ${assignedAgent.name}`}
-                            </button>
-                          ) : (
-                            <div className="inline-flex items-center gap-2">
-                              <AgentAssignDropdown
-                                taskId={task.id}
-                                currentAgentId={task.assignedAgentId}
-                                variant="button"
-                              />
-                            </div>
-                          )}
-                        </>
-                      )}
+              {(() => {
+                // Determine which terminal session to show
+                const displaySessionId = activeTerminalTab ?? terminalSessionId;
+                if (displaySessionId) {
+                  return (
+                    <TaskTerminal
+                      sessionId={displaySessionId}
+                      onExit={handleTerminalExit}
+                      className="h-full rounded-xl"
+                    />
+                  );
+                }
+                return (
+                  <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border/50 bg-[#1a1a2e]">
+                    <div className="flex flex-1 items-center justify-center">
+                      <div className="flex flex-col items-center gap-3 text-center">
+                        <TerminalIcon className="h-8 w-8 text-white/20" />
+                        {assignedAgent?.status === 'running' ? (
+                          <>
+                            <p className="text-sm text-white/40">
+                              Agent is running ({task.agentRuntime ?? 'unknown'} runtime)
+                            </p>
+                            <p className="text-xs text-white/30">No terminal output for this runtime</p>
+                          </>
+                        ) : (
+                          <>
+                            <p className="text-sm text-white/40">
+                              {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
+                            </p>
+                            {assignedAgent ? (
+                              <button
+                                type="button"
+                                onClick={handleStartAgent}
+                                disabled={isStartingAgent}
+                                className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
+                              >
+                                <PlayIcon className="h-3.5 w-3.5" />
+                                {isStartingAgent ? 'Starting…' : `Start ${assignedAgent.name}`}
+                              </button>
+                            ) : (
+                              <div className="inline-flex items-center gap-2">
+                                <AgentAssignDropdown
+                                  taskId={task.id}
+                                  currentAgentId={task.assignedAgentId}
+                                  variant="button"
+                                />
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
             </div>
 
             {/* Steering composer — always visible */}

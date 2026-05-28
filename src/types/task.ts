@@ -11,6 +11,7 @@ export type {
   TaskConversationMessage,
   TaskStreamEvent,
   TaskReviewNote,
+  TaskReviewResult,
 } from '../../shared/task-types';
 export type { KaiTaskStatus } from '../../shared/task-types';
 
