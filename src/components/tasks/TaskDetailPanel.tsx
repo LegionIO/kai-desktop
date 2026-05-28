@@ -21,8 +21,6 @@ import {
   FileCodeIcon,
   TerminalIcon,
   CheckCircle2Icon,
-  CheckIcon,
-  RotateCcwIcon,
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -45,6 +43,7 @@ import { AgentAssignDropdown } from './AgentAssignDropdown';
 import { TaskStatusDropdown } from './TaskStatusDropdown';
 import { ReviewerAssignment } from './ReviewerAssignment';
 import { ReviewResultsPanel } from './ReviewResultsPanel';
+import { HumanReviewActions } from './HumanReviewActions';
 import type { TaskFile } from '@/types/task';
 
 interface TaskDetailPanelProps {
@@ -463,40 +462,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
                   {/* Human Review Actions — approve or request changes */}
                   {task.status === 'human_review' && (
-                    <div className="mt-6 rounded-xl border border-purple-400/30 bg-purple-400/5 p-4">
-                      <div className="mb-3 flex items-center gap-2">
-                        <span className="text-xs font-semibold uppercase tracking-wide text-purple-400">
-                          Human Review Required
-                        </span>
-                      </div>
-                      <p className="mb-4 text-sm text-muted-foreground">
-                        Review the agent's work above. Approve to mark as done, or request changes to send back for more
-                        work.
-                      </p>
-                      <div className="flex items-center gap-3">
-                        <button
-                          type="button"
-                          onClick={() => void updateTaskStatus(task.id, 'done')}
-                          className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
-                        >
-                          <CheckIcon className="h-4 w-4" />
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const feedback = window.prompt('What changes are needed?');
-                            if (feedback) {
-                              void app.tasks.kickBack(task.id, feedback, 'human');
-                            }
-                          }}
-                          className="inline-flex items-center gap-2 rounded-lg border border-border/60 bg-muted/40 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/70"
-                        >
-                          <RotateCcwIcon className="h-4 w-4" />
-                          Request Changes
-                        </button>
-                      </div>
-                    </div>
+                    <HumanReviewActions taskId={task.id} onApprove={() => void updateTaskStatus(task.id, 'done')} />
                   )}
                 </div>
               </div>

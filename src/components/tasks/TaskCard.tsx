@@ -16,6 +16,8 @@ import {
   ArrowRightIcon,
   Trash2Icon,
   ChevronRightIcon,
+  CheckIcon,
+  RotateCcwIcon,
 } from 'lucide-react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { cn } from '@/lib/utils';
@@ -185,6 +187,27 @@ export const TaskCard: FC<TaskCardProps> = memo(
                 </ContextMenu.SubContent>
               </ContextMenu.Portal>
             </ContextMenu.Sub>
+
+            {/* Quick review actions for human_review tasks */}
+            {task.status === 'human_review' && (
+              <>
+                <ContextMenu.Separator className="my-1 h-px bg-border/60" />
+                <ContextMenu.Item
+                  className={cn(itemClassName, 'text-emerald-500 data-[highlighted]:bg-emerald-500/10')}
+                  onSelect={() => void updateTaskStatus(task.id, 'done')}
+                >
+                  <CheckIcon className="h-3.5 w-3.5" />
+                  <span>Approve</span>
+                </ContextMenu.Item>
+                <ContextMenu.Item
+                  className={itemClassName}
+                  onSelect={() => void updateTaskStatus(task.id, 'in_progress')}
+                >
+                  <RotateCcwIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span>Request Changes</span>
+                </ContextMenu.Item>
+              </>
+            )}
 
             <ContextMenu.Separator className="my-1 h-px bg-border/60" />
 

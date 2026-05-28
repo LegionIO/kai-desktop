@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
 import { ReviewResultsPanel } from './ReviewResultsPanel';
+import { HumanReviewActions } from './HumanReviewActions';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
@@ -27,7 +28,7 @@ interface TaskDetailModalProps {
 
 export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenChange, onOpenFullView }) => {
   const { state: agentState, startAgent, stopAgent } = useAgents();
-  const { updateTask } = useTasks();
+  const { updateTask, updateTaskStatus } = useTasks();
   const [isStartingAgent, setIsStartingAgent] = useState(false);
 
   const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
@@ -260,6 +261,17 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
               {(task.reviewResults ?? []).length > 0 && (
                 <div className="shrink-0">
                   <ReviewResultsPanel task={task} />
+                </div>
+              )}
+
+              {/* Human review actions — approve/reject in modal */}
+              {task.status === 'human_review' && (
+                <div className="shrink-0">
+                  <HumanReviewActions
+                    taskId={task.id}
+                    onApprove={() => void updateTaskStatus(task.id, 'done')}
+                    compact
+                  />
                 </div>
               )}
 
