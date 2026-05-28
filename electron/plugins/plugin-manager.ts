@@ -30,7 +30,6 @@ import type {
   PluginAPI,
   PluginPermission,
   PluginInferenceProvider,
-  PluginRuntimeContribution,
   PluginCliToolContribution,
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
@@ -374,7 +373,6 @@ export class PluginManager {
       configChangeListeners: [],
       rendererBuild: null,
       inferenceProvider: null,
-      contributedRuntimes: [],
       contributedCliTools: [],
     };
 
@@ -796,39 +794,19 @@ export class PluginManager {
         return instance.inferenceProvider;
       }
 
-      // Check if this plugin owns the resolved runtime
-      const pluginRuntimeIds = instance.contributedRuntimes.map((r) => r.id);
-      if (context.runtimeId && pluginRuntimeIds.includes(context.runtimeId)) {
-        return instance.inferenceProvider;
-      }
-
-      // Check if the model's provider key matches a plugin runtime ID prefix.
-      // Only use this fallback when no explicit runtime was chosen — if the user
-      // has overridden the runtime, respect that choice and do not let a plugin
-      // claim the request based on model provider key alone.
+      // Match by model provider key — the provider key conventionally includes
+      // the plugin/provider name, so e.g. "legionio_sonnet" matches an inference
+      // provider named "Legion" or "legionio". Only activate when no explicit
+      // runtime has been chosen, to respect user overrides.
       const hasExplicitRuntime = context.runtimeId && context.runtimeId !== 'auto';
       if (!hasExplicitRuntime && context.modelProviderKey) {
-        const matchesRuntime = pluginRuntimeIds.some(
-          (rid) => context.modelProviderKey!.startsWith(rid) ||
-                   context.modelProviderKey!.startsWith(instance.inferenceProvider!.name.toLowerCase().replace(/\s+/g, '')),
-        );
-        if (matchesRuntime) {
+        const providerName = instance.inferenceProvider.name.toLowerCase().replace(/\s+/g, '');
+        if (context.modelProviderKey.startsWith(providerName)) {
           return instance.inferenceProvider;
         }
       }
     }
     return null;
-  }
-
-  /* ── Plugin Runtime Contributions ── */
-
-  getPluginRuntimes(): PluginRuntimeContribution[] {
-    const result: PluginRuntimeContribution[] = [];
-    for (const instance of this.plugins.values()) {
-      if (instance.state !== 'active') continue;
-      result.push(...instance.contributedRuntimes);
-    }
-    return result;
   }
 
   /* ── Plugin CLI Tool Contributions ── */

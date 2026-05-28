@@ -27,6 +27,7 @@ import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import type { z } from 'zod';
 
 // ---------------------------------------------------------------------------
@@ -360,7 +361,11 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
     const sdkOptions: SdkOptions = {
       abortController,
-      cwd: cwd ?? process.cwd(),
+      // Default to homedir when no working directory is set. Using process.cwd()
+      // would point at the kai-desktop source tree, causing the Claude Code
+      // subprocess to walk up and load kai-desktop's CLAUDE.md + AGENTS.md
+      // (~5.8 KB / ~1400 tokens) on every request.
+      cwd: cwd ?? homedir(),
       // Model + auth from Kai's model-runtime resolver.
       ...(auth ? { model: auth.modelName } : {}),
       maxTurns,
@@ -387,10 +392,14 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       ],
       // Expose Kai's custom tools via in-process MCP server
       ...(mcpServers ? { mcpServers } : {}),
-      // Pass Kai's system prompt appended to Claude Code's default
+      // Pass Kai's system prompt appended to Claude Code's default.
+      // excludeDynamicSections strips the permissions list, hooks, and MCP
+      // tool definitions that Claude Code normally injects from
+      // ~/.claude/settings.json — those sections add ~3–5k tokens per request
+      // and are irrelevant here since Kai manages its own permissions UX.
       systemPrompt: assembledPrompt
-        ? { type: 'preset', preset: 'claude_code', append: assembledPrompt }
-        : { type: 'preset', preset: 'claude_code' },
+        ? { type: 'preset', preset: 'claude_code', append: assembledPrompt, excludeDynamicSections: true }
+        : { type: 'preset', preset: 'claude_code', excludeDynamicSections: true },
       // Override the SDK's default auth when Kai provides explicit credentials.
       // This uses the "flag settings" layer which has highest priority.
       ...(auth?.baseUrl || auth?.apiKey ? {

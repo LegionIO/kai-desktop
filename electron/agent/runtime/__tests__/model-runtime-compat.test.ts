@@ -47,51 +47,44 @@ function makeModel(key: 'legion-qwen' | 'openai-gpt', providerKey: 'legionio' | 
   };
 }
 
-describe('resolveRuntimeForModel plugin runtime ownership', () => {
-  it('uses the plugin runtime for plugin-owned models in auto mode', () => {
+describe('resolveRuntimeForModel — provider/runtime resolution', () => {
+  it('routes openai-compatible models through Codex when available in auto mode', () => {
+    const resolution = resolveRuntimeForModel(
+      makeModel('openai-gpt', 'openai'),
+      makeConfig(),
+      'auto',
+      new Set(['mastra', 'codex-sdk']),
+    );
+
+    expect(resolution.runtimeId).toBe('codex-sdk');
+  });
+
+  it('falls back to Mastra for openai-compatible models when Codex is unavailable', () => {
+    const resolution = resolveRuntimeForModel(
+      makeModel('openai-gpt', 'openai'),
+      makeConfig(),
+      'auto',
+      new Set(['mastra']),
+    );
+
+    expect(resolution.runtimeId).toBe('mastra');
+  });
+
+  it('routes openai-compatible legionio model through Mastra in auto mode', () => {
+    // legionio is not a built-in runtime — auto mode falls through to Mastra/Codex
     const resolution = resolveRuntimeForModel(
       makeModel('legion-qwen', 'legionio'),
       makeConfig(),
       'auto',
-      new Set(['mastra', 'legion']),
+      new Set(['mastra']),
     );
 
-    expect(resolution).toMatchObject({
-      runtimeId: 'legion',
-      inferenceProviderRuntimeId: 'legion',
-    });
+    expect(resolution.runtimeId).toBe('mastra');
   });
 
-  it('keeps explicit plugin runtime ownership while overriding non-plugin models through the plugin provider', () => {
-    const resolution = resolveRuntimeForModel(
-      makeModel('openai-gpt', 'openai'),
-      makeConfig(),
-      'legion' as Parameters<typeof resolveRuntimeForModel>[2],
-      new Set(['mastra', 'legion']),
-    );
-
-    expect(resolution).toMatchObject({
-      runtimeId: 'legion',
-      providerOverride: 'legionio',
-      inferenceProviderRuntimeId: 'legion',
-    });
-  });
-
-  it('keeps explicit plugin runtime ownership for models already supplied by that plugin', () => {
-    const resolution = resolveRuntimeForModel(
-      makeModel('legion-qwen', 'legionio'),
-      makeConfig(),
-      'legion' as Parameters<typeof resolveRuntimeForModel>[2],
-      new Set(['mastra', 'legion']),
-    );
-
-    expect(resolution).toMatchObject({
-      runtimeId: 'legion',
-      inferenceProviderRuntimeId: 'legion',
-    });
-  });
-
-  it('does not fall back to Mastra when an explicit plugin runtime is unavailable', () => {
+  it('uses nativeProviderKey fallback when explicit runtime is unavailable but matching provider exists', () => {
+    // When 'legion' is selected but not in available, and 'legionio' provider exists in config,
+    // route through Mastra with providerOverride instead of hard-erroring.
     const resolution = resolveRuntimeForModel(
       makeModel('legion-qwen', 'legionio'),
       makeConfig(),
@@ -100,9 +93,20 @@ describe('resolveRuntimeForModel plugin runtime ownership', () => {
     );
 
     expect(resolution).toMatchObject({
-      runtimeId: 'legion',
-      inferenceProviderRuntimeId: 'legion',
+      runtimeId: 'mastra',
+      providerOverride: 'legionio',
     });
-    expect(resolution.warning).toContain('runtime is currently unavailable');
+    expect(resolution.warning).toBeUndefined();
+  });
+
+  it('falls back to Mastra when explicit runtime is unavailable and no native provider key matches', () => {
+    const resolution = resolveRuntimeForModel(
+      makeModel('openai-gpt', 'openai'),
+      makeConfig(),
+      'unknown-runtime' as Parameters<typeof resolveRuntimeForModel>[2],
+      new Set(['mastra']),
+    );
+
+    expect(resolution.runtimeId).toBe('mastra');
   });
 });

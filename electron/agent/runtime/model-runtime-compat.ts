@@ -28,22 +28,22 @@ export type ModelAuth = {
 };
 
 export type RuntimeResolution = {
-  /** The runtime to use (built-in RuntimeId or plugin-contributed runtime ID) */
+  /** The runtime to use (built-in RuntimeId) */
   runtimeId: string;
   /** For Claude Code: resolved Anthropic-compatible credentials */
   modelAuth?: ModelAuth;
   /** For incompatible explicit-runtime selections */
   warning?: string;
   /**
-   * When a plugin runtime is selected but the model belongs to a different
-   * provider, override the model's endpoint to route through the plugin's
-   * provider. Contains the provider key to look up in config.models.providers.
+   * When a non-built-in runtime is selected but the model belongs to a different
+   * provider, override the model's endpoint to route through that provider.
+   * Contains the provider key to look up in config.models.providers.
    */
   providerOverride?: string;
   /**
-   * Plugin runtime that owns the selected model/request even when the concrete
-   * streaming runtime is Mastra. Used to locate a plugin inference provider
-   * before falling back to OpenAI-compatible provider routing.
+   * Identifies the inference provider context even when the concrete streaming
+   * runtime is Mastra. Used to locate a plugin inference provider before
+   * falling back to OpenAI-compatible provider routing.
    */
   inferenceProviderRuntimeId?: string;
   /**
@@ -96,24 +96,6 @@ function resolveAutoMode(
       return { runtimeId: 'claude-agent-sdk' };
     }
     return { runtimeId: 'mastra' };
-  }
-
-  // Check if this model belongs to a plugin-contributed runtime.
-  // Plugin models use provider keys that start with or match their runtime ID.
-  // When detected, use Mastra (the universal runtime) — the model's provider
-  // config already points at the plugin's OpenAI-compatible endpoint.
-  const rawCatalogEntry = config.models.catalog.find((m) => m.key === model.key);
-  if (rawCatalogEntry) {
-    const providerKey = rawCatalogEntry.provider;
-    // Check each available runtime to see if the provider key indicates plugin ownership
-    for (const runtimeId of available) {
-      // Skip built-in runtimes — they don't own provider keys
-      if (runtimeId === 'mastra' || runtimeId === 'claude-agent-sdk' || runtimeId === 'codex-sdk') continue;
-      // Match: provider key starts with the plugin runtime ID
-      if (providerKey.startsWith(runtimeId) || runtimeId.startsWith(providerKey.split('_')[0])) {
-        return { runtimeId, inferenceProviderRuntimeId: runtimeId };
-      }
-    }
   }
 
   switch (providerType) {
@@ -172,11 +154,18 @@ function resolveExplicitMode(
   if (!available.has(preferred)) {
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
-      return {
-        runtimeId: preferred,
-        inferenceProviderRuntimeId: preferred,
-        warning: `The "${preferred}" runtime is currently unavailable. Requests cannot be sent until that runtime is available.`,
-      };
+      // Before falling back, check whether a native provider key exists that
+      // matches this runtime ID (e.g. runtime 'legion' → provider 'legionio').
+      // If so, route through Mastra using that provider.
+      const nativeProviderKey = Object.keys(config.models.providers).find(
+        (key) => key.startsWith(preferred) || key === preferred,
+      );
+      if (nativeProviderKey) {
+        return {
+          runtimeId: 'mastra',
+          providerOverride: nativeProviderKey,
+        };
+      }
     }
     return { runtimeId: 'mastra' };
   }
@@ -185,7 +174,15 @@ function resolveExplicitMode(
   if (!model || !providerType) {
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
     if (!isBuiltInRuntime) {
-      return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
+      // Same native-provider fallback: if a provider key exists for this runtime,
+      // route through Mastra rather than a missing plugin.
+      const nativeProviderKey = Object.keys(config.models.providers).find(
+        (key) => key.startsWith(preferred) || key === preferred,
+      );
+      if (nativeProviderKey) {
+        return { runtimeId: 'mastra', providerOverride: nativeProviderKey };
+      }
+      return { runtimeId: 'mastra', inferenceProviderRuntimeId: preferred };
     }
     return { runtimeId: preferred };
   }
@@ -253,39 +250,6 @@ function resolveExplicitMode(
 
     case 'mastra':
     default:
-      // If this is a known plugin runtime (not a built-in), keep the plugin
-      // runtime as the owner and optionally override the model's provider to
-      // use the plugin's endpoint.
-      // This enables "route any model through the plugin" behavior — the plugin
-      // runtime's provider acts as a gateway that speaks OpenAI-compatible format.
-      if (preferred !== 'mastra' && available.has(preferred)) {
-        // Find the plugin's provider key: convention is the runtime ID is the provider prefix
-        // (e.g. runtime 'legion' → provider 'legionio'). Look for a provider whose key
-        // starts with the runtime ID.
-        const pluginProviderKey = Object.keys(config.models.providers).find(
-          (key) => key.startsWith(preferred) || key === preferred,
-        );
-
-        // If the model already belongs to the plugin's provider, no override needed
-        const rawEntry = config.models.catalog.find((m) => m.key === model?.key);
-        const modelProviderKey = rawEntry?.provider ?? '';
-        const modelAlreadyUsesPlugin = pluginProviderKey && modelProviderKey.startsWith(preferred);
-
-        if (modelAlreadyUsesPlugin) {
-          return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
-        }
-
-        // Non-plugin model with plugin runtime selected — override to route through plugin
-        if (pluginProviderKey) {
-          return {
-            runtimeId: preferred,
-            providerOverride: pluginProviderKey,
-            inferenceProviderRuntimeId: preferred,
-          };
-        }
-
-        return { runtimeId: preferred, inferenceProviderRuntimeId: preferred };
-      }
       // Mastra handles everything
       return { runtimeId: 'mastra' };
   }

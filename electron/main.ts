@@ -42,7 +42,7 @@ import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
 import { registerStreamingSttHandlers } from './audio/streaming-stt.js';
 import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
-import { registerRuntime, setPluginRuntimesSource } from './agent/runtime/index.js';
+import { registerRuntime } from './agent/runtime/index.js';
 import { MastraRuntime } from './agent/runtime/mastra-runtime.js';
 import { ClaudeAgentRuntime } from './agent/runtime/claude-agent-runtime.js';
 import { CodexRuntime } from './agent/runtime/codex-runtime.js';
@@ -936,9 +936,6 @@ if (gotSingleInstanceLock) {
     registerRuntime(new MastraRuntime());
     registerRuntime(new ClaudeAgentRuntime());
     registerRuntime(new CodexRuntime());
-
-    // Wire plugin runtime contributions into the runtime registry
-    setPluginRuntimesSource(() => pluginManager.getPluginRuntimes());
 
     // Listen for plugin tool changes before plugin activation so early registrations are not missed
     pluginManager.onToolsChanged((pluginTools) => {

@@ -35,7 +35,6 @@ import type {
   PluginNavigationTarget,
   MessageContent,
   PluginInferenceProvider,
-  PluginRuntimeContribution,
   PluginCliToolContribution,
   AllowedBinary,
   ExecRequest,
@@ -1249,28 +1248,6 @@ export function createPluginAPI(
           console.info(`[PluginAPI:${manifest.name}] Unregistered inference provider: ${instance.inferenceProvider.name}`);
           instance.inferenceProvider = null;
         }
-      },
-
-      registerRuntime: (runtime: PluginRuntimeContribution) => {
-        requirePermission('agent:register-runtime');
-        if (!runtime?.id || !runtime?.name || typeof runtime.isAvailable !== 'function') {
-          throw new Error('Invalid runtime contribution: must have id, name, and isAvailable().');
-        }
-        const existing = instance.contributedRuntimes.findIndex((r) => r.id === runtime.id);
-        if (existing >= 0) {
-          instance.contributedRuntimes[existing] = runtime;
-        } else {
-          instance.contributedRuntimes.push(runtime);
-        }
-        console.info(`[PluginAPI:${manifest.name}] Registered runtime: ${runtime.id}`);
-        callbacks.onUIStateChanged();
-      },
-
-      unregisterRuntime: (runtimeId: string) => {
-        requirePermission('agent:register-runtime');
-        instance.contributedRuntimes = instance.contributedRuntimes.filter((r) => r.id !== runtimeId);
-        console.info(`[PluginAPI:${manifest.name}] Unregistered runtime: ${runtimeId}`);
-        callbacks.onUIStateChanged();
       },
 
       registerCliTool: (tool: PluginCliToolContribution) => {
