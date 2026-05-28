@@ -290,15 +290,29 @@ export async function startAgentRun(
     const { streamAgentResponse } = await import('../agent/mastra-agent.js');
     const config = readEffectiveConfig(appHome);
 
-    // Build a simple user message from the task description
+    // Build task-aware system prompt that ensures the agent completes the full task
+    const taskSystemPrompt = [
+      agent.instructions ?? '',
+      '',
+      '## Task Execution Mode',
+      '',
+      'You are executing a task from the task board. You MUST:',
+      '1. Complete the ENTIRE task described below — do not stop after one step.',
+      '2. Use workspace tools (file read/write/edit, shell commands) to accomplish the task.',
+      '3. Verify your work is correct (read files you created, check output).',
+      '4. Continue making tool calls until the task is fully complete.',
+      '5. Do NOT just update memory or acknowledge the task — actually DO the work.',
+      '',
+      `Working directory: ${cwd}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    // Build messages with task description as user message
     const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: taskSystemPrompt },
       { role: 'user', content: task.description ?? 'No task description provided.' },
     ];
-
-    // Add agent instructions as system context if available
-    if (agent.instructions) {
-      messages.unshift({ role: 'system', content: agent.instructions });
-    }
 
     broadcast(`\x1b[1;36m[Mastra Agent]\x1b[0m Starting task: ${task.title}\r\n`);
     broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
