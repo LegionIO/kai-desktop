@@ -51,6 +51,12 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     condition: 'User marks task done without executing (e.g. already completed)',
   },
   {
+    from: 'todo',
+    to: 'human_review',
+    trigger: 'manual',
+    condition: 'User moves task directly to review',
+  },
+  {
     from: 'in_progress',
     to: 'human_review',
     trigger: 'both',

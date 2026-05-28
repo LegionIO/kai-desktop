@@ -10,13 +10,15 @@ import { createPortal } from 'react-dom';
 import {
   DndContext,
   DragOverlay,
-  closestCenter,
+  pointerWithin,
+  rectIntersection,
   PointerSensor,
   KeyboardSensor,
   useSensors,
   useSensor,
   type DragStartEvent,
   type DragEndEvent,
+  type CollisionDetection,
 } from '@dnd-kit/core';
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
 import {
@@ -151,6 +153,20 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
       window.removeEventListener('contextmenu', close);
     };
   }, [contextMenu]);
+
+  // Custom collision detection: prioritize droppable columns, fall back to pointer position
+  const collisionDetection: CollisionDetection = useCallback((args) => {
+    // First check if pointer is within any droppable column
+    const pointerCollisions = pointerWithin(args);
+    if (pointerCollisions.length > 0) {
+      // Prefer column droppables over sortable items
+      const columnHit = pointerCollisions.find((c) => String(c.id).startsWith('column-'));
+      if (columnHit) return [columnHit];
+      return pointerCollisions;
+    }
+    // Fall back to rect intersection
+    return rectIntersection(args);
+  }, []);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -687,7 +703,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
           <div className="h-full overflow-y-auto">
             <DndContext
               sensors={sensors}
-              collisionDetection={closestCenter}
+              collisionDetection={collisionDetection}
               onDragStart={handleDragStart}
               onDragEnd={handleDragEnd}
             >
