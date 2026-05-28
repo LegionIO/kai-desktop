@@ -50,6 +50,10 @@ export interface TaskFile {
   metadata?: KaiTaskMetadata;
   /** The agent assigned to work on this task. */
   assignedAgentId?: string;
+  /** The agent assigned to review this task (AI review phase). */
+  reviewerAgentId?: string;
+  /** If true, skip AI review and go directly to human_review on promote. */
+  skipAiReview?: boolean;
   /** The workspace this task belongs to. Undefined = legacy/unscoped. */
   workspaceId?: string;
   /** Conversation history used to generate/refine the task description. */

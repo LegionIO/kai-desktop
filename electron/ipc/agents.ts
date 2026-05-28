@@ -375,12 +375,29 @@ export async function startAgentRun(
               const { summary } = input as { summary: string };
               const t = readTask(appHome, task.id);
               if (t && t.status === 'in_progress') {
-                t.status = 'ai_review';
+                // Respect skipAiReview setting — go directly to human_review if set
+                t.status = t.skipAiReview ? 'human_review' : 'ai_review';
                 t.completionSummary = summary;
                 t.updatedAt = new Date().toISOString();
                 writeTask(appHome, t);
                 broadcastTaskChange(appHome);
-                return { success: true, newStatus: 'ai_review', message: 'Task promoted to AI Review.' };
+
+                // Also mark agent as idle immediately (task is done)
+                const ag = readAgent(appHome, agentId);
+                if (ag && ag.status === 'running') {
+                  ag.status = 'idle';
+                  ag.stats.tasksCompleted = (ag.stats.tasksCompleted ?? 0) + 1;
+                  ag.updatedAt = new Date().toISOString();
+                  writeAgent(appHome, ag);
+                  broadcastAgentChange(appHome);
+                }
+
+                const newStatus = t.skipAiReview ? 'human_review' : 'ai_review';
+                return {
+                  success: true,
+                  newStatus,
+                  message: `Task promoted to ${newStatus === 'ai_review' ? 'AI Review' : 'Human Review'}.`,
+                };
               }
               return { success: false, message: `Task is in status '${t?.status}', cannot promote.` };
             },
@@ -408,6 +425,16 @@ export async function startAgentRun(
                 t.updatedAt = new Date().toISOString();
                 writeTask(appHome, t);
                 broadcastTaskChange(appHome);
+
+                // Also mark agent as idle immediately
+                const ag = readAgent(appHome, agentId);
+                if (ag && ag.status === 'running') {
+                  ag.status = 'idle';
+                  ag.updatedAt = new Date().toISOString();
+                  writeAgent(appHome, ag);
+                  broadcastAgentChange(appHome);
+                }
+
                 return { success: true, newStatus: 'blocked', message: 'Task marked as blocked.' };
               }
               return { success: false, message: 'Task not found.' };
