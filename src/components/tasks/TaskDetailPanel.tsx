@@ -726,7 +726,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <span>{assignedAgent.icon ?? '🤖'}</span>
                   <span className="font-medium">{assignedAgent.name}</span>
-                  {terminalSessionId && (
+                  {(terminalSessionId || assignedAgent.status === 'running') && (
                     <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-500">
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
                       Running
@@ -773,27 +773,38 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   <div className="flex flex-1 items-center justify-center">
                     <div className="flex flex-col items-center gap-3 text-center">
                       <TerminalIcon className="h-8 w-8 text-white/20" />
-                      <p className="text-sm text-white/40">
-                        {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
-                      </p>
-                      {assignedAgent ? (
-                        <button
-                          type="button"
-                          onClick={handleStartAgent}
-                          disabled={isStartingAgent}
-                          className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
-                        >
-                          <PlayIcon className="h-3.5 w-3.5" />
-                          {isStartingAgent ? 'Starting…' : `Start ${assignedAgent.name}`}
-                        </button>
+                      {assignedAgent?.status === 'running' ? (
+                        <>
+                          <p className="text-sm text-white/40">
+                            Agent is running ({task.agentRuntime ?? 'unknown'} runtime)
+                          </p>
+                          <p className="text-xs text-white/30">No terminal output for this runtime</p>
+                        </>
                       ) : (
-                        <div className="inline-flex items-center gap-2">
-                          <AgentAssignDropdown
-                            taskId={task.id}
-                            currentAgentId={task.assignedAgentId}
-                            variant="button"
-                          />
-                        </div>
+                        <>
+                          <p className="text-sm text-white/40">
+                            {assignedAgent ? 'Agent ready to start' : 'No agent assigned'}
+                          </p>
+                          {assignedAgent ? (
+                            <button
+                              type="button"
+                              onClick={handleStartAgent}
+                              disabled={isStartingAgent}
+                              className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/20 disabled:opacity-50"
+                            >
+                              <PlayIcon className="h-3.5 w-3.5" />
+                              {isStartingAgent ? 'Starting…' : `Start ${assignedAgent.name}`}
+                            </button>
+                          ) : (
+                            <div className="inline-flex items-center gap-2">
+                              <AgentAssignDropdown
+                                taskId={task.id}
+                                currentAgentId={task.assignedAgentId}
+                                variant="button"
+                              />
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
