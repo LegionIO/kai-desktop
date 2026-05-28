@@ -134,6 +134,31 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     trigger: 'manual',
     condition: 'Reopen and immediately resume work',
   },
+  // ── Blocked transitions ──────────────────────────────────────────────
+  {
+    from: 'in_progress',
+    to: 'blocked',
+    trigger: 'both',
+    condition: 'Agent or human marks task as blocked (with reason)',
+  },
+  {
+    from: 'todo',
+    to: 'blocked',
+    trigger: 'manual',
+    condition: 'Task is blocked before work begins',
+  },
+  {
+    from: 'blocked',
+    to: 'in_progress',
+    trigger: 'both',
+    condition: 'Blocker resolved — resume work',
+  },
+  {
+    from: 'blocked',
+    to: 'todo',
+    trigger: 'manual',
+    condition: 'Move blocked task back to backlog',
+  },
 ] as const;
 
 /** Returns the statuses a user is allowed to manually transition to from `current`. */

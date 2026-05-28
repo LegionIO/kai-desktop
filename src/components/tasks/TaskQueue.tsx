@@ -180,6 +180,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
     const grouped: Record<KaiTaskStatus, TaskFile[]> = {
       todo: [],
       in_progress: [],
+      blocked: [],
       ai_review: [],
       human_review: [],
       done: [],

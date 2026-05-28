@@ -13,6 +13,7 @@ import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
+import { z } from 'zod';
 import { appendOutput } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
@@ -302,6 +303,9 @@ export async function startAgentRun(
       '3. Verify your work is correct (read files you created, check output).',
       '4. Continue making tool calls until the task is fully complete.',
       '5. Do NOT just update memory or acknowledge the task — actually DO the work.',
+      '6. When DONE, call the `promote_task` tool with a summary of what you accomplished.',
+      '7. If BLOCKED (missing info, access denied, dependency), call `block_task` with the reason.',
+      '8. Do NOT end your response without calling either `promote_task` or `block_task`.',
       '',
       `Working directory: ${cwd}`,
     ]
@@ -355,7 +359,63 @@ export async function startAgentRun(
         broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
 
         const dbPath = join(appHome, 'data', 'task-agent-memory.db');
-        const tools = getRegisteredTools(); // Full tool registry (file I/O, shell, MCP, etc.)
+        const registeredTools = getRegisteredTools();
+
+        // Add task lifecycle tools that let the agent explicitly promote/block the task
+        const taskLifecycleTools = [
+          {
+            name: 'promote_task',
+            description:
+              'Call this tool when you have COMPLETED the task successfully and want to submit it for review. ' +
+              'This moves the task to AI Review status. Only call this after you have verified your work is correct.',
+            inputSchema: z.object({
+              summary: z.string().describe('Brief summary of what was accomplished (1-3 sentences)'),
+            }),
+            execute: async (input: unknown) => {
+              const { summary } = input as { summary: string };
+              const t = readTask(appHome, task.id);
+              if (t && t.status === 'in_progress') {
+                t.status = 'ai_review';
+                t.completionSummary = summary;
+                t.updatedAt = new Date().toISOString();
+                writeTask(appHome, t);
+                broadcastTaskChange(appHome);
+                return { success: true, newStatus: 'ai_review', message: 'Task promoted to AI Review.' };
+              }
+              return { success: false, message: `Task is in status '${t?.status}', cannot promote.` };
+            },
+          },
+          {
+            name: 'block_task',
+            description:
+              'Call this tool when the task CANNOT be completed due to a blocker (missing info, dependency, access issue, etc). ' +
+              'Provide the reason so the blocker can be resolved later.',
+            inputSchema: z.object({
+              reason: z.string().describe('Why the task is blocked and what is needed to unblock it'),
+            }),
+            execute: async (input: unknown) => {
+              const { reason } = input as { reason: string };
+              const t = readTask(appHome, task.id);
+              if (t) {
+                t.status = 'blocked';
+                if (!t.reviewNotes) t.reviewNotes = [];
+                t.reviewNotes.push({
+                  source: 'ai',
+                  content: reason,
+                  timestamp: new Date().toISOString(),
+                  fromStatus: 'in_progress',
+                });
+                t.updatedAt = new Date().toISOString();
+                writeTask(appHome, t);
+                broadcastTaskChange(appHome);
+                return { success: true, newStatus: 'blocked', message: 'Task marked as blocked.' };
+              }
+              return { success: false, message: 'Task not found.' };
+            },
+          },
+        ];
+
+        const tools = [...registeredTools, ...taskLifecycleTools];
 
         // Ensure maxSteps is set for multi-turn task execution (default 25 if not configured)
         const taskConfig = {
@@ -441,14 +501,13 @@ export async function startAgentRun(
           writeAgent(appHome, freshAgent);
         }
 
-        // Promote task on successful completion, leave in_progress on error
+        // Do NOT auto-promote task status. The agent must explicitly call
+        // the promote_task tool to move from in_progress → ai_review.
+        // If it doesn't, the task stays in_progress for the user to decide.
         // NOTE: We intentionally keep task.terminalSessionId so the UI can
         // replay buffered output when the user navigates back to this task.
         const freshTask = readTask(appHome, task.id);
         if (freshTask) {
-          if (!hasError && freshTask.status === 'in_progress') {
-            freshTask.status = 'ai_review';
-          }
           freshTask.updatedAt = new Date().toISOString();
           writeTask(appHome, freshTask);
         }

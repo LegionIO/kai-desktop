@@ -28,12 +28,13 @@ import { useTasks } from '@/providers/TaskProvider';
 const CARD_BG_COLORS: Record<KaiTaskStatus, string> = {
   todo: 'bg-sky-500/5',
   in_progress: 'bg-amber-500/5',
+  blocked: 'bg-red-500/5',
   ai_review: 'bg-rose-500/5',
   human_review: 'bg-purple-400/5',
   done: 'bg-emerald-500/5',
 };
 
-const STATUS_OPTIONS: KaiTaskStatus[] = ['todo', 'in_progress', 'ai_review', 'human_review', 'done'];
+const STATUS_OPTIONS: KaiTaskStatus[] = ['todo', 'in_progress', 'blocked', 'ai_review', 'human_review', 'done'];
 
 interface TaskCardProps {
   task: TaskFile;

@@ -2,7 +2,7 @@
  * Types shared between main and renderer process for Tasks.
  */
 
-export type KaiTaskStatus = 'todo' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
+export type KaiTaskStatus = 'todo' | 'in_progress' | 'blocked' | 'ai_review' | 'human_review' | 'done';
 
 export interface KaiTaskMetadata {
   category?: 'feature' | 'bug_fix' | 'refactoring' | 'docs' | 'other';
