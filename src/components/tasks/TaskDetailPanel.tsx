@@ -178,9 +178,12 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const menuItemClassName =
     'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
-  // Sync terminal session when task changes
+  // Sync terminal session when task changes — only update if task gets a NEW session
+  // (never clear an existing local session, as we want to preserve output for review)
   useEffect(() => {
-    setTerminalSessionId(task.terminalSessionId ?? null);
+    if (task.terminalSessionId) {
+      setTerminalSessionId(task.terminalSessionId);
+    }
   }, [task.id, task.terminalSessionId]);
 
   // Auto-switch to agent tab when terminal starts
@@ -259,7 +262,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const handleStopAgent = useCallback(async () => {
     if (!assignedAgent) return;
     await stopAgent(assignedAgent.id);
-    setTerminalSessionId(null);
+    // Don't clear terminalSessionId — keep terminal visible for reviewing output
   }, [assignedAgent, stopAgent]);
 
   const handleTerminalExit = useCallback(

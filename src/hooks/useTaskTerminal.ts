@@ -73,19 +73,29 @@ export function useTaskTerminal({ sessionId, onExit }: UseTaskTerminalOptions) {
 
   useEffect(() => {
     if (!sessionId) return;
+    const xterm = xtermRef.current;
+    if (!xterm) return;
 
-    // Replay buffered output first (covers missed events during navigation away)
+    // Track whether we've finished initial replay to avoid writing data twice
+    let replayDone = false;
+    // Set of chunk indices we've seen live (to deduplicate)
+    let liveChunkCount = 0;
+
+    // Clear terminal and replay buffered output (covers navigation away/back)
+    xterm.clear();
     void app.tasks.terminalGetBuffer(sessionId).then((buffer) => {
       if (buffer.length > 0 && xtermRef.current) {
         for (const chunk of buffer) {
           xtermRef.current.write(chunk);
         }
       }
+      liveChunkCount = buffer.length;
+      replayDone = true;
     });
 
-    // Receive data from PTY
+    // Receive live data from PTY — only write chunks that arrive AFTER replay
     const unsubData = app.tasks.onTerminalData((event) => {
-      if (event.sessionId === sessionId) {
+      if (event.sessionId === sessionId && replayDone) {
         xtermRef.current?.write(event.data);
       }
     });
