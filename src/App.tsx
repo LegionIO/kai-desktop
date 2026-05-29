@@ -26,14 +26,34 @@ import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProv
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { DictationOverlay } from '@/components/dictation/DictationOverlay';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
-import { ArchiveIcon, ArchiveRestoreIcon, ChevronDownIcon, ChevronRightIcon, DownloadIcon, LoaderIcon, MenuIcon, PencilIcon, PinIcon, Settings2Icon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react';
+import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
+  BotIcon,
+  CheckSquareIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  DownloadIcon,
+  LoaderIcon,
+  MenuIcon,
+  MessageSquareIcon,
+  PackageIcon,
+  PencilIcon,
+  PinIcon,
+  Settings2Icon,
+  SettingsIcon,
+  SlidersHorizontalIcon,
+  Trash2Icon,
+  XIcon,
+} from 'lucide-react';
 import { useThemeToggleControl } from '@/components/ThemeToggle';
-import { IconRail } from '@/components/sidebar/IconRail';
+import { SidebarDock, type DockItem } from '@/components/sidebar/SidebarDock';
 import { WorkspaceSelector } from '@/components/sidebar/WorkspaceSelector';
 import { ContentPanel } from '@/components/sidebar/ContentPanel';
 import type { SidebarTab, Workspace } from '../electron/config/schema';
 import { PluginMarketplace } from '@/components/settings/PluginMarketplace';
 import { InstalledPluginsList } from '@/components/plugins/InstalledPluginsList';
+import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
 import { InstalledPluginsView } from '@/components/plugins/InstalledPluginsView';
 import { BrokenPluginView } from '@/components/plugins/BrokenPluginView';
 import { UpdateCard } from '@/components/UpdateCard';
@@ -91,7 +111,7 @@ function AppRoot() {
   const isComputerSetupWindow = isOperatorWindow && search?.get('setup') === '1';
   const operatorSessionId = isOperatorWindow && !isComputerSetupWindow ? search.get('sessionId') : null;
   const operatorConversationId = isComputerSetupWindow ? search?.get('conversationId') : null;
-  const overlaySessionId = isOverlayWindow ? search?.get('sessionId') ?? null : null;
+  const overlaySessionId = isOverlayWindow ? (search?.get('sessionId') ?? null) : null;
 
   if (isDictationOverlay) {
     return <DictationOverlay />;
@@ -122,11 +142,15 @@ const OperatorSessionShell: FC<{ sessionId: string }> = ({ sessionId }) => {
         <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl border border-border/70 bg-card/60 px-4 py-3">
           <div className="min-w-0 overflow-hidden">
             <div className="text-sm font-semibold">Live Operator</div>
-            <div className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">{session?.goal ? `Goal: ${session.goal}` : 'Waiting for session...'}</div>
+            <div className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+              {session?.goal ? `Goal: ${session.goal}` : 'Waiting for session...'}
+            </div>
           </div>
           <button
             type="button"
-            onClick={() => { void setSurface(sessionId, 'docked'); }}
+            onClick={() => {
+              void setSurface(sessionId, 'docked');
+            }}
             className="rounded-xl border border-border/70 bg-card/70 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted/50"
           >
             Return to Docked View
@@ -157,7 +181,8 @@ function useOperatorConversationId(preferredConversationId?: string | null): str
     }
 
     let cancelled = false;
-    app.conversations.getActiveId()
+    app.conversations
+      .getActiveId()
       .then((id) => {
         if (!cancelled) setConversationId(id);
       })
@@ -202,7 +227,8 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
     }
 
     let cancelled = false;
-    app.conversations.get(conversationId)
+    app.conversations
+      .get(conversationId)
       .then((conversation) => {
         if (cancelled) return;
         const record = conversation as {
@@ -231,24 +257,30 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
 
   useEffect(() => {
     if (!conversationId) return;
-    app.conversations.get(conversationId).then((conv: unknown) => {
-      const record = conv as ConversationRecord | null;
-      if (!record) return;
-      // Skip if values haven't actually changed to avoid unnecessary writes
-      // that could race with concurrent stream persistence.
-      if (record.selectedModelKey === selectedModelKey
-        && record.selectedProfileKey === selectedProfileKey
-        && record.fallbackEnabled === fallbackEnabled
-        && record.profilePrimaryModelKey === profilePrimaryModelKey) return;
-      app.conversations.put({
-        ...record,
-        selectedModelKey,
-        selectedProfileKey,
-        fallbackEnabled,
-        profilePrimaryModelKey,
-        updatedAt: new Date().toISOString(),
-      });
-    }).catch(() => {});
+    app.conversations
+      .get(conversationId)
+      .then((conv: unknown) => {
+        const record = conv as ConversationRecord | null;
+        if (!record) return;
+        // Skip if values haven't actually changed to avoid unnecessary writes
+        // that could race with concurrent stream persistence.
+        if (
+          record.selectedModelKey === selectedModelKey &&
+          record.selectedProfileKey === selectedProfileKey &&
+          record.fallbackEnabled === fallbackEnabled &&
+          record.profilePrimaryModelKey === profilePrimaryModelKey
+        )
+          return;
+        app.conversations.put({
+          ...record,
+          selectedModelKey,
+          selectedProfileKey,
+          fallbackEnabled,
+          profilePrimaryModelKey,
+          updatedAt: new Date().toISOString(),
+        });
+      })
+      .catch(() => {});
   }, [conversationId, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
 
   const handleSelectProfile = useCallback((key: string | null, primaryModelKey: string | null) => {
@@ -263,12 +295,15 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
     }
   }, []);
 
-  const handleToggleFallback = useCallback((enabled: boolean) => {
-    setFallbackEnabled(enabled);
-    if (enabled && selectedProfileKey && profilePrimaryModelKey) {
-      setSelectedModelKey(profilePrimaryModelKey);
-    }
-  }, [profilePrimaryModelKey, selectedProfileKey]);
+  const handleToggleFallback = useCallback(
+    (enabled: boolean) => {
+      setFallbackEnabled(enabled);
+      if (enabled && selectedProfileKey && profilePrimaryModelKey) {
+        setSelectedModelKey(profilePrimaryModelKey);
+      }
+    },
+    [profilePrimaryModelKey, selectedProfileKey],
+  );
 
   useEffect(() => {
     if (!selectedProfileKey || !config) return;
@@ -381,10 +416,12 @@ const AGENTS_VIEW = 'agents';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function isPluginView(view: string): boolean {
-  return view === MARKETPLACE_VIEW
-    || view === PLUGINS_VIEW
-    || view.startsWith(PLUGIN_ERROR_VIEW_PREFIX)
-    || view.startsWith('plugin-panel:');
+  return (
+    view === MARKETPLACE_VIEW ||
+    view === PLUGINS_VIEW ||
+    view.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ||
+    view.startsWith('plugin-panel:')
+  );
 }
 
 function getPluginPanelViewKey(pluginName: string, panelId: string): string {
@@ -397,10 +434,7 @@ function getProfilePrimaryModelKey(config: Record<string, unknown> | null, profi
 
   const profile = profiles.find((entry) => {
     return Boolean(
-      entry
-      && typeof entry === 'object'
-      && 'key' in entry
-      && (entry as { key?: unknown }).key === profileKey,
+      entry && typeof entry === 'object' && 'key' in entry && (entry as { key?: unknown }).key === profileKey,
     );
   }) as { primaryModelKey?: unknown } | undefined;
 
@@ -408,7 +442,11 @@ function getProfilePrimaryModelKey(config: Record<string, unknown> | null, profi
 }
 
 function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean {
-  const tokens = shortcut.toLowerCase().split('+').map((token) => token.trim()).filter(Boolean);
+  const tokens = shortcut
+    .toLowerCase()
+    .split('+')
+    .map((token) => token.trim())
+    .filter(Boolean);
   if (tokens.length === 0) return false;
 
   const keyToken = tokens[tokens.length - 1];
@@ -444,13 +482,16 @@ function AppShell() {
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
-  const [threadOverrides, setThreadOverrides] = useState<{
-    temperature?: number | null;
-    systemPromptOverride?: string | null;
-    maxSteps?: number | null;
-    maxRetries?: number | null;
-    runtimeOverride?: string | null;
-  } | undefined>(undefined);
+  const [threadOverrides, setThreadOverrides] = useState<
+    | {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+      }
+    | undefined
+  >(undefined);
   const { sessionsByConversation: cuSessionsByConversation } = useComputerUse();
   // Track the primary model key of the currently selected profile so we can
   // restore it when auto-routing is re-enabled.
@@ -463,7 +504,10 @@ function AppShell() {
     if (el) {
       // Radix dropdown restores focus to the trigger button asynchronously
       // after the menu closes, so we need a longer delay to beat that.
-      setTimeout(() => { el.focus(); el.select(); }, 50);
+      setTimeout(() => {
+        el.focus();
+        el.select();
+      }, 50);
     }
   }, []);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -471,10 +515,18 @@ function AppShell() {
   const [threadSettingsOpen, setThreadSettingsOpen] = useState(false);
   const [planPanel, setPlanPanel] = useState<{ content: string; filePath?: string } | null>(null);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]'));
+    } catch {
+      return new Set();
+    }
   });
   const [pinnedPlugins, setPinnedPlugins] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-plugins') || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-plugins') || '[]'));
+    } catch {
+      return new Set();
+    }
   });
   const [pluginTitleMenuOpen, setPluginTitleMenuOpen] = useState(false);
   const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
@@ -488,7 +540,11 @@ function AppShell() {
   const [confirmingTaskDelete, setConfirmingTaskDelete] = useState(false);
   const [isCreatingTask, setIsCreatingTask] = useState(false);
   const [pinnedTaskIds, setPinnedTaskIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]')); } catch { return new Set(); }
+    try {
+      return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]'));
+    } catch {
+      return new Set();
+    }
   });
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -516,7 +572,8 @@ function AppShell() {
     () => (config?.ui as { workspaces?: Workspace[] } | undefined)?.workspaces ?? [],
     [config],
   );
-  const activeWorkspaceId = (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
+  const activeWorkspaceId =
+    (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
   const activeWorkspace = useMemo<Workspace | null>(
     () => workspaces.find((w) => w.id === activeWorkspaceId) ?? null,
     [workspaces, activeWorkspaceId],
@@ -567,11 +624,8 @@ function AppShell() {
       void (async () => {
         await app.conversations.setActiveId(restoredId);
         setActiveConversationId(restoredId);
-        const conv = await app.conversations.get(restoredId) as ConversationRecord | null;
-        setActiveConversationTitle(getConversationDisplayTitle(
-          conv,
-          cuSessionsByConversation.get(restoredId),
-        ));
+        const conv = (await app.conversations.get(restoredId)) as ConversationRecord | null;
+        setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(restoredId)));
       })();
     }
   }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
@@ -579,18 +633,23 @@ function AppShell() {
   // Build a name→displayName map from the plugin list (refreshed when pluginUIState changes)
   useEffect(() => {
     let cancelled = false;
-    app.plugins.list().then((list: Array<{ name: string; displayName: string; brandRequired?: boolean }>) => {
-      if (cancelled) return;
-      const map = new Map<string, string>();
-      const required = new Set<string>();
-      for (const p of list) {
-        if (p.displayName) map.set(p.name, p.displayName);
-        if (p.brandRequired) required.add(p.name);
-      }
-      setPluginDisplayNames(map);
-      setPluginBrandRequired(required);
-    }).catch(() => {});
-    return () => { cancelled = true; };
+    app.plugins
+      .list()
+      .then((list: Array<{ name: string; displayName: string; brandRequired?: boolean }>) => {
+        if (cancelled) return;
+        const map = new Map<string, string>();
+        const required = new Set<string>();
+        for (const p of list) {
+          if (p.displayName) map.set(p.name, p.displayName);
+          if (p.brandRequired) required.add(p.name);
+        }
+        setPluginDisplayNames(map);
+        setPluginBrandRequired(required);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [pluginUIState]);
 
   useEffect(() => {
@@ -600,31 +659,32 @@ function AppShell() {
       if (cancelled) return;
       if (suppressStoreSync.current) return;
       const resolvedActiveId = store?.activeConversationId ?? null;
-      const conversation = resolvedActiveId && store?.conversations
-        ? store.conversations[resolvedActiveId] ?? null
-        : null;
+      const conversation =
+        resolvedActiveId && store?.conversations ? (store.conversations[resolvedActiveId] ?? null) : null;
 
       setActiveConversationId(resolvedActiveId);
-      setActiveConversationTitle(getConversationDisplayTitle(
-        conversation,
-        resolvedActiveId ? cuSessionsByConversation.get(resolvedActiveId) : undefined,
-      ));
-      setActiveConversationHasMessages((conversation as { messageCount?: number } | null)?.messageCount ? ((conversation as { messageCount: number }).messageCount > 0) : false);
+      setActiveConversationTitle(
+        getConversationDisplayTitle(
+          conversation,
+          resolvedActiveId ? cuSessionsByConversation.get(resolvedActiveId) : undefined,
+        ),
+      );
+      setActiveConversationHasMessages(
+        (conversation as { messageCount?: number } | null)?.messageCount
+          ? (conversation as { messageCount: number }).messageCount > 0
+          : false,
+      );
     };
 
     const loadActiveConversation = async () => {
       try {
-        const [id, list] = await Promise.all([
-          app.conversations.getActiveId(),
-          app.conversations.list(),
-        ]);
+        const [id, list] = await Promise.all([app.conversations.getActiveId(), app.conversations.list()]);
         if (cancelled) return;
 
         const conversations = Object.fromEntries(
           (list as ConversationRecord[]).map((conversation) => [conversation.id, conversation]),
         );
         applyStore({ activeConversationId: id, conversations });
-
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
@@ -660,9 +720,14 @@ function AppShell() {
   const togglePin = useCallback((id: string) => {
     const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') || '[]';
     let ids: string[];
-    try { ids = JSON.parse(raw); } catch { ids = []; }
+    try {
+      ids = JSON.parse(raw);
+    } catch {
+      ids = [];
+    }
     const set = new Set(ids);
-    if (set.has(id)) set.delete(id); else set.add(id);
+    if (set.has(id)) set.delete(id);
+    else set.add(id);
     const serialized = JSON.stringify([...set]);
     localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', serialized);
     setPinnedIds(set);
@@ -676,7 +741,9 @@ function AppShell() {
       try {
         const ids = JSON.parse(detail) as string[];
         setPinnedIds(new Set(ids));
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener('pinned-conversations-changed', handler);
     return () => window.removeEventListener('pinned-conversations-changed', handler);
@@ -685,9 +752,14 @@ function AppShell() {
   const togglePluginPin = useCallback((name: string) => {
     const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-plugins') || '[]';
     let names: string[];
-    try { names = JSON.parse(raw); } catch { names = []; }
+    try {
+      names = JSON.parse(raw);
+    } catch {
+      names = [];
+    }
     const set = new Set(names);
-    if (set.has(name)) set.delete(name); else set.add(name);
+    if (set.has(name)) set.delete(name);
+    else set.add(name);
     const serialized = JSON.stringify([...set]);
     localStorage.setItem(__BRAND_APP_SLUG + ':pinned-plugins', serialized);
     setPinnedPlugins(set);
@@ -698,7 +770,11 @@ function AppShell() {
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
-      try { setPinnedPlugins(new Set(JSON.parse(detail) as string[])); } catch { /* ignore */ }
+      try {
+        setPinnedPlugins(new Set(JSON.parse(detail) as string[]));
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener('pinned-plugins-changed', handler);
     return () => window.removeEventListener('pinned-plugins-changed', handler);
@@ -721,40 +797,42 @@ function AppShell() {
     const trimmed = newTitle.trim();
     setRenamingTitle(false);
     if (!trimmed) return;
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return;
     await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' } as ConversationRecord);
   }, []);
 
-  const handleDeleteConversation = useCallback(async (id: string) => {
-    const allConversations = await app.conversations.list() as ConversationRecord[];
-    const remaining = allConversations
-      .filter((c) => c.id !== id)
-      .sort((a, b) => {
-        const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
-        const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
-        return bTime - aTime;
-      });
-    // Set the next active conversation BEFORE deleting so the backend
-    // never broadcasts activeConversationId = null.
-    if (remaining.length > 0) {
-      await app.conversations.setActiveId(remaining[0].id);
-    }
-    await app.conversations.delete(id);
-    if (remaining.length > 0) {
-      setActiveConversationId(remaining[0].id);
-      setActiveConversationTitle(getConversationDisplayTitle(
-        remaining[0],
-        cuSessionsByConversation.get(remaining[0].id),
-      ));
-    } else {
-      setActiveConversationId(null);
-      setActiveConversationTitle(null);
-    }
-  }, [cuSessionsByConversation]);
+  const handleDeleteConversation = useCallback(
+    async (id: string) => {
+      const allConversations = (await app.conversations.list()) as ConversationRecord[];
+      const remaining = allConversations
+        .filter((c) => c.id !== id)
+        .sort((a, b) => {
+          const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
+          const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
+          return bTime - aTime;
+        });
+      // Set the next active conversation BEFORE deleting so the backend
+      // never broadcasts activeConversationId = null.
+      if (remaining.length > 0) {
+        await app.conversations.setActiveId(remaining[0].id);
+      }
+      await app.conversations.delete(id);
+      if (remaining.length > 0) {
+        setActiveConversationId(remaining[0].id);
+        setActiveConversationTitle(
+          getConversationDisplayTitle(remaining[0], cuSessionsByConversation.get(remaining[0].id)),
+        );
+      } else {
+        setActiveConversationId(null);
+        setActiveConversationTitle(null);
+      }
+    },
+    [cuSessionsByConversation],
+  );
 
   const handleArchiveConversation = useCallback(async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return;
     await app.conversations.put({ ...conv, archived: !conv.archived } as ConversationRecord);
   }, []);
@@ -790,19 +868,19 @@ function AppShell() {
     };
   }, [dragState, sidebarWidth, updateConfig]);
 
-  const handleSwitchConversation = useCallback(async (id: string) => {
-    if (isMobile) setSidebarOpen(false);
-    setPlanPanel(null);
-    await app.conversations.setActiveId(id);
-    setActiveView(CHAT_VIEW);
-    setActiveConversationId(id);
-    // Load the title for the switched-to conversation
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
-    setActiveConversationTitle(getConversationDisplayTitle(
-      conv,
-      cuSessionsByConversation.get(id),
-    ));
-  }, [cuSessionsByConversation, isMobile]);
+  const handleSwitchConversation = useCallback(
+    async (id: string) => {
+      if (isMobile) setSidebarOpen(false);
+      setPlanPanel(null);
+      await app.conversations.setActiveId(id);
+      setActiveView(CHAT_VIEW);
+      setActiveConversationId(id);
+      // Load the title for the switched-to conversation
+      const conv = (await app.conversations.get(id)) as ConversationRecord | null;
+      setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
+    },
+    [cuSessionsByConversation, isMobile],
+  );
 
   const handleNewConversation = useCallback(async () => {
     if (isMobile) setSidebarOpen(false);
@@ -812,13 +890,24 @@ function AppShell() {
       const newId = generateId();
       const now = new Date().toISOString();
       await app.conversations.put({
-        id: newId, title: null, fallbackTitle: null, messages: [],
-        messageTree: [], headId: null,
-        conversationCompaction: null, lastContextUsage: null,
-        createdAt: now, updatedAt: now, lastMessageAt: null,
-        titleStatus: 'idle', titleUpdatedAt: null,
-        messageCount: 0, userMessageCount: 0,
-        runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
+        id: newId,
+        title: null,
+        fallbackTitle: null,
+        messages: [],
+        messageTree: [],
+        headId: null,
+        conversationCompaction: null,
+        lastContextUsage: null,
+        createdAt: now,
+        updatedAt: now,
+        lastMessageAt: null,
+        titleStatus: 'idle',
+        titleUpdatedAt: null,
+        messageCount: 0,
+        userMessageCount: 0,
+        runStatus: 'idle',
+        hasUnread: false,
+        lastAssistantUpdateAt: null,
         selectedModelKey: null,
         currentWorkingDirectory: activeWorkspace?.directory ?? null,
         workspaceId: activeWorkspaceId ?? undefined,
@@ -923,12 +1012,15 @@ function AppShell() {
 
   // When toggling auto-routing back ON with an active profile, restore the
   // profile's primary model in the model selector.
-  const handleToggleFallback = useCallback((enabled: boolean) => {
-    setFallbackEnabled(enabled);
-    if (enabled && selectedProfileKey && profilePrimaryModelKey) {
-      setSelectedModelKey(profilePrimaryModelKey);
-    }
-  }, [selectedProfileKey, profilePrimaryModelKey]);
+  const handleToggleFallback = useCallback(
+    (enabled: boolean) => {
+      setFallbackEnabled(enabled);
+      if (enabled && selectedProfileKey && profilePrimaryModelKey) {
+        setSelectedModelKey(profilePrimaryModelKey);
+      }
+    },
+    [selectedProfileKey, profilePrimaryModelKey],
+  );
 
   useEffect(() => {
     if (!selectedProfileKey || !config) return;
@@ -952,72 +1044,90 @@ function AppShell() {
   }, [config, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
 
   // Restore per-conversation settings when switching conversations
-  const handleConversationSettingsLoaded = useCallback((settings: {
-    selectedModelKey: string | null;
-    selectedProfileKey: string | null;
-    fallbackEnabled: boolean;
-    profilePrimaryModelKey: string | null;
-    reasoningEffort?: ReasoningEffort | null;
-    executionMode?: ExecutionMode | null;
-    temperature?: number | null;
-    systemPromptOverride?: string | null;
-    maxSteps?: number | null;
-    maxRetries?: number | null;
-    runtimeOverride?: string | null;
-  }) => {
-    setSelectedModelKey(settings.selectedModelKey);
-    setSelectedProfileKey(settings.selectedProfileKey);
-    setFallbackEnabled(settings.fallbackEnabled);
-    setProfilePrimaryModelKey(settings.profilePrimaryModelKey);
-    if (settings.reasoningEffort) setReasoningEffort(settings.reasoningEffort);
-    else setReasoningEffort('medium');
-    if (settings.executionMode) setExecutionMode(settings.executionMode as ExecutionMode);
-    else setExecutionMode('auto');
-    setThreadOverrides({
-      temperature: settings.temperature ?? null,
-      systemPromptOverride: settings.systemPromptOverride ?? null,
-      maxSteps: settings.maxSteps ?? null,
-      maxRetries: settings.maxRetries ?? null,
-      runtimeOverride: settings.runtimeOverride ?? null,
-    });
-  }, []);
+  const handleConversationSettingsLoaded = useCallback(
+    (settings: {
+      selectedModelKey: string | null;
+      selectedProfileKey: string | null;
+      fallbackEnabled: boolean;
+      profilePrimaryModelKey: string | null;
+      reasoningEffort?: ReasoningEffort | null;
+      executionMode?: ExecutionMode | null;
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    }) => {
+      setSelectedModelKey(settings.selectedModelKey);
+      setSelectedProfileKey(settings.selectedProfileKey);
+      setFallbackEnabled(settings.fallbackEnabled);
+      setProfilePrimaryModelKey(settings.profilePrimaryModelKey);
+      if (settings.reasoningEffort) setReasoningEffort(settings.reasoningEffort);
+      else setReasoningEffort('medium');
+      if (settings.executionMode) setExecutionMode(settings.executionMode as ExecutionMode);
+      else setExecutionMode('auto');
+      setThreadOverrides({
+        temperature: settings.temperature ?? null,
+        systemPromptOverride: settings.systemPromptOverride ?? null,
+        maxSteps: settings.maxSteps ?? null,
+        maxRetries: settings.maxRetries ?? null,
+        runtimeOverride: settings.runtimeOverride ?? null,
+      });
+    },
+    [],
+  );
 
   // Persist per-conversation settings whenever they change
   useEffect(() => {
     if (!activeConversationId) return;
-    app.conversations.get(activeConversationId).then((conv: unknown) => {
-      const record = conv as ConversationRecord | null;
-      if (!record) return;
-      // Skip if values haven't actually changed to avoid unnecessary writes
-      // that could race with concurrent stream persistence.
-      if (record.selectedModelKey === selectedModelKey
-        && record.selectedProfileKey === selectedProfileKey
-        && record.fallbackEnabled === fallbackEnabled
-        && record.profilePrimaryModelKey === profilePrimaryModelKey
-        && (record.reasoningEffort ?? null) === (reasoningEffort === 'medium' ? null : reasoningEffort)
-        && (record.executionMode ?? null) === (executionMode === 'auto' ? null : executionMode)
-        && (record.temperature ?? null) === (threadOverrides?.temperature ?? null)
-        && (record.systemPromptOverride ?? null) === (threadOverrides?.systemPromptOverride ?? null)
-        && (record.maxSteps ?? null) === (threadOverrides?.maxSteps ?? null)
-        && (record.maxRetries ?? null) === (threadOverrides?.maxRetries ?? null)
-        && (record.runtimeOverride ?? null) === (threadOverrides?.runtimeOverride ?? null)) return;
-      app.conversations.put({
-        ...record,
-        selectedModelKey,
-        selectedProfileKey,
-        fallbackEnabled,
-        profilePrimaryModelKey,
-        reasoningEffort: reasoningEffort === 'medium' ? null : reasoningEffort,
-        executionMode: executionMode === 'auto' ? null : executionMode,
-        temperature: threadOverrides?.temperature ?? null,
-        systemPromptOverride: threadOverrides?.systemPromptOverride ?? null,
-        maxSteps: threadOverrides?.maxSteps ?? null,
-        maxRetries: threadOverrides?.maxRetries ?? null,
-        runtimeOverride: threadOverrides?.runtimeOverride ?? null,
-        updatedAt: new Date().toISOString(),
-      });
-    }).catch(() => {});
-  }, [activeConversationId, selectedModelKey, selectedProfileKey, fallbackEnabled, profilePrimaryModelKey, reasoningEffort, executionMode, threadOverrides]);
+    app.conversations
+      .get(activeConversationId)
+      .then((conv: unknown) => {
+        const record = conv as ConversationRecord | null;
+        if (!record) return;
+        // Skip if values haven't actually changed to avoid unnecessary writes
+        // that could race with concurrent stream persistence.
+        if (
+          record.selectedModelKey === selectedModelKey &&
+          record.selectedProfileKey === selectedProfileKey &&
+          record.fallbackEnabled === fallbackEnabled &&
+          record.profilePrimaryModelKey === profilePrimaryModelKey &&
+          (record.reasoningEffort ?? null) === (reasoningEffort === 'medium' ? null : reasoningEffort) &&
+          (record.executionMode ?? null) === (executionMode === 'auto' ? null : executionMode) &&
+          (record.temperature ?? null) === (threadOverrides?.temperature ?? null) &&
+          (record.systemPromptOverride ?? null) === (threadOverrides?.systemPromptOverride ?? null) &&
+          (record.maxSteps ?? null) === (threadOverrides?.maxSteps ?? null) &&
+          (record.maxRetries ?? null) === (threadOverrides?.maxRetries ?? null) &&
+          (record.runtimeOverride ?? null) === (threadOverrides?.runtimeOverride ?? null)
+        )
+          return;
+        app.conversations.put({
+          ...record,
+          selectedModelKey,
+          selectedProfileKey,
+          fallbackEnabled,
+          profilePrimaryModelKey,
+          reasoningEffort: reasoningEffort === 'medium' ? null : reasoningEffort,
+          executionMode: executionMode === 'auto' ? null : executionMode,
+          temperature: threadOverrides?.temperature ?? null,
+          systemPromptOverride: threadOverrides?.systemPromptOverride ?? null,
+          maxSteps: threadOverrides?.maxSteps ?? null,
+          maxRetries: threadOverrides?.maxRetries ?? null,
+          runtimeOverride: threadOverrides?.runtimeOverride ?? null,
+          updatedAt: new Date().toISOString(),
+        });
+      })
+      .catch(() => {});
+  }, [
+    activeConversationId,
+    selectedModelKey,
+    selectedProfileKey,
+    fallbackEnabled,
+    profilePrimaryModelKey,
+    reasoningEffort,
+    executionMode,
+    threadOverrides,
+  ]);
 
   // Sync when the ThreadSettingsModal modifies the ACTIVE conversation
   useEffect(() => {
@@ -1030,11 +1140,19 @@ function AppShell() {
       if ('reasoningEffort' in detail) setReasoningEffort((detail.reasoningEffort as ReasoningEffort) ?? 'medium');
       if ('executionMode' in detail) setExecutionMode((detail.executionMode as ExecutionMode) ?? 'auto');
       // Thread overrides (temperature, systemPrompt, maxSteps, etc.)
-      if ('temperature' in detail || 'systemPromptOverride' in detail || 'maxSteps' in detail || 'maxRetries' in detail || 'runtimeOverride' in detail) {
+      if (
+        'temperature' in detail ||
+        'systemPromptOverride' in detail ||
+        'maxSteps' in detail ||
+        'maxRetries' in detail ||
+        'runtimeOverride' in detail
+      ) {
         setThreadOverrides((prev) => ({
           ...prev,
           ...('temperature' in detail ? { temperature: detail.temperature as number | null } : {}),
-          ...('systemPromptOverride' in detail ? { systemPromptOverride: detail.systemPromptOverride as string | null } : {}),
+          ...('systemPromptOverride' in detail
+            ? { systemPromptOverride: detail.systemPromptOverride as string | null }
+            : {}),
           ...('maxSteps' in detail ? { maxSteps: detail.maxSteps as number | null } : {}),
           ...('maxRetries' in detail ? { maxRetries: detail.maxRetries as number | null } : {}),
           ...('runtimeOverride' in detail ? { runtimeOverride: detail.runtimeOverride as string | null } : {}),
@@ -1160,7 +1278,11 @@ function AppShell() {
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
-      try { setPinnedTaskIds(new Set(JSON.parse(detail))); } catch { /* ignore */ }
+      try {
+        setPinnedTaskIds(new Set(JSON.parse(detail)));
+      } catch {
+        /* ignore */
+      }
     };
     window.addEventListener('pinned-tasks-changed', handler);
     return () => window.removeEventListener('pinned-tasks-changed', handler);
@@ -1169,32 +1291,43 @@ function AppShell() {
   const toggleTaskPin = useCallback((id: string) => {
     const raw = localStorage.getItem(__BRAND_APP_SLUG + ':pinned-tasks') || '[]';
     let ids: string[];
-    try { ids = JSON.parse(raw); } catch { ids = []; }
+    try {
+      ids = JSON.parse(raw);
+    } catch {
+      ids = [];
+    }
     const set = new Set(ids);
-    if (set.has(id)) set.delete(id); else set.add(id);
+    if (set.has(id)) set.delete(id);
+    else set.add(id);
     const serialized = JSON.stringify([...set]);
     localStorage.setItem(__BRAND_APP_SLUG + ':pinned-tasks', serialized);
     setPinnedTaskIds(set);
     window.dispatchEvent(new CustomEvent('pinned-tasks-changed', { detail: serialized }));
   }, []);
 
-  const handleTaskRename = useCallback(async (taskId: string, newTitle: string) => {
-    if (!tasksCtx || !newTitle.trim()) return;
-    await tasksCtx.updateTask(taskId, { title: newTitle.trim() });
-    setRenamingTask(false);
-  }, [tasksCtx]);
+  const handleTaskRename = useCallback(
+    async (taskId: string, newTitle: string) => {
+      if (!tasksCtx || !newTitle.trim()) return;
+      await tasksCtx.updateTask(taskId, { title: newTitle.trim() });
+      setRenamingTask(false);
+    },
+    [tasksCtx],
+  );
 
-  const handleTaskDelete = useCallback(async (taskId: string) => {
-    if (!tasksCtx) return;
-    // Kill any running terminal session before deleting
-    const task = tasksCtx.state.tasks.find((t) => t.id === taskId);
-    if (task?.terminalSessionId) {
-      void app.tasks.terminalKill(task.terminalSessionId);
-    }
-    await tasksCtx.deleteTask(taskId);
-    tasksCtx.selectTask(null);
-    setConfirmingTaskDelete(false);
-  }, [tasksCtx]);
+  const handleTaskDelete = useCallback(
+    async (taskId: string) => {
+      if (!tasksCtx) return;
+      // Kill any running terminal session before deleting
+      const task = tasksCtx.state.tasks.find((t) => t.id === taskId);
+      if (task?.terminalSessionId) {
+        void app.tasks.terminalKill(task.terminalSessionId);
+      }
+      await tasksCtx.deleteTask(taskId);
+      tasksCtx.selectTask(null);
+      setConfirmingTaskDelete(false);
+    },
+    [tasksCtx],
+  );
 
   const pluginPanels = pluginUIState?.panels?.filter((panel) => panel.visible) ?? [];
   const activePluginPanel = useMemo(() => {
@@ -1223,30 +1356,46 @@ function AppShell() {
     : null;
 
   /** Resolve a raw plugin name to its display label */
-  const pluginDisplayName = useCallback((rawName: string): string => {
-    // First try navigation items (active plugins)
-    const navItems = pluginUIState?.navigationItems ?? [];
-    const match = navItems.find((n) => n.pluginName === rawName && n.visible);
-    if (match?.label) return match.label;
-    // Fall back to the plugin list's displayName (works for errored plugins too)
-    return pluginDisplayNames.get(rawName) || rawName;
-  }, [pluginUIState?.navigationItems, pluginDisplayNames]);
+  const pluginDisplayName = useCallback(
+    (rawName: string): string => {
+      // First try navigation items (active plugins)
+      const navItems = pluginUIState?.navigationItems ?? [];
+      const match = navItems.find((n) => n.pluginName === rawName && n.visible);
+      if (match?.label) return match.label;
+      // Fall back to the plugin list's displayName (works for errored plugins too)
+      return pluginDisplayNames.get(rawName) || rawName;
+    },
+    [pluginUIState?.navigationItems, pluginDisplayNames],
+  );
 
-  const handlePluginNavigationItem = useCallback((pluginName: string, target: { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown }) => {
-    if (target.type === 'panel' && target.panelId) {
-      setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
-      return;
-    }
+  const handlePluginNavigationItem = useCallback(
+    (
+      pluginName: string,
+      target: {
+        type: string;
+        panelId?: string;
+        conversationId?: string;
+        targetId?: string;
+        action?: string;
+        data?: unknown;
+      },
+    ) => {
+      if (target.type === 'panel' && target.panelId) {
+        setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
+        return;
+      }
 
-    if (target.type === 'conversation' && target.conversationId) {
-      void handleSwitchConversation(target.conversationId);
-      return;
-    }
+      if (target.type === 'conversation' && target.conversationId) {
+        void handleSwitchConversation(target.conversationId);
+        return;
+      }
 
-    if (target.type === 'action' && target.targetId && target.action) {
-      void sendPluginAction(pluginName, target.targetId, target.action, target.data);
-    }
-  }, [handleSwitchConversation, sendPluginAction]);
+      if (target.type === 'action' && target.targetId && target.action) {
+        void sendPluginAction(pluginName, target.targetId, target.action, target.data);
+      }
+    },
+    [handleSwitchConversation, sendPluginAction],
+  );
 
   const pluginCommands = pluginUIState?.commands?.filter((command) => command.visible) ?? [];
 
@@ -1259,15 +1408,33 @@ function AppShell() {
     const handleKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey)) return;
 
-      const matchingPluginCommand = pluginCommands.find((command) => command.shortcut && matchesPluginShortcut(e, command.shortcut));
+      const matchingPluginCommand = pluginCommands.find(
+        (command) => command.shortcut && matchesPluginShortcut(e, command.shortcut),
+      );
       if (matchingPluginCommand) {
         e.preventDefault();
-        handlePluginNavigationItem(matchingPluginCommand.pluginName, matchingPluginCommand.target as { type: string; panelId?: string; conversationId?: string; targetId?: string; action?: string; data?: unknown });
+        handlePluginNavigationItem(
+          matchingPluginCommand.pluginName,
+          matchingPluginCommand.target as {
+            type: string;
+            panelId?: string;
+            conversationId?: string;
+            targetId?: string;
+            action?: string;
+            data?: unknown;
+          },
+        );
         return;
       }
 
       // Sidebar tab shortcuts: Cmd+1 through Cmd+5
-      const tabShortcuts: Record<string, SidebarTab> = { '1': 'chats', '2': 'tasks', '3': 'messages', '4': 'agents', '5': 'plugins' };
+      const tabShortcuts: Record<string, SidebarTab> = {
+        '1': 'chats',
+        '2': 'tasks',
+        '3': 'messages',
+        '4': 'agents',
+        '5': 'plugins',
+      };
       if (e.key in tabShortcuts) {
         e.preventDefault();
         const tab = tabShortcuts[e.key];
@@ -1280,863 +1447,1101 @@ function AppShell() {
       }
 
       switch (e.key) {
-        case '?': e.preventDefault(); setShortcutsOpen((v) => !v); break;
-        case ',': e.preventDefault(); void handleOpenSettings(); break;
+        case '?':
+          e.preventDefault();
+          setShortcutsOpen((v) => !v);
+          break;
+        case ',':
+          e.preventDefault();
+          void handleOpenSettings();
+          break;
       }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
   }, [handleOpenSettings, handlePluginNavigationItem, pluginCommands]);
 
+  // ── Dock items for bottom sidebar dock ──────────────────────────────────
+  const showPluginDockIcons =
+    (config?.ui as { showPluginDockIcons?: boolean } | undefined)?.showPluginDockIcons !== false;
+
+  const dockItems: DockItem[] = useMemo(() => {
+    // Check if a specific plugin panel dock icon is active
+    const pluginPanelActive =
+      showPluginDockIcons &&
+      pluginPanels.some((panel) => activeView === getPluginPanelViewKey(panel.pluginName, panel.id));
+
+    const items: DockItem[] = [
+      {
+        id: 'chats',
+        label: 'Chats',
+        icon: <MessageSquareIcon className="h-[18px] w-[18px]" />,
+        onClick: () => {
+          setSidebarSection('chats');
+          setActiveView(lastChatsViewRef.current);
+        },
+        active: sidebarSection === 'chats' && activeView !== SETTINGS_VIEW,
+      },
+      {
+        id: 'tasks',
+        label: 'Tasks',
+        icon: <CheckSquareIcon className="h-[18px] w-[18px]" />,
+        onClick: () => {
+          setSidebarSection('tasks');
+          setActiveView(TASKS_VIEW);
+        },
+        active: sidebarSection === 'tasks' && activeView !== SETTINGS_VIEW,
+      },
+      {
+        id: 'agents',
+        label: 'Agents',
+        icon: <BotIcon className="h-[18px] w-[18px]" />,
+        onClick: () => {
+          setSidebarSection('agents');
+          setActiveView(AGENTS_VIEW);
+        },
+        active: sidebarSection === 'agents' && activeView !== SETTINGS_VIEW,
+      },
+      {
+        id: 'plugins',
+        label: 'Plugins',
+        icon: <PackageIcon className="h-[18px] w-[18px]" />,
+        onClick: () => {
+          setSidebarSection('plugins');
+          setActiveView(lastPluginViewRef.current);
+        },
+        active: sidebarSection === 'plugins' && activeView !== SETTINGS_VIEW && !pluginPanelActive,
+        subdued: pluginPanelActive,
+        badge:
+          (pluginUpdateCount ?? 0) > 0 ? (
+            <span className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
+          ) : undefined,
+      },
+    ];
+
+    // Add plugin icons for plugins that have a content panel (not settings-only)
+    if (showPluginDockIcons && pluginPanels.length > 0) {
+      const navItems = pluginUIState?.navigationItems ?? [];
+      // Deduplicate by plugin name (a plugin may register multiple panels)
+      const seenPlugins = new Set<string>();
+      for (const panel of pluginPanels) {
+        if (seenPlugins.has(panel.pluginName)) continue;
+        seenPlugins.add(panel.pluginName);
+
+        const navItem = navItems.find((n) => n.pluginName === panel.pluginName && n.visible);
+        const label = navItem?.label || pluginDisplayNames.get(panel.pluginName) || panel.pluginName;
+        const icon = navItem?.icon;
+        const viewKey = getPluginPanelViewKey(panel.pluginName, panel.id);
+
+        items.push({
+          id: `plugin:${panel.pluginName}`,
+          label,
+          icon: (
+            <span className="inline-flex h-[18px] w-[18px] items-center justify-center [&>svg]:h-full [&>svg]:w-full">
+              {getPluginNavigationIcon(icon)}
+            </span>
+          ),
+          onClick: () => {
+            setSidebarSection('plugins');
+            setActiveView(viewKey);
+          },
+          active: activeView === viewKey,
+        });
+      }
+    }
+
+    return items;
+  }, [
+    sidebarSection,
+    activeView,
+    pluginUpdateCount,
+    showPluginDockIcons,
+    pluginPanels,
+    pluginUIState?.navigationItems,
+    pluginDisplayNames,
+  ]);
+
   return (
     <AttachmentProvider>
       <DropZone>
-      <RuntimeProvider
-        conversationId={activeConversationId}
-        selectedModelKey={selectedModelKey}
-        reasoningEffort={reasoningEffort}
-        executionMode={executionMode}
-        selectedProfileKey={selectedProfileKey}
-        fallbackEnabled={fallbackEnabled}
-        threadOverrides={threadOverrides}
-        onModelFallback={setSelectedModelKey}
-        onConversationSettingsLoaded={handleConversationSettingsLoaded}
-      >
-      <ComputerUseAutoNavigator
-        activeConversationId={activeConversationId}
-        onRevealComputerSurface={() => {
-          setActiveView('chat');
-          setThreadMode('computer');
-        }}
-      />
-      <RealtimeProvider>
-        <PluginModalHost />
-        <PluginToastHost />
-        <PermissionConsentModal />
-        <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
-        <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} conversationId={activeConversationId} />
-        <ThreadSettingsModal
-          open={threadSettingsOpen}
+        <RuntimeProvider
           conversationId={activeConversationId}
-          onClose={() => setThreadSettingsOpen(false)}
-          isActiveConversation={true}
-        />
-        {activeView === SETTINGS_VIEW && createPortal(
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center"
-            onClick={handleCloseSettings}
-            onKeyDown={(e) => { if (e.key === 'Escape') handleCloseSettings(); }}
-          >
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div
-              className="relative flex h-[min(85vh,800px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
-                <h2 className="text-sm font-semibold text-foreground">Settings</h2>
-                <button
-                  type="button"
-                  onClick={handleCloseSettings}
-                  className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
-                >
-                  <XIcon className="h-4 w-4" />
-                </button>
-              </div>
-              <div className="min-h-0 flex-1">
-                <SettingsPanel onClose={handleCloseSettings} />
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
-        {pluginSettingsOpen && (
-          <PluginSettingsModal
-            pluginName={pluginSettingsOpen}
-            displayName={pluginDisplayName(pluginSettingsOpen)}
-            onClose={() => setPluginSettingsOpen(null)}
+          selectedModelKey={selectedModelKey}
+          reasoningEffort={reasoningEffort}
+          executionMode={executionMode}
+          selectedProfileKey={selectedProfileKey}
+          fallbackEnabled={fallbackEnabled}
+          threadOverrides={threadOverrides}
+          onModelFallback={setSelectedModelKey}
+          onConversationSettingsLoaded={handleConversationSettingsLoaded}
+        >
+          <ComputerUseAutoNavigator
+            activeConversationId={activeConversationId}
+            onRevealComputerSurface={() => {
+              setActiveView('chat');
+              setThreadMode('computer');
+            }}
           />
-        )}
-        {renamingTitle && activeConversationId && (
-          <RenameChatModal
-            initialValue={renameValue}
-            onSave={(title) => void handleRename(activeConversationId, title)}
-            onClose={() => setRenamingTitle(false)}
-          />
-        )}
-        {confirmingDelete && activeConversationId && createPortal(
-          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingDelete(false)}>
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Delete chat</h2>
-              <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setConfirmingDelete(false)}
-                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setConfirmingDelete(false); void handleDeleteConversation(activeConversationId); }}
-                  className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
-        {confirmPluginUninstall && createPortal(
-          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmPluginUninstall(null)}>
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                This will uninstall{' '}
-                <span className="font-medium text-foreground">{pluginDisplayName(confirmPluginUninstall)}</span>.
-                This cannot be undone.
-              </p>
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setConfirmPluginUninstall(null)}
-                  disabled={isPluginUninstalling}
-                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { void handlePluginUninstall(confirmPluginUninstall); }}
-                  disabled={isPluginUninstalling}
-                  className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-                >
-                  {isPluginUninstalling ? (
-                    <>
-                      <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
-                      Uninstalling...
-                    </>
-                  ) : (
-                    <>
-                      <Trash2Icon className="h-3.5 w-3.5" />
-                      Uninstall
-                    </>
-                  )}
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
-        {renamingTask && tasksCtx?.state.selectedTaskId && createPortal(
-          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRenamingTask(false)}>
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
-              <input
-                ref={renameInputRef}
-                value={taskRenameValue}
-                onChange={(e) => setTaskRenameValue(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue); if (e.key === 'Escape') setRenamingTask(false); }}
-                className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
-              />
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setRenamingTask(false)}
-                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
-                  className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
-                >
-                  Save
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
-        {confirmingTaskDelete && tasksCtx?.state.selectedTaskId && createPortal(
-          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmingTaskDelete(false)}>
-            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-            <div className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
-              <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
-              <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this task? This cannot be undone.</p>
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setConfirmingTaskDelete(false)}
-                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { void handleTaskDelete(tasksCtx.state.selectedTaskId!); }}
-                  className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
-        <div className="relative flex h-screen overflow-hidden text-foreground">
-          {/* Mobile sidebar backdrop */}
-          {isMobile && sidebarOpen && (
-            <div
-              className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
-              onClick={() => setSidebarOpen(false)}
+          <RealtimeProvider>
+            <PluginModalHost />
+            <PluginToastHost />
+            <PermissionConsentModal />
+            <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+            <ExportDialog
+              open={exportOpen}
+              onClose={() => setExportOpen(false)}
+              conversationId={activeConversationId}
             />
-          )}
-          {/* Sidebar */}
-          <aside
-            className={
-              isMobile
-                ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
-                : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
-            }
-            style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
-          >
-            <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
-            <div className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4" onDoubleClick={() => window.app?.titlebar.doubleClick()}>
-              {app.platform.os === 'darwin' && <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />}
-              <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
-                <span className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}>{__BRAND_WORDMARK}</span>
-              </span>
-              <div className="titlebar-no-drag absolute right-3 flex items-center gap-1" onDoubleClick={(e) => e.stopPropagation()}>
-                <button
-                  type="button"
-                  onClick={toggleTheme}
-                  className="rounded-lg p-1.5 text-muted-foreground hover:bg-sidebar-accent/80 transition-colors"
-                  title={themeTitle}
+            <ThreadSettingsModal
+              open={threadSettingsOpen}
+              conversationId={activeConversationId}
+              onClose={() => setThreadSettingsOpen(false)}
+              isActiveConversation={true}
+            />
+            {activeView === SETTINGS_VIEW &&
+              createPortal(
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center"
+                  onClick={handleCloseSettings}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') handleCloseSettings();
+                  }}
                 >
-                  <ThemeIcon className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-            <div className="flex min-h-0 flex-1">
-              <IconRail
-                activeTab={sidebarSection}
-                onSelectTab={(tab) => {
-                  setSidebarSection(tab);
-                  if (tab === 'plugins') {
-                    setActiveView(lastPluginViewRef.current);
-                  } else if (tab === 'chats') {
-                    setActiveView(lastChatsViewRef.current);
-                  } else if (tab === 'tasks') {
-                    setActiveView(TASKS_VIEW);
-                  } else if (tab === 'agents') {
-                    setActiveView(AGENTS_VIEW);
-                  }
-                }}
-                settingsActive={activeView === SETTINGS_VIEW}
-                onSettingsClick={() => { void handleSettingsToggle(); }}
-                pluginUpdateCount={pluginUpdateCount}
+                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                  <div
+                    className="relative flex h-[min(85vh,800px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
+                      <h2 className="text-sm font-semibold text-foreground">Settings</h2>
+                      <button
+                        type="button"
+                        onClick={handleCloseSettings}
+                        className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
+                      >
+                        <XIcon className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="min-h-0 flex-1">
+                      <SettingsPanel onClose={handleCloseSettings} />
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+            {pluginSettingsOpen && (
+              <PluginSettingsModal
+                pluginName={pluginSettingsOpen}
+                displayName={pluginDisplayName(pluginSettingsOpen)}
+                onClose={() => setPluginSettingsOpen(null)}
               />
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                <ContentPanel
-                  activeTab={sidebarSection}
-                  chatsContent={
-                    <>
-                      <div className="min-h-0 flex-1 overflow-y-auto">
-                        <ConversationList
-                          activeConversationId={activeView === CHAT_LIST_VIEW ? null : activeConversationId}
-                          activeThreadMode={threadMode}
-                          onSwitchConversation={handleSwitchConversation}
-                          onNewConversation={handleNewConversation}
-                          onDeleteConversation={handleDeleteConversation}
-                          onNavigateToChatsPage={() => setActiveView(CHAT_LIST_VIEW)}
-                          workspaceId={activeWorkspaceId}
-                        />
+            )}
+            {renamingTitle && activeConversationId && (
+              <RenameChatModal
+                initialValue={renameValue}
+                onSave={(title) => void handleRename(activeConversationId, title)}
+                onClose={() => setRenamingTitle(false)}
+              />
+            )}
+            {confirmingDelete &&
+              activeConversationId &&
+              createPortal(
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center"
+                  onClick={() => setConfirmingDelete(false)}
+                >
+                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                  <div
+                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <h2 className="text-lg font-semibold text-foreground">Delete chat</h2>
+                    <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
+                    <div className="mt-5 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingDelete(false)}
+                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmingDelete(false);
+                          void handleDeleteConversation(activeConversationId);
+                        }}
+                        className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+            {confirmPluginUninstall &&
+              createPortal(
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center"
+                  onClick={() => setConfirmPluginUninstall(null)}
+                >
+                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                  <div
+                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      This will uninstall{' '}
+                      <span className="font-medium text-foreground">{pluginDisplayName(confirmPluginUninstall)}</span>.
+                      This cannot be undone.
+                    </p>
+                    <div className="mt-5 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmPluginUninstall(null)}
+                        disabled={isPluginUninstalling}
+                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handlePluginUninstall(confirmPluginUninstall);
+                        }}
+                        disabled={isPluginUninstalling}
+                        className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+                      >
+                        {isPluginUninstalling ? (
+                          <>
+                            <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                            Uninstalling...
+                          </>
+                        ) : (
+                          <>
+                            <Trash2Icon className="h-3.5 w-3.5" />
+                            Uninstall
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+            {renamingTask &&
+              tasksCtx?.state.selectedTaskId &&
+              createPortal(
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center"
+                  onClick={() => setRenamingTask(false)}
+                >
+                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                  <div
+                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
+                    <input
+                      ref={renameInputRef}
+                      value={taskRenameValue}
+                      onChange={(e) => setTaskRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue);
+                        if (e.key === 'Escape') setRenamingTask(false);
+                      }}
+                      className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+                    />
+                    <div className="mt-5 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setRenamingTask(false)}
+                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
+                        className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                      >
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+            {confirmingTaskDelete &&
+              tasksCtx?.state.selectedTaskId &&
+              createPortal(
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center"
+                  onClick={() => setConfirmingTaskDelete(false)}
+                >
+                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                  <div
+                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      Are you sure you want to delete this task? This cannot be undone.
+                    </p>
+                    <div className="mt-5 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingTaskDelete(false)}
+                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleTaskDelete(tasksCtx.state.selectedTaskId!);
+                        }}
+                        className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+            <div className="relative flex h-screen overflow-hidden text-foreground">
+              {/* Mobile sidebar backdrop */}
+              {isMobile && sidebarOpen && (
+                <div
+                  className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
+                  onClick={() => setSidebarOpen(false)}
+                />
+              )}
+              {/* Sidebar */}
+              <aside
+                className={
+                  isMobile
+                    ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
+                    : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
+                }
+                style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
+              >
+                <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
+                  <div
+                    className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4"
+                    onDoubleClick={() => window.app?.titlebar.doubleClick()}
+                  >
+                    {app.platform.os === 'darwin' && (
+                      <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
+                    )}
+                    <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
+                      <span
+                        className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}
+                      >
+                        {__BRAND_WORDMARK}
+                      </span>
+                    </span>
+                    <div
+                      className="titlebar-no-drag absolute right-3 flex items-center gap-1"
+                      onDoubleClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleSettingsToggle();
+                        }}
+                        className={cn(
+                          'rounded-lg p-1.5 transition-colors',
+                          activeView === SETTINGS_VIEW
+                            ? 'text-[var(--brand-accent)]'
+                            : 'text-muted-foreground hover:bg-sidebar-accent/80',
+                        )}
+                        title="Settings"
+                      >
+                        <SettingsIcon className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex min-h-0 flex-1 flex-col">
+                    <ContentPanel
+                      activeTab={sidebarSection}
+                      chatsContent={
+                        <>
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            <ConversationList
+                              activeConversationId={activeView === CHAT_LIST_VIEW ? null : activeConversationId}
+                              activeThreadMode={threadMode}
+                              onSwitchConversation={handleSwitchConversation}
+                              onNewConversation={handleNewConversation}
+                              onDeleteConversation={handleDeleteConversation}
+                              onNavigateToChatsPage={() => setActiveView(CHAT_LIST_VIEW)}
+                              workspaceId={activeWorkspaceId}
+                            />
+                          </div>
+                          <div className="shrink-0">
+                            <SubAgentSidebarSection />
+                          </div>
+                        </>
+                      }
+                      tasksContent={
+                        <div className="min-h-0 flex-1 overflow-y-auto">
+                          <TaskSidebarList
+                            onSelectTask={() => {
+                              setIsCreatingTask(false);
+                              setActiveView(TASKS_VIEW);
+                            }}
+                            onCreateTask={() => {
+                              tasksCtx?.selectTask(null);
+                              tasksCtx?.exitAICreation();
+                              setIsCreatingTask(true);
+                              setActiveView(TASKS_VIEW);
+                            }}
+                            onViewBoard={() => {
+                              tasksCtx?.selectTask(null);
+                              setIsCreatingTask(false);
+                              setActiveView(TASKS_VIEW);
+                            }}
+                            isBoardActive={
+                              activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId
+                            }
+                            isCreatingTask={isCreatingTask}
+                            workspaceId={activeWorkspaceId}
+                          />
+                        </div>
+                      }
+                      agentsContent={
+                        <div className="min-h-0 flex-1 overflow-y-auto">
+                          <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
+                        </div>
+                      }
+                      pluginsContent={
+                        <div className="min-h-0 flex-1 overflow-y-auto">
+                          <InstalledPluginsList
+                            activeView={activeView}
+                            onNavigate={handlePluginNavigationItem}
+                            onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                            onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                            onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                            onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
+                            pluginBrandRequired={pluginBrandRequired}
+                          />
+                        </div>
+                      }
+                    />
+                    <UpdateCard />
+                    <SidebarDock
+                      items={dockItems}
+                      trailing={
+                        <button
+                          type="button"
+                          onClick={toggleTheme}
+                          className="flex h-8 w-8 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
+                          title={themeTitle}
+                        >
+                          <ThemeIcon className="h-[18px] w-[18px]" />
+                        </button>
+                      }
+                    />
+                  </div>
+                </div>
+              </aside>
+              {!isMobile && (
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize left navigation"
+                  aria-valuenow={sidebarWidth}
+                  aria-valuemin={SIDEBAR_MIN_WIDTH}
+                  aria-valuemax={SIDEBAR_MAX_WIDTH}
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    setDragState({ startX: event.clientX, startWidth: sidebarWidth });
+                  }}
+                  className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
+                >
+                  {/* Invisible hit area — wide enough to grab easily */}
+                  <div className="absolute inset-y-0 -left-4 w-6" />
+                  {/* Handle pill — on the panel border, appears on hover */}
+                  <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
+                  {/* Tooltip */}
+                  <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
+                    <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
+                      Drag to resize
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Main content area */}
+              <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                <UpdateCard />
+                {/* Interactive title bar */}
+                <div
+                  onDoubleClick={() => window.app?.titlebar.doubleClick()}
+                  className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
+                >
+                  <div className="flex w-full items-center justify-between">
+                    {isMobile && (
+                      <button
+                        type="button"
+                        onClick={() => setSidebarOpen(true)}
+                        className="titlebar-no-drag mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
+                      >
+                        <MenuIcon className="h-5 w-5" />
+                      </button>
+                    )}
+                    <div
+                      className="titlebar-no-drag min-w-0 shrink-0 flex items-center"
+                      onDoubleClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="min-w-0">
+                        {activeView === SETTINGS_VIEW ? (
+                          <div className="flex items-center gap-1.5">
+                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                              Settings
+                            </div>
+                          </div>
+                        ) : activeView === MARKETPLACE_VIEW ? (
+                          <div className="flex items-center gap-1.5" />
+                        ) : activeView === PLUGINS_VIEW ? (
+                          <div className="flex items-center gap-1.5">
+                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                              Plugins
+                            </div>
+                          </div>
+                        ) : activeView === AGENTS_VIEW ? (
+                          (() => {
+                            if (agentsCtx.state.isCreatingAgent) {
+                              return null;
+                            }
+                            const selectedAgentId = agentsCtx.state.selectedAgentId;
+                            const selectedAgent = selectedAgentId
+                              ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
+                              : null;
+                            if (selectedAgent) {
+                              const agentIsPending = selectedAgent.name === 'New Agent';
+                              return (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => agentsCtx.selectAgent(null)}
+                                    className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                                  >
+                                    Agents
+                                  </button>
+                                  <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                                  <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
+                                    <DropdownMenu.Trigger asChild>
+                                      <button
+                                        type="button"
+                                        className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                      >
+                                        <span
+                                          className={`whitespace-nowrap text-sm font-medium ${agentIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
+                                        >
+                                          {agentIsPending ? 'Generating…' : selectedAgent.name}
+                                        </span>
+                                        {!agentIsPending && (
+                                          <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                        )}
+                                      </button>
+                                    </DropdownMenu.Trigger>
+                                    <DropdownMenu.Portal>
+                                      <DropdownMenu.Content
+                                        align="start"
+                                        sideOffset={4}
+                                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                      >
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => {
+                                            setAgentRenameModal({ id: selectedAgent.id, value: selectedAgent.name });
+                                            setAgentTitleMenuOpen(false);
+                                          }}
+                                        >
+                                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>Rename</span>
+                                        </DropdownMenu.Item>
+                                        <div className="my-1 h-px bg-border/60" />
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                          onSelect={() => {
+                                            setAgentDeleteModal({ id: selectedAgent.id, name: selectedAgent.name });
+                                            setAgentTitleMenuOpen(false);
+                                          }}
+                                        >
+                                          <Trash2Icon className="h-4 w-4" />
+                                          <span>Delete Agent</span>
+                                        </DropdownMenu.Item>
+                                      </DropdownMenu.Content>
+                                    </DropdownMenu.Portal>
+                                  </DropdownMenu.Root>
+                                </div>
+                              );
+                            }
+                            return (
+                              <div className="flex items-center gap-1.5">
+                                <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                  Agents
+                                </div>
+                              </div>
+                            );
+                          })()
+                        ) : activeView === TASKS_VIEW ? (
+                          (() => {
+                            if (isCreatingTask) {
+                              return null;
+                            }
+                            const selectedTaskId = tasksCtx?.state.selectedTaskId;
+                            const selectedTask = selectedTaskId
+                              ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId)
+                              : null;
+                            if (selectedTask) {
+                              const taskIsPending = selectedTask.title === 'New Task';
+                              return (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => tasksCtx?.selectTask(null)}
+                                    className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                                  >
+                                    Tasks
+                                  </button>
+                                  <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                                  <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
+                                    <DropdownMenu.Trigger asChild>
+                                      <button
+                                        type="button"
+                                        className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                      >
+                                        <span
+                                          className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
+                                        >
+                                          {selectedTask.title}
+                                        </span>
+                                        {!taskIsPending && (
+                                          <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                        )}
+                                      </button>
+                                    </DropdownMenu.Trigger>
+                                    <DropdownMenu.Portal>
+                                      <DropdownMenu.Content
+                                        align="start"
+                                        sideOffset={4}
+                                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                      >
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => toggleTaskPin(selectedTask.id)}
+                                        >
+                                          <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
+                                        </DropdownMenu.Item>
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => {
+                                            setTaskRenameValue(selectedTask.title);
+                                            setRenamingTask(true);
+                                          }}
+                                        >
+                                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>Rename</span>
+                                        </DropdownMenu.Item>
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => void tasksCtx?.archiveTask(selectedTask.id)}
+                                        >
+                                          <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>Archive</span>
+                                        </DropdownMenu.Item>
+                                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                          onSelect={() => setConfirmingTaskDelete(true)}
+                                        >
+                                          <Trash2Icon className="h-4 w-4" />
+                                          <span>Delete</span>
+                                        </DropdownMenu.Item>
+                                      </DropdownMenu.Content>
+                                    </DropdownMenu.Portal>
+                                  </DropdownMenu.Root>
+                                </div>
+                              );
+                            }
+                            return (
+                              <div className="flex items-center gap-1.5">
+                                <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                  Tasks
+                                </div>
+                              </div>
+                            );
+                          })()
+                        ) : activeErrorPluginName ? (
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setActiveView(PLUGINS_VIEW)}
+                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                            >
+                              Plugins
+                            </button>
+                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                            <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                >
+                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                    {pluginDisplayName(activeErrorPluginName)}
+                                  </span>
+                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  align="start"
+                                  sideOffset={4}
+                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                >
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => togglePluginPin(activeErrorPluginName)}
+                                  >
+                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>{pinnedPlugins.has(activeErrorPluginName) ? 'Unpin' : 'Pin'}</span>
+                                  </DropdownMenu.Item>
+                                  {pluginUIState?.settingsSections.some(
+                                    (s) => s.pluginName === activeErrorPluginName,
+                                  ) && (
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => setPluginSettingsOpen(activeErrorPluginName)}
+                                    >
+                                      <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                                      <span>Settings</span>
+                                    </DropdownMenu.Item>
+                                  )}
+                                  {!pluginBrandRequired.has(activeErrorPluginName) && (
+                                    <>
+                                      <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                      <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                        onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
+                                      >
+                                        <Trash2Icon className="h-4 w-4" />
+                                        <span>Uninstall</span>
+                                      </DropdownMenu.Item>
+                                    </>
+                                  )}
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
+                          </div>
+                        ) : activePluginPanel ? (
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setActiveView(PLUGINS_VIEW)}
+                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                            >
+                              Plugins
+                            </button>
+                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                            <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                >
+                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                    {pluginDisplayName(activePluginPanel.pluginName)}
+                                  </span>
+                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  align="start"
+                                  sideOffset={4}
+                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                >
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => togglePluginPin(activePluginPanel.pluginName)}
+                                  >
+                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>{pinnedPlugins.has(activePluginPanel.pluginName) ? 'Unpin' : 'Pin'}</span>
+                                  </DropdownMenu.Item>
+                                  {pluginUIState?.settingsSections.some(
+                                    (s) => s.pluginName === activePluginPanel.pluginName,
+                                  ) && (
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
+                                    >
+                                      <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                                      <span>Settings</span>
+                                    </DropdownMenu.Item>
+                                  )}
+                                  {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
+                                    <>
+                                      <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                      <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                        onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
+                                      >
+                                        <Trash2Icon className="h-4 w-4" />
+                                        <span>Uninstall</span>
+                                      </DropdownMenu.Item>
+                                    </>
+                                  )}
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
+                          </div>
+                        ) : activeView === CHAT_LIST_VIEW ? (
+                          <div className="flex items-center gap-1.5">
+                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Chats</div>
+                          </div>
+                        ) : activeConversationId && !activeConversationTitle && activeConversationHasMessages ? (
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveView(CHAT_LIST_VIEW);
+                              }}
+                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                            >
+                              Chats
+                            </button>
+                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                            <span className="whitespace-nowrap rounded-lg px-2 py-1 text-sm font-medium italic text-muted-foreground/50">
+                              New Chat
+                            </span>
+                          </div>
+                        ) : activeConversationId && activeConversationTitle ? (
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveView(CHAT_LIST_VIEW);
+                              }}
+                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                            >
+                              Chats
+                            </button>
+                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                            <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                >
+                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                    {activeConversationTitle}
+                                  </span>
+                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  align="start"
+                                  sideOffset={4}
+                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                >
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => togglePin(activeConversationId)}
+                                  >
+                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
+                                  </DropdownMenu.Item>
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => {
+                                      setRenameValue(activeConversationTitle ?? '');
+                                      setRenamingTitle(true);
+                                    }}
+                                  >
+                                    <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>Rename</span>
+                                  </DropdownMenu.Item>
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => void handleArchiveConversation(activeConversationId)}
+                                  >
+                                    <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>Archive</span>
+                                  </DropdownMenu.Item>
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => setExportOpen(true)}
+                                  >
+                                    <DownloadIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>Export</span>
+                                  </DropdownMenu.Item>
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                    onSelect={() => setThreadSettingsOpen(true)}
+                                  >
+                                    <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
+                                    <span>Settings</span>
+                                  </DropdownMenu.Item>
+                                  <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                  <DropdownMenu.Item
+                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                    onSelect={() => setConfirmingDelete(true)}
+                                  >
+                                    <Trash2Icon className="h-4 w-4" />
+                                    <span>Delete</span>
+                                  </DropdownMenu.Item>
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
+                          </div>
+                        ) : activeConversationTitle ? (
+                          <span className="block whitespace-nowrap text-sm font-medium text-foreground">
+                            {activeConversationTitle}
+                          </span>
+                        ) : null}
                       </div>
-                      <div className="shrink-0">
-                        <SubAgentSidebarSection />
-                      </div>
-                    </>
-                  }
-                  tasksContent={
-                    <div className="min-h-0 flex-1 overflow-y-auto">
-                      <TaskSidebarList
-                        onSelectTask={() => {
-                          setIsCreatingTask(false);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        onCreateTask={() => {
-                          tasksCtx?.selectTask(null);
-                          tasksCtx?.exitAICreation();
-                          setIsCreatingTask(true);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        onViewBoard={() => {
-                          tasksCtx?.selectTask(null);
-                          setIsCreatingTask(false);
-                          setActiveView(TASKS_VIEW);
-                        }}
-                        isBoardActive={activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId}
-                        isCreatingTask={isCreatingTask}
-                        workspaceId={activeWorkspaceId}
+                    </div>
+                    <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
+                      <WorkspaceSelector
+                        workspaces={workspaces}
+                        activeWorkspaceId={activeWorkspaceId}
+                        activeWorkspace={activeWorkspace}
                       />
                     </div>
-                  }
-                  agentsContent={
-                    <div className="min-h-0 flex-1 overflow-y-auto">
-                      <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 flex flex-col">
+                  {activeView === MARKETPLACE_VIEW ? (
+                    <div className="relative flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                      <SplashBackground visible storageKey="__marketplace_bg_last_index" />
+                      <PluginMarketplace />
                     </div>
-                  }
-                  pluginsContent={
-                    <div className="min-h-0 flex-1 overflow-y-auto">
-                      <InstalledPluginsList
-                        activeView={activeView}
-                        onNavigate={handlePluginNavigationItem}
+                  ) : activeView === PLUGINS_VIEW ? (
+                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                      <InstalledPluginsView
                         onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                        onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                        onNavigate={handlePluginNavigationItem}
                         onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
                         onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
-                        pluginBrandRequired={pluginBrandRequired}
                       />
                     </div>
-                  }
-                />
-                <UpdateCard />
-              </div>
-            </div>
-            </div>
-          </aside>
-          {!isMobile && (
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize left navigation"
-              aria-valuenow={sidebarWidth}
-              aria-valuemin={SIDEBAR_MIN_WIDTH}
-              aria-valuemax={SIDEBAR_MAX_WIDTH}
-              onPointerDown={(event) => {
-                event.preventDefault();
-                setDragState({ startX: event.clientX, startWidth: sidebarWidth });
-              }}
-              className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
-            >
-              {/* Invisible hit area — wide enough to grab easily */}
-              <div className="absolute inset-y-0 -left-4 w-6" />
-              {/* Handle pill — on the panel border, appears on hover */}
-              <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
-              {/* Tooltip */}
-              <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
-                <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
-                  Drag to resize
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Main content area */}
-          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            <UpdateCard />
-            {/* Interactive title bar */}
-            <div
-              onDoubleClick={() => window.app?.titlebar.doubleClick()}
-              className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
-            >
-              <div className="flex w-full items-center justify-between">
-              {isMobile && (
-                <button
-                  type="button"
-                  onClick={() => setSidebarOpen(true)}
-                  className="titlebar-no-drag mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
-                >
-                  <MenuIcon className="h-5 w-5" />
-                </button>
-              )}
-              <div className="titlebar-no-drag min-w-0 shrink-0 flex items-center" onDoubleClick={(e) => e.stopPropagation()}>
-              <div className="min-w-0">
-                {activeView === SETTINGS_VIEW ? (
-                  <div className="flex items-center gap-1.5">
-                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Settings</div>
-                  </div>
-                ) : activeView === MARKETPLACE_VIEW ? (
-                  <div className="flex items-center gap-1.5" />
-                ) : activeView === PLUGINS_VIEW ? (
-                  <div className="flex items-center gap-1.5">
-                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Plugins</div>
-                  </div>
-                ) : activeView === AGENTS_VIEW ? (
-                  (() => {
-                    if (agentsCtx.state.isCreatingAgent) {
-                      return null;
-                    }
-                    const selectedAgentId = agentsCtx.state.selectedAgentId;
-                    const selectedAgent = selectedAgentId
-                      ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
-                      : null;
-                    if (selectedAgent) {
-                      const agentIsPending = selectedAgent.name === 'New Agent';
-                      return (
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => agentsCtx.selectAgent(null)}
-                            className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                          >
-                            Agents
-                          </button>
-                          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                          <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
-                            <DropdownMenu.Trigger asChild>
-                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                                <span className={`whitespace-nowrap text-sm font-medium ${agentIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
-                                  {agentIsPending ? 'Generating…' : selectedAgent.name}
-                                </span>
-                                {!agentIsPending && <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />}
-                              </button>
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Portal>
-                              <DropdownMenu.Content
-                                align="start"
-                                sideOffset={4}
-                                className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                              >
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                  onSelect={() => { setAgentRenameModal({ id: selectedAgent.id, value: selectedAgent.name }); setAgentTitleMenuOpen(false); }}
-                                >
-                                  <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                  <span>Rename</span>
-                                </DropdownMenu.Item>
-                                <div className="my-1 h-px bg-border/60" />
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                  onSelect={() => { setAgentDeleteModal({ id: selectedAgent.id, name: selectedAgent.name }); setAgentTitleMenuOpen(false); }}
-                                >
-                                  <Trash2Icon className="h-4 w-4" />
-                                  <span>Delete Agent</span>
-                                </DropdownMenu.Item>
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Portal>
-                          </DropdownMenu.Root>
+                  ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
+                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                      <div className="flex-1 overflow-y-auto">
+                        <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
+                          <BrokenPluginView
+                            pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
+                            onUninstalled={() => setActiveView(PLUGINS_VIEW)}
+                          />
                         </div>
-                      );
-                    }
-                    return <div className="flex items-center gap-1.5"><div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Agents</div></div>;
-                  })()
-                ) : activeView === TASKS_VIEW ? (
-                  (() => {
-                    if (isCreatingTask) {
-                      return null;
-                    }
-                    const selectedTaskId = tasksCtx?.state.selectedTaskId;
-                    const selectedTask = selectedTaskId ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId) : null;
-                    if (selectedTask) {
-                      const taskIsPending = selectedTask.title === 'New Task';
-                      return (
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => tasksCtx?.selectTask(null)}
-                            className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                          >
-                            Tasks
-                          </button>
-                          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                          <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
-                            <DropdownMenu.Trigger asChild>
-                              <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                                <span className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}>
-                                  {selectedTask.title}
-                                </span>
-                                {!taskIsPending && <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />}
-                              </button>
-                            </DropdownMenu.Trigger>
-                            <DropdownMenu.Portal>
-                              <DropdownMenu.Content
-                                align="start"
-                                sideOffset={4}
-                                className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                              >
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                  onSelect={() => toggleTaskPin(selectedTask.id)}
-                                >
-                                  <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                  <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
-                                </DropdownMenu.Item>
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                  onSelect={() => { setTaskRenameValue(selectedTask.title); setRenamingTask(true); }}
-                                >
-                                  <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                  <span>Rename</span>
-                                </DropdownMenu.Item>
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                  onSelect={() => void tasksCtx?.archiveTask(selectedTask.id)}
-                                >
-                                  <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" />
-                                  <span>Archive</span>
-                                </DropdownMenu.Item>
-                                <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                                <DropdownMenu.Item
-                                  className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                  onSelect={() => setConfirmingTaskDelete(true)}
-                                >
-                                  <Trash2Icon className="h-4 w-4" />
-                                  <span>Delete</span>
-                                </DropdownMenu.Item>
-                              </DropdownMenu.Content>
-                            </DropdownMenu.Portal>
-                          </DropdownMenu.Root>
-                        </div>
-                      );
-                    }
-                    return <div className="flex items-center gap-1.5"><div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Tasks</div></div>;
-                  })()
-                ) : activeErrorPluginName ? (
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setActiveView(PLUGINS_VIEW)}
-                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                    >
-                      Plugins
-                    </button>
-                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                  <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
-                    <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                          {pluginDisplayName(activeErrorPluginName)}
-                        </span>
-                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      </button>
-                    </DropdownMenu.Trigger>
-                    <DropdownMenu.Portal>
-                      <DropdownMenu.Content
-                        align="start"
-                        sideOffset={4}
-                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                      >
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => togglePluginPin(activeErrorPluginName)}
-                        >
-                          <PinIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>{pinnedPlugins.has(activeErrorPluginName) ? 'Unpin' : 'Pin'}</span>
-                        </DropdownMenu.Item>
-                        {pluginUIState?.settingsSections.some((s) => s.pluginName === activeErrorPluginName) && (
-                          <DropdownMenu.Item
-                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                            onSelect={() => setPluginSettingsOpen(activeErrorPluginName)}
-                          >
-                            <Settings2Icon className="h-4 w-4 text-muted-foreground" />
-                            <span>Settings</span>
-                          </DropdownMenu.Item>
-                        )}
-                        {!pluginBrandRequired.has(activeErrorPluginName) && (
-                          <>
-                            <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                            <DropdownMenu.Item
-                              className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                              onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
-                            >
-                              <Trash2Icon className="h-4 w-4" />
-                              <span>Uninstall</span>
-                            </DropdownMenu.Item>
-                          </>
-                        )}
-                      </DropdownMenu.Content>
-                    </DropdownMenu.Portal>
-                  </DropdownMenu.Root>
-                  </div>
-                ) : activePluginPanel ? (
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setActiveView(PLUGINS_VIEW)}
-                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                    >
-                      Plugins
-                    </button>
-                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                  <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
-                    <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                          {pluginDisplayName(activePluginPanel.pluginName)}
-                        </span>
-                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      </button>
-                    </DropdownMenu.Trigger>
-                    <DropdownMenu.Portal>
-                      <DropdownMenu.Content
-                        align="start"
-                        sideOffset={4}
-                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                      >
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => togglePluginPin(activePluginPanel.pluginName)}
-                        >
-                          <PinIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>{pinnedPlugins.has(activePluginPanel.pluginName) ? 'Unpin' : 'Pin'}</span>
-                        </DropdownMenu.Item>
-                        {pluginUIState?.settingsSections.some((s) => s.pluginName === activePluginPanel.pluginName) && (
-                          <DropdownMenu.Item
-                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                            onSelect={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
-                          >
-                            <Settings2Icon className="h-4 w-4 text-muted-foreground" />
-                            <span>Settings</span>
-                          </DropdownMenu.Item>
-                        )}
-                        {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
-                          <>
-                            <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                            <DropdownMenu.Item
-                              className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                              onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
-                            >
-                              <Trash2Icon className="h-4 w-4" />
-                              <span>Uninstall</span>
-                            </DropdownMenu.Item>
-                          </>
-                        )}
-                      </DropdownMenu.Content>
-                    </DropdownMenu.Portal>
-                  </DropdownMenu.Root>
-                  </div>
-                ) : activeView === CHAT_LIST_VIEW ? (
-                  <div className="flex items-center gap-1.5">
-                    <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
-                      Chats
+                      </div>
                     </div>
-                  </div>
-                ) : activeConversationId && !activeConversationTitle && activeConversationHasMessages ? (
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => { setActiveView(CHAT_LIST_VIEW); }}
-                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                    >
-                      Chats
-                    </button>
-                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                    <span className="whitespace-nowrap rounded-lg px-2 py-1 text-sm font-medium italic text-muted-foreground/50">
-                      New Chat
-                    </span>
-                  </div>
-                ) : activeConversationId && activeConversationTitle ? (
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => { setActiveView(CHAT_LIST_VIEW); }}
-                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                    >
-                      Chats
-                    </button>
-                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                  <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
-                    <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10">
-                        <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                          {activeConversationTitle}
-                        </span>
-                        <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      </button>
-                    </DropdownMenu.Trigger>
-                    <DropdownMenu.Portal>
-                      <DropdownMenu.Content
-                        align="start"
-                        sideOffset={4}
-                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                      >
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => togglePin(activeConversationId)}
-                        >
-                          <PinIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
-                        </DropdownMenu.Item>
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => { setRenameValue(activeConversationTitle ?? ''); setRenamingTitle(true); }}
-                        >
-                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>Rename</span>
-                        </DropdownMenu.Item>
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => void handleArchiveConversation(activeConversationId)}
-                        >
-                          <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>Archive</span>
-                        </DropdownMenu.Item>
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => setExportOpen(true)}
-                        >
-                          <DownloadIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>Export</span>
-                        </DropdownMenu.Item>
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                          onSelect={() => setThreadSettingsOpen(true)}
-                        >
-                          <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
-                          <span>Settings</span>
-                        </DropdownMenu.Item>
-                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                        <DropdownMenu.Item
-                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                          onSelect={() => setConfirmingDelete(true)}
-                        >
-                          <Trash2Icon className="h-4 w-4" />
-                          <span>Delete</span>
-                        </DropdownMenu.Item>
-                      </DropdownMenu.Content>
-                    </DropdownMenu.Portal>
-                  </DropdownMenu.Root>
-                  </div>
-                ) : activeConversationTitle ? (
-                  <span className="block whitespace-nowrap text-sm font-medium text-foreground">
-                    {activeConversationTitle}
-                  </span>
-                ) : null}
-              </div>
-              </div>
-              <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
-              <WorkspaceSelector
-                workspaces={workspaces}
-                activeWorkspaceId={activeWorkspaceId}
-                activeWorkspace={activeWorkspace}
-              />
-              </div>
-              </div>
-            </div>
-            <div className="min-h-0 flex-1 flex flex-col">
-              {activeView === MARKETPLACE_VIEW ? (
-                <div className="relative flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                  <SplashBackground visible storageKey="__marketplace_bg_last_index" />
-                  <PluginMarketplace />
-                </div>
-              ) : activeView === PLUGINS_VIEW ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                  <InstalledPluginsView
-                    onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                    onNavigate={handlePluginNavigationItem}
-                    onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
-                    onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
-                  />
-                </div>
-              ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                  <div className="flex-1 overflow-y-auto">
-                    <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
-                      <BrokenPluginView
-                        pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
-                        onUninstalled={() => setActiveView(PLUGINS_VIEW)}
+                  ) : activePluginPanel ? (
+                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                      <PluginPanelHost
+                        panel={activePluginPanel}
+                        onClose={() => setActiveView(CHAT_VIEW)}
+                        displayName={pluginDisplayName(activePluginPanel.pluginName)}
                       />
                     </div>
-                  </div>
-                </div>
-              ) : activePluginPanel ? (
-                <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                  <PluginPanelHost
-                    panel={activePluginPanel}
-                    onClose={() => setActiveView(CHAT_VIEW)}
-                    displayName={pluginDisplayName(activePluginPanel.pluginName)}
-                  />
-                </div>
-              ) : activeView === CHAT_LIST_VIEW ? (
-                <ChatsListPage
-                  onOpenConversation={(id) => {
-                    setActiveView(CHAT_VIEW);
-                    void handleSwitchConversation(id);
-                  }}
-                  onNewConversation={() => {
-                    setActiveView(CHAT_VIEW);
-                    return handleNewConversation();
-                  }}
-                  workspaceId={activeWorkspaceId}
-                />
-              ) : activeView === TASKS_VIEW ? (
-                isCreatingTask ? (
-                  <TaskCreationView
-                    onDone={(taskId) => {
-                      setIsCreatingTask(false);
-                      tasksCtx?.selectTask(taskId);
-                    }}
-                    onCancel={() => {
-                      setIsCreatingTask(false);
-                    }}
-                  />
-                ) : (
-                  <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                    <TaskQueue workspaceId={activeWorkspaceId} />
-                  </div>
-                )
-              ) : activeView === AGENTS_VIEW ? (
-                <div className="flex flex-col flex-1 min-h-0">
-                  <AgentSwarmView />
-                  {agentRenameModal && (
-                    <AgentRenameModal
-                      initialValue={agentRenameModal.value}
-                      onSave={(name) => { void agentsCtx.updateAgent(agentRenameModal.id, { name }); setAgentRenameModal(null); }}
-                      onClose={() => setAgentRenameModal(null)}
+                  ) : activeView === CHAT_LIST_VIEW ? (
+                    <ChatsListPage
+                      onOpenConversation={(id) => {
+                        setActiveView(CHAT_VIEW);
+                        void handleSwitchConversation(id);
+                      }}
+                      onNewConversation={() => {
+                        setActiveView(CHAT_VIEW);
+                        return handleNewConversation();
+                      }}
+                      workspaceId={activeWorkspaceId}
                     />
-                  )}
-                  {agentDeleteModal && (
-                    <DeleteAgentModal
-                      agentName={agentDeleteModal.name}
-                      onConfirm={() => { void agentsCtx.deleteAgent(agentDeleteModal.id); agentsCtx.selectAgent(null); }}
-                      onClose={() => setAgentDeleteModal(null)}
-                    />
+                  ) : activeView === TASKS_VIEW ? (
+                    isCreatingTask ? (
+                      <TaskCreationView
+                        onDone={(taskId) => {
+                          setIsCreatingTask(false);
+                          tasksCtx?.selectTask(taskId);
+                        }}
+                        onCancel={() => {
+                          setIsCreatingTask(false);
+                        }}
+                      />
+                    ) : (
+                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <TaskQueue workspaceId={activeWorkspaceId} />
+                      </div>
+                    )
+                  ) : activeView === AGENTS_VIEW ? (
+                    <div className="flex flex-col flex-1 min-h-0">
+                      <AgentSwarmView />
+                      {agentRenameModal && (
+                        <AgentRenameModal
+                          initialValue={agentRenameModal.value}
+                          onSave={(name) => {
+                            void agentsCtx.updateAgent(agentRenameModal.id, { name });
+                            setAgentRenameModal(null);
+                          }}
+                          onClose={() => setAgentRenameModal(null)}
+                        />
+                      )}
+                      {agentDeleteModal && (
+                        <DeleteAgentModal
+                          agentName={agentDeleteModal.name}
+                          onConfirm={() => {
+                            void agentsCtx.deleteAgent(agentDeleteModal.id);
+                            agentsCtx.selectAgent(null);
+                          }}
+                          onClose={() => setAgentDeleteModal(null)}
+                        />
+                      )}
+                    </div>
+                  ) : (
+                    <PlanPanelProvider onOpenPlan={handleOpenPlan}>
+                      <div className="flex h-full min-h-0">
+                        {/* Chat column */}
+                        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                          <ThreadOrSubAgent
+                            mode={threadMode}
+                            onChangeMode={setThreadMode}
+                            selectedModelKey={selectedModelKey}
+                            onSelectModel={setSelectedModelKey}
+                            reasoningEffort={reasoningEffort}
+                            onChangeReasoningEffort={setReasoningEffort}
+                            executionMode={executionMode}
+                            onChangeExecutionMode={setExecutionMode}
+                            selectedProfileKey={selectedProfileKey}
+                            onSelectProfile={handleSelectProfile}
+                            fallbackEnabled={fallbackEnabled}
+                            onToggleFallback={handleToggleFallback}
+                          />
+                        </div>
+                        {/* Plan modal */}
+                        {planPanel && (
+                          <PlanPanel
+                            content={planPanel.content}
+                            filePath={planPanel.filePath}
+                            onClose={() => setPlanPanel(null)}
+                          />
+                        )}
+                      </div>
+                    </PlanPanelProvider>
                   )}
                 </div>
-              ) : (
-                <PlanPanelProvider onOpenPlan={handleOpenPlan}>
-                  <div className="flex h-full min-h-0">
-                    {/* Chat column */}
-                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                      <ThreadOrSubAgent
-                        mode={threadMode}
-                        onChangeMode={setThreadMode}
-                        selectedModelKey={selectedModelKey}
-                        onSelectModel={setSelectedModelKey}
-                        reasoningEffort={reasoningEffort}
-                        onChangeReasoningEffort={setReasoningEffort}
-                        executionMode={executionMode}
-                        onChangeExecutionMode={setExecutionMode}
-                        selectedProfileKey={selectedProfileKey}
-                        onSelectProfile={handleSelectProfile}
-                        fallbackEnabled={fallbackEnabled}
-                        onToggleFallback={handleToggleFallback}
-                      />
-                    </div>
-                    {/* Plan modal */}
-                    {planPanel && (
-                      <PlanPanel
-                        content={planPanel.content}
-                        filePath={planPanel.filePath}
-                        onClose={() => setPlanPanel(null)}
-                      />
-                    )}
-                  </div>
-                </PlanPanelProvider>
-              )}
+              </main>
             </div>
-          </main>
-        </div>
-      </RealtimeProvider>
-      </RuntimeProvider>
-    </DropZone>
+          </RealtimeProvider>
+        </RuntimeProvider>
+      </DropZone>
     </AttachmentProvider>
   );
 }
@@ -2171,11 +2576,12 @@ const ComputerUseAutoNavigator: FC<{
     }
 
     const previous = knownSessionsRef.current.get(activeSession.id);
-    const shouldReveal = activeSession.surface === 'docked'
-      && activeSession.status !== 'completed'
-      && activeSession.status !== 'failed'
-      && activeSession.status !== 'stopped'
-      && (!previous || previous.surface !== 'docked');
+    const shouldReveal =
+      activeSession.surface === 'docked' &&
+      activeSession.status !== 'completed' &&
+      activeSession.status !== 'failed' &&
+      activeSession.status !== 'stopped' &&
+      (!previous || previous.surface !== 'docked');
 
     knownSessionsRef.current = nextKnown;
 
@@ -2202,16 +2608,24 @@ const ThreadOrSubAgent: FC<{
   onSelectProfile: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled: boolean;
   onToggleFallback: (value: boolean) => void;
-}> = ({ mode, onChangeMode, selectedModelKey, onSelectModel, reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({
+  mode,
+  onChangeMode,
+  selectedModelKey,
+  onSelectModel,
+  reasoningEffort,
+  onChangeReasoningEffort,
+  executionMode,
+  onChangeExecutionMode,
+  selectedProfileKey,
+  onSelectProfile,
+  fallbackEnabled,
+  onToggleFallback,
+}) => {
   const { activeSubAgentView, setActiveSubAgentView } = useSubAgents();
 
   if (activeSubAgentView) {
-    return (
-      <SubAgentThread
-        subAgentConversationId={activeSubAgentView}
-        onBack={() => setActiveSubAgentView(null)}
-      />
-    );
+    return <SubAgentThread subAgentConversationId={activeSubAgentView} onBack={() => setActiveSubAgentView(null)} />;
   }
 
   return (

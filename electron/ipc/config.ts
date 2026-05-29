@@ -150,6 +150,7 @@ function getDefaultConfig() {
       theme: 'system' as const,
       sidebarWidth: 280,
       fullWidthContent: true,
+      showPluginDockIcons: true,
       splashBackground: 'random' as const,
       workspaces: [] as Array<{
         id: string;

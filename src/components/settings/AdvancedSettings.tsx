@@ -19,6 +19,8 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
     useResponsesApi: boolean;
   };
 
+  const ui = config.ui as { showPluginDockIcons?: boolean } | undefined;
+
   const [stats, setStats] = useState<StepUsageStats | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
   const [showUsageStats, setShowUsageStats] = useState(false);
@@ -243,6 +245,25 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
           <p>
             Enable the OpenAI Responses API format for models that support it. This provides better streaming and error
             handling.
+          </p>
+        </div>
+      </fieldset>
+
+      {/* Sidebar */}
+      <fieldset className="rounded-lg border p-4 space-y-4">
+        <legend className="text-xs font-semibold px-1">Sidebar</legend>
+
+        <Toggle
+          label="Show plugin icons in dock"
+          checked={ui?.showPluginDockIcons !== false}
+          onChange={(v) => updateConfig('ui.showPluginDockIcons', v)}
+        />
+
+        <div className="flex items-start gap-2 rounded-md bg-muted/40 p-3 text-[10px] leading-relaxed text-muted-foreground">
+          <InfoIcon className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+          <p>
+            When enabled, plugins that provide a content panel (not settings-only) will appear as icons in the bottom
+            dock for quick access.
           </p>
         </div>
       </fieldset>
