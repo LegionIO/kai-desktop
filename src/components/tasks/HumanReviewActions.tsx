@@ -20,15 +20,7 @@ interface HumanReviewActionsProps {
 }
 
 export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onApprove, compact, className }) => {
-  const [showFeedback, setShowFeedback] = useState(() => {
-    // Check if there's a pending signal on initial mount
-    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
-    if (pending === taskId) {
-      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
-      return true;
-    }
-    return false;
-  });
+  const [showFeedback, setShowFeedback] = useState(false);
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -38,6 +30,15 @@ export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onAppr
       setTimeout(() => textareaRef.current?.focus(), 50);
     }
   }, [showFeedback]);
+
+  // Check for pending request-changes signal on mount (after first paint)
+  useEffect(() => {
+    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
+    if (pending === taskId) {
+      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
+      setShowFeedback(true);
+    }
+  }, [taskId]);
 
   // Listen for auto-expand event (for already-mounted instances)
   useEffect(() => {
