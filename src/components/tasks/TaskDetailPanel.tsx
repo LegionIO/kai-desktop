@@ -466,25 +466,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                   {task.status === 'human_review' && (
                     <HumanReviewActions taskId={task.id} onApprove={() => void updateTaskStatus(task.id, 'done')} />
                   )}
-
-                  {/* Block reason — shown when task is blocked (editable) */}
-                  {task.status === 'blocked' &&
-                    (() => {
-                      const blockReason =
-                        [...(task.reviewNotes ?? [])]
-                          .reverse()
-                          .find((n) => !n.content.includes('[Autopilot] Unblocked:'))?.content ??
-                        (task.runs ?? [])
-                          .slice()
-                          .reverse()
-                          .find((r) => r.outcome === 'blocked')?.summary ??
-                        '';
-                      return (
-                        <div className="mt-6">
-                          <BlockTaskActions taskId={task.id} currentReason={blockReason} mode="view" />
-                        </div>
-                      );
-                    })()}
                 </div>
               </div>
               {/* Sticky plan composer */}
@@ -823,6 +804,24 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 />
               </div>
             )}
+
+            {/* Block reason — shown when task is blocked (editable) */}
+            {task.status === 'blocked' &&
+              (() => {
+                const blockReason =
+                  [...(task.reviewNotes ?? [])].reverse().find((n) => !n.content.includes('[Autopilot] Unblocked:'))
+                    ?.content ??
+                  (task.runs ?? [])
+                    .slice()
+                    .reverse()
+                    .find((r) => r.outcome === 'blocked')?.summary ??
+                  '';
+                return (
+                  <div className="shrink-0">
+                    <BlockTaskActions taskId={task.id} currentReason={blockReason} mode="view" />
+                  </div>
+                );
+              })()}
 
             {/* Execution history timeline */}
             <div className="shrink-0">
