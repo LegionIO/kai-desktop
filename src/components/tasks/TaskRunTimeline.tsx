@@ -24,6 +24,8 @@ import type { TaskFile, TaskRun } from '@/types/task';
 
 interface TaskRunTimelineProps {
   task: TaskFile;
+  /** Filter runs by type. When omitted, all runs are shown. */
+  filterType?: 'execution' | 'review';
 }
 
 function formatDuration(startedAt: string, completedAt?: string): string {
@@ -60,8 +62,9 @@ function getOutcomeInfo(outcome?: TaskRun['outcome']): {
   }
 }
 
-export const TaskRunTimeline: FC<TaskRunTimelineProps> = ({ task }) => {
-  const runs = task.runs ?? [];
+export const TaskRunTimeline: FC<TaskRunTimelineProps> = ({ task, filterType }) => {
+  const allRuns = task.runs ?? [];
+  const runs = filterType ? allRuns.filter((r) => r.type === filterType) : allRuns;
   const [isExpanded, setIsExpanded] = useState(false);
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const [terminalOutput, setTerminalOutput] = useState<Record<string, string>>({});

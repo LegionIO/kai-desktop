@@ -1,14 +1,25 @@
 /**
- * TaskDetailModal — task preview modal with Plan and Agent tabs.
+ * TaskDetailModal — compact task preview modal with 4 tabs: Overview, Plan, Execution, Review.
  *
+ * Overview tab: status banners, metadata, quick state summary.
  * Plan tab: shows the task description/plan.
- * Agent tab: always-visible terminal with dark idle overlay.
+ * Execution tab: terminal + start/stop controls.
+ * Review tab: reviewer results + reviewer terminals (only shown when reviewers assigned).
  * Provides a button to navigate to the full TaskDetailPanel view.
  */
 
 import { type FC, useState, useEffect, useCallback } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { ExternalLinkIcon, FileCodeIcon, TerminalIcon, PlayIcon, SquareIcon, CheckCircle2Icon } from 'lucide-react';
+import {
+  ExternalLinkIcon,
+  FileCodeIcon,
+  TerminalIcon,
+  PlayIcon,
+  SquareIcon,
+  CheckCircle2Icon,
+  LayoutDashboardIcon,
+  UsersIcon,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
@@ -20,6 +31,8 @@ import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
 import { KAI_TASK_STATUS_LABELS, KAI_TASK_STATUS_COLORS } from '@/types/task';
+
+type TabId = 'overview' | 'plan' | 'execution' | 'review';
 
 interface TaskDetailModalProps {
   task: TaskFile | null;
@@ -33,8 +46,25 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
   const { updateTask, updateTaskStatus } = useTasks();
   const [isStartingAgent, setIsStartingAgent] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<'plan' | 'agent'>('plan');
+  const getDefaultTab = (status: TaskFile['status']): TabId => {
+    switch (status) {
+      case 'todo':
+        return 'plan';
+      case 'in_progress':
+        return 'execution';
+      case 'blocked':
+      case 'ai_review':
+      case 'human_review':
+      case 'done':
+        return 'overview';
+      default:
+        return 'overview';
+    }
+  };
+
+  const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
+  const [activeTerminalTab, setActiveTerminalTab] = useState<string | null>(null);
 
   // Sync terminal session from task
   useEffect(() => {
@@ -43,22 +73,22 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
     }
   }, [task?.id, task?.terminalSessionId]);
 
-  // Auto-switch to agent tab when terminal starts
+  // Auto-switch to execution tab when terminal starts
   useEffect(() => {
-    if (terminalSessionId) setActiveTab('agent');
+    if (terminalSessionId) setActiveTab('execution');
   }, [terminalSessionId]);
 
-  // Reset tab when modal opens
+  // Reset tab when modal opens based on task status
   useEffect(() => {
-    if (open) setActiveTab('plan');
-  }, [open]);
+    if (open && task) setActiveTab(getDefaultTab(task.status));
+  }, [open, task?.id]);
 
-  // Listen for "Request Changes" event — switch to agent tab where the review actions are
+  // Listen for "Request Changes" event — switch to overview tab
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
       if (detail === task?.id) {
-        setActiveTab('agent');
+        setActiveTab('overview');
       }
     };
     window.addEventListener('kai:request-changes-focus', handler);
@@ -97,6 +127,8 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
     .map((id) => agentState.agents.find((a) => a.id === id))
     .filter(Boolean);
 
+  const hasReviewers = (task.reviewerAgentIds ?? []).length > 0;
+
   const fmtDate = (iso: string) =>
     new Date(iso).toLocaleString(undefined, {
       year: 'numeric',
@@ -106,55 +138,12 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
       minute: '2-digit',
     });
 
-  const leftRows: Array<{ label: string; value: React.ReactNode }> = [
-    {
-      label: 'Status',
-      value: (
-        <span
-          className={cn(
-            'inline-flex items-center rounded-full px-2 py-px text-xs font-medium',
-            KAI_TASK_STATUS_COLORS[task.status],
-          )}
-        >
-          {KAI_TASK_STATUS_LABELS[task.status]}
-        </span>
-      ),
-    },
-    {
-      label: 'Agent',
-      value: assignedAgent ? (
-        <span className="text-xs text-foreground/80">
-          {assignedAgent.icon ?? '🤖'} {assignedAgent.name}
-        </span>
-      ) : (
-        <span className="text-xs text-muted-foreground/30">—</span>
-      ),
-    },
-    {
-      label: 'Review',
-      value:
-        reviewerAgents.length > 0 ? (
-          <div className="flex items-center gap-1 flex-wrap">
-            {reviewerAgents.map((agent) => (
-              <span
-                key={agent!.id}
-                className="inline-flex items-center rounded-full bg-purple-500/10 px-1.5 py-px text-[10px] font-medium text-purple-400"
-              >
-                {agent!.icon ?? '🤖'} {agent!.name}
-              </span>
-            ))}
-          </div>
-        ) : (
-          <span className="text-xs text-muted-foreground/30">—</span>
-        ),
-    },
-  ];
-
-  const rightRows: Array<{ label: string; value: string | null }> = [
-    { label: 'Created', value: fmtDate(task.createdAt) },
-    { label: 'Updated', value: fmtDate(task.updatedAt) },
-    { label: 'Started', value: task.startedAt ? fmtDate(task.startedAt) : null },
-    { label: 'Completed', value: task.completedAt ? fmtDate(task.completedAt) : null },
+  // Tab definitions
+  const tabs: Array<{ id: TabId; label: string; icon: FC<{ className?: string }>; show: boolean }> = [
+    { id: 'overview', label: 'Overview', icon: LayoutDashboardIcon, show: true },
+    { id: 'plan', label: 'Plan', icon: FileCodeIcon, show: true },
+    { id: 'execution', label: 'Execution', icon: TerminalIcon, show: true },
+    { id: 'review', label: 'Review', icon: UsersIcon, show: hasReviewers },
   ];
 
   return (
@@ -182,83 +171,66 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
               </button>
             </div>
 
-            {/* Metadata: two columns */}
-            <div className="mt-3 flex gap-8">
-              <div className="flex flex-col gap-0.5">
-                {leftRows.map(({ label, value }) => (
-                  <div key={label} className="flex h-[18px] items-center gap-2">
-                    <span className="w-12 shrink-0 text-xs text-muted-foreground/70">{label}</span>
-                    {value}
-                  </div>
-                ))}
-              </div>
-              <div className="flex flex-col gap-0.5">
-                {rightRows.map(({ label, value }) => (
-                  <div key={label} className="flex h-[18px] items-center gap-2">
-                    <span className="w-18 shrink-0 text-xs text-muted-foreground/70">{label}</span>
-                    {value ? (
-                      <span className="text-xs text-foreground/80">{value}</span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground/30">—</span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-
             {/* Tab bar */}
             <div className="mt-4 flex items-center gap-1 border-b border-border/40">
-              <button
-                type="button"
-                onClick={() => setActiveTab('plan')}
-                className={cn(
-                  'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
-                  activeTab === 'plan'
-                    ? 'border-primary text-foreground'
-                    : 'border-transparent text-muted-foreground hover:text-foreground/80',
-                )}
-              >
-                <FileCodeIcon className="h-3.5 w-3.5" />
-                Plan
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('agent')}
-                className={cn(
-                  'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
-                  activeTab === 'agent'
-                    ? 'border-primary text-foreground'
-                    : 'border-transparent text-muted-foreground hover:text-foreground/80',
-                )}
-              >
-                <TerminalIcon className="h-3.5 w-3.5" />
-                Agent
-                {terminalSessionId && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
-              </button>
+              {tabs
+                .filter((t) => t.show)
+                .map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setActiveTab(tab.id)}
+                    className={cn(
+                      'flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
+                      activeTab === tab.id
+                        ? 'border-primary text-foreground'
+                        : 'border-transparent text-muted-foreground hover:text-foreground/80',
+                    )}
+                  >
+                    <tab.icon className="h-3.5 w-3.5" />
+                    {tab.label}
+                    {tab.id === 'execution' && terminalSessionId && (
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                    )}
+                  </button>
+                ))}
             </div>
           </div>
 
-          {/* Tab content */}
-          {activeTab === 'plan' ? (
-            /* Plan tab */
-            <div className="relative min-h-0 flex-1">
-              <div className="pointer-events-none absolute inset-x-0 -top-px z-20 h-10 bg-gradient-to-b from-popover to-transparent" />
-              <div className="h-full overflow-y-auto px-6 py-5">
-                {task.description ? (
-                  <div className="prose-sm text-sm text-foreground/90">
-                    <MarkdownText text={task.description} />
-                  </div>
-                ) : (
-                  <p className="text-sm italic text-muted-foreground">No description</p>
-                )}
-              </div>
-            </div>
-          ) : (
-            /* Agent tab */
-            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5 gap-3 overflow-y-auto">
+          {/* ═══ OVERVIEW TAB ═══ */}
+          {activeTab === 'overview' && (
+            <div className="relative min-h-0 flex-1 overflow-y-auto px-6 py-5">
+              {/* Status-specific banners */}
+              {task.status === 'blocked' &&
+                (() => {
+                  const blockReason =
+                    [...(task.reviewNotes ?? [])].reverse().find((n) => !n.content.includes('[Autopilot] Unblocked:'))
+                      ?.content ??
+                    ((task as unknown as { runs?: Array<{ outcome?: string; summary?: string }> }).runs ?? [])
+                      .slice()
+                      .reverse()
+                      .find((r) => r.outcome === 'blocked')?.summary ??
+                    '';
+                  return (
+                    <div className="mb-4">
+                      <BlockTaskActions taskId={task.id} currentReason={blockReason} mode="view" />
+                    </div>
+                  );
+                })()}
+
+              {task.status === 'human_review' && (
+                <div className="mb-4">
+                  <HumanReviewActions
+                    taskId={task.id}
+                    onApprove={() => void updateTaskStatus(task.id, 'done')}
+                    compact
+                  />
+                </div>
+              )}
+
               {/* Completion summary */}
               {task.completionSummary && (task.status === 'human_review' || task.status === 'done') && (
-                <div className="shrink-0 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
+                <div className="mb-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
                   <div className="mb-1.5 flex items-center gap-2">
                     <CheckCircle2Icon className="h-3.5 w-3.5 text-emerald-500" />
                     <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
@@ -271,45 +243,90 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                 </div>
               )}
 
-              {/* Review results */}
-              {(task.reviewResults ?? []).length > 0 && (
-                <div className="shrink-0">
-                  <ReviewResultsPanel task={task} />
+              {/* Metadata grid */}
+              <div className="grid grid-cols-2 gap-x-6 gap-y-2 mt-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Status</span>
+                  <span
+                    className={cn(
+                      'inline-flex items-center rounded-full px-2 py-px text-xs font-medium',
+                      KAI_TASK_STATUS_COLORS[task.status],
+                    )}
+                  >
+                    {KAI_TASK_STATUS_LABELS[task.status]}
+                  </span>
                 </div>
-              )}
-
-              {/* Human review actions — approve/reject in modal */}
-              {task.status === 'human_review' && (
-                <div className="shrink-0">
-                  <HumanReviewActions
-                    taskId={task.id}
-                    onApprove={() => void updateTaskStatus(task.id, 'done')}
-                    compact
-                  />
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Agent</span>
+                  {assignedAgent ? (
+                    <span className="text-xs text-foreground/80">
+                      {assignedAgent.icon ?? '🤖'} {assignedAgent.name}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground/30">—</span>
+                  )}
                 </div>
-              )}
-
-              {/* Block reason — shown when task is blocked */}
-              {task.status === 'blocked' &&
-                (() => {
-                  const blockReason =
-                    [...(task.reviewNotes ?? [])].reverse().find((n) => !n.content.includes('[Autopilot] Unblocked:'))
-                      ?.content ??
-                    ((task as unknown as { runs?: Array<{ outcome?: string; summary?: string }> }).runs ?? [])
-                      .slice()
-                      .reverse()
-                      .find((r) => r.outcome === 'blocked')?.summary ??
-                    '';
-                  return (
-                    <div className="shrink-0">
-                      <BlockTaskActions taskId={task.id} currentReason={blockReason} mode="view" />
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Created</span>
+                  <span className="text-xs text-foreground/80">{fmtDate(task.createdAt)}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Updated</span>
+                  <span className="text-xs text-foreground/80">{fmtDate(task.updatedAt)}</span>
+                </div>
+                {task.startedAt && (
+                  <div className="flex items-center gap-2">
+                    <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Started</span>
+                    <span className="text-xs text-foreground/80">{fmtDate(task.startedAt)}</span>
+                  </div>
+                )}
+                {task.completedAt && (
+                  <div className="flex items-center gap-2">
+                    <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Completed</span>
+                    <span className="text-xs text-foreground/80">{fmtDate(task.completedAt)}</span>
+                  </div>
+                )}
+                {reviewerAgents.length > 0 && (
+                  <div className="flex items-center gap-2 col-span-2">
+                    <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Reviewers</span>
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {reviewerAgents.map((agent) => (
+                        <span
+                          key={agent!.id}
+                          className="inline-flex items-center rounded-full bg-purple-500/10 px-1.5 py-px text-[10px] font-medium text-purple-400"
+                        >
+                          {agent!.icon ?? '🤖'} {agent!.name}
+                        </span>
+                      ))}
                     </div>
-                  );
-                })()}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
+          {/* ═══ PLAN TAB ═══ */}
+          {activeTab === 'plan' && (
+            <div className="relative min-h-0 flex-1">
+              <div className="pointer-events-none absolute inset-x-0 -top-px z-20 h-10 bg-gradient-to-b from-popover to-transparent" />
+              <div className="h-full overflow-y-auto px-6 py-5">
+                {task.description ? (
+                  <div className="prose-sm text-sm text-foreground/90">
+                    <MarkdownText text={task.description} />
+                  </div>
+                ) : (
+                  <p className="text-sm italic text-muted-foreground">No description</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ═══ EXECUTION TAB ═══ */}
+          {activeTab === 'execution' && (
+            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5 gap-3 overflow-y-auto">
               {/* Execution history */}
               <div className="shrink-0">
-                <TaskRunTimeline task={task} />
+                <TaskRunTimeline task={task} filterType="execution" />
               </div>
 
               {/* Start/Stop toolbar — only in states where execution is relevant */}
@@ -357,6 +374,75 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* ═══ REVIEW TAB ═══ */}
+          {activeTab === 'review' && (
+            <div className="flex min-h-0 flex-1 flex-col px-6 pt-4 pb-5 gap-3 overflow-y-auto">
+              {/* Review results */}
+              {(task.reviewResults ?? []).length > 0 && (
+                <div className="shrink-0">
+                  <ReviewResultsPanel
+                    task={task}
+                    onViewTerminal={(sessionId) => {
+                      setActiveTerminalTab(sessionId);
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* Review history */}
+              <div className="shrink-0">
+                <TaskRunTimeline task={task} filterType="review" />
+              </div>
+
+              {/* Reviewer terminal tabs */}
+              {(() => {
+                const reviewerTerminals = (task.reviewResults ?? []).filter((r) => r.terminalSessionId);
+                if (reviewerTerminals.length === 0) return null;
+                return (
+                  <>
+                    <div className="shrink-0 flex items-center gap-0.5 rounded-lg border border-border/40 bg-muted/20 p-0.5">
+                      {reviewerTerminals.map((r) => (
+                        <button
+                          key={r.agentId}
+                          type="button"
+                          onClick={() => setActiveTerminalTab(r.terminalSessionId!)}
+                          className={cn(
+                            'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
+                            activeTerminalTab === r.terminalSessionId
+                              ? 'bg-background text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground/80',
+                          )}
+                        >
+                          <span className="flex items-center gap-1">
+                            <span className="shrink-0 text-xs">{r.agentName.slice(0, 2) === '🤖' ? '🤖' : '🔍'}</span>
+                            <span className="max-w-[60px] truncate">{r.agentName}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    {activeTerminalTab && (
+                      <div className="relative min-h-[180px] flex-1">
+                        <TaskTerminal sessionId={activeTerminalTab} onExit={() => {}} className="h-full rounded-xl" />
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+
+              {/* Empty state when no review output */}
+              {(task.reviewResults ?? []).length === 0 && (
+                <div className="flex min-h-[150px] flex-1 flex-col overflow-hidden rounded-xl border border-border/50 bg-[#1a1a2e]">
+                  <div className="flex flex-1 items-center justify-center">
+                    <div className="flex flex-col items-center gap-2 text-center">
+                      <UsersIcon className="h-8 w-8 text-white/20" />
+                      <p className="text-sm text-white/40">No reviewer output yet</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </Dialog.Content>
