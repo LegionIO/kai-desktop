@@ -32,7 +32,15 @@ export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onAppr
   }, [showFeedback]);
 
   // Listen for auto-expand event (fired when context menu "Request Changes…" opens the modal)
+  // Also check on mount if a pending request-changes signal exists (handles race with tab switch)
   useEffect(() => {
+    // Check if there's a pending signal (set before this component mounted)
+    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
+    if (pending === taskId) {
+      setShowFeedback(true);
+      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
+    }
+
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
       if (detail === taskId) {

@@ -202,11 +202,13 @@ export const TaskCard: FC<TaskCardProps> = memo(
                 <ContextMenu.Item
                   className={itemClassName}
                   onSelect={() => {
+                    // Set pending flag so HumanReviewActions auto-expands on mount
+                    (window as unknown as Record<string, unknown>).__pendingRequestChanges = task.id;
                     onClick();
-                    // Signal HumanReviewActions to auto-expand feedback textarea
+                    // Also fire the event for already-mounted instances
                     setTimeout(() => {
                       window.dispatchEvent(new CustomEvent('kai:request-changes-focus', { detail: task.id }));
-                    }, 100);
+                    }, 300);
                   }}
                 >
                   <RotateCcwIcon className="h-3.5 w-3.5 text-muted-foreground" />
