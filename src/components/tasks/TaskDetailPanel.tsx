@@ -232,11 +232,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   }, [task.id, task.terminalSessionId]);
 
-  // Auto-switch to execution tab when terminal starts
+  // Auto-switch to execution tab when a NEW terminal starts (not on initial mount)
+  const prevTerminalRef = useRef(terminalSessionId);
   useEffect(() => {
-    if (terminalSessionId) {
+    if (terminalSessionId && terminalSessionId !== prevTerminalRef.current) {
       setActiveTab('execution');
     }
+    prevTerminalRef.current = terminalSessionId;
   }, [terminalSessionId]);
 
   // Listen for "Request Changes" event — switch to overview tab
