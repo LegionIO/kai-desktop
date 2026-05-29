@@ -438,12 +438,33 @@ const cliToolSchema = z.object({
 // Autopilot (Orchestrator)
 // ---------------------------------------------------------------------------
 
+const reviewPolicySchema = z.object({
+  /** Minimum AI reviewers autopilot should assign. 0 = no AI review. */
+  minReviewers: z.number().min(0).max(5).default(2),
+  /** When all AI reviewers approve, skip human review and go directly to done. */
+  skipHumanReviewOnApproval: z.boolean().default(false),
+  /** When true, AI can override skipHumanReviewOnApproval for complex/untestable work. */
+  aiCanRequireHumanReview: z.boolean().default(true),
+  /** Max auto-retries before escalating to human review. */
+  maxRetriesBeforeEscalation: z.number().min(1).max(10).default(3),
+  /** Review mode: parallel (all at once) or sequential (stop on first rejection). */
+  defaultReviewMode: z.enum(['parallel', 'sequential']).default('parallel'),
+});
+
+const unblockPolicySchema = z.object({
+  /** Whether autopilot should attempt to resolve blocked tasks using AI. */
+  enabled: z.boolean().default(true),
+  /** Max AI unblock attempts per task before giving up. */
+  maxAttempts: z.number().min(1).max(5).default(2),
+});
+
 const autopilotConfigSchema = z.object({
   enabled: z.boolean().default(false),
   intervalMs: z.number().min(5000).max(300000).default(30000),
   autoStart: z.boolean().default(true),
   maxConcurrentAgents: z.number().min(1).max(10).default(3),
   matchingStrategy: z.enum(['simple', 'ai-scored']).default('simple'),
+  /** @deprecated Use reviewPolicy.skipHumanReviewOnApproval instead */
   requireHumanReview: z.boolean().default(true),
   /**
    * When true, agents spawned by autopilot run with --dangerously-skip-permissions
@@ -451,9 +472,24 @@ const autopilotConfigSchema = z.object({
    * agents run in interactive/approval mode. Requires user confirmation on first enable.
    */
   dangerousMode: z.boolean().default(false),
+  /** Review policy — controls reviewer assignment, approval routing, and retries. */
+  reviewPolicy: reviewPolicySchema.default({
+    minReviewers: 2,
+    skipHumanReviewOnApproval: false,
+    aiCanRequireHumanReview: true,
+    maxRetriesBeforeEscalation: 3,
+    defaultReviewMode: 'parallel',
+  }),
+  /** Unblock policy — controls AI-powered task unblocking behavior. */
+  unblockPolicy: unblockPolicySchema.default({
+    enabled: true,
+    maxAttempts: 2,
+  }),
 });
 
 export type AutopilotConfig = z.infer<typeof autopilotConfigSchema>;
+export type ReviewPolicy = z.infer<typeof reviewPolicySchema>;
+export type UnblockPolicy = z.infer<typeof unblockPolicySchema>;
 
 // ---------------------------------------------------------------------------
 // Agent runtime config

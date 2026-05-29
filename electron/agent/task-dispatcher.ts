@@ -25,6 +25,17 @@ export interface DispatcherConfig {
   maxConcurrentAgents: number;
   matchingStrategy: 'simple' | 'ai-scored';
   requireHumanReview: boolean;
+  reviewPolicy?: {
+    minReviewers: number;
+    skipHumanReviewOnApproval: boolean;
+    aiCanRequireHumanReview: boolean;
+    maxRetriesBeforeEscalation: number;
+    defaultReviewMode: 'parallel' | 'sequential';
+  };
+  unblockPolicy?: {
+    enabled: boolean;
+    maxAttempts: number;
+  };
 }
 
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
@@ -76,6 +87,10 @@ export interface DispatcherDeps {
   getConfig: () => DispatcherConfig | null | undefined;
   /** Rollback assignment on start failure. */
   unassignTask?: (agentId: string, taskId: string) => Promise<void> | void;
+  /** Assign reviewer agents to a task. */
+  assignReviewers?: (taskId: string, reviewerIds: string[], mode: string) => Promise<void>;
+  /** Attempt to unblock a task. Returns true if unblocked. */
+  attemptUnblock?: (taskId: string) => Promise<boolean>;
   /** Optional broadcast callback fired whenever state changes. */
   broadcastState?: (state: TaskDispatcherState) => void;
 }
@@ -532,6 +547,50 @@ export class TaskDispatcher {
 
       decisions.push(decision);
       this.recordDecision(decision);
+    }
+
+    // ── Phase 2: Auto-assign reviewers to in_progress tasks ──────────
+    if (!isAborted() && this.deps.assignReviewers) {
+      const reviewPolicy = this.config.reviewPolicy;
+      if (reviewPolicy && reviewPolicy.minReviewers > 0) {
+        const tasksNeedingReviewers = tasks.filter(
+          (t) =>
+            t.status === 'in_progress' &&
+            !t.archivedAt &&
+            (!t.reviewerAgentIds || t.reviewerAgentIds.length < reviewPolicy.minReviewers),
+        );
+        for (const task of tasksNeedingReviewers) {
+          if (isAborted()) break;
+          try {
+            // Delegate to the dep which handles AI selection
+            await this.deps.assignReviewers(
+              task.id,
+              [], // empty = let the dep pick them
+              reviewPolicy.defaultReviewMode ?? 'parallel',
+            );
+          } catch (err) {
+            console.warn('[task-dispatcher] assignReviewers failed:', err);
+          }
+        }
+      }
+    }
+
+    // ── Phase 3: Attempt to unblock blocked tasks ────────────────────
+    if (!isAborted() && this.deps.attemptUnblock) {
+      const unblockPolicy = this.config.unblockPolicy;
+      if (unblockPolicy && unblockPolicy.enabled) {
+        const blockedTasks = tasks.filter(
+          (t) => t.status === 'blocked' && !t.archivedAt && (t.unblockAttempts ?? 0) < unblockPolicy.maxAttempts,
+        );
+        for (const task of blockedTasks) {
+          if (isAborted()) break;
+          try {
+            await this.deps.attemptUnblock(task.id);
+          } catch (err) {
+            console.warn('[task-dispatcher] attemptUnblock failed:', err);
+          }
+        }
+      }
     }
   }
 

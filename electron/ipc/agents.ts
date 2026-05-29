@@ -421,8 +421,31 @@ async function startReviewProcess(appHome: string, task: TaskFile): Promise<void
   const anyRejected = results.some((r) => r.status === 'rejected');
 
   if (allApproved) {
-    // All reviewers approved — promote to human_review
-    freshTask.status = 'human_review';
+    // All reviewers approved — check review policy for next status
+    const config = readEffectiveConfig(appHome);
+    const policy = (
+      config?.autopilot as
+        | { reviewPolicy?: { skipHumanReviewOnApproval?: boolean; aiCanRequireHumanReview?: boolean } }
+        | undefined
+    )?.reviewPolicy;
+
+    if (policy?.skipHumanReviewOnApproval) {
+      if (policy.aiCanRequireHumanReview) {
+        // AI decides if human review is still needed for complex work
+        const { assessComplexity } = await import('../agent/task-unblocker.js');
+        const needsHuman = await assessComplexity(freshTask);
+        freshTask.status = needsHuman ? 'human_review' : 'done';
+        if (!needsHuman) freshTask.completedAt = new Date().toISOString();
+        console.info(
+          `[Agent:task] AI complexity check: ${needsHuman ? 'requires human review' : 'auto-completing'} for "${freshTask.title}"`,
+        );
+      } else {
+        freshTask.status = 'done';
+        freshTask.completedAt = new Date().toISOString();
+      }
+    } else {
+      freshTask.status = 'human_review';
+    }
   } else if (anyRejected) {
     // At least one rejection — kick back to in_progress with merged feedback
     freshTask.status = 'in_progress';

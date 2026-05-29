@@ -1,0 +1,85 @@
+/**
+ * AI-powered reviewer selection for the autopilot scrum master.
+ *
+ * Given a task and a list of available reviewer agents, uses a fast model
+ * to pick the N best-fit reviewers based on task content and agent capabilities.
+ */
+
+import type { AgentFile } from '../../shared/agent-types.js';
+import type { TaskFile } from '../../shared/task-types.js';
+
+/**
+ * Use AI to select the best reviewer agents for a task.
+ * Falls back to round-robin if AI is unavailable.
+ */
+export async function selectReviewers(
+  task: TaskFile,
+  availableReviewers: AgentFile[],
+  count: number,
+): Promise<string[]> {
+  if (availableReviewers.length === 0) return [];
+  if (availableReviewers.length <= count) {
+    return availableReviewers.map((a) => a.id);
+  }
+
+  // Try AI-powered selection
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    // Fallback: pick first N reviewers (sorted by name for stability)
+    return availableReviewers
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, count)
+      .map((a) => a.id);
+  }
+
+  try {
+    const { createAnthropic } = await import('@ai-sdk/anthropic');
+    const { generateText } = await import('ai');
+
+    const anthropic = createAnthropic({ apiKey });
+    const model = anthropic('claude-3-5-haiku-latest');
+
+    const prompt = [
+      'You are selecting code reviewers for a task. Pick the best-fit reviewers.',
+      'Return ONLY a JSON array of agent IDs (strings), ordered by best fit.',
+      `Select exactly ${count} reviewers.`,
+      '',
+      `TASK TITLE: ${task.title}`,
+      `TASK DESCRIPTION: ${(task.description ?? '').slice(0, 2000)}`,
+      `TASK LABELS: ${(task.metadata?.labels ?? []).join(', ') || '(none)'}`,
+      '',
+      'AVAILABLE REVIEWERS:',
+      ...availableReviewers.map(
+        (a) =>
+          `- ID: ${a.id} | Name: ${a.name} | Description: ${(a.description ?? '').slice(0, 300)} | Capabilities: ${(a.capabilities ?? []).join(', ') || '(none)'}`,
+      ),
+    ].join('\n');
+
+    const { text } = await generateText({
+      model,
+      prompt,
+      maxOutputTokens: 200,
+    });
+
+    // Parse the JSON array from the response
+    const raw = (text ?? '').trim();
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (match) {
+      const ids = JSON.parse(match[0]) as string[];
+      // Validate IDs exist in available reviewers
+      const validIds = ids.filter((id) => availableReviewers.some((a) => a.id === id));
+      if (validIds.length >= count) return validIds.slice(0, count);
+      // If AI returned fewer valid IDs, supplement with remaining reviewers
+      const remaining = availableReviewers.filter((a) => !validIds.includes(a.id)).slice(0, count - validIds.length);
+      return [...validIds, ...remaining.map((a) => a.id)].slice(0, count);
+    }
+  } catch (err) {
+    console.warn('[reviewer-selection] AI selection failed, using fallback:', err);
+  }
+
+  // Fallback: first N by name
+  return availableReviewers
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .slice(0, count)
+    .map((a) => a.id);
+}

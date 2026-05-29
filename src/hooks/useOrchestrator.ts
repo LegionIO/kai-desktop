@@ -13,6 +13,28 @@ import { useCallback, useEffect, useState } from 'react';
 
 export type MatchingStrategy = 'simple' | 'ai-scored';
 
+export type ReviewMode = 'parallel' | 'sequential';
+
+export interface ReviewPolicy {
+  /** Number of AI reviewers assigned to each task. */
+  minReviewers: number;
+  /** Skip human review when all AI reviewers approve. */
+  skipHumanReviewOnApproval: boolean;
+  /** AI may still route complex or untestable work to human review. */
+  aiCanRequireHumanReview: boolean;
+  /** Failed attempts before escalating to human review. */
+  maxRetriesBeforeEscalation: number;
+  /** Parallel runs all reviewers at once; sequential stops on first rejection. */
+  defaultReviewMode: ReviewMode;
+}
+
+export interface UnblockPolicy {
+  /** Whether AI unblock attempts are enabled. */
+  enabled: boolean;
+  /** Maximum AI attempts to resolve a blocker before giving up. */
+  maxAttempts: number;
+}
+
 export interface DispatcherConfig {
   /** Master enable for the autopilot loop. */
   enabled: boolean;
@@ -26,6 +48,10 @@ export interface DispatcherConfig {
   autoStart: boolean;
   /** Require human review before completion is finalized. */
   requireHumanReview: boolean;
+  /** Review policy configuration. */
+  reviewPolicy?: ReviewPolicy;
+  /** Unblock policy configuration. */
+  unblockPolicy?: UnblockPolicy;
 }
 
 export interface DispatchDecision {

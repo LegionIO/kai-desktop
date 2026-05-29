@@ -905,6 +905,68 @@ if (gotSingleInstanceLock) {
             }
           }
         },
+        assignReviewers: async (taskId: string, _reviewerIds: string[], mode: string) => {
+          // AI-powered reviewer selection
+          const { selectReviewers } = await import('./agent/reviewer-selection.js');
+          const agents = listAllAgents(APP_HOME);
+          const reviewerAgents = agents.filter((a) => a.role === 'reviewer' && a.status === 'idle');
+          const config = getConfig();
+          const minReviewers = config?.autopilot?.reviewPolicy?.minReviewers ?? 2;
+
+          const taskPath = join(APP_HOME, 'data', 'tasks', `${taskId}.json`);
+          if (!existsSync(taskPath)) return;
+          const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
+
+          // Only assign if task doesn't already have enough reviewers
+          const currentCount = task.reviewerAgentIds?.length ?? 0;
+          if (currentCount >= minReviewers) return;
+
+          const needed = minReviewers - currentCount;
+          const selectedIds = await selectReviewers(task, reviewerAgents, needed);
+          if (selectedIds.length === 0) return;
+
+          task.reviewerAgentIds = [...(task.reviewerAgentIds ?? []), ...selectedIds];
+          task.reviewMode = mode as 'parallel' | 'sequential';
+          task.updatedAt = new Date().toISOString();
+          writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+          console.info(`[Autopilot] Auto-assigned ${selectedIds.length} reviewers to task "${task.title}"`);
+        },
+        attemptUnblock: async (taskId: string) => {
+          const { attemptUnblock } = await import('./agent/task-unblocker.js');
+          const taskPath = join(APP_HOME, 'data', 'tasks', `${taskId}.json`);
+          if (!existsSync(taskPath)) return false;
+          const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
+
+          const result = await attemptUnblock(task);
+          if (result.resolved) {
+            task.status = 'in_progress';
+            task.unblockAttempts = (task.unblockAttempts ?? 0) + 1;
+            if (!task.reviewNotes) task.reviewNotes = [];
+            task.reviewNotes.push({
+              source: 'ai',
+              content: `[Autopilot] Unblocked: ${result.resolution}`,
+              timestamp: new Date().toISOString(),
+              fromStatus: 'blocked',
+            });
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+            console.info(`[Autopilot] Unblocked task "${task.title}": ${result.resolution}`);
+
+            // Auto-restart the assigned agent
+            if (task.assignedAgentId) {
+              setTimeout(() => {
+                void startAgentRun(APP_HOME, taskTerminalManager, task.assignedAgentId);
+              }, 500);
+            }
+            return true;
+          } else {
+            task.unblockAttempts = (task.unblockAttempts ?? 0) + 1;
+            task.updatedAt = new Date().toISOString();
+            writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+            console.info(`[Autopilot] Cannot unblock "${task.title}": ${result.reason}`);
+            return false;
+          }
+        },
       },
       initialAutopilotConfig,
     );

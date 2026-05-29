@@ -80,6 +80,8 @@ export interface TaskFile {
   lastExitCode?: number;
   /** Number of times this task has been auto-retried (timeout recovery). */
   retryCount?: number;
+  /** Number of AI unblock attempts made on this task. */
+  unblockAttempts?: number;
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */
