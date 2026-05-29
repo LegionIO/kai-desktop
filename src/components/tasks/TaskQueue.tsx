@@ -83,6 +83,7 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [modalTaskId, setModalTaskId] = useState<string | null>(null);
+  const [modalRequestChanges, setModalRequestChanges] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   // ── Pin state ──────────────────────────────────────────────────────────
@@ -292,6 +293,14 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   );
 
   const handleTaskClick = useCallback((task: TaskFile) => {
+    // Check if this was triggered by "Request Changes…" context menu
+    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
+    if (pending === task.id) {
+      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
+      setModalRequestChanges(true);
+    } else {
+      setModalRequestChanges(false);
+    }
     setModalTaskId(task.id);
   }, []);
 
@@ -737,9 +746,13 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
         task={modalTask}
         open={!!modalTask}
         onOpenChange={(open) => {
-          if (!open) setModalTaskId(null);
+          if (!open) {
+            setModalTaskId(null);
+            setModalRequestChanges(false);
+          }
         }}
         onOpenFullView={handleOpenFullView}
+        requestChangesMode={modalRequestChanges}
       />
     </div>
   );

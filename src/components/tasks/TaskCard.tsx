@@ -202,13 +202,9 @@ export const TaskCard: FC<TaskCardProps> = memo(
                 <ContextMenu.Item
                   className={itemClassName}
                   onSelect={() => {
-                    // Set pending flag so HumanReviewActions auto-expands on mount
+                    // Set flag so TaskQueue knows to pass requestChangesMode to modal
                     (window as unknown as Record<string, unknown>).__pendingRequestChanges = task.id;
                     onClick();
-                    // Also fire the event after modal is fully open + animated + mounted
-                    setTimeout(() => {
-                      window.dispatchEvent(new CustomEvent('kai:request-changes-focus', { detail: task.id }));
-                    }, 500);
                   }}
                 >
                   <RotateCcwIcon className="h-3.5 w-3.5 text-muted-foreground" />

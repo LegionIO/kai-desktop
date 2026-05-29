@@ -16,11 +16,19 @@ interface HumanReviewActionsProps {
   onApprove: () => void;
   /** Compact mode for modals/context menus — smaller spacing */
   compact?: boolean;
+  /** Start with feedback textarea already expanded */
+  autoExpand?: boolean;
   className?: string;
 }
 
-export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onApprove, compact, className }) => {
-  const [showFeedback, setShowFeedback] = useState(false);
+export const HumanReviewActions: FC<HumanReviewActionsProps> = ({
+  taskId,
+  onApprove,
+  compact,
+  autoExpand,
+  className,
+}) => {
+  const [showFeedback, setShowFeedback] = useState(autoExpand ?? false);
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -31,16 +39,7 @@ export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onAppr
     }
   }, [showFeedback]);
 
-  // Check for pending request-changes signal on mount (after first paint)
-  useEffect(() => {
-    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
-    if (pending === taskId) {
-      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
-      setShowFeedback(true);
-    }
-  }, [taskId]);
-
-  // Listen for auto-expand event (for already-mounted instances)
+  // Listen for auto-expand event (for instances already mounted, e.g. docked panel)
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;

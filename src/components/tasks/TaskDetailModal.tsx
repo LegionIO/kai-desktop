@@ -39,9 +39,17 @@ interface TaskDetailModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onOpenFullView: (taskId: string) => void;
+  /** When true, auto-expand the feedback textarea in HumanReviewActions */
+  requestChangesMode?: boolean;
 }
 
-export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenChange, onOpenFullView }) => {
+export const TaskDetailModal: FC<TaskDetailModalProps> = ({
+  task,
+  open,
+  onOpenChange,
+  onOpenFullView,
+  requestChangesMode,
+}) => {
   const { state: agentState, startAgent, stopAgent } = useAgents();
   const { updateTask, updateTaskStatus } = useTasks();
   const [isStartingAgent, setIsStartingAgent] = useState(false);
@@ -80,20 +88,10 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
 
   // Reset tab when modal opens based on task status
   useEffect(() => {
-    if (open && task) setActiveTab(getDefaultTab(task.status));
-  }, [open, task?.id]);
-
-  // Listen for "Request Changes" event — switch to overview tab
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as string;
-      if (detail === task?.id) {
-        setActiveTab('overview');
-      }
-    };
-    window.addEventListener('kai:request-changes-focus', handler);
-    return () => window.removeEventListener('kai:request-changes-focus', handler);
-  }, [task?.id]);
+    if (open && task) {
+      setActiveTab(requestChangesMode ? 'overview' : getDefaultTab(task.status));
+    }
+  }, [open, task?.id, requestChangesMode]);
 
   const handleTerminalExit = useCallback(() => {
     if (!task) return;
@@ -224,6 +222,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                     taskId={task.id}
                     onApprove={() => void updateTaskStatus(task.id, 'done')}
                     compact
+                    autoExpand={requestChangesMode}
                   />
                 </div>
               )}
