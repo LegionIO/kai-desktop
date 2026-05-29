@@ -6,6 +6,7 @@
 
 export type {
   TaskFile,
+  TaskRun,
   KaiTaskMetadata,
   KaiTaskOrder,
   TaskConversationMessage,

@@ -11,7 +11,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdir
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
-import type { TaskFile, TaskReviewResult } from '../../shared/task-types.js';
+import type { TaskFile, TaskReviewResult, TaskRun } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { analyzeCompletion as analyzeCompletionCore } from '../agent/task-completion.js';
 import { z } from 'zod';
@@ -187,6 +187,22 @@ async function runSingleReviewer(
     }
   }
 
+  // Record review run in audit trail
+  const freshTaskForRun = readTask(appHome, task.id);
+  if (freshTaskForRun) {
+    const reviewRun: TaskRun = {
+      id: randomUUID(),
+      number: (freshTaskForRun.runs?.length ?? 0) + 1,
+      type: 'review',
+      agentId: reviewerAgentId,
+      agentName,
+      terminalSessionId: virtualSessionId,
+      startedAt: new Date().toISOString(),
+    };
+    freshTaskForRun.runs = [...(freshTaskForRun.runs ?? []), reviewRun];
+    writeTask(appHome, freshTaskForRun);
+  }
+
   const broadcast = (text: string) => {
     appendOutput(virtualSessionId, text);
     for (const win of BrowserWindow.getAllWindows()) {
@@ -355,6 +371,20 @@ async function runSingleReviewer(
     result.status = 'rejected';
     result.feedback = `Review process error: ${errMsg}`;
     result.timestamp = new Date().toISOString();
+  }
+
+  // Complete the review run in audit trail
+  const finalTask = readTask(appHome, task.id);
+  if (finalTask?.runs?.length) {
+    const reviewRun = [...finalTask.runs]
+      .reverse()
+      .find((r) => r.type === 'review' && r.agentId === reviewerAgentId && !r.completedAt);
+    if (reviewRun) {
+      reviewRun.completedAt = new Date().toISOString();
+      reviewRun.outcome = result.status === 'approved' ? 'approved' : 'rejected';
+      reviewRun.summary = result.feedback?.slice(0, 200);
+      writeTask(appHome, finalTask);
+    }
   }
 
   // Broadcast terminal exit for this reviewer's session
@@ -644,6 +674,19 @@ export async function startAgentRun(
     task.updatedAt = new Date().toISOString();
     writeTask(appHome, task);
 
+    // Record execution run in audit trail
+    const run: TaskRun = {
+      id: randomUUID(),
+      number: (task.runs?.length ?? 0) + 1,
+      type: 'execution',
+      agentId,
+      agentName: agent.name,
+      terminalSessionId: virtualSessionId,
+      startedAt: new Date().toISOString(),
+    };
+    task.runs = [...(task.runs ?? []), run];
+    writeTask(appHome, task);
+
     broadcastAgentChange(appHome);
     broadcastTaskChange(appHome);
 
@@ -748,6 +791,16 @@ export async function startAgentRun(
                 t.completionSummary = summary;
                 t.updatedAt = new Date().toISOString();
 
+                // Complete the last execution run in audit trail
+                if (t.runs?.length) {
+                  const lastRun = t.runs[t.runs.length - 1];
+                  if (lastRun.type === 'execution' && !lastRun.completedAt) {
+                    lastRun.completedAt = new Date().toISOString();
+                    lastRun.outcome = 'promoted';
+                    lastRun.summary = summary?.slice(0, 200);
+                  }
+                }
+
                 // Multi-reviewer: check if reviewerAgentIds has entries
                 const hasReviewers = t.reviewerAgentIds && t.reviewerAgentIds.length > 0;
 
@@ -818,6 +871,17 @@ export async function startAgentRun(
                   fromStatus: 'in_progress',
                 });
                 t.updatedAt = new Date().toISOString();
+
+                // Complete the last execution run in audit trail
+                if (t.runs?.length) {
+                  const lastRun = t.runs[t.runs.length - 1];
+                  if (lastRun.type === 'execution' && !lastRun.completedAt) {
+                    lastRun.completedAt = new Date().toISOString();
+                    lastRun.outcome = 'blocked';
+                    lastRun.summary = reason?.slice(0, 200);
+                  }
+                }
+
                 writeTask(appHome, t);
                 broadcastTaskChange(appHome);
 
@@ -977,6 +1041,19 @@ export async function startAgentRun(
     task.updatedAt = new Date().toISOString();
     writeTask(appHome, task);
 
+    // Record execution run in audit trail
+    const ptyRun: TaskRun = {
+      id: randomUUID(),
+      number: (task.runs?.length ?? 0) + 1,
+      type: 'execution',
+      agentId,
+      agentName: agent.name,
+      terminalSessionId: sessionId,
+      startedAt: new Date().toISOString(),
+    };
+    task.runs = [...(task.runs ?? []), ptyRun];
+    writeTask(appHome, task);
+
     broadcastAgentChange(appHome);
     broadcastTaskChange(appHome);
 
@@ -1056,6 +1133,24 @@ export async function startAgentRun(
           }
         }
         exitTask.lastExitCode = exitCode;
+
+        // Complete the last execution run in audit trail
+        if (exitTask.runs?.length) {
+          const lastRun = exitTask.runs[exitTask.runs.length - 1];
+          if (lastRun.type === 'execution' && !lastRun.completedAt) {
+            lastRun.completedAt = new Date().toISOString();
+            lastRun.exitCode = exitCode;
+            lastRun.outcome = shouldRetry
+              ? 'timeout'
+              : nextStatus === 'blocked'
+                ? 'blocked'
+                : nextStatus === 'done'
+                  ? 'promoted'
+                  : 'promoted';
+            lastRun.summary = (blockedReason ?? completedTaskId) ? undefined : undefined;
+          }
+        }
+
         writeTask(appHome, exitTask);
         broadcastTaskChange(appHome);
 

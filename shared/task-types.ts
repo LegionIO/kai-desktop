@@ -40,6 +40,31 @@ export interface TaskReviewResult {
   terminalSessionId?: string;
 }
 
+/** A single execution or review attempt on a task — part of the audit trail. */
+export interface TaskRun {
+  /** Unique ID for this run. */
+  id: string;
+  /** Sequential run number (1, 2, 3...). */
+  number: number;
+  /** What type of run: executor working on the task, or reviewer reviewing it. */
+  type: 'execution' | 'review';
+  /** Agent that performed this run. */
+  agentId: string;
+  agentName: string;
+  /** Terminal session ID — used to retrieve persisted output from disk. */
+  terminalSessionId: string;
+  /** ISO timestamp when the run started. */
+  startedAt: string;
+  /** ISO timestamp when the run completed. */
+  completedAt?: string;
+  /** Exit code (for PTY-based runs). */
+  exitCode?: number;
+  /** Outcome of this run. */
+  outcome?: 'promoted' | 'blocked' | 'rejected' | 'approved' | 'timeout' | 'crashed' | 'stopped';
+  /** Reason/summary for the outcome. */
+  summary?: string;
+}
+
 export interface TaskFile {
   id: string;
   title: string;
@@ -82,6 +107,8 @@ export interface TaskFile {
   retryCount?: number;
   /** Number of AI unblock attempts made on this task. */
   unblockAttempts?: number;
+  /** Chronological history of all execution and review runs (audit trail). */
+  runs?: TaskRun[];
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */
