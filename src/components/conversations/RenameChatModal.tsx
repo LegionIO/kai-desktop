@@ -1,4 +1,4 @@
-import { useState, type FC } from 'react';
+import { useEffect, useRef, useState, type FC } from 'react';
 import { createPortal } from 'react-dom';
 
 interface RenameChatModalProps {
@@ -9,6 +9,15 @@ interface RenameChatModalProps {
 
 export const RenameChatModal: FC<RenameChatModalProps> = ({ initialValue, onSave, onClose }) => {
   const [value, setValue] = useState(initialValue);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, []);
 
   const handleSave = () => {
     const trimmed = value.trim();
@@ -25,12 +34,15 @@ export const RenameChatModal: FC<RenameChatModalProps> = ({ initialValue, onSave
       >
         <h2 className="text-lg font-semibold text-foreground">Rename chat</h2>
         <input
-          ref={(el) => { if (el) setTimeout(() => { el.focus(); el.select(); }, 50); }}
+          ref={inputRef}
           className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') { e.preventDefault(); handleSave(); }
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              handleSave();
+            }
             if (e.key === 'Escape') onClose();
           }}
         />
