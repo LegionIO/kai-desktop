@@ -485,11 +485,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                         </div>
                       );
                     })()}
-
-                  {/* Execution history timeline */}
-                  <div className="mt-6">
-                    <TaskRunTimeline task={task} />
-                  </div>
                 </div>
               </div>
               {/* Sticky plan composer */}
@@ -828,6 +823,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 />
               </div>
             )}
+
+            {/* Execution history timeline */}
+            <div className="shrink-0">
+              <TaskRunTimeline task={task} />
+            </div>
 
             {/* Reviewer terminal tabs — shown when reviewers have terminal sessions */}
             {(() => {

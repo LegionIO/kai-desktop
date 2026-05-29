@@ -14,6 +14,8 @@ import { MarkdownText } from '@/components/thread/MarkdownText';
 import { TaskTerminal } from './TaskTerminal';
 import { ReviewResultsPanel } from './ReviewResultsPanel';
 import { HumanReviewActions } from './HumanReviewActions';
+import { BlockTaskActions } from './BlockTaskActions';
+import { TaskRunTimeline } from './TaskRunTimeline';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
@@ -274,6 +276,29 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
                   />
                 </div>
               )}
+
+              {/* Block reason — shown when task is blocked */}
+              {task.status === 'blocked' &&
+                (() => {
+                  const blockReason =
+                    [...(task.reviewNotes ?? [])].reverse().find((n) => !n.content.includes('[Autopilot] Unblocked:'))
+                      ?.content ??
+                    ((task as unknown as { runs?: Array<{ outcome?: string; summary?: string }> }).runs ?? [])
+                      .slice()
+                      .reverse()
+                      .find((r) => r.outcome === 'blocked')?.summary ??
+                    '';
+                  return (
+                    <div className="shrink-0">
+                      <BlockTaskActions taskId={task.id} currentReason={blockReason} mode="view" />
+                    </div>
+                  );
+                })()}
+
+              {/* Execution history */}
+              <div className="shrink-0">
+                <TaskRunTimeline task={task} />
+              </div>
 
               {/* Start/Stop toolbar — only in states where execution is relevant */}
               {assignedAgent && (task.status === 'todo' || task.status === 'in_progress') && (
