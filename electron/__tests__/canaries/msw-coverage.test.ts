@@ -46,7 +46,7 @@ describe('msw coverage canaries', () => {
     // not just at the raw fetch boundary. If a future SDK release changes
     // its URL or auth-header shape, this canary will flag it.
     httpMock.use(...mockAnthropic());
-    const anthropic = createAnthropic({ apiKey: FAKE_KEY });
+    const anthropic = createAnthropic({ apiKey: FAKE_KEY, baseURL: 'https://api.anthropic.com' });
     const model = anthropic('claude-3-5-sonnet-20241022');
 
     const res = await model.doGenerate({
