@@ -81,12 +81,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({
     }
   }, [task?.id, task?.terminalSessionId]);
 
-  // Auto-switch to execution tab when terminal starts
-  useEffect(() => {
-    if (terminalSessionId) setActiveTab('execution');
-  }, [terminalSessionId]);
-
-  // Reset tab when modal opens based on task status
+  // Reset tab when modal opens based on task status (this takes priority)
   useEffect(() => {
     if (open && task) {
       setActiveTab(requestChangesMode ? 'overview' : getDefaultTab(task.status));
