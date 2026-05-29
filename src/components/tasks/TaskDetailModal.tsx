@@ -53,6 +53,18 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({ task, open, onOpenCh
     if (open) setActiveTab('plan');
   }, [open]);
 
+  // Listen for "Request Changes" event — switch to agent tab where the review actions are
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      if (detail === task?.id) {
+        setActiveTab('agent');
+      }
+    };
+    window.addEventListener('kai:request-changes-focus', handler);
+    return () => window.removeEventListener('kai:request-changes-focus', handler);
+  }, [task?.id]);
+
   const handleTerminalExit = useCallback(() => {
     if (!task) return;
     setTerminalSessionId(null);
