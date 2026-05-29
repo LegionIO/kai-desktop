@@ -31,6 +31,18 @@ export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onAppr
     }
   }, [showFeedback]);
 
+  // Listen for auto-expand event (fired when context menu "Request Changes…" opens the modal)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as string;
+      if (detail === taskId) {
+        setShowFeedback(true);
+      }
+    };
+    window.addEventListener('kai:request-changes-focus', handler);
+    return () => window.removeEventListener('kai:request-changes-focus', handler);
+  }, [taskId]);
+
   const handleRequestChanges = async () => {
     if (!feedback.trim()) return;
     setIsSubmitting(true);

@@ -199,7 +199,16 @@ export const TaskCard: FC<TaskCardProps> = memo(
                   <CheckIcon className="h-3.5 w-3.5" />
                   <span>Approve</span>
                 </ContextMenu.Item>
-                <ContextMenu.Item className={itemClassName} onSelect={() => onClick()}>
+                <ContextMenu.Item
+                  className={itemClassName}
+                  onSelect={() => {
+                    onClick();
+                    // Signal HumanReviewActions to auto-expand feedback textarea
+                    setTimeout(() => {
+                      window.dispatchEvent(new CustomEvent('kai:request-changes-focus', { detail: task.id }));
+                    }, 100);
+                  }}
+                >
                   <RotateCcwIcon className="h-3.5 w-3.5 text-muted-foreground" />
                   <span>Request Changes…</span>
                 </ContextMenu.Item>
