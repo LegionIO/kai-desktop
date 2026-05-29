@@ -1,5 +1,5 @@
 /**
- * AutopilotStatus — activity log of recent dispatch decisions.
+ * OrchestratorStatus — activity log of recent dispatch decisions.
  *
  * Each row shows the task → agent assignment, match score, outcome, and
  * a relative timestamp. Resolves task/agent IDs to display names via the
@@ -21,7 +21,7 @@ import { useOrchestrator, type DispatchDecision } from '@/hooks/useOrchestrator'
 import { useTasks } from '@/providers/TaskProvider';
 import { useAgents } from '@/providers/AgentProvider';
 
-interface AutopilotStatusProps {
+interface OrchestratorStatusProps {
   maxItems?: number;
 }
 
@@ -47,7 +47,7 @@ function outcomeBadge(decision: DispatchDecision) {
   return { Icon: CircleDashedIcon, color: 'text-muted-foreground/70', label: 'Skipped' };
 }
 
-export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => {
+export const OrchestratorStatus: FC<OrchestratorStatusProps> = ({ maxItems = 20 }) => {
   const { state, available, clearLog } = useOrchestrator();
   const { state: taskState } = useTasks();
   const { state: agentState } = useAgents();
@@ -67,7 +67,7 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
   if (!available) {
     return (
       <div className="rounded-xl border border-border/60 bg-card/50 p-4 text-center text-xs text-muted-foreground">
-        Autopilot is not available in this build.
+        Orchestrator is not available in this build.
       </div>
     );
   }
@@ -107,12 +107,10 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
           <p className="text-xs text-muted-foreground">No dispatch activity yet</p>
           {state.config.enabled ? (
             <p className="text-[10px] text-muted-foreground/70">
-              Autopilot is watching — decisions will appear here.
+              Orchestrator is watching — decisions will appear here.
             </p>
           ) : (
-            <p className="text-[10px] text-muted-foreground/70">
-              Enable autopilot to start dispatching tasks.
-            </p>
+            <p className="text-[10px] text-muted-foreground/70">Enable orchestrator to start dispatching tasks.</p>
           )}
         </div>
       ) : (
@@ -120,7 +118,7 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
           {items.map((d, idx) => {
             const taskName = taskNameById.get(d.taskId) ?? d.taskTitle ?? 'Unknown task';
             const agent = d.agentId ? agentNameById.get(d.agentId) : null;
-            const agentLabel = agent ? `${agent.icon ?? '🤖'} ${agent.name}` : d.agentName ?? '—';
+            const agentLabel = agent ? `${agent.icon ?? '🤖'} ${agent.name}` : (d.agentName ?? '—');
             const { Icon, color, label } = outcomeBadge(d);
             const scorePct = Math.round((d.score ?? 0) * 100);
             return (
@@ -130,9 +128,7 @@ export const AutopilotStatus: FC<AutopilotStatusProps> = ({ maxItems = 20 }) => 
                   <div className="flex items-center gap-1.5 text-xs">
                     <span className="truncate font-medium text-foreground">{taskName}</span>
                     <ArrowRightIcon className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                    <span className="truncate text-foreground/80">
-                      {agentLabel}
-                    </span>
+                    <span className="truncate text-foreground/80">{agentLabel}</span>
                   </div>
                   <div className="mt-0.5 flex items-center gap-2 text-[10px] text-muted-foreground">
                     <span className={cn('font-medium', color)}>{label}</span>

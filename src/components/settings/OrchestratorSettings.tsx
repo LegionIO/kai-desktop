@@ -1,5 +1,5 @@
 /**
- * AutopilotSettings — settings panel for the task dispatcher / autopilot.
+ * OrchestratorSettings — settings panel for the task dispatcher / orchestrator.
  *
  * Exposes the dispatcher knobs: enable, polling interval, max concurrency,
  * matching strategy, auto-start, and require-human-review. Wires directly
@@ -25,17 +25,17 @@ const STRATEGY_OPTIONS: Array<{ value: MatchingStrategy; label: string; descript
   },
 ];
 
-interface AutopilotSettingsProps {
+interface OrchestratorSettingsProps {
   hideTitle?: boolean;
 }
 
-export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => {
+export const OrchestratorSettings: FC<OrchestratorSettingsProps> = ({ hideTitle }) => {
   const { state, available, loading, setConfig } = useOrchestrator();
 
   if (loading) {
     return (
       <div className="space-y-6">
-        {!hideTitle && <h3 className="text-sm font-semibold">Autopilot</h3>}
+        {!hideTitle && <h3 className="text-sm font-semibold">Orchestrator</h3>}
         <div className="rounded-lg border p-3 text-xs text-muted-foreground">Loading…</div>
       </div>
     );
@@ -44,9 +44,9 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
   if (!available) {
     return (
       <div className="space-y-6">
-        {!hideTitle && <h3 className="text-sm font-semibold">Autopilot</h3>}
+        {!hideTitle && <h3 className="text-sm font-semibold">Orchestrator</h3>}
         <div className="rounded-lg border p-3 text-xs text-muted-foreground">
-          Autopilot is not available in this build of {__BRAND_PRODUCT_NAME}. Update to the latest version to enable
+          Orchestrator is not available in this build of {__BRAND_PRODUCT_NAME}. Update to the latest version to enable
           automatic task dispatching.
         </div>
       </div>
@@ -57,7 +57,7 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
 
   return (
     <div className="space-y-6">
-      {!hideTitle && <h3 className="text-sm font-semibold">Autopilot</h3>}
+      {!hideTitle && <h3 className="text-sm font-semibold">Orchestrator</h3>}
 
       {/* Master enable */}
       <fieldset className="rounded-lg border p-3 space-y-3">
@@ -70,7 +70,7 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
             onChange={(e) => void setConfig({ enabled: e.target.checked })}
             className="rounded"
           />
-          <span className="text-xs">Enable autopilot</span>
+          <span className="text-xs">Enable orchestrator</span>
         </label>
         <p className="text-[10px] text-muted-foreground/80 pl-1">
           When on, {__BRAND_PRODUCT_NAME} watches the queue and assigns tasks to idle agents on its own. Decisions
@@ -192,7 +192,7 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
             }
           />
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Number of AI reviewers autopilot assigns to each task
+            Number of AI reviewers orchestrator assigns to each task
           </p>
         </div>
 
@@ -303,7 +303,7 @@ export const AutopilotSettings: FC<AutopilotSettingsProps> = ({ hideTitle }) => 
           <span className="text-xs">AI unblock attempts</span>
         </label>
         <p className="text-[11px] text-muted-foreground pl-1">
-          Autopilot will try to resolve blocked tasks using AI analysis
+          Orchestrator will try to resolve blocked tasks using AI analysis
         </p>
 
         {/* Max Attempts — only visible when enabled */}

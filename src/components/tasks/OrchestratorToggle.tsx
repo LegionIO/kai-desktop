@@ -1,9 +1,9 @@
 /**
- * AutopilotToggle — compact switch + status text for the task queue toolbar.
+ * OrchestratorToggle — compact switch + status text for the task queue toolbar.
  *
- * Shows a small switch (h-4 w-7), the label "Autopilot", and contextual
+ * Shows a small switch (h-4 w-7), the label "Orchestrator", and contextual
  * status: "Off" when disabled, "Watching…" when enabled with no current
- * assignments, or "N assigned" when tasks are running under autopilot.
+ * assignments, or "N assigned" when tasks are running under orchestrator.
  *
  * Hidden entirely when the orchestrator IPC surface isn't available so
  * older builds don't render a dead control.
@@ -14,11 +14,11 @@ import { cn } from '@/lib/utils';
 import { useOrchestrator } from '@/hooks/useOrchestrator';
 import { Tooltip } from '@/components/ui/Tooltip';
 
-interface AutopilotToggleProps {
+interface OrchestratorToggleProps {
   className?: string;
 }
 
-export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
+export const OrchestratorToggle: FC<OrchestratorToggleProps> = ({ className }) => {
   const { state, available, loading, toggle } = useOrchestrator();
 
   if (!available || loading) return null;
@@ -40,7 +40,7 @@ export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
 
   return (
     <Tooltip
-      content={enabled ? 'Autopilot is watching the queue' : 'Enable autopilot to dispatch tasks automatically'}
+      content={enabled ? 'Orchestrator is watching the queue' : 'Enable orchestrator to dispatch tasks automatically'}
       side="bottom"
     >
       <button
@@ -58,9 +58,7 @@ export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
         <span
           className={cn(
             'relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors',
-            enabled
-              ? 'bg-[var(--brand-accent)]'
-              : 'bg-muted-foreground/30',
+            enabled ? 'bg-[var(--brand-accent)]' : 'bg-muted-foreground/30',
           )}
         >
           <span
@@ -72,7 +70,7 @@ export const AutopilotToggle: FC<AutopilotToggleProps> = ({ className }) => {
         </span>
 
         {/* Label */}
-        <span className="text-xs font-medium text-foreground">Autopilot</span>
+        <span className="text-xs font-medium text-foreground">Orchestrator</span>
 
         {/* Status */}
         <span
