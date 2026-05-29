@@ -38,7 +38,7 @@ interface TaskDetailModalProps {
   task: TaskFile | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onOpenFullView: (taskId: string) => void;
+  onOpenFullView: (taskId: string, activeTab?: string) => void;
   /** When true, auto-expand the feedback textarea in HumanReviewActions */
   requestChangesMode?: boolean;
 }
@@ -156,7 +156,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({
               <h2 className="text-lg font-semibold text-foreground leading-tight">{task.title}</h2>
               <button
                 type="button"
-                onClick={() => onOpenFullView(task.id)}
+                onClick={() => onOpenFullView(task.id, activeTab)}
                 className="shrink-0 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 title="Open full task view"
               >

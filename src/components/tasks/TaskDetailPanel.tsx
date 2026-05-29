@@ -88,7 +88,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   };
 
-  const [activeTab, setActiveTab] = useState<TabId>(getDefaultTab(task.status));
+  const [activeTab, setActiveTab] = useState<TabId>(() => {
+    // Check if transitioning from pop-out modal with a preserved tab
+    const preserved = (window as unknown as Record<string, unknown>).__taskDetailActiveTab as TabId | undefined;
+    if (preserved) {
+      (window as unknown as Record<string, unknown>).__taskDetailActiveTab = undefined;
+      return preserved;
+    }
+    return getDefaultTab(task.status);
+  });
 
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId
@@ -1205,21 +1213,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
               if (!showTabs) return null;
               return (
                 <div className="shrink-0 flex items-center gap-0.5 rounded-lg border border-border/40 bg-muted/20 p-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTerminalTab(null)}
-                    className={cn(
-                      'rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors',
-                      activeTerminalTab === null
-                        ? 'bg-background text-foreground shadow-sm'
-                        : 'text-muted-foreground hover:text-foreground/80',
-                    )}
-                  >
-                    <span className="flex items-center gap-1">
-                      <TerminalIcon className="h-3 w-3" />
-                      Executor
-                    </span>
-                  </button>
                   {reviewerTerminals.map((r) => (
                     <button
                       key={r.agentId}

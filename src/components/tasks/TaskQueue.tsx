@@ -305,8 +305,13 @@ export const TaskQueue: FC<TaskQueueProps> = ({ workspaceId }) => {
   }, []);
 
   const handleOpenFullView = useCallback(
-    (taskId: string) => {
+    (taskId: string, activeTab?: string) => {
       setModalTaskId(null);
+      setModalRequestChanges(false);
+      // Preserve the active tab when switching to docked view
+      if (activeTab) {
+        (window as unknown as Record<string, unknown>).__taskDetailActiveTab = activeTab;
+      }
       selectTask(taskId);
     },
     [selectTask],
