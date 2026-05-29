@@ -134,6 +134,18 @@ export const TASK_TRANSITIONS: readonly TransitionRule[] = [
     trigger: 'manual',
     condition: 'Reopen and immediately resume work',
   },
+  {
+    from: 'done',
+    to: 'human_review',
+    trigger: 'manual',
+    condition: 'Send back to human review (e.g. mistake found after completion)',
+  },
+  {
+    from: 'done',
+    to: 'ai_review',
+    trigger: 'manual',
+    condition: 'Send back to AI review (e.g. re-evaluate completed work)',
+  },
   // ── Blocked transitions ──────────────────────────────────────────────
   {
     from: 'in_progress',
