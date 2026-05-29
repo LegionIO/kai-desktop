@@ -1320,6 +1320,9 @@ const MessageInfoIndicator: FC = () => {
   const persistedModelDisplay = meta?.sourceModelDisplayName as string | undefined;
   const persistedEffort = meta?.reasoningEffort as string | undefined;
   const persistedRuntimeId = meta?.runtimeId as string | undefined;
+  // When an inference provider override is active, its key is stamped here (sourced from
+  // ~/.kai config at runtime — no provider names are hardcoded in this file).
+  const persistedProviderKey = meta?.providerKey as string | undefined;
 
   // Model: persisted display name > catalog lookup > formatted raw key.
   // When the message was handled by a plugin inference provider (persistedRuntimeId
@@ -1370,7 +1373,7 @@ const MessageInfoIndicator: FC = () => {
     (modelKey
       ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey)
       : null);
-  const runtimeDisplay = effectiveRuntimeId ? (RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId) : null;
+  const runtimeDisplay = persistedProviderKey ?? (effectiveRuntimeId ? (RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId) : null);
   const effortDisplay = effectiveEffort ? (EFFORT_DISPLAY_NAMES[effectiveEffort] ?? effectiveEffort) : null;
   const elapsedDisplay = elapsedMs != null ? formatElapsed(Math.max(1, elapsedMs)) : null;
 

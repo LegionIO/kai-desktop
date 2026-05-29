@@ -1417,6 +1417,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
               reasoningEffort: reasoningEffort ?? null,
               runtimeId: runtime.id,
+              ...(resolution.providerOverride ? { providerKey: resolution.providerOverride } : {}),
             };
           }
           if (activeObserverSessions.get(conversationId) !== observerSessionId) {
