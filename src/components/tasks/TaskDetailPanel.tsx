@@ -98,6 +98,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     return getDefaultTab(task.status);
   });
 
+  // Also check on re-render (handles case where panel is already mounted)
+  useEffect(() => {
+    const preserved = (window as unknown as Record<string, unknown>).__taskDetailActiveTab as TabId | undefined;
+    if (preserved) {
+      (window as unknown as Record<string, unknown>).__taskDetailActiveTab = undefined;
+      setActiveTab(preserved);
+    }
+  });
+
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId
   const [activeTerminalTab, setActiveTerminalTab] = useState<string | null>(null);
