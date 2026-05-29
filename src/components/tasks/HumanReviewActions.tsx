@@ -20,7 +20,15 @@ interface HumanReviewActionsProps {
 }
 
 export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onApprove, compact, className }) => {
-  const [showFeedback, setShowFeedback] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(() => {
+    // Check if there's a pending signal on initial mount
+    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
+    if (pending === taskId) {
+      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
+      return true;
+    }
+    return false;
+  });
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -31,16 +39,8 @@ export const HumanReviewActions: FC<HumanReviewActionsProps> = ({ taskId, onAppr
     }
   }, [showFeedback]);
 
-  // Listen for auto-expand event (fired when context menu "Request Changes…" opens the modal)
-  // Also check on mount if a pending request-changes signal exists (handles race with tab switch)
+  // Listen for auto-expand event (for already-mounted instances)
   useEffect(() => {
-    // Check if there's a pending signal (set before this component mounted)
-    const pending = (window as unknown as Record<string, unknown>).__pendingRequestChanges;
-    if (pending === taskId) {
-      setShowFeedback(true);
-      (window as unknown as Record<string, unknown>).__pendingRequestChanges = undefined;
-    }
-
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as string;
       if (detail === taskId) {
