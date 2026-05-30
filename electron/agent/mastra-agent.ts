@@ -14,7 +14,6 @@ import { anthropic as anthropicProvider } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import { homedir } from 'os';
 import { isAbsolute, resolve as resolvePath } from 'path';
-import { appendFileSync, mkdirSync } from 'fs';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
@@ -24,24 +23,6 @@ import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
-
-// ── Debug logger (temporary) ─────────────────────────────────────────────────
-const DEBUG_LOG_DIR = `${homedir()}/Documents/kai/kai-desktop/debug-logs`;
-const DEBUG_LOG_FILE = `${DEBUG_LOG_DIR}/stream-events.jsonl`;
-try {
-  mkdirSync(DEBUG_LOG_DIR, { recursive: true });
-} catch {
-  /* ignore */
-}
-function debugLog(label: string, data: unknown): void {
-  try {
-    const line = JSON.stringify({ ts: new Date().toISOString(), label, data }) + '\n';
-    appendFileSync(DEBUG_LOG_FILE, line);
-  } catch {
-    /* ignore */
-  }
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -1135,12 +1116,6 @@ async function* streamWithRealEvents(
           const c = chunk as RawStreamChunk;
           const type = c?.type;
           const payload = (c?.payload ?? c) as Record<string, unknown> | undefined;
-          // DEBUG: log every chunk type, and full chunk for step-finish/finish
-          if (type === 'step-finish' || type === 'finish') {
-            debugLog('chunk-full', chunk);
-          } else {
-            debugLog('chunk-type', type);
-          }
 
           if (type === 'text-delta') {
             const text = extractStreamText(payload);
@@ -1382,7 +1357,6 @@ async function* streamWithRealEvents(
   }
 
   // Emit accumulated token usage before done
-  debugLog('acc-tokens', { accInputTokens, accOutputTokens, accCacheReadTokens, accCacheWriteTokens });
   if (accInputTokens > 0 || accOutputTokens > 0) {
     yield {
       conversationId,
