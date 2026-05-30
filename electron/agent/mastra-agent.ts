@@ -1227,14 +1227,21 @@ async function* streamWithRealEvents(
               console.info(`[Agent] Ending stream early for ${conversationId} after content-filter step finish`);
               break;
             }
-            // Accumulate token usage from each step
-            const stepUsage = payload?.usage as { promptTokens?: number; completionTokens?: number } | undefined;
+            // Accumulate token usage from each step.
+            // Mastra wraps the AI SDK step result — usage may sit at
+            // payload.usage (direct) or payload.output.usage (wrapped).
+            const payloadOutput = payload?.output as Record<string, unknown> | undefined;
+            const stepUsage = (payload?.usage ?? payloadOutput?.usage) as
+              | { promptTokens?: number; completionTokens?: number }
+              | undefined;
             if (stepUsage) {
               accInputTokens += stepUsage.promptTokens ?? 0;
               accOutputTokens += stepUsage.completionTokens ?? 0;
             }
             // Extract Anthropic cache token info from providerMetadata
-            const stepMeta = payload?.providerMetadata as Record<string, unknown> | undefined;
+            const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
+              | Record<string, unknown>
+              | undefined;
             const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
