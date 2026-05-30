@@ -16,10 +16,6 @@
 export const BLOCKED_HOSTS: ReadonlyArray<string | RegExp> = [
   // Anthropic
   'api.anthropic.com',
-  // Corporate LLM gateway (UHG / Optum) — same Anthropic API surface, different host.
-  // Blocked so tests that create an un-baseURL'd Anthropic client don't silently
-  // route through the gateway when ANTHROPIC_BASE_URL is set in the developer shell.
-  'llm-gateway.uhg.com',
   // OpenAI
   'api.openai.com',
   // Google (Gemini + Vertex AI). Vertex regional endpoints use the

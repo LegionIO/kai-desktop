@@ -24,9 +24,9 @@ import {
 } from './test-utils/blocked-hosts.js';
 
 // Clear provider base-URL overrides so SDK clients use their canonical defaults
-// during tests. Without this, env vars like ANTHROPIC_BASE_URL (set to a
-// corporate gateway in developer shells) redirect SDK fetches to a host the
-// MSW handlers don't intercept, causing canary tests to fail.
+// during tests. Without this, env vars like ANTHROPIC_BASE_URL set in the
+// developer shell redirect SDK fetches to a host the MSW handlers don't
+// intercept, causing canary tests to fail.
 delete process.env.ANTHROPIC_BASE_URL;
 delete process.env.OPENAI_BASE_URL;
 delete process.env.OPENAI_API_BASE;
