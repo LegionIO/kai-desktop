@@ -1373,7 +1373,15 @@ const MessageInfoIndicator: FC = () => {
     (modelKey
       ? formatModelDisplayName(modelKey.includes(':') ? modelKey.split(':').slice(1).join(':') : modelKey)
       : null);
-  const runtimeDisplay = persistedProviderKey ?? (effectiveRuntimeId ? (RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId) : null);
+  // Look up a display name for the provider key from the catalog (display name is
+  // sourced from ~/.kai config — no provider names are hardcoded here).
+  const providerCatalogEntry = persistedProviderKey
+    ? (catalog?.find((m) => m.provider === persistedProviderKey && m.key === persistedProviderKey) ??
+      catalog?.find((m) => m.provider === persistedProviderKey))
+    : undefined;
+  const runtimeDisplay =
+    (persistedProviderKey ? (providerCatalogEntry?.displayName ?? persistedProviderKey) : null) ??
+    (effectiveRuntimeId ? (RUNTIME_DISPLAY_NAMES[effectiveRuntimeId] ?? effectiveRuntimeId) : null);
   const effortDisplay = effectiveEffort ? (EFFORT_DISPLAY_NAMES[effectiveEffort] ?? effectiveEffort) : null;
   const elapsedDisplay = elapsedMs != null ? formatElapsed(Math.max(1, elapsedMs)) : null;
 
