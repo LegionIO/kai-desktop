@@ -14,6 +14,7 @@ import { anthropic as anthropicProvider } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import { homedir } from 'os';
 import { isAbsolute, resolve as resolvePath } from 'path';
+import { appendFileSync, mkdirSync } from 'fs';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
@@ -23,6 +24,24 @@ import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
+
+// ── Debug logger (temporary) ─────────────────────────────────────────────────
+const DEBUG_LOG_DIR = `${homedir()}/Documents/kai/kai-desktop/debug-logs`;
+const DEBUG_LOG_FILE = `${DEBUG_LOG_DIR}/stream-events.jsonl`;
+try {
+  mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+} catch {
+  /* ignore */
+}
+function debugLog(label: string, data: unknown): void {
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), label, data }) + '\n';
+    appendFileSync(DEBUG_LOG_FILE, line);
+  } catch {
+    /* ignore */
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -1116,6 +1135,12 @@ async function* streamWithRealEvents(
           const c = chunk as RawStreamChunk;
           const type = c?.type;
           const payload = (c?.payload ?? c) as Record<string, unknown> | undefined;
+          // DEBUG: log every chunk type, and full chunk for step-finish/finish
+          if (type === 'step-finish' || type === 'finish') {
+            debugLog('chunk-full', chunk);
+          } else {
+            debugLog('chunk-type', type);
+          }
 
           if (type === 'text-delta') {
             const text = extractStreamText(payload);
@@ -1230,15 +1255,17 @@ async function* streamWithRealEvents(
             // Accumulate token usage from each step.
             // Mastra wraps the AI SDK step result — usage may sit at
             // payload.usage (direct) or payload.output.usage (wrapped).
+            // Key names also vary: openai-compat uses inputTokens/outputTokens,
+            // Anthropic uses promptTokens/completionTokens.
             const payloadOutput = payload?.output as Record<string, unknown> | undefined;
             const stepUsage = (payload?.usage ?? payloadOutput?.usage) as
-              | { promptTokens?: number; completionTokens?: number }
+              | { promptTokens?: number; completionTokens?: number; inputTokens?: number; outputTokens?: number }
               | undefined;
             if (stepUsage) {
-              accInputTokens += stepUsage.promptTokens ?? 0;
-              accOutputTokens += stepUsage.completionTokens ?? 0;
+              accInputTokens += stepUsage.promptTokens ?? stepUsage.inputTokens ?? 0;
+              accOutputTokens += stepUsage.completionTokens ?? stepUsage.outputTokens ?? 0;
             }
-            // Extract Anthropic cache token info from providerMetadata
+            // Extract Anthropic cache token info from providerMetadata or directly from usage
             const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
               | Record<string, unknown>
               | undefined;
@@ -1246,6 +1273,10 @@ async function* streamWithRealEvents(
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
               accCacheWriteTokens += (anthropicMeta.cacheCreationInputTokens as number | undefined) ?? 0;
+            }
+            // openai-compat provider puts cache tokens directly on usage
+            if (stepUsage) {
+              accCacheReadTokens += ((stepUsage as Record<string, unknown>).cachedInputTokens as number) ?? 0;
             }
           } else if (type && isExpectedMastraStructuralEvent(type)) {
             continue;
@@ -1351,6 +1382,7 @@ async function* streamWithRealEvents(
   }
 
   // Emit accumulated token usage before done
+  debugLog('acc-tokens', { accInputTokens, accOutputTokens, accCacheReadTokens, accCacheWriteTokens });
   if (accInputTokens > 0 || accOutputTokens > 0) {
     yield {
       conversationId,
