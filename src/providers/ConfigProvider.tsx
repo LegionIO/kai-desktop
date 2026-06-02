@@ -18,12 +18,26 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     try {
-      app.config.get()
+      app.config
+        .get()
         .then((cfg) => setConfig(cfg as AppConfig))
         .catch((err) => console.error('[Config] Failed to load:', err));
 
-      const unsubscribe = app.config.onChanged((cfg) => {
-        setConfig(cfg as AppConfig);
+      // The `config:changed` broadcast payload is intentionally redacted
+      // before it crosses the IPC and WebSocket boundaries (see
+      // `electron/ipc/config.ts` and `electron/plugins/safe-config.ts`),
+      // so we cannot use it directly to refresh local state — settings
+      // inputs that bind to fields like `realtime.openai.apiKey` would
+      // be emptied on every external config change. Instead we treat the
+      // event as a "something changed" signal and re-fetch the full
+      // config over the dedicated `config:get` channel. The fetched copy
+      // is only ever seen by first-party renderer code, never by plugin
+      // renderer scripts loaded via the plugin-sandbox API.
+      const unsubscribe = app.config.onChanged(() => {
+        app.config
+          .get()
+          .then((cfg) => setConfig(cfg as AppConfig))
+          .catch((err) => console.error('[Config] Failed to refresh after broadcast:', err));
       });
 
       return unsubscribe;
@@ -43,11 +57,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo(() => ({ config, updateConfig }), [config, updateConfig]);
 
-  return (
-    <ConfigContext.Provider value={value}>
-      {children}
-    </ConfigContext.Provider>
-  );
+  return <ConfigContext.Provider value={value}>{children}</ConfigContext.Provider>;
 }
 
 export function useConfig() {

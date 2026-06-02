@@ -8,11 +8,7 @@ import type { AppConfig } from '../config/schema.js';
  */
 export type PluginSafeProviderConfig = Omit<
   AppConfig['models']['providers'][string],
-  | 'apiKey'
-  | 'accessKeyId'
-  | 'secretAccessKey'
-  | 'sessionToken'
-  | 'extraHeaders'
+  'apiKey' | 'accessKeyId' | 'secretAccessKey' | 'sessionToken' | 'extraHeaders'
 > & {
   hasApiKey: boolean;
   hasAccessKeyId: boolean;
@@ -56,9 +52,7 @@ type PluginSafeVideoGenerationConfig = Omit<VideoGenerationConfig, 'openai' | 'a
   custom?: PluginSafeProviderCredentialBlock<NonNullable<VideoGenerationConfig['custom']>>;
 };
 
-type EmbeddingProviderConfig = NonNullable<
-  AppConfig['memory']['semanticRecall']['embeddingProvider']
->;
+type EmbeddingProviderConfig = NonNullable<AppConfig['memory']['semanticRecall']['embeddingProvider']>;
 type PluginSafeEmbeddingProviderConfig = Omit<EmbeddingProviderConfig, 'openai' | 'azure' | 'custom'> & {
   openai?: PluginSafeProviderCredentialBlock<NonNullable<EmbeddingProviderConfig['openai']>>;
   azure?: PluginSafeProviderCredentialBlock<NonNullable<EmbeddingProviderConfig['azure']>>;
@@ -102,14 +96,7 @@ type PluginSafeWebServerConfig = Omit<AppConfig['webServer'], 'tls' | 'auth'> & 
  */
 export type PluginSafeConfig = Omit<
   AppConfig,
-  | 'models'
-  | 'memory'
-  | 'mcpServers'
-  | 'webServer'
-  | 'audio'
-  | 'realtime'
-  | 'imageGeneration'
-  | 'videoGeneration'
+  'models' | 'memory' | 'mcpServers' | 'webServer' | 'audio' | 'realtime' | 'imageGeneration' | 'videoGeneration'
 > & {
   models: Omit<AppConfig['models'], 'providers'> & {
     providers: Record<string, PluginSafeProviderConfig>;
@@ -138,17 +125,8 @@ function redactProviderCredentialBlock<T extends { apiKey?: string }>(
   };
 }
 
-function redactProvider(
-  provider: AppConfig['models']['providers'][string],
-): PluginSafeProviderConfig {
-  const {
-    apiKey,
-    accessKeyId,
-    secretAccessKey,
-    sessionToken,
-    extraHeaders,
-    ...rest
-  } = provider;
+function redactProvider(provider: AppConfig['models']['providers'][string]): PluginSafeProviderConfig {
+  const { apiKey, accessKeyId, secretAccessKey, sessionToken, extraHeaders, ...rest } = provider;
   return {
     ...rest,
     hasApiKey: hasNonEmptyString(apiKey),
@@ -288,6 +266,42 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
     imageGeneration: safeImageGeneration,
     videoGeneration: safeVideoGeneration,
   };
+}
+
+/**
+ * Type alias for the redacted config shape used by the `config:changed`
+ * IPC broadcast and the `broadcastToWebClients` WebSocket fan-out. Same
+ * structural contract as {@link PluginSafeConfig} — every credential leaf
+ * (apiKey, AWS access keys, MCP server env vars, web server password,
+ * TLS private key path, Azure subscription key, extra HTTP headers) is
+ * either omitted or replaced with a boolean / key-list indicator.
+ *
+ * Build instances with {@link toBroadcastSafeConfig}.
+ */
+export type BroadcastSafeConfig = PluginSafeConfig;
+
+/**
+ * Strip credential-bearing fields from an {@link AppConfig} before it is
+ * broadcast over IPC or the local web server WebSocket. Reuses the same
+ * denylist as {@link toPluginSafeConfig} so there is one source of truth
+ * for what counts as a credential.
+ *
+ * Why a separate named export instead of just calling `toPluginSafeConfig`
+ * at the broadcast site:
+ *   - The call site reads as `toBroadcastSafeConfig(currentConfig)`, which
+ *     documents the intent of the redaction at the point of use.
+ *   - If the broadcast redaction ever needs to diverge from the plugin
+ *     redaction (e.g. a future field should reach plugins but not
+ *     web-server clients, or vice versa), this is the one seam to widen.
+ *
+ * Main-process consumers like the `onChanged` callback in
+ * `registerConfigHandlers` must continue to receive the raw config —
+ * the agent runtime, MCP loader, and other in-process subsystems
+ * legitimately need the credentials to do their job. Only renderer-bound
+ * and network-bound payloads are redacted.
+ */
+export function toBroadcastSafeConfig(config: AppConfig): BroadcastSafeConfig {
+  return toPluginSafeConfig(config);
 }
 
 /**
