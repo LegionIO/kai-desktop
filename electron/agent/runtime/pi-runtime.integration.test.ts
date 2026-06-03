@@ -159,6 +159,17 @@ describe('PiRuntime (integration — real subprocess)', () => {
     expect(events[events.length - 1].type).toBe('done');
   });
 
+  it('terminates cleanly when the signal is already aborted before spawn (no hang)', async () => {
+    // Regression for the abort-during-spawn window: a pre-aborted signal must
+    // still reap the child and end the stream promptly rather than blocking the
+    // stdout read loop forever.
+    process.env.PI_FAKE_MODE = 'hang'; // child would otherwise never exit
+    const ac = new AbortController();
+    ac.abort();
+    const events = await collect(new PiRuntime().stream(makeOptions({ abortSignal: ac.signal })));
+    expect(events[events.length - 1]?.type).toBe('done');
+  });
+
   it.skipIf(process.platform === 'win32')(
     'kills the whole process group on abort — the pi grandchild is reaped',
     async () => {

@@ -55,9 +55,14 @@ const PI_CAPABILITIES: RuntimeCapabilities = {
   customTools: false, // no MCP bridge possible — Kai custom tools unavailable
 };
 
-// Guard against pathological/garbage lines on stdout.
-const MAX_LINE_BYTES = 1024 * 1024; // 1 MiB
+// Guard against pathological/garbage output on stdout.
+const MAX_LINE_BYTES = 1024 * 1024; // 1 MiB per line
+const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64 MiB aggregate ceiling per turn
 const STDERR_CAP = 64 * 1024;
+
+// pi's accepted --thinking levels; anything else is dropped rather than passed
+// through (defense-in-depth against an upstream reasoning-effort enum widening).
+const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 
 // ---------------------------------------------------------------------------
 // Loose typings for pi's JSON event stream (avoids any compile-time pi dep)
@@ -166,8 +171,8 @@ export class PiRuntime implements AgentRuntime {
     // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
     args.push(...buildToolScopingArgs(piConfig));
 
-    // Reasoning effort → pi --thinking (Kai's values are all valid pi levels).
-    if (reasoningEffort) {
+    // Reasoning effort → pi --thinking. Only forward values pi actually accepts.
+    if (reasoningEffort && PI_THINKING_LEVELS.has(reasoningEffort)) {
       args.push('--thinking', reasoningEffort);
     }
 
@@ -223,8 +228,17 @@ export class PiRuntime implements AgentRuntime {
       });
     });
 
-    const onAbort = () => killProcessGroup(child);
+    const onAbort = () => {
+      killProcessGroup(child);
+      // Unblock the `for await (… of child.stdout)` loop even when the child has
+      // emitted nothing yet — otherwise an abort against a hung, silent child
+      // would never reach the `finally` that reaps it.
+      child.stdout.destroy();
+    };
     abortSignal?.addEventListener('abort', onAbort, { once: true });
+    // If the signal was already aborted before we attached (abort landed during
+    // spawn), `{ once: true }` won't fire — reap immediately.
+    if (abortSignal?.aborted) onAbort();
 
     // Send the prompt via stdin, then close it so pi runs single-shot.
     try {
@@ -236,9 +250,22 @@ export class PiRuntime implements AgentRuntime {
 
     try {
       let buf = '';
+      let totalBytes = 0;
       for await (const chunk of child.stdout) {
         if (abortSignal?.aborted) break;
-        buf += (chunk as Buffer).toString('utf8');
+        const bytes = chunk as Buffer;
+        totalBytes += bytes.length;
+        if (totalBytes > MAX_TOTAL_BYTES) {
+          errorYielded = true;
+          killProcessGroup(child);
+          yield {
+            conversationId,
+            type: 'error',
+            error: 'pi produced an excessive amount of output; the stream was stopped.',
+          };
+          break;
+        }
+        buf += bytes.toString('utf8');
         let nl: number;
         while ((nl = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, nl);
