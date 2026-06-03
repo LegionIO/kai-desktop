@@ -495,7 +495,7 @@ export type UnblockPolicy = z.infer<typeof unblockPolicySchema>;
 // Agent runtime config
 // ---------------------------------------------------------------------------
 
-export type RuntimeIdConfig = 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
+export type RuntimeIdConfig = 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | 'pi';
 
 const claudeAgentSdkConfigSchema = z.object({
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions']).optional(),
@@ -514,12 +514,21 @@ const codexSdkConfigSchema = z.object({
   approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
 });
 
+// pi runtime: `approval` maps to spawn-time tool scoping (pi has no mid-stream
+// approval hook). Default 'full-auto' = pi runs all tools (bash + file edits)
+// unsupervised. `excludeTools` is an explicit pi tool-exclusion override.
+const piSdkConfigSchema = z.object({
+  approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
+  excludeTools: z.array(z.string()).optional(),
+});
+
 const agentConfigSchema = z.object({
-  runtime: z.string().default('auto'), // 'auto' | 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | plugin runtime ids
+  runtime: z.string().default('auto'), // 'auto' | 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | 'pi' | plugin runtime ids
   maxTurns: z.number().positive().optional(),
   autoContinueOnMaxTurns: z.boolean().optional(),
   claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
   codexSdk: codexSdkConfigSchema.optional(),
+  piSdk: piSdkConfigSchema.optional(),
 });
 
 const webServerConfigSchema = z.object({

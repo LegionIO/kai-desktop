@@ -148,7 +148,9 @@ export async function getAvailableRuntimes(): Promise<
           ? 'Claude Code CLI not found on PATH'
           : runtime.id === 'codex-sdk'
             ? 'Codex CLI not found on PATH'
-            : undefined,
+            : runtime.id === 'pi'
+              ? 'pi CLI not found on PATH'
+              : undefined,
     });
   }
 

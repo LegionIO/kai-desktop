@@ -149,10 +149,10 @@ function resolveExplicitMode(
   preferred: RuntimeId,
   available: Set<string>,
 ): RuntimeResolution {
-
   // Runtime not available.
   if (!available.has(preferred)) {
-    const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
+    const isBuiltInRuntime =
+      preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk' || preferred === 'pi';
     if (!isBuiltInRuntime) {
       // Before falling back, check whether a native provider key exists that
       // matches this runtime ID (e.g. runtime 'legion' → provider 'legionio').
@@ -172,7 +172,8 @@ function resolveExplicitMode(
 
   // No model info.
   if (!model || !providerType) {
-    const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
+    const isBuiltInRuntime =
+      preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk' || preferred === 'pi';
     if (!isBuiltInRuntime) {
       // Same native-provider fallback: if a provider key exists for this runtime,
       // route through Mastra rather than a missing plugin.
@@ -221,9 +222,14 @@ function resolveExplicitMode(
       // failing inside the Claude Code runtime.
       const rawEntry = config.models.catalog.find((m) => m.key === model.key);
       const providerKey = rawEntry?.provider ?? '';
-      const isBuiltInProvider = providerKey === 'anthropic' || providerKey === 'amazon-bedrock'
-        || providerKey === 'openai' || providerKey === 'google' || providerKey === 'gemini'
-        || providerKey === 'ollama' || providerKey === 'bedrock';
+      const isBuiltInProvider =
+        providerKey === 'anthropic' ||
+        providerKey === 'amazon-bedrock' ||
+        providerKey === 'openai' ||
+        providerKey === 'google' ||
+        providerKey === 'gemini' ||
+        providerKey === 'ollama' ||
+        providerKey === 'bedrock';
       if (!isBuiltInProvider) {
         return {
           runtimeId: 'claude-agent-sdk',
@@ -246,6 +252,16 @@ function resolveExplicitMode(
         runtimeId: 'codex-sdk',
         warning: `The selected model (${model.displayName}) is from ${providerTypeLabel(providerType)} provider, which is not supported by the Codex runtime. Switch to Auto runtime in Settings → Agent Runtime, or select a model from an OpenAI-compatible provider.`,
       };
+    }
+
+    case 'pi': {
+      // pi is multi-provider and degrades gracefully: when the model maps to a
+      // pi-known provider/endpoint the runtime uses it, otherwise pi falls back
+      // to its own configured default (with an in-chat note). So there is no
+      // hard incompatibility to warn about — always route to pi, passing the
+      // resolved auth as a hint. The runtime reads the full model entry
+      // (primaryModel) to decide mappability.
+      return { runtimeId: 'pi', modelAuth: extractModelAuth(model) };
     }
 
     case 'mastra':
@@ -276,12 +292,8 @@ function extractModelAuth(model: ModelCatalogEntry): ModelAuth {
  * Anthropic or Bedrock provider. This handles the enterprise gateway case
  * where the same model is registered under both OpenAI and Anthropic endpoints.
  */
-function crossReferenceAnthropicProvider(
-  modelName: string,
-  config: AppConfig,
-): ModelAuth | null {
+function crossReferenceAnthropicProvider(modelName: string, config: AppConfig): ModelAuth | null {
   const catalog = resolveModelCatalog(config);
-
 
   for (const entry of catalog.entries) {
     if (
@@ -313,10 +325,15 @@ function stripV1Suffix(url: string): string {
 
 function providerTypeLabel(type: LLMProviderType): string {
   switch (type) {
-    case 'openai-compatible': return 'an OpenAI-compatible';
-    case 'anthropic': return 'an Anthropic';
-    case 'amazon-bedrock': return 'an Amazon Bedrock';
-    case 'google': return 'a Google';
-    default: return `a ${type}`;
+    case 'openai-compatible':
+      return 'an OpenAI-compatible';
+    case 'anthropic':
+      return 'an Anthropic';
+    case 'amazon-bedrock':
+      return 'an Amazon Bedrock';
+    case 'google':
+      return 'a Google';
+    default:
+      return `a ${type}`;
   }
 }

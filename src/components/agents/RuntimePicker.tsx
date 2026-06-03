@@ -3,7 +3,7 @@
  */
 
 import type { FC } from 'react';
-import { TerminalIcon, BrainIcon, ZapIcon, SparklesIcon } from 'lucide-react';
+import { TerminalIcon, BrainIcon, ZapIcon, SparklesIcon, CpuIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AgentRuntime } from '../../../shared/agent-types';
 
@@ -32,6 +32,12 @@ const RUNTIME_OPTIONS: RuntimeOption[] = [
     label: 'Codex',
     description: "OpenAI's coding agent CLI",
     icon: BrainIcon,
+  },
+  {
+    id: 'pi',
+    label: 'Pi',
+    description: 'The pi coding agent CLI (earendil-works)',
+    icon: CpuIcon,
   },
   {
     id: 'mastra',
@@ -73,17 +79,13 @@ export const RuntimePicker: FC<RuntimePickerProps> = ({ value, onChange }) => {
               <Icon size={16} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className={cn('text-sm font-medium', isSelected && 'text-primary')}>
-                {option.label}
-              </div>
+              <div className={cn('text-sm font-medium', isSelected && 'text-primary')}>{option.label}</div>
               <div className="text-xs text-muted-foreground">{option.description}</div>
             </div>
             <div
               className={cn(
                 'h-4 w-4 shrink-0 rounded-full border-2 transition-colors',
-                isSelected
-                  ? 'border-primary bg-primary'
-                  : 'border-muted-foreground/30',
+                isSelected ? 'border-primary bg-primary' : 'border-muted-foreground/30',
               )}
             >
               {isSelected && (

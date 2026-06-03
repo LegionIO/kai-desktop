@@ -2,7 +2,7 @@
  * Types shared between main and renderer process for the Agents feature.
  */
 
-export type AgentRuntime = 'auto' | 'claude-code' | 'codex' | 'mastra';
+export type AgentRuntime = 'auto' | 'claude-code' | 'codex' | 'pi' | 'mastra';
 export type AgentStatus = 'idle' | 'running' | 'error';
 export type AgentRole = 'general' | 'engineer' | 'reviewer' | 'researcher';
 

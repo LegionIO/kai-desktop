@@ -20,6 +20,7 @@ import { resolveBinaryPathSync } from '../../utils/shell-env.js';
 
 let _claudeCliPath: string | false | null = null;
 let _codexCliPath: string | false | null = null;
+let _piCliPath: string | false | null = null;
 
 /**
  * Returns `true` when the `claude` CLI binary is found on PATH.
@@ -54,12 +55,34 @@ export async function detectCodexSdk(): Promise<boolean> {
 }
 
 /**
+ * Returns `true` when the `pi` CLI binary is found on PATH.
+ * This is required for the pi coding-agent runtime to function.
+ */
+export async function detectPiCli(): Promise<boolean> {
+  if (typeof _piCliPath === 'string') return true;
+  _piCliPath = resolveCliPath('pi');
+  return _piCliPath !== false;
+}
+
+/**
+ * Returns the absolute path to the `pi` CLI binary if found on PATH,
+ * or `undefined` if not found.  The pi runtime spawns this path directly.
+ */
+export async function resolvePiCliPath(): Promise<string | undefined> {
+  if (typeof _piCliPath !== 'string') {
+    _piCliPath = resolveCliPath('pi');
+  }
+  return _piCliPath || undefined;
+}
+
+/**
  * Resets the cached detection results.  Useful if the user installs a
  * CLI binary while Kai is already running.
  */
 export function resetDetectionCache(): void {
   _claudeCliPath = null;
   _codexCliPath = null;
+  _piCliPath = null;
 }
 
 // ---------------------------------------------------------------------------
