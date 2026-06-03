@@ -53,6 +53,7 @@ const PI_CAPABILITIES: RuntimeCapabilities = {
   subAgents: false, // no sub-agent delegation
   sessions: true, // session resume via --session-id
   customTools: false, // no MCP bridge possible — Kai custom tools unavailable
+  perActionApproval: false, // pi has NO per-tool hook in headless mode — runs unsupervised
 };
 
 // Guard against pathological/garbage output on stdout.
@@ -218,6 +219,10 @@ export class PiRuntime implements AgentRuntime {
     child.on('error', (err) => {
       spawnError = err as NodeJS.ErrnoException;
     });
+    // Writing the prompt to a child that has already exited (e.g. an abort
+    // landed during spawn) emits an async EPIPE 'error' on stdin that a
+    // synchronous try/catch can't catch — swallow it to avoid an unhandled error.
+    child.stdin.on('error', () => {});
     child.stderr.on('data', (d: Buffer) => {
       if (stderrBuf.length < STDERR_CAP) stderrBuf += d.toString('utf8');
     });

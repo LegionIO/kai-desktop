@@ -1,8 +1,16 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
 import { settingsSelectClass, Toggle, NumberField, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
+import { AutonomyWarning } from '@/components/runtime/AutonomyWarning';
 
-type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string; description?: string };
+type RuntimeInfo = {
+  id: string;
+  name: string;
+  available: boolean;
+  reason?: string;
+  description?: string;
+  perActionApproval?: boolean;
+};
 
 type AgentConfig = {
   runtime: string;
@@ -15,7 +23,7 @@ const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   'claude-agent-sdk':
     "Anthropic's Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.",
   'codex-sdk': "OpenAI's Codex agent. Thread-based execution with session resume.",
-  pi: 'The pi coding agent (earendil-works). Built-in bash + file tools and session resume. Runs autonomously — it executes shell commands and file edits in your working directory without per-action approval. Kai custom tools, MCP, and plan mode are unavailable; only first-party Anthropic/OpenAI/Google/Bedrock models can be driven.',
+  pi: 'The pi coding agent (earendil-works). Built-in bash + file tools and session resume. Kai custom tools, MCP, and plan mode are unavailable; only first-party Anthropic/OpenAI/Google/Bedrock models can be driven.',
 };
 
 /** Sort order: available before offline, then by priority. */
@@ -101,6 +109,9 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
             const desc = RUNTIME_DESCRIPTIONS[selectedRuntime];
             return desc ? <p className="text-[10px] text-muted-foreground/80 italic">{desc}</p> : null;
           })()}
+
+        {/* Autonomy warning — derived from the runtime's perActionApproval capability */}
+        {runtimes.find((r) => r.id === selectedRuntime)?.perActionApproval === false && <AutonomyWarning />}
       </fieldset>
 
       {/* Availability */}

@@ -49,6 +49,7 @@ function makeFakeChild() {
     stdin: {
       write: vi.fn((c: string) => spawnState.stdinWrites.push(String(c))),
       end: vi.fn(),
+      on: vi.fn(),
     },
     stderr: { on: vi.fn() },
     stdout: {

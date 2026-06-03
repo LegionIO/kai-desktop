@@ -57,6 +57,15 @@ export type RuntimeCapabilities = {
 
   /** Can accept custom Kai tools (skills, plugins, CLI tools) at stream time. */
   customTools: boolean;
+
+  /**
+   * Runtime can gate individual tool actions at execution time (e.g. Claude's
+   * `canUseTool`, Codex's `approvalPolicy`) so Kai can interpose a per-action
+   * approval prompt mid-turn.  When `false`, tool autonomy is fixed at spawn
+   * time only and the runtime executes tools unsupervised — the UI surfaces an
+   * autonomy warning at runtime-selection time based on this flag.
+   */
+  perActionApproval: boolean;
 };
 
 // ---------------------------------------------------------------------------
