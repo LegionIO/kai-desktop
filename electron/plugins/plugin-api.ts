@@ -41,12 +41,7 @@ import type {
   CookiePromotionConfig,
   SessionCookieInfo,
 } from './types.js';
-import {
-  executeCommand,
-  detectTool,
-  findBinary,
-  SAFE_ENV_VARS,
-} from './sandboxed-exec.js';
+import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandboxed-exec.js';
 import { writeAuditEntry } from './audit-log.js';
 import { resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { AppConfig } from '../config/schema.js';
@@ -109,10 +104,7 @@ function domainMatchesPattern(cookieDomain: string, pattern: string): boolean {
  * Resolves whether a cookie should be promoted and with what TTL.
  * Returns TTL in seconds, or false if the cookie should not be promoted.
  */
-function resolveCookiePromotion(
-  config: CookiePromotionConfig | undefined,
-  cookie: Electron.Cookie,
-): number | false {
+function resolveCookiePromotion(config: CookiePromotionConfig | undefined, cookie: Electron.Cookie): number | false {
   // No config or explicitly false = no promotion
   if (!config) return false;
 
@@ -144,10 +136,7 @@ function resolveCookiePromotion(
  * Configures session cookie promotion for a partition's session.
  * Installs the cookie listener once; subsequent calls update the config.
  */
-function configureSessionCookiePromotion(
-  ses: Electron.Session,
-  config?: CookiePromotionConfig,
-): void {
+function configureSessionCookiePromotion(ses: Electron.Session, config?: CookiePromotionConfig): void {
   const existing = sessionPromotionState.get(ses);
 
   if (existing) {
@@ -173,17 +162,21 @@ function configureSessionCookiePromotion(
     if (ttlSeconds === false) return;
 
     const expirationDate = Math.floor(Date.now() / 1000) + ttlSeconds;
-    ses.cookies.set({
-      url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
-      name: cookie.name,
-      value: cookie.value,
-      domain: cookie.domain,
-      path: cookie.path,
-      secure: cookie.secure,
-      httpOnly: cookie.httpOnly,
-      sameSite: cookie.sameSite,
-      expirationDate,
-    }).catch(() => { /* best-effort — ignore failures */ });
+    ses.cookies
+      .set({
+        url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        sameSite: cookie.sameSite,
+        expirationDate,
+      })
+      .catch(() => {
+        /* best-effort — ignore failures */
+      });
   });
 }
 
@@ -208,9 +201,7 @@ type PluginAPICallbacks = {
 
 function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
   return Boolean(
-    schema
-    && typeof schema === 'object'
-    && typeof (schema as { safeParse?: unknown }).safeParse === 'function',
+    schema && typeof schema === 'object' && typeof (schema as { safeParse?: unknown }).safeParse === 'function',
   );
 }
 
@@ -266,10 +257,7 @@ function normalizeConversationRole(role: PluginConversationAppendMessage['role']
   return role;
 }
 
-function getConversationBranch(
-  tree: StoredConversationMessage[],
-  headId: string | null,
-): StoredConversationMessage[] {
+function getConversationBranch(tree: StoredConversationMessage[], headId: string | null): StoredConversationMessage[] {
   if (!headId) return [];
 
   const byId = new Map(tree.map((message) => [message.id, message] as const));
@@ -286,11 +274,12 @@ function getConversationBranch(
   return branch.reverse();
 }
 
-function ensureConversationTree(
-  conversation: PluginConversationRecord,
-): { tree: StoredConversationMessage[]; headId: string | null } {
+function ensureConversationTree(conversation: PluginConversationRecord): {
+  tree: StoredConversationMessage[];
+  headId: string | null;
+} {
   const rawTree = Array.isArray(conversation.messageTree)
-    ? conversation.messageTree as StoredConversationMessage[]
+    ? (conversation.messageTree as StoredConversationMessage[])
     : null;
 
   if (rawTree && rawTree.length > 0) {
@@ -303,9 +292,10 @@ function ensureConversationTree(
   let parentId: string | null = null;
   const tree = (Array.isArray(conversation.messages) ? conversation.messages : []).map((message, index) => {
     const typed = normalizePluginObject(message) as StoredConversationMessage;
-    const id = typeof typed.id === 'string' && typed.id
-      ? typed.id
-      : `plugin-msg-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+    const id =
+      typeof typed.id === 'string' && typed.id
+        ? typed.id
+        : `plugin-msg-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
     const normalized: StoredConversationMessage = {
       id,
       role: normalizeConversationRole(
@@ -316,9 +306,7 @@ function ensureConversationTree(
       content: (typed.content as MessageContent[] | string | undefined) ?? '',
       parentId,
       createdAt: typeof typed.createdAt === 'string' ? typed.createdAt : new Date().toISOString(),
-      metadata: typed.metadata && typeof typed.metadata === 'object'
-        ? typed.metadata
-        : undefined,
+      metadata: typed.metadata && typeof typed.metadata === 'object' ? typed.metadata : undefined,
     };
     parentId = normalized.id;
     return normalized;
@@ -330,9 +318,7 @@ function ensureConversationTree(
   };
 }
 
-function normalizeConversationRecord(
-  conversation: PluginConversationRecord,
-): PluginConversationRecord {
+function normalizeConversationRecord(conversation: PluginConversationRecord): PluginConversationRecord {
   const { tree, headId } = ensureConversationTree(conversation);
   const branch = getConversationBranch(tree, headId);
 
@@ -350,16 +336,15 @@ function listPermission(instance: PluginInstance): string {
   return instance.manifest.permissions.join(', ') || 'none';
 }
 
-export function createPluginAPI(
-  instance: PluginInstance,
-  callbacks: PluginAPICallbacks,
-): PluginAPI {
+export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICallbacks): PluginAPI {
   const { manifest } = instance;
   let httpServer: Server | null = null;
 
   const requirePermission = (permission: string): void => {
-    if (!manifest.permissions.includes(permission as typeof manifest.permissions[number])) {
-      throw new Error(`Plugin "${manifest.name}" requires permission "${permission}" for this action. Declared: ${listPermission(instance)}`);
+    if (!manifest.permissions.includes(permission as (typeof manifest.permissions)[number])) {
+      throw new Error(
+        `Plugin "${manifest.name}" requires permission "${permission}" for this action. Declared: ${listPermission(instance)}`,
+      );
     }
   };
 
@@ -440,33 +425,35 @@ export function createPluginAPI(
       register: (tools: ToolDefinition[]) => {
         requirePermission('tools:register');
         const seenNames = new Set<string>();
-        const prefixed = tools.map((tool) => normalizePluginTool(tool)).map((tool) => {
-          const originalName = resolvePluginToolOriginalName(manifest.name, tool);
-          let scopedName = buildScopedToolName('plugin', manifest.name, originalName);
+        const prefixed = tools
+          .map((tool) => normalizePluginTool(tool))
+          .map((tool) => {
+            const originalName = resolvePluginToolOriginalName(manifest.name, tool);
+            let scopedName = buildScopedToolName('plugin', manifest.name, originalName);
 
-          // buildScopedToolName already truncates to MAX_TOOL_NAME_LENGTH, but
-          // truncation can cause collisions.  Append a counter to resolve.
-          if (seenNames.has(scopedName)) {
-            let counter = 2;
-            while (seenNames.has(`${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
-            scopedName = `${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
-            console.warn(`[plugin:${manifest.name}] Tool name collision after truncation, resolved: ${originalName} → ${scopedName}`);
-          }
-          seenNames.add(scopedName);
+            // buildScopedToolName already truncates to MAX_TOOL_NAME_LENGTH, but
+            // truncation can cause collisions.  Append a counter to resolve.
+            if (seenNames.has(scopedName)) {
+              let counter = 2;
+              while (seenNames.has(`${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
+              scopedName = `${scopedName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
+              console.warn(
+                `[plugin:${manifest.name}] Tool name collision after truncation, resolved: ${originalName} → ${scopedName}`,
+              );
+            }
+            seenNames.add(scopedName);
 
-          return {
-            ...tool,
-            name: scopedName,
-            source: 'plugin' as const,
-            sourceId: manifest.name,
-            originalName,
-            aliases: Array.from(new Set([
-              ...(tool.aliases ?? []),
-              tool.name,
-              `plugin:${manifest.name}:${originalName}`,
-            ])),
-          };
-        });
+            return {
+              ...tool,
+              name: scopedName,
+              source: 'plugin' as const,
+              sourceId: manifest.name,
+              originalName,
+              aliases: Array.from(
+                new Set([...(tool.aliases ?? []), tool.name, `plugin:${manifest.name}:${originalName}`]),
+              ),
+            };
+          });
         const newNames = new Set(prefixed.map((tool) => tool.name));
         instance.registeredTools = instance.registeredTools.filter((tool) => !newNames.has(tool.name));
         instance.registeredTools.push(...prefixed);
@@ -489,7 +476,7 @@ export function createPluginAPI(
           }),
         );
         instance.registeredTools = instance.registeredTools.filter(
-          (tool) => !fullNames.has(tool.name) && !(tool.aliases?.some((alias) => fullNames.has(alias))),
+          (tool) => !fullNames.has(tool.name) && !tool.aliases?.some((alias) => fullNames.has(alias)),
         );
         callbacks.onToolsChanged();
       },
@@ -559,7 +546,11 @@ export function createPluginAPI(
 
       registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => {
         requirePermission('ui:settings');
-        registerOrReplace(instance.uiSettingsSections, { ...descriptor, component: 'SettingsView', pluginName: manifest.name });
+        registerOrReplace(instance.uiSettingsSections, {
+          ...descriptor,
+          component: 'SettingsView',
+          pluginName: manifest.name,
+        });
       },
 
       registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => {
@@ -708,11 +699,22 @@ export function createPluginAPI(
             }
           };
 
+          const INTERACTIVE_AUTH_TIMEOUT_MS = 300_000;
+
           const revealWindow = () => {
             if (settled || authWin.isDestroyed() || authWin.isVisible()) return;
             wasShown = true;
             authWin.show();
             authWin.focus();
+            // The caller's timeoutMs was a budget for silent/hidden auth. Once the
+            // user is looking at a login form, give them the full interactive
+            // budget instead of cutting them off mid-keystroke.
+            if (timeoutMs < INTERACTIVE_AUTH_TIMEOUT_MS) {
+              clearTimeout(timeout);
+              timeout = setTimeout(() => {
+                settle({ success: false, error: 'Authentication timed out' });
+              }, INTERACTIVE_AUTH_TIMEOUT_MS);
+            }
           };
 
           const settle = (result: PluginAuthResult, closeWindow = true) => {
@@ -722,7 +724,11 @@ export function createPluginAPI(
             clearRevealTimer();
             if (closeWindow) {
               setTimeout(() => {
-                try { if (!authWin.isDestroyed()) authWin.close(); } catch { /* ignore */ }
+                try {
+                  if (!authWin.isDestroyed()) authWin.close();
+                } catch {
+                  /* ignore */
+                }
               }, 500);
             }
             resolve(result);
@@ -732,7 +738,7 @@ export function createPluginAPI(
             revealTimer = setTimeout(revealWindow, showAfterMs);
           }
 
-          const timeout = setTimeout(() => {
+          let timeout = setTimeout(() => {
             settle({ success: false, error: 'Authentication timed out' });
           }, timeoutMs);
 
@@ -740,22 +746,16 @@ export function createPluginAPI(
           if (interceptUrls && interceptUrls.length > 0 && interceptHeader) {
             const targetSession = ses ?? authWin.webContents.session;
             const urlPatterns = interceptUrls;
-            targetSession.webRequest.onBeforeSendHeaders(
-              { urls: urlPatterns },
-              (details, callback) => {
-                const headerValue =
-                  details.requestHeaders[interceptHeader] ??
-                  details.requestHeaders[interceptHeader.toLowerCase()] ??
-                  details.requestHeaders[interceptHeader.charAt(0).toUpperCase() + interceptHeader.slice(1)];
-                if (headerValue && !settled) {
-                  settle(
-                    { success: true, params: { [interceptHeader]: headerValue } },
-                    true,
-                  );
-                }
-                callback({ requestHeaders: details.requestHeaders });
-              },
-            );
+            targetSession.webRequest.onBeforeSendHeaders({ urls: urlPatterns }, (details, callback) => {
+              const headerValue =
+                details.requestHeaders[interceptHeader] ??
+                details.requestHeaders[interceptHeader.toLowerCase()] ??
+                details.requestHeaders[interceptHeader.charAt(0).toUpperCase() + interceptHeader.slice(1)];
+              if (headerValue && !settled) {
+                settle({ success: true, params: { [interceptHeader]: headerValue } }, true);
+              }
+              callback({ requestHeaders: details.requestHeaders });
+            });
           }
 
           // Mode 2: Redirect matching (original behavior)
@@ -777,12 +777,18 @@ export function createPluginAPI(
                 clearTimeout(timeout);
 
                 if (!wasShown) {
-                  try { authWin.close(); } catch { /* ignore */ }
+                  try {
+                    authWin.close();
+                  } catch {
+                    /* ignore */
+                  }
                   resolve({ success: true, params });
                   return;
                 }
 
-                const successHtml = successMessage || `
+                const successHtml =
+                  successMessage ||
+                  `
                   <html>
                   <body style="font-family: system-ui; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: #e0e0e0;">
                     <div style="text-align: center;">
@@ -794,7 +800,11 @@ export function createPluginAPI(
                 `;
                 authWin.loadURL(`data:text/html,${encodeURIComponent(successHtml)}`);
                 setTimeout(() => {
-                  try { authWin.close(); } catch { /* ignore */ }
+                  try {
+                    authWin.close();
+                  } catch {
+                    /* ignore */
+                  }
                 }, 2000);
 
                 resolve({ success: true, params });
@@ -818,7 +828,9 @@ export function createPluginAPI(
                 authWin.webContents.on('will-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
               },
               show: () => revealWindow(),
-              hide: () => { if (!authWin.isDestroyed()) authWin.hide(); },
+              hide: () => {
+                if (!authWin.isDestroyed()) authWin.hide();
+              },
               close: () => settle({ success: false, error: 'Closed by plugin' }),
             };
             onReady(helpers);
@@ -869,14 +881,7 @@ export function createPluginAPI(
     browser: {
       open: (options: PluginBrowserWindowOptions) => {
         requirePermission('browser:window');
-        const {
-          url,
-          title = 'Browser',
-          width = 1280,
-          height = 900,
-          partition,
-          customUserAgent,
-        } = options;
+        const { url, title = 'Browser', width = 1280, height = 900, partition, customUserAgent } = options;
 
         const ses = partition ? session.fromPartition(partition) : undefined;
         if (ses) configureSessionCookiePromotion(ses, options.cookiePromotion);
@@ -1100,9 +1105,9 @@ export function createPluginAPI(
           webContents.setWindowOpenHandler(({ url: newUrl }) => {
             if (newUrl && newUrl !== 'about:blank') {
               // Send the URL to the chrome page to open as a new tab
-              browserWin.webContents.executeJavaScript(
-                `typeof createTab === 'function' && createTab(${JSON.stringify(newUrl)})`
-              ).catch(() => {});
+              browserWin.webContents
+                .executeJavaScript(`typeof createTab === 'function' && createTab(${JSON.stringify(newUrl)})`)
+                .catch(() => {});
             }
             return { action: 'deny' };
           });
@@ -1245,7 +1250,9 @@ export function createPluginAPI(
       unregisterInferenceProvider: () => {
         requirePermission('agent:inference-provider');
         if (instance.inferenceProvider) {
-          console.info(`[PluginAPI:${manifest.name}] Unregistered inference provider: ${instance.inferenceProvider.name}`);
+          console.info(
+            `[PluginAPI:${manifest.name}] Unregistered inference provider: ${instance.inferenceProvider.name}`,
+          );
           instance.inferenceProvider = null;
         }
       },
@@ -1287,7 +1294,14 @@ export function createPluginAPI(
         requirePermission('exec:whitelisted');
         const execScope = manifest.execScope;
         if (!execScope) {
-          return { exitCode: -1, stdout: '', stderr: 'No execScope declared in plugin.json', command: request.binary, durationMs: 0, truncated: false };
+          return {
+            exitCode: -1,
+            stdout: '',
+            stderr: 'No execScope declared in plugin.json',
+            command: request.binary,
+            durationMs: 0,
+            truncated: false,
+          };
         }
         return executeCommand(request, execScope, manifest.name, writeAuditEntry);
       },
@@ -1301,13 +1315,34 @@ export function createPluginAPI(
     // ─── Tool Detection ─────────────────────────────────────────────────
 
     detect: {
-      claudeCode: () => { requirePermission('tools:detect'); return detectTool('claude'); },
-      codex:      () => { requirePermission('tools:detect'); return detectTool('codex'); },
-      python:     () => { requirePermission('tools:detect'); return detectTool('python3'); },
-      node:       () => { requirePermission('tools:detect'); return detectTool('node'); },
-      git:        () => { requirePermission('tools:detect'); return detectTool('git'); },
-      pip:        () => { requirePermission('tools:detect'); return detectTool('pip3'); },
-      binary: (name: AllowedBinary) => { requirePermission('tools:detect'); return detectTool(name); },
+      claudeCode: () => {
+        requirePermission('tools:detect');
+        return detectTool('claude');
+      },
+      codex: () => {
+        requirePermission('tools:detect');
+        return detectTool('codex');
+      },
+      python: () => {
+        requirePermission('tools:detect');
+        return detectTool('python3');
+      },
+      node: () => {
+        requirePermission('tools:detect');
+        return detectTool('node');
+      },
+      git: () => {
+        requirePermission('tools:detect');
+        return detectTool('git');
+      },
+      pip: () => {
+        requirePermission('tools:detect');
+        return detectTool('pip3');
+      },
+      binary: (name: AllowedBinary) => {
+        requirePermission('tools:detect');
+        return detectTool(name);
+      },
 
       claudePlugin: async (pluginName: string) => {
         requirePermission('tools:detect');
@@ -1348,8 +1383,14 @@ export function createPluginAPI(
     // ─── Safe Environment Access ────────────────────────────────────────
 
     env: {
-      home:     () => { requirePermission('system:env'); return homedir(); },
-      platform: () => { requirePermission('system:env'); return process.platform; },
+      home: () => {
+        requirePermission('system:env');
+        return homedir();
+      },
+      platform: () => {
+        requirePermission('system:env');
+        return process.platform;
+      },
       get: (name: string) => {
         requirePermission('system:env');
         if (!SAFE_ENV_VARS.has(name)) return undefined;
@@ -1378,7 +1419,7 @@ export function createPluginAPI(
     requirePermission('conversations:write');
     const store = readConversationStore(callbacks.appHome);
     const normalizedConversation = normalizeConversationRecord(conversation);
-    store.conversations[conversation.id] = normalizedConversation as unknown as typeof store.conversations[string];
+    store.conversations[conversation.id] = normalizedConversation as unknown as (typeof store.conversations)[string];
     writeConversationStore(callbacks.appHome, store);
     broadcastConversationChange(store);
   };
@@ -1405,9 +1446,8 @@ export function createPluginAPI(
     const next = normalizePluginObject(conversation) as PluginConversationRecord;
     const { tree, headId } = ensureConversationTree(next);
     const messageId = `plugin-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const normalizedContent = typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : message.content;
+    const normalizedContent =
+      typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
     const createdAt = message.createdAt ?? new Date().toISOString();
     const normalizedRole = normalizeConversationRole(message.role);
 
