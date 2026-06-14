@@ -29,6 +29,7 @@ export type StubRuntimeCapabilities = {
   subAgents: boolean;
   sessions: boolean;
   customTools: boolean;
+  perActionApproval: boolean;
 };
 
 const DEFAULT_CAPABILITIES: StubRuntimeCapabilities = {
@@ -42,6 +43,7 @@ const DEFAULT_CAPABILITIES: StubRuntimeCapabilities = {
   subAgents: false,
   sessions: false,
   customTools: false,
+  perActionApproval: true,
 };
 
 // ---------------------------------------------------------------------------

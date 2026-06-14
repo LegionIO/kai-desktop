@@ -132,9 +132,23 @@ export async function resolveRuntimeForStream(
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }>
+  Array<{
+    id: string;
+    name: string;
+    available: boolean;
+    reason?: string;
+    description?: string;
+    perActionApproval?: boolean;
+  }>
 > {
-  const results: Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }> = [];
+  const results: Array<{
+    id: string;
+    name: string;
+    available: boolean;
+    reason?: string;
+    description?: string;
+    perActionApproval?: boolean;
+  }> = [];
 
   for (const [, runtime] of runtimes) {
     const available = await runtime.isAvailable();
@@ -142,13 +156,16 @@ export async function getAvailableRuntimes(): Promise<
       id: runtime.id,
       name: runtime.name,
       available,
+      perActionApproval: runtime.capabilities.perActionApproval,
       reason: available
         ? undefined
         : runtime.id === 'claude-agent-sdk'
           ? 'Claude Code CLI not found on PATH'
           : runtime.id === 'codex-sdk'
             ? 'Codex CLI not found on PATH'
-            : undefined,
+            : runtime.id === 'pi'
+              ? 'pi CLI not found on PATH'
+              : undefined,
     });
   }
 

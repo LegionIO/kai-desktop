@@ -58,7 +58,7 @@ export class TaskTerminalManager {
     const pty = await import('@lydell/node-pty');
 
     // Validate runtime against allowlist
-    const ALLOWED_RUNTIMES = ['claude-code', 'codex', 'mastra'];
+    const ALLOWED_RUNTIMES = ['claude-code', 'codex', 'pi', 'mastra'];
     const runtime = ALLOWED_RUNTIMES.includes(options.runtime) ? options.runtime : 'shell';
 
     const sessionId = randomUUID();
@@ -184,6 +184,13 @@ export class TaskTerminalManager {
         return {
           command: 'codex',
           args: [...(dangerousMode ? ['--dangerously-bypass-approvals-and-sandbox'] : []), ...(customArgs ?? [])],
+        };
+      case 'pi':
+        // pi has no approval/sandbox flag to bypass — its interactive TUI is the
+        // human-in-the-loop, so `dangerousMode` is a no-op here. Launch pi directly.
+        return {
+          command: 'pi',
+          args: [...(customArgs ?? [])],
         };
       case 'mastra':
         // Mastra as a terminal agent: use the shell and let the task description

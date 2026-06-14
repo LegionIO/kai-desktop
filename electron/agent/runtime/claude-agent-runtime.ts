@@ -42,7 +42,9 @@ function debugLog(msg: string): void {
   try {
     mkdirSync(DEBUG_DIR, { recursive: true });
     appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 // ---------------------------------------------------------------------------
 
@@ -50,16 +52,17 @@ function debugLog(msg: string): void {
 const SKIP_TOOLS = new Set(['sub_agent']);
 
 const CLAUDE_CAPABILITIES: RuntimeCapabilities = {
-  builtInTools: true,   // SDK has its own built-in tools (Read, Write, Bash, etc.)
-  mcpSupport: true,     // SDK supports MCP natively
-  toolObserver: false,  // SDK manages its own tool lifecycle
-  compaction: false,    // SDK manages context internally
-  memory: false,        // SDK uses sessions, not Kai memory layers
-  fallback: true,       // SDK supports fallbackModel option
-  multiProvider: true,  // Anthropic + Bedrock + Vertex
-  subAgents: true,      // SDK has native Agent tool
-  sessions: true,       // SDK supports session resume
-  customTools: true,    // Via MCP bridge
+  builtInTools: true, // SDK has its own built-in tools (Read, Write, Bash, etc.)
+  mcpSupport: true, // SDK supports MCP natively
+  toolObserver: false, // SDK manages its own tool lifecycle
+  compaction: false, // SDK manages context internally
+  memory: false, // SDK uses sessions, not Kai memory layers
+  fallback: true, // SDK supports fallbackModel option
+  multiProvider: true, // Anthropic + Bedrock + Vertex
+  subAgents: true, // SDK has native Agent tool
+  sessions: true, // SDK supports session resume
+  customTools: true, // Via MCP bridge
+  perActionApproval: true, // SDK canUseTool callback gates actions
 };
 
 // ---------------------------------------------------------------------------
@@ -92,7 +95,10 @@ type SdkOptions = {
   sessionId?: string;
   persistSession?: boolean;
   env?: Record<string, string | undefined>;
-  systemPrompt?: string | string[] | { type: 'preset'; preset: 'claude_code'; append?: string; excludeDynamicSections?: boolean };
+  systemPrompt?:
+    | string
+    | string[]
+    | { type: 'preset'; preset: 'claude_code'; append?: string; excludeDynamicSections?: boolean };
   pathToClaudeCodeExecutable?: string;
 };
 
@@ -127,22 +133,23 @@ export class ClaudeAgentRuntime implements AgentRuntime {
   }
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
-    const {
-      conversationId,
-      config,
-      tools,
-      cwd,
-      reasoningEffort,
-      abortSignal,
-    } = options;
+    const { conversationId, config, tools, cwd, reasoningEffort, abortSignal } = options;
 
     // -----------------------------------------------------------------------
     // 1. Dynamic SDK import
     // -----------------------------------------------------------------------
     type SdkUserMessageInput = { type: 'user'; message: { role: 'user'; content: unknown }; parent_tool_use_id: null };
-    type SdkQueryFn = (params: { prompt: string | AsyncIterable<SdkUserMessageInput>; options?: SdkOptions }) => AsyncGenerator<SdkMessageAny, void>;
+    type SdkQueryFn = (params: {
+      prompt: string | AsyncIterable<SdkUserMessageInput>;
+      options?: SdkOptions;
+    }) => AsyncGenerator<SdkMessageAny, void>;
     type SdkCreateMcpServerFn = (opts: { name: string; version?: string; tools?: unknown[] }) => unknown;
-    type SdkToolFn = (name: string, desc: string, schema: Record<string, unknown>, handler: (args: unknown, extra: unknown) => Promise<CallToolResult>) => unknown;
+    type SdkToolFn = (
+      name: string,
+      desc: string,
+      schema: Record<string, unknown>,
+      handler: (args: unknown, extra: unknown) => Promise<CallToolResult>,
+    ) => unknown;
 
     let sdkQuery: SdkQueryFn;
     let sdkCreateMcpServer: SdkCreateMcpServerFn;
@@ -168,12 +175,14 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // options.streamConfig carries the user's model selection from the IPC layer.
     // The fallback re-resolves with defaults only when streamConfig is absent.
-    const streamConfig = options.streamConfig ?? resolveStreamConfig(config, {
-      threadModelKey: null,
-      threadProfileKey: null,
-      reasoningEffort,
-      fallbackEnabled: false,
-    });
+    const streamConfig =
+      options.streamConfig ??
+      resolveStreamConfig(config, {
+        threadModelKey: null,
+        threadProfileKey: null,
+        reasoningEffort,
+        fallbackEnabled: false,
+      });
 
     // Assemble system prompt (appended to Claude Code's default prompt)
     const basePrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
@@ -202,9 +211,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         const usedNames = new Set<string>();
 
         const sdkTools = bridgeableTools.map((t) => {
-          let safeName = t.name.length > MAX_TOOL_NAME_LENGTH
-            ? t.name.slice(0, MAX_TOOL_NAME_LENGTH)
-            : t.name;
+          let safeName = t.name.length > MAX_TOOL_NAME_LENGTH ? t.name.slice(0, MAX_TOOL_NAME_LENGTH) : t.name;
           // Resolve collisions from truncation by appending a counter
           if (usedNames.has(safeName)) {
             let counter = 2;
@@ -231,10 +238,14 @@ export class ClaudeAgentRuntime implements AgentRuntime {
           tools: sdkTools,
         });
 
-        mcpServers = { 'kai': kaiServer };
-        debugLog(`[BRIDGE] Created MCP bridge with ${sdkTools.length} tools: ${bridgeableTools.map((t) => t.name).join(', ')}`);
+        mcpServers = { kai: kaiServer };
+        debugLog(
+          `[BRIDGE] Created MCP bridge with ${sdkTools.length} tools: ${bridgeableTools.map((t) => t.name).join(', ')}`,
+        );
       } catch (bridgeErr) {
-        debugLog(`[BRIDGE] Failed to create MCP bridge: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`);
+        debugLog(
+          `[BRIDGE] Failed to create MCP bridge: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`,
+        );
         // Non-fatal — SDK can still work with its built-in tools only
       }
     }
@@ -285,8 +296,8 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // If the content is purely text, send a plain string (simpler + more
     // compatible with session-resume flows). Otherwise send a structured
     // SDKUserMessage so image blocks reach the model intact.
-    const hasImages = Array.isArray(lastUserContent)
-      && lastUserContent.some((b: { type: string }) => b.type === 'image');
+    const hasImages =
+      Array.isArray(lastUserContent) && lastUserContent.some((b: { type: string }) => b.type === 'image');
 
     // When cross-runtime switch context is present, prepend it to the user prompt
     // so it's visible as direct conversation context (not buried in system prompt).
@@ -300,12 +311,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
             parent_tool_use_id: null,
           };
         })()
-      : (typeof lastUserContent === 'string'
-          ? `${switchPrefix}${lastUserContent}`
-          : `${switchPrefix}${(lastUserContent as Array<{ type: string; text?: string }>)
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text ?? '')
-              .join('\n')}`);
+      : typeof lastUserContent === 'string'
+        ? `${switchPrefix}${lastUserContent}`
+        : `${switchPrefix}${(lastUserContent as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === 'text')
+            .map((b) => b.text ?? '')
+            .join('\n')}`;
 
     if (!prompt && !hasImages) {
       yield {
@@ -355,9 +366,13 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // rather than silently falling back to ~/.claude/settings.json.
     const auth = options.modelAuth ?? null;
 
-    debugLog(`[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`);
+    debugLog(
+      `[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`,
+    );
     debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(`[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`);
+    debugLog(
+      `[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`,
+    );
 
     const sdkOptions: SdkOptions = {
       abortController,
@@ -377,19 +392,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       persistSession: true,
       // Use specific Claude Code tools — SDK's built-in file/code tools.
       // Kai's custom tools are available via the MCP bridge above.
-      tools: [
-        'Read',
-        'Write',
-        'Edit',
-        'Bash',
-        'Glob',
-        'Grep',
-        'LSP',
-        'WebFetch',
-        'WebSearch',
-        'Agent',
-        'Monitor',
-      ],
+      tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch', 'Agent', 'Monitor'],
       // Expose Kai's custom tools via in-process MCP server
       ...(mcpServers ? { mcpServers } : {}),
       // Pass Kai's system prompt appended to Claude Code's default.
@@ -402,14 +405,16 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         : { type: 'preset', preset: 'claude_code', excludeDynamicSections: true },
       // Override the SDK's default auth when Kai provides explicit credentials.
       // This uses the "flag settings" layer which has highest priority.
-      ...(auth?.baseUrl || auth?.apiKey ? {
-        settings: {
-          env: {
-            ...(auth.baseUrl ? { ANTHROPIC_BASE_URL: auth.baseUrl } : {}),
-            ...(auth.apiKey ? { ANTHROPIC_AUTH_TOKEN: auth.apiKey } : {}),
-          },
-        },
-      } : {}),
+      ...(auth?.baseUrl || auth?.apiKey
+        ? {
+            settings: {
+              env: {
+                ...(auth.baseUrl ? { ANTHROPIC_BASE_URL: auth.baseUrl } : {}),
+                ...(auth.apiKey ? { ANTHROPIC_AUTH_TOKEN: auth.apiKey } : {}),
+              },
+            },
+          }
+        : {}),
       // Resume previous session for conversation continuity
       ...(existingSessionId ? { resume: existingSessionId } : {}),
       // Fall back to system-installed CLI when bundled binary is missing
@@ -435,14 +440,16 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         msgCount++;
         // Log every raw SDK message (truncate large ones)
         const rawJson = JSON.stringify(msg);
-        debugLog(`[MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`);
+        debugLog(
+          `[MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
+        );
 
         // Detect session resume failure — retry without resume
         if (
           existingSessionId &&
           msg.type === 'result' &&
           msg.subtype === 'error_during_execution' &&
-          msgCount <= 2  // Error on first real message = resume failed
+          msgCount <= 2 // Error on first real message = resume failed
         ) {
           const rawStr = JSON.stringify(msg);
           if (rawStr.includes('No conversation found with session ID')) {
@@ -461,7 +468,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         }
 
         const events = translateSdkMessage(conversationId, msg);
-        debugLog(`[TRANSLATE] ${events.length} events: ${events.map(e => e.type).join(', ')}`);
+        debugLog(`[TRANSLATE] ${events.length} events: ${events.map((e) => e.type).join(', ')}`);
         for (const event of events) {
           yield event;
         }
@@ -473,14 +480,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         yield { conversationId, type: 'done' };
       }
     } catch (err) {
-      debugLog(`[ERROR] ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      debugLog(`[ERROR] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
 
       // Session resume failure can also throw — detect and retry
-      if (
-        existingSessionId &&
-        err instanceof Error &&
-        err.message.includes('No conversation found with session ID')
-      ) {
+      if (existingSessionId && err instanceof Error && err.message.includes('No conversation found with session ID')) {
         debugLog(`[SESSION] Resume threw — will retry without resume`);
         this.sessionMap.delete(conversationId);
         retryWithoutResume = true;
@@ -521,7 +524,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
           msgCount++;
           const rawJson = JSON.stringify(msg);
-          debugLog(`[RETRY-MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`);
+          debugLog(
+            `[RETRY-MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
+          );
 
           // Capture new session ID
           const msgSessionId = (msg as { session_id?: string }).session_id;
@@ -539,7 +544,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         debugLog(`[RETRY] Finished after ${msgCount} messages`);
         yield { conversationId, type: 'done' };
       } catch (retryErr) {
-        debugLog(`[RETRY-ERROR] ${retryErr instanceof Error ? retryErr.stack ?? retryErr.message : String(retryErr)}`);
+        debugLog(
+          `[RETRY-ERROR] ${retryErr instanceof Error ? (retryErr.stack ?? retryErr.message) : String(retryErr)}`,
+        );
         if (!abortSignal?.aborted) {
           yield {
             conversationId,
@@ -552,10 +559,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     }
   }
 
-  async generateTitle(
-    _messages: unknown[],
-    _config: AppConfig,
-  ): Promise<string | null> {
+  async generateTitle(_messages: unknown[], _config: AppConfig): Promise<string | null> {
     // Let the IPC layer handle title generation for now
     return null;
   }
@@ -577,9 +581,7 @@ type AnthropicContentBlock =
  * Extract the last user message and return it as Anthropic content blocks,
  * preserving image parts so vision models can see attached screenshots.
  */
-function extractLastUserContent(
-  messages: unknown[],
-): string | AnthropicContentBlock[] | null {
+function extractLastUserContent(messages: unknown[]): string | AnthropicContentBlock[] | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as { role?: string; content?: unknown } | undefined;
     if (!msg || msg.role !== 'user') continue;
@@ -653,10 +655,7 @@ function rewriteSdkError(text: string): string {
       /Run --model to pick a different model\.?/gi,
       'Try selecting a different model in the model picker, or check that your provider endpoint and API key are configured correctly in Settings → Model Providers.',
     )
-    .replace(
-      /Run `claude login`[^.]*/gi,
-      'Check your API key in Settings → Model Providers.',
-    );
+    .replace(/Run `claude login`[^.]*/gi, 'Check your API key in Settings → Model Providers.');
 }
 
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
@@ -667,12 +666,14 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // Streaming text deltas (partial assistant messages)
     // ---------------------------------------------------------------
     case 'stream_event': {
-      const event = msg.event as {
-        type?: string;
-        delta?: { type?: string; text?: string };
-        content_block?: { type?: string; id?: string; name?: string; input?: unknown };
-        index?: number;
-      } | undefined;
+      const event = msg.event as
+        | {
+            type?: string;
+            delta?: { type?: string; text?: string };
+            content_block?: { type?: string; id?: string; name?: string; input?: unknown };
+            index?: number;
+          }
+        | undefined;
       if (!event) {
         debugLog(`[STREAM_EVENT] No event field in msg. keys=${Object.keys(msg).join(',')}`);
         break;
@@ -680,7 +681,9 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
 
       // Log non-text-delta events (text deltas are too noisy)
       if (event.type !== 'content_block_delta' || event.delta?.type !== 'text_delta') {
-        debugLog(`[STREAM_EVENT] event.type=${event.type} delta.type=${event.delta?.type ?? 'none'} block.type=${event.content_block?.type ?? 'none'}`);
+        debugLog(
+          `[STREAM_EVENT] event.type=${event.type} delta.type=${event.delta?.type ?? 'none'} block.type=${event.content_block?.type ?? 'none'}`,
+        );
       }
 
       // content_block_delta with text
@@ -717,23 +720,32 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // Full assistant message (contains complete content blocks)
     // ---------------------------------------------------------------
     case 'assistant': {
-      const betaMessage = msg.message as {
-        content?: Array<{
-          type: string;
-          id?: string;
-          text?: string;
-          name?: string;
-          input?: unknown;
-        }>;
-        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-      } | undefined;
+      const betaMessage = msg.message as
+        | {
+            content?: Array<{
+              type: string;
+              id?: string;
+              text?: string;
+              name?: string;
+              input?: unknown;
+            }>;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+            };
+          }
+        | undefined;
 
       if (!betaMessage?.content) {
         debugLog(`[ASSISTANT] No content in message. msg keys: ${Object.keys(msg).join(',')}`);
         break;
       }
 
-      debugLog(`[ASSISTANT] ${betaMessage.content.length} blocks: ${betaMessage.content.map(b => `${b.type}${b.text ? '(text=' + b.text.slice(0, 80) + ')' : ''}`).join(', ')}`);
+      debugLog(
+        `[ASSISTANT] ${betaMessage.content.length} blocks: ${betaMessage.content.map((b) => `${b.type}${b.text ? '(text=' + b.text.slice(0, 80) + ')' : ''}`).join(', ')}`,
+      );
 
       for (const block of betaMessage.content) {
         if (block.type === 'tool_use') {
@@ -753,7 +765,8 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
       // Emit usage from the assistant message
       if (betaMessage.usage) {
         const u = betaMessage.usage;
-        const inputTokens = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+        const inputTokens =
+          (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
         const outputTokens = u.output_tokens ?? 0;
         events.push({
           conversationId,
@@ -793,16 +806,21 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // Result (success or error)
     // ---------------------------------------------------------------
     case 'result': {
-      debugLog(`[RESULT] subtype=${msg.subtype} result_type=${typeof msg.result} result=${JSON.stringify(msg.result ?? null).slice(0, 300)} structured_output=${JSON.stringify(msg.structured_output ?? null).slice(0, 300)}`);
-      const usage = msg.usage as {
-        input_tokens?: number;
-        output_tokens?: number;
-        cache_read_input_tokens?: number;
-        cache_creation_input_tokens?: number;
-      } | undefined;
+      debugLog(
+        `[RESULT] subtype=${msg.subtype} result_type=${typeof msg.result} result=${JSON.stringify(msg.result ?? null).slice(0, 300)} structured_output=${JSON.stringify(msg.structured_output ?? null).slice(0, 300)}`,
+      );
+      const usage = msg.usage as
+        | {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+          }
+        | undefined;
 
       if (usage) {
-        const inputTokens = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+        const inputTokens =
+          (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
         const outputTokens = usage.output_tokens ?? 0;
         events.push({
           conversationId,
@@ -818,7 +836,11 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
         });
       }
 
-      if (msg.subtype === 'error_during_execution' || msg.subtype === 'error_max_turns' || msg.subtype === 'error_max_budget_usd') {
+      if (
+        msg.subtype === 'error_during_execution' ||
+        msg.subtype === 'error_max_turns' ||
+        msg.subtype === 'error_max_budget_usd'
+      ) {
         const errors = msg.errors as string[] | undefined;
         const rawError = errors?.join('; ') ?? `SDK error: ${msg.subtype}`;
         events.push({
@@ -837,9 +859,8 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           events.push({
             conversationId,
             type: 'text-delta',
-            text: typeof msg.structured_output === 'string'
-              ? msg.structured_output
-              : JSON.stringify(msg.structured_output),
+            text:
+              typeof msg.structured_output === 'string' ? msg.structured_output : JSON.stringify(msg.structured_output),
           });
         }
       }
@@ -871,11 +892,13 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
 
       // Compact boundary — let the UI know context was compacted
       if (msg.subtype === 'compact_boundary') {
-        const metadata = msg.compact_metadata as {
-          pre_tokens?: number;
-          post_tokens?: number;
-          duration_ms?: number;
-        } | undefined;
+        const metadata = msg.compact_metadata as
+          | {
+              pre_tokens?: number;
+              post_tokens?: number;
+              duration_ms?: number;
+            }
+          | undefined;
         events.push({
           conversationId,
           type: 'compaction',
@@ -895,14 +918,16 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // We translate these to tool-result events so the UI can show completion.
     // ---------------------------------------------------------------
     case 'user': {
-      const userMessage = msg.message as {
-        content?: Array<{
-          type: string;
-          tool_use_id?: string;
-          content?: string;
-          is_error?: boolean;
-        }>;
-      } | undefined;
+      const userMessage = msg.message as
+        | {
+            content?: Array<{
+              type: string;
+              tool_use_id?: string;
+              content?: string;
+              is_error?: boolean;
+            }>;
+          }
+        | undefined;
 
       if (!userMessage?.content) break;
 
@@ -913,16 +938,16 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           const resultText = block.content ?? '';
           const isError = block.is_error === true;
 
-          debugLog(`[TOOL_RESULT] toolUseId=${block.tool_use_id} isError=${isError} result=${resultText.slice(0, 200)}`);
+          debugLog(
+            `[TOOL_RESULT] toolUseId=${block.tool_use_id} isError=${isError} result=${resultText.slice(0, 200)}`,
+          );
 
           events.push({
             conversationId,
             type: 'tool-result',
             toolCallId: block.tool_use_id,
             toolName: '', // SDK doesn't include tool name in result; UI can match by toolCallId
-            result: isError
-              ? { isError: true, error: resultText }
-              : resultText,
+            result: isError ? { isError: true, error: resultText } : resultText,
             finishedAt,
           });
         }
@@ -949,7 +974,9 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // Other message types (user_replay, auth_status, etc.) are
     // informational and don't need translation to StreamEvent.
     default:
-      debugLog(`[TRANSLATE-SKIP] Unhandled msg type=${msg.type} subtype=${msg.subtype ?? 'none'} keys=${Object.keys(msg).join(',')}`);
+      debugLog(
+        `[TRANSLATE-SKIP] Unhandled msg type=${msg.type} subtype=${msg.subtype ?? 'none'} keys=${Object.keys(msg).join(',')}`,
+      );
       break;
   }
 
@@ -968,7 +995,13 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
  */
 function extractZodShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
   // z.object() has a .shape property containing { key: ZodType }
-  if (schema && typeof schema === 'object' && 'shape' in schema && typeof schema.shape === 'object' && schema.shape !== null) {
+  if (
+    schema &&
+    typeof schema === 'object' &&
+    'shape' in schema &&
+    typeof schema.shape === 'object' &&
+    schema.shape !== null
+  ) {
     return schema.shape as Record<string, z.ZodTypeAny>;
   }
   // Fallback for non-object schemas — wrap in a single-key object
@@ -1068,7 +1101,9 @@ function createAskUserHandler(
     const answers = pendingQuestionAnswers.get(toolCallId);
     pendingQuestionAnswers.delete(toolCallId);
 
-    debugLog(`[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`);
+    debugLog(
+      `[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`,
+    );
 
     return {
       content: [{ type: 'text', text: JSON.stringify({ success: true, answers: answers ?? {} }) }],
@@ -1125,9 +1160,15 @@ function createExitPlanModeHandler(
     if (approved !== true) {
       debugLog(`[EXIT_PLAN_MODE] User rejected plan toolCallId=${toolCallId}`);
       return {
-        content: [{ type: 'text', text: JSON.stringify({
-          error: 'User rejected the plan. Continue planning — refine the approach based on the user\'s feedback and call exit_plan_mode again when ready.',
-        }) }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error:
+                "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
+            }),
+          },
+        ],
         isError: true,
       };
     }
