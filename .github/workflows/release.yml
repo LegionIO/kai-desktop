@@ -135,6 +135,23 @@ jobs:
 
       - run: pnpm build:mac
 
+      - name: Verify update zip preserves framework symlinks
+        run: |
+          ZIP_PATH="$(find dist -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          if [ -z "$ZIP_PATH" ]; then
+            echo "ERROR: No update zip found in dist/" >&2
+            exit 1
+          fi
+          # Squirrel.Mac requires Electron's .framework bundles to keep their
+          # Versions/Current → A symlinks. A 7za variant that follows symlinks
+          # produces a zip that fails with "bundle format is ambiguous".
+          if ! zipinfo "$ZIP_PATH" | grep -q '^l'; then
+            echo "ERROR: $ZIP_PATH contains no symlink entries — auto-update will fail." >&2
+            zipinfo "$ZIP_PATH" '*/Frameworks/Squirrel.framework/*' >&2 || true
+            exit 1
+          fi
+          echo "✓ $(basename "$ZIP_PATH") has $(zipinfo "$ZIP_PATH" | grep -c '^l') symlink entries"
+
       - name: Verify Swift helper binary
         run: |
           APP_PATH="$(find dist/mac-arm64 -maxdepth 1 -name '*.app' -type d | head -n 1)"

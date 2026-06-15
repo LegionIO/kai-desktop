@@ -2,8 +2,9 @@ import { app, dialog, type IpcMain } from 'electron';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
-import { existsSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
@@ -33,7 +34,9 @@ if (isUpdateTestMode) {
   // Reuse the SemVer constructor from the existing currentVersion instance
   // so we get a real SemVer object without importing semver directly
   // (pnpm doesn't hoist it).
-  const SemVer = (autoUpdater.currentVersion as unknown as { constructor: new (v: string) => typeof autoUpdater.currentVersion }).constructor;
+  const SemVer = (
+    autoUpdater.currentVersion as unknown as { constructor: new (v: string) => typeof autoUpdater.currentVersion }
+  ).constructor;
   (autoUpdater as { currentVersion: typeof autoUpdater.currentVersion }).currentVersion = new SemVer(DEV_TEST_VERSION!);
 }
 
@@ -53,7 +56,10 @@ function broadcast(status: UpdateStatus): void {
 /* ── Plugin Lifecycle Hook Runner ── */
 
 export type UpdateHookRunner = {
-  runPreUpdateHooks: (args: { version: string; artifactPath: string }) => Promise<{ abort?: boolean; abortReason?: string }>;
+  runPreUpdateHooks: (args: {
+    version: string;
+    artifactPath: string;
+  }) => Promise<{ abort?: boolean; abortReason?: string }>;
   runPostUpdateHooks: (args: { version: string; success: boolean }) => Promise<void>;
 };
 
@@ -69,12 +75,17 @@ const POST_UPDATE_MARKER = join(app.getPath('userData'), '.update-completed');
 
 function writePostUpdateMarker(version: string): void {
   try {
-    writeFileSync(POST_UPDATE_MARKER, JSON.stringify({
-      version,
-      fromVersion: app.getVersion(),
-      timestamp: Date.now(),
-    }));
-  } catch { /* non-fatal */ }
+    writeFileSync(
+      POST_UPDATE_MARKER,
+      JSON.stringify({
+        version,
+        fromVersion: app.getVersion(),
+        timestamp: Date.now(),
+      }),
+    );
+  } catch {
+    /* non-fatal */
+  }
 }
 
 /**
@@ -89,7 +100,11 @@ export function consumePostUpdateMarker(): { version: string; fromVersion: strin
     unlinkSync(POST_UPDATE_MARKER);
     return data;
   } catch {
-    try { unlinkSync(POST_UPDATE_MARKER); } catch { /* */ }
+    try {
+      unlinkSync(POST_UPDATE_MARKER);
+    } catch {
+      /* */
+    }
     return null;
   }
 }
@@ -150,19 +165,22 @@ export function checkForUpdatesInteractive(): void {
 
   // If an update was already downloaded, skip the check and offer install
   if (downloaded) {
-    dialog.showMessageBox({
-      type: 'info',
-      title: 'Update Ready',
-      message: `A new version of ${__BRAND_PRODUCT_NAME} is ready to install.`,
-      detail: `${__BRAND_PRODUCT_NAME} ${downloadedVersion ?? ''} has been downloaded. Would you like to restart now to finish updating?`.trim(),
-      buttons: ['Restart Now', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
-    }).then(({ response }) => {
-      if (response === 0) {
-        void performQuitAndInstall();
-      }
-    });
+    dialog
+      .showMessageBox({
+        type: 'info',
+        title: 'Update Ready',
+        message: `A new version of ${__BRAND_PRODUCT_NAME} is ready to install.`,
+        detail:
+          `${__BRAND_PRODUCT_NAME} ${downloadedVersion ?? ''} has been downloaded. Would you like to restart now to finish updating?`.trim(),
+        buttons: ['Restart Now', 'Later'],
+        defaultId: 0,
+        cancelId: 1,
+      })
+      .then(({ response }) => {
+        if (response === 0) {
+          void performQuitAndInstall();
+        }
+      });
     return;
   }
 
@@ -217,10 +235,7 @@ let downloadedVersion: string | undefined;
 let downloadedFilePath: string | undefined;
 let pendingVersion: string | undefined;
 
-export function registerAutoUpdateHandlers(
-  ipcMain: IpcMain,
-  onUpdateDownloaded?: () => void,
-): void {
+export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?: () => void): void {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
@@ -261,6 +276,19 @@ export function registerAutoUpdateHandlers(
   });
   autoUpdater.on('error', (err) => {
     console.error('[auto-update] Error:', err.message);
+    // Squirrel.Mac leaves the extracted bundle in ~/Library/Caches/<appId>.ShipIt
+    // when validation fails (e.g. a published zip with dereferenced framework
+    // symlinks). Every subsequent check then re-fails on that stale extract
+    // before it even re-downloads. Clear it so a fixed release can land.
+    if (process.platform === 'darwin' && /SQRL|Code signature|ShipIt/i.test(err.message)) {
+      const shipItCache = join(homedir(), 'Library', 'Caches', `${__BRAND_APP_ID}.ShipIt`);
+      try {
+        rmSync(shipItCache, { recursive: true, force: true });
+        console.info('[auto-update] Cleared stale ShipIt cache:', shipItCache);
+      } catch {
+        /* non-fatal */
+      }
+    }
     if (!downloaded) broadcast({ state: 'idle' });
   });
 
