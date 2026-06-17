@@ -95,7 +95,12 @@ jobs:
             //           the base branch from a previous workflow run.
             //           Graceful degradation: any failure here just means
             //           the comment shows "no baseline available".
+            //
+            //           We capture both `baseline` (the `.total` aggregate
+            //           used by the project-wide table) and `baselineSummary`
+            //           (the full per-file map used by the erosion alert).
             let baseline = null;
+            let baselineSummary = null;
             let baselineSource = 'none';
             try {
               const { owner, repo } = context.repo;
@@ -133,6 +138,7 @@ jobs:
                   if (fs.existsSync(baseSummaryPath)) {
                     const baseSummary = JSON.parse(fs.readFileSync(baseSummaryPath, 'utf8'));
                     baseline = (baseSummary && baseSummary.total) || null;
+                    baselineSummary = baseSummary || null;
                     baselineSource = `run #${run.run_number} on ${baseRef}`;
                   }
                 }
@@ -141,26 +147,74 @@ jobs:
               core.warning(`Baseline lookup failed (graceful degradation): ${err.message}`);
             }
 
-            // ── Step 3: identify changed files for the per-file breakdown.
+            // ── Step 3: identify changed files for the per-file breakdown
+            //           AND the erosion alert.
+            //
             //           BASE_SHA and HEAD_SHA come from env, never inlined
-            //           into a shell. We use execFileSync so even if those
-            //           values were attacker-controlled, no shell metachar
-            //           injection is possible.
-            let changedFiles = [];
+            //           into a shell. execFileSync prevents shell-metachar
+            //           injection even if the values were attacker-controlled.
+            //
+            //           We collect richer metadata than just file names so
+            //           the erosion-alert filters (skip renames, deletes,
+            //           pure-addition files) can run later without re-shelling.
+            //           --find-renames=90 detects renames at 90% similarity
+            //           (stricter than git's 50% default) — only obvious
+            //           renames get suppressed from the alert.
+            let changedFileMeta = [];
             try {
               const baseSha = process.env.BASE_SHA;
               const headSha = process.env.HEAD_SHA;
               if (baseSha && headSha) {
-                const diff = execFileSync('git', ['diff', '--name-only', baseSha, headSha], { encoding: 'utf8' });
-                changedFiles = diff
-                  .split('\n')
-                  .map((s) => s.trim())
-                  .filter((s) => s && (s.endsWith('.ts') || s.endsWith('.tsx')))
-                  .filter((s) => !s.includes('__tests__') && !s.endsWith('.test.ts') && !s.endsWith('.test.tsx'));
+                // First pass: name + status (A/M/R/D) with rename detection.
+                const nameStatus = execFileSync('git',
+                  ['diff', '--name-status', '--find-renames=90', baseSha, headSha],
+                  { encoding: 'utf8' });
+                const statusMap = new Map();
+                for (const line of nameStatus.split('\n')) {
+                  if (!line.trim()) continue;
+                  const parts = line.split('\t');
+                  const code = parts[0];
+                  // R<sim>\told\tnew  — record the NEW name with status 'R'.
+                  if (code.startsWith('R')) {
+                    if (parts[2]) statusMap.set(parts[2], 'R');
+                  } else {
+                    if (parts[1]) statusMap.set(parts[1], code[0]);
+                  }
+                }
+
+                // Second pass: per-file additions/deletions from numstat.
+                // For renames numstat may write `oldpath => newpath`; we only
+                // care about per-file edit counts on non-renames, so we keep
+                // the simpler `parts.length === 3 && !parts[2].includes('=>')`
+                // entries and skip the rest (renames are dropped by the
+                // alert filter below anyway).
+                const numstat = execFileSync('git',
+                  ['diff', '--numstat', '--find-renames=90', baseSha, headSha],
+                  { encoding: 'utf8' });
+                const numstatMap = new Map();
+                for (const line of numstat.split('\n')) {
+                  if (!line.trim()) continue;
+                  const parts = line.split('\t');
+                  if (parts.length !== 3) continue;
+                  if (parts[2].includes('=>')) continue;
+                  numstatMap.set(parts[2], {
+                    additions: parts[0] === '-' ? 0 : Number(parts[0]),
+                    deletions: parts[1] === '-' ? 0 : Number(parts[1]),
+                  });
+                }
+
+                for (const [file, status] of statusMap.entries()) {
+                  if (!file.endsWith('.ts') && !file.endsWith('.tsx')) continue;
+                  if (file.includes('__tests__') || file.endsWith('.test.ts') || file.endsWith('.test.tsx')) continue;
+                  const ns = numstatMap.get(file) || { additions: 0, deletions: 0 };
+                  changedFileMeta.push({ file, status, additions: ns.additions, deletions: ns.deletions });
+                }
               }
             } catch (err) {
               core.warning(`git diff failed: ${err.message}`);
             }
+            // Back-compat name used by the per-file table block below.
+            const changedFiles = changedFileMeta.map((m) => m.file);
 
             // ── Step 4: render the comment body. ─────────────────────────
             function fmt(n) {
@@ -197,6 +251,71 @@ jobs:
                 lines.push(`Baseline: ${baselineSource}.`);
               } else {
                 lines.push('No baseline available — first run, missing artifact, or fetch failed.');
+              }
+            }
+
+            // ── Erosion alert (advisory, not blocking) ───────────────────
+            //
+            // Per-file line-coverage drop ≥2pp vs the baseline. Surfaced
+            // ABOVE the collapsible per-file table so the signal is visible
+            // without expanding the details block. The section is omitted
+            // entirely when no files qualify — see
+            // `docs/TESTING_ARCHITECTURE.md` §"Erosion alerts (advisory, not
+            // blocking)" for the design rationale.
+            //
+            // Three filters drop refactor-artifact noise so the alert stays
+            // actionable on the 2pp threshold:
+            //   - status === 'A': new file, no baseline to compare;
+            //   - status === 'R': renamed at ≥90% similarity, baseline lookup
+            //                     would miss anyway and the coverage delta is
+            //                     spurious;
+            //   - status === 'D': deleted, head has no coverage row;
+            //   - deletions === 0: file gained code without losing any
+            //                     ("file split" residue or whitespace-style
+            //                     additions). If you removed nothing, you
+            //                     didn't erode anything; you diluted.
+            //
+            // Files with no baseline entry (added in this PR, or excluded
+            // from the unit slice) silently skip — they cannot have eroded
+            // because there is nothing to erode from.
+            if (head && baselineSummary && changedFileMeta.length > 0) {
+              const EROSION_THRESHOLD_PP = 2;
+              const cwd = process.cwd();
+              const erosionRows = [];
+              for (const meta of changedFileMeta) {
+                if (meta.status === 'A' || meta.status === 'R' || meta.status === 'D') continue;
+                if (meta.deletions === 0) continue;
+                const key = path.join(cwd, meta.file);
+                const headNode = (summary && (summary[key] || summary[meta.file])) || null;
+                const baseNode = (baselineSummary[key] || baselineSummary[meta.file]) || null;
+                if (!headNode || !baseNode) continue;
+                const hp = pct(headNode, 'lines');
+                const bp = pct(baseNode, 'lines');
+                if (hp === null || bp === null) continue;
+                const d = hp - bp;
+                if (d > -EROSION_THRESHOLD_PP) continue;
+                erosionRows.push({ file: meta.file, head: hp, base: bp, delta: d });
+              }
+
+              if (erosionRows.length > 0) {
+                erosionRows.sort((a, b) => a.delta - b.delta); // most negative first
+                const rendered = erosionRows.slice(0, 5);
+                const more = erosionRows.length - rendered.length;
+                lines.push('');
+                lines.push(`### Coverage erosion alert (advisory, not blocking)`);
+                lines.push('');
+                lines.push(`${erosionRows.length} file(s) on this PR dropped ≥${EROSION_THRESHOLD_PP}pp in line coverage versus baseline.`);
+                lines.push('');
+                lines.push('| File | Baseline | This PR | Δ |');
+                lines.push('| --- | --- | --- | --- |');
+                for (const row of rendered) {
+                  lines.push(`| \`${row.file}\` | ${fmt(row.base)} | ${fmt(row.head)} | ${row.delta.toFixed(2)}pp |`);
+                }
+                if (more > 0) {
+                  lines.push(`| _…and ${more} more file(s)_ | | | |`);
+                }
+                lines.push('');
+                lines.push('_Alerts are advisory — no CI gate is involved. See `docs/TESTING_ARCHITECTURE.md` §"Erosion alerts" for the rationale._');
               }
             }
 

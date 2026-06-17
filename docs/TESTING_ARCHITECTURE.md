@@ -240,6 +240,43 @@ lines-changed.
 If a PR adds a new module with zero coverage, that is a review-time
 conversation, not a CI-time block.
 
+### Erosion alerts (advisory, not blocking)
+
+A refinement of the "report, don't gate" position above: the coverage
+sticky comment also surfaces a **per-file erosion alert** when any
+touched file drops by ≥2 percentage points in line coverage versus
+`main`. The alert is advisory — it never fails the build — and is
+omitted entirely from the comment when no files qualify.
+
+The alert exists to surface a narrow class of regression that the
+existing "review-time conversation" rule does not catch: a covered
+file silently rotting when a PR adds an untested branch or yanks the
+only assertion for an existing one. Touched-file scoping (the
+codecov / coveralls default) keeps the signal local; three filters
+drop refactor-artifact noise so the alert stays actionable:
+
+- **Renamed/moved files are skipped** (`git diff --find-renames=90`).
+  The original anti-threshold concern — "a refactor moves numbers" —
+  applies here; ignore them.
+- **Deleted files are skipped.** There is no head coverage to compare
+  against; the delta is meaningless.
+- **Pure-addition files are skipped.** A file with only new lines and
+  no removals cannot have lost coverage — only gained it. New modules
+  with zero coverage are still a review-time conversation, not an
+  alert.
+
+The alert only fires on files that _already had_ coverage on `main`
+and lost some of it on the PR.
+
+#### What the alert does not catch
+
+Coverage instruments execution, not verification. A PR that deletes
+an assertion while keeping the line executed will not change coverage
+and will not fire the alert. For the assertion-deletion case, the
+answer is mutation testing on the modules that warrant it (e.g.
+`electron/plugins/plugin-integrity.ts`), not a coverage delta
+threshold. Coverage alerts are a floor signal, not a ceiling.
+
 ## Conventions
 
 - **Explicit assertions only.** Use `expect(...).toBe(...)`,
