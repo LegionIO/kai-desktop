@@ -20,15 +20,16 @@ import type { AppConfig } from '../../config/schema.js';
 
 const MASTRA_CAPABILITIES: RuntimeCapabilities = {
   builtInTools: false, // Mastra workspace tools are created per-stream, not "built in" to the SDK
-  mcpSupport: true,    // Kai connects MCP and passes tools to Mastra
+  mcpSupport: true, // Kai connects MCP and passes tools to Mastra
   toolObserver: true,
   compaction: true,
   memory: true,
   fallback: true,
   multiProvider: true,
   subAgents: true,
-  sessions: false,     // Mastra doesn't have session resume (Kai manages conversations)
+  sessions: false, // Mastra doesn't have session resume (Kai manages conversations)
   customTools: true,
+  perActionApproval: true, // Kai executes Mastra tools and can gate each via the approval flow
 };
 
 // ---------------------------------------------------------------------------
@@ -70,15 +71,16 @@ export class MastraRuntime implements AgentRuntime {
     } = options;
 
     // Use pre-resolved config when the IPC layer provides it, otherwise resolve
-    const streamConfig = options.streamConfig ?? resolveStreamConfig(config, {
-      threadModelKey: null,
-      threadProfileKey: null,
-      reasoningEffort,
-      fallbackEnabled: false,
-    });
-    const primaryModel = options.primaryModel !== undefined
-      ? options.primaryModel
-      : streamConfig?.primaryModel ?? null;
+    const streamConfig =
+      options.streamConfig ??
+      resolveStreamConfig(config, {
+        threadModelKey: null,
+        threadProfileKey: null,
+        reasoningEffort,
+        fallbackEnabled: false,
+      });
+    const primaryModel =
+      options.primaryModel !== undefined ? options.primaryModel : (streamConfig?.primaryModel ?? null);
 
     if (!primaryModel || !streamConfig) {
       yield {
@@ -91,10 +93,7 @@ export class MastraRuntime implements AgentRuntime {
     }
 
     // Assemble system prompt with working directory + project instructions
-    const assembledPrompt = await withWorkingDirectoryPrompt(
-      streamConfig.systemPrompt,
-      cwd,
-    );
+    const assembledPrompt = await withWorkingDirectoryPrompt(streamConfig.systemPrompt, cwd);
 
     const configForStream: AppConfig = {
       ...config,
@@ -124,15 +123,7 @@ export class MastraRuntime implements AgentRuntime {
     };
 
     if (streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0) {
-      yield* streamWithFallback(
-        conversationId,
-        messages,
-        streamConfig,
-        configForStream,
-        tools,
-        dbPath,
-        streamOpts,
-      );
+      yield* streamWithFallback(conversationId, messages, streamConfig, configForStream, tools, dbPath, streamOpts);
     } else {
       yield* streamAgentResponse(
         conversationId,
@@ -146,10 +137,7 @@ export class MastraRuntime implements AgentRuntime {
     }
   }
 
-  async generateTitle(
-    _messages: unknown[],
-    _config: AppConfig,
-  ): Promise<string | null> {
+  async generateTitle(_messages: unknown[], _config: AppConfig): Promise<string | null> {
     // Title generation is handled separately by the IPC layer for Mastra.
     // Returning null signals that the caller should use its own implementation.
     return null;

@@ -8,6 +8,7 @@
  *   - Mastra           (default, full Kai feature set)
  *   - Claude Agent SDK (@anthropic-ai/claude-agent-sdk)
  *   - Codex SDK        (@openai/codex-sdk) — stub/minimal
+ *   - Pi               (`pi` CLI, spawned in --mode json; no SDK)
  */
 
 import type { StreamEvent } from '../mastra-agent.js';
@@ -56,6 +57,15 @@ export type RuntimeCapabilities = {
 
   /** Can accept custom Kai tools (skills, plugins, CLI tools) at stream time. */
   customTools: boolean;
+
+  /**
+   * Runtime can gate individual tool actions at execution time (e.g. Claude's
+   * `canUseTool`, Codex's `approvalPolicy`) so Kai can interpose a per-action
+   * approval prompt mid-turn.  When `false`, tool autonomy is fixed at spawn
+   * time only and the runtime executes tools unsupervised — the UI surfaces an
+   * autonomy warning at runtime-selection time based on this flag.
+   */
+  perActionApproval: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,10 +103,7 @@ export type StreamOptions = {
   }) => void | Promise<void>;
 
   /** Called when a tool finishes executing. */
-  onToolExecutionEnd?: (state: {
-    toolCallId: string;
-    toolName: string;
-  }) => void;
+  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
 
   /**
    * Allows the IPC layer to modify / compact a tool result before it is
@@ -208,11 +215,12 @@ export interface AgentRuntime {
 // ---------------------------------------------------------------------------
 
 /** The set of known runtime identifiers. */
-export type RuntimeId = 'mastra' | 'claude-agent-sdk' | 'codex-sdk';
+export type RuntimeId = 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | 'pi';
 
 /** Human-readable labels for the settings UI. */
 export const RUNTIME_LABELS: Record<RuntimeId, string> = {
   mastra: 'Mastra',
   'claude-agent-sdk': 'Claude Agent SDK',
   'codex-sdk': 'Codex SDK',
+  pi: 'Pi',
 };

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { XIcon, RotateCcwIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
+import { AutonomyWarning } from '@/components/runtime/AutonomyWarning';
 import type { ConversationRecord, ReasoningEffort } from '@/providers/RuntimeProvider';
 
 type CatalogModel = {
@@ -16,7 +17,7 @@ type ProfileEntry = {
   primaryModelKey: string;
 };
 
-type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string };
+type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string; perActionApproval?: boolean };
 
 type Props = {
   open: boolean;
@@ -346,6 +347,9 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
                       </option>
                     ))}
                   </select>
+                  {runtimes.find((r) => r.id === settings.runtimeOverride)?.perActionApproval === false && (
+                    <AutonomyWarning className="mt-1.5" />
+                  )}
                 </div>
 
                 {/* Fallback */}
