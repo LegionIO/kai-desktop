@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parse as shellParse } from 'shell-quote';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from './types.js';
 import type { PluginCliToolContribution } from '../plugins/types.js';
@@ -35,14 +36,41 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
         const { command, cwd, timeout } = input as { command: string; cwd?: string; timeout?: number };
         const config = getConfig();
 
+        // Tokenize the command. Pass process.env so $VAR references expand to
+        // the user's actual environment instead of empty strings.
+        // shell-quote returns:
+        //   - strings for plain words
+        //   - {op: 'glob', pattern: '*.ts'} for unquoted glob patterns
+        //   - {op: ';' | '&&' | ...} for control operators
+        //   - {comment: '...'} for # comments
+        // We pass globs through as literal strings (the target binary may
+        // handle them itself, e.g. `git add '*.ts'`); we reject control
+        // operators so the validated binary cannot be chained.
+        const rawTokens = shellParse(command, process.env as Record<string, string>);
+        const argv: string[] = [];
+        for (const t of rawTokens) {
+          if (typeof t === 'string') {
+            argv.push(t);
+          } else if ('op' in t && t.op === 'glob' && 'pattern' in t) {
+            argv.push(t.pattern as string);
+          } else if ('comment' in t) {
+            break; // ignore trailing # comment
+          } else {
+            return {
+              error: 'Shell control operators (;, &&, ||, |, >, <, etc.) are not allowed in CLI tool commands',
+              command,
+              isError: true,
+            };
+          }
+        }
+
         // Validate command starts with an allowed binary for this tool
         const allBinaries = [spec.binary, ...(spec.extraBinaries ?? [])];
-        const firstToken = command.trim().split(/\s+/)[0];
-        if (!allBinaries.includes(firstToken)) {
+        if (argv.length === 0 || !allBinaries.includes(argv[0])) {
           return { error: `Command must start with one of: ${allBinaries.join(', ')}`, command, isError: true };
         }
 
-        // Apply shell allow/deny guardrails
+        // Apply shell allow/deny guardrails (operates on the original string for deny-pattern matching)
         const check = isCommandAllowed(command, config);
         if (!check.allowed) {
           return { error: check.reason, command, isError: true };
@@ -51,6 +79,7 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
         const streaming = resolveProcessStreamingConfig(config);
         const result = await runCommandWithStreaming({
           command,
+          argv,
           cwd: cwd || context.cwd || process.env.HOME,
           timeoutMs: timeout || config.tools.shell.timeout,
           env: { ...process.env },

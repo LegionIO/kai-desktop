@@ -56,18 +56,23 @@ async function exitFullScreenApps(appNames: string[]): Promise<{ exited: string[
   if (process.platform !== 'darwin') return { exited: [], failed: [] };
   const exited: string[] = [];
   const failed: string[] = [];
+  // Pass the app name via osascript argv (item 1 of argv) rather than interpolating
+  // it into the script body, so app names containing quotes or AppleScript syntax
+  // are treated as data and cannot inject code.
+  const script = `on run argv
+  tell application "System Events" to tell application process (item 1 of argv)
+    repeat with w in (every window)
+      try
+        if value of attribute "AXFullScreen" of w is true then
+          set value of attribute "AXFullScreen" of w to false
+        end if
+      end try
+    end repeat
+  end tell
+end run`;
   for (const appName of appNames) {
     try {
-      const script = `tell application "System Events" to tell application process "${appName}"
-  repeat with w in (every window)
-    try
-      if value of attribute "AXFullScreen" of w is true then
-        set value of attribute "AXFullScreen" of w to false
-      end if
-    end try
-  end repeat
-end tell`;
-      await execFileAsync('osascript', ['-e', script], { timeout: 5000 });
+      await execFileAsync('osascript', ['-e', script, appName], { timeout: 5000 });
       exited.push(appName);
     } catch {
       failed.push(appName);

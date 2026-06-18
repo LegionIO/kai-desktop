@@ -1,8 +1,7 @@
 /**
  * Batch transcription handler for the main process.
  *
- * Accepts a WAV buffer (via base64 or temp file path) and transcribes it
- * using either:
+ * Accepts a WAV buffer (via base64) and transcribes it using either:
  *   1. OpenAI Whisper API (/v1/audio/transcriptions) — preferred, fast
  *   2. Azure Speech SDK continuous recognition — fallback for Azure-only setups
  *
@@ -16,17 +15,14 @@
  */
 
 import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
-import { readFileSync, unlinkSync } from 'fs';
 import { net } from 'electron';
 import type { IpcMain, WebContents } from 'electron';
 import type { AppConfig } from '../config/schema.js';
 import { chunkWavBuffer, calculateWavDuration } from './audio-chunker.js';
 
 export interface BatchTranscribeRequest {
-  /** Base64-encoded WAV audio (mutually exclusive with tempFilePath) */
+  /** Base64-encoded WAV audio */
   wavBase64?: string;
-  /** Path to a temporary WAV file on disk (mutually exclusive with wavBase64) */
-  tempFilePath?: string;
   /** BCP-47 language code, e.g. 'en-US' */
   language: string;
 }
@@ -371,23 +367,17 @@ async function transcribeWithWhisper(
 
 export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => AppConfig): void {
   ipc.handle('stt:batch-transcribe', async (event, request: BatchTranscribeRequest): Promise<BatchTranscribeResult> => {
-    console.log('[BatchTranscribe] Request received, language=%s, hasWavBase64=%s, hasTempFile=%s',
-      request.language, Boolean(request.wavBase64), Boolean(request.tempFilePath));
+    console.log('[BatchTranscribe] Request received, language=%s, hasWavBase64=%s',
+      request.language, Boolean(request.wavBase64));
 
     try {
       const config = getConfig();
 
       // Load the WAV buffer
-      let wavBuffer: Buffer;
-      if (request.tempFilePath) {
-        wavBuffer = readFileSync(request.tempFilePath);
-        // Clean up temp file
-        try { unlinkSync(request.tempFilePath); } catch { /* ignore */ }
-      } else if (request.wavBase64) {
-        wavBuffer = Buffer.from(request.wavBase64, 'base64');
-      } else {
+      if (!request.wavBase64) {
         return { text: '', error: 'No audio data provided' };
       }
+      const wavBuffer = Buffer.from(request.wavBase64, 'base64');
 
       if (wavBuffer.length < 44) {
         return { text: '', error: 'WAV data too short (missing header)' };

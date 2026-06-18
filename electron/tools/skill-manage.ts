@@ -1,10 +1,27 @@
 import { z } from 'zod';
 import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync, chmodSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import { getSkillToolName, loadSkillsFromDisk, type SkillManifest } from './skill-loader.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
+
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+function validateSkillName(name: string | undefined): string | null {
+  if (!name || !SKILL_NAME_RE.test(name)) return null;
+  return name;
+}
+
+function isContained(childPath: string, parentPath: string): boolean {
+  return resolve(childPath).startsWith(resolve(parentPath) + sep);
+}
+
+function isValidSkillFilename(filename: string): boolean {
+  if (filename === '' || filename === '.') return false;
+  if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) return false;
+  return true;
+}
 
 function readConfig(appHome: string): AppConfig {
   return readEffectiveConfig(appHome);
@@ -77,10 +94,12 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         }
 
         case 'get': {
-          if (!name) return { error: 'Skill name is required.' };
-          const skillDir = join(skillsDir, name);
+          const safeName = validateSkillName(name);
+          if (!safeName) return { error: 'Invalid skill name' };
+          const skillDir = join(skillsDir, safeName);
+          if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
           const manifestPath = join(skillDir, 'skill.json');
-          if (!existsSync(manifestPath)) return { error: `Skill "${name}" not found.` };
+          if (!existsSync(manifestPath)) return { error: `Skill "${safeName}" not found.` };
 
           const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
 
@@ -101,23 +120,32 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         }
 
         case 'create': {
-          if (!name) return { error: 'Skill name is required.' };
+          const safeName = validateSkillName(name);
+          if (!safeName) {
+            return { error: 'Skill name must start with a letter/digit and contain only lowercase letters, digits, hyphens, and underscores.' };
+          }
           if (!execution) return { error: 'Execution configuration is required.' };
           if (!description) return { error: 'Description is required.' };
 
-          // Validate name
-          if (!/^[a-z0-9][a-z0-9_-]*$/.test(name)) {
-            return { error: 'Skill name must start with a letter/digit and contain only lowercase letters, digits, hyphens, and underscores.' };
-          }
-
-          const skillDir = join(skillsDir, name);
-          if (existsSync(skillDir)) return { error: `Skill "${name}" already exists. Use "edit" to update it.` };
+          const skillDir = join(skillsDir, safeName);
+          if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
+          if (existsSync(skillDir)) return { error: `Skill "${safeName}" already exists. Use "edit" to update it.` };
 
           // Create skill directory and manifest
+          // Pre-validate ALL filenames before any disk write so a rejected
+          // request leaves no partially-created skill directory behind.
+          if (files) {
+            for (const filename of Object.keys(files)) {
+              if (!isValidSkillFilename(filename) || !isContained(join(skillDir, filename), skillDir)) {
+                return { error: `Invalid filename: ${filename}` };
+              }
+            }
+          }
+
           mkdirSync(skillDir, { recursive: true });
 
           const manifest: SkillManifest = {
-            name,
+            name: safeName,
             description,
             version: version ?? '1.0.0',
             ...(inputSchema ? { inputSchema } : {}),
@@ -125,7 +153,7 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
           };
           writeFileSync(join(skillDir, 'skill.json'), JSON.stringify(manifest, null, 2));
 
-          // Write additional files
+          // Write additional files (already validated above)
           if (files) {
             for (const [filename, content] of Object.entries(files)) {
               const filePath = join(skillDir, filename);
@@ -139,8 +167,8 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
 
           // Add to enabled list
           const enabled = [...(config.skills?.enabled ?? [])];
-          if (!enabled.includes(name)) {
-            enabled.push(name);
+          if (!enabled.includes(safeName)) {
+            enabled.push(safeName);
           }
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
@@ -149,15 +177,27 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             success: true,
             created: manifest,
             dir: skillDir,
-            note: `Skill "${name}" created. It will be available as tool "${getSkillToolName(name)}" on your next turn.`,
+            note: `Skill "${safeName}" created. It will be available as tool "${getSkillToolName(safeName)}" on your next turn.`,
           };
         }
 
         case 'edit': {
-          if (!name) return { error: 'Skill name is required.' };
-          const skillDir = join(skillsDir, name);
+          const safeName = validateSkillName(name);
+          if (!safeName) return { error: 'Invalid skill name' };
+          const skillDir = join(skillsDir, safeName);
+          if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
           const manifestPath = join(skillDir, 'skill.json');
-          if (!existsSync(manifestPath)) return { error: `Skill "${name}" not found.` };
+          if (!existsSync(manifestPath)) return { error: `Skill "${safeName}" not found.` };
+
+          // Pre-validate ALL filenames before any disk write so a rejected
+          // request leaves the existing skill unchanged.
+          if (files) {
+            for (const filename of Object.keys(files)) {
+              if (!isValidSkillFilename(filename) || !isContained(join(skillDir, filename), skillDir)) {
+                return { error: `Invalid filename: ${filename}` };
+              }
+            }
+          }
 
           const existing = JSON.parse(readFileSync(manifestPath, 'utf-8')) as SkillManifest;
           const updated: SkillManifest = {
@@ -169,7 +209,7 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
           };
           writeFileSync(manifestPath, JSON.stringify(updated, null, 2));
 
-          // Write additional files if provided
+          // Write additional files if provided (already validated above)
           if (files) {
             for (const [filename, content] of Object.entries(files)) {
               const filePath = join(skillDir, filename);
@@ -188,42 +228,47 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         }
 
         case 'delete': {
-          if (!name) return { error: 'Skill name is required.' };
-          const skillDir = join(skillsDir, name);
-          if (!existsSync(skillDir)) return { error: `Skill "${name}" not found.` };
+          const safeName = validateSkillName(name);
+          if (!safeName) return { error: 'Invalid skill name' };
+          const skillDir = join(skillsDir, safeName);
+          if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
+          if (!existsSync(skillDir)) return { error: `Skill "${safeName}" not found.` };
 
           rmSync(skillDir, { recursive: true, force: true });
 
           // Remove from enabled list
-          const enabled = (config.skills?.enabled ?? []).filter((s: string) => s !== name);
+          const enabled = (config.skills?.enabled ?? []).filter((s: string) => s !== safeName);
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 
-          return { success: true, deleted: name, note: 'Skill removed. Changes take effect on your next turn.' };
+          return { success: true, deleted: safeName, note: 'Skill removed. Changes take effect on your next turn.' };
         }
 
         case 'enable': {
-          if (!name) return { error: 'Skill name is required.' };
-          const skillDir = join(skillsDir, name);
-          if (!existsSync(join(skillDir, 'skill.json'))) return { error: `Skill "${name}" not found.` };
+          const safeName = validateSkillName(name);
+          if (!safeName) return { error: 'Invalid skill name' };
+          const skillDir = join(skillsDir, safeName);
+          if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
+          if (!existsSync(join(skillDir, 'skill.json'))) return { error: `Skill "${safeName}" not found.` };
 
           const enabled = [...(config.skills?.enabled ?? [])];
-          if (!enabled.includes(name)) {
-            enabled.push(name);
+          if (!enabled.includes(safeName)) {
+            enabled.push(safeName);
           }
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 
-          return { success: true, enabled: name, note: 'Skill enabled. Changes take effect on your next turn.' };
+          return { success: true, enabled: safeName, note: 'Skill enabled. Changes take effect on your next turn.' };
         }
 
         case 'disable': {
-          if (!name) return { error: 'Skill name is required.' };
-          const enabled = (config.skills?.enabled ?? []).filter((s: string) => s !== name);
+          const safeName = validateSkillName(name);
+          if (!safeName) return { error: 'Invalid skill name' };
+          const enabled = (config.skills?.enabled ?? []).filter((s: string) => s !== safeName);
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 
-          return { success: true, disabled: name, note: 'Skill disabled. Changes take effect on your next turn.' };
+          return { success: true, disabled: safeName, note: 'Skill disabled. Changes take effect on your next turn.' };
         }
 
         default:

@@ -124,7 +124,17 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const handleInstall = async (pluginName: string) => {
     setInstallingPlugins((prev) => new Set([...prev, pluginName]));
     try {
-      await app.plugins.marketplaceInstall(pluginName);
+      const result = await app.plugins.marketplaceInstall(pluginName);
+      if (result?.needsConfirmation) {
+        const accepted = window.confirm(
+          `The plugin "${result.pluginName ?? pluginName}" has no published integrity hash. ` +
+            `Installing it means trusting whatever the download server returns.\n\nInstall anyway?`,
+        );
+        if (!accepted) {
+          return;
+        }
+        await app.plugins.marketplaceInstallUnverified(pluginName);
+      }
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to update ${pluginName}`);

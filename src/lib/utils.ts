@@ -6,6 +6,19 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
+ * Escape a string for safe interpolation into HTML/innerHTML.
+ * Use this whenever assigning user-controlled text to `innerHTML`.
+ */
+export function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
  * Re-focus the chat composer after an interaction that steals focus
  * (tool approvals, native dialogs, etc.).
  */

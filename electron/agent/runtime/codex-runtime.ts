@@ -224,16 +224,35 @@ export class CodexRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 5. Create Codex instance and thread
     // -----------------------------------------------------------------------
+    // Pass the bridge bearer token to the Codex CLI via the SDK's `env`
+    // option (scoped to the spawned child process) so the CLI can read it
+    // via the `bearer_token_env_var` config key. The env var name is unique
+    // per bridge instance, and using the SDK's env option instead of
+    // mutating process.env avoids leaking the token to other child
+    // processes and avoids races between concurrent Codex runs.
+    const bridgeAuthToken = bridge.getAuthToken();
+    const bridgeAuthTokenEnvVar = bridge.getAuthTokenEnvVar();
     const codex = new CodexCtor({
       ...(apiKey ? { apiKey } : {}),
       ...(baseUrl ? { baseUrl } : {}),
+      ...(bridgeAuthToken && bridgeAuthTokenEnvVar
+        ? {
+            // The SDK's `env` option replaces the child environment entirely,
+            // so spread process.env and overlay only the bridge token —
+            // otherwise the Codex CLI loses HOME/PATH/cert vars.
+            env: {
+              ...(process.env as Record<string, string>),
+              [bridgeAuthTokenEnvVar]: bridgeAuthToken,
+            },
+          }
+        : {}),
       ...(bridgeUrl ? {
         config: {
           features: {
             tool_search_always_defer_mcp_tools: false,
           },
           mcp_servers: {
-            kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? []),
+            kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
           },
         },
       } : {}),

@@ -1,12 +1,29 @@
 import type { IpcMain } from 'electron';
 import { readFileSync, existsSync, readdirSync, rmSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import { loadSkillsFromDisk } from '../tools/skill-loader.js';
 import { readEffectiveConfig, writeDesktopConfig } from './config.js';
 
 function readConfig(appHome: string): AppConfig {
   return readEffectiveConfig(appHome);
+}
+
+/**
+ * Validate a skill name and resolve it to a directory strictly inside skillsDir.
+ * Returns null if the name contains path separators, traversal segments, or
+ * resolves outside skillsDir.
+ */
+function safeSkillDir(skillsDir: string, name: string): string | null {
+  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+    return null;
+  }
+  const skillDir = join(skillsDir, name);
+  const resolved = resolve(skillDir);
+  if (!resolved.startsWith(resolve(skillsDir) + sep)) {
+    return null;
+  }
+  return skillDir;
 }
 
 export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void {
@@ -29,7 +46,8 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
   ipcMain.handle('skills:get', async (_event, name: string) => {
     const config = readConfig(appHome);
     const skillsDir = config.skills?.directory || join(appHome, 'skills');
-    const skillDir = join(skillsDir, name);
+    const skillDir = safeSkillDir(skillsDir, name);
+    if (!skillDir) return { error: 'Invalid skill name' };
     const manifestPath = join(skillDir, 'skill.json');
 
     if (!existsSync(manifestPath)) return { error: `Skill "${name}" not found.` };
@@ -53,7 +71,8 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
   ipcMain.handle('skills:delete', async (_event, name: string) => {
     const config = readConfig(appHome);
     const skillsDir = config.skills?.directory || join(appHome, 'skills');
-    const skillDir = join(skillsDir, name);
+    const skillDir = safeSkillDir(skillsDir, name);
+    if (!skillDir) return { error: 'Invalid skill name' };
 
     if (!existsSync(skillDir)) return { error: `Skill "${name}" not found.` };
 

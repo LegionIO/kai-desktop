@@ -1,6 +1,16 @@
 import { useState, type FC } from 'react';
+import { Copy, RefreshCw, Check } from 'lucide-react';
 import { Toggle, NumberField, TextField, settingsSelectClass, type SettingsProps } from './shared';
 import { WebServerQRCode } from './WebServerQRCode';
+
+/** Generate a ~16-char URL-safe random password in the renderer (no Node APIs). */
+function generatePassword(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
 type WebServerConfig = {
   enabled: boolean;
@@ -25,10 +35,11 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
     port: 5243,
     bindAddress: '0.0.0.0',
     tls: { enabled: true, mode: 'self-signed' as const, certPath: '', keyPath: '' },
-    auth: { mode: 'anonymous' as const, username: '', password: '' },
+    auth: { mode: 'password' as const, username: 'kai', password: '' },
   };
 
   const [showQR, setShowQR] = useState(false);
+  const [copied, setCopied] = useState(false);
   const protocol = ws.tls.enabled ? 'https' : 'http';
 
   return (
@@ -141,10 +152,16 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
                 value={ws.auth.mode}
                 onChange={(e) => updateConfig('webServer.auth.mode', e.target.value)}
               >
-                <option value="anonymous">Anonymous (no login required)</option>
                 <option value="password">Password Protected</option>
+                <option value="anonymous">Anonymous (no login required)</option>
               </select>
             </div>
+
+            {ws.auth.mode === 'anonymous' && (
+              <p className="text-[10px] text-amber-600 dark:text-amber-500 pl-1">
+                Anyone on your network will have full access. Only use on trusted networks.
+              </p>
+            )}
 
             {ws.auth.mode === 'password' && (
               <div className="space-y-3 pl-1">
@@ -152,15 +169,39 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
                   label="Username"
                   value={ws.auth.username}
                   onChange={(v) => updateConfig('webServer.auth.username', v)}
-                  placeholder="admin"
+                  placeholder="kai"
                 />
-                <TextField
-                  label="Password"
-                  value={ws.auth.password}
-                  onChange={(v) => updateConfig('webServer.auth.password', v)}
-                  placeholder="Enter password"
-                  mono
-                />
+                <div>
+                  <label className="text-[10px] text-muted-foreground block mb-0.5">Password</label>
+                  <div className="flex gap-1.5">
+                    <input
+                      className="flex-1 rounded-md border border-border/60 bg-card/60 px-2 py-1 text-xs font-mono"
+                      value={ws.auth.password}
+                      onChange={(e) => updateConfig('webServer.auth.password', e.target.value)}
+                      placeholder="(auto-generated on first enable)"
+                    />
+                    <button
+                      type="button"
+                      title="Copy password"
+                      className="rounded-md border border-border/60 bg-card/60 px-2 hover:bg-card transition-colors"
+                      onClick={() => {
+                        void window.app?.clipboard.writeText(ws.auth.password);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 1500);
+                      }}
+                    >
+                      {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    </button>
+                    <button
+                      type="button"
+                      title="Regenerate password"
+                      className="rounded-md border border-border/60 bg-card/60 px-2 hover:bg-card transition-colors"
+                      onClick={() => updateConfig('webServer.auth.password', generatePassword())}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
           </fieldset>

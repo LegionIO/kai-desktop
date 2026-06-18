@@ -69,7 +69,6 @@ function ensureWindow(sessionId: string): BrowserWindow {
     height: 960,
     show: false,
     webPreferences: {
-      sandbox: false,
       nodeIntegration: false,
       contextIsolation: true,
     },

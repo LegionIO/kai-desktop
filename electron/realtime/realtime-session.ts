@@ -425,7 +425,7 @@ export class RealtimeSession {
       } else if (/^https?:\/\//.test(baseUrl)) {
         wsUrl = baseUrl.replace(/^http/, 'ws'); // http→ws, https→wss
       } else {
-        wsUrl = `ws://${baseUrl}`; // no protocol — assume ws://
+        wsUrl = `wss://${baseUrl}`; // no protocol — default to secure wss://
       }
       const separator = wsUrl.includes('?') ? '&' : '?';
       const headers = withBrandUserAgent();

@@ -10,13 +10,13 @@
  */
 
 import { createHash } from 'crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { net, app } from 'electron';
 import { gte as semverGte } from 'semver';
-import type { OtaFeed, OtaManifest, OtaStatus } from './types.js';
+import type { OtaFeed, OtaFeedEntry, OtaManifest, OtaStatus } from './types.js';
 import {
   OTA_DIR_NAME,
   OTA_CURRENT_DIR,
@@ -24,6 +24,7 @@ import {
   OTA_ROLLBACK_DIR,
   OTA_MANIFEST_FILE,
 } from './types.js';
+import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -57,11 +58,19 @@ function broadcast(status: OtaStatus): void {
  * Get the GitHub release feed URL for OTA manifests.
  */
 function getOtaFeedUrl(): string {
+  // Runtime env override (highest priority — for testing per CLAUDE.md)
   const updateUrl = process.env.KAI_UPDATE_URL;
   if (updateUrl) {
     return `${updateUrl.replace(/\/$/, '')}/latest-ota.json`;
   }
-  const repo = process.env.KAI_UPDATE_REPO ?? 'legionio/kai-desktop';
+  // Brand-baked explicit feed URL (e.g. on-prem S3 for uhc-tech builds)
+  if (typeof __BRAND_OTA_FEED_URL !== 'undefined' && __BRAND_OTA_FEED_URL) {
+    return `${__BRAND_OTA_FEED_URL.replace(/\/$/, '')}/latest-ota.json`;
+  }
+  // Brand-baked GitHub repo → releases/latest/download
+  const repo =
+    process.env.KAI_UPDATE_REPO ??
+    (typeof __BRAND_UPDATE_REPO !== 'undefined' ? __BRAND_UPDATE_REPO : 'legionio/kai-desktop');
   return `https://github.com/${repo}/releases/latest/download/latest-ota.json`;
 }
 
@@ -206,6 +215,40 @@ async function verifyExtracted(stagingDir: string): Promise<{ valid: boolean; er
   return { valid: true };
 }
 
+/**
+ * Gate an OTA feed entry on its Ed25519 signature.
+ *
+ * New clients REQUIRE a valid signature; the field is additive in the feed so
+ * old clients (which lack this check) continue to upgrade via sha512-only and
+ * will pick up this enforcement on their next update.
+ *
+ * @returns null if the entry is acceptable, otherwise a user-facing error string
+ */
+function checkFeedSignature(latest: OtaFeedEntry): string | null {
+  if (shouldSkipOtaSignature(app.isPackaged)) {
+    console.warn(
+      '[ota-updater] KAI_OTA_SKIP_SIGNATURE or dev mode — skipping OTA signature verification',
+    );
+    return null;
+  }
+  if (!latest.signature || !latest.filesHash) {
+    console.error('[ota-updater] OTA feed entry is unsigned — refusing update');
+    return 'OTA feed entry is unsigned — refusing update';
+  }
+  const ok = verifyOtaSignature({
+    sha512: latest.sha512,
+    codeVersion: latest.codeVersion,
+    minBaseVersion: latest.minBaseVersion,
+    filesHash: latest.filesHash,
+    signature: latest.signature,
+  });
+  if (!ok) {
+    console.error('[ota-updater] OTA signature verification failed — refusing update');
+    return 'OTA signature verification failed';
+  }
+  return null;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -234,9 +277,18 @@ export async function checkForOtaUpdate(
 
     const { latest } = feed;
 
-    // Already on this version or newer
+    // Already on this version or newer — return idle before signature check
+    // so a stale/legacy unsigned feed for an already-installed version
+    // doesn't surface a spurious signature error to the user.
     if (semverGte(currentCodeVersion, latest.codeVersion)) {
       broadcast({ state: 'idle' });
+      return false;
+    }
+
+    // Signature gate — refuse to advertise an unsigned/invalid update
+    const sigError = checkFeedSignature(latest);
+    if (sigError) {
+      broadcast({ state: 'error', message: sigError });
       return false;
     }
 
@@ -277,9 +329,17 @@ export async function downloadOtaUpdate(
 
     const { latest } = feed;
 
-    // Re-validate compatibility
+    // Re-validate compatibility before signature check — no need to error
+    // on an unsigned legacy feed when we wouldn't apply it anyway.
     if (semverGte(currentCodeVersion, latest.codeVersion)) {
       return { success: false, error: 'Already up to date' };
+    }
+
+    // Signature gate — MUST run before any download or extraction
+    const sigError = checkFeedSignature(latest);
+    if (sigError) {
+      broadcast({ state: 'error', message: sigError });
+      return { success: false, error: sigError };
     }
     if (!semverGte(shellVersion, latest.minBaseVersion)) {
       return { success: false, error: 'Shell version incompatible, full update required' };
@@ -294,15 +354,19 @@ export async function downloadOtaUpdate(
     }
     mkdirSync(stagingDir, { recursive: true });
 
-    // Resolve download URL (may be relative to feed URL)
+    // Resolve download URL (may be relative to feed URL) — same precedence
+    // as getOtaFeedUrl(): KAI_UPDATE_URL > __BRAND_OTA_FEED_URL > GitHub repo.
     let archiveUrl = latest.url;
     if (!archiveUrl.startsWith('http')) {
-      // Relative URL — resolve against the release base
       const updateUrl = process.env.KAI_UPDATE_URL;
       if (updateUrl) {
         archiveUrl = `${updateUrl.replace(/\/$/, '')}/${latest.url}`;
+      } else if (typeof __BRAND_OTA_FEED_URL !== 'undefined' && __BRAND_OTA_FEED_URL) {
+        archiveUrl = `${__BRAND_OTA_FEED_URL.replace(/\/$/, '')}/${latest.url}`;
       } else {
-        const repo = process.env.KAI_UPDATE_REPO ?? 'legionio/kai-desktop';
+        const repo =
+          process.env.KAI_UPDATE_REPO ??
+          (typeof __BRAND_UPDATE_REPO !== 'undefined' ? __BRAND_UPDATE_REPO : 'legionio/kai-desktop');
         archiveUrl = `https://github.com/${repo}/releases/latest/download/${latest.url}`;
       }
     }
@@ -332,6 +396,37 @@ export async function downloadOtaUpdate(
     if (!verification.valid) {
       rmSync(stagingDir, { recursive: true, force: true });
       const error = `File verification failed: ${verification.error}`;
+      broadcast({ state: 'error', message: error });
+      return { success: false, error };
+    }
+
+    // Persist the verified signature + archive hash into the on-disk manifest
+    // so that bootstrap.ts can re-verify the overlay on every launch without
+    // needing the (now-deleted) archive or a network round-trip.
+    try {
+      const extractedManifestPath = join(extractDir, OTA_MANIFEST_FILE);
+      const extractedManifest: OtaManifest = JSON.parse(
+        readFileSync(extractedManifestPath, 'utf-8'),
+      );
+      // Verify the archive's manifest.files actually hashes to the signed
+      // filesHash before persisting it. Catching the mismatch here fails the
+      // update cleanly instead of letting bootstrap wipe a bad overlay on
+      // next launch.
+      const extractedFilesHash = computeFilesHash(extractedManifest.files ?? {});
+      if (extractedFilesHash !== latest.filesHash) {
+        rmSync(stagingDir, { recursive: true, force: true });
+        const error = 'Archive manifest.files does not match signed filesHash';
+        console.error('[ota-updater]', error);
+        broadcast({ state: 'error', message: error });
+        return { success: false, error };
+      }
+      extractedManifest.sha512 = latest.sha512;
+      extractedManifest.filesHash = latest.filesHash;
+      extractedManifest.signature = latest.signature;
+      writeFileSync(extractedManifestPath, JSON.stringify(extractedManifest, null, 2));
+    } catch (err) {
+      rmSync(stagingDir, { recursive: true, force: true });
+      const error = `Failed to persist OTA signature to manifest: ${err}`;
       broadcast({ state: 'error', message: error });
       return { success: false, error };
     }

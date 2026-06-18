@@ -192,7 +192,14 @@ const appAPI = {
         }>
       >,
     marketplaceInstall: (pluginName: string) =>
-      ipcRenderer.invoke('plugin:marketplace-install', pluginName) as Promise<{ success: boolean }>,
+      ipcRenderer.invoke('plugin:marketplace-install', pluginName) as Promise<{
+        success: boolean;
+        needsConfirmation?: boolean;
+        pluginName?: string;
+        reason?: 'no-integrity-hash';
+      }>,
+    marketplaceInstallUnverified: (pluginName: string) =>
+      ipcRenderer.invoke('plugin:marketplace-install-unverified', pluginName) as Promise<{ success: boolean }>,
     marketplaceUninstall: (pluginName: string) =>
       ipcRenderer.invoke('plugin:marketplace-uninstall', pluginName) as Promise<{ success: boolean }>,
     marketplaceRefresh: () =>
@@ -546,7 +553,7 @@ const appAPI = {
       ipcRenderer.invoke('stt:stream-start', options) as Promise<{ ok?: boolean; error?: string }>,
     streamStop: () => ipcRenderer.invoke('stt:stream-stop') as Promise<{ text: string; error?: string }>,
     streamCancel: () => ipcRenderer.invoke('stt:stream-cancel') as Promise<{ ok?: boolean }>,
-    batchTranscribe: (options: { wavBase64?: string; tempFilePath?: string; language: string }) =>
+    batchTranscribe: (options: { wavBase64?: string; language: string }) =>
       ipcRenderer.invoke('stt:batch-transcribe', options) as Promise<{
         text: string;
         durationSec?: number;

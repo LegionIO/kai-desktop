@@ -161,6 +161,12 @@ export function resolveProcessStreamingConfig(config: AppConfig): ProcessStreami
 
 export type RunProcessOptions = {
   command: string;
+  /**
+   * When provided, spawn `argv[0]` with `argv.slice(1)` directly (shell: false)
+   * instead of passing `command` through a shell. `command` is still used for
+   * logging/display purposes.
+   */
+  argv?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs: number;
@@ -187,7 +193,7 @@ export type RunProcessResult = {
 };
 
 export async function runCommandWithStreaming(options: RunProcessOptions): Promise<RunProcessResult> {
-  const { command, cwd, env, timeoutMs, context, streaming } = options;
+  const { command, argv, cwd, env, timeoutMs, context, streaming } = options;
   await primeResolvedShellPath();
   const effectiveEnv = getResolvedProcessEnv(env);
 
@@ -217,13 +223,21 @@ export async function runCommandWithStreaming(options: RunProcessOptions): Promi
   let cancelled = false;
   let terminationRequested = false;
 
-  const child = spawn(command, {
-    cwd,
-    env: effectiveEnv,
-    shell: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32',
-  });
+  const child = argv && argv.length > 0
+    ? spawn(argv[0], argv.slice(1), {
+        cwd,
+        env: effectiveEnv,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+      })
+    : spawn(command, {
+        cwd,
+        env: effectiveEnv,
+        shell: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+      });
 
   child.stdout?.setEncoding('utf-8');
   child.stderr?.setEncoding('utf-8');

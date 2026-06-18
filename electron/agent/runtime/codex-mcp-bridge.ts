@@ -116,9 +116,20 @@ export function buildCodexMcpPrompt(prompt: string, tools: ToolDefinition[]): st
   ].join('\n');
 }
 
-export function buildCodexMcpServerConfig(url: string, tools: ToolDefinition[]): Record<string, unknown> {
+export function buildCodexMcpServerConfig(
+  url: string,
+  tools: ToolDefinition[],
+  authToken?: string | null,
+  authTokenEnvVar?: string | null,
+): Record<string, unknown> {
   return {
     url,
+    // Codex CLI's streamable-HTTP MCP transport reads the bearer token from
+    // an env var named here, NOT from an http_headers map. The runtime sets
+    // process.env[<authTokenEnvVar>] before spawning the CLI. The env var
+    // name is unique per bridge instance so concurrent Codex runs do not
+    // clobber each other's tokens.
+    ...(authToken && authTokenEnvVar ? { bearer_token_env_var: authTokenEnvVar } : {}),
     enabled_tools: getCodexMcpToolEntries(tools).map(({ name }) => name),
   };
 }
@@ -160,6 +171,8 @@ export class CodexMcpBridge {
   private mcpServer: McpServerInstance | null = null;
   private transport: TransportInstance | null = null;
   private port: number | null = null;
+  private authToken: string | null = null;
+  private authTokenEnvVar: string | null = null;
 
   /**
    * Start the local MCP bridge server.
@@ -286,12 +299,25 @@ export class CodexMcpBridge {
       sessionIdGenerator: () => randomUUID(),
     }) as unknown as TransportInstance;
 
+    // Per-bridge bearer token — only the spawned Codex CLI is given this value,
+    // so other local processes cannot drive Kai's tools via this loopback port.
+    this.authToken = randomUUID();
+    // Unique env-var name per bridge instance so concurrent Codex runs each
+    // read their own token instead of racing on a shared process.env key.
+    this.authTokenEnvVar =
+      'KAI_MCP_BRIDGE_TOKEN_' + randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
+
     // 4. Create HTTP server
     await new Promise<void>((resolve, reject) => {
       this.httpServer = createServer(async (req, res) => {
         const url = new URL(req.url ?? '/', `http://127.0.0.1`);
         console.info(`[codex-mcp-bridge] ${req.method} ${url.pathname}`);
         if (url.pathname === '/mcp') {
+          if (req.headers.authorization !== `Bearer ${this.authToken}`) {
+            res.writeHead(401);
+            res.end('Unauthorized');
+            return;
+          }
           try {
             await this.transport!.handleRequest(req, res);
           } catch (err) {
@@ -359,12 +385,24 @@ export class CodexMcpBridge {
     }
 
     this.port = null;
+    this.authToken = null;
+    this.authTokenEnvVar = null;
     console.info('[codex-mcp-bridge] Stopped');
   }
 
   /** Whether the bridge is currently running. */
   get isRunning(): boolean {
     return this.httpServer !== null && this.port !== null;
+  }
+
+  /** Bearer token required in the Authorization header, or null if not running. */
+  getAuthToken(): string | null {
+    return this.authToken;
+  }
+
+  /** Per-instance env var name the Codex CLI reads the bearer token from, or null if not running. */
+  getAuthTokenEnvVar(): string | null {
+    return this.authTokenEnvVar;
   }
 
   /** The port the bridge is listening on, or null if not running. */

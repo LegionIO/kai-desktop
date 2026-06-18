@@ -29,12 +29,17 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
   return cPatch > iPatch;
 }
 
-// Parse author string like "Name <https://example.com>" into {name, url}
+// Parse author string like "Name <https://example.com>" into {name, url}.
+// The URL is only returned if it uses an allowlisted scheme (https:// or
+// mailto:) — anything else (javascript:, data:, file:, etc.) is dropped so
+// the caller renders plain text instead of a link.
 function parseAuthor(author?: string): { name: string; url?: string } | null {
   if (!author) return null;
   const match = author.match(/^(.+?)\s*<(.+?)>$/);
   if (match) {
-    return { name: match[1].trim(), url: match[2].trim() };
+    const rawUrl = match[2].trim();
+    const url = /^(https:\/\/|mailto:)/i.test(rawUrl) ? rawUrl : undefined;
+    return { name: match[1].trim(), url };
   }
   return { name: author.trim() };
 }
@@ -96,7 +101,17 @@ export const PluginMarketplace: FC = () => {
   const handleInstall = async (pluginName: string) => {
     setInstallingPlugins((prev) => new Set([...prev, pluginName]));
     try {
-      await app.plugins.marketplaceInstall(pluginName);
+      const result = await app.plugins.marketplaceInstall(pluginName);
+      if (result.needsConfirmation) {
+        const accepted = window.confirm(
+          `"${result.pluginName ?? pluginName}" has no published integrity hash. ` +
+          'Installing it means trusting whatever the download server returns. Install anyway?',
+        );
+        if (!accepted) {
+          return;
+        }
+        await app.plugins.marketplaceInstallUnverified(pluginName);
+      }
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to install ${pluginName}`);

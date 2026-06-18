@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
+import { createHash } from 'crypto';
 import { execFile } from 'child_process';
 import { net } from 'electron';
 import type { AppConfig } from '../config/schema.js';
@@ -16,6 +17,8 @@ export type MarketplacePluginEntry = {
   description: string;
   repository: string;
   version: string;
+  /** sha256 of the release tarball, verified before extraction. */
+  archiveHash?: string;
   fileHash?: string;
   hash?: string;
   author?: string;
@@ -38,6 +41,27 @@ export type MarketplaceCatalogEntry = MarketplacePluginEntry & {
   marketplaceUrl: string;
 };
 
+/**
+ * Thrown by {@link MarketplaceService.installPlugin} when the catalog entry
+ * publishes no integrity hash (neither archiveHash, fileHash, nor hash). The
+ * IPC handler catches this and surfaces a user-consent prompt before retrying.
+ */
+export class UnverifiedPluginError extends Error {
+  constructor(public pluginName: string) {
+    super(`Plugin "${pluginName}" has no published integrity hash`);
+    this.name = 'UnverifiedPluginError';
+  }
+}
+
+/**
+ * Permissions that grant code-execution or secret-read capability and
+ * therefore require explicit user consent. Mirrors
+ * PluginManager.DANGEROUS_PERMISSIONS (private) — keep in sync.
+ */
+const DANGEROUS_PERMISSIONS = new Set<string>(['exec:whitelisted', 'config:read-secrets']);
+
+const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+
 /* ── Service ── */
 
 export class MarketplaceService {
@@ -49,6 +73,7 @@ export class MarketplaceService {
     private appHome: string,
     private getConfig: () => AppConfig,
     private setConfig: (path: string, value: unknown) => void,
+    private brandRequiredPluginNames: ReadonlySet<string> = new Set(),
   ) {
     this.cacheDir = join(appHome, 'data');
   }
@@ -142,7 +167,17 @@ export class MarketplaceService {
 
   /* ── Plugin install ── */
 
-  async installPlugin(entry: MarketplaceCatalogEntry): Promise<PluginIntegrity> {
+  async installPlugin(entry: MarketplaceCatalogEntry, opts?: { skipHashCheck?: boolean }): Promise<PluginIntegrity> {
+    if (!PLUGIN_NAME_RE.test(entry.name)) {
+      throw new Error(`Invalid plugin name in catalog: ${entry.name}`);
+    }
+    // Only the "no hash published at all" case can be bypassed by user consent.
+    // If an archiveHash *is* present it is still verified below regardless of
+    // skipHashCheck — the bypass never weakens a hash that exists.
+    if (!opts?.skipHashCheck && !entry.archiveHash && !entry.fileHash && !entry.hash) {
+      throw new UnverifiedPluginError(entry.name);
+    }
+
     const destDir = join(this.pluginsDir, entry.name);
     const tmpDir = join(this.pluginsDir, `.tmp-${entry.name}-${Date.now()}`);
 
@@ -195,10 +230,21 @@ export class MarketplaceService {
         throw new Error(`Failed to download plugin "${entry.name}": HTTP ${response.status}`);
       }
 
+      const arrayBuffer = await response.arrayBuffer();
+      const archiveBuffer = Buffer.from(arrayBuffer);
+
+      // Verify the tarball integrity BEFORE writing it to disk or feeding it
+      // to tar — a malicious archive could otherwise exploit the extractor.
+      const archiveHash = createHash('sha256').update(archiveBuffer).digest('hex');
+      if (entry.archiveHash && archiveHash !== entry.archiveHash) {
+        throw new Error(
+          `Plugin "${entry.name}" archive integrity check failed: expected ${entry.archiveHash}, got ${archiveHash}`,
+        );
+      }
+
       // Write tarball to temp file
       const tarballPath = join(tmpDir, 'plugin.tar.gz');
-      const arrayBuffer = await response.arrayBuffer();
-      writeFileSync(tarballPath, Buffer.from(arrayBuffer));
+      writeFileSync(tarballPath, archiveBuffer);
 
       // Extract tarball
       await new Promise<void>((resolve, reject) => {
@@ -249,7 +295,12 @@ export class MarketplaceService {
         },
       };
       this.setConfig('marketplace.installedPlugins', installedPlugins);
-      this.persistPluginApproval(entry.name, fileHash, manifest.permissions);
+
+      const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
+      const hasDangerous = manifest.permissions.some((p) => DANGEROUS_PERMISSIONS.has(p));
+      if (isBrandRequired || !hasDangerous) {
+        this.persistPluginApproval(entry.name, fileHash, manifest.permissions);
+      }
       if (this.cachedCatalog) {
         this.cachedCatalog = this.cachedCatalog.map((catalogEntry) =>
           catalogEntry.name === entry.name
@@ -293,7 +344,20 @@ export class MarketplaceService {
   /* ── Plugin uninstall ── */
 
   uninstallPlugin(pluginName: string): void {
+    if (
+      !pluginName ||
+      pluginName.includes('/') ||
+      pluginName.includes('\\') ||
+      pluginName === '.' ||
+      pluginName === '..'
+    ) {
+      throw new Error('Invalid plugin name');
+    }
+
     const pluginDir = join(this.pluginsDir, pluginName);
+    if (!resolve(pluginDir).startsWith(resolve(this.pluginsDir) + sep)) {
+      throw new Error('Invalid plugin name');
+    }
     if (existsSync(pluginDir)) {
       rmSync(pluginDir, { recursive: true, force: true });
     }
@@ -384,7 +448,11 @@ export class MarketplaceService {
 
     const approval = this.getConfig().pluginApprovals?.[entry.name];
     if (!approval || approval.hash !== installed.fileHash || !arePermissionSetsEqual(approval.permissions, installed.permissions)) {
-      this.persistPluginApproval(entry.name, installed.fileHash, installed.permissions);
+      const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
+      const hasDangerous = installed.permissions.some((p) => DANGEROUS_PERMISSIONS.has(p));
+      if (isBrandRequired || !hasDangerous) {
+        this.persistPluginApproval(entry.name, installed.fileHash, installed.permissions);
+      }
     }
 
     return null;

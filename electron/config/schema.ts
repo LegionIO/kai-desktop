@@ -438,6 +438,58 @@ const cliToolSchema = z.object({
 // Autopilot (Orchestrator)
 // ---------------------------------------------------------------------------
 
+/**
+ * Default denylist for environment variables that agent processes may NOT override.
+ * Glob patterns (`*` prefix/suffix) are supported. These guard against PATH/loader
+ * hijacking and credential exfiltration via overridden API endpoints.
+ */
+export const DEFAULT_AGENT_ENV_DENYLIST = [
+  'PATH',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'DYLD_*',
+  'LD_*',
+  '*_BASE_URL',
+  '*_API_KEY',
+  // Config-root redirects — overriding these lets the agent point the CLI at
+  // an attacker-controlled config file, bypassing the args denylist below.
+  'HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME',
+  'CODEX_HOME',
+  'CLAUDE_CONFIG_DIR',
+  'ANTHROPIC_CONFIG_DIR',
+] as const;
+
+/**
+ * Default denylist for CLI arguments that agent processes may NOT receive via
+ * `config.customArgs`. Glob patterns (`*` prefix/suffix) are supported. These
+ * guard against permission-bypass flags and arbitrary code/config injection.
+ */
+export const DEFAULT_AGENT_ARGS_DENYLIST = [
+  '--dangerously*',
+  // Trailing `*` on long options also catches the `--opt=value` form.
+  '--eval*',
+  '--mcp-config*',
+  '--config*',
+  // Permission / sandbox override flags for claude-code and codex CLIs
+  // (both camelCase and kebab-case aliases)
+  '--permission-mode*',
+  '--permissionMode*',
+  '--sandbox*',
+  '--ask-for-approval*',
+  '--allowedTools*',
+  '--allowed-tools*',
+  '--add-dir*',
+  // Short flags with attached values (-cfoo, -sfoo, -afoo, -efoo). Glob match
+  // is exact-or-prefix so `-c*` matches `-c` AND `-csandbox_mode=...` but NOT
+  // `--color` (different leading chars).
+  '-c*',
+  '-e*',
+  '-s*',
+  '-a*',
+] as const;
+
 const reviewPolicySchema = z.object({
   /** Minimum AI reviewers autopilot should assign. 0 = no AI review. */
   minReviewers: z.number().min(0).max(5).default(2),
@@ -485,6 +537,26 @@ const autopilotConfigSchema = z.object({
     enabled: true,
     maxAttempts: 2,
   }),
+  /**
+   * Env-var keys (glob `*` prefix/suffix supported) that agent `config.env` may NOT set.
+   * Applied in startAgentRun before the env is handed to the PTY.
+   */
+  agentEnvDenylist: z.array(z.string()).default([...DEFAULT_AGENT_ENV_DENYLIST]),
+  /**
+   * If set and non-empty, agent `config.env` keys must ALSO match one of these patterns
+   * (after surviving the denylist). Unset/empty = allow anything not denied.
+   */
+  agentEnvAllowlist: z.array(z.string()).optional(),
+  /**
+   * CLI args (glob `*` prefix/suffix supported) that agent `config.customArgs` may NOT contain.
+   * Applied in startAgentRun before args are handed to the PTY.
+   */
+  agentArgsDenylist: z.array(z.string()).default([...DEFAULT_AGENT_ARGS_DENYLIST]),
+  /**
+   * If set and non-empty, agent `config.customArgs` entries must ALSO match one of these
+   * patterns (after surviving the denylist). Unset/empty = allow anything not denied.
+   */
+  agentArgsAllowlist: z.array(z.string()).optional(),
 });
 
 export type AutopilotConfig = z.infer<typeof autopilotConfigSchema>;
@@ -587,6 +659,7 @@ export const appConfigSchema = z.object({
       .object({
         enabled: z.boolean().default(true),
         timeout: z.number().positive().optional(),
+        allowPrivateNetworks: z.boolean().default(false),
       })
       .optional(),
     webSearch: z

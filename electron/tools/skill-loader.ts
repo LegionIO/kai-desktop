@@ -8,6 +8,7 @@ import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { buildScopedToolName, findToolByName } from './naming.js';
 import type { AppConfig } from '../config/schema.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
+import { isCommandAllowed } from './shell.js';
 import { runToolExecution } from './execution.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
 
@@ -61,6 +62,35 @@ export function interpolateTemplate(template: string, input: Record<string, unkn
     }
     return current == null ? '' : String(current);
   });
+}
+
+function shellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Like interpolateTemplate, but each substituted value is single-quoted for the
+ * shell so that interpolated input cannot break out of argument position.
+ *
+ * The regex also consumes an optional pair of single- or double-quotes that
+ * directly surround the placeholder in the template, so that pre-existing
+ * skill templates written as `./run.sh '{{input.name}}'` produce
+ * `./run.sh 'value'` (safe) rather than `./run.sh ''value''` (which would
+ * un-quote the value and re-introduce injection).
+ */
+export function interpolateTemplateShellSafe(template: string, input: Record<string, unknown>): string {
+  return template.replace(
+    /(['"]?)\{\{input\.([^}]+)\}\}\1/g,
+    (_match, _quote: string, path: string) => {
+      const keys = path.trim().split('.');
+      let current: unknown = input;
+      for (const key of keys) {
+        if (current == null || typeof current !== 'object') return shellQuote('');
+        current = (current as Record<string, unknown>)[key];
+      }
+      return shellQuote(current == null ? '' : String(current));
+    },
+  );
 }
 
 /* ── JSON Schema → Zod conversion ── */
@@ -184,8 +214,14 @@ async function runShellExecution(
   getConfig: () => AppConfig,
 ): Promise<Record<string, unknown>> {
   const command = manifest.execution.command ?? './run.sh';
-  const resolvedCommand = interpolateTemplate(command, input);
+  const resolvedCommand = interpolateTemplateShellSafe(command, input);
   const config = getConfig();
+
+  const check = isCommandAllowed(resolvedCommand, config);
+  if (!check.allowed) {
+    return { error: check.reason, isError: true };
+  }
+
   const streaming = resolveProcessStreamingConfig(config);
 
   // Create a minimal execution context for process-runner (no progress/abort in workflow steps)

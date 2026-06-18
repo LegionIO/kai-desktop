@@ -28,6 +28,26 @@ export interface OtaManifest {
   files: Record<string, OtaFileEntry>;
   /** ISO timestamp when this OTA archive was created */
   createdAt: string;
+  /**
+   * SHA-512 of the archive this manifest was extracted from.
+   * Persisted by the updater after a verified download so that bootstrap can
+   * rebuild the signed payload on every launch. Absent in legacy overlays.
+   */
+  sha512?: string;
+  /**
+   * Deterministic SHA-256 over the sorted `files` map (see
+   * signing.ts#computeFilesHash). Included in the signed payload so the
+   * per-file integrity table cannot be forged on disk. Absent in legacy
+   * overlays; new clients refuse to boot an overlay without it.
+   */
+  filesHash?: string;
+  /**
+   * Base64 Ed25519 signature over
+   * `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`.
+   * Persisted by the updater after a verified download. Absent in legacy
+   * overlays; new clients refuse to boot an overlay without it.
+   */
+  signature?: string;
 }
 
 /**
@@ -90,6 +110,18 @@ export interface OtaFeedEntry {
   size: number;
   /** ISO timestamp of publication */
   releaseDate: string;
+  /**
+   * Deterministic SHA-256 over the sorted manifest.files map (see
+   * signing.ts#computeFilesHash). Additive: old clients ignore this field;
+   * new clients require it as part of the signed payload.
+   */
+  filesHash?: string;
+  /**
+   * Base64 Ed25519 signature over
+   * `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`.
+   * Additive: old clients ignore this field; new clients refuse unsigned feeds.
+   */
+  signature?: string;
 }
 
 /**

@@ -199,6 +199,49 @@ async function main(): Promise<void> {
   }
 
   console.info(`[fuses] OK — all ${EXPECTED.length} required fuses match expected values`);
+
+  // ── OTA public-key release gate ───────────────────────────────────────────
+  // The runtime intentionally falls open (sha512-only) when the baked-in
+  // OTA_PUBLIC_KEY is still the placeholder, so that a build shipped without
+  // a real key can still receive its next OTA update instead of being
+  // bricked. That fail-open is acceptable ONLY if it never reaches users —
+  // so this release gate fails CI builds loudly when the placeholder is
+  // still present. Local developer runs (CI unset) are exempt.
+  //
+  // signing.ts only depends on `crypto`, so it is safe to import from a
+  // plain Node/tsx script (no `electron` import is pulled in).
+  // Read the branding config directly rather than importing signing.ts —
+  // signing.ts now reads __BRAND_OTA_PUBLIC_KEY which is a Vite define and
+  // not available in raw tsx execution.
+  const { branding } = await import('../branding.config.js');
+  let mergedBranding: Record<string, unknown> = { ...branding };
+  try {
+    const local = await import('../branding.config.local.js');
+    mergedBranding = { ...mergedBranding, ...(local.brandingLocal ?? local.default ?? {}) };
+  } catch {
+    // No local override — fine.
+  }
+  const otaPublicKey = String(mergedBranding.otaPublicKey ?? '');
+  const OTA_PUBLIC_KEY_IS_PLACEHOLDER = !otaPublicKey || !otaPublicKey.includes('BEGIN PUBLIC KEY');
+  if (OTA_PUBLIC_KEY_IS_PLACEHOLDER) {
+    // Only fail RELEASE builds — PR/branch CI runs verify:fuses too and
+    // shouldn't be blocked while the kai-builder signing-key rollout is
+    // in progress. release.yml sets KAI_RELEASE_BUILD=1.
+    if (process.env.KAI_RELEASE_BUILD === '1') {
+      console.error(
+        '[fuses] FATAL: OTA public key is missing — set `otaPublicKey` in branding.config.ts ' +
+          '(or your brand override) to the Ed25519 public PEM matching KAI_OTA_SIGNING_KEY. ' +
+          'Packaged binaries built without it fall back to sha512-only OTA verification.',
+      );
+      process.exit(1);
+    }
+    console.warn(
+      '[fuses] WARNING: branding.otaPublicKey is missing. ' +
+        'This is allowed for local/PR builds but will fail release builds (KAI_RELEASE_BUILD=1).',
+    );
+  } else {
+    console.info('[fuses] OK — OTA public key is set in branding config');
+  }
 }
 
 main().catch((err: unknown) => {

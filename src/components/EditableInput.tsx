@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
   type ClipboardEvent,
 } from 'react';
+import { escapeHtml } from '@/lib/utils';
 
 type EditableInputProps = {
   value: string;
@@ -38,7 +39,7 @@ export const EditableInput: FC<EditableInputProps> = ({
   const toHTML = useCallback((text: string): string => {
     if (!text) return '';
     if (type === 'password') return '•'.repeat(text.length);
-    return text;
+    return escapeHtml(text);
   }, [highlightBrand, type]);
 
   // --- Cursor save/restore (same as EditableTextarea) ---

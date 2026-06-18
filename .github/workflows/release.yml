@@ -135,6 +135,12 @@ jobs:
 
       - run: pnpm build:mac
 
+      - name: Verify Electron fuses + OTA public key
+        run: pnpm verify:fuses
+        env:
+          CI: 'true'
+          KAI_RELEASE_BUILD: '1'
+
       - name: Verify update zip preserves framework symlinks
         run: |
           ZIP_PATH="$(find dist -maxdepth 1 -type f -name '*.zip' | head -n 1)"
@@ -252,15 +258,13 @@ jobs:
         if: steps.ota-classify.outputs.eligible == 'true'
         env:
           MIN_BASE_VERSION: ${{ steps.ota-classify.outputs.min_base_version }}
+          KAI_OTA_SIGNING_KEY: ${{ secrets.KAI_OTA_SIGNING_KEY }}
         run: |
+          # build-ota-archive.ts now reads MIN_BASE_VERSION and KAI_OTA_SIGNING_KEY
+          # directly and writes a signed feed — the post-hoc node -e patch step
+          # has been removed because mutating the feed after signing would
+          # invalidate the Ed25519 signature.
           node --import tsx scripts/build-ota-archive.ts
-          # Patch the minBaseVersion in the feed (classify-release knows the real minimum)
-          node -e "
-            const fs = require('fs');
-            const feed = JSON.parse(fs.readFileSync('dist/latest-ota.json', 'utf-8'));
-            feed.latest.minBaseVersion = '$MIN_BASE_VERSION';
-            fs.writeFileSync('dist/latest-ota.json', JSON.stringify(feed, null, 2));
-          "
 
       - name: Upload OTA artifacts
         if: steps.ota-classify.outputs.eligible == 'true'

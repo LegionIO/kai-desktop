@@ -20,6 +20,9 @@ function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
 
   for (const entry of entries) {
     const fullPath = join(currentDir, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Symbolic links are not allowed in plugin directories: ${fullPath}`);
+    }
     if (entry.isDirectory()) {
       files.push(...collectPluginFiles(rootDir, fullPath));
       continue;

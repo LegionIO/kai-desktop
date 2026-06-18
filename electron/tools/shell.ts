@@ -4,13 +4,31 @@ import type { ToolDefinition } from './types.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { runToolExecution } from './execution.js';
 
-function matchesPattern(command: string, pattern: string): boolean {
+function buildWildcardRegex(pattern: string): RegExp {
+  // Escape all regex metacharacters except `*`, which we map to `.*` below.
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('^' + escaped.replace(/\*/g, '.*') + '$');
+}
+
+/** Allow-pattern matching: anchored at the start of the command. */
+function matchesAllowPattern(command: string, pattern: string): boolean {
   if (pattern === '*') return true;
-  if (pattern.includes('*')) {
-    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
-    return regex.test(command);
-  }
-  return command.includes(pattern);
+  if (pattern.includes('*')) return buildWildcardRegex(pattern).test(command);
+  return command.trimStart().startsWith(pattern);
+}
+
+/**
+ * Deny-pattern matching: whitespace-normalized substring search anywhere in
+ * the command. Deny semantics are intentionally broader than allow — a deny
+ * of `rm -rf /` should still catch `sudo rm  -rf /` and `env X=1 rm -rf /`.
+ * (This is best-effort; quoting/expansion can still evade textual matching.)
+ */
+function matchesDenyPattern(command: string, pattern: string): boolean {
+  if (pattern === '*') return true;
+  const normCommand = command.replace(/\s+/g, ' ');
+  const normPattern = pattern.replace(/\s+/g, ' ');
+  if (normPattern.includes('*')) return buildWildcardRegex(normPattern).test(normCommand);
+  return normCommand.includes(normPattern);
 }
 
 export function isCommandAllowed(command: string, config: AppConfig): { allowed: boolean; reason?: string } {
@@ -18,13 +36,13 @@ export function isCommandAllowed(command: string, config: AppConfig): { allowed:
   if (!shellConfig.enabled) return { allowed: false, reason: 'Shell tool is disabled' };
 
   for (const pattern of shellConfig.denyPatterns) {
-    if (matchesPattern(command, pattern)) {
+    if (matchesDenyPattern(command, pattern)) {
       return { allowed: false, reason: `Command matches deny pattern: ${pattern}` };
     }
   }
 
   if (shellConfig.allowPatterns.length > 0 && !shellConfig.allowPatterns.includes('*')) {
-    const allowed = shellConfig.allowPatterns.some((p) => matchesPattern(command, p));
+    const allowed = shellConfig.allowPatterns.some((p) => matchesAllowPattern(command, p));
     if (!allowed) return { allowed: false, reason: 'Command does not match any allow pattern' };
   }
 

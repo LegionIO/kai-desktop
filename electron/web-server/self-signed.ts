@@ -1,5 +1,5 @@
 import forge from 'node-forge';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { networkInterfaces } from 'os';
@@ -107,11 +107,16 @@ function generateSelfSignedCert(addresses: string[]): { cert: string; key: strin
  * Reuses an existing cert if it's non-expired and covers all current IPs.
  */
 export function ensureSelfSignedCert(): { cert: string; key: string } {
-  mkdirSync(CERT_DIR, { recursive: true });
+  mkdirSync(CERT_DIR, { recursive: true, mode: 0o700 });
+  // `mode` is only applied when mkdirSync actually creates the directory;
+  // tighten perms on a pre-existing directory (e.g. upgraded installs).
+  try { chmodSync(CERT_DIR, 0o700); } catch { /* best-effort */ }
   const addresses = getLocalAddresses();
   const meta = readMeta();
 
   if (meta && isCertValid(meta, addresses)) {
+    // Tighten perms on an existing key written before the 0o600 mode was added.
+    try { chmodSync(KEY_PATH, 0o600); } catch { /* best-effort */ }
     return {
       cert: readFileSync(CERT_PATH, 'utf-8'),
       key: readFileSync(KEY_PATH, 'utf-8'),
@@ -123,7 +128,9 @@ export function ensureSelfSignedCert(): { cert: string; key: string } {
   const { cert, key } = generateSelfSignedCert(addresses);
 
   writeFileSync(CERT_PATH, cert, 'utf-8');
-  writeFileSync(KEY_PATH, key, 'utf-8');
+  writeFileSync(KEY_PATH, key, { encoding: 'utf-8', mode: 0o600 });
+  // `mode` only applies on file creation; enforce 0o600 if the file already existed.
+  try { chmodSync(KEY_PATH, 0o600); } catch { /* best-effort */ }
   writeFileSync(META_PATH, JSON.stringify({
     addresses,
     notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),

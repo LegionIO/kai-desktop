@@ -11,7 +11,7 @@
  *   - latest-ota.json             — The OTA feed manifest for the updater
  */
 
-import { createHash } from 'crypto';
+import { createHash, createPrivateKey, sign as cryptoSign } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs';
 import { resolve, dirname, relative, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,18 @@ const distDir = resolve(root, 'dist');
 const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8'));
 const version: string = pkg.version;
 const appSlug: string = branding.appSlug as string;
+
+// The release pipeline (release.yml → classify-release.ts) computes the real
+// minimum compatible shell version and exports it as MIN_BASE_VERSION before
+// invoking this script. It MUST be read here so the manifest, the feed, and
+// the Ed25519-signed payload all agree on the same value.
+//
+// NOTE for kai-builder maintainers: because this script now consumes
+// MIN_BASE_VERSION directly, release.yml no longer needs the post-hoc
+// `node -e` step that patched `dist/latest-ota.json` after the build — that
+// patch step would now desync the feed from the signed payload and should be
+// removed.
+const minBaseVersion: string = process.env.MIN_BASE_VERSION ?? version;
 
 // Validate that the out/ directory exists and has content
 if (!existsSync(outDir)) {
@@ -91,11 +103,29 @@ console.info(`[build-ota] Found ${files.size} files`);
 
 // ── Generate manifest ────────────────────────────────────────────────────────
 
+const filesRecord: Record<string, FileEntry> = Object.fromEntries(files);
+
+/**
+ * Deterministic hash over the manifest.files map.
+ * MUST match electron/ota/signing.ts#computeFilesHash exactly.
+ */
+function computeFilesHash(f: Record<string, { sha512: string }>): string {
+  const keys = Object.keys(f).sort();
+  let canon = '';
+  for (const key of keys) {
+    canon += `${key}\0${f[key].sha512}\n`;
+  }
+  return createHash('sha256').update(canon, 'utf8').digest('hex');
+}
+
+const filesHash = computeFilesHash(filesRecord);
+
 const manifest = {
   codeVersion: version,
   baseVersion: version, // The base version this was built against (same version for now)
-  minBaseVersion: version, // Will be overridden by classify-release in CI
-  files: Object.fromEntries(files),
+  minBaseVersion,
+  files: filesRecord,
+  filesHash,
   createdAt: new Date().toISOString(),
 };
 
@@ -147,16 +177,58 @@ console.info(`[build-ota] Archive created: ${archiveName}`);
 console.info(`[build-ota] Size: ${(archiveStat.size / 1024 / 1024).toFixed(2)} MB`);
 console.info(`[build-ota] SHA-512: ${archiveHash.slice(0, 16)}...`);
 
+// ── Sign the archive (Ed25519) ───────────────────────────────────────────────
+//
+// Canonical signed payload — MUST match electron/ota/signing.ts#buildSignedPayload:
+//   `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`
+//
+// The private key is supplied via KAI_OTA_SIGNING_KEY (PEM-encoded Ed25519
+// private key) by the kai-builder CI pipeline. Local/dev builds without the
+// key produce an unsigned feed, which packaged clients will refuse — set
+// KAI_OTA_SKIP_SIGNATURE=1 when testing those locally.
+
+let signature: string | undefined;
+const signingKeyPem = process.env.KAI_OTA_SIGNING_KEY;
+if (signingKeyPem) {
+  try {
+    const privateKey = createPrivateKey(signingKeyPem);
+    const payload = Buffer.from(
+      `${archiveHash}\n${version}\n${minBaseVersion}\n${filesHash}`,
+      'utf8',
+    );
+    // Ed25519 → algorithm must be null
+    signature = cryptoSign(null, payload, privateKey).toString('base64');
+    console.info(`[build-ota] Signed archive (Ed25519): ${signature.slice(0, 16)}...`);
+  } catch (err) {
+    console.error('[build-ota] FATAL: KAI_OTA_SIGNING_KEY was set but signing failed:', err);
+    process.exit(1);
+  }
+} else if (process.env.CI === 'true') {
+  console.error(
+    '[build-ota] FATAL: KAI_OTA_SIGNING_KEY is not set in CI. ' +
+      'Configure the secret in the release workflow before publishing.',
+  );
+  process.exit(1);
+} else {
+  console.warn(
+    '[build-ota] WARNING: KAI_OTA_SIGNING_KEY not set — emitting UNSIGNED feed. ' +
+      'Packaged clients will refuse this update.',
+  );
+}
+
 // ── Generate latest-ota.json feed ────────────────────────────────────────────
 
 const feed = {
   latest: {
     codeVersion: version,
-    minBaseVersion: manifest.minBaseVersion,
+    minBaseVersion,
     url: archiveName,
     sha512: archiveHash,
     size: archiveStat.size,
     releaseDate: new Date().toISOString(),
+    filesHash,
+    // Additive: old clients ignore this; new clients require it.
+    ...(signature ? { signature } : {}),
   },
 };
 
@@ -169,5 +241,6 @@ console.info(`[build-ota] Feed written: latest-ota.json`);
 console.info('\n[build-ota] OTA archive build complete:');
 console.info(`  Archive: dist/${archiveName} (${(archiveStat.size / 1024 / 1024).toFixed(2)} MB)`);
 console.info(`  Feed:    dist/latest-ota.json`);
-console.info(`  Version: ${version}`);
+console.info(`  Version: ${version} (minBase ${minBaseVersion})`);
+console.info(`  Signed:  ${signature ? 'yes (Ed25519)' : 'NO — unsigned'}`);
 console.info(`  Files:   ${files.size}`);

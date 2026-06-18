@@ -138,13 +138,7 @@ const ServerCard: FC<{
     }
     setTestResult({ status: 'testing' });
     try {
-      const result = await app.mcp.testConnection({
-        name: server.name,
-        url: server.url,
-        command: server.command,
-        args: server.args,
-        env: server.env,
-      });
+      const result = await app.mcp.testConnection(server);
       setTestResult({
         status: result.status === 'connected' ? 'connected' : 'error',
         toolCount: result.toolCount,
@@ -253,38 +247,9 @@ const ServerForm: FC<{
   const [testResult, setTestResult] = useState<TestResult | null>(null);
 
   const canSave = name.trim() && (transport === 'url' ? url.trim() : command.trim());
-  const canTest = transport === 'url' ? url.trim() : command.trim();
+  const canTest = canSave;
 
-  const handleTest = async () => {
-    if (!canTest) return;
-    setTestResult({ status: 'testing' });
-    try {
-      const serverConfig: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> } = {
-        name: name.trim() || '__form_test__',
-      };
-      if (transport === 'url') {
-        serverConfig.url = url.trim();
-      } else {
-        serverConfig.command = command.trim();
-        const parsedArgs = args.trim().split(/\s+/).filter(Boolean);
-        if (parsedArgs.length > 0) serverConfig.args = parsedArgs;
-      }
-      if (env.length > 0) {
-        serverConfig.env = Object.fromEntries(env.filter(([k]) => k.trim()));
-      }
-      const result = await app.mcp.testConnection(serverConfig);
-      setTestResult({
-        status: result.status === 'connected' ? 'connected' : 'error',
-        toolCount: result.toolCount,
-        error: result.error,
-      });
-    } catch (err) {
-      setTestResult({ status: 'error', error: String(err) });
-    }
-  };
-
-  const handleSave = () => {
-    if (!canSave) return;
+  const buildServer = (): McpServer => {
     const server: McpServer = {
       name: name.trim(),
       enabled,
@@ -299,7 +264,34 @@ const ServerForm: FC<{
     if (env.length > 0) {
       server.env = Object.fromEntries(env.filter(([k]) => k.trim()));
     }
-    onSave(server);
+    return server;
+  };
+
+  const handleTest = async () => {
+    if (!canTest) return;
+    setTestResult({ status: 'testing' });
+    try {
+      const server = buildServer();
+      const result = await app.mcp.testConnection({
+        name: server.name,
+        url: server.url,
+        command: server.command,
+        args: server.args,
+        env: server.env,
+      });
+      setTestResult({
+        status: result.status === 'connected' ? 'connected' : 'error',
+        toolCount: result.toolCount,
+        error: result.error,
+      });
+    } catch (err) {
+      setTestResult({ status: 'error', error: String(err) });
+    }
+  };
+
+  const handleSave = () => {
+    if (!canSave) return;
+    onSave(buildServer());
   };
 
   return (

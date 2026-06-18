@@ -4,8 +4,9 @@
  * Fetches the full markdown content for a matched role from the
  * msitarzewski/agency-agents repository. Includes in-memory caching.
  *
- * Uses https.request directly (instead of fetch) so that rejectUnauthorized: false
- * is respected — Node's built-in fetch ignores the agent option.
+ * TLS verification is enforced. Environments with corporate MITM proxies
+ * should set NODE_EXTRA_CA_CERTS to trust the proxy's CA rather than
+ * disabling verification.
  */
 
 import https from 'https';
@@ -14,17 +15,37 @@ import { ROLE_BASE_URL } from './agent-roles.js';
 /** In-memory cache for fetched templates. */
 const templateCache = new Map<string, string>();
 
+/** Only follow redirects that stay on this host. */
+const ALLOWED_REDIRECT_HOST = 'raw.githubusercontent.com';
+/** Maximum redirect chain length. */
+const MAX_REDIRECTS = 5;
+
 /**
- * Fetch a URL via https.request with TLS verification disabled.
- * Follows a single redirect if the response is 301/302/307/308.
+ * Fetch a URL via https.get with TLS verification enabled.
+ * Follows up to MAX_REDIRECTS same-host redirects.
  */
-function httpsGet(url: string, timeoutMs = 8000): Promise<string> {
+function httpsGet(url: string, timeoutMs = 8000, depth = 0): Promise<string> {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { rejectUnauthorized: false }, (res) => {
+    const req = https.get(url, (res) => {
       // Follow redirect
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         req.destroy();
-        httpsGet(res.headers.location, timeoutMs).then(resolve).catch(reject);
+        if (depth >= MAX_REDIRECTS) {
+          reject(new Error('Too many redirects'));
+          return;
+        }
+        let redirectUrl: URL;
+        try {
+          redirectUrl = new URL(res.headers.location, url);
+        } catch {
+          reject(new Error('Invalid redirect location'));
+          return;
+        }
+        if (redirectUrl.hostname !== ALLOWED_REDIRECT_HOST) {
+          reject(new Error(`Refusing to follow redirect to disallowed host: ${redirectUrl.hostname}`));
+          return;
+        }
+        httpsGet(redirectUrl.toString(), timeoutMs, depth + 1).then(resolve).catch(reject);
         return;
       }
       if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {

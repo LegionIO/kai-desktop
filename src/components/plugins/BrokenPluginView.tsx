@@ -65,7 +65,17 @@ export const BrokenPluginView: FC<BrokenPluginViewProps> = ({
     setReinstalling(true);
     setActionError(null);
     try {
-      await app.plugins.marketplaceInstall(pluginName);
+      const result = await app.plugins.marketplaceInstall(pluginName);
+      if (result?.needsConfirmation) {
+        const accepted = window.confirm(
+          `The plugin "${result.pluginName ?? pluginName}" has no published integrity hash. ` +
+            `Installing it means trusting whatever the download server returns.\n\nInstall anyway?`,
+        );
+        if (!accepted) {
+          return;
+        }
+        await app.plugins.marketplaceInstallUnverified(pluginName);
+      }
       await loadData();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Reinstall failed');

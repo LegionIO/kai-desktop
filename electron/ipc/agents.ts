@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
+import { DEFAULT_AGENT_ENV_DENYLIST, DEFAULT_AGENT_ARGS_DENYLIST } from '../config/schema.js';
 import { getRegisteredTools } from './agent.js';
 import { resolveModelCatalog } from '../agent/model-catalog.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
@@ -53,6 +54,83 @@ async function autoRestartAgent(appHome: string, agentId: string): Promise<void>
 
 function isValidId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
+}
+
+// ── Runtime / env / arg validation ──────────────────────────────────────
+//
+// Persisted agents carry caller-supplied `runtime`, `config.env`, and
+// `config.customArgs`. These flow into a PTY in startAgentRun(), so we
+// validate runtime against a fixed allowlist at write time and filter
+// env/args through a configurable dual deny+allowlist at run time.
+
+/** Runtimes an AgentFile may persist. Mirrors shared/agent-types.ts AgentRuntime. */
+const ALLOWED_AGENT_RUNTIMES: ReadonlySet<string> = new Set(['auto', 'claude-code', 'codex', 'mastra']);
+
+function isValidAgentRuntime(runtime: unknown): runtime is AgentFile['runtime'] {
+  return typeof runtime === 'string' && ALLOWED_AGENT_RUNTIMES.has(runtime);
+}
+
+/**
+ * Match a value against a simple glob pattern supporting `*` as a prefix
+ * and/or suffix wildcard only (no mid-string globs, no regex).
+ * Comparison is case-insensitive to catch `Path` / `path` on macOS.
+ */
+function matchesGlob(value: string, pattern: string): boolean {
+  const v = value.toLowerCase();
+  const p = pattern.toLowerCase();
+  const leading = p.startsWith('*');
+  const trailing = p.endsWith('*');
+  const core = p.slice(leading ? 1 : 0, trailing ? p.length - 1 : p.length);
+  if (leading && trailing) return core === '' || v.includes(core);
+  if (leading) return v.endsWith(core);
+  if (trailing) return v.startsWith(core);
+  return v === core;
+}
+
+function matchesAny(value: string, patterns: readonly string[]): boolean {
+  return patterns.some((p) => matchesGlob(value, p));
+}
+
+/**
+ * Filter agent env vars through a dual deny+allowlist.
+ * - Drop any key matching a denylist pattern.
+ * - If allowlist is non-empty, additionally drop any key NOT matching it.
+ */
+export function filterAgentEnv(
+  env: Record<string, string> | undefined,
+  denylist: readonly string[],
+  allowlist: readonly string[] | undefined,
+): Record<string, string> {
+  if (!env) return {};
+  const useAllowlist = Array.isArray(allowlist) && allowlist.length > 0;
+  const out: Record<string, string> = {};
+  for (const [key, val] of Object.entries(env)) {
+    if (typeof key !== 'string' || typeof val !== 'string') continue;
+    if (matchesAny(key, denylist)) continue;
+    if (useAllowlist && !matchesAny(key, allowlist)) continue;
+    out[key] = val;
+  }
+  return out;
+}
+
+/**
+ * Filter agent CLI args through a dual deny+allowlist.
+ * - Drop any arg matching a denylist pattern.
+ * - If allowlist is non-empty, additionally drop any arg NOT matching it.
+ */
+export function filterAgentArgs(
+  args: readonly string[] | undefined,
+  denylist: readonly string[],
+  allowlist: readonly string[] | undefined,
+): string[] {
+  if (!Array.isArray(args)) return [];
+  const useAllowlist = Array.isArray(allowlist) && allowlist.length > 0;
+  return args.filter((arg) => {
+    if (typeof arg !== 'string') return false;
+    if (matchesAny(arg, denylist)) return false;
+    if (useAllowlist && !matchesAny(arg, allowlist)) return false;
+    return true;
+  });
 }
 
 function getAgentsDir(appHome: string): string {
@@ -1013,8 +1091,16 @@ export async function startAgentRun(
   const config = readEffectiveConfig(appHome);
   const dangerousMode = config?.autopilot?.dangerousMode === true;
 
-  // Filter out any --dangerously-* flags that a renderer might try to inject
-  const safeArgs = (agent.config?.customArgs ?? []).filter((arg: string) => !arg.startsWith('--dangerously'));
+  // Filter caller-supplied args/env through the configurable dual deny+allowlist
+  // before they reach the PTY. Falls back to compiled-in defaults when the
+  // autopilot config block is absent.
+  const argsDenylist = config?.autopilot?.agentArgsDenylist ?? DEFAULT_AGENT_ARGS_DENYLIST;
+  const argsAllowlist = config?.autopilot?.agentArgsAllowlist;
+  const envDenylist = config?.autopilot?.agentEnvDenylist ?? DEFAULT_AGENT_ENV_DENYLIST;
+  const envAllowlist = config?.autopilot?.agentEnvAllowlist;
+
+  const safeArgs = filterAgentArgs(agent.config?.customArgs, argsDenylist, argsAllowlist);
+  const safeEnv = filterAgentEnv(agent.config?.env, envDenylist, envAllowlist);
 
   try {
     const sessionId = await terminalManager.create(agent.currentTaskId, {
@@ -1023,7 +1109,7 @@ export async function startAgentRun(
       cols: 120,
       rows: 30,
       customArgs: safeArgs,
-      env: agent.config.env,
+      env: safeEnv,
       dangerousMode,
     });
 
@@ -1188,13 +1274,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
   ipcMain.handle('agents:create', (_e, payload: CreateAgentPayload) => {
     try {
+      const runtime = payload.runtime ?? 'auto';
+      if (!isValidAgentRuntime(runtime)) {
+        return { error: `Unknown runtime: ${String(payload.runtime)}` };
+      }
       const id = randomUUID();
       const now = new Date().toISOString();
       const agent: AgentFile = {
         id,
         name: payload.name ?? `Agent ${id.slice(0, 6)}`,
         role: payload.role,
-        runtime: payload.runtime,
+        runtime,
         status: 'idle',
         icon: payload.icon,
         description: payload.description,
@@ -1229,6 +1319,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     // Validate nested IDs to prevent path traversal via persisted references
     if (updates.currentTaskId && !isValidId(updates.currentTaskId)) {
       return { error: 'Invalid task ID in update' };
+    }
+    if (updates.runtime !== undefined && !isValidAgentRuntime(updates.runtime)) {
+      return { error: `Unknown runtime: ${String(updates.runtime)}` };
     }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };

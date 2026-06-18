@@ -2,9 +2,9 @@ import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
 import net from 'net';
-import { join, extname } from 'path';
+import { join, extname, sep } from 'path';
 import { homedir } from 'os';
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathSync } from 'fs';
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
@@ -57,21 +57,26 @@ const LOGIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
 const SESSIONS_PATH = join(SESSIONS_DIR, 'web-sessions.json');
 
-type SessionStore = Record<string, number>; // token -> expiry epoch ms
+/** token -> expiry epoch ms. Map (not plain object) so prototype keys like '__proto__' can't poison lookups. */
+type SessionStore = Map<string, number>;
 
 function loadSessions(): SessionStore {
   try {
-    if (!existsSync(SESSIONS_PATH)) return {};
-    return JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8')) as SessionStore;
+    if (!existsSync(SESSIONS_PATH)) return new Map();
+    const parsed = JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8')) as Record<string, number>;
+    return new Map(Object.entries(parsed));
   } catch {
-    return {};
+    return new Map();
   }
 }
 
 function saveSessions(store: SessionStore): void {
   try {
     mkdirSync(SESSIONS_DIR, { recursive: true });
-    writeFileSync(SESSIONS_PATH, JSON.stringify(store), 'utf-8');
+    writeFileSync(SESSIONS_PATH, JSON.stringify(Object.fromEntries(store)), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
   } catch {
     // Non-fatal — sessions degrade to in-memory-only.
   }
@@ -80,9 +85,9 @@ function saveSessions(store: SessionStore): void {
 /** Prune expired entries and return the cleaned store. */
 function pruneExpired(store: SessionStore): SessionStore {
   const now = Date.now();
-  const pruned: SessionStore = {};
-  for (const [token, expiry] of Object.entries(store)) {
-    if (expiry > now) pruned[token] = expiry;
+  const pruned: SessionStore = new Map();
+  for (const [token, expiry] of store.entries()) {
+    if (expiry > now) pruned.set(token, expiry);
   }
   return pruned;
 }
@@ -91,25 +96,57 @@ function pruneExpired(store: SessionStore): SessionStore {
 let sessions: SessionStore = pruneExpired(loadSessions());
 saveSessions(sessions); // persist any pruning
 
+/**
+ * One-time QR login tokens, kept separate from `sessions` so they cannot be
+ * used directly as session cookies and are guaranteed single-use via the
+ * /api/token-login exchange. In-memory only; not persisted.
+ */
+const loginTokens = new Map<string, number>();
+
 function addSession(token: string, expiresAt: number): void {
-  sessions[token] = expiresAt;
+  sessions.set(token, expiresAt);
   saveSessions(sessions);
 }
 
 function hasSession(token: string): boolean {
-  const expiry = sessions[token];
-  if (!expiry) return false;
+  const expiry = sessions.get(token);
+  if (typeof expiry !== 'number') return false;
   if (Date.now() > expiry) {
-    delete sessions[token];
+    sessions.delete(token);
     saveSessions(sessions);
     return false;
   }
   return true;
 }
 
-function deleteSession(token: string): void {
-  delete sessions[token];
-  saveSessions(sessions);
+/* ── Login rate limiting ───────────────────────────────────────────── */
+
+const LOGIN_RATE_WINDOW_MS = 60 * 1000;
+const LOGIN_RATE_MAX_ATTEMPTS = 5;
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) return false;
+  return entry.count >= LOGIN_RATE_MAX_ATTEMPTS;
+}
+
+function recordFailedLogin(ip: string): void {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_RATE_WINDOW_MS });
+  } else {
+    entry.count += 1;
+  }
+}
+
+/** Constant-time string equality. Hashes both sides first so length differences don't leak. */
+function safeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
 }
 
 /** Serialization guard — only one restart runs at a time; late callers get the latest config. */
@@ -390,7 +427,7 @@ function getBridgeScript(): string {
 
 function parseCookies(req: http.IncomingMessage): Record<string, string> {
   const header = req.headers.cookie ?? '';
-  const cookies: Record<string, string> = {};
+  const cookies = Object.create(null) as Record<string, string>;
   for (const pair of header.split(';')) {
     const [name, ...rest] = pair.trim().split('=');
     if (name) cookies[name] = rest.join('=');
@@ -509,6 +546,16 @@ function proxyToViteDev(
 export async function startWebServer(config: WebServerConfig): Promise<void> {
   if (httpServer) await stopWebServer();
 
+  // Defense in depth: refuse to start in password mode with an empty password.
+  // The config layer auto-generates one on first enable, but if that path is
+  // ever bypassed (manual config edit, migration bug) we fail closed here
+  // rather than silently accepting an empty-string credential.
+  if (config.auth.mode === 'password' && !config.auth.password) {
+    throw new Error(
+      '[WebServer] Refusing to start: auth mode is "password" but no password is set.',
+    );
+  }
+
   const bridgeScript = getBridgeScript();
   const rendererDir = getRendererDir();
   const viteDevUrl = process.env.ELECTRON_RENDERER_URL;
@@ -532,12 +579,23 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     // --- Auth-exempt API endpoints ---
 
     if (urlPath === '/api/login' && req.method === 'POST') {
+      const ip = req.socket.remoteAddress ?? 'unknown';
+      if (isRateLimited(ip)) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ ok: false, error: 'Too many attempts' }));
+        return;
+      }
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-          if (body.username?.toLowerCase() === config.auth.username.toLowerCase() && body.password === config.auth.password) {
+          const userOk = safeEqual(
+            String(body.username ?? '').toLowerCase(),
+            config.auth.username.toLowerCase(),
+          );
+          const passOk = safeEqual(String(body.password ?? ''), config.auth.password);
+          if (userOk && passOk) {
             const token = crypto.randomUUID();
             addSession(token, Date.now() + SESSION_LIFETIME_MS);
             const secure = config.tls?.enabled ? '; Secure' : '';
@@ -547,6 +605,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
             });
             res.end(JSON.stringify({ ok: true }));
           } else {
+            recordFailedLogin(ip);
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'Invalid credentials' }));
           }
@@ -569,9 +628,10 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     if (urlPath === '/api/token-login') {
       const fullUrl = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
       const loginToken = fullUrl.searchParams.get('token');
-      if (loginToken && hasSession(loginToken)) {
+      const loginTokenExpiry = loginToken ? loginTokens.get(loginToken) : undefined;
+      if (loginToken && typeof loginTokenExpiry === 'number' && Date.now() <= loginTokenExpiry) {
         // Consume the token (one-time use)
-        deleteSession(loginToken);
+        loginTokens.delete(loginToken);
         // Issue a fresh session cookie
         const sessionToken = crypto.randomUUID();
         addSession(sessionToken, Date.now() + SESSION_LIFETIME_MS);
@@ -633,7 +693,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       const filePath = join(MEDIA_DIR, relativePath);
 
       // Security: ensure the resolved path is under the media directory
-      if (!filePath.startsWith(MEDIA_DIR)) {
+      if (!filePath.startsWith(MEDIA_DIR + sep) && filePath !== MEDIA_DIR) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
         return;
@@ -664,7 +724,14 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       const [pluginName, ...assetParts] = segments;
       const assetPath = assetParts.join('/');
 
-      if (!pluginName || !assetPath) {
+      if (
+        !pluginName ||
+        !assetPath ||
+        pluginName.includes('/') ||
+        pluginName.includes('\\') ||
+        pluginName === '.' ||
+        pluginName === '..'
+      ) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Bad Request');
         return;
@@ -673,8 +740,11 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       const pluginDir = join(PLUGINS_DIR, pluginName);
       const filePath = join(pluginDir, assetPath);
 
-      // Security: ensure the resolved path is within the plugin directory
-      if (!filePath.startsWith(pluginDir + '/') && filePath !== pluginDir) {
+      // Security: ensure the resolved path stays within THIS plugin's directory.
+      // `pluginName` is validated above (no `..` / separators), so `pluginDir`
+      // is a trustworthy anchor; anchoring only to PLUGINS_DIR would allow
+      // `../other-plugin/...` traversal between plugins.
+      if (!filePath.startsWith(pluginDir + sep) && filePath !== pluginDir) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
         return;
@@ -686,9 +756,26 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         return;
       }
 
-      const ext = extname(filePath).toLowerCase();
+      // Symlink defence: resolve the canonical path and re-check containment
+      // so a symlink inside the plugin dir cannot escape it. (statSync follows
+      // links, so the isFile() check above doesn't catch this.)
+      let realPath: string;
+      try {
+        realPath = realpathSync(filePath);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+      if (!realPath.startsWith(pluginDir + sep) && realPath !== pluginDir) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return;
+      }
+
+      const ext = extname(realPath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      const data = readFileSync(filePath);
+      const data = readFileSync(realPath);
       res.writeHead(200, {
         'Content-Type': contentType,
         'Content-Length': data.byteLength,
@@ -712,7 +799,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     const filePath = join(rendererDir, urlPath);
     // Security: prevent path traversal
-    if (!filePath.startsWith(rendererDir)) {
+    if (!filePath.startsWith(rendererDir + sep) && filePath !== rendererDir) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('Forbidden');
       return;
@@ -779,6 +866,24 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         socket.destroy();
       }
       return;
+    }
+
+    // Origin check — block cross-site WebSocket hijacking. Browsers always
+    // send Origin on WS upgrades; non-browser clients may omit it (allowed).
+    const origin = req.headers.origin;
+    if (origin) {
+      try {
+        const o = new URL(origin);
+        const expectedHost = req.headers.host;
+        if (o.host !== expectedHost) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      } catch {
+        socket.destroy();
+        return;
+      }
     }
 
     // Auth check for WebSocket (cookies)
@@ -942,7 +1047,7 @@ export async function stopWebServer(): Promise<void> {
 export function createLoginToken(): string | null {
   if (!httpServer) return null;
   const token = crypto.randomUUID();
-  addSession(token, Date.now() + LOGIN_TOKEN_LIFETIME_MS);
+  loginTokens.set(token, Date.now() + LOGIN_TOKEN_LIFETIME_MS);
   return token;
 }
 

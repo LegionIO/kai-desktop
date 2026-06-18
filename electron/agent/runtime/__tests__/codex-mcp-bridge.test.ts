@@ -46,7 +46,10 @@ describe('CodexMcpBridge', () => {
       }),
     ], 'test-conversation', '/tmp', abortController.signal);
     const client = new Client({ name: 'kai-test-client', version: '1.0.0' });
-    const transport = new StreamableHTTPClientTransport(new URL(url));
+    const authToken = bridge.getAuthToken();
+    const transport = new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: `Bearer ${authToken}` } },
+    });
 
     try {
       await client.connect(transport);

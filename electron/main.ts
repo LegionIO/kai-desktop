@@ -13,7 +13,7 @@ import {
   protocol,
   screen,
 } from 'electron';
-import { basename, join } from 'path';
+import { basename, join, sep } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
@@ -493,6 +493,19 @@ function createWindow(): BrowserWindow {
           label: 'Save Image As\u2026',
           click: async () => {
             try {
+              let parsed;
+              try {
+                parsed = new URL(params.srcURL);
+              } catch {
+                return;
+              }
+              if (
+                parsed.protocol !== 'http:' &&
+                parsed.protocol !== 'https:' &&
+                parsed.protocol !== __BRAND_MEDIA_PROTOCOL + ':'
+              ) {
+                return;
+              }
               const defaultName = params.srcURL.split('/').pop()?.split('?')[0] || 'image.png';
               const result = await dialog.showSaveDialog(mainWindow, {
                 defaultPath: defaultName,
@@ -1206,6 +1219,19 @@ if (gotSingleInstanceLock) {
 
     // Fetch image bytes from main process (bypasses CORS)
     ipcMain.handle('image:fetch', async (_event, url: string) => {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { error: 'Invalid URL' };
+      }
+      if (
+        parsed.protocol !== 'http:' &&
+        parsed.protocol !== 'https:' &&
+        parsed.protocol !== __BRAND_MEDIA_PROTOCOL + ':'
+      ) {
+        return { error: 'Only http(s) and media URLs are allowed' };
+      }
       try {
         const resp = await net.fetch(url, {
           headers: withBrandUserAgent(),
@@ -1223,6 +1249,20 @@ if (gotSingleInstanceLock) {
     ipcMain.handle('image:save', async (_event, url: string, suggestedName?: string) => {
       const win = BrowserWindow.getFocusedWindow();
       if (!win) return { canceled: true };
+
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { error: 'Invalid URL' };
+      }
+      if (
+        parsed.protocol !== 'http:' &&
+        parsed.protocol !== 'https:' &&
+        parsed.protocol !== __BRAND_MEDIA_PROTOCOL + ':'
+      ) {
+        return { error: 'Only http(s) and media URLs are allowed' };
+      }
 
       const ext = (suggestedName?.split('.').pop() ?? 'png').toLowerCase();
 
@@ -1283,7 +1323,7 @@ if (gotSingleInstanceLock) {
       const filePath = join(mediaDir, urlPath);
 
       // Security: ensure the resolved path is under the media directory
-      if (!filePath.startsWith(mediaDir)) {
+      if (!filePath.startsWith(mediaDir + sep) && filePath !== mediaDir) {
         return new Response('Forbidden', { status: 403 });
       }
 

@@ -1,5 +1,6 @@
 import type { IpcMain } from 'electron';
 import type { PluginManager } from '../plugins/plugin-manager.js';
+import { UnverifiedPluginError } from '../plugins/marketplace-service.js';
 
 export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginManager): void {
   ipcMain.handle('plugin:get-ui-state', () => {
@@ -54,7 +55,24 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
   });
 
   ipcMain.handle('plugin:marketplace-install', async (_event, pluginName: string) => {
-    await pluginManager.installFromMarketplace(pluginName);
+    try {
+      await pluginManager.installFromMarketplace(pluginName);
+      return { success: true };
+    } catch (err) {
+      if (err instanceof UnverifiedPluginError) {
+        return {
+          success: false,
+          needsConfirmation: true,
+          pluginName: err.pluginName,
+          reason: 'no-integrity-hash',
+        };
+      }
+      throw err;
+    }
+  });
+
+  ipcMain.handle('plugin:marketplace-install-unverified', async (_event, pluginName: string) => {
+    await pluginManager.installFromMarketplace(pluginName, { skipHashCheck: true });
     return { success: true };
   });
 

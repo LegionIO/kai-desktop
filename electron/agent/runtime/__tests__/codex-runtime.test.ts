@@ -74,6 +74,8 @@ vi.mock('../codex-mcp-bridge.js', () => ({
     return {
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined),
+      getAuthToken: vi.fn(() => null),
+      getAuthTokenEnvVar: vi.fn(() => null),
     };
   }),
   buildCodexMcpPrompt: vi.fn((text: string) => text),

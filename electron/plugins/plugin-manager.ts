@@ -1,6 +1,6 @@
 import { Notification, BrowserWindow } from 'electron';
 import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, mkdirSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import { pathToFileURL } from 'url';
 import type {
   PluginManifest,
@@ -44,14 +44,17 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { buildPluginRendererBundle } from './renderer-build.js';
-import { MarketplaceService } from './marketplace-service.js';
+import { MarketplaceService, UnverifiedPluginError } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
 
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
+  if (keys.some((k) => DANGEROUS_KEYS.has(k))) return;
   if (keys.length === 0) return;
 
   let current = target;
@@ -659,7 +662,10 @@ export class PluginManager {
     if (!instance || instance.state !== 'active' || !instance.rendererBuild) return null;
 
     const filePath = join(instance.dir, assetPath);
-    if (!existsSync(filePath)) return null;
+    const resolvedPath = resolve(filePath);
+    const baseDir = resolve(instance.dir);
+    if (resolvedPath !== baseDir && !resolvedPath.startsWith(baseDir + sep)) return null;
+    if (!existsSync(resolvedPath)) return null;
 
     const ext = assetPath.split('.').pop()?.toLowerCase() ?? '';
     const mimeTypes: Record<string, string> = {
@@ -667,7 +673,7 @@ export class PluginManager {
       css: 'text/css; charset=utf-8',
       json: 'application/json; charset=utf-8',
     };
-    return { filePath, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
+    return { filePath: resolvedPath, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
   }
 
   setPluginConfig(pluginName: string, path: string, value: unknown): void {
@@ -1153,6 +1159,7 @@ export class PluginManager {
       this.appHome,
       this.getConfig,
       this.setConfig,
+      this.brandRequiredPluginNamesSet,
     );
 
     let catalog: MarketplaceCatalogEntry[] = [];
@@ -1235,7 +1242,7 @@ export class PluginManager {
     }
   }
 
-  async installFromMarketplace(pluginName: string): Promise<void> {
+  async installFromMarketplace(pluginName: string, opts?: { skipHashCheck?: boolean }): Promise<void> {
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
     }
@@ -1246,10 +1253,17 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" not found in marketplace catalog`);
     }
 
+    // Preflight: if the catalog entry has no integrity hash and the caller
+    // has not opted in, throw BEFORE unloading the existing instance so a
+    // user who declines the confirmation keeps their currently-loaded plugin.
+    if (!opts?.skipHashCheck && !entry.archiveHash && !entry.fileHash && !entry.hash) {
+      throw new UnverifiedPluginError(pluginName);
+    }
+
     // Unload existing instance if present (handles broken or active plugins)
     await this.unloadPlugin(pluginName);
 
-    await this.marketplaceService.installPlugin(entry);
+    await this.marketplaceService.installPlugin(entry, opts);
 
     // Discover and load the newly installed plugin
     const discovered = this.discoverPlugins();
@@ -1265,6 +1279,10 @@ export class PluginManager {
   async uninstallFromMarketplace(pluginName: string): Promise<void> {
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
+    }
+
+    if (!pluginName || pluginName.includes('/') || pluginName.includes('\\') || pluginName === '.' || pluginName === '..') {
+      throw new Error('Invalid plugin name');
     }
 
     if (this.brandRequiredPluginNamesSet.has(pluginName)) {

@@ -35,3 +35,11 @@ pw-results.xml
 
 # Vitest v8 coverage output (see vitest.unit.config.ts; reporting only)
 coverage/
+
+# Security scan output (ccsec-detection / triage / patch skills write here)
+results/
+
+# OTA signing — never commit private key material
+ota-private*.pem
+ota-public*.pem
+*.signing.key

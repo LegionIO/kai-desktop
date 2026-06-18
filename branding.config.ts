@@ -73,6 +73,19 @@ export const branding = {
   macCategory: 'public.app-category.developer-tools',
   /** GitHub "owner/repo" used as the auto-updater release source. */
   updateRepo: 'legionio/kai-desktop',
+  /**
+   * Optional explicit OTA feed base URL. When set (non-empty), the OTA
+   * updater fetches `${otaFeedUrl}/latest-ota.json` instead of deriving
+   * a GitHub releases URL from `updateRepo`. Use for on-prem / S3 hosts.
+   */
+  otaFeedUrl: '',
+  /**
+   * Ed25519 public key (PEM, SPKI) for verifying OTA update signatures.
+   * The matching private key must be set as the KAI_OTA_SIGNING_KEY secret
+   * in this brand's release CI. See electron/ota/signing.ts.
+   */
+  otaPublicKey:
+    '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEASp1m/UrCYbF2Js7Mf3n3Y85IlXLNwJU1Qy3Tyo92rcI=\n-----END PUBLIC KEY-----\n',
 
   // ── Theme / visual identity ──────────────────────────────────────────
   /** OKLCh hue angle (0-360) used for the brand accent across the UI. */

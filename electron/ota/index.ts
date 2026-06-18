@@ -6,6 +6,7 @@
  */
 
 export { resolveCodePaths } from './bootstrap.js';
+export { OTA_PUBLIC_KEY, buildSignedPayload, verifyOtaSignature, shouldSkipOtaSignature } from './signing.js';
 export { checkAndHandleRollback, signalAppRunning, signalGracefulQuit, manualRollback, getOtaMeta } from './rollback.js';
 export {
   checkForOtaUpdate,

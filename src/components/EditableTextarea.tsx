@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
   type ClipboardEvent,
 } from 'react';
+import { escapeHtml } from '@/lib/utils';
 
 type EditableTextareaProps = {
   value: string;
@@ -117,7 +118,7 @@ export const EditableTextarea: FC<EditableTextareaProps> = ({
   const renderTextHTML = useCallback((text: string): string => {
     return text
       .split('\n')
-      .map((line) => line)
+      .map((line) => escapeHtml(line))
       .join('<br>');
   }, [highlightBrand]);
 

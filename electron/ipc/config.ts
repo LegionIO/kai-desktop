@@ -1,5 +1,6 @@
 import type { IpcMain } from 'electron';
 import { readFileSync, writeFileSync, existsSync, watch, mkdirSync } from 'fs';
+import { randomBytes } from 'crypto';
 import { join } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
@@ -106,6 +107,10 @@ function getDefaultConfig() {
         maxConcurrent: 4,
         maxPerParent: 2,
       },
+      webFetch: {
+        enabled: true,
+        allowPrivateNetworks: false,
+      },
     },
     mcpServers: [] as Array<{
       name: string;
@@ -169,7 +174,7 @@ function getDefaultConfig() {
       port: 5243,
       bindAddress: '0.0.0.0',
       tls: { enabled: true, mode: 'self-signed' as const, certPath: '', keyPath: '' },
-      auth: { mode: 'anonymous' as const, username: '', password: '' },
+      auth: { mode: 'password' as const, username: 'kai', password: '' },
     },
     audio: {
       provider: 'native' as const,
@@ -1170,6 +1175,24 @@ export function registerConfigHandlers(
     }
 
     setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
+
+    // Security: never let the web server start in password mode with an empty
+    // password. Auto-generate one whenever a webServer.* write would leave the
+    // server enabled in password mode without a credential — covers first
+    // enable, switching auth.mode anonymous→password while enabled, and
+    // clearing the password while enabled.
+    if (
+      path.startsWith('webServer.') &&
+      currentConfig.webServer?.enabled &&
+      currentConfig.webServer?.auth?.mode === 'password' &&
+      !currentConfig.webServer?.auth?.password
+    ) {
+      setNestedValue(
+        currentConfig as unknown as Record<string, unknown>,
+        'webServer.auth.password',
+        randomBytes(12).toString('base64url'),
+      );
+    }
     writeDesktopConfig(appHome, currentConfig);
     currentConfig = readEffectiveConfig(appHome);
     scheduleConfigBroadcast();

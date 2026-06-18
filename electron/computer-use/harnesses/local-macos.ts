@@ -628,7 +628,9 @@ export class LocalMacosHarness implements ComputerHarness {
   async focusWindow(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
     const appName = action.appName?.trim();
     if (!appName) throw new Error('Focus window requires appName.');
-    await runAppleScript(`tell application "${appName}" to activate`);
+    // Pass model-supplied appName as argv data, never interpolate into script source.
+    const FOCUS_SCRIPT = 'on run argv\n  tell application (item 1 of argv) to activate\nend run';
+    await execFileAsync('osascript', ['-e', FOCUS_SCRIPT, appName], { timeout: 15000 });
     return buildResult(`Focused ${appName}.`);
   }
 
