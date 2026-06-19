@@ -37,6 +37,15 @@ function patchLocalNetworkInfo(plistPath, localNetworkUsageDescription) {
 }
 
 module.exports = async function afterPack(context) {
+  if (context.electronPlatformName === 'linux') {
+    const { chmodSync } = require('node:fs');
+    const resourcesBin = join(context.appOutDir, 'resources', 'bin');
+    for (const helper of ['LocalLinuxHelper.sh', 'atspi_helper.py']) {
+      const p = join(resourcesBin, helper);
+      if (existsSync(p)) chmodSync(p, 0o755);
+    }
+    return;
+  }
   if (context.electronPlatformName !== 'darwin') return;
 
   const appName = `${context.packager.appInfo.productFilename}.app`;

@@ -81,6 +81,9 @@ publish:
     repo: kai-desktop
 win:
   icon: build/icon.ico
+  extraResources:
+    - from: build/bin/LocalWindowsHelper.ps1
+      to: bin/LocalWindowsHelper.ps1
   target:
     - target: nsis
       arch:
@@ -91,3 +94,19 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: true
   deleteAppDataOnUninstall: false
+linux:
+  category: Development
+  icon: build/icon.png
+  extraResources:
+    - from: build/bin/LocalLinuxHelper.sh
+      to: bin/LocalLinuxHelper.sh
+    - from: build/bin/atspi_helper.py
+      to: bin/atspi_helper.py
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  artifactName: "{{artifactPrefix}}-${version}-linux-${arch}.${ext}"

@@ -31,7 +31,6 @@ type ComputerSetupPanelProps = {
   renderRecording?: () => ReactNode;
 };
 
-
 export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   conversationId,
   selectedModelKey,
@@ -58,10 +57,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     probeInputMonitoring,
   } = useComputerUse();
   const [computerGoal, setComputerGoal] = useState('');
-  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>(() => {
-    const fallback = app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser';
-    return fallback;
-  });
+  const [computerTarget, setComputerTarget] = useState<ComputerUseTarget>('local-macos');
   const [computerApprovalMode, setComputerApprovalMode] = useState<'step' | 'goal' | 'autonomous'>('autonomous');
   const [isStartingComputerSession, setIsStartingComputerSession] = useState(false);
   const [probedLocalPermissionState, setProbedLocalPermissionState] = useState<ComputerUsePermissions | null>(null);
@@ -74,32 +70,38 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
   const [isExitingFullScreen, setIsExitingFullScreen] = useState(false);
   const goalRef = useRef<HTMLTextAreaElement>(null);
 
-  const computerConfig = (config as Record<string, unknown> | null)?.computerUse as {
-    defaultTarget?: ComputerUseTarget;
-    approvalModeDefault?: 'step' | 'goal' | 'autonomous';
-    isolated?: { remoteVmUrl?: string };
-  } | undefined;
+  const computerConfig = (config as Record<string, unknown> | null)?.computerUse as
+    | {
+        defaultTarget?: ComputerUseTarget;
+        approvalModeDefault?: 'step' | 'goal' | 'autonomous';
+        isolated?: { remoteVmUrl?: string };
+      }
+    | undefined;
 
   useEffect(() => {
-    const target = computerConfig?.defaultTarget ?? (app.platform.os === 'darwin' ? 'local-macos' : 'isolated-browser');
-    setComputerTarget((target === 'local-macos' && app.platform.os !== 'darwin') ? 'isolated-browser' : target);
+    setComputerTarget(computerConfig?.defaultTarget ?? 'local-macos');
     setComputerApprovalMode(computerConfig?.approvalModeDefault ?? 'autonomous');
   }, [computerConfig?.approvalModeDefault, computerConfig?.defaultTarget]);
 
-  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
-  const localPermissionState = activeComputerSession?.permissionState?.target === 'local-macos'
-    ? activeComputerSession.permissionState
-    : probedLocalPermissionState;
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
+  );
+  const localPermissionState =
+    activeComputerSession?.permissionState?.target === 'local-macos'
+      ? activeComputerSession.permissionState
+      : probedLocalPermissionState;
   // When accessed via web UI, skip the input monitoring requirement since the
   // user is remote and cannot provide local input events for the probe.
   const inputMonitoringOk = isWebBridge || Boolean(localPermissionState?.inputMonitoringGranted);
-  const localPermissionAuthorized = localPermissionState?.target === 'local-macos'
-    && localPermissionState.helperReady
-    && localPermissionState.accessibilityTrusted
-    && localPermissionState.screenRecordingGranted
-    && localPermissionState.automationGranted
-    && inputMonitoringOk;
-  const showLocalMacPreflight = computerTarget === 'local-macos' && (showLocalPermissionSpinner || !localPermissionAuthorized);
+  const localPermissionAuthorized =
+    localPermissionState?.target === 'local-macos' &&
+    localPermissionState.helperReady &&
+    localPermissionState.accessibilityTrusted &&
+    localPermissionState.screenRecordingGranted &&
+    localPermissionState.automationGranted &&
+    inputMonitoringOk;
+  const showLocalMacPreflight =
+    computerTarget === 'local-macos' && (showLocalPermissionSpinner || !localPermissionAuthorized);
   const canStart = Boolean(conversationId) && Boolean(computerGoal.trim()) && !isStartingComputerSession;
 
   useEffect(() => {
@@ -160,12 +162,17 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
       return;
     }
     let cancelled = false;
-    void app.computerUse.checkFullScreenApps().then(({ problematicApps }) => {
-      if (!cancelled) setFullScreenApps(problematicApps);
-    }).catch(() => {
-      if (!cancelled) setFullScreenApps([]);
-    });
-    return () => { cancelled = true; };
+    void app.computerUse
+      .checkFullScreenApps()
+      .then(({ problematicApps }) => {
+        if (!cancelled) setFullScreenApps(problematicApps);
+      })
+      .catch(() => {
+        if (!cancelled) setFullScreenApps([]);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [computerTarget]);
 
   const handleExitFullScreenApps = async () => {
@@ -219,25 +226,41 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
     setIsStartingComputerSession(true);
 
     // If there's a completed/stopped/failed session, continue it instead of starting new
-    const promise = canContinue && activeComputerSession
-      ? continueSession(activeComputerSession.id, computerGoal.trim())
-      : startSession(computerGoal.trim(), {
-          conversationId,
-          target: computerTarget,
-          surface: startSurface,
-          approvalMode: computerApprovalMode,
-          modelKey: selectedModelKey,
-          profileKey: selectedProfileKey,
-          fallbackEnabled,
-          reasoningEffort,
-        });
+    const promise =
+      canContinue && activeComputerSession
+        ? continueSession(activeComputerSession.id, computerGoal.trim())
+        : startSession(computerGoal.trim(), {
+            conversationId,
+            target: computerTarget,
+            surface: startSurface,
+            approvalMode: computerApprovalMode,
+            modelKey: selectedModelKey,
+            profileKey: selectedProfileKey,
+            fallbackEnabled,
+            reasoningEffort,
+          });
 
-    void promise.then(() => {
-      setComputerGoal('');
-    }).finally(() => {
-      setIsStartingComputerSession(false);
-    });
-  }, [canStart, canContinue, conversationId, computerGoal, startSession, continueSession, activeComputerSession, computerTarget, startSurface, computerApprovalMode, selectedModelKey, selectedProfileKey]);
+    void promise
+      .then(() => {
+        setComputerGoal('');
+      })
+      .finally(() => {
+        setIsStartingComputerSession(false);
+      });
+  }, [
+    canStart,
+    canContinue,
+    conversationId,
+    computerGoal,
+    startSession,
+    continueSession,
+    activeComputerSession,
+    computerTarget,
+    startSurface,
+    computerApprovalMode,
+    selectedModelKey,
+    selectedProfileKey,
+  ]);
 
   const handleGoalKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
@@ -245,7 +268,6 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
       handleStart();
     }
   };
-
 
   return (
     <div className="relative px-1 pb-1">
@@ -264,23 +286,29 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
       {/* Permission alerts — only when there's a real problem */}
       {showLocalMacPreflight && (
         <div className="mb-3">
-        {isCheckingLocalPermissions && showLocalPermissionSpinner ? (
-          <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
-            <LoaderIcon className="h-3.5 w-3.5 animate-spin shrink-0" />
-            <span>Checking permissions...</span>
-          </div>
-        ) : localPermissionState ? (
-          <PermissionChecklist
-            permissions={localPermissionState}
-            isRequestingAll={isRequestingLocalPermissions}
-            isProbingInputMonitoring={isProbingInputMonitoring}
-            inputMonitoringProbeAttempts={inputMonitoringProbeAttempts}
-            onRequestAll={() => { void handleRequestLocalPermissions(); }}
-            onRequestSingle={handleRequestSinglePermission}
-            onProbeInputMonitoring={() => { void handleRetryInputMonitoringProbe(); }}
-            onOpenSettings={(section) => { void openLocalMacosPrivacySettings(section); }}
-          />
-        ) : null}
+          {isCheckingLocalPermissions && showLocalPermissionSpinner ? (
+            <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
+              <LoaderIcon className="h-3.5 w-3.5 animate-spin shrink-0" />
+              <span>Checking permissions...</span>
+            </div>
+          ) : localPermissionState ? (
+            <PermissionChecklist
+              permissions={localPermissionState}
+              isRequestingAll={isRequestingLocalPermissions}
+              isProbingInputMonitoring={isProbingInputMonitoring}
+              inputMonitoringProbeAttempts={inputMonitoringProbeAttempts}
+              onRequestAll={() => {
+                void handleRequestLocalPermissions();
+              }}
+              onRequestSingle={handleRequestSinglePermission}
+              onProbeInputMonitoring={() => {
+                void handleRetryInputMonitoringProbe();
+              }}
+              onOpenSettings={(section) => {
+                void openLocalMacosPrivacySettings(section);
+              }}
+            />
+          ) : null}
         </div>
       )}
 
@@ -293,18 +321,29 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
               <span>Full-screen apps detected</span>
             </div>
             <p className="mt-1 text-[11px] text-muted-foreground/80">
-              <span className="font-medium text-foreground">{fullScreenApps.join(', ')}</span> {fullScreenApps.length === 1 ? 'is' : 'are'} in
-              full-screen mode. Screenshots may appear blank, which can cause the AI to get stuck.
+              <span className="font-medium text-foreground">{fullScreenApps.join(', ')}</span>{' '}
+              {fullScreenApps.length === 1 ? 'is' : 'are'} in full-screen mode. Screenshots may appear blank, which can
+              cause the AI to get stuck.
             </p>
             <div className="mt-1.5">
               <button
                 type="button"
-                onClick={() => { void handleExitFullScreenApps(); }}
+                onClick={() => {
+                  void handleExitFullScreenApps();
+                }}
                 disabled={isExitingFullScreen}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1 text-[11px] font-medium text-foreground transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {isExitingFullScreen ? <LoaderIcon className="h-3 w-3 animate-spin" /> : <MaximizeIcon className="h-3 w-3" />}
-                <span>{isExitingFullScreen ? 'Exiting full-screen...' : `Exit full-screen for ${fullScreenApps.length === 1 ? fullScreenApps[0] : 'all'}`}</span>
+                {isExitingFullScreen ? (
+                  <LoaderIcon className="h-3 w-3 animate-spin" />
+                ) : (
+                  <MaximizeIcon className="h-3 w-3" />
+                )}
+                <span>
+                  {isExitingFullScreen
+                    ? 'Exiting full-screen...'
+                    : `Exit full-screen for ${fullScreenApps.length === 1 ? fullScreenApps[0] : 'all'}`}
+                </span>
               </button>
             </div>
           </div>
@@ -317,7 +356,13 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
         value={computerGoal}
         onChange={(event) => setComputerGoal(event.target.value)}
         onKeyDown={handleGoalKeyDown}
-        placeholder={!conversationId ? 'Select a chat first...' : canContinue ? 'Continue the session with a follow-up... (Enter to resume)' : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`}
+        placeholder={
+          !conversationId
+            ? 'Select a chat first...'
+            : canContinue
+              ? 'Continue the session with a follow-up... (Enter to resume)'
+              : `What should ${__BRAND_PRODUCT_NAME} do on your computer? (Enter to start)`
+        }
         disabled={!conversationId}
         rows={2}
         className="w-full resize-none bg-transparent px-1 py-0.5 text-base md:text-[15px] outline-none placeholder:text-muted-foreground/50 disabled:cursor-not-allowed disabled:opacity-50"
@@ -334,10 +379,7 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           onToggle={() => {}}
         />
 
-        <ChatSettingsButton
-          reasoningEffort={reasoningEffort}
-          onChangeReasoningEffort={onChangeReasoningEffort}
-        />
+        <ChatSettingsButton reasoningEffort={reasoningEffort} onChangeReasoningEffort={onChangeReasoningEffort} />
 
         {renderRecording?.()}
 
@@ -346,7 +388,19 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
           type="button"
           onClick={handleStart}
           disabled={!canStart}
-          title={!conversationId ? 'Select a chat first' : !computerGoal.trim() ? 'Enter a goal first' : isStartingComputerSession ? (canContinue ? 'Resuming...' : 'Starting...') : canContinue ? 'Continue session' : 'Start computer session'}
+          title={
+            !conversationId
+              ? 'Select a chat first'
+              : !computerGoal.trim()
+                ? 'Enter a goal first'
+                : isStartingComputerSession
+                  ? canContinue
+                    ? 'Resuming...'
+                    : 'Starting...'
+                  : canContinue
+                    ? 'Continue session'
+                    : 'Start computer session'
+          }
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
         >
           {isStartingComputerSession ? (
@@ -360,7 +414,8 @@ export const ComputerSetupPanel: FC<ComputerSetupPanelProps> = ({
       {/* Active session indicator — compact */}
       {activeComputerSession ? (
         <div className="mt-3 text-[11px] text-muted-foreground">
-          Session <span className="font-medium text-foreground">{activeComputerSession.status}</span> — view in Computer tab above
+          Session <span className="font-medium text-foreground">{activeComputerSession.status}</span> — view in Computer
+          tab above
         </div>
       ) : null}
     </div>

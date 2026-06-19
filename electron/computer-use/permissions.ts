@@ -25,12 +25,17 @@ import { getResolvedProcessEnv } from '../utils/shell-env.js';
 import type { HelperRunner, HelperRunnerResult } from './helper-runner.js';
 
 const execFileAsync = promisify(execFile);
-const LOCAL_MACOS_PRIVACY_URLS: Record<ComputerUsePermissionSection, string> = {
+type MacosPrivacySection = 'accessibility' | 'screen-recording' | 'automation' | 'input-monitoring';
+const LOCAL_MACOS_PRIVACY_URLS: Record<MacosPrivacySection, string> = {
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
   'screen-recording': 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
   automation: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Automation',
   'input-monitoring': 'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent',
 };
+
+function isMacosPrivacySection(section: ComputerUsePermissionSection): section is MacosPrivacySection {
+  return section in LOCAL_MACOS_PRIVACY_URLS;
+}
 
 /**
  * Resolve the pre-compiled LocalMacosHelper binary path.
@@ -338,7 +343,41 @@ function buildPermissionGuidance(
 
 export async function openLocalMacosPrivacySettings(section: ComputerUsePermissionSection): Promise<void> {
   if (process.platform !== 'darwin') return;
+  if (!isMacosPrivacySection(section)) return;
   await shell.openExternal(LOCAL_MACOS_PRIVACY_URLS[section]);
+}
+
+async function getNonDarwinPermissions(): Promise<ComputerUsePermissions> {
+  const { getPlatformAdapter, getFallbackAdapter } = await import('../platform/index.js');
+  const adapter = await getPlatformAdapter();
+  const platform = await adapter.checkPermissions();
+  const lookup = (section: ComputerUsePermissionSection): boolean | undefined =>
+    platform.states.find((s) => s.section === section)?.granted;
+  const caps = adapter.capabilities;
+
+  // The fallback adapter (nut-js) covers input + screenshot when the native
+  // helper is missing pieces; preflight should pass as long as either path
+  // can drive a session.
+  const fallback = await getFallbackAdapter()
+    .checkPermissions()
+    .catch(() => null);
+  const fallbackReady = fallback?.helperReady === true;
+
+  const inputReady = (lookup('xdotool') ?? caps.input) || fallbackReady;
+  const screenshotReady = (lookup('screenshot-tool') ?? caps.screenshotDisplay) || fallbackReady;
+  const helperReady = (platform.helperReady && caps.screenshotDisplay && caps.input) || fallbackReady;
+
+  return {
+    target: 'local-macos',
+    accessibilityTrusted: inputReady,
+    screenRecordingGranted: screenshotReady,
+    // `automationGranted` is a hard preflight gate; on non-darwin it reflects
+    // the ability to launch/control apps, not optional text introspection.
+    automationGranted: helperReady,
+    inputMonitoringGranted: true,
+    helperReady,
+    message: helperReady ? undefined : (platform.message ?? fallback?.message),
+  };
 }
 
 export async function getComputerUsePermissions(options?: {
@@ -358,6 +397,9 @@ export async function getComputerUsePermissions(options?: {
   /** Timeout (ms) for the input monitoring probe. Default 3 000. */
   probeTimeoutMs?: number;
 }): Promise<ComputerUsePermissions> {
+  if (process.platform !== 'darwin') {
+    return getNonDarwinPermissions();
+  }
   const shouldProbe = options?.probeInputMonitoring ?? true;
   const probeTimeout = options?.probeTimeoutMs ?? 3000;
 
@@ -441,6 +483,9 @@ export async function requestSinglePermission(
   section: ComputerUsePermissionSection,
   options?: { openSettings?: boolean },
 ): Promise<ComputerUsePermissions> {
+  if (process.platform !== 'darwin') {
+    return getComputerUsePermissions();
+  }
   switch (section) {
     case 'accessibility':
       if (process.platform === 'darwin') {

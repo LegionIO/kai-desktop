@@ -19,18 +19,19 @@ import type { AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveModelForThread } from '../agent/model-catalog.js';
 import { ComputerUseOrchestrator } from './orchestrator.js';
 import { closeOperatorWindow, openComputerSetupWindow, openOperatorWindow } from './operator-window.js';
-import {
-  closeOverlayWindow,
-  createOverlayWindow,
-  updateOverlayState,
-} from './overlay-window.js';
+import { closeOverlayWindow, createOverlayWindow, updateOverlayState } from './overlay-window.js';
 import {
   getComputerUsePermissions,
   openLocalMacosPrivacySettings as openLocalMacosPrivacySettingsExternal,
   requestLocalMacosPermissions as requestLocalMacosPermissionsFlow,
   requestSinglePermission as requestSinglePermissionExternal,
 } from './permissions.js';
-import { startLocalMacosTakeoverMonitor, stopLocalMacosTakeoverMonitor, type LocalMacosTakeoverEvent } from './takeover-monitor.js';
+import {
+  startLocalMacosTakeoverMonitor,
+  stopLocalMacosTakeoverMonitor,
+  type LocalMacosTakeoverEvent,
+} from './takeover-monitor.js';
+import { restoreLocalDesktopWindows } from './harnesses/local-desktop.js';
 
 type SessionMap = Map<string, ComputerSession>;
 type SessionAlertKind = 'completed' | 'failed' | 'takeover';
@@ -106,12 +107,7 @@ function focusAnyAppWindow(): void {
   win.focus();
 }
 
-function showSessionAlert(params: {
-  kind: SessionAlertKind;
-  title: string;
-  subtitle: string;
-  body: string;
-}): void {
+function showSessionAlert(params: { kind: SessionAlertKind; title: string; subtitle: string; body: string }): void {
   playSessionAlertSound(params.kind);
   if (!Notification.isSupported()) return;
   try {
@@ -163,7 +159,11 @@ function notifyForSessionTransition(previous: ComputerSession | null, next: Comp
       kind,
       title: 'Computer Session Error',
       subtitle: goal || 'The session hit an error',
-      body: summarizeForNotification(next.lastError ?? next.statusMessage ?? 'The computer-use session stopped because of an error.', 140) || 'The computer-use session stopped because of an error.',
+      body:
+        summarizeForNotification(
+          next.lastError ?? next.statusMessage ?? 'The computer-use session stopped because of an error.',
+          140,
+        ) || 'The computer-use session stopped because of an error.',
     });
     return;
   }
@@ -277,11 +277,15 @@ export class ComputerUseSessionManager extends EventEmitter {
     if (!config.computerUse.overlay?.enabled) return;
     if (session.target !== 'local-macos') return;
 
-    createOverlayWindow(session.id, {
-      position: config.computerUse.overlay.position ?? 'top',
-      heightPx: config.computerUse.overlay.heightPx ?? 120,
-      opacity: config.computerUse.overlay.opacity ?? 0.75,
-    }, session.displayLayout);
+    createOverlayWindow(
+      session.id,
+      {
+        position: config.computerUse.overlay.position ?? 'top',
+        heightPx: config.computerUse.overlay.heightPx ?? 120,
+        opacity: config.computerUse.overlay.opacity ?? 0.75,
+      },
+      session.displayLayout,
+    );
     this.pushOverlayState(session);
   }
 
@@ -346,10 +350,13 @@ export class ComputerUseSessionManager extends EventEmitter {
     };
   }
 
-  private async getPermissionsForTarget(target: ComputerUseTarget, options?: {
-    /** Skip the timing-dependent Input Monitoring probe (used during session start/resume). */
-    skipInputMonitoringProbe?: boolean;
-  }): Promise<ComputerUsePermissions> {
+  private async getPermissionsForTarget(
+    target: ComputerUseTarget,
+    options?: {
+      /** Skip the timing-dependent Input Monitoring probe (used during session start/resume). */
+      skipInputMonitoringProbe?: boolean;
+    },
+  ): Promise<ComputerUsePermissions> {
     if (target === 'local-macos') {
       return getComputerUsePermissions({
         probeInputMonitoring: !options?.skipInputMonitoringProbe,
@@ -360,22 +367,47 @@ export class ComputerUseSessionManager extends EventEmitter {
   }
 
   private getPreflightBlocker(target: ComputerUseTarget, permissions: ComputerUsePermissions): string | null {
+    if (target === 'local-macos' && process.platform !== 'darwin') {
+      if (permissions.helperReady) return null;
+      return (
+        permissions.message ??
+        'Local desktop control is unavailable. Install the platform input/screenshot tools listed in Settings, or ensure the nut-js fallback dependency is present.'
+      );
+    }
     if (target === 'local-macos') {
       const missing: string[] = [];
       if (!permissions.helperReady) {
-        missing.push(permissions.message ?? 'Local macOS helper could not start. Ensure Xcode command line tools are installed.');
+        missing.push(
+          permissions.message ?? 'Local macOS helper could not start. Ensure Xcode command line tools are installed.',
+        );
       }
       if (!permissions.accessibilityTrusted) {
-        missing.push('Enable Accessibility for ' + __BRAND_PRODUCT_NAME + ' in System Settings > Privacy & Security > Accessibility.');
+        missing.push(
+          'Enable Accessibility for ' +
+            __BRAND_PRODUCT_NAME +
+            ' in System Settings > Privacy & Security > Accessibility.',
+        );
       }
       if (!permissions.screenRecordingGranted) {
-        missing.push('Enable Screen Recording for ' + __BRAND_PRODUCT_NAME + ' in System Settings > Privacy & Security > Screen Recording.');
+        missing.push(
+          'Enable Screen Recording for ' +
+            __BRAND_PRODUCT_NAME +
+            ' in System Settings > Privacy & Security > Screen Recording.',
+        );
       }
       if (!permissions.automationGranted) {
-        missing.push('Allow Automation for ' + __BRAND_PRODUCT_NAME + ' so it can drive System Events and read focused window metadata.');
+        missing.push(
+          'Allow Automation for ' +
+            __BRAND_PRODUCT_NAME +
+            ' so it can drive System Events and read focused window metadata.',
+        );
       }
       if (!permissions.inputMonitoringGranted) {
-        missing.push('Enable Input Monitoring for ' + __BRAND_PRODUCT_NAME + ' in System Settings > Privacy & Security > Input Monitoring so it can detect when you take over control.');
+        missing.push(
+          'Enable Input Monitoring for ' +
+            __BRAND_PRODUCT_NAME +
+            ' in System Settings > Privacy & Security > Input Monitoring so it can detect when you take over control.',
+        );
       }
       return missing.length > 0 ? missing.join(' ') : null;
     }
@@ -397,21 +429,16 @@ export class ComputerUseSessionManager extends EventEmitter {
 
     for (const session of this.sessions.values()) {
       if (session.target !== 'local-macos') continue;
-      const wasBlockedByPermissions = session.pauseReason === 'permissions' || (session.status === 'failed' && session.permissionState?.target === 'local-macos');
-      const nextStatus = !blocker && wasBlockedByPermissions && session.status === 'failed'
-        ? 'paused'
-        : session.status;
-      const nextPauseReason = !blocker && wasBlockedByPermissions
-        ? 'user'
-        : blocker
-          ? 'permissions'
-          : session.pauseReason;
+      const wasBlockedByPermissions =
+        session.pauseReason === 'permissions' ||
+        (session.status === 'failed' && session.permissionState?.target === 'local-macos');
+      const nextStatus = !blocker && wasBlockedByPermissions && session.status === 'failed' ? 'paused' : session.status;
+      const nextPauseReason =
+        !blocker && wasBlockedByPermissions ? 'user' : blocker ? 'permissions' : session.pauseReason;
       const nextStatusMessage = wasBlockedByPermissions
         ? (blocker ?? 'Permissions look ready. Resume when you are ready to continue.')
         : session.statusMessage;
-      const nextLastError = wasBlockedByPermissions
-        ? blocker ?? undefined
-        : session.lastError;
+      const nextLastError = wasBlockedByPermissions ? (blocker ?? undefined) : session.lastError;
 
       this.upsertSession({
         ...session,
@@ -442,7 +469,9 @@ export class ComputerUseSessionManager extends EventEmitter {
     return getComputerUsePermissions();
   }
 
-  async openLocalMacosPrivacySettings(section?: ComputerUsePermissionSection): Promise<{ opened: ComputerUsePermissionSection | null }> {
+  async openLocalMacosPrivacySettings(
+    section?: ComputerUsePermissionSection,
+  ): Promise<{ opened: ComputerUsePermissionSection | null }> {
     const permissions = await getComputerUsePermissions();
     const targetSection = section ?? this.firstMissingLocalMacPermission(permissions) ?? 'accessibility';
     await openLocalMacosPrivacySettingsExternal(targetSection);
@@ -463,7 +492,13 @@ export class ComputerUseSessionManager extends EventEmitter {
     let permissions = await this.getPermissionsForTarget(target, { skipInputMonitoringProbe: true });
     let blocker = this.getPreflightBlocker(target, permissions);
 
-    if (target === 'local-macos' && blocker && options?.requestMissing && this.getConfig().computerUse.localMacos.autoRequestPermissions) {
+    if (
+      target === 'local-macos' &&
+      process.platform === 'darwin' &&
+      blocker &&
+      options?.requestMissing &&
+      this.getConfig().computerUse.localMacos.autoRequestPermissions
+    ) {
       const requestResult = await requestLocalMacosPermissionsFlow({
         openSettings: this.getConfig().computerUse.localMacos.autoOpenPrivacySettings,
       });
@@ -529,6 +564,7 @@ export class ComputerUseSessionManager extends EventEmitter {
         updatedAt: timestamp,
       });
     }
+    restoreLocalDesktopWindows();
   }
 
   private handleOperatorWindowClosed(sessionId: string): void {
@@ -558,9 +594,10 @@ export class ComputerUseSessionManager extends EventEmitter {
   async startSession(goal: string, options: StartComputerSessionOptions): Promise<ComputerSession> {
     const config = this.getConfig();
     const sessionId = makeComputerUseId('cs');
-    const conversationId = options.conversationId.trim().toLowerCase() === 'current'
-      ? readActiveConversationId(this.appHome) ?? options.conversationId
-      : options.conversationId;
+    const conversationId =
+      options.conversationId.trim().toLowerCase() === 'current'
+        ? (readActiveConversationId(this.appHome) ?? options.conversationId)
+        : options.conversationId;
     const target = options.target ?? config.computerUse.defaultTarget;
     const surface = options.surface ?? config.computerUse.defaultSurface;
     const approvalMode = options.approvalMode ?? config.computerUse.approvalModeDefault;
@@ -570,11 +607,11 @@ export class ComputerUseSessionManager extends EventEmitter {
     if (target === 'local-macos') {
       for (const existing of this.sessions.values()) {
         if (
-          existing.target === 'local-macos'
-          && existing.status !== 'completed'
-          && existing.status !== 'stopped'
-          && existing.status !== 'failed'
-          && existing.status !== 'paused'
+          existing.target === 'local-macos' &&
+          existing.status !== 'completed' &&
+          existing.status !== 'stopped' &&
+          existing.status !== 'failed' &&
+          existing.status !== 'paused'
         ) {
           throw new Error(`A local Mac session is already active (${existing.id}). Stop it before starting a new one.`);
         }
@@ -632,6 +669,7 @@ export class ComputerUseSessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
     this.orchestrator.pause(sessionId);
+    if (session.target === 'local-macos') restoreLocalDesktopWindows();
     return this.upsertSession({
       ...session,
       status: 'paused',
@@ -682,6 +720,7 @@ export class ComputerUseSessionManager extends EventEmitter {
     this.orchestrator.stop(sessionId);
     closeOperatorWindow(sessionId);
     closeOverlayWindow(sessionId);
+    if (session.target === 'local-macos') restoreLocalDesktopWindows();
     const next = this.upsertSession({
       ...session,
       status: 'stopped',
@@ -695,12 +734,15 @@ export class ComputerUseSessionManager extends EventEmitter {
     return next;
   }
 
-  updateSessionSettings(sessionId: string, settings: {
-    modelKey?: string | null;
-    profileKey?: string | null;
-    fallbackEnabled?: boolean;
-    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
-  }): ComputerSession | null {
+  updateSessionSettings(
+    sessionId: string,
+    settings: {
+      modelKey?: string | null;
+      profileKey?: string | null;
+      fallbackEnabled?: boolean;
+      reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    },
+  ): ComputerSession | null {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
     // Don't update terminal sessions
@@ -758,9 +800,10 @@ export class ComputerUseSessionManager extends EventEmitter {
     const target = session.target;
 
     // Re-check permissions for local-macos
-    const { permissions, blocker } = target === 'local-macos'
-      ? await this.evaluatePreflight(target, { requestMissing: true })
-      : { permissions: session.permissionState, blocker: null as string | null };
+    const { permissions, blocker } =
+      target === 'local-macos'
+        ? await this.evaluatePreflight(target, { requestMissing: true })
+        : { permissions: session.permissionState, blocker: null as string | null };
 
     if (blocker) {
       return this.upsertSession({
@@ -808,8 +851,12 @@ export class ComputerUseSessionManager extends EventEmitter {
     this.suppressTakeoverMonitor();
     const next: ComputerSession = {
       ...session,
-      approvals: session.approvals.map((approval) => approval.actionId === actionId ? { ...approval, status: 'approved' as const } : approval),
-      actions: session.actions.map((action) => action.id === actionId ? { ...action, status: 'approved' as const } : action),
+      approvals: session.approvals.map((approval) =>
+        approval.actionId === actionId ? { ...approval, status: 'approved' as const } : approval,
+      ),
+      actions: session.actions.map((action) =>
+        action.id === actionId ? { ...action, status: 'approved' as const } : action,
+      ),
       status: 'running',
       humanInControl: false,
       pauseReason: undefined,
@@ -826,8 +873,16 @@ export class ComputerUseSessionManager extends EventEmitter {
     if (!session) return null;
     return this.upsertSession({
       ...session,
-      approvals: session.approvals.map((approval) => approval.actionId === actionId ? { ...approval, status: 'rejected' as const, rationale: reason ?? approval.rationale } : approval),
-      actions: session.actions.map((action) => action.id === actionId ? { ...action, status: 'rejected' as const, error: reason ?? 'Rejected by user' } : action),
+      approvals: session.approvals.map((approval) =>
+        approval.actionId === actionId
+          ? { ...approval, status: 'rejected' as const, rationale: reason ?? approval.rationale }
+          : approval,
+      ),
+      actions: session.actions.map((action) =>
+        action.id === actionId
+          ? { ...action, status: 'rejected' as const, error: reason ?? 'Rejected by user' }
+          : action,
+      ),
       status: 'paused',
       humanInControl: false,
       pauseReason: 'approval',

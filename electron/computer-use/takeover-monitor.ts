@@ -16,6 +16,20 @@ let activeMonitor: LocalMacosTakeoverMonitorHandle | null = null;
 let activeListener: Listener | null = null;
 let restartTimer: NodeJS.Timeout | null = null;
 let shouldRun = false;
+let suppressedUntil = 0;
+
+/**
+ * Drop monitor events for the next `durationMs` milliseconds.
+ *
+ * The macOS Swift helper tags its own synthetic events and filters them at
+ * source. The Windows PowerShell helper filters via LL*HF_INJECTED. Linux
+ * `xinput test-xi2` cannot distinguish XTEST-injected events from real ones,
+ * so the cross-platform harness calls this around every input action as a
+ * timing-based guard that also provides defence-in-depth on the other OSes.
+ */
+export function suppressTakeoverEvents(durationMs: number): void {
+  suppressedUntil = Math.max(suppressedUntil, Date.now() + durationMs);
+}
 
 function clearRestartTimer(): void {
   if (restartTimer) {
@@ -36,6 +50,39 @@ function scheduleRestart(): void {
 
 function startMonitor(listener: Listener): void {
   clearRestartTimer();
+  activeListener = listener;
+
+  if (process.platform !== 'darwin') {
+    void import('../platform/index.js').then(async ({ getPlatformAdapter }) => {
+      if (!shouldRun) return;
+      const adapter = await getPlatformAdapter();
+      if (!shouldRun) return;
+      const handle = adapter.startInputMonitor(
+        (e) => {
+          if (Date.now() < suppressedUntil) return;
+          listener.onEvent({
+            event: 'takeover',
+            kind: e.kind,
+            eventType: e.eventType,
+            x: e.x,
+            y: e.y,
+            keyCode: e.keyCode,
+            deltaX: e.deltaX,
+            deltaY: e.deltaY,
+            timestampMs: e.timestampMs,
+          });
+        },
+        (message) => listener.onError?.(message),
+      );
+      if (!shouldRun) {
+        handle.stop();
+        return;
+      }
+      activeMonitor = { process: null as unknown as LocalMacosTakeoverMonitorHandle['process'], stop: handle.stop };
+    });
+    return;
+  }
+
   resolveMaterializedHelperPath();
   const monitor = startNativeMonitor({
     onEvent: listener.onEvent,
@@ -43,7 +90,6 @@ function startMonitor(listener: Listener): void {
   });
 
   activeMonitor = monitor;
-  activeListener = listener;
 
   monitor.process.on('exit', (code, signal) => {
     if (activeMonitor?.process === monitor.process) {
@@ -58,7 +104,10 @@ function startMonitor(listener: Listener): void {
 export function startLocalMacosTakeoverMonitor(listener: Listener): void {
   shouldRun = true;
   activeListener = listener;
-  if (activeMonitor && !activeMonitor.process.killed) {
+  if (activeMonitor && activeMonitor.process && !activeMonitor.process.killed) {
+    return;
+  }
+  if (activeMonitor && !activeMonitor.process) {
     return;
   }
   startMonitor(listener);

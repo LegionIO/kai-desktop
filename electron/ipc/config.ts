@@ -968,6 +968,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     realtime: config.realtime,
     computerUse: config.computerUse,
     dictation: config.dictation,
+    appShots: config.appShots,
     advanced: config.advanced,
     profiles: config.profiles,
     defaultProfileKey: config.defaultProfileKey,

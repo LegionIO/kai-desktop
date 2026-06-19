@@ -63,10 +63,7 @@ export default defineConfig({
             /const mod = "execa";\s*const execa = \(await import\(\s*\/\*\s*@vite-ignore\s*\*\/\s*\/\*\s*webpackIgnore:\s*true\s*\*\/\s*mod\s*\)\)\.execa;/s;
           if (!pattern.test(code)) return null;
           return {
-            code: code.replace(
-              pattern,
-              `const execa = (await import("execa")).execa;`,
-            ),
+            code: code.replace(pattern, `const execa = (await import("execa")).execa;`),
             map: null,
           };
         },
@@ -92,6 +89,12 @@ export default defineConfig({
           // libsql uses platform-specific native binaries
           'libsql',
           /^@libsql\//,
+          // Platform-adapter fallback: native addons resolved via `bindings`
+          // (libnut) or a bundled CLI binary (active-win) — must load from
+          // node_modules so the addon/binary path resolution works.
+          '@nut-tree-fork/nut-js',
+          /^@nut-tree-fork\//,
+          'active-win',
           // Optional SDK packages — detected at runtime via dynamic import()
           // with try/catch in electron/agent/runtime/detect.ts
           '@anthropic-ai/claude-agent-sdk',

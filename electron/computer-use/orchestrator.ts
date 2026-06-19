@@ -12,40 +12,55 @@ import { geminiPlanSession } from './provider-adapters/gemini.js';
 import { openaiPlanSession } from './provider-adapters/openai.js';
 import type { ModelChainEntry, FallbackCallbacks } from './provider-adapters/shared.js';
 import { IsolatedBrowserHarness } from './harnesses/isolated-browser.js';
+import { LocalDesktopHarness } from './harnesses/local-desktop.js';
 import { LocalMacosHarness } from './harnesses/local-macos.js';
 import type { ComputerHarness, ComputerHarnessActionResult } from './harnesses/shared.js';
 import { closeOverlayWindow, hideOverlayForCapture, showOverlayAfterCapture } from './overlay-window.js';
 
-const DEFAULT_COMPUTER_USE_PROMPT = 'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
+const DEFAULT_COMPUTER_USE_PROMPT =
+  'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
 
-type SessionMutator = (sessionId: string, update: (session: ComputerSession) => ComputerSession) => ComputerSession | null;
+type SessionMutator = (
+  sessionId: string,
+  update: (session: ComputerSession) => ComputerSession,
+) => ComputerSession | null;
 type SessionReader = (sessionId: string) => ComputerSession | null;
 type EventSink = (event: ComputerUseEvent) => void;
 
 function getHarness(config: AppConfig, session: ComputerSession, getConfig: () => AppConfig): ComputerHarness {
-  if (session.target === 'local-macos') return new LocalMacosHarness(getConfig);
+  if (session.target === 'local-macos') {
+    return process.platform === 'darwin' ? new LocalMacosHarness(getConfig) : new LocalDesktopHarness(getConfig);
+  }
   return new IsolatedBrowserHarness();
 }
 
-function getEntryForRole(config: AppConfig, session: ComputerSession, role: 'planner' | 'driver' | 'verifier' | 'recovery'): ModelCatalogEntry | null {
+function getEntryForRole(
+  config: AppConfig,
+  session: ComputerSession,
+  role: 'planner' | 'driver' | 'verifier' | 'recovery',
+): ModelCatalogEntry | null {
   const catalog = resolveModelCatalog(config);
   const computerModels = config.computerUse.models;
-  const overrideKey = role === 'planner'
-    ? computerModels.plannerModelKey
-    : role === 'driver'
-      ? computerModels.driverModelKey
-      : role === 'verifier'
-        ? computerModels.verifierModelKey
-        : computerModels.recoveryModelKey;
+  const overrideKey =
+    role === 'planner'
+      ? computerModels.plannerModelKey
+      : role === 'driver'
+        ? computerModels.driverModelKey
+        : role === 'verifier'
+          ? computerModels.verifierModelKey
+          : computerModels.recoveryModelKey;
   if (overrideKey) {
     return catalog.byKey.get(overrideKey) ?? null;
   }
   return resolveModelForThread(config, session.selectedModelKey ?? null);
 }
 
-function getModelChainForRole(config: AppConfig, session: ComputerSession, role: 'planner' | 'driver' | 'verifier' | 'recovery'): ModelChainEntry[] {
-  const primaryEntry = getEntryForRole(config, session, role)
-    ?? getEntryForRole(config, session, 'driver');
+function getModelChainForRole(
+  config: AppConfig,
+  session: ComputerSession,
+  role: 'planner' | 'driver' | 'verifier' | 'recovery',
+): ModelChainEntry[] {
+  const primaryEntry = getEntryForRole(config, session, role) ?? getEntryForRole(config, session, 'driver');
   if (!primaryEntry) return [];
 
   const primary: ModelChainEntry = {
@@ -60,9 +75,7 @@ function getModelChainForRole(config: AppConfig, session: ComputerSession, role:
   // Build fallback chain: profile fallbacks → global fallback
   const catalog = resolveModelCatalog(config);
   const profileKey = session.selectedProfileKey ?? config.defaultProfileKey ?? null;
-  const profile = profileKey
-    ? (config.profiles ?? []).find((p) => p.key === profileKey)
-    : undefined;
+  const profile = profileKey ? (config.profiles ?? []).find((p) => p.key === profileKey) : undefined;
   const fallbackKeys = profile?.fallbackModelKeys ?? config.fallback?.modelKeys ?? [];
 
   const fallbacks: ModelChainEntry[] = fallbackKeys
@@ -80,9 +93,7 @@ function getModelChainForRole(config: AppConfig, session: ComputerSession, role:
 
 function getMaxRetries(config: AppConfig, session: ComputerSession): number {
   const profileKey = session.selectedProfileKey ?? config.defaultProfileKey ?? null;
-  const profile = profileKey
-    ? (config.profiles ?? []).find((p) => p.key === profileKey)
-    : undefined;
+  const profile = profileKey ? (config.profiles ?? []).find((p) => p.key === profileKey) : undefined;
   return profile?.maxRetries ?? config.advanced.maxRetries;
 }
 
@@ -98,7 +109,12 @@ function getStartingCursor(action: ComputerActionProposal): { x: number; y: numb
   // overlay indicator starts animating toward it immediately (before the action
   // completes). For drag, start at the drag origin; the end position is set
   // after the action finishes.
-  if (action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'movePointer' || action.kind === 'drag') {
+  if (
+    action.kind === 'click' ||
+    action.kind === 'doubleClick' ||
+    action.kind === 'movePointer' ||
+    action.kind === 'drag'
+  ) {
     if (action.x == null || action.y == null) return undefined;
     return { x: action.x, y: action.y, visible: true };
   }
@@ -106,10 +122,31 @@ function getStartingCursor(action: ComputerActionProposal): { x: number; y: numb
 }
 
 function getTerminalStatus(session: ComputerSession | null): session is ComputerSession {
-  return Boolean(session && (session.status === 'failed' || session.status === 'completed' || session.status === 'stopped'));
+  return Boolean(
+    session && (session.status === 'failed' || session.status === 'completed' || session.status === 'stopped'),
+  );
 }
 
-function actionLoopFingerprint(action: Pick<ComputerActionProposal, 'kind' | 'selector' | 'elementId' | 'x' | 'y' | 'endX' | 'endY' | 'url' | 'text' | 'keys' | 'deltaX' | 'deltaY' | 'appName' | 'waitMs' | 'movementPath'>): string {
+function actionLoopFingerprint(
+  action: Pick<
+    ComputerActionProposal,
+    | 'kind'
+    | 'selector'
+    | 'elementId'
+    | 'x'
+    | 'y'
+    | 'endX'
+    | 'endY'
+    | 'url'
+    | 'text'
+    | 'keys'
+    | 'deltaX'
+    | 'deltaY'
+    | 'appName'
+    | 'waitMs'
+    | 'movementPath'
+  >,
+): string {
   return JSON.stringify({
     kind: action.kind,
     selector: action.selector ?? null,
@@ -153,9 +190,8 @@ function getLoopRecoveryReason(session: ComputerSession): string | null {
 
   if (!repeatedAction || repeatedCount < 3) return null;
 
-  const location = repeatedAction.x != null && repeatedAction.y != null
-    ? ` at ${repeatedAction.x},${repeatedAction.y}`
-    : '';
+  const location =
+    repeatedAction.x != null && repeatedAction.y != null ? ` at ${repeatedAction.x},${repeatedAction.y}` : '';
   return `Detected a repeated "${repeatedAction.kind}" action${location}. Switching to recovery strategy.`;
 }
 
@@ -216,7 +252,8 @@ export class ComputerUseOrchestrator {
       for (let step = 0; step < 12; step += 1) {
         if (controller.signal.aborted) return;
         const current = this.readSession(sessionId);
-        if (!current || current.status === 'paused' || current.status === 'stopped' || current.status === 'completed') return;
+        if (!current || current.status === 'paused' || current.status === 'stopped' || current.status === 'completed')
+          return;
 
         // Re-read config each step so mid-session changes take effect
         const config = this.getConfig();
@@ -231,9 +268,8 @@ export class ComputerUseOrchestrator {
         if (prevTiming && step > 0) {
           const cycleDurationMs = stepStartMs - new Date(prevTiming.lastCaptureAt).getTime();
           const alpha = 0.3;
-          const newAvg = prevTiming.avgMs > 0
-            ? alpha * cycleDurationMs + (1 - alpha) * prevTiming.avgMs
-            : cycleDurationMs;
+          const newAvg =
+            prevTiming.avgMs > 0 ? alpha * cycleDurationMs + (1 - alpha) * prevTiming.avgMs : cycleDurationMs;
           this.cycleDurations.set(sessionId, { avgMs: newAvg, lastCaptureAt: nowIso() });
         } else {
           this.cycleDurations.set(sessionId, { avgMs: 0, lastCaptureAt: nowIso() });
@@ -251,7 +287,7 @@ export class ComputerUseOrchestrator {
 
         const planningSession = this.readSession(sessionId) ?? current;
         const recoveryReason = getLoopRecoveryReason(planningSession);
-        const planningRole = recoveryReason ? 'recovery' as const : 'driver' as const;
+        const planningRole = recoveryReason ? ('recovery' as const) : ('driver' as const);
 
         // Build model chain with fallback support
         const modelChain = getModelChainForRole(config, planningSession, planningRole);
@@ -268,11 +304,12 @@ export class ComputerUseOrchestrator {
           }));
         }
 
-        const support = modelChain[0].modelConfig.provider === 'anthropic'
-          ? 'anthropic-client-tool'
-          : modelChain[0].modelConfig.provider === 'google'
-            ? 'gemini-computer-use'
-            : 'openai-responses';
+        const support =
+          modelChain[0].modelConfig.provider === 'anthropic'
+            ? 'anthropic-client-tool'
+            : modelChain[0].modelConfig.provider === 'google'
+              ? 'gemini-computer-use'
+              : 'openai-responses';
 
         // Build fallback callbacks for status updates and events
         const fallbackCallbacks: FallbackCallbacks = {
@@ -318,9 +355,7 @@ export class ComputerUseOrchestrator {
           this.mutateSession(sessionId, (existing) => ({
             ...existing,
             guidanceMessages: (existing.guidanceMessages ?? []).map((m) =>
-              pendingGuidance.some((pg) => pg.id === m.id)
-                ? { ...m, injectedAt: nowIso() }
-                : m,
+              pendingGuidance.some((pg) => pg.id === m.id) ? { ...m, injectedAt: nowIso() } : m,
             ),
             updatedAt: nowIso(),
           }));
@@ -330,11 +365,34 @@ export class ComputerUseOrchestrator {
         const excludedApps = config.computerUse.localMacos.captureExcludedApps;
         const computerUseInstructions = config.systemPrompts?.computerUse?.trim() || DEFAULT_COMPUTER_USE_PROMPT;
 
-        const plan = support === 'anthropic-client-tool'
-          ? await anthropicPlanSession(freshSession, modelChain, maxRetries, planningRole, computerUseInstructions, excludedApps, fallbackCallbacks)
-          : support === 'gemini-computer-use'
-            ? await geminiPlanSession(freshSession, modelChain, maxRetries, computerUseInstructions, fallbackCallbacks)
-            : await openaiPlanSession(freshSession, modelChain, maxRetries, planningRole, computerUseInstructions, excludedApps, fallbackCallbacks);
+        const plan =
+          support === 'anthropic-client-tool'
+            ? await anthropicPlanSession(
+                freshSession,
+                modelChain,
+                maxRetries,
+                planningRole,
+                computerUseInstructions,
+                excludedApps,
+                fallbackCallbacks,
+              )
+            : support === 'gemini-computer-use'
+              ? await geminiPlanSession(
+                  freshSession,
+                  modelChain,
+                  maxRetries,
+                  computerUseInstructions,
+                  fallbackCallbacks,
+                )
+              : await openaiPlanSession(
+                  freshSession,
+                  modelChain,
+                  maxRetries,
+                  planningRole,
+                  computerUseInstructions,
+                  excludedApps,
+                  fallbackCallbacks,
+                );
 
         this.mutateSession(sessionId, (existing) => ({
           ...existing,
@@ -475,9 +533,9 @@ export class ComputerUseOrchestrator {
   private markActionFailed(sessionId: string, actionId: string, error: string): void {
     const updated = this.mutateSession(sessionId, (existing) => ({
       ...existing,
-      actions: existing.actions.map((candidate) => candidate.id === actionId
-        ? { ...candidate, status: 'failed' as const, error }
-        : candidate),
+      actions: existing.actions.map((candidate) =>
+        candidate.id === actionId ? { ...candidate, status: 'failed' as const, error } : candidate,
+      ),
       updatedAt: nowIso(),
     }));
     const failedAction = updated?.actions.find((candidate) => candidate.id === actionId);
@@ -500,8 +558,12 @@ export class ComputerUseOrchestrator {
     // window doesn't intercept synthetic CGEvents dispatched by the macOS helper.
     // The overlay uses setIgnoreMouseEvents(true, {forward: true}) but macOS may
     // still route synthetic HID-level events to the topmost window.
-    const pointerAction = action.kind === 'click' || action.kind === 'doubleClick'
-      || action.kind === 'drag' || action.kind === 'movePointer' || action.kind === 'scroll';
+    const pointerAction =
+      action.kind === 'click' ||
+      action.kind === 'doubleClick' ||
+      action.kind === 'drag' ||
+      action.kind === 'movePointer' ||
+      action.kind === 'scroll';
     if (pointerAction && session.target === 'local-macos') {
       await hideOverlayForCapture(sessionId);
     }
@@ -542,13 +604,31 @@ export class ComputerUseOrchestrator {
           x: result.cursor.x ?? this.readSession(sessionId)?.cursor?.x ?? action.endX ?? action.x ?? 0,
           y: result.cursor.y ?? this.readSession(sessionId)?.cursor?.y ?? action.endY ?? action.y ?? 0,
           visible: result.cursor.visible ?? true,
-          clickedAt: action.kind === 'click' || action.kind === 'doubleClick' ? nowIso() : this.readSession(sessionId)?.cursor?.clickedAt ?? null,
+          clickedAt:
+            action.kind === 'click' || action.kind === 'doubleClick'
+              ? nowIso()
+              : (this.readSession(sessionId)?.cursor?.clickedAt ?? null),
           displayIndex: actionDisplayIndex,
         }
       : action.kind === 'drag' && action.endX != null && action.endY != null
-        ? { x: action.endX, y: action.endY, visible: true, clickedAt: this.readSession(sessionId)?.cursor?.clickedAt ?? null, displayIndex: actionDisplayIndex }
+        ? {
+            x: action.endX,
+            y: action.endY,
+            visible: true,
+            clickedAt: this.readSession(sessionId)?.cursor?.clickedAt ?? null,
+            displayIndex: actionDisplayIndex,
+          }
         : action.x != null && action.y != null
-          ? { x: action.x, y: action.y, visible: true, clickedAt: action.kind === 'click' || action.kind === 'doubleClick' ? nowIso() : this.readSession(sessionId)?.cursor?.clickedAt ?? null, displayIndex: actionDisplayIndex }
+          ? {
+              x: action.x,
+              y: action.y,
+              visible: true,
+              clickedAt:
+                action.kind === 'click' || action.kind === 'doubleClick'
+                  ? nowIso()
+                  : (this.readSession(sessionId)?.cursor?.clickedAt ?? null),
+              displayIndex: actionDisplayIndex,
+            }
           : this.readSession(sessionId)?.cursor;
 
     const updated = this.mutateSession(sessionId, (existing) => ({
@@ -560,19 +640,25 @@ export class ComputerUseOrchestrator {
       lastActionAt: nowIso(),
       lastCompletedActionId: action.id,
       updatedAt: nowIso(),
-      actions: existing.actions.map((candidate) => candidate.id === action.id
-        ? {
-            ...candidate,
-            status: 'completed',
-            resultSummary: result.summary,
-            ...(result.cursor && (action.kind === 'movePointer' || action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'drag')
-              ? {
-                  resolvedX: result.cursor.x ?? candidate.resolvedX ?? candidate.endX ?? candidate.x,
-                  resolvedY: result.cursor.y ?? candidate.resolvedY ?? candidate.endY ?? candidate.y,
-                }
-              : {}),
-          }
-        : candidate),
+      actions: existing.actions.map((candidate) =>
+        candidate.id === action.id
+          ? {
+              ...candidate,
+              status: 'completed',
+              resultSummary: result.summary,
+              ...(result.cursor &&
+              (action.kind === 'movePointer' ||
+                action.kind === 'click' ||
+                action.kind === 'doubleClick' ||
+                action.kind === 'drag')
+                ? {
+                    resolvedX: result.cursor.x ?? candidate.resolvedX ?? candidate.endX ?? candidate.x,
+                    resolvedY: result.cursor.y ?? candidate.resolvedY ?? candidate.endY ?? candidate.y,
+                  }
+                : {}),
+            }
+          : candidate,
+      ),
     }));
     const nextAction = updated?.actions.find((candidate) => candidate.id === action.id);
     if (nextAction) {

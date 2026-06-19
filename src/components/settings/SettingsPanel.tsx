@@ -9,6 +9,7 @@ import { SkillSettings } from './SkillSettings';
 import { AudioSettings } from './AudioSettings';
 import { RealtimeSettings } from './RealtimeSettings';
 import { DictationSettings } from './DictationSettings';
+import { AppShotsSettings } from './AppShotsSettings';
 import { UsageDashboard } from './UsageDashboard';
 import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
@@ -70,7 +71,10 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   return (
     <div className="flex h-full flex-col bg-background md:flex-row">
       <div className="app-shell-panel w-full shrink-0 border-b border-border/70 bg-sidebar/55 md:w-[220px] md:overflow-y-auto md:border-b-0 md:border-r md:p-3">
-        <div ref={navRef} className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0">
+        <div
+          ref={navRef}
+          className="flex gap-1 overflow-x-auto px-2 pb-2 md:block md:space-y-1 md:overflow-x-visible md:px-3 md:pb-0"
+        >
           {sections.map((section) => (
             <button
               key={section.key}
@@ -96,7 +100,9 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
         {activeSection === 'tools' && <CombinedToolsSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'voice' && <VoiceSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'media-generation' && <MediaGenerationSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'media-generation' && (
+          <MediaGenerationSettings config={config} updateConfig={updateConfig} />
+        )}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} />}
@@ -153,7 +159,7 @@ const CombinedToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   );
 };
 
-type VoiceTab = 'realtime' | 'dictation';
+type VoiceTab = 'realtime' | 'dictation' | 'app-shots';
 
 const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const [activeTab, setActiveTab] = useState<VoiceTab>('realtime');
@@ -161,15 +167,14 @@ const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const tabs: Array<{ key: VoiceTab; label: string }> = [
     { key: 'realtime', label: 'Voice Chat' },
     { key: 'dictation', label: 'Dictation' },
+    { key: 'app-shots', label: 'App Shots' },
   ];
 
   return (
     <div className="space-y-6">
       <div>
         <h3 className="text-sm font-semibold">Voice</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Configure live voice chat and dictation settings.
-        </p>
+        <p className="mt-1 text-xs text-muted-foreground">Configure live voice chat and dictation settings.</p>
       </div>
 
       {/* Tab Bar */}
@@ -193,6 +198,7 @@ const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       {/* Content */}
       {activeTab === 'realtime' && <RealtimeSettings config={config} updateConfig={updateConfig} hideTitle />}
       {activeTab === 'dictation' && <DictationSettings config={config} updateConfig={updateConfig} />}
+      {activeTab === 'app-shots' && <AppShotsSettings config={config} updateConfig={updateConfig} />}
     </div>
   );
 };

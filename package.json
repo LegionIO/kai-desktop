@@ -18,6 +18,7 @@
     "generate:dmg-bg": "tsx scripts/generate-dmg-background.ts",
     "build:mac": "pnpm generate:dmg-bg && pnpm build && pnpm generate:builder && electron-builder --mac --config",
     "build:win": "pnpm build && pnpm generate:builder && electron-builder --win --config",
+    "build:linux": "pnpm build && pnpm generate:builder && electron-builder --linux --config",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
@@ -151,9 +152,15 @@
     "yaml": "^2.8.3",
     "zod": "^4.3.6"
   },
+  "optionalDependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6",
+    "active-win": "^9.0.0"
+  },
   "packageManager": "pnpm@10.33.0",
   "pnpm": {
     "onlyBuiltDependencies": [
+      "@nut-tree-fork/libnut",
+      "active-win",
       "electron",
       "esbuild",
       "sharp"

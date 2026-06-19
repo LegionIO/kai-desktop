@@ -74,20 +74,28 @@ const AppListPicker: FC<{
 
   const refreshApps = useCallback(() => {
     setIsLoading(true);
-    void app.computerUse.listRunningApps().then(({ apps }) => {
-      setRunningApps(apps);
-    }).catch(() => {}).finally(() => setIsLoading(false));
+    void app.computerUse
+      .listRunningApps()
+      .then(({ apps }) => {
+        setRunningApps(apps);
+      })
+      .catch(() => {})
+      .finally(() => setIsLoading(false));
   }, []);
 
-  useEffect(() => { refreshApps(); }, [refreshApps]);
+  useEffect(() => {
+    refreshApps();
+  }, [refreshApps]);
 
   // Close dropdown when clicking outside
   useEffect(() => {
     if (!isFocused) return;
     const handleClickOutside = (e: MouseEvent) => {
       if (
-        inputRef.current && !inputRef.current.contains(e.target as Node) &&
-        dropdownRef.current && !dropdownRef.current.contains(e.target as Node)
+        inputRef.current &&
+        !inputRef.current.contains(e.target as Node) &&
+        dropdownRef.current &&
+        !dropdownRef.current.contains(e.target as Node)
       ) {
         setIsFocused(false);
       }
@@ -178,8 +186,14 @@ const AppListPicker: FC<{
           ref={inputRef}
           type="text"
           value={query}
-          onChange={(e) => { setQuery(e.target.value); setHighlightIndex(-1); }}
-          onFocus={() => { setIsFocused(true); refreshApps(); }}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setHighlightIndex(-1);
+          }}
+          onFocus={() => {
+            setIsFocused(true);
+            refreshApps();
+          }}
           onKeyDown={handleKeyDown}
           placeholder={isLoading ? 'Loading apps...' : 'Search running apps or type a name...'}
           className="w-full rounded-md border border-border/60 bg-card/60 px-2 py-1.5 text-[11px] outline-none placeholder:text-muted-foreground/40 focus:border-primary/50"
@@ -215,9 +229,7 @@ const AppListPicker: FC<{
               </button>
             )}
             {isLoading && filteredApps.length === 0 && (
-              <div className="px-2 py-1.5 text-[11px] text-muted-foreground/60">
-                Discovering running apps...
-              </div>
+              <div className="px-2 py-1.5 text-[11px] text-muted-foreground/60">Discovering running apps...</div>
             )}
           </div>
         )}
@@ -256,55 +268,75 @@ const DisplayListPicker: FC<{
 
   const refreshDisplays = useCallback(() => {
     setIsLoading(true);
-    void app.computerUse.listDisplays().then(({ displays: found }) => {
-      setDisplays(found);
+    void app.computerUse
+      .listDisplays()
+      .then(({ displays: found }) => {
+        setDisplays(found);
 
-      const currentValue = valueRef.current;
-      const currentOnChange = onChangeRef.current;
-      const currentOnDiscovered = onDisplaysDiscoveredRef.current;
+        const currentValue = valueRef.current;
+        const currentOnChange = onChangeRef.current;
+        const currentOnDiscovered = onDisplaysDiscoveredRef.current;
 
-      // Detect display list changes (new/removed displays)
-      const newFingerprint = found.map((d) => `${d.displayId}:${d.pixelWidth}x${d.pixelHeight}`).sort().join('|');
-      const fingerprintChanged = prevDisplayFingerprintRef.current !== '' && newFingerprint !== prevDisplayFingerprintRef.current;
-      prevDisplayFingerprintRef.current = newFingerprint;
+        // Detect display list changes (new/removed displays)
+        const newFingerprint = found
+          .map((d) => `${d.displayId}:${d.pixelWidth}x${d.pixelHeight}`)
+          .sort()
+          .join('|');
+        const fingerprintChanged =
+          prevDisplayFingerprintRef.current !== '' && newFingerprint !== prevDisplayFingerprintRef.current;
+        prevDisplayFingerprintRef.current = newFingerprint;
 
-      // Auto-seed: when allowedDisplays is empty and we discover displays,
-      // default ALL displays to ON by populating allowedDisplays with all display names
-      if (found.length > 0 && currentValue.length === 0 && !seededRef.current) {
-        seededRef.current = true;
-        const allNames = found.map((d) => d.name);
-        currentOnChange(allNames);
-        currentOnDiscovered?.(found);
-      } else if (fingerprintChanged && found.length > 0) {
-        // Display list changed (monitor plugged/unplugged) — add any new displays,
-        // keep existing selections, remove stale references
-        const currentLower = new Set(currentValue.map((v) => v.toLowerCase()));
-        const discoveredNames = new Set(found.map((d) => d.name.toLowerCase()));
-        const discoveredIds = new Set(found.map((d) => d.displayId.toLowerCase()));
-        // Keep existing entries that still match a discovered display, add newly discovered ones
-        const kept = currentValue.filter((v) => discoveredNames.has(v.toLowerCase()) || discoveredIds.has(v.toLowerCase()));
-        const newDisplayNames = found
-          .filter((d) => !currentLower.has(d.name.toLowerCase()) && !currentLower.has(d.displayId.toLowerCase()))
-          .map((d) => d.name);
-        if (newDisplayNames.length > 0 || kept.length !== currentValue.length) {
-          const updated = [...kept, ...newDisplayNames];
-          currentOnChange(updated);
-          currentOnDiscovered?.(found.filter((d) =>
-            updated.some((v) => v.toLowerCase() === d.name.toLowerCase() || v.toLowerCase() === d.displayId.toLowerCase()),
-          ));
+        // Auto-seed: when allowedDisplays is empty and we discover displays,
+        // default ALL displays to ON by populating allowedDisplays with all display names
+        if (found.length > 0 && currentValue.length === 0 && !seededRef.current) {
+          seededRef.current = true;
+          const allNames = found.map((d) => d.name);
+          currentOnChange(allNames);
+          currentOnDiscovered?.(found);
+        } else if (fingerprintChanged && found.length > 0) {
+          // Display list changed (monitor plugged/unplugged) — add any new displays,
+          // keep existing selections, remove stale references
+          const currentLower = new Set(currentValue.map((v) => v.toLowerCase()));
+          const discoveredNames = new Set(found.map((d) => d.name.toLowerCase()));
+          const discoveredIds = new Set(found.map((d) => d.displayId.toLowerCase()));
+          // Keep existing entries that still match a discovered display, add newly discovered ones
+          const kept = currentValue.filter(
+            (v) => discoveredNames.has(v.toLowerCase()) || discoveredIds.has(v.toLowerCase()),
+          );
+          const newDisplayNames = found
+            .filter((d) => !currentLower.has(d.name.toLowerCase()) && !currentLower.has(d.displayId.toLowerCase()))
+            .map((d) => d.name);
+          if (newDisplayNames.length > 0 || kept.length !== currentValue.length) {
+            const updated = [...kept, ...newDisplayNames];
+            currentOnChange(updated);
+            currentOnDiscovered?.(
+              found.filter((d) =>
+                updated.some(
+                  (v) => v.toLowerCase() === d.name.toLowerCase() || v.toLowerCase() === d.displayId.toLowerCase(),
+                ),
+              ),
+            );
+          }
         }
-      }
-    }).catch(() => {}).finally(() => setIsLoading(false));
+      })
+      .catch(() => {})
+      .finally(() => setIsLoading(false));
   }, []); // stable — uses refs internally
 
-  useEffect(() => { refreshDisplays(); }, [refreshDisplays]);
+  useEffect(() => {
+    refreshDisplays();
+  }, [refreshDisplays]);
 
   const isSelected = (display: DisplayInfo) =>
-    value.some((v) => v.toLowerCase() === display.name.toLowerCase() || v.toLowerCase() === display.displayId.toLowerCase());
+    value.some(
+      (v) => v.toLowerCase() === display.name.toLowerCase() || v.toLowerCase() === display.displayId.toLowerCase(),
+    );
 
   const toggleDisplay = (display: DisplayInfo) => {
     if (isSelected(display)) {
-      const next = value.filter((v) => v.toLowerCase() !== display.name.toLowerCase() && v.toLowerCase() !== display.displayId.toLowerCase());
+      const next = value.filter(
+        (v) => v.toLowerCase() !== display.name.toLowerCase() && v.toLowerCase() !== display.displayId.toLowerCase(),
+      );
       onChange(next);
       // Update maxDimension based on remaining enabled displays
       const enabledDisplays = displays.filter((d) =>
@@ -338,21 +370,28 @@ const DisplayListPicker: FC<{
       {/* Current selections that don't match any discovered display (custom entries) */}
       {value.length > 0 && (
         <div className="flex flex-wrap gap-1">
-          {value.filter((v) => !displays.some((d) => d.name.toLowerCase() === v.toLowerCase() || d.displayId.toLowerCase() === v.toLowerCase())).map((name) => (
-            <span
-              key={name}
-              className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/60 px-2 py-0.5 text-[11px]"
-            >
-              {name}
-              <button
-                type="button"
-                onClick={() => removeDisplay(name)}
-                className="text-muted-foreground/60 hover:text-foreground transition-colors"
+          {value
+            .filter(
+              (v) =>
+                !displays.some(
+                  (d) => d.name.toLowerCase() === v.toLowerCase() || d.displayId.toLowerCase() === v.toLowerCase(),
+                ),
+            )
+            .map((name) => (
+              <span
+                key={name}
+                className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/60 px-2 py-0.5 text-[11px]"
               >
-                <XIcon className="h-3 w-3" />
-              </button>
-            </span>
-          ))}
+                {name}
+                <button
+                  type="button"
+                  onClick={() => removeDisplay(name)}
+                  className="text-muted-foreground/60 hover:text-foreground transition-colors"
+                >
+                  <XIcon className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
         </div>
       )}
 
@@ -375,7 +414,9 @@ const DisplayListPicker: FC<{
                       : 'border-border/60 bg-card/60 opacity-40'
                 }`}
               >
-                <span className={`h-2 w-2 rounded-full flex-shrink-0 ${selected ? 'bg-primary' : noSelection ? 'bg-muted-foreground/30' : 'bg-muted-foreground/20'}`} />
+                <span
+                  className={`h-2 w-2 rounded-full flex-shrink-0 ${selected ? 'bg-primary' : noSelection ? 'bg-muted-foreground/30' : 'bg-muted-foreground/20'}`}
+                />
                 <span className="flex-1 truncate">
                   {display.name}
                   {display.isPrimary && <span className="text-muted-foreground/60 ml-1">(primary)</span>}
@@ -390,9 +431,7 @@ const DisplayListPicker: FC<{
       )}
 
       {isLoading && displays.length === 0 && (
-        <div className="px-2 py-1.5 text-[11px] text-muted-foreground/60">
-          Discovering displays...
-        </div>
+        <div className="px-2 py-1.5 text-[11px] text-muted-foreground/60">Discovering displays...</div>
       )}
 
       {!isLoading && displays.length === 0 && (
@@ -410,15 +449,18 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
   const computerUse = config.computerUse as ComputerUseConfig;
   const models = config.models as { catalog: Array<{ key: string; displayName: string }> };
 
-  const handleDisplaysDiscovered = useCallback((enabledDisplays: DisplayInfo[]) => {
-    if (enabledDisplays.length === 0) return;
-    const maxX = Math.max(...enabledDisplays.map((d) => d.pixelWidth));
-    const maxY = Math.max(...enabledDisplays.map((d) => d.pixelHeight));
-    const largestDim = Math.max(maxX, maxY);
-    if (largestDim > 0 && largestDim !== computerUse.capture.maxDimension) {
-      updateConfig('computerUse.capture.maxDimension', largestDim);
-    }
-  }, [computerUse.capture.maxDimension, updateConfig]);
+  const handleDisplaysDiscovered = useCallback(
+    (enabledDisplays: DisplayInfo[]) => {
+      if (enabledDisplays.length === 0) return;
+      const maxX = Math.max(...enabledDisplays.map((d) => d.pixelWidth));
+      const maxY = Math.max(...enabledDisplays.map((d) => d.pixelHeight));
+      const largestDim = Math.max(maxX, maxY);
+      if (largestDim > 0 && largestDim !== computerUse.capture.maxDimension) {
+        updateConfig('computerUse.capture.maxDimension', largestDim);
+      }
+    },
+    [computerUse.capture.maxDimension, updateConfig],
+  );
 
   return (
     <div className="space-y-6">
@@ -431,26 +473,52 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">General</legend>
-        <Toggle label="Enabled" checked={computerUse.enabled} onChange={(value) => updateConfig('computerUse.enabled', value)} />
-        <Toggle label="Show Step Log" checked={computerUse.showStepLog} onChange={(value) => updateConfig('computerUse.showStepLog', value)} />
+        <Toggle
+          label="Enabled"
+          checked={computerUse.enabled}
+          onChange={(value) => updateConfig('computerUse.enabled', value)}
+        />
+        <Toggle
+          label="Show Step Log"
+          checked={computerUse.showStepLog}
+          onChange={(value) => updateConfig('computerUse.showStepLog', value)}
+        />
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Default Surface</label>
-            <select className={settingsSelectClass} value={computerUse.defaultSurface} onChange={(e) => updateConfig('computerUse.defaultSurface', e.target.value)}>
+            <select
+              className={settingsSelectClass}
+              value={computerUse.defaultSurface}
+              onChange={(e) => updateConfig('computerUse.defaultSurface', e.target.value)}
+            >
               <option value="docked">Docked panel</option>
               <option value="window">Detached window</option>
             </select>
           </div>
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Default Target</label>
-            <select className={settingsSelectClass} value={computerUse.defaultTarget} onChange={(e) => updateConfig('computerUse.defaultTarget', e.target.value)}>
+            <select
+              className={settingsSelectClass}
+              value={computerUse.defaultTarget}
+              onChange={(e) => updateConfig('computerUse.defaultTarget', e.target.value)}
+            >
               <option value="isolated-browser">Isolated Browser</option>
-              {app.platform.os === 'darwin' && <option value="local-macos">Local Mac</option>}
+              <option value="local-macos">
+                {app.platform.os === 'darwin'
+                  ? 'Local Mac'
+                  : app.platform.os === 'win32'
+                    ? 'Local Windows'
+                    : 'Local Linux'}
+              </option>
             </select>
           </div>
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Approval Mode</label>
-            <select className={settingsSelectClass} value={computerUse.approvalModeDefault} onChange={(e) => updateConfig('computerUse.approvalModeDefault', e.target.value)}>
+            <select
+              className={settingsSelectClass}
+              value={computerUse.approvalModeDefault}
+              onChange={(e) => updateConfig('computerUse.approvalModeDefault', e.target.value)}
+            >
               <option value="step">Step approvals</option>
               <option value="goal">Goal approvals</option>
               <option value="autonomous">Mostly autonomous</option>
@@ -458,32 +526,61 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
           </div>
           <div>
             <label className="text-[10px] text-muted-foreground block mb-0.5">Tool Availability</label>
-            <select className={settingsSelectClass} value={computerUse.toolSurface ?? 'both'} onChange={(e) => updateConfig('computerUse.toolSurface', e.target.value)}>
+            <select
+              className={settingsSelectClass}
+              value={computerUse.toolSurface ?? 'both'}
+              onChange={(e) => updateConfig('computerUse.toolSurface', e.target.value)}
+            >
               <option value="both">Chat & Calls (Both)</option>
               <option value="only-calls">Only Realtime Calls</option>
               <option value="only-chat">Only Chat</option>
               <option value="none">Disabled</option>
             </select>
           </div>
-          <NumberField label="Idle Timeout (sec)" value={computerUse.idleTimeoutSec} onChange={(value) => updateConfig('computerUse.idleTimeoutSec', value)} min={30} />
-          <NumberField label="Post-Action Delay (ms)" value={computerUse.postActionDelayMs} onChange={(value) => updateConfig('computerUse.postActionDelayMs', value)} min={0} max={5000} />
-          <NumberField label="Max Session Duration (min)" value={computerUse.maxSessionDurationMin} onChange={(value) => updateConfig('computerUse.maxSessionDurationMin', value)} min={5} />
+          <NumberField
+            label="Idle Timeout (sec)"
+            value={computerUse.idleTimeoutSec}
+            onChange={(value) => updateConfig('computerUse.idleTimeoutSec', value)}
+            min={30}
+          />
+          <NumberField
+            label="Post-Action Delay (ms)"
+            value={computerUse.postActionDelayMs}
+            onChange={(value) => updateConfig('computerUse.postActionDelayMs', value)}
+            min={0}
+            max={5000}
+          />
+          <NumberField
+            label="Max Session Duration (min)"
+            value={computerUse.maxSessionDurationMin}
+            onChange={(value) => updateConfig('computerUse.maxSessionDurationMin', value)}
+            min={5}
+          />
         </div>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Model Assignments</legend>
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
-          Override the default model for each session role. Leave on "Inherit" to use whatever model is selected in the composer.
+          Override the default model for each session role. Leave on "Inherit" to use whatever model is selected in the
+          composer.
         </div>
         <div className="grid grid-cols-2 gap-3">
           {MODEL_ROLES.map(([key, label, hint]) => (
             <div key={key}>
-              <label className="text-[10px] text-muted-foreground block mb-0.5" title={hint}>{label}</label>
-              <select className={settingsSelectClass} value={computerUse.models[key as keyof ComputerUseConfig['models']] ?? ''} onChange={(e) => updateConfig(`computerUse.models.${key}`, e.target.value || undefined)}>
+              <label className="text-[10px] text-muted-foreground block mb-0.5" title={hint}>
+                {label}
+              </label>
+              <select
+                className={settingsSelectClass}
+                value={computerUse.models[key as keyof ComputerUseConfig['models']] ?? ''}
+                onChange={(e) => updateConfig(`computerUse.models.${key}`, e.target.value || undefined)}
+              >
                 <option value="">Inherit selected model</option>
                 {models.catalog.map((model) => (
-                  <option key={model.key} value={model.key}>{model.displayName}</option>
+                  <option key={model.key} value={model.key}>
+                    {model.displayName}
+                  </option>
                 ))}
               </select>
               <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">{hint}</span>
@@ -495,24 +592,52 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Safety</legend>
         <div className="grid grid-cols-2 gap-2">
-          <Toggle label="Pause on Terminal actions" checked={computerUse.safety.pauseOnTerminal} onChange={(value) => updateConfig('computerUse.safety.pauseOnTerminal', value)} />
-          <Toggle label="Pause on manual takeover" checked={computerUse.safety.manualTakeoverPauses} onChange={(value) => updateConfig('computerUse.safety.manualTakeoverPauses', value)} />
+          <Toggle
+            label="Pause on Terminal actions"
+            checked={computerUse.safety.pauseOnTerminal}
+            onChange={(value) => updateConfig('computerUse.safety.pauseOnTerminal', value)}
+          />
+          <Toggle
+            label="Pause on manual takeover"
+            checked={computerUse.safety.manualTakeoverPauses}
+            onChange={(value) => updateConfig('computerUse.safety.manualTakeoverPauses', value)}
+          />
         </div>
       </fieldset>
 
       {app.platform.os === 'darwin' && (
-      <fieldset className="rounded-lg border p-3 space-y-3">
-        <legend className="text-xs font-semibold px-1">Local Mac</legend>
-        <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
-          Requires macOS Accessibility, Screen Recording, and Automation permissions. {__BRAND_PRODUCT_NAME} can request these automatically when a session starts.
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <Toggle label="Auto-request permissions" checked={computerUse.localMacos.autoRequestPermissions} onChange={(value) => updateConfig('computerUse.localMacos.autoRequestPermissions', value)} />
-          <Toggle label="Auto-open Privacy Settings" checked={computerUse.localMacos.autoOpenPrivacySettings} onChange={(value) => updateConfig('computerUse.localMacos.autoOpenPrivacySettings', value)} />
-        </div>
-        <DisplayListPicker label="Allowed Displays" value={computerUse.localMacos.allowedDisplays ?? []} onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)} onDisplaysDiscovered={handleDisplaysDiscovered} hint="Select which displays autopilot can capture. All displays are enabled by default." />
-        <AppListPicker label="Capture Excluded Apps" value={computerUse.localMacos.captureExcludedApps ?? []} onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)} hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID." />
-      </fieldset>
+        <fieldset className="rounded-lg border p-3 space-y-3">
+          <legend className="text-xs font-semibold px-1">Local Mac</legend>
+          <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
+            Requires macOS Accessibility, Screen Recording, and Automation permissions. {__BRAND_PRODUCT_NAME} can
+            request these automatically when a session starts.
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Toggle
+              label="Auto-request permissions"
+              checked={computerUse.localMacos.autoRequestPermissions}
+              onChange={(value) => updateConfig('computerUse.localMacos.autoRequestPermissions', value)}
+            />
+            <Toggle
+              label="Auto-open Privacy Settings"
+              checked={computerUse.localMacos.autoOpenPrivacySettings}
+              onChange={(value) => updateConfig('computerUse.localMacos.autoOpenPrivacySettings', value)}
+            />
+          </div>
+          <DisplayListPicker
+            label="Allowed Displays"
+            value={computerUse.localMacos.allowedDisplays ?? []}
+            onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)}
+            onDisplaysDiscovered={handleDisplaysDiscovered}
+            hint="Select which displays autopilot can capture. All displays are enabled by default."
+          />
+          <AppListPicker
+            label="Capture Excluded Apps"
+            value={computerUse.localMacos.captureExcludedApps ?? []}
+            onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)}
+            hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID."
+          />
+        </fieldset>
       )}
 
       <fieldset className="rounded-lg border p-3 space-y-3">
@@ -520,18 +645,40 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
           Shows a status bar on your screen during Local Mac sessions. Excluded from screenshots via ScreenCaptureKit.
         </div>
-        <Toggle label="Enabled" checked={computerUse.overlay.enabled} onChange={(value) => updateConfig('computerUse.overlay.enabled', value)} />
+        <Toggle
+          label="Enabled"
+          checked={computerUse.overlay.enabled}
+          onChange={(value) => updateConfig('computerUse.overlay.enabled', value)}
+        />
         {computerUse.overlay.enabled && (
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-[10px] text-muted-foreground block mb-0.5">Position</label>
-              <select className={settingsSelectClass} value={computerUse.overlay.position} onChange={(e) => updateConfig('computerUse.overlay.position', e.target.value)}>
+              <select
+                className={settingsSelectClass}
+                value={computerUse.overlay.position}
+                onChange={(e) => updateConfig('computerUse.overlay.position', e.target.value)}
+              >
                 <option value="top">Top of screen</option>
                 <option value="bottom">Bottom of screen</option>
               </select>
             </div>
-            <NumberField label="Height (px)" value={computerUse.overlay.heightPx} onChange={(value) => updateConfig('computerUse.overlay.heightPx', value)} min={60} max={300} />
-            <NumberField label="Opacity (%)" value={Math.round(computerUse.overlay.opacity * 100)} onChange={(value) => updateConfig('computerUse.overlay.opacity', Math.max(0.3, Math.min(value / 100, 0.95)))} min={30} max={95} />
+            <NumberField
+              label="Height (px)"
+              value={computerUse.overlay.heightPx}
+              onChange={(value) => updateConfig('computerUse.overlay.heightPx', value)}
+              min={60}
+              max={300}
+            />
+            <NumberField
+              label="Opacity (%)"
+              value={Math.round(computerUse.overlay.opacity * 100)}
+              onChange={(value) =>
+                updateConfig('computerUse.overlay.opacity', Math.max(0.3, Math.min(value / 100, 0.95)))
+              }
+              min={30}
+              max={95}
+            />
           </div>
         )}
       </fieldset>
@@ -541,8 +688,21 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
           Fine-tune screenshot capture. Most users can leave these at defaults.
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <NumberField label="Max Dimension (px)" value={computerUse.capture.maxDimension} onChange={(value) => updateConfig('computerUse.capture.maxDimension', value)} min={512} />
-          <NumberField label="JPEG Quality (%)" value={Math.round(computerUse.capture.jpegQuality * 100)} onChange={(value) => updateConfig('computerUse.capture.jpegQuality', Math.max(0.1, Math.min(value / 100, 1)))} min={10} max={100} />
+          <NumberField
+            label="Max Dimension (px)"
+            value={computerUse.capture.maxDimension}
+            onChange={(value) => updateConfig('computerUse.capture.maxDimension', value)}
+            min={512}
+          />
+          <NumberField
+            label="JPEG Quality (%)"
+            value={Math.round(computerUse.capture.jpegQuality * 100)}
+            onChange={(value) =>
+              updateConfig('computerUse.capture.jpegQuality', Math.max(0.1, Math.min(value / 100, 1)))
+            }
+            min={10}
+            max={100}
+          />
         </div>
         <div className="grid grid-cols-3 gap-3">
           <label className="space-y-1">
@@ -556,8 +716,18 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
               <option value="native">Native</option>
             </select>
           </label>
-          <NumberField label="Model Width" value={computerUse.capture.modelFrame?.width ?? 1366} onChange={(value) => updateConfig('computerUse.capture.modelFrame.width', value)} min={512} />
-          <NumberField label="Model Height" value={computerUse.capture.modelFrame?.height ?? 768} onChange={(value) => updateConfig('computerUse.capture.modelFrame.height', value)} min={384} />
+          <NumberField
+            label="Model Width"
+            value={computerUse.capture.modelFrame?.width ?? 1366}
+            onChange={(value) => updateConfig('computerUse.capture.modelFrame.width', value)}
+            min={512}
+          />
+          <NumberField
+            label="Model Height"
+            value={computerUse.capture.modelFrame?.height ?? 768}
+            onChange={(value) => updateConfig('computerUse.capture.modelFrame.height', value)}
+            min={384}
+          />
         </div>
       </CollapsibleSection>
     </div>

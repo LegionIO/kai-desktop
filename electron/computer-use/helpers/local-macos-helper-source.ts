@@ -999,6 +999,7 @@ final class DictationSessionServer {
   private var partialTyping: [String: String] = [:]
   private var livePartials = false
   private var allowBlindKeyboardFullPatch = false
+  private var debugLogging = false
   private var ownPid: pid_t?
   private var ownAppName = ""
   private var monitorTap: CFMachPort?
@@ -1087,10 +1088,57 @@ final class DictationSessionServer {
     if let partialTypingStrategyUsed {
       response["strategy"] = partialTypingStrategyUsed
     }
+    if let debug = gatherDebugMetadata() {
+      response["debug"] = debug
+    }
     for (key, value) in extra {
       response[key] = value
     }
     return response
+  }
+
+  private func gatherDebugMetadata() -> [String: Any]? {
+    guard debugLogging, let pid = targetPid else { return nil }
+    guard let element = focusedAccessibilityElement(pid: pid) else { return nil }
+
+    var debug: [String: Any] = [:]
+
+    // Role and subrole
+    debug["role"] = stringAttribute(element, kAXRoleAttribute as String) ?? "unknown"
+    debug["subrole"] = stringAttribute(element, kAXSubroleAttribute as String) ?? "none"
+    debug["identifier"] = stringAttribute(element, "AXIdentifier") ?? "none"
+
+    // Placeholder value
+    if let placeholder = stringAttribute(element, "AXPlaceholderValue") {
+      debug["placeholderValue"] = placeholder
+    }
+
+    // Value length
+    var valueRef: CFTypeRef?
+    let valueErr = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef)
+    if valueErr == .success, let valueStr = valueRef as? String {
+      debug["valueLength"] = valueStr.utf16.count
+    } else {
+      debug["axValueError"] = "\(valueErr.rawValue)"
+    }
+
+    // Selected text range
+    var rangeRef: CFTypeRef?
+    let selErr = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef)
+    if selErr == .success, let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() {
+      var range = CFRange(location: 0, length: 0)
+      if AXValueGetValue(rangeRef as! AXValue, .cfRange, &range) {
+        debug["selectedRangeLocation"] = range.location
+        debug["selectedRangeLength"] = range.length
+      }
+    } else {
+      debug["axSelectionError"] = "\(selErr.rawValue)"
+    }
+
+    // Secure field check
+    debug["isSecure"] = focusedTextTargetIsSecure(pid: pid)
+
+    return debug
   }
 
   private var hasAxSpan: Bool {
@@ -1157,6 +1205,7 @@ final class DictationSessionServer {
     }
     livePartials = (params["livePartials"] as? Bool) ?? false
     allowBlindKeyboardFullPatch = (params["allowBlindKeyboardFullPatch"] as? Bool) ?? false
+    debugLogging = (params["debugLogging"] as? Bool) ?? false
     if let rawPid = params["ownPid"] as? Int {
       ownPid = pid_t(rawPid)
     } else if let rawPid = params["ownPid"] as? NSNumber {
@@ -2272,8 +2321,196 @@ case "displays":
     "displayCount": layout.count,
   ])
 
+case "activeWindow":
+  printJson(activeWindowInfo())
+
+case "selectedText":
+  printJson(["ok": true, "rangeText": readFocusedSelectedText() ?? ""])
+
+case "uiTree":
+  let depth = parseIntArg(args, 2, default: 4)
+  if let tree = dumpFrontmostUiTree(maxDepth: max(1, depth)) {
+    printJson(["ok": true, "uiTree": tree])
+  } else {
+    printJson(["ok": false, "error": "no frontmost application"])
+  }
+
+case "screenshotWindow":
+  let windowIdArg = args.count >= 3 ? args[2] : ""
+  printJson(captureWindowScreenshot(windowIdArg: windowIdArg))
+
 default:
   printJson(["ok": false, "error": "Unknown command"])
   exit(1)
+}
+
+// MARK: - App Shots support
+
+func activeWindowInfo() -> [String: Any] {
+  guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+    return ["ok": false, "error": "no frontmost application"]
+  }
+  let pid = frontApp.processIdentifier
+  var info: [String: Any] = [
+    "ok": true,
+    "name": frontApp.localizedName ?? "",
+    "bundleId": frontApp.bundleIdentifier ?? "",
+    "pid": Int(pid),
+  ]
+
+  let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+  if let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
+    for entry in windowList {
+      guard let ownerPid = entry[kCGWindowOwnerPID as String] as? Int, ownerPid == Int(pid) else { continue }
+      guard let layer = entry[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+      if let title = entry[kCGWindowName as String] as? String { info["windowTitle"] = title }
+      if let wid = entry[kCGWindowNumber as String] as? Int { info["windowId"] = wid }
+      if let boundsDict = entry[kCGWindowBounds as String] as? [String: CGFloat] {
+        info["bounds"] = [
+          "x": Int(boundsDict["X"] ?? 0),
+          "y": Int(boundsDict["Y"] ?? 0),
+          "width": Int(boundsDict["Width"] ?? 0),
+          "height": Int(boundsDict["Height"] ?? 0),
+        ]
+      }
+      break
+    }
+  }
+
+  if info["windowTitle"] == nil {
+    let appElement = AXUIElementCreateApplication(pid)
+    var focusedWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+       let win = focusedWindow {
+      var titleRef: CFTypeRef?
+      if AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success,
+         let title = titleRef as? String {
+        info["windowTitle"] = title
+      }
+    }
+  }
+
+  return info
+}
+
+func readFocusedSelectedText() -> String? {
+  let system = AXUIElementCreateSystemWide()
+  var focused: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+        let element = focused else { return nil }
+  var selected: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selected) == .success,
+     let text = selected as? String, !text.isEmpty {
+    return text
+  }
+  return nil
+}
+
+func dumpFrontmostUiTree(maxDepth: Int) -> [String: Any]? {
+  guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
+  let appElement = AXUIElementCreateApplication(frontApp.processIdentifier)
+  var focusedWindow: CFTypeRef?
+  let root: AXUIElement
+  if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+     let win = focusedWindow {
+    root = win as! AXUIElement
+  } else {
+    root = appElement
+  }
+  return walkUiNode(root, depth: 0, maxDepth: maxDepth)
+}
+
+func walkUiNode(_ element: AXUIElement, depth: Int, maxDepth: Int) -> [String: Any] {
+  var node: [String: Any] = [:]
+
+  var roleRef: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+     let role = roleRef as? String {
+    node["role"] = role
+  } else {
+    node["role"] = "AXUnknown"
+  }
+
+  var titleRef: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success,
+     let title = titleRef as? String, !title.isEmpty {
+    node["name"] = title
+  }
+
+  var valueRef: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+     let value = valueRef as? String, !value.isEmpty, value.count <= 512 {
+    node["value"] = value
+  }
+
+  var posRef: CFTypeRef?
+  var sizeRef: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+     AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success {
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    if let posVal = posRef, CFGetTypeID(posVal) == AXValueGetTypeID() {
+      AXValueGetValue(posVal as! AXValue, .cgPoint, &point)
+    }
+    if let sizeVal = sizeRef, CFGetTypeID(sizeVal) == AXValueGetTypeID() {
+      AXValueGetValue(sizeVal as! AXValue, .cgSize, &size)
+    }
+    if size.width > 0 || size.height > 0 {
+      node["bounds"] = [
+        "x": Int(point.x), "y": Int(point.y),
+        "width": Int(size.width), "height": Int(size.height),
+      ]
+    }
+  }
+
+  if depth < maxDepth {
+    var childrenRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+       let children = childrenRef as? [AXUIElement], !children.isEmpty {
+      var nodes: [[String: Any]] = []
+      for (i, child) in children.enumerated() {
+        if i >= 64 { break }
+        nodes.append(walkUiNode(child, depth: depth + 1, maxDepth: maxDepth))
+      }
+      if !nodes.isEmpty { node["children"] = nodes }
+    }
+  }
+
+  return node
+}
+
+func captureWindowScreenshot(windowIdArg: String) -> [String: Any] {
+  var windowId: CGWindowID? = nil
+  if let parsed = UInt32(windowIdArg), parsed > 0 {
+    windowId = parsed
+  } else if let frontApp = NSWorkspace.shared.frontmostApplication {
+    let pid = Int(frontApp.processIdentifier)
+    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+      for entry in list {
+        if (entry[kCGWindowOwnerPID as String] as? Int) == pid,
+           (entry[kCGWindowLayer as String] as? Int) == 0,
+           let wid = entry[kCGWindowNumber as String] as? Int {
+          windowId = CGWindowID(wid)
+          break
+        }
+      }
+    }
+  }
+
+  guard let wid = windowId,
+        let image = CGWindowListCreateImage(.null, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) else {
+    return ["ok": false, "error": "unable to capture window image"]
+  }
+
+  let rep = NSBitmapImageRep(cgImage: image)
+  guard let png = rep.representation(using: .png, properties: [:]) else {
+    return ["ok": false, "error": "unable to encode PNG"]
+  }
+  return [
+    "ok": true,
+    "imageBase64": png.base64EncodedString(),
+    "width": image.width,
+    "height": image.height,
+  ]
 }
 `;

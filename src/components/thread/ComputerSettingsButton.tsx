@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useRef, useState, useMemo, type FC } from 'react';
-import { CheckIcon, ChevronUpIcon, FootprintsIcon, GlobeIcon, LaptopIcon, MonitorIcon, ShieldCheckIcon, TargetIcon, ZapIcon } from 'lucide-react';
+import {
+  CheckIcon,
+  ChevronUpIcon,
+  FootprintsIcon,
+  GlobeIcon,
+  LaptopIcon,
+  MonitorIcon,
+  ShieldCheckIcon,
+  TargetIcon,
+  ZapIcon,
+} from 'lucide-react';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
@@ -8,12 +18,25 @@ import type { ComputerUseTarget } from '../../../shared/computer-use';
 
 type ApprovalMode = 'step' | 'goal' | 'autonomous';
 
-const ALL_TARGET_OPTIONS: Array<{ value: ComputerUseTarget; label: string; description: string; icon: typeof GlobeIcon }> = [
+const LOCAL_DESKTOP_LABEL =
+  app.platform.os === 'darwin' ? 'Local Mac' : app.platform.os === 'win32' ? 'Local Windows' : 'Local Linux';
+
+const ALL_TARGET_OPTIONS: Array<{
+  value: ComputerUseTarget;
+  label: string;
+  description: string;
+  icon: typeof GlobeIcon;
+}> = [
   { value: 'isolated-browser', label: 'Browser', description: 'Sandboxed browser session', icon: GlobeIcon },
-  { value: 'local-macos', label: 'Local Mac', description: 'Full desktop access', icon: LaptopIcon },
+  { value: 'local-macos', label: LOCAL_DESKTOP_LABEL, description: 'Full desktop access', icon: LaptopIcon },
 ];
 
-const APPROVAL_OPTIONS: Array<{ value: ApprovalMode; label: string; description: string; icon: typeof FootprintsIcon }> = [
+const APPROVAL_OPTIONS: Array<{
+  value: ApprovalMode;
+  label: string;
+  description: string;
+  icon: typeof FootprintsIcon;
+}> = [
   { value: 'step', label: 'Step', description: 'Approve every action', icon: FootprintsIcon },
   { value: 'goal', label: 'Goal', description: 'Approve each goal', icon: TargetIcon },
   { value: 'autonomous', label: 'Auto', description: 'No approval needed', icon: ZapIcon },
@@ -30,11 +53,7 @@ export const ComputerSettingsButton: FC<{
   const [isOpen, setIsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
-  // Filter targets by platform — local-macos is only available on macOS
-  const TARGET_OPTIONS = useMemo(
-    () => ALL_TARGET_OPTIONS.filter((opt) => opt.value !== 'local-macos' || app.platform.os === 'darwin'),
-    [],
-  );
+  const TARGET_OPTIONS = useMemo(() => ALL_TARGET_OPTIONS, []);
 
   // Close on outside click
   useEffect(() => {
@@ -55,23 +74,23 @@ export const ComputerSettingsButton: FC<{
   return (
     <div ref={rootRef} {...containerProps} className="relative flex items-center">
       {/* Joined button group: chevron + monitor toggle */}
-      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
-        toggled
-          ? 'border-primary/50 bg-primary/10'
-          : 'border-border/50 bg-muted/40'
-      }`}>
+      <div
+        className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+          toggled ? 'border-primary/50 bg-primary/10' : 'border-border/50 bg-muted/40'
+        }`}
+      >
         {/* Left segment: chevron — opens settings popover (only when toggled on) */}
-        <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-          expanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
-        }`}>
+        <div
+          className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+            expanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+          }`}
+        >
           <Tooltip content="Autopilot settings" side="top" sideOffset={8}>
             <button
               type="button"
               onClick={togglePopover}
               className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
-                toggled
-                  ? 'text-primary hover:bg-primary/15'
-                  : 'text-muted-foreground hover:bg-muted/50'
+                toggled ? 'text-primary hover:bg-primary/15' : 'text-muted-foreground hover:bg-muted/50'
               }`}
             >
               <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${isOpen ? '' : 'rotate-180'}`} />
@@ -85,9 +104,7 @@ export const ComputerSettingsButton: FC<{
             type="button"
             onClick={onToggle}
             className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
-              toggled
-                ? 'text-primary hover:bg-primary/15'
-                : 'text-muted-foreground hover:bg-muted/50'
+              toggled ? 'text-primary hover:bg-primary/15' : 'text-muted-foreground hover:bg-muted/50'
             }`}
           >
             <MonitorIcon className="h-4 w-4" />
@@ -97,7 +114,11 @@ export const ComputerSettingsButton: FC<{
 
       {/* Settings popover */}
       {isOpen && (
-        <div ref={popover.ref} style={popover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+        <div
+          ref={popover.ref}
+          style={popover.style}
+          className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl"
+        >
           {/* Target section */}
           <div className="flex items-center gap-2 px-3 pt-2 pb-1">
             <MonitorIcon className="h-3.5 w-3.5 text-muted-foreground" />
@@ -121,9 +142,13 @@ export const ComputerSettingsButton: FC<{
                   <OptionIcon className="h-4 w-4 shrink-0" />
                   <div className="flex-1 min-w-0 text-left">
                     <span className="block truncate">{option.label}</span>
-                    <span className={`block text-[10px] ${
-                      option.value === target ? 'text-primary/70' : 'text-muted-foreground'
-                    }`}>{option.description}</span>
+                    <span
+                      className={`block text-[10px] ${
+                        option.value === target ? 'text-primary/70' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {option.description}
+                    </span>
                   </div>
                   {option.value === target && <CheckIcon className="h-3 w-3 shrink-0" />}
                 </button>
@@ -155,9 +180,13 @@ export const ComputerSettingsButton: FC<{
                   <OptionIcon className="h-4 w-4 shrink-0" />
                   <div className="flex-1 min-w-0 text-left">
                     <span className="block truncate">{option.label}</span>
-                    <span className={`block text-[10px] ${
-                      option.value === approvalMode ? 'text-primary/70' : 'text-muted-foreground'
-                    }`}>{option.description}</span>
+                    <span
+                      className={`block text-[10px] ${
+                        option.value === approvalMode ? 'text-primary/70' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {option.description}
+                    </span>
                   </div>
                   {option.value === approvalMode && <CheckIcon className="h-3 w-3 shrink-0" />}
                 </button>

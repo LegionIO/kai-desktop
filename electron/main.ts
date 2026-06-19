@@ -65,6 +65,8 @@ import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/ta
 import { initOutputBuffer, flushAll as flushOutputBuffers } from './terminal/output-buffer.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
+import { initAppShots, updateAppShotsConfig, cleanupAppShots } from './app-shots/manager.js';
+import { registerAppShotsHandlers } from './ipc/app-shots.js';
 import { registerUsageHandlers } from './ipc/usage.js';
 import {
   registerAutoUpdateHandlers,
@@ -848,6 +850,9 @@ if (gotSingleInstanceLock) {
       // Dictation hotkey hot-reload
       updateDictationConfig(config);
 
+      // App Shots hotkey hot-reload
+      updateAppShotsConfig(config);
+
       // Launch at login
       const newLaunchAtLoginFp = JSON.stringify(config.launchAtLogin ?? false);
       if (newLaunchAtLoginFp !== lastLaunchAtLoginFp) {
@@ -888,6 +893,10 @@ if (gotSingleInstanceLock) {
 
     // Initialize dictation system (global hotkey + STT + text insertion)
     initDictation(getConfig(), setConfig);
+
+    // Initialize App Shots (global hotkey → screenshot + window metadata → composer)
+    initAppShots(getConfig());
+    registerAppShotsHandlers(ipcMain);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
     const debugLogDir = join(process.cwd(), 'debug-logs');
@@ -1539,6 +1548,7 @@ app.on('before-quit', () => {
   });
   cleanupMicRecorder();
   cleanupDictation();
+  cleanupAppShots();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
   flushOutputBuffers();

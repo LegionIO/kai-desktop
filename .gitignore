@@ -16,6 +16,10 @@ pnpm-lock.yaml
 # Debug logs written during development (see CLAUDE.md § Debug Logging)
 debug-logs/
 
+# Python bytecode (electron/platform/linux/atspi_helper.py)
+__pycache__/
+*.pyc
+
 # Local branding overrides (developer-specific, not committed)
 branding.config.local.ts
 

@@ -721,6 +721,18 @@ export const appConfigSchema = z.object({
       debugLogging: z.boolean().optional(),
     })
     .optional(),
+  appShots: z
+    .object({
+      enabled: z.boolean().default(false),
+      hotkey: z.string().default('CommandOrControl+Shift+1'),
+      captureMode: z.enum(['window', 'display']).default('window'),
+      includeUiTree: z.boolean().default(true),
+      includeSelectedText: z.boolean().default(true),
+      uiTreeDepth: z.number().int().min(1).max(10).default(4),
+      /** When true, also auto-attach to the active composer on capture (otherwise clipboard-only). */
+      autoAttach: z.boolean().default(false),
+    })
+    .optional(),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
     maxSteps: z.number().positive(),

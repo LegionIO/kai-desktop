@@ -7,6 +7,8 @@ import type {
 } from '../../shared/computer-use';
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
+import type { AppShotPayload } from '../../shared/app-shots';
+import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
 
 type AppAPI = {
   config: {
@@ -252,6 +254,15 @@ type AppAPI = {
   platform: {
     os: 'darwin' | 'win32' | 'linux';
     homedir: () => Promise<string>;
+    getCapabilities: () => Promise<{ kind: string; capabilities: AdapterCapabilities }>;
+    getPermissions: () => Promise<PlatformPermissions>;
+  };
+  appShots: {
+    capture: () => Promise<AppShotPayload>;
+    suspendHotkey: () => Promise<unknown>;
+    resumeHotkey: () => Promise<unknown>;
+    resolveRef: (refId: string) => Promise<AppShotPayload | null>;
+    onCaptured: (callback: (payload: AppShotPayload) => void) => () => void;
   };
   computerUse: {
     startSession: (goal: string, options: unknown) => Promise<unknown>;

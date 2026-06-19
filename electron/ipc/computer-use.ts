@@ -10,6 +10,7 @@ import type {
 } from '../../shared/computer-use.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import { getLocalMacDisplayLayout, probeInputMonitoring } from '../computer-use/permissions.js';
+import { getPlatformAdapter } from '../platform/index.js';
 import type { AppConfig } from '../config/schema.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from './conversations.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
@@ -21,7 +22,18 @@ const execFileAsync = promisify(execFile);
  * Returns an array of app names that are currently full-screened.
  */
 async function detectFullScreenApps(): Promise<string[]> {
-  if (process.platform !== 'darwin') return [];
+  if (process.platform !== 'darwin') {
+    try {
+      const adapter = await getPlatformAdapter();
+      if (await adapter.isFullscreen()) {
+        const win = await adapter.getActiveWindow();
+        return win?.appName ? [win.appName] : [];
+      }
+    } catch {
+      /* fall through */
+    }
+    return [];
+  }
   try {
     const script = `
 tell application "System Events"
@@ -43,7 +55,10 @@ end tell`;
     const trimmed = stdout.trim();
     if (!trimmed) return [];
     // AppleScript returns comma-separated list for multiple, or a single name
-    return trimmed.split(', ').map((s) => s.trim()).filter(Boolean);
+    return trimmed
+      .split(', ')
+      .map((s) => s.trim())
+      .filter(Boolean);
   } catch {
     return [];
   }
@@ -53,7 +68,15 @@ end tell`;
  * Use AppleScript to exit full-screen for specific apps.
  */
 async function exitFullScreenApps(appNames: string[]): Promise<{ exited: string[]; failed: string[] }> {
-  if (process.platform !== 'darwin') return { exited: [], failed: [] };
+  if (process.platform !== 'darwin') {
+    try {
+      const adapter = await getPlatformAdapter();
+      await adapter.exitFullscreen();
+      return { exited: appNames, failed: [] };
+    } catch {
+      return { exited: [], failed: appNames };
+    }
+  }
   const exited: string[] = [];
   const failed: string[] = [];
   // Pass the app name via osascript argv (item 1 of argv) rather than interpolating
@@ -108,11 +131,7 @@ function findMainWindow(): BrowserWindow | null {
   return null;
 }
 
-export function registerComputerUseHandlers(
-  ipcMain: IpcMain,
-  appHome: string,
-  getConfig: () => AppConfig,
-): void {
+export function registerComputerUseHandlers(ipcMain: IpcMain, appHome: string, getConfig: () => AppConfig): void {
   const manager = getComputerUseManager(appHome, getConfig);
   manager.on('event', (event: ComputerUseEvent) => {
     broadcast(event);
@@ -124,20 +143,52 @@ export function registerComputerUseHandlers(
   ipcMain.handle('computer-use:pause-session', (_event, sessionId: string) => manager.pauseSession(sessionId));
   ipcMain.handle('computer-use:resume-session', (_event, sessionId: string) => manager.resumeSession(sessionId));
   ipcMain.handle('computer-use:stop-session', (_event, sessionId: string) => manager.stopSession(sessionId));
-  ipcMain.handle('computer-use:approve-action', (_event, sessionId: string, actionId: string) => manager.approveAction(sessionId, actionId));
-  ipcMain.handle('computer-use:reject-action', (_event, sessionId: string, actionId: string, reason?: string) => manager.rejectAction(sessionId, actionId, reason));
+  ipcMain.handle('computer-use:approve-action', (_event, sessionId: string, actionId: string) =>
+    manager.approveAction(sessionId, actionId),
+  );
+  ipcMain.handle('computer-use:reject-action', (_event, sessionId: string, actionId: string, reason?: string) =>
+    manager.rejectAction(sessionId, actionId, reason),
+  );
   ipcMain.handle('computer-use:list-sessions', () => manager.listSessions());
   ipcMain.handle('computer-use:get-session', (_event, sessionId: string) => manager.getSession(sessionId));
-  ipcMain.handle('computer-use:set-surface', (_event, sessionId: string, surface: ComputerUseSurface) => manager.setSurface(sessionId, surface));
-  ipcMain.handle('computer-use:send-guidance', (_event, sessionId: string, text: string) => manager.sendGuidance(sessionId, text));
-  ipcMain.handle('computer-use:update-session-settings', (_event, sessionId: string, settings: { modelKey?: string | null; profileKey?: string | null; fallbackEnabled?: boolean; reasoningEffort?: string }) => manager.updateSessionSettings(sessionId, settings as Parameters<typeof manager.updateSessionSettings>[1]));
-  ipcMain.handle('computer-use:continue-session', (_event, sessionId: string, newGoal: string) => manager.continueSession(sessionId, newGoal));
-  ipcMain.handle('computer-use:mark-sessions-seen', (_event, conversationId: string) => { manager.markConversationSessionsSeen(conversationId); return { ok: true }; });
-  ipcMain.handle('computer-use:open-setup-window', (_event, conversationId?: string | null) => manager.openSetupWindow(conversationId));
+  ipcMain.handle('computer-use:set-surface', (_event, sessionId: string, surface: ComputerUseSurface) =>
+    manager.setSurface(sessionId, surface),
+  );
+  ipcMain.handle('computer-use:send-guidance', (_event, sessionId: string, text: string) =>
+    manager.sendGuidance(sessionId, text),
+  );
+  ipcMain.handle(
+    'computer-use:update-session-settings',
+    (
+      _event,
+      sessionId: string,
+      settings: {
+        modelKey?: string | null;
+        profileKey?: string | null;
+        fallbackEnabled?: boolean;
+        reasoningEffort?: string;
+      },
+    ) => manager.updateSessionSettings(sessionId, settings as Parameters<typeof manager.updateSessionSettings>[1]),
+  );
+  ipcMain.handle('computer-use:continue-session', (_event, sessionId: string, newGoal: string) =>
+    manager.continueSession(sessionId, newGoal),
+  );
+  ipcMain.handle('computer-use:mark-sessions-seen', (_event, conversationId: string) => {
+    manager.markConversationSessionsSeen(conversationId);
+    return { ok: true };
+  });
+  ipcMain.handle('computer-use:open-setup-window', (_event, conversationId?: string | null) =>
+    manager.openSetupWindow(conversationId),
+  );
   ipcMain.handle('computer-use:get-local-macos-permissions', () => manager.getLocalMacosPermissions());
   ipcMain.handle('computer-use:request-local-macos-permissions', () => manager.requestLocalMacosPermissions());
-  ipcMain.handle('computer-use:request-single-local-macos-permission', (_event, section: ComputerUsePermissionSection) => manager.requestSingleLocalMacosPermission(section));
-  ipcMain.handle('computer-use:open-local-macos-privacy-settings', (_event, section?: ComputerUsePermissionSection) => manager.openLocalMacosPrivacySettings(section));
+  ipcMain.handle(
+    'computer-use:request-single-local-macos-permission',
+    (_event, section: ComputerUsePermissionSection) => manager.requestSingleLocalMacosPermission(section),
+  );
+  ipcMain.handle('computer-use:open-local-macos-privacy-settings', (_event, section?: ComputerUsePermissionSection) =>
+    manager.openLocalMacosPrivacySettings(section),
+  );
   ipcMain.handle('computer-use:probe-input-monitoring', async (_event, timeoutMs?: number) => {
     const granted = await probeInputMonitoring(timeoutMs ?? 3000);
     return { inputMonitoringGranted: granted };
@@ -148,8 +199,9 @@ export function registerComputerUseHandlers(
     const config = getConfig();
 
     // Apps in the capture exclusion list will produce blank screenshots if full-screened
-    const excludedNames = (config.computerUse?.localMacos?.captureExcludedApps ?? [])
-      .map((n: string) => n.toLowerCase());
+    const excludedNames = (config.computerUse?.localMacos?.captureExcludedApps ?? []).map((n: string) =>
+      n.toLowerCase(),
+    );
 
     // Our own app is always excluded by PID, so it's always problematic when full-screened.
     // Use app.getName() so this works regardless of app name.
@@ -171,24 +223,22 @@ export function registerComputerUseHandlers(
   });
 
   ipcMain.handle('computer-use:list-running-apps', async () => {
-    if (process.platform !== 'darwin') return { apps: [] };
     try {
-      const script = `tell application "System Events" to get name of every application process whose background only is false`;
-      const { stdout } = await execFileAsync('osascript', ['-e', script], { timeout: 10000 });
-      const trimmed = stdout.trim();
-      if (!trimmed) return { apps: [] };
-      const apps = trimmed.split(', ').map((s) => s.trim()).filter(Boolean);
-      // Sort alphabetically and deduplicate
-      return { apps: [...new Set(apps)].sort((a, b) => a.localeCompare(b)) };
+      const adapter = await getPlatformAdapter();
+      const running = await adapter.listRunningApps();
+      const apps = [...new Set(running.map((r) => r.name).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      return { apps };
     } catch {
       return { apps: [] };
     }
   });
 
   ipcMain.handle('computer-use:list-displays', async () => {
-    if (process.platform !== 'darwin') return { displays: [] };
     try {
-      const layout = await getLocalMacDisplayLayout();
+      const layout =
+        process.platform === 'darwin'
+          ? await getLocalMacDisplayLayout()
+          : await (await getPlatformAdapter()).listDisplays();
       if (!layout || layout.displays.length === 0) return { displays: [] };
       return {
         displays: layout.displays.map((d) => ({

@@ -1,0 +1,4 @@
+# Contains {{placeholder}} tokens substituted by scripts/generate-builder-config.ts,
+# so it is not valid YAML until generation and prettier cannot parse it.
+electron-builder.template.yml
+electron-builder.yml

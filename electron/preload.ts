@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface } from '../shared/computer-use.js';
+import type { AppShotPayload } from '../shared/app-shots.js';
+import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
 
 export type AppAPI = typeof appAPI;
 
@@ -313,6 +315,9 @@ const appAPI = {
   platform: {
     os: process.platform as 'darwin' | 'win32' | 'linux',
     homedir: () => ipcRenderer.invoke('platform:homedir'),
+    getCapabilities: () =>
+      ipcRenderer.invoke('platform:get-capabilities') as Promise<{ kind: string; capabilities: AdapterCapabilities }>,
+    getPermissions: () => ipcRenderer.invoke('platform:get-permissions') as Promise<PlatformPermissions>,
   },
 
   webServer: {
@@ -641,6 +646,18 @@ const appAPI = {
 
   debug: {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
+  },
+
+  appShots: {
+    capture: () => ipcRenderer.invoke('app-shots:capture') as Promise<AppShotPayload>,
+    suspendHotkey: () => ipcRenderer.invoke('app-shots:suspend-hotkey'),
+    resumeHotkey: () => ipcRenderer.invoke('app-shots:resume-hotkey'),
+    resolveRef: (refId: string) => ipcRenderer.invoke('app-shots:resolve-ref', refId) as Promise<AppShotPayload | null>,
+    onCaptured: (callback: (payload: AppShotPayload) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: AppShotPayload) => callback(payload);
+      ipcRenderer.on('app-shots:captured', handler);
+      return () => ipcRenderer.removeListener('app-shots:captured', handler);
+    },
   },
 
   dictation: {

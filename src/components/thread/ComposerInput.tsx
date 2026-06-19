@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type FC 
 import { useComposerRuntime } from '@assistant-ui/react';
 import { RichChatInput } from './RichChatInput';
 import { useAttachments } from '@/providers/AttachmentContext';
+import { useAppShotPasteHandler } from '@/hooks/useAppShots';
 import { usePromptHistory } from '@/providers/RuntimeProvider';
 import { cn } from '@/lib/utils';
 
@@ -12,6 +13,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
 }) => {
   const composerRuntime = useComposerRuntime();
   const { attachments, addAttachments } = useAttachments();
+  const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   const historyIndexRef = useRef(-1);
@@ -23,38 +25,44 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     draftBeforeHistoryRef.current = draft;
   }, []);
 
-  const setComposerText = useCallback((nextText: string) => {
-    setText(nextText);
-    composerRuntime.setText(nextText);
-  }, [composerRuntime]);
+  const setComposerText = useCallback(
+    (nextText: string) => {
+      setText(nextText);
+      composerRuntime.setText(nextText);
+    },
+    [composerRuntime],
+  );
 
-  const navigatePromptHistory = useCallback((direction: 'older' | 'newer'): boolean => {
-    if (direction === 'older') {
-      if (promptHistory.length === 0) return false;
+  const navigatePromptHistory = useCallback(
+    (direction: 'older' | 'newer'): boolean => {
+      if (direction === 'older') {
+        if (promptHistory.length === 0) return false;
 
-      if (historyIndexRef.current === -1) {
-        draftBeforeHistoryRef.current = text;
+        if (historyIndexRef.current === -1) {
+          draftBeforeHistoryRef.current = text;
+        }
+
+        const nextIndex = Math.min(historyIndexRef.current + 1, promptHistory.length - 1);
+        historyIndexRef.current = nextIndex;
+        setComposerText(promptHistory[nextIndex] ?? '');
+        return true;
       }
 
-      const nextIndex = Math.min(historyIndexRef.current + 1, promptHistory.length - 1);
+      if (historyIndexRef.current === -1) return false;
+
+      const nextIndex = historyIndexRef.current - 1;
+      if (nextIndex < 0) {
+        historyIndexRef.current = -1;
+        setComposerText(draftBeforeHistoryRef.current);
+        return true;
+      }
+
       historyIndexRef.current = nextIndex;
       setComposerText(promptHistory[nextIndex] ?? '');
       return true;
-    }
-
-    if (historyIndexRef.current === -1) return false;
-
-    const nextIndex = historyIndexRef.current - 1;
-    if (nextIndex < 0) {
-      historyIndexRef.current = -1;
-      setComposerText(draftBeforeHistoryRef.current);
-      return true;
-    }
-
-    historyIndexRef.current = nextIndex;
-    setComposerText(promptHistory[nextIndex] ?? '');
-    return true;
-  }, [promptHistory, setComposerText, text]);
+    },
+    [promptHistory, setComposerText, text],
+  );
 
   useEffect(() => {
     if (historyConversationRef.current === conversationId) return;
@@ -74,13 +82,16 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     return unsubscribe;
   }, [composerRuntime, resetHistoryNavigation]);
 
-  const handleChange = useCallback((nextText: string) => {
-    if (historyIndexRef.current !== -1) {
-      resetHistoryNavigation(nextText);
-    }
-    setText(nextText);
-    composerRuntime.setText(nextText);
-  }, [composerRuntime, resetHistoryNavigation]);
+  const handleChange = useCallback(
+    (nextText: string) => {
+      if (historyIndexRef.current !== -1) {
+        resetHistoryNavigation(nextText);
+      }
+      setText(nextText);
+      composerRuntime.setText(nextText);
+    },
+    [composerRuntime, resetHistoryNavigation],
+  );
 
   const handleSubmit = useCallback(() => {
     if (!text.trim() && attachments.length === 0) return;
@@ -90,37 +101,44 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     resetHistoryNavigation('');
   }, [attachments.length, composerRuntime, resetHistoryNavigation, text]);
 
-  const handlePaste = useCallback((event: ClipboardEvent<HTMLElement>) => {
-    const items = Array.from(event.clipboardData.items);
-    const imageItems = items.filter((item) => item.type.startsWith('image/'));
+  const handlePaste = useCallback(
+    (event: ClipboardEvent<HTMLElement>) => {
+      if (handleAppShotPaste(event)) return true;
 
-    if (imageItems.length === 0) return false;
+      const items = Array.from(event.clipboardData.items);
+      const imageItems = items.filter((item) => item.type.startsWith('image/'));
 
-    event.preventDefault();
-    for (const item of imageItems) {
-      const file = item.getAsFile();
-      if (!file) continue;
+      if (imageItems.length === 0) return false;
 
-      const reader = new FileReader();
-      reader.onload = () => {
-        addAttachments([{
-          name: file.name || `pasted-image-${Date.now()}.${file.type.split('/')[1] || 'png'}`,
-          mime: file.type,
-          isImage: true,
-          size: file.size,
-          dataUrl: reader.result as string,
-        }]);
-      };
-      reader.readAsDataURL(file);
-    }
+      event.preventDefault();
+      for (const item of imageItems) {
+        const file = item.getAsFile();
+        if (!file) continue;
 
-    const pastedText = event.clipboardData.getData('text/plain');
-    if (pastedText) {
-      document.execCommand('insertText', false, pastedText);
-    }
+        const reader = new FileReader();
+        reader.onload = () => {
+          addAttachments([
+            {
+              name: file.name || `pasted-image-${Date.now()}.${file.type.split('/')[1] || 'png'}`,
+              mime: file.type,
+              isImage: true,
+              size: file.size,
+              dataUrl: reader.result as string,
+            },
+          ]);
+        };
+        reader.readAsDataURL(file);
+      }
 
-    return true;
-  }, [addAttachments]);
+      const pastedText = event.clipboardData.getData('text/plain');
+      if (pastedText) {
+        document.execCommand('insertText', false, pastedText);
+      }
+
+      return true;
+    },
+    [addAttachments, handleAppShotPaste],
+  );
 
   const isMultiline = text.includes('\n');
 

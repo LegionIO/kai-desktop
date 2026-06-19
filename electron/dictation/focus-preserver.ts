@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { runLocalMacMouseCommand } from '../computer-use/permissions.js';
+import { getPlatformAdapter } from '../platform/index.js';
 import { dictationDebugLog } from './debug-log.js';
 
 const execFileAsync = promisify(execFile);
@@ -12,6 +13,7 @@ type FocusSnapshot = {
   appName: string;
   bundleId: string | null;
   pid: number | null;
+  windowId?: string | null;
   capturedAt: number;
 };
 
@@ -37,22 +39,33 @@ function isOwnProcess(snapshot: FocusSnapshot): boolean {
 }
 
 async function captureFrontmostApp(): Promise<void> {
-  if (process.platform !== 'darwin') return;
-
   const startedAt = Date.now();
-  const result = await runLocalMacMouseCommand(['frontmostApplication']);
-  const rawPid = result.pid;
-  const parsedPid = typeof rawPid === 'number' && Number.isFinite(rawPid)
-    ? rawPid
-    : Number(rawPid);
-  const appName = typeof result.name === 'string' ? result.name.trim() : '';
-  const bundleId = typeof result.bundleId === 'string' ? result.bundleId.trim() : '';
-  const snapshot: FocusSnapshot = {
-    bundleId: bundleId || null,
-    appName,
-    pid: Number.isFinite(parsedPid) ? parsedPid : null,
-    capturedAt: Date.now(),
-  };
+  let snapshot: FocusSnapshot;
+
+  if (process.platform === 'darwin') {
+    const result = await runLocalMacMouseCommand(['frontmostApplication']);
+    const rawPid = result.pid;
+    const parsedPid = typeof rawPid === 'number' && Number.isFinite(rawPid) ? rawPid : Number(rawPid);
+    const appName = typeof result.name === 'string' ? result.name.trim() : '';
+    const bundleId = typeof result.bundleId === 'string' ? result.bundleId.trim() : '';
+    snapshot = {
+      bundleId: bundleId || null,
+      appName,
+      pid: Number.isFinite(parsedPid) ? parsedPid : null,
+      capturedAt: Date.now(),
+    };
+  } else {
+    const adapter = await getPlatformAdapter();
+    const focus = await adapter.captureFocus();
+    if (!focus) return;
+    snapshot = {
+      bundleId: focus.ownerId,
+      appName: focus.appName,
+      pid: focus.pid,
+      windowId: focus.windowId ?? null,
+      capturedAt: focus.capturedAt,
+    };
+  }
 
   dictationDebugLog('FOCUS_CAPTURE', {
     ok: Boolean(snapshot.appName && snapshot.pid != null && !isOwnProcess(snapshot)),
@@ -67,12 +80,10 @@ async function captureFrontmostApp(): Promise<void> {
 }
 
 function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runFreshFocusCapture(): Promise<void> {
-  if (process.platform !== 'darwin') return;
-
   const capture = captureFrontmostApp()
     .catch((err) => {
       // Startup and mutation paths fail closed if a target cannot be identified.
@@ -111,7 +122,6 @@ export function refreshDictationTargetFocus(): void {
 }
 
 async function refreshDictationTargetFocusNow(): Promise<void> {
-  if (process.platform !== 'darwin') return;
   if (captureInFlight) {
     await captureInFlight;
     return;
@@ -155,11 +165,15 @@ export function getDictationTargetBundleId(): string | null {
 }
 
 export function restoreDictationTargetFocusSoon(): void {
-  if (process.platform !== 'darwin') return;
-
-  setTimeout(() => { void restoreDictationTargetFocus().catch(() => {}); }, 25);
-  setTimeout(() => { void restoreDictationTargetFocus().catch(() => {}); }, 150);
-  setTimeout(() => { void restoreDictationTargetFocus().catch(() => {}); }, 300);
+  setTimeout(() => {
+    void restoreDictationTargetFocus().catch(() => {});
+  }, 25);
+  setTimeout(() => {
+    void restoreDictationTargetFocus().catch(() => {});
+  }, 150);
+  setTimeout(() => {
+    void restoreDictationTargetFocus().catch(() => {});
+  }, 300);
 }
 
 async function restoreDictationTargetFocus(): Promise<void> {
@@ -174,13 +188,26 @@ async function restoreDictationTargetFocus(): Promise<void> {
     return;
   }
 
-  const pidClause = snapshot.pid != null
-    ? `
+  if (process.platform !== 'darwin') {
+    const adapter = await getPlatformAdapter();
+    await adapter.restoreFocus({
+      appName: snapshot.appName,
+      ownerId: snapshot.bundleId,
+      pid: snapshot.pid,
+      windowId: snapshot.windowId ?? null,
+      capturedAt: snapshot.capturedAt,
+    });
+    return;
+  }
+
+  const pidClause =
+    snapshot.pid != null
+      ? `
 try
   tell application "System Events" to set frontmost of first application process whose unix id is ${snapshot.pid} to true
   return
 end try`
-    : '';
+      : '';
   const bundleClause = snapshot.bundleId
     ? `
 try

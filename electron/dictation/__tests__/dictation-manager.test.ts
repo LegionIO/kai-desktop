@@ -349,6 +349,10 @@ vi.mock('ai', () => ({ generateText: vi.fn() }));
 vi.mock('../../agent/language-model.js', () => ({ createLanguageModelFromConfig: vi.fn() }));
 vi.mock('../../agent/model-catalog.js', () => ({ resolveModelCatalog: vi.fn(() => ({ defaultEntry: null })) }));
 vi.mock('../../computer-use/permissions.js', () => ({ runLocalMacMouseCommand: mocks.runLocalMacMouseCommand }));
+vi.mock('../adapter-bridge.js', () => ({
+  runDictationViaAdapter: vi.fn(async () => null),
+  clipboardPaste: vi.fn(async () => {}),
+}));
 vi.mock('../../computer-use/harnesses/local-macos.js', () => ({
   startLocalMacosTakeoverMonitor: mocks.startLocalMacosTakeoverMonitor,
 }));
@@ -451,15 +455,19 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
     expect(native.start).toHaveBeenCalled();
-    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
-      allowBlindKeyboardFullPatch: false,
-      ownAppName: expect.any(String),
-      ownPid: expect.any(Number),
-    }));
-    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(expect.objectContaining({
-      pid: 4242,
-      appName: 'TextEdit',
-    }));
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowBlindKeyboardFullPatch: false,
+        ownAppName: expect.any(String),
+        ownPid: expect.any(Number),
+      }),
+    );
+    expect(mocks.setDictationTargetFocusSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pid: 4242,
+        appName: 'TextEdit',
+      }),
+    );
     expect(mocks.showDictationOverlay).toHaveBeenCalledWith({ skipFocusCapture: true });
     expect(native.startTargetTracking).toHaveBeenCalled();
     expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'ax');
@@ -480,9 +488,11 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
 
     const native = mocks.DictationNativeSessionClient.instances[0];
     expect(manager.getDictationState().state).toBe('active');
-    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(expect.objectContaining({
-      allowBlindKeyboardFullPatch: true,
-    }));
+    expect(native.beginSessionUnchecked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowBlindKeyboardFullPatch: true,
+      }),
+    );
     expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:typing-mode', 'kb');
   });
 

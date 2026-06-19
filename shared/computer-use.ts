@@ -4,7 +4,15 @@ export type ComputerUseTarget = 'isolated-browser' | 'local-macos';
 
 export type ComputerUseApprovalMode = 'step' | 'goal' | 'autonomous';
 
-export type ComputerUsePermissionSection = 'accessibility' | 'screen-recording' | 'automation' | 'input-monitoring';
+export type ComputerUsePermissionSection =
+  | 'accessibility'
+  | 'screen-recording'
+  | 'automation'
+  | 'input-monitoring'
+  | 'helper-available'
+  | 'xdotool'
+  | 'screenshot-tool'
+  | 'at-spi';
 
 export type ComputerUseSupport =
   | 'openai-responses'
@@ -335,17 +343,11 @@ export function supportsComputerUse(support?: ComputerUseSupport | null): boolea
 }
 
 export function isRiskyAction(kind: ComputerUseActionKind): boolean {
-  return kind === 'openApp'
-    || kind === 'focusWindow'
-    || kind === 'pressKeys'
-    || kind === 'typeText'
-    || kind === 'drag';
+  return kind === 'openApp' || kind === 'focusWindow' || kind === 'pressKeys' || kind === 'typeText' || kind === 'drag';
 }
 
 export function isComputerSessionTerminal(status: ComputerUseSessionStatus): boolean {
-  return status === 'completed'
-    || status === 'failed'
-    || status === 'stopped';
+  return status === 'completed' || status === 'failed' || status === 'stopped';
 }
 
 export function shouldShowComputerSetup(session?: Pick<ComputerSession, 'status'> | null): boolean {

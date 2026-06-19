@@ -26,6 +26,7 @@ import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProv
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { DictationOverlay } from '@/components/dictation/DictationOverlay';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
+import { useAppShots } from '@/hooks/useAppShots';
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -98,6 +99,11 @@ export default function App() {
       </ConfigProvider>
     </TooltipProvider>
   );
+}
+
+function AppShotsBridge() {
+  useAppShots();
+  return null;
 }
 
 function AppRoot() {
@@ -1565,6 +1571,7 @@ function AppShell() {
 
   return (
     <AttachmentProvider>
+      <AppShotsBridge />
       <DropZone>
         <RuntimeProvider
           conversationId={activeConversationId}

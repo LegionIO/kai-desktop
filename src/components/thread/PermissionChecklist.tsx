@@ -7,12 +7,17 @@ import {
   SettingsIcon,
   ShieldCheckIcon,
 } from 'lucide-react';
-import type {
-  ComputerUsePermissions,
-  ComputerUsePermissionSection,
-} from '../../../shared/computer-use';
+import type { ComputerUsePermissions, ComputerUsePermissionSection } from '../../../shared/computer-use';
 
-const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+type WindowAppPlatform = { app?: { __isWebBridge?: boolean; platform?: { os?: 'darwin' | 'win32' | 'linux' } } };
+
+function readWindowApp(): WindowAppPlatform['app'] {
+  return (typeof window !== 'undefined' ? (window as unknown as WindowAppPlatform).app : undefined) ?? undefined;
+}
+
+const isWebBridge = Boolean(readWindowApp()?.__isWebBridge);
+const platformOs: 'darwin' | 'win32' | 'linux' = readWindowApp()?.platform?.os ?? 'darwin';
+const PLATFORM_LABEL = platformOs === 'darwin' ? 'Local Mac' : platformOs === 'win32' ? 'Local Windows' : 'Local Linux';
 
 type PermissionRowStatus = 'granted' | 'missing' | 'requesting';
 
@@ -21,9 +26,11 @@ type PermissionRowDef = {
   label: string;
   description: string;
   getStatus: (p: ComputerUsePermissions) => boolean;
+  /** When false, the row is informational only — no Grant button or settings deep-link. */
+  requestable?: boolean;
 };
 
-const PERMISSION_ROWS: PermissionRowDef[] = [
+const MAC_PERMISSION_ROWS: PermissionRowDef[] = [
   {
     section: 'accessibility',
     label: 'Accessibility',
@@ -45,13 +52,54 @@ const PERMISSION_ROWS: PermissionRowDef[] = [
   // Input Monitoring is only relevant when running locally in Electron.
   // When accessed via the web UI the user is remote and cannot provide
   // local input events for the probe, so we skip this row entirely.
-  ...(!isWebBridge ? [{
-    section: 'input-monitoring' as ComputerUsePermissionSection,
-    label: 'Input Monitoring',
-    description: 'Detect takeover to pause sessions',
-    getStatus: (p: ComputerUsePermissions) => p.inputMonitoringGranted,
-  }] : []),
+  ...(!isWebBridge
+    ? [
+        {
+          section: 'input-monitoring' as ComputerUsePermissionSection,
+          label: 'Input Monitoring',
+          description: 'Detect takeover to pause sessions',
+          getStatus: (p: ComputerUsePermissions) => p.inputMonitoringGranted,
+        },
+      ]
+    : []),
 ];
+
+const WIN_PERMISSION_ROWS: PermissionRowDef[] = [
+  {
+    section: 'helper-available',
+    label: 'PowerShell helper',
+    description: 'Drives input, screenshots, and UI Automation',
+    getStatus: (p) => p.helperReady,
+    requestable: false,
+  },
+];
+
+const LINUX_PERMISSION_ROWS: PermissionRowDef[] = [
+  {
+    section: 'helper-available',
+    label: 'Linux helper script',
+    description: 'bash + jq dispatcher',
+    getStatus: (p) => p.helperReady,
+    requestable: false,
+  },
+  {
+    section: 'xdotool',
+    label: 'Input tool',
+    description: 'xdotool (X11) or wtype/ydotool (Wayland)',
+    getStatus: (p) => p.accessibilityTrusted,
+    requestable: false,
+  },
+  {
+    section: 'screenshot-tool',
+    label: 'Screenshot tool',
+    description: 'maim/scrot (X11) or grim (Wayland)',
+    getStatus: (p) => p.screenRecordingGranted,
+    requestable: false,
+  },
+];
+
+const PERMISSION_ROWS: PermissionRowDef[] =
+  platformOs === 'darwin' ? MAC_PERMISSION_ROWS : platformOs === 'win32' ? WIN_PERMISSION_ROWS : LINUX_PERMISSION_ROWS;
 
 type PermissionChecklistProps = {
   permissions: ComputerUsePermissions;
@@ -83,7 +131,7 @@ export const PermissionChecklist: FC<PermissionChecklistProps> = ({
     return (
       <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground">
         <ShieldCheckIcon className="h-3.5 w-3.5 text-green-500 shrink-0" />
-        <span>Local Mac permissions granted</span>
+        <span>{PLATFORM_LABEL} permissions granted</span>
       </div>
     );
   }
@@ -104,10 +152,8 @@ export const PermissionChecklist: FC<PermissionChecklistProps> = ({
       <div className="flex items-center justify-between">
         <div className="inline-flex items-center gap-1.5 font-medium text-foreground">
           <ShieldCheckIcon className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-          <span>Local Mac Permissions</span>
-          <span className="text-muted-foreground font-normal">
-            ({missingCount} remaining)
-          </span>
+          <span>{PLATFORM_LABEL} Permissions</span>
+          <span className="text-muted-foreground font-normal">({missingCount} remaining)</span>
         </div>
       </div>
 
@@ -123,10 +169,7 @@ export const PermissionChecklist: FC<PermissionChecklistProps> = ({
           else if (isRequesting) status = 'requesting';
 
           return (
-            <div
-              key={row.section}
-              className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5"
-            >
+            <div key={row.section} className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5">
               {/* Left: icon + label + description */}
               <div className="flex items-center gap-2 min-w-0">
                 {status === 'granted' ? (
@@ -174,10 +217,14 @@ export const PermissionChecklist: FC<PermissionChecklistProps> = ({
                   </div>
                 ) : status === 'requesting' ? (
                   <span className="text-[11px] text-muted-foreground">Requesting...</span>
+                ) : row.requestable === false ? (
+                  <span className="text-[11px] text-amber-500/80">Install required</span>
                 ) : (
                   <button
                     type="button"
-                    onClick={() => { void handleSingleRequest(row.section); }}
+                    onClick={() => {
+                      void handleSingleRequest(row.section);
+                    }}
                     disabled={requestingSection !== null || isRequestingAll}
                     className="inline-flex items-center gap-1 rounded-lg border border-border/70 bg-card/70 px-2 py-0.5 text-[11px] font-medium text-foreground transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-60"
                   >
@@ -200,7 +247,7 @@ export const PermissionChecklist: FC<PermissionChecklistProps> = ({
       )}
 
       {/* Footer actions */}
-      {missingCount > 1 && (
+      {platformOs === 'darwin' && missingCount > 1 && (
         <div className="flex items-center gap-1.5 pt-0.5">
           <button
             type="button"

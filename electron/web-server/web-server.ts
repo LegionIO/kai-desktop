@@ -346,7 +346,16 @@ function getBridgeScript(): string {
     },
     platform: {
       os: '${process.platform}',
-      homedir: function() { return invoke('platform:homedir'); }
+      homedir: function() { return invoke('platform:homedir'); },
+      getCapabilities: function() { return invoke('platform:get-capabilities'); },
+      getPermissions: function() { return invoke('platform:get-permissions'); }
+    },
+    appShots: {
+      capture: function() { return invoke('app-shots:capture'); },
+      suspendHotkey: function() { return invoke('app-shots:suspend-hotkey'); },
+      resumeHotkey: function() { return invoke('app-shots:resume-hotkey'); },
+      resolveRef: function(refId) { return invoke('app-shots:resolve-ref', refId); },
+      onCaptured: function(cb) { return on('app-shots:captured', cb); }
     },
     webServer: {
       getLanAddresses: function() { return invoke('webServer:lan-addresses'); },
@@ -441,26 +450,26 @@ function hasValidSession(req: http.IncomingMessage): boolean {
   return Boolean(token && hasSession(token));
 }
 
-function isAuthenticated(
-  req: http.IncomingMessage,
-  config: WebServerConfig,
-): boolean {
+function isAuthenticated(req: http.IncomingMessage, config: WebServerConfig): boolean {
   if (config.auth.mode === 'anonymous') return true;
   return hasValidSession(req);
 }
 
 /** Routes that bypass auth so the login page and its API work. */
-const AUTH_EXEMPT_PATHS = new Set(['/login', '/api/login', '/api/auth-status', '/api/token-login', '/favicon.ico', '/favicon.png']);
+const AUTH_EXEMPT_PATHS = new Set([
+  '/login',
+  '/api/login',
+  '/api/auth-status',
+  '/api/token-login',
+  '/favicon.ico',
+  '/favicon.png',
+]);
 
 function getRendererDir(): string {
   return join(import.meta.dirname, '../renderer');
 }
 
-function serveStaticFile(
-  filePath: string,
-  res: http.ServerResponse,
-  bridgeScript?: string,
-): void {
+function serveStaticFile(filePath: string, res: http.ServerResponse, bridgeScript?: string): void {
   try {
     if (!existsSync(filePath) || !statSync(filePath).isFile()) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -551,9 +560,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
   // ever bypassed (manual config edit, migration bug) we fail closed here
   // rather than silently accepting an empty-string credential.
   if (config.auth.mode === 'password' && !config.auth.password) {
-    throw new Error(
-      '[WebServer] Refusing to start: auth mode is "password" but no password is set.',
-    );
+    throw new Error('[WebServer] Refusing to start: auth mode is "password" but no password is set.');
   }
 
   const bridgeScript = getBridgeScript();
@@ -590,10 +597,7 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       req.on('end', () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-          const userOk = safeEqual(
-            String(body.username ?? '').toLowerCase(),
-            config.auth.username.toLowerCase(),
-          );
+          const userOk = safeEqual(String(body.username ?? '').toLowerCase(), config.auth.username.toLowerCase());
           const passOk = safeEqual(String(body.password ?? ''), config.auth.password);
           if (userOk && passOk) {
             const token = crypto.randomUUID();
@@ -907,7 +911,9 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     // Heartbeat: ping every 30s, terminate if no pong within 10s
     let alive = true;
-    ws.on('pong', () => { alive = true; });
+    ws.on('pong', () => {
+      alive = true;
+    });
     const heartbeat = setInterval(() => {
       if (!alive) {
         clearInterval(heartbeat);
@@ -931,11 +937,13 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
           const result = await invokeHandler(msg.channel, ...(msg.args ?? []));
           ws.send(JSON.stringify({ id: msg.id, type: 'result', data: result }));
         } catch (err) {
-          ws.send(JSON.stringify({
-            id: msg.id,
-            type: 'error',
-            message: err instanceof Error ? err.message : String(err),
-          }));
+          ws.send(
+            JSON.stringify({
+              id: msg.id,
+              type: 'error',
+              message: err instanceof Error ? err.message : String(err),
+            }),
+          );
         }
       }
 
@@ -1007,7 +1015,11 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 export async function stopWebServer(): Promise<void> {
   // Close all web client connections
   for (const ws of webClients) {
-    try { ws.close(); } catch { /* ignore */ }
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
   }
   webClients.clear();
 
@@ -1021,19 +1033,33 @@ export async function stopWebServer(): Promise<void> {
   if (netServer) {
     const s = netServer;
     netServer = null;
-    closers.push(new Promise<void>((r) => { s.close(() => r()); }));
+    closers.push(
+      new Promise<void>((r) => {
+        s.close(() => r());
+      }),
+    );
   }
 
   if (redirectServer) {
     const s = redirectServer;
     redirectServer = null;
-    closers.push(new Promise<void>((r) => { s.close(() => r()); s.closeAllConnections(); }));
+    closers.push(
+      new Promise<void>((r) => {
+        s.close(() => r());
+        s.closeAllConnections();
+      }),
+    );
   }
 
   if (httpServer) {
     const s = httpServer;
     httpServer = null;
-    closers.push(new Promise<void>((r) => { s.close(() => r()); s.closeAllConnections(); }));
+    closers.push(
+      new Promise<void>((r) => {
+        s.close(() => r());
+        s.closeAllConnections();
+      }),
+    );
   }
 
   await Promise.all(closers);
