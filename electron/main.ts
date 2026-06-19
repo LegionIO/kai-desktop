@@ -107,6 +107,43 @@ function resolveUserDataDir(): string {
 
 const APP_HOME = resolveUserDataDir();
 
+type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
+
+const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
+
+function formatMainProcessError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack || error.message;
+  }
+  if (typeof error === 'string') {
+    return error;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function recordMainProcessUnhandledError(kind: MainProcessUnhandledKind, error: unknown): void {
+  const formatted = formatMainProcessError(error);
+  console.error(`[${__BRAND_PRODUCT_NAME}] Unhandled main-process ${kind}:`, error);
+  try {
+    mkdirSync(join(APP_HOME, 'logs'), { recursive: true });
+    appendFileSync(MAIN_PROCESS_LOG, `[${new Date().toISOString()}] [${kind}] ${formatted}\n\n`, 'utf-8');
+  } catch {
+    /* best-effort logging only */
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  recordMainProcessUnhandledError('uncaughtException', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  recordMainProcessUnhandledError('unhandledRejection', reason);
+});
+
 // Initialize terminal output buffer persistence (must be before any terminal usage)
 initOutputBuffer(APP_HOME);
 
