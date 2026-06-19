@@ -129,11 +129,11 @@ export { HTTP_FIREWALL_ERROR_CODE, HTTP_FIREWALL_INSTALLED_SYMBOL };
 
 const __realFetch = globalThis.fetch.bind(globalThis);
 const __firewallFetch: typeof globalThis.fetch = async (input, init) => {
-  const hostname = extractHostname(input as RequestInfo | URL);
+  const hostname = extractHostname(input);
   if (hostname && isBlockedHostname(hostname)) {
     throw makeFirewallError(hostname, 'fetch');
   }
-  return __realFetch(input as RequestInfo | URL, init);
+  return __realFetch(input, init);
 };
 
 // Stamp the wrapper so any later setup file that reassigns `globalThis.fetch`
@@ -166,8 +166,8 @@ vi.mock('undici', async () => {
   // structural compatibility check.
   const wrappedFetch = ((input: FetchInput, init?: FetchInit) =>
     globalThis.fetch(
-      input as unknown as RequestInfo | URL,
-      init as RequestInit | undefined,
+      input as unknown as Parameters<typeof globalThis.fetch>[0],
+      init as Parameters<typeof globalThis.fetch>[1],
     )) as unknown as typeof actual.fetch;
 
   const guard = (url: unknown, source: string): void => {

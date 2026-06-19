@@ -4,11 +4,12 @@ import { release } from 'node:os';
 type UserAgentVariables = Record<string, string>;
 
 function tokeniseProductName(value: string): string {
-  return value
-    .trim()
-    .replace(/[^A-Za-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    || 'app';
+  return (
+    value
+      .trim()
+      .replace(/[^A-Za-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'app'
+  );
 }
 
 function normalizeOsName(platform: NodeJS.Platform): string {
@@ -57,7 +58,9 @@ export function renderBrandUserAgentTemplate(
   template: string,
   variables: Record<string, string> = getBrandUserAgentVariables(),
 ): string {
-  const rendered = template.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, key: string) => cleanSegment(variables[key] || ''));
+  const rendered = template.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, key: string) =>
+    cleanSegment(variables[key] || ''),
+  );
 
   return rendered
     .replace(/\(\s*\)/g, '')
@@ -75,7 +78,7 @@ export function getBrandUserAgent(): string {
   return `${tokeniseProductName(__BRAND_PRODUCT_NAME)}/${cleanSegment(__APP_VERSION)}`;
 }
 
-export function withBrandUserAgent(headers?: HeadersInit): Record<string, string> {
+export function withBrandUserAgent(headers?: ConstructorParameters<typeof Headers>[0]): Record<string, string> {
   const normalized = new Headers(headers);
   if (!normalized.has('User-Agent')) {
     normalized.set('User-Agent', getBrandUserAgent());

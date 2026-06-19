@@ -3,8 +3,8 @@ import { cleanup } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 // Mock window.app IPC client
-global.window = global.window || {};
-(global.window as unknown as { app: unknown }).app = {
+globalThis.window = globalThis.window || ({} as Window & typeof globalThis);
+(globalThis.window as unknown as { app: unknown }).app = {
   agent: {
     onStreamEvent: vi.fn(() => () => {}),
     stream: vi.fn(),
