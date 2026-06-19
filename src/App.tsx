@@ -1203,11 +1203,13 @@ function AppShell() {
         setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
       } else if (target?.type === 'conversation' && target.conversationId) {
         void handleSwitchConversation(target.conversationId);
+      } else if (target?.type === 'action' && target.targetId && target.action) {
+        void sendPluginAction(pluginName, target.targetId, target.action, target.data);
       }
     };
     window.addEventListener('plugin-navigate', handler);
     return () => window.removeEventListener('plugin-navigate', handler);
-  }, [handleSwitchConversation]);
+  }, [handleSwitchConversation, sendPluginAction]);
 
   // Handle "View Task" links from chat — navigate to task queue and open the task modal
   const tasksCtx = useTasksOptional();
