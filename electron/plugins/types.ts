@@ -573,6 +573,7 @@ export type PluginAPI = {
 
   agent: {
     generate: (options: PluginAgentGenerateOptions) => Promise<PluginAgentGenerateResult>;
+    stream: (options: PluginAgentGenerateOptions) => AsyncGenerator<PluginAgentStreamEvent>;
     registerInferenceProvider: (provider: PluginInferenceProvider) => void;
     unregisterInferenceProvider: () => void;
     registerCliTool: (tool: PluginCliToolContribution) => void;
@@ -654,6 +655,47 @@ export type PluginAgentGenerateResult = {
     error?: string;
     durationMs?: number;
   }>;
+};
+
+export type PluginAgentStreamEvent = {
+  conversationId: string;
+  type:
+    | 'text-delta'
+    | 'observer-message'
+    | 'tool-call'
+    | 'tool-result'
+    | 'tool-error'
+    | 'tool-progress'
+    | 'tool-compaction'
+    | 'tool-approval-required'
+    | 'error'
+    | 'done'
+    | 'compaction'
+    | 'context-usage'
+    | 'model-fallback'
+    | 'enrichment'
+    | 'retry'
+    | 'step-progress'
+    | 'max-steps-reached';
+  text?: string;
+  toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+  error?: string;
+  data?: unknown;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  modelKey?: string;
+  errorCategory?: string;
+  errorStatusCode?: number;
+  stepInfo?: {
+    currentStep: number;
+    maxSteps: number;
+    hitLimit: boolean;
+    taskComplete: boolean;
+  };
 };
 
 /* ── Plugin Inference Provider ── */

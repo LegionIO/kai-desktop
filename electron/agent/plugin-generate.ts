@@ -33,6 +33,10 @@ export type PluginGenerateResult = {
   toolCalls: PluginGenerateToolCall[];
 };
 
+export type PluginGenerateStreamEvent = StreamEvent & {
+  modelKey?: string;
+};
+
 type SanitizedContent = string | Array<{ type: 'text'; text: string } | { type: 'image'; image: unknown; mimeType?: string }>;
 
 function sanitizeMessages(
@@ -81,7 +85,10 @@ function sanitizeMessages(
   return clean;
 }
 
-export async function generateForPlugin(options: PluginGenerateOptions): Promise<PluginGenerateResult> {
+async function preparePluginStream(options: PluginGenerateOptions): Promise<{
+  stream: AsyncGenerator<StreamEvent>;
+  modelKey: string;
+}> {
   const { config, appHome, messages, systemPrompt, tools: pluginTools } = options;
 
   const streamConfig = resolveStreamConfig(config, {
@@ -106,7 +113,7 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
     const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const stream = streamAgentResponse(conversationId, allMessages, fallbackEntry.modelConfig, config, pluginTools ?? [], dbPath, { abortSignal: options.abortSignal });
-    return collectStreamResult(stream, fallbackEntry.key);
+    return { stream, modelKey: fallbackEntry.key };
   }
 
   const modelConfig = streamConfig.primaryModel.modelConfig;
@@ -145,7 +152,20 @@ export async function generateForPlugin(options: PluginGenerateOptions): Promise
     );
   }
 
-  return collectStreamResult(stream, streamConfig.primaryModel.key);
+  return { stream, modelKey: streamConfig.primaryModel.key };
+}
+
+export async function generateForPlugin(options: PluginGenerateOptions): Promise<PluginGenerateResult> {
+  const { stream, modelKey } = await preparePluginStream(options);
+  return collectStreamResult(stream, modelKey);
+}
+
+export async function* streamForPlugin(options: PluginGenerateOptions): AsyncGenerator<PluginGenerateStreamEvent> {
+  const { stream, modelKey } = await preparePluginStream(options);
+
+  for await (const event of stream) {
+    yield event.type === 'done' ? { ...event, modelKey } : event;
+  }
 }
 
 async function collectStreamResult(

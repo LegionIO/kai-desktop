@@ -3,7 +3,7 @@ import { getBrandUserAgent } from '../utils/user-agent.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'http';
 import { URL } from 'url';
 import { z } from 'zod';
-import { generateForPlugin } from '../agent/plugin-generate.js';
+import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import { getRegisteredTools } from '../ipc/agent.js';
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -1225,6 +1225,24 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         const config = callbacks.getConfig();
         const allTools = options.tools ? getRegisteredTools() : [];
         return generateForPlugin({
+          messages: options.messages,
+          config,
+          appHome: callbacks.appHome,
+          modelKey: options.modelKey,
+          profileKey: options.profileKey,
+          reasoningEffort: options.reasoningEffort,
+          fallbackEnabled: options.fallbackEnabled,
+          systemPrompt: options.systemPrompt,
+          tools: allTools,
+          abortSignal: options.abortSignal,
+        });
+      },
+
+      stream: async function* (options) {
+        requirePermission('agent:generate');
+        const config = callbacks.getConfig();
+        const allTools = options.tools ? getRegisteredTools() : [];
+        yield* streamForPlugin({
           messages: options.messages,
           config,
           appHome: callbacks.appHome,
