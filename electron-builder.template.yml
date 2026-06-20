@@ -15,6 +15,13 @@ directories:
 files:
   - out/**/*
   - "!**/*.map"
+  # active-win's .node addon is loaded only by lib/windows.js; node-pre-gyp
+  # builds it per-arch on darwin/linux anyway, which breaks @electron/universal's
+  # mach-o symmetry check. Exclude the non-win32 binding dirs (macOS uses the
+  # bundled universal `main` binary, Linux shells out to xprop/xdotool).
+  - "!**/node_modules/active-win/lib/binding/napi-*-darwin-*/**"
+  - "!**/node_modules/active-win/lib/binding/napi-*-linux-*/**"
+  - "!**/node_modules/active-win/build-tmp-*/**"
 extraResources:
   - from: bundled-plugins
     to: bundled-plugins
@@ -35,6 +42,10 @@ electronFuses:
   onlyLoadAppFromAsar: true
 mac:
   category: "{{macCategory}}"
+  # The bundled esbuild binary (extraResources) is host-arch-only and identical
+  # in both per-arch temp builds; tell @electron/universal to copy it as-is
+  # instead of failing the same-SHA mach-o check.
+  x64ArchFiles: "Contents/Resources/esbuild/bin/esbuild"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
