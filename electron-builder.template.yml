@@ -55,11 +55,11 @@ mac:
   target:
     - target: dmg
       arch:
-        - arm64
+        - universal
     - target: zip
       arch:
-        - arm64
-  artifactName: "{{artifactPrefix}}-${version}-arm64.${ext}"
+        - universal
+  artifactName: "{{artifactPrefix}}-${version}-${arch}.${ext}"
 dmg:
   background: build/dmg-background.png
   icon: build/icon.icns

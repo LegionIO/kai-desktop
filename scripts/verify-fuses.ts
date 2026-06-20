@@ -81,7 +81,7 @@ function assertKnownFuseByte(byte: number, fuseName: string): asserts byte is Fu
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = dirname(__dirname);
-const DIST_MAC_ARM64 = join(REPO_ROOT, 'dist', 'mac-arm64');
+const DIST_MAC = join(REPO_ROOT, 'dist', 'mac-universal');
 
 /** Mirror of the table at the top of this file. */
 const EXPECTED: ReadonlyArray<{ name: string; option: FuseV1Options; want: boolean }> = [
@@ -107,23 +107,23 @@ const EXPECTED: ReadonlyArray<{ name: string; option: FuseV1Options; want: boole
 
 function findAppBundle(): string {
   // Match the resolution used by the existing post-build verification:
-  //   APP_PATH="$(find dist/mac-arm64 -maxdepth 1 -name '*.app' -type d | head -n 1)"
-  if (!existsSync(DIST_MAC_ARM64)) {
-    console.error(`[fuses] expected build output directory not found: ${DIST_MAC_ARM64}`);
+  //   APP_PATH="$(find dist/mac-universal -maxdepth 1 -name '*.app' -type d | head -n 1)"
+  if (!existsSync(DIST_MAC)) {
+    console.error(`[fuses] expected build output directory not found: ${DIST_MAC}`);
     process.exit(1);
   }
 
   const matches: string[] = [];
-  for (const name of readdirSync(DIST_MAC_ARM64)) {
+  for (const name of readdirSync(DIST_MAC)) {
     if (!name.endsWith('.app')) continue;
-    const full = join(DIST_MAC_ARM64, name);
+    const full = join(DIST_MAC, name);
     if (statSync(full).isDirectory()) {
       matches.push(full);
     }
   }
 
   if (matches.length === 0) {
-    console.error(`[fuses] no .app bundle found in ${DIST_MAC_ARM64}`);
+    console.error(`[fuses] no .app bundle found in ${DIST_MAC}`);
     process.exit(1);
   }
 
@@ -131,7 +131,7 @@ function findAppBundle(): string {
   const appPath = matches[0];
   if (!appPath) {
     // Defensive: should be unreachable given the length check above.
-    console.error(`[fuses] no .app bundle resolved in ${DIST_MAC_ARM64}`);
+    console.error(`[fuses] no .app bundle resolved in ${DIST_MAC}`);
     process.exit(1);
   }
   return appPath;
