@@ -71,6 +71,8 @@ export const branding = {
   artifactPrefix: '{{productName}}',
   /** macOS app category. */
   macCategory: 'public.app-category.developer-tools',
+  /** Linux .deb package maintainer ("Name <email>"). Required by fpm. */
+  linuxMaintainer: 'Kai <kai@legion.io>',
   /** GitHub "owner/repo" used as the auto-updater release source. */
   updateRepo: 'legionio/kai-desktop',
   /**
@@ -98,16 +100,13 @@ export const branding = {
   themeGradientText: 'true',
 
   // ── macOS permission-usage strings (shown in system dialogs) ──────────
-  microphoneUsage:
-    '{{productName}} uses the microphone for voice recording (speech-to-text).',
+  microphoneUsage: '{{productName}} uses the microphone for voice recording (speech-to-text).',
   appleEventsUsage:
     '{{productName}} uses Apple Events to activate apps and inspect focused windows during local Mac computer control.',
   screenCaptureUsage:
-    '{{productName}} captures your screen to enable local Mac computer control and allow the AI to see what\'s on your display.',
-  localNetworkUsage:
-    '{{productName}} connects to services on your local network.',
-  contactsUsage:
-    '{{productName}} accesses your contacts to display names and photos for messaging plugins.',
+    "{{productName}} captures your screen to enable local Mac computer control and allow the AI to see what's on your display.",
+  localNetworkUsage: '{{productName}} connects to services on your local network.',
+  contactsUsage: '{{productName}} accesses your contacts to display names and photos for messaging plugins.',
 
   // ── Plugin API ─────────────────────────────────────────────────────────
   /** Semver version of the plugin API surface. Bump minor for additive changes, major for breaking. */

@@ -96,6 +96,7 @@ nsis:
   deleteAppDataOnUninstall: false
 linux:
   category: Development
+  maintainer: "{{linuxMaintainer}}"
   icon: build/icon.png
   extraResources:
     - from: build/bin/LocalLinuxHelper.sh
