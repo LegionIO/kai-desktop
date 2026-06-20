@@ -159,6 +159,12 @@
   },
   "packageManager": "pnpm@10.33.0",
   "pnpm": {
+    "supportedArchitectures": {
+      "cpu": [
+        "x64",
+        "arm64"
+      ]
+    },
     "onlyBuiltDependencies": [
       "@nut-tree-fork/libnut",
       "active-win",

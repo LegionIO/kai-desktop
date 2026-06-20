@@ -42,10 +42,15 @@ electronFuses:
   onlyLoadAppFromAsar: true
 mac:
   category: "{{macCategory}}"
-  # The bundled esbuild binary (extraResources) is host-arch-only and identical
-  # in both per-arch temp builds; tell @electron/universal to copy it as-is
-  # instead of failing the same-SHA mach-o check.
-  x64ArchFiles: "Contents/Resources/esbuild/bin/esbuild"
+  # Platform-package binaries (@libsql/darwin-*, @lydell/node-pty-darwin-*,
+  # claude-agent-sdk, codex, esbuild) land in app.asar.unpacked identically in
+  # both per-arch temp builds because pnpm installs both cpu variants
+  # (supportedArchitectures) and electron-builder copies node_modules verbatim.
+  # Tell @electron/universal to copy these as-is instead of failing the
+  # same-SHA mach-o check; the runtime loader of each package picks the right
+  # darwin-${process.arch} variant. The bundled esbuild extraResource is
+  # host-arch-only and currently unused at runtime.
+  x64ArchFiles: "Contents/Resources/{esbuild/bin/esbuild,app.asar.unpacked/**}"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
