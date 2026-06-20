@@ -1198,6 +1198,9 @@ function AppShell() {
 
     if (request.target.type === 'action') {
       void sendPluginAction(request.pluginName, request.target.targetId, request.target.action, request.target.data);
+      if (request.target.panelId) {
+        setActiveView(getPluginPanelViewKey(request.pluginName, request.target.panelId));
+      }
     }
   }, [consumeNavigationRequest, handleSwitchConversation, navigationRequests.length, sendPluginAction]);
 
@@ -1211,6 +1214,11 @@ function AppShell() {
         void handleSwitchConversation(target.conversationId);
       } else if (target?.type === 'action' && target.targetId && target.action) {
         void sendPluginAction(pluginName, target.targetId, target.action, target.data);
+        // Optional explicit panel navigation alongside the action. The plugin's
+        // own api.navigation.open() goes through the navigationRequests queue,
+        // which this DOM-event path exists to bypass — so let the target carry
+        // the panelId directly instead of round-tripping through the backend.
+        if (target.panelId) setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
       }
     };
     window.addEventListener('plugin-navigate', handler);
@@ -1400,6 +1408,7 @@ function AppShell() {
 
       if (target.type === 'action' && target.targetId && target.action) {
         void sendPluginAction(pluginName, target.targetId, target.action, target.data);
+        if (target.panelId) setActiveView(getPluginPanelViewKey(pluginName, target.panelId));
       }
     },
     [handleSwitchConversation, sendPluginAction],

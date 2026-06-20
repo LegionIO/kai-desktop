@@ -3,8 +3,7 @@ import { app } from '@/lib/ipc-client';
 import { registerPluginComponents, type PluginComponent } from '@/components/plugins/PluginComponentRegistry';
 
 const isWebBridge = Boolean(
-  (window as unknown as Record<string, unknown>).app &&
-    (window.app as Record<string, unknown>).__isWebBridge,
+  (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
 );
 
 /**
@@ -61,7 +60,7 @@ export type PluginPanelDescriptor = {
 export type PluginNavigationTarget =
   | { type: 'panel'; panelId: string }
   | { type: 'conversation'; conversationId: string }
-  | { type: 'action'; targetId: string; action: string; data?: unknown };
+  | { type: 'action'; targetId: string; action: string; data?: unknown; panelId?: string };
 
 export type PluginNavigationItemDescriptor = {
   id: string;
@@ -270,10 +269,7 @@ function loadPluginRendererScripts(
   }
 }
 
-function applyPluginRendererStyles(
-  styles: PluginRendererStyle[],
-  loadedRef: Map<string, string>,
-): void {
+function applyPluginRendererStyles(styles: PluginRendererStyle[], loadedRef: Map<string, string>): void {
   for (const { pluginName, stylePath, styleHash, styleContent, styleUrl } of styles) {
     if (!styleContent && !styleUrl) continue;
     const key = `${pluginName}:${stylePath}`;
@@ -324,31 +320,40 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     setRendererLoadCount((count) => count + 1);
   }, []);
 
-  const updateRendererStatus = useCallback((pluginName: string, status: PluginRendererStatus, error?: string | null) => {
-    setRendererStatuses((current) => {
-      if (current[pluginName] === status) return current;
-      return {
-        ...current,
-        [pluginName]: status,
-      };
-    });
-    setRendererErrors((current) => {
-      const nextError = error ?? null;
-      if ((current[pluginName] ?? null) === nextError) return current;
-      return {
-        ...current,
-        [pluginName]: nextError,
-      };
-    });
-  }, []);
+  const updateRendererStatus = useCallback(
+    (pluginName: string, status: PluginRendererStatus, error?: string | null) => {
+      setRendererStatuses((current) => {
+        if (current[pluginName] === status) return current;
+        return {
+          ...current,
+          [pluginName]: status,
+        };
+      });
+      setRendererErrors((current) => {
+        const nextError = error ?? null;
+        if ((current[pluginName] ?? null) === nextError) return current;
+        return {
+          ...current,
+          [pluginName]: nextError,
+        };
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
-    app.plugins.getUIState()
+    app.plugins
+      .getUIState()
       .then((state) => {
         const typed = state as PluginUIState;
         setUIState(typed);
         if (typed.rendererScripts?.length) {
-          loadPluginRendererScripts(typed.rendererScripts, loadedRenderers.current, updateRendererStatus, onRendererLoaded);
+          loadPluginRendererScripts(
+            typed.rendererScripts,
+            loadedRenderers.current,
+            updateRendererStatus,
+            onRendererLoaded,
+          );
         }
         if (typed.rendererStyles?.length) {
           applyPluginRendererStyles(typed.rendererStyles, loadedStyles.current);
@@ -360,7 +365,12 @@ export function PluginProvider({ children }: { children: ReactNode }) {
       const typed = state as PluginUIState;
       setUIState(typed);
       if (typed.rendererScripts?.length) {
-        loadPluginRendererScripts(typed.rendererScripts, loadedRenderers.current, updateRendererStatus, onRendererLoaded);
+        loadPluginRendererScripts(
+          typed.rendererScripts,
+          loadedRenderers.current,
+          updateRendererStatus,
+          onRendererLoaded,
+        );
       }
       if (typed.rendererStyles?.length) {
         applyPluginRendererStyles(typed.rendererStyles, loadedStyles.current);
@@ -401,14 +411,17 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     const unsubNavigateDirect = app.plugins.onNavigateDirect?.((data) => {
       const typed = data as { pluginName?: string; target?: PluginNavigationTarget };
       if (typed.pluginName && typed.target) {
-        window.dispatchEvent(new CustomEvent('plugin-navigate', {
-          detail: { pluginName: typed.pluginName, target: typed.target },
-        }));
+        window.dispatchEvent(
+          new CustomEvent('plugin-navigate', {
+            detail: { pluginName: typed.pluginName, target: typed.target },
+          }),
+        );
       }
     });
 
     // Plugin update count
-    app.plugins.getAvailableUpdateCount()
+    app.plugins
+      .getAvailableUpdateCount()
       .then((count) => setPluginUpdateCount(count))
       .catch(() => {});
     const unsubUpdates = app.plugins.onUpdatesAvailable((data) => {
@@ -431,7 +444,8 @@ export function PluginProvider({ children }: { children: ReactNode }) {
   );
 
   const getPluginStatus = useCallback(
-    (pluginName: string): 'loading' | 'active' | 'error' | 'disabled' => uiState?.pluginStatuses?.[pluginName] ?? 'disabled',
+    (pluginName: string): 'loading' | 'active' | 'error' | 'disabled' =>
+      uiState?.pluginStatuses?.[pluginName] ?? 'disabled',
     [uiState],
   );
 
@@ -474,43 +488,31 @@ export function PluginProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const getPluginConfig = useCallback(
-    (pluginName: string) => app.plugins.getConfig(pluginName),
-    [],
-  );
+  const getPluginConfig = useCallback((pluginName: string) => app.plugins.getConfig(pluginName), []);
 
   const getResolvedPluginConfig = useCallback(
     (pluginName: string) => uiState?.pluginConfigs?.[pluginName] ?? {},
     [uiState],
   );
 
-  const getPluginState = useCallback(
-    (pluginName: string) => uiState?.pluginStates?.[pluginName] ?? {},
-    [uiState],
-  );
+  const getPluginState = useCallback((pluginName: string) => uiState?.pluginStates?.[pluginName] ?? {}, [uiState]);
 
-  const setPluginConfig = useCallback(
-    async (pluginName: string, path: string, value: unknown) => {
-      await app.plugins.setConfig(pluginName, path, value);
-    },
-    [],
-  );
+  const setPluginConfig = useCallback(async (pluginName: string, path: string, value: unknown) => {
+    await app.plugins.setConfig(pluginName, path, value);
+  }, []);
 
-  const consumeModalCallback = useCallback(
-    (pluginName: string, modalId: string): ModalCallbackData | null => {
-      let found: ModalCallbackData | null = null;
-      setModalCallbacks((prev) => {
-        const idx = prev.findIndex((cb) => cb.pluginName === pluginName && cb.modalId === modalId);
-        if (idx >= 0) {
-          found = prev[idx];
-          return [...prev.slice(0, idx), ...prev.slice(idx + 1)];
-        }
-        return prev;
-      });
-      return found;
-    },
-    [],
-  );
+  const consumeModalCallback = useCallback((pluginName: string, modalId: string): ModalCallbackData | null => {
+    let found: ModalCallbackData | null = null;
+    setModalCallbacks((prev) => {
+      const idx = prev.findIndex((cb) => cb.pluginName === pluginName && cb.modalId === modalId);
+      if (idx >= 0) {
+        found = prev[idx];
+        return [...prev.slice(0, idx), ...prev.slice(idx + 1)];
+      }
+      return prev;
+    });
+    return found;
+  }, []);
 
   const consumeNavigationRequest = useCallback((): PluginNavigationRequestRecord | null => {
     let found: PluginNavigationRequestRecord | null = null;
@@ -525,9 +527,11 @@ export function PluginProvider({ children }: { children: ReactNode }) {
   const injectNavigationRequest = useCallback((pluginName: string, target: PluginNavigationTarget) => {
     // Dispatch a DOM custom event that App.tsx listens for directly
     // This bypasses React state batching issues with the navigation request queue
-    window.dispatchEvent(new CustomEvent('plugin-navigate', {
-      detail: { pluginName, target },
-    }));
+    window.dispatchEvent(
+      new CustomEvent('plugin-navigate', {
+        detail: { pluginName, target },
+      }),
+    );
   }, []);
 
   const consumePluginEvent = useCallback((pluginName?: string, eventName?: string): PluginEventRecord | null => {

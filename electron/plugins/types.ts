@@ -46,20 +46,20 @@ export type PluginApprovalRecord = {
 /* ── Scoped Filesystem & Execution Declarations ── */
 
 export type ScopedDirectory =
-  | 'claude-home'   // ~/.claude/
-  | 'codex-home';   // ~/.codex/
+  | 'claude-home' // ~/.claude/
+  | 'codex-home'; // ~/.codex/
 
 export type AllowedBinary =
-  | 'claude'       // Claude Code CLI
-  | 'codex'        // Codex CLI
-  | 'node'         // Node.js
-  | 'npm'          // npm
-  | 'pip'          // Python package manager
-  | 'pip3'         // Python 3 package manager
-  | 'python'       // Python interpreter
-  | 'python3'      // Python 3 interpreter
-  | 'git'          // Git CLI
-  | 'bash';        // Bash (only for whitelisted scripts)
+  | 'claude' // Claude Code CLI
+  | 'codex' // Codex CLI
+  | 'node' // Node.js
+  | 'npm' // npm
+  | 'pip' // Python package manager
+  | 'pip3' // Python 3 package manager
+  | 'python' // Python interpreter
+  | 'python3' // Python 3 interpreter
+  | 'git' // Git CLI
+  | 'bash'; // Bash (only for whitelisted scripts)
 
 export type ExecScopeDeclaration = {
   binaries: AllowedBinary[];
@@ -71,7 +71,7 @@ export type ExecRequest = {
   args: string[];
   cwd?: string;
   env?: Record<string, string>;
-  timeoutMs?: number;       // default 60_000, max 300_000
+  timeoutMs?: number; // default 60_000, max 300_000
   stdin?: string;
 };
 
@@ -289,7 +289,7 @@ export type PluginPanelDescriptor = {
 export type PluginNavigationTarget =
   | { type: 'panel'; panelId: string }
   | { type: 'conversation'; conversationId: string }
-  | { type: 'action'; targetId: string; action: string; data?: unknown };
+  | { type: 'action'; targetId: string; action: string; data?: unknown; panelId?: string };
 
 export type PluginNavigationItemDescriptor = {
   id: string;
@@ -511,7 +511,12 @@ export type PluginAPI = {
     updateModal: (id: string, updates: Partial<Omit<PluginModalDescriptor, 'id' | 'pluginName'>>) => void;
     registerSettingsView: (descriptor: Omit<PluginSettingsSectionDescriptor, 'pluginName' | 'component'>) => void;
     registerPanelView: (descriptor: Omit<PluginPanelDescriptor, 'pluginName' | 'component'>) => void;
-    registerNavigationItem: (descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName' | 'label' | 'icon'> & { label?: string; icon?: PluginNavigationItemDescriptor['icon'] }) => void;
+    registerNavigationItem: (
+      descriptor: Omit<PluginNavigationItemDescriptor, 'pluginName' | 'label' | 'icon'> & {
+        label?: string;
+        icon?: PluginNavigationItemDescriptor['icon'];
+      },
+    ) => void;
     registerCommand: (descriptor: Omit<PluginCommandDescriptor, 'pluginName'>) => void;
     showConversationDecoration: (descriptor: Omit<PluginConversationDecorationDescriptor, 'pluginName'>) => void;
     hideConversationDecoration: (id: string) => void;
@@ -534,7 +539,10 @@ export type PluginAPI = {
     upsert: (conversation: PluginConversationRecord) => void;
     setActive: (conversationId: string) => void;
     getActiveId: () => string | null;
-    appendMessage: (conversationId: string, message: PluginConversationAppendMessage) => PluginConversationRecord | null;
+    appendMessage: (
+      conversationId: string,
+      message: PluginConversationAppendMessage,
+    ) => PluginConversationRecord | null;
     markUnread: (conversationId: string, unread: boolean) => void;
   };
 
@@ -567,7 +575,11 @@ export type PluginAPI = {
   };
 
   http: {
-    listen: (port: number, handler: (req: PluginHttpRequest) => PluginHttpResponse | Promise<PluginHttpResponse>, options?: { host?: string }) => Promise<void>;
+    listen: (
+      port: number,
+      handler: (req: PluginHttpRequest) => PluginHttpResponse | Promise<PluginHttpResponse>,
+      options?: { host?: string },
+    ) => Promise<void>;
     close: () => Promise<void>;
   };
 
@@ -702,7 +714,19 @@ export type PluginAgentStreamEvent = {
 
 export type PluginInferenceStreamEvent = {
   conversationId: string;
-  type: 'text-delta' | 'tool-call' | 'tool-result' | 'tool-error' | 'tool-progress' | 'tool-compaction' | 'error' | 'done' | 'context-usage' | 'enrichment' | 'compaction' | 'model-fallback';
+  type:
+    | 'text-delta'
+    | 'tool-call'
+    | 'tool-result'
+    | 'tool-error'
+    | 'tool-progress'
+    | 'tool-compaction'
+    | 'error'
+    | 'done'
+    | 'context-usage'
+    | 'enrichment'
+    | 'compaction'
+    | 'model-fallback';
   text?: string;
   toolCallId?: string;
   toolName?: string;
