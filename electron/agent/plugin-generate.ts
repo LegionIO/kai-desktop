@@ -1,6 +1,6 @@
 import type { AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveStreamConfig } from './model-catalog.js';
-import type { ReasoningEffort } from './model-catalog.js';
+import type { ReasoningEffort, ResolvedStreamConfig } from './model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
@@ -85,6 +85,33 @@ function sanitizeMessages(
   return clean;
 }
 
+function configForPluginStream(
+  config: AppConfig,
+  streamConfig: ResolvedStreamConfig | null | undefined,
+  systemPrompt?: string,
+): AppConfig {
+  const effectiveSystemPrompt =
+    systemPrompt?.trim() ||
+    streamConfig?.systemPrompt ||
+    config.systemPrompts?.chat ||
+    config.systemPrompt;
+
+  return {
+    ...config,
+    systemPrompt: effectiveSystemPrompt,
+    systemPrompts: {
+      ...config.systemPrompts,
+      chat: effectiveSystemPrompt,
+    },
+    advanced: {
+      ...config.advanced,
+      temperature: streamConfig?.temperature ?? config.advanced.temperature,
+      maxSteps: streamConfig?.maxSteps ?? config.advanced.maxSteps,
+      maxRetries: streamConfig?.maxRetries ?? config.advanced.maxRetries,
+    },
+  };
+}
+
 async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   stream: AsyncGenerator<StreamEvent>;
   modelKey: string;
@@ -107,24 +134,25 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     // Fallback: use default model directly
     const dbPath = join(appHome, 'data', 'memory.db');
     const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
-    const allMessages: Array<{ role: string; content: SanitizedContent }> = [];
-    if (systemPrompt) allMessages.push({ role: 'system', content: systemPrompt });
-    allMessages.push(...sanitized);
+    const configForStream = configForPluginStream(config, null, systemPrompt);
     const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const stream = streamAgentResponse(conversationId, allMessages, fallbackEntry.modelConfig, config, pluginTools ?? [], dbPath, { abortSignal: options.abortSignal });
+    const stream = streamAgentResponse(
+      conversationId,
+      sanitized,
+      fallbackEntry.modelConfig,
+      configForStream,
+      pluginTools ?? [],
+      dbPath,
+      { abortSignal: options.abortSignal },
+    );
     return { stream, modelKey: fallbackEntry.key };
   }
 
   const modelConfig = streamConfig.primaryModel.modelConfig;
   const dbPath = join(appHome, 'data', 'memory.db');
   const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
-
-  const allMessages: Array<{ role: string; content: SanitizedContent }> = [];
-  if (systemPrompt) {
-    allMessages.push({ role: 'system', content: systemPrompt });
-  }
-  allMessages.push(...sanitized);
+  const configForStream = configForPluginStream(config, streamConfig, systemPrompt);
 
   const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -133,9 +161,9 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   if (streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0) {
     stream = streamWithFallback(
       conversationId,
-      allMessages,
+      sanitized,
       streamConfig,
-      config,
+      configForStream,
       pluginTools ?? [],
       dbPath,
       { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },
@@ -143,9 +171,9 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   } else {
     stream = streamAgentResponse(
       conversationId,
-      allMessages,
+      sanitized,
       modelConfig,
-      config,
+      configForStream,
       pluginTools ?? [],
       dbPath,
       { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },

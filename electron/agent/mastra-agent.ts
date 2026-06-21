@@ -1070,6 +1070,9 @@ async function* streamWithRealEvents(
   let compatibilityRetried = false;
   let sanitizationRetried = false;
   let activeMessages = messages;
+  let currentStepCount = 0;
+  let maxStepsReachedEmitted = false;
+  const maxStepsLimit = config.agent?.maxTurns ?? config.advanced.maxSteps;
   // Accumulated token usage across all steps
   let accInputTokens = 0;
   let accOutputTokens = 0;
@@ -1094,7 +1097,7 @@ async function* streamWithRealEvents(
         const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
 
         const streamOptions = {
-          maxSteps: config.agent?.maxTurns ?? config.advanced.maxSteps,
+          maxSteps: maxStepsLimit,
           abortSignal: options?.abortSignal,
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),
@@ -1222,8 +1225,23 @@ async function* streamWithRealEvents(
             }
           } else if (type === 'step-finish') {
             const finishReason = extractStreamFinishReason(payload);
-            if (finishReason === 'content-filter') {
+            currentStepCount += 1;
+            emittedAnyOutput = true;
+            yield {
+              conversationId,
+              type: 'step-progress',
+              stepInfo: {
+                currentStep: currentStepCount,
+                maxSteps: maxStepsLimit,
+                hitLimit: false,
+                taskComplete: false,
+              },
+            };
+
+            if (finishReason) {
               terminalFinishReason = finishReason;
+            }
+            if (finishReason === 'content-filter') {
               console.info(`[Agent] Ending stream early for ${conversationId} after content-filter step finish`);
               break;
             }
@@ -1354,6 +1372,27 @@ async function* streamWithRealEvents(
         finishedAt,
       };
     }
+  }
+
+  const hitStepLimit = didHitStepLimit({
+    currentStepCount,
+    maxStepsLimit,
+    terminalFinishReason,
+  });
+
+  if (hitStepLimit && !maxStepsReachedEmitted) {
+    maxStepsReachedEmitted = true;
+    console.warn(`[Agent] Max steps reached for ${conversationId}: ${currentStepCount}/${maxStepsLimit}`);
+    yield {
+      conversationId,
+      type: 'max-steps-reached',
+      stepInfo: {
+        currentStep: currentStepCount,
+        maxSteps: maxStepsLimit,
+        hitLimit: true,
+        taskComplete: false,
+      },
+    };
   }
 
   // Emit accumulated token usage before done

@@ -237,6 +237,44 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
       expect(events.some((e) => e.type === 'text-delta' && e.text === 'Hello.')).toBe(true);
       expect(events[events.length - 1].type).toBe('done');
     });
+
+    it('emits step progress and max-steps-reached for capped streaming tool loops', async () => {
+      agentState.streamImpl = () => ({
+        textStream: (async function* () {})(),
+        fullStream: (async function* () {
+          yield { type: 'step-finish', payload: { finishReason: 'tool-calls' } };
+          yield { type: 'step-finish', payload: { finishReason: 'tool-calls' } };
+          yield { type: 'finish', payload: { finishReason: 'tool-calls' } };
+        })(),
+      });
+
+      const baseConfig = makeConfig();
+      const config = {
+        ...baseConfig,
+        advanced: { ...baseConfig.advanced, maxSteps: 2 },
+      } as AppConfig;
+
+      const events = await collect(
+        streamAgentResponse(
+          'conv-step-cap',
+          [{ role: 'user', content: 'Keep using tools.' }],
+          makeModelConfig(),
+          config,
+          [],
+          '/tmp/step-cap.db',
+        ),
+      );
+
+      const stepEvents = events.filter((e) => e.type === 'step-progress');
+      expect(stepEvents).toHaveLength(2);
+      expect(stepEvents[1].stepInfo).toMatchObject({
+        currentStep: 2,
+        maxSteps: 2,
+        hitLimit: false,
+      });
+      expect(events.some((e) => e.type === 'max-steps-reached' && e.stepInfo?.hitLimit)).toBe(true);
+      expect(events[events.length - 1].type).toBe('done');
+    });
   });
 
   describe('memory attachment', () => {
