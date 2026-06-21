@@ -26,9 +26,7 @@ function inferMimeTypeFromDataUrl(value: unknown): string | undefined {
 }
 
 function normalizeImagePart(part: RendererContentPart): { type: 'image'; image: unknown; mimeType?: string } {
-  const mimeType = typeof part.mimeType === 'string'
-    ? part.mimeType
-    : inferMimeTypeFromDataUrl(part.image);
+  const mimeType = typeof part.mimeType === 'string' ? part.mimeType : inferMimeTypeFromDataUrl(part.image);
 
   return {
     type: 'image',
@@ -43,9 +41,7 @@ function normalizeFilePart(part: RendererContentPart): {
   mimeType?: unknown;
   filename?: unknown;
 } {
-  const mimeType = typeof part.mimeType === 'string'
-    ? part.mimeType
-    : inferMimeTypeFromDataUrl(part.data);
+  const mimeType = typeof part.mimeType === 'string' ? part.mimeType : inferMimeTypeFromDataUrl(part.data);
 
   return {
     type: 'file',
@@ -55,9 +51,7 @@ function normalizeFilePart(part: RendererContentPart): {
   };
 }
 
-export function normalizeMessagesForApi(
-  messages: unknown[],
-): Array<{ role: string; content: unknown }> {
+export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: string; content: unknown }> {
   const result: Array<{ role: string; content: unknown }> = [];
 
   for (const raw of messages) {
@@ -79,8 +73,8 @@ export function normalizeMessagesForApi(
         continue;
       }
       const cleanParts = (msg.content as RendererContentPart[])
-        .filter(p => p.type === 'text' || p.type === 'image' || p.type === 'file')
-        .map(p => {
+        .filter((p) => p.type === 'text' || p.type === 'image' || (p.type === 'file' && p.displayOnly !== true))
+        .map((p) => {
           if (p.type === 'text') return { type: 'text' as const, text: p.text };
           if (p.type === 'image') return normalizeImagePart(p);
           return normalizeFilePart(p);
@@ -129,9 +123,7 @@ export function normalizeMessagesForApi(
             type: 'tool-result',
             toolCallId: part.toolCallId as string,
             toolName: part.toolName as string,
-            result: part.result !== undefined
-              ? part.result
-              : 'Tool execution did not complete.',
+            result: part.result !== undefined ? part.result : 'Tool execution did not complete.',
           });
           continue;
         }

@@ -1,14 +1,24 @@
-import { useState, useCallback, useEffect, useRef, useMemo, type ReactNode, createContext as createCtx, useContext as useCtx } from 'react';
-import type { ThreadMessageLike, AppendMessage } from '@assistant-ui/react';
 import {
-  AssistantRuntimeProvider,
-  useExternalStoreRuntime,
-} from '@assistant-ui/react';
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  useMemo,
+  type ReactNode,
+  createContext as createCtx,
+  useContext as useCtx,
+} from 'react';
+import type { ThreadMessageLike, AppendMessage } from '@assistant-ui/react';
+import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui/react';
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
 import { useConfig } from './ConfigProvider';
-import { createUnifiedSpeechAdapter, createUnifiedRecordingAdapter, type AudioProvider } from '@/lib/audio/speech-adapters';
+import {
+  createUnifiedSpeechAdapter,
+  createUnifiedRecordingAdapter,
+  type AudioProvider,
+} from '@/lib/audio/speech-adapters';
 import { buildResponseTiming, getResponseTiming, withResponseTiming } from '@/lib/response-timing';
 import { normalizeTokenUsage, type TokenUsageData as NormalizedTokenUsageData } from '../../shared/token-usage';
 
@@ -42,43 +52,43 @@ export type TokenUsageData = NormalizedTokenUsageData;
 type ContentPart =
   | { type: 'text'; text: string; source?: 'assistant' | 'observer' | 'interrupt' | 'unspoken' }
   | { type: 'image'; image: string; mimeType?: string }
-  | { type: 'file'; data: string; mimeType: string; filename: string }
+  | { type: 'file'; data: string; mimeType: string; filename: string; displayOnly?: boolean }
   | { type: 'enrichments'; enrichments: PipelineEnrichments }
   | { type: 'max-turns-reached'; text: string; status: 'pending' | 'continued' }
   | {
-    type: 'tool-call';
-    toolCallId: string;
-    toolName: string;
-    args: unknown;
-    argsText?: string;
-    result?: unknown;
-    isError?: boolean;
-    startedAt?: string;
-    finishedAt?: string;
-    /** Server-computed wall-clock duration in milliseconds — more accurate than finishedAt-startedAt for fast tools */
-    durationMs?: number;
-    /** Original (pre-compaction) result content — present only when tool output was compacted */
-    originalResult?: unknown;
-    /** Tool compaction metadata — present only when tool output was compacted */
-    compactionMeta?: {
-      wasCompacted: boolean;
-      extractionDurationMs: number;
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      argsText?: string;
+      result?: unknown;
+      isError?: boolean;
+      startedAt?: string;
+      finishedAt?: string;
+      /** Server-computed wall-clock duration in milliseconds — more accurate than finishedAt-startedAt for fast tools */
+      durationMs?: number;
+      /** Original (pre-compaction) result content — present only when tool output was compacted */
+      originalResult?: unknown;
+      /** Tool compaction metadata — present only when tool output was compacted */
+      compactionMeta?: {
+        wasCompacted: boolean;
+        extractionDurationMs: number;
+      };
+      /** Live compaction phase — 'start' while AI summarization is running, cleared on complete */
+      compactionPhase?: 'start' | 'complete' | null;
+      liveOutput?: {
+        stdout?: string;
+        stderr?: string;
+        truncated?: boolean;
+        stopped?: boolean;
+        subAgentConversationId?: string;
+      };
+      /** Approval status for tool execution */
+      approvalStatus?: 'pending' | 'approved' | 'rejected';
+      /** The ID the backend uses for the approval promise — may differ from
+       *  toolCallId due to execute-side vs stream-side ID mismatch. */
+      approvalId?: string;
     };
-    /** Live compaction phase — 'start' while AI summarization is running, cleared on complete */
-    compactionPhase?: 'start' | 'complete' | null;
-    liveOutput?: {
-      stdout?: string;
-      stderr?: string;
-      truncated?: boolean;
-      stopped?: boolean;
-      subAgentConversationId?: string;
-    };
-    /** Approval status for tool execution */
-    approvalStatus?: 'pending' | 'approved' | 'rejected';
-    /** The ID the backend uses for the approval promise — may differ from
-     *  toolCallId due to execute-side vs stream-side ID mismatch. */
-    approvalId?: string;
-  };
 
 // A message with an ID and parentId for tree branching
 type StoredMessage = ThreadMessageLike & {
@@ -218,7 +228,8 @@ function toTitleCase(value: string): string {
 }
 
 // Generic image-request phrases that convey no meaningful title on their own
-const IMAGE_GENERIC_PHRASES = /^(can you |could you |please )?(read|look at|analyze|describe|explain|summarize|check|view|see|show me|tell me about)\s+(this\s+)?(image|picture|photo|screenshot|diagram|chart|graph|file)s?[?.!]*$/i;
+const IMAGE_GENERIC_PHRASES =
+  /^(can you |could you |please )?(read|look at|analyze|describe|explain|summarize|check|view|see|show me|tell me about)\s+(this\s+)?(image|picture|photo|screenshot|diagram|chart|graph|file)s?[?.!]*$/i;
 
 function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
   const hasImages = messagesHaveImages(messages);
@@ -248,13 +259,15 @@ function deriveFallbackTitle(messages: ThreadMessageLike[]): string | null {
 
   if (!simplified) return hasImages ? 'Image Analysis' : null;
 
-  return toTitleCase(
-    simplified
-      .split(' ')
-      .filter((word) => word.length > 1)
-      .slice(0, 4)
-      .join(' '),
-  ) || (hasImages ? 'Image Analysis' : null);
+  return (
+    toTitleCase(
+      simplified
+        .split(' ')
+        .filter((word) => word.length > 1)
+        .slice(0, 4)
+        .join(' '),
+    ) || (hasImages ? 'Image Analysis' : null)
+  );
 }
 
 function extractPromptHistoryText(message: ThreadMessageLike): string | null {
@@ -459,7 +472,14 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
 
   const content = acc.messages[idx].content;
   if (Array.isArray(content)) {
-    type ToolCallPart = { type: string; result?: unknown; finishedAt?: string; isError?: boolean; isHung?: boolean; approvalStatus?: string };
+    type ToolCallPart = {
+      type: string;
+      result?: unknown;
+      finishedAt?: string;
+      isError?: boolean;
+      isHung?: boolean;
+      approvalStatus?: string;
+    };
     let mutated = false;
     for (const part of content) {
       const tc = part as ToolCallPart;
@@ -629,8 +649,9 @@ function applyToolProgress(
     stderr: existing.liveOutput?.stderr ?? '',
     truncated: existing.liveOutput?.truncated ?? false,
     stopped: existing.liveOutput?.stopped ?? false,
-    subAgentConversationId: existing.liveOutput?.subAgentConversationId
-      ?? (e.data as { subAgentConversationId?: string } | undefined)?.subAgentConversationId,
+    subAgentConversationId:
+      existing.liveOutput?.subAgentConversationId ??
+      (e.data as { subAgentConversationId?: string } | undefined)?.subAgentConversationId,
   };
   if (e.data?.stream === 'stdout') liveOutput.stdout = e.data.output ?? liveOutput.stdout;
   if (e.data?.stream === 'stderr') liveOutput.stderr = e.data.output ?? liveOutput.stderr;
@@ -804,7 +825,7 @@ function applyToolResult(
       finishedAt,
       ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
       ...(!e.compaction?.wasCompacted && existing.compactionPhase === 'start'
-        ? { compactionPhase: existing.compactionMeta?.wasCompacted ? 'complete' as const : null }
+        ? { compactionPhase: existing.compactionMeta?.wasCompacted ? ('complete' as const) : null }
         : {}),
       ...compactionFields,
     };
@@ -844,13 +865,14 @@ function formatStreamError(raw: string, category?: string, statusCode?: number):
   return raw;
 }
 
-function applyEnrichments(
-  acc: MessageAccumulator,
-  data: Record<string, unknown>,
-): void {
+function applyEnrichments(acc: MessageAccumulator, data: Record<string, unknown>): void {
   // Normalize enrichment payload from multiple event shapes — supports both flat keys and nested
-  const debate = (data['debate:result'] ?? data['debate'] ?? data['debate_result']) as Record<string, unknown> | undefined;
-  const curation = (data['curation:stats'] ?? data['curation'] ?? data['curation_stats']) as Record<string, unknown> | undefined;
+  const debate = (data['debate:result'] ?? data['debate'] ?? data['debate_result']) as
+    | Record<string, unknown>
+    | undefined;
+  const curation = (data['curation:stats'] ?? data['curation'] ?? data['curation_stats']) as
+    | Record<string, unknown>
+    | undefined;
 
   if (!debate && !curation) return;
 
@@ -871,12 +893,16 @@ function applyEnrichments(
 
   if (curation && typeof curation === 'object') {
     enrichments.curation = {
-      thinking_blocks_stripped: typeof curation.thinking_blocks_stripped === 'number' ? curation.thinking_blocks_stripped : undefined,
-      tool_results_distilled: typeof curation.tool_results_distilled === 'number' ? curation.tool_results_distilled : undefined,
+      thinking_blocks_stripped:
+        typeof curation.thinking_blocks_stripped === 'number' ? curation.thinking_blocks_stripped : undefined,
+      tool_results_distilled:
+        typeof curation.tool_results_distilled === 'number' ? curation.tool_results_distilled : undefined,
       exchanges_folded: typeof curation.exchanges_folded === 'number' ? curation.exchanges_folded : undefined,
-      superseded_reads_evicted: typeof curation.superseded_reads_evicted === 'number' ? curation.superseded_reads_evicted : undefined,
+      superseded_reads_evicted:
+        typeof curation.superseded_reads_evicted === 'number' ? curation.superseded_reads_evicted : undefined,
       duplicates_removed: typeof curation.duplicates_removed === 'number' ? curation.duplicates_removed : undefined,
-      token_savings_estimate: typeof curation.token_savings_estimate === 'number' ? curation.token_savings_estimate : undefined,
+      token_savings_estimate:
+        typeof curation.token_savings_estimate === 'number' ? curation.token_savings_estimate : undefined,
     };
   }
 
@@ -917,7 +943,7 @@ async function persistConversation(
   persistVersions.set(conversationId, currentVersion);
 
   try {
-    const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
     if (!conv) return;
 
     // After the async get(), check if a newer persist started while we were waiting
@@ -952,7 +978,7 @@ type TitleGenerationSettings = {
 
 async function getTitleGenerationSettings(): Promise<TitleGenerationSettings> {
   try {
-    const config = await app.config.get() as { titleGeneration?: Partial<TitleGenerationSettings> } | null;
+    const config = (await app.config.get()) as { titleGeneration?: Partial<TitleGenerationSettings> } | null;
     const tg = config?.titleGeneration ?? {};
     return {
       enabled: tg.enabled ?? true,
@@ -974,7 +1000,7 @@ async function updateConversation(
   conversationId: string,
   createPatch: (latest: ConversationRecord) => Partial<ConversationRecord>,
 ): Promise<void> {
-  const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+  const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;
   if (!latest) return;
   await app.conversations.put({ ...latest, ...createPatch(latest) });
 }
@@ -985,7 +1011,7 @@ async function patchConversation(conversationId: string, patch: Partial<Conversa
 
 async function maybeGenerateTitle(conversationId: string, messages: ThreadMessageLike[], hint?: string): Promise<void> {
   try {
-    const conv = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
     if (!conv) return;
 
     // Don't clobber a user-renamed conversation. Rename sites
@@ -1030,7 +1056,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
         });
       } else {
         // Title gen returned nothing — keep the UI moving with a simple fallback.
-        const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+        const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;
         if (latest && latest.titleStatus === 'generating') {
           const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
           await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
@@ -1045,7 +1071,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       titleGenInFlight.delete(conversationId);
     }
   } catch {
-    const latest = await app.conversations.get(conversationId) as ConversationRecord | null;
+    const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;
     if (latest && latest.titleStatus === 'generating') {
       const fallbackTitle = latest.fallbackTitle ?? deriveFallbackTitle(messages);
       await patchConversation(conversationId, { fallbackTitle, titleStatus: 'idle' });
@@ -1139,7 +1165,19 @@ export function RuntimeProvider({
     runtimeOverride?: string | null;
   };
   onModelFallback?: (toModelKey: string) => void;
-  onConversationSettingsLoaded?: (settings: { selectedModelKey: string | null; selectedProfileKey: string | null; fallbackEnabled: boolean; profilePrimaryModelKey: string | null; reasoningEffort?: ReasoningEffort | null; executionMode?: ExecutionMode | null; temperature?: number | null; systemPromptOverride?: string | null; maxSteps?: number | null; maxRetries?: number | null; runtimeOverride?: string | null }) => void;
+  onConversationSettingsLoaded?: (settings: {
+    selectedModelKey: string | null;
+    selectedProfileKey: string | null;
+    fallbackEnabled: boolean;
+    profilePrimaryModelKey: string | null;
+    reasoningEffort?: ReasoningEffort | null;
+    executionMode?: ExecutionMode | null;
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  }) => void;
 }) {
   const [tree, setTree] = useState<StoredMessage[]>([]);
   const [headId, setHeadId] = useState<string | null>(null);
@@ -1194,21 +1232,29 @@ export function RuntimeProvider({
       enabled: true,
       voice: tts.voice,
       rate: tts.rate ?? 1,
-      azure: audioProvider === 'azure' ? {
-        endpoint: audioConfig?.azure?.endpoint,
-        region: audioConfig?.azure?.region ?? 'eastus',
-        subscriptionKey: audioConfig?.azure?.subscriptionKey ?? '',
-        voice: audioConfig?.azure?.ttsVoice ?? 'en-US-JennyNeural',
-        outputFormat: audioConfig?.azure?.ttsOutputFormat ?? 'audio-24khz-48kbitrate-mono-mp3',
-        rate: audioConfig?.azure?.ttsRate ?? 1,
-      } : undefined,
+      azure:
+        audioProvider === 'azure'
+          ? {
+              endpoint: audioConfig?.azure?.endpoint,
+              region: audioConfig?.azure?.region ?? 'eastus',
+              subscriptionKey: audioConfig?.azure?.subscriptionKey ?? '',
+              voice: audioConfig?.azure?.ttsVoice ?? 'en-US-JennyNeural',
+              outputFormat: audioConfig?.azure?.ttsOutputFormat ?? 'audio-24khz-48kbitrate-mono-mp3',
+              rate: audioConfig?.azure?.ttsRate ?? 1,
+            }
+          : undefined,
     });
   }, [
     audioProvider,
-    audioConfig?.tts?.enabled, audioConfig?.tts?.voice, audioConfig?.tts?.rate,
-    audioConfig?.azure?.endpoint, audioConfig?.azure?.region,
-    audioConfig?.azure?.subscriptionKey, audioConfig?.azure?.ttsVoice,
-    audioConfig?.azure?.ttsOutputFormat, audioConfig?.azure?.ttsRate,
+    audioConfig?.tts?.enabled,
+    audioConfig?.tts?.voice,
+    audioConfig?.tts?.rate,
+    audioConfig?.azure?.endpoint,
+    audioConfig?.azure?.region,
+    audioConfig?.azure?.subscriptionKey,
+    audioConfig?.azure?.ttsVoice,
+    audioConfig?.azure?.ttsOutputFormat,
+    audioConfig?.azure?.ttsRate,
   ]);
 
   const recordingAdapter = useMemo(() => {
@@ -1220,20 +1266,27 @@ export function RuntimeProvider({
       enabled: true,
       language: rec.language,
       continuous: rec.continuous ?? true,
-      azure: audioProvider === 'azure' ? {
-        endpoint: audioConfig?.azure?.endpoint,
-        region: audioConfig?.azure?.region ?? 'eastus',
-        subscriptionKey: audioConfig?.azure?.subscriptionKey ?? '',
-        language: audioConfig?.azure?.sttLanguage ?? rec.language ?? 'en-US',
-        continuous: rec.continuous ?? true,
-        inputDeviceId: (audioConfig?.recording as { inputDeviceId?: string } | undefined)?.inputDeviceId,
-      } : undefined,
+      azure:
+        audioProvider === 'azure'
+          ? {
+              endpoint: audioConfig?.azure?.endpoint,
+              region: audioConfig?.azure?.region ?? 'eastus',
+              subscriptionKey: audioConfig?.azure?.subscriptionKey ?? '',
+              language: audioConfig?.azure?.sttLanguage ?? rec.language ?? 'en-US',
+              continuous: rec.continuous ?? true,
+              inputDeviceId: (audioConfig?.recording as { inputDeviceId?: string } | undefined)?.inputDeviceId,
+            }
+          : undefined,
     });
   }, [
     audioProvider,
-    audioConfig?.recording?.enabled, audioConfig?.recording?.language, audioConfig?.recording?.continuous,
-    audioConfig?.azure?.endpoint, audioConfig?.azure?.region,
-    audioConfig?.azure?.subscriptionKey, audioConfig?.azure?.sttLanguage,
+    audioConfig?.recording?.enabled,
+    audioConfig?.recording?.language,
+    audioConfig?.recording?.continuous,
+    audioConfig?.azure?.endpoint,
+    audioConfig?.azure?.region,
+    audioConfig?.azure?.subscriptionKey,
+    audioConfig?.azure?.sttLanguage,
   ]);
 
   // Sub-agent state — backed by module-level globals so it survives remounts
@@ -1247,10 +1300,18 @@ export function RuntimeProvider({
     setSubAgentVersion(globalSubAgentVersion);
   }, []);
 
-  useEffect(() => { activeIdRef.current = activeConversationId; }, [activeConversationId]);
-  useEffect(() => { treeRef.current = tree; }, [tree]);
-  useEffect(() => { headIdRef.current = headId; }, [headId]);
-  useEffect(() => { currentWorkingDirectoryRef.current = currentWorkingDirectory; }, [currentWorkingDirectory]);
+  useEffect(() => {
+    activeIdRef.current = activeConversationId;
+  }, [activeConversationId]);
+  useEffect(() => {
+    treeRef.current = tree;
+  }, [tree]);
+  useEffect(() => {
+    headIdRef.current = headId;
+  }, [headId]);
+  useEffect(() => {
+    currentWorkingDirectoryRef.current = currentWorkingDirectory;
+  }, [currentWorkingDirectory]);
 
   // Derive active branch from tree
   const activeBranch = useMemo(() => getActiveBranch(tree, headId), [tree, headId]);
@@ -1273,7 +1334,7 @@ export function RuntimeProvider({
   }, [tree, headId, isRunning]);
 
   const loadConversationState = useCallback(async (id: string) => {
-    const conv = await app.conversations.get(id) as ConversationRecord | null;
+    const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return false;
 
     const { tree: t, headId: h } = ensureTree(conv);
@@ -1285,7 +1346,13 @@ export function RuntimeProvider({
     if (!hasActiveStream) {
       for (const msg of t) {
         if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-        type PersistedToolPart = { type: string; result?: unknown; isHung?: boolean; finishedAt?: string; approvalStatus?: string };
+        type PersistedToolPart = {
+          type: string;
+          result?: unknown;
+          isHung?: boolean;
+          finishedAt?: string;
+          approvalStatus?: string;
+        };
         let repaired = false;
         for (const part of msg.content) {
           const tc = part as PersistedToolPart;
@@ -1344,13 +1411,18 @@ export function RuntimeProvider({
   useEffect(() => {
     (async () => {
       try {
-        const allConvs = await app.conversations.list() as ConversationRecord[];
+        const allConvs = (await app.conversations.list()) as ConversationRecord[];
         for (const conv of allConvs) {
-          if ((conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') && !streamAccumulators.has(conv.id)) {
+          if (
+            (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') &&
+            !streamAccumulators.has(conv.id)
+          ) {
             await patchConversation(conv.id, { runStatus: 'idle' });
           }
         }
-      } catch { /* best-effort cleanup */ }
+      } catch {
+        /* best-effort cleanup */
+      }
     })();
   }, []);
 
@@ -1358,21 +1430,37 @@ export function RuntimeProvider({
   useEffect(() => {
     (async () => {
       try {
-        const id = conversationId ?? await app.conversations.getActiveId();
-        if (id && await loadConversationState(id)) {
+        const id = conversationId ?? (await app.conversations.getActiveId());
+        if (id && (await loadConversationState(id))) {
           return;
         }
         const newId = generateId();
         const now = nowIso();
         let defaultCwd: string | null = null;
-        try { defaultCwd = await app.platform.homedir(); } catch { /* fallback to null */ }
+        try {
+          defaultCwd = await app.platform.homedir();
+        } catch {
+          /* fallback to null */
+        }
         await app.conversations.put({
-          id: newId, title: null, fallbackTitle: null, messages: [], messageTree: [], headId: null,
-          conversationCompaction: null, lastContextUsage: null,
-          createdAt: now, updatedAt: now, lastMessageAt: null,
-          titleStatus: 'idle', titleUpdatedAt: null,
-          messageCount: 0, userMessageCount: 0,
-          runStatus: 'idle', hasUnread: false, lastAssistantUpdateAt: null,
+          id: newId,
+          title: null,
+          fallbackTitle: null,
+          messages: [],
+          messageTree: [],
+          headId: null,
+          conversationCompaction: null,
+          lastContextUsage: null,
+          createdAt: now,
+          updatedAt: now,
+          lastMessageAt: null,
+          titleStatus: 'idle',
+          titleUpdatedAt: null,
+          messageCount: 0,
+          userMessageCount: 0,
+          runStatus: 'idle',
+          hasUnread: false,
+          lastAssistantUpdateAt: null,
           selectedModelKey: null,
           currentWorkingDirectory: defaultCwd,
         } as ConversationRecord);
@@ -1398,29 +1486,35 @@ export function RuntimeProvider({
     if (!activeConversationId || isRunning || streamAccumulators.has(activeConversationId)) return;
 
     void (async () => {
-      const conv = await app.conversations.get(activeConversationId) as ConversationRecord | null;
+      const conv = (await app.conversations.get(activeConversationId)) as ConversationRecord | null;
       if (conv?.runStatus === 'running') {
         await patchConversation(activeConversationId, { runStatus: 'idle' });
       }
     })();
   }, [activeConversationId, isRunning, tree, headId]);
 
-  const schedulePersist = useCallback((conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
-    const timers = persistTimersRef.current;
-    const existing = timers.get(conversationId);
-    if (existing) clearTimeout(existing);
-    timers.set(conversationId, setTimeout(() => {
-      timers.delete(conversationId);
-      // Guard: if the stream has already ended (accumulator deleted), don't
-      // overwrite the terminal runStatus that the done/error handler persisted.
-      // This prevents a stale debounced persist (runStatus:'running') from
-      // racing with the immediate done-persist (runStatus:'idle').
-      if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
-        return;
-      }
-      persistConversation(conversationId, t, h, extra);
-    }, 300));
-  }, []);
+  const schedulePersist = useCallback(
+    (conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {
+      const timers = persistTimersRef.current;
+      const existing = timers.get(conversationId);
+      if (existing) clearTimeout(existing);
+      timers.set(
+        conversationId,
+        setTimeout(() => {
+          timers.delete(conversationId);
+          // Guard: if the stream has already ended (accumulator deleted), don't
+          // overwrite the terminal runStatus that the done/error handler persisted.
+          // This prevents a stale debounced persist (runStatus:'running') from
+          // racing with the immediate done-persist (runStatus:'idle').
+          if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
+            return;
+          }
+          persistConversation(conversationId, t, h, extra);
+        }, 300),
+      );
+    },
+    [],
+  );
 
   const setCurrentWorkingDirectory = useCallback(async (cwd: string | null) => {
     const trimmed = cwd?.trim() ? cwd.trim() : null;
@@ -1436,19 +1530,56 @@ export function RuntimeProvider({
   }, []);
 
   // Stable ref for values the stream handler needs without re-subscribing
-  const streamHandlerRef = useRef({ tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides });
-  useEffect(() => { streamHandlerRef.current = { tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides }; }, [tree, headId, schedulePersist, selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, threadOverrides]);
+  const streamHandlerRef = useRef({
+    tree,
+    headId,
+    schedulePersist,
+    selectedModelKey,
+    reasoningEffort,
+    selectedProfileKey,
+    fallbackEnabled,
+    threadOverrides,
+  });
+  useEffect(() => {
+    streamHandlerRef.current = {
+      tree,
+      headId,
+      schedulePersist,
+      selectedModelKey,
+      reasoningEffort,
+      selectedProfileKey,
+      fallbackEnabled,
+      threadOverrides,
+    };
+  }, [
+    tree,
+    headId,
+    schedulePersist,
+    selectedModelKey,
+    reasoningEffort,
+    selectedProfileKey,
+    fallbackEnabled,
+    threadOverrides,
+  ]);
 
   // Stream event listener — subscribes ONCE, reads mutable values via refs/globals
   useEffect(() => {
     const unsubscribe = app.agent.onStreamEvent((event: unknown) => {
       const e = event as {
-        conversationId: string; type: string; text?: string;
+        conversationId: string;
+        type: string;
+        text?: string;
         messageMeta?: Record<string, unknown>;
-        toolCallId?: string; toolName?: string; args?: unknown;
-        result?: unknown; error?: string;
-        errorCategory?: string; errorStatusCode?: number;
-        startedAt?: string; finishedAt?: string; durationMs?: number;
+        toolCallId?: string;
+        toolName?: string;
+        args?: unknown;
+        result?: unknown;
+        error?: string;
+        errorCategory?: string;
+        errorStatusCode?: number;
+        startedAt?: string;
+        finishedAt?: string;
+        durationMs?: number;
         compaction?: {
           originalContent: string;
           wasCompacted: boolean;
@@ -1471,20 +1602,23 @@ export function RuntimeProvider({
       };
 
       // Debug: log every event received in renderer
-      const debugSummary = e.type === 'text-delta'
-        ? `text-delta len=${(e.text ?? '').length}`
-        : e.type === 'tool-call'
-          ? `tool-call id=${e.toolCallId} name=${e.toolName}`
-          : e.type === 'tool-result'
-            ? `tool-result id=${e.toolCallId}`
-            : e.type === 'done'
-              ? `done data=${JSON.stringify(e.data ?? null)}`
-              : e.type === 'error'
-                ? `error msg=${(e.error ?? '').slice(0, 100)}`
-                : e.type;
+      const debugSummary =
+        e.type === 'text-delta'
+          ? `text-delta len=${(e.text ?? '').length}`
+          : e.type === 'tool-call'
+            ? `tool-call id=${e.toolCallId} name=${e.toolName}`
+            : e.type === 'tool-result'
+              ? `tool-result id=${e.toolCallId}`
+              : e.type === 'done'
+                ? `done data=${JSON.stringify(e.data ?? null)}`
+                : e.type === 'error'
+                  ? `error msg=${(e.error ?? '').slice(0, 100)}`
+                  : e.type;
       const isActive = e.conversationId === activeIdRef.current;
       const hasAccumulator = streamAccumulators.has(e.conversationId);
-      console.warn(`[StreamEvent] conv=${e.conversationId.slice(0, 8)} ${debugSummary} isActive=${isActive} hasAccumulator=${hasAccumulator}`);
+      console.warn(
+        `[StreamEvent] conv=${e.conversationId.slice(0, 8)} ${debugSummary} isActive=${isActive} hasAccumulator=${hasAccumulator}`,
+      );
 
       // Route sub-agent events to global sub-agent state
       if (e.subAgentConversationId) {
@@ -1536,7 +1670,9 @@ export function RuntimeProvider({
           const lastMsg = saAcc.messages[saAcc.messages.length - 1];
           const lastIsUser = lastMsg?.role === 'user';
           const lastContent = lastIsUser && Array.isArray(lastMsg.content) ? lastMsg.content : [];
-          const lastText = lastContent.find((p: unknown) => (p as { type: string }).type === 'text') as { text?: string } | undefined;
+          const lastText = lastContent.find((p: unknown) => (p as { type: string }).type === 'text') as
+            | { text?: string }
+            | undefined;
           const isDuplicate = lastIsUser && lastText?.text === msgText;
 
           if (!isDuplicate) {
@@ -1553,11 +1689,29 @@ export function RuntimeProvider({
         } else if (e.type === 'text-delta') {
           applyTextDelta(saAcc, e.text ?? '', e.messageMeta);
         } else if (e.type === 'tool-call' && e.toolCallId) {
-          applyToolCall(saAcc, { toolCallId: e.toolCallId, toolName: e.toolName ?? 'unknown', args: e.args, startedAt: e.startedAt });
+          applyToolCall(saAcc, {
+            toolCallId: e.toolCallId,
+            toolName: e.toolName ?? 'unknown',
+            args: e.args,
+            startedAt: e.startedAt,
+          });
         } else if (e.type === 'tool-result') {
-          applyToolResult(saAcc, { toolCallId: e.toolCallId, toolName: e.toolName, result: e.result, startedAt: e.startedAt, finishedAt: e.finishedAt, durationMs: e.durationMs });
+          applyToolResult(saAcc, {
+            toolCallId: e.toolCallId,
+            toolName: e.toolName,
+            result: e.result,
+            startedAt: e.startedAt,
+            finishedAt: e.finishedAt,
+            durationMs: e.durationMs,
+          });
         } else if (e.type === 'tool-progress') {
-          applyToolProgress(saAcc, { toolCallId: e.toolCallId, toolName: e.toolName, data: e.data as { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean } | undefined });
+          applyToolProgress(saAcc, {
+            toolCallId: e.toolCallId,
+            toolName: e.toolName,
+            data: e.data as
+              | { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean }
+              | undefined,
+          });
         } else if (e.type === 'error') {
           applyError(saAcc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         }
@@ -1594,12 +1748,16 @@ export function RuntimeProvider({
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
           const { tree: curTree, headId: curHead } = streamHandlerRef.current;
-          console.warn(`[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`);
+          console.warn(
+            `[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`,
+          );
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
         } else {
           // No accumulator for a non-active conversation — the stream already
           // completed and was persisted by the done/error handler.  Drop stale events.
-          console.warn(`[StreamEvent] DROPPING event for non-active conv=${convId.slice(0, 8)} type=${e.type} activeConv=${activeIdRef.current?.slice(0, 8) ?? 'none'}`);
+          console.warn(
+            `[StreamEvent] DROPPING event for non-active conv=${convId.slice(0, 8)} type=${e.type} activeConv=${activeIdRef.current?.slice(0, 8) ?? 'none'}`,
+          );
           return;
         }
       }
@@ -1612,9 +1770,8 @@ export function RuntimeProvider({
           eventType: e.type,
           toolCallId: e.toolCallId ?? null,
           toolName: e.toolName ?? null,
-          compactionPhase: e.type === 'tool-compaction'
-            ? ((e.data as { phase?: string } | undefined)?.phase ?? null)
-            : null,
+          compactionPhase:
+            e.type === 'tool-compaction' ? ((e.data as { phase?: string } | undefined)?.phase ?? null) : null,
           hasResultCompaction: e.type === 'tool-result' ? Boolean(e.compaction?.wasCompacted) : false,
         });
       }
@@ -1675,7 +1832,10 @@ export function RuntimeProvider({
         // Find the current assistant message and replace its content
         let assistantIdx = -1;
         for (let i = acc.messages.length - 1; i >= 0; i--) {
-          if (acc.messages[i].role === 'assistant') { assistantIdx = i; break; }
+          if (acc.messages[i].role === 'assistant') {
+            assistantIdx = i;
+            break;
+          }
         }
         if (assistantIdx >= 0) {
           const newContent: ContentPart[] = [];
@@ -1691,7 +1851,11 @@ export function RuntimeProvider({
         // from merging into the previous call's last assistant message.
         if (rtStatus === 'connected' && acc.messages.length > 0) {
           finalizeAssistantResponse(acc);
-          const _pt1 = persistTimersRef.current.get(convId); if (_pt1) { clearTimeout(_pt1); persistTimersRef.current.delete(convId); }
+          const _pt1 = persistTimersRef.current.get(convId);
+          if (_pt1) {
+            clearTimeout(_pt1);
+            persistTimersRef.current.delete(convId);
+          }
           streamAccumulators.delete(convId);
           forceNewAssistant.add(convId);
           persistConversation(convId, acc.messages, acc.headId, {
@@ -1723,7 +1887,12 @@ export function RuntimeProvider({
           const tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
           if (tcIdx >= 0) {
             const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-            content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: deferred.toolCallId, finishedAt: nowIso() };
+            content[tcIdx] = {
+              ...existing,
+              approvalStatus: 'pending',
+              approvalId: deferred.toolCallId,
+              finishedAt: nowIso(),
+            };
             acc.messages[idx] = { ...msg, content: toStoredContent(content) };
           }
         }
@@ -1748,7 +1917,12 @@ export function RuntimeProvider({
         }
         if (tcIdx >= 0) {
           const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-          content[tcIdx] = { ...existing, approvalStatus: 'pending', approvalId: e.toolCallId as string, finishedAt: nowIso() };
+          content[tcIdx] = {
+            ...existing,
+            approvalStatus: 'pending',
+            approvalId: e.toolCallId as string,
+            finishedAt: nowIso(),
+          };
           acc.messages[idx] = { ...msg, content: toStoredContent(content) };
         } else if (e.toolName) {
           // tool-call event hasn't arrived yet — defer the approval so it can
@@ -1768,15 +1942,17 @@ export function RuntimeProvider({
           compaction: e.compaction,
         });
       } else if (e.type === 'tool-progress') {
-        const toolProgressData = e.data as {
-          type?: string;
-          stream?: 'stdout' | 'stderr';
-          output?: string;
-          truncated?: boolean;
-          stopped?: boolean;
-          content?: string;
-          duration_ms?: number;
-        } | undefined;
+        const toolProgressData = e.data as
+          | {
+              type?: string;
+              stream?: 'stdout' | 'stderr';
+              output?: string;
+              truncated?: boolean;
+              stopped?: boolean;
+              content?: string;
+              duration_ms?: number;
+            }
+          | undefined;
         if (toolProgressData?.type === 'extraction_start' || toolProgressData?.type === 'extraction_complete') {
           applyToolCompaction(acc, {
             toolCallId: e.toolCallId,
@@ -1798,11 +1974,13 @@ export function RuntimeProvider({
         applyToolCompaction(acc, {
           toolCallId: e.toolCallId,
           toolName: e.toolName,
-          data: e.data as {
-            phase?: 'start' | 'complete' | 'error' | null;
-            originalContent?: string;
-            extractionDurationMs?: number;
-          } | undefined,
+          data: e.data as
+            | {
+                phase?: 'start' | 'complete' | 'error' | null;
+                originalContent?: string;
+                extractionDurationMs?: number;
+              }
+            | undefined,
         });
       } else if (e.type === 'enrichment') {
         const enrichData = e.data as Record<string, unknown> | undefined;
@@ -1832,14 +2010,16 @@ export function RuntimeProvider({
         const usageData = normalizeTokenUsage(e.data);
         if (usageData) applyTokenUsage(acc, usageData);
       } else if (e.type === 'model-fallback') {
-        const fbData = e.data as {
-          fromModel: string;
-          toModel: string;
-          toModelKey?: string;
-          error: string;
-          reason?: string;
-          discardPartialAssistant?: boolean;
-        } | undefined;
+        const fbData = e.data as
+          | {
+              fromModel: string;
+              toModel: string;
+              toModelKey?: string;
+              error: string;
+              reason?: string;
+              discardPartialAssistant?: boolean;
+            }
+          | undefined;
         if (fbData?.discardPartialAssistant) {
           discardTrailingAssistant(acc);
         }
@@ -1859,7 +2039,9 @@ export function RuntimeProvider({
         }
       } else if (e.type === 'retry') {
         // Retry events are informational — show as observer message
-        const retryData = e.data as { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string } | undefined;
+        const retryData = e.data as
+          | { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string }
+          | undefined;
         if (retryData) {
           const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
           const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
@@ -1881,7 +2063,9 @@ export function RuntimeProvider({
         return;
       } else if (e.type === 'max-steps-reached') {
         // Max steps reached — show incomplete task banner
-        console.warn(`[StreamEvent] MAX_STEPS conv=${convId.slice(0, 8)} steps=${e.stepInfo?.currentStep}/${e.stepInfo?.maxSteps}`);
+        console.warn(
+          `[StreamEvent] MAX_STEPS conv=${convId.slice(0, 8)} steps=${e.stepInfo?.currentStep}/${e.stepInfo?.maxSteps}`,
+        );
 
         if (e.stepInfo && isActiveConv) {
           setStepInfo({
@@ -1905,17 +2089,26 @@ export function RuntimeProvider({
         if (autoContinue) {
           // Auto-continue: finalize current response and immediately restart the stream
           finalizeAssistantResponse(acc);
-          const _ptAC = persistTimersRef.current.get(convId); if (_ptAC) { clearTimeout(_ptAC); persistTimersRef.current.delete(convId); }
+          const _ptAC = persistTimersRef.current.get(convId);
+          if (_ptAC) {
+            clearTimeout(_ptAC);
+            persistTimersRef.current.delete(convId);
+          }
           const branch = getActiveBranch(acc.messages, acc.headId);
           persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' });
-          streamAccumulators.set(convId, { messages: [...acc.messages], headId: acc.headId, pendingAssistantTiming: createPendingAssistantTiming() });
+          streamAccumulators.set(convId, {
+            messages: [...acc.messages],
+            headId: acc.headId,
+            pendingAssistantTiming: createPendingAssistantTiming(),
+          });
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
           }
           const cfg = streamHandlerRef.current;
           app.agent.stream(
-            convId, branch,
+            convId,
+            branch,
             cfg.selectedModelKey ?? undefined,
             cfg.reasoningEffort ?? 'medium',
             cfg.selectedProfileKey ?? undefined,
@@ -1930,13 +2123,23 @@ export function RuntimeProvider({
         // Manual continue: show interactive card
         const { msg: mtMsg, idx: mtIdx } = getOrCreateAssistantInAcc(acc);
         const mtContent = (Array.isArray(mtMsg.content) ? [...mtMsg.content] : []) as ContentPart[];
-        mtContent.push({ type: 'max-turns-reached', text: e.error ?? 'Reached maximum number of turns', status: 'pending' });
+        mtContent.push({
+          type: 'max-turns-reached',
+          text: e.error ?? 'Reached maximum number of turns',
+          status: 'pending',
+        });
         acc.messages[mtIdx] = { ...mtMsg, content: toStoredContent(mtContent) };
         finalizeAssistantResponse(acc);
-        const _ptMaxTurns = persistTimersRef.current.get(convId); if (_ptMaxTurns) { clearTimeout(_ptMaxTurns); persistTimersRef.current.delete(convId); }
+        const _ptMaxTurns = persistTimersRef.current.get(convId);
+        if (_ptMaxTurns) {
+          clearTimeout(_ptMaxTurns);
+          persistTimersRef.current.delete(convId);
+        }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
+          runStatus: 'idle',
+          lastAssistantUpdateAt: nowIso(),
+          hasUnread: !isActiveConv,
         });
         if (isActiveConv) {
           setIsRunning(false);
@@ -1945,7 +2148,9 @@ export function RuntimeProvider({
         }
         return;
       } else if (e.type === 'error') {
-        console.warn(`[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`);
+        console.warn(
+          `[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`,
+        );
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         // Apply messageMeta (e.g. runtimeId) from error events so the popover
         // shows the correct runtime even when the response is an error.
@@ -1958,10 +2163,16 @@ export function RuntimeProvider({
           }
         }
         finalizeAssistantResponse(acc);
-        const _ptErr = persistTimersRef.current.get(convId); if (_ptErr) { clearTimeout(_ptErr); persistTimersRef.current.delete(convId); }
+        const _ptErr = persistTimersRef.current.get(convId);
+        if (_ptErr) {
+          clearTimeout(_ptErr);
+          persistTimersRef.current.delete(convId);
+        }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
+          runStatus: 'idle',
+          lastAssistantUpdateAt: nowIso(),
+          hasUnread: !isActiveConv,
         });
         if (isActiveConv) {
           setIsRunning(false);
@@ -1970,15 +2181,18 @@ export function RuntimeProvider({
         }
         return;
       } else if (e.type === 'done') {
-        console.warn(`[StreamEvent] DONE conv=${convId.slice(0, 8)} accMsgCount=${acc.messages.length} awaitingApproval=${acc.awaitingApproval ?? false} isActive=${isActiveConv} data=${JSON.stringify(e.data ?? null)}`);
+        console.warn(
+          `[StreamEvent] DONE conv=${convId.slice(0, 8)} accMsgCount=${acc.messages.length} awaitingApproval=${acc.awaitingApproval ?? false} isActive=${isActiveConv} data=${JSON.stringify(e.data ?? null)}`,
+        );
         // Plan-mode transitions (accept, reject, dismiss) send a done event while
         // a tool is still awaiting approval.  Clear the flag so the normal done
         // path can clean up or restart the stream correctly.
         const doneData = e.data as Record<string, unknown> | undefined;
-        if (acc.awaitingApproval && doneData && (
-          doneData.planModeRestart || doneData.planModeRejectRestart ||
-          doneData.planDismissed
-        )) {
+        if (
+          acc.awaitingApproval &&
+          doneData &&
+          (doneData.planModeRestart || doneData.planModeRejectRestart || doneData.planDismissed)
+        ) {
           acc.awaitingApproval = false;
         }
         // If a tool is awaiting user approval, the stream "done" just means the
@@ -1993,9 +2207,13 @@ export function RuntimeProvider({
           }
           // Persist with awaiting-approval so the sidebar stays correct
           const _ptAwait = persistTimersRef.current.get(convId);
-          if (_ptAwait) { clearTimeout(_ptAwait); persistTimersRef.current.delete(convId); }
+          if (_ptAwait) {
+            clearTimeout(_ptAwait);
+            persistTimersRef.current.delete(convId);
+          }
           persistConversation(convId, acc.messages, acc.headId, {
-            runStatus: 'awaiting-approval', hasUnread: true,
+            runStatus: 'awaiting-approval',
+            hasUnread: true,
           });
           return;
         }
@@ -2010,10 +2228,16 @@ export function RuntimeProvider({
             if (idx >= 0) acc.messages[idx] = applyAssistantMessageMeta(acc.messages[idx], e.messageMeta);
           }
         }
-        const _ptDone = persistTimersRef.current.get(convId); if (_ptDone) { clearTimeout(_ptDone); persistTimersRef.current.delete(convId); }
+        const _ptDone = persistTimersRef.current.get(convId);
+        if (_ptDone) {
+          clearTimeout(_ptDone);
+          persistTimersRef.current.delete(convId);
+        }
         streamAccumulators.delete(convId);
         persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle', lastAssistantUpdateAt: nowIso(), hasUnread: !isActiveConv,
+          runStatus: 'idle',
+          lastAssistantUpdateAt: nowIso(),
+          hasUnread: !isActiveConv,
         });
         if (isActiveConv) {
           setTree([...acc.messages]);
@@ -2043,7 +2267,11 @@ export function RuntimeProvider({
                 const treeForStream = [...acc.messages];
 
                 const branch = getActiveBranch(treeForStream, headForStream);
-                streamAccumulators.set(convId, { messages: [...treeForStream], headId: headForStream, pendingAssistantTiming: createPendingAssistantTiming() });
+                streamAccumulators.set(convId, {
+                  messages: [...treeForStream],
+                  headId: headForStream,
+                  pendingAssistantTiming: createPendingAssistantTiming(),
+                });
                 setIsRunning(true);
                 persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
                 const cfg = streamHandlerRef.current;
@@ -2073,9 +2301,12 @@ export function RuntimeProvider({
         setTree([...acc.messages]);
         setHeadId(acc.headId);
       }
-      const persistStatus = e.type === 'tool-approval-required' ? 'awaiting-approval'
-        : acc.awaitingApproval ? 'awaiting-approval'
-        : 'running';
+      const persistStatus =
+        e.type === 'tool-approval-required'
+          ? 'awaiting-approval'
+          : acc.awaitingApproval
+            ? 'awaiting-approval'
+            : 'running';
       const persistExtra: Partial<ConversationRecord> = { runStatus: persistStatus };
       if (e.type === 'tool-approval-required') {
         persistExtra.hasUnread = true;
@@ -2086,7 +2317,10 @@ export function RuntimeProvider({
         // Persist immediately — no debounce — so the sidebar picks up the
         // awaiting-approval state even if the user switches threads quickly.
         const _pt = persistTimersRef.current.get(convId);
-        if (_pt) { clearTimeout(_pt); persistTimersRef.current.delete(convId); }
+        if (_pt) {
+          clearTimeout(_pt);
+          persistTimersRef.current.delete(convId);
+        }
         persistConversation(convId, acc.messages, acc.headId, persistExtra);
       } else {
         // Resume running indicator only if not awaiting approval — stale
@@ -2100,96 +2334,154 @@ export function RuntimeProvider({
     return unsubscribe;
   }, [bumpSubAgentVersion]);
 
-  const onNew = useCallback(async (message: AppendMessage) => {
-    const convId = activeIdRef.current;
-    if (!convId) return;
+  const onNew = useCallback(
+    async (message: AppendMessage) => {
+      const convId = activeIdRef.current;
+      if (!convId) return;
 
-    const pendingAttachments = consumeAttachments();
-    const cwd = currentWorkingDirectoryRef.current;
-    const userContent: ContentPart[] = [];
-    for (const part of message.content) {
-      if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
-      else if (part.type === 'image') {
-        const imagePart = part as { image: string; mimeType?: string };
-        userContent.push({
-          type: 'image',
-          image: imagePart.image,
-          ...(imagePart.mimeType ? { mimeType: imagePart.mimeType } : {}),
-        });
+      const pendingAttachments = consumeAttachments();
+      const cwd = currentWorkingDirectoryRef.current;
+      const userContent: ContentPart[] = [];
+      for (const part of message.content) {
+        if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
+        else if (part.type === 'image') {
+          const imagePart = part as { image: string; mimeType?: string };
+          userContent.push({
+            type: 'image',
+            image: imagePart.image,
+            ...(imagePart.mimeType ? { mimeType: imagePart.mimeType } : {}),
+          });
+        }
       }
-    }
-    for (const att of pendingAttachments) {
-      const pathLabel = att.filePath ? att.filePath : att.name;
-      if (att.isImage) {
-        // Send the actual image data — the model reads the image directly, no text placeholder needed
-        userContent.push({ type: 'image', image: att.dataUrl, mimeType: att.mime });
-      } else if (att.text) {
-        userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
-        userContent.push({ type: 'text', text: `\n\n--- File: ${pathLabel} ---\n${att.text}\n--- End File ---\n` });
-      } else {
-        userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
-        userContent.push({ type: 'text', text: `\n[Attached file: ${pathLabel} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]` });
+      for (const att of pendingAttachments) {
+        const pathLabel = att.filePath ? att.filePath : att.name;
+        if (att.isImage) {
+          // Send the actual image data — the model reads the image directly, no text placeholder needed
+          userContent.push({ type: 'image', image: att.dataUrl, mimeType: att.mime });
+        } else if (att.text) {
+          userContent.push({
+            type: 'file',
+            data: att.dataUrl,
+            mimeType: att.mime,
+            filename: att.name,
+            displayOnly: true,
+          });
+          userContent.push({ type: 'text', text: `\n\n--- File: ${pathLabel} ---\n${att.text}\n--- End File ---\n` });
+        } else {
+          userContent.push({ type: 'file', data: att.dataUrl, mimeType: att.mime, filename: att.name });
+          userContent.push({
+            type: 'text',
+            text: `\n[Attached file: ${pathLabel} (${att.mime}, ${(att.size / 1024).toFixed(1)} KB)]`,
+          });
+        }
       }
-    }
-    if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
+      if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
 
-    const userMsg: StoredMessage = { id: msgId(), parentId: headId, role: 'user', content: toStoredContent(userContent), createdAt: new Date() };
-    const newTree = [...tree, userMsg];
-    const newHead = userMsg.id;
-    const pendingAssistantTiming = createPendingAssistantTiming();
-    setTree(newTree);
-    setHeadId(newHead);
-    setIsRunning(true);
+      const userMsg: StoredMessage = {
+        id: msgId(),
+        parentId: headId,
+        role: 'user',
+        content: toStoredContent(userContent),
+        createdAt: new Date(),
+      };
+      const newTree = [...tree, userMsg];
+      const newHead = userMsg.id;
+      const pendingAssistantTiming = createPendingAssistantTiming();
+      setTree(newTree);
+      setHeadId(newHead);
+      setIsRunning(true);
 
-    streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
-    const branch = getActiveBranch(newTree, newHead);
+      streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
+      const branch = getActiveBranch(newTree, newHead);
 
-    await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
-    void maybeGenerateTitle(convId, branch);
-    console.info(`[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`);    console.info('[UI:stream] Last message preview:', branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)');
-    app.agent.stream(convId, branch, selectedModelKey ?? undefined, reasoningEffort ?? 'medium', selectedProfileKey ?? undefined, fallbackEnabled ?? false, cwd ?? undefined, executionMode ?? 'auto', threadOverrides ?? undefined);
-  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides, consumeAttachments]);
+      await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+      void maybeGenerateTitle(convId, branch);
+      console.info(
+        `[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`,
+      );
+      console.info(
+        '[UI:stream] Last message preview:',
+        branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)',
+      );
+      app.agent.stream(
+        convId,
+        branch,
+        selectedModelKey ?? undefined,
+        reasoningEffort ?? 'medium',
+        selectedProfileKey ?? undefined,
+        fallbackEnabled ?? false,
+        cwd ?? undefined,
+        executionMode ?? 'auto',
+        threadOverrides ?? undefined,
+      );
+    },
+    [
+      tree,
+      headId,
+      selectedModelKey,
+      reasoningEffort,
+      executionMode,
+      selectedProfileKey,
+      fallbackEnabled,
+      threadOverrides,
+      consumeAttachments,
+    ],
+  );
 
-  const onReload = useCallback(async (parentId: string | null) => {
-    const convId = activeIdRef.current;
-    if (!convId) return;
+  const onReload = useCallback(
+    async (parentId: string | null) => {
+      const convId = activeIdRef.current;
+      if (!convId) return;
 
-    // parentId is the message ID to regenerate from (the user message before the assistant response)
-    // We keep the old assistant branch (it becomes an alternate sibling) and start a new one
-    const reloadParentId = parentId ?? headId;
-    if (!reloadParentId) return;
+      // parentId is the message ID to regenerate from (the user message before the assistant response)
+      // We keep the old assistant branch (it becomes an alternate sibling) and start a new one
+      const reloadParentId = parentId ?? headId;
+      if (!reloadParentId) return;
 
-    // Find the parent message — if it's an assistant message, go to its parent (the user message)
-    const parentMsg = tree.find((m) => m.id === reloadParentId);
-    const actualParent = parentMsg?.role === 'assistant' ? parentMsg.parentId : reloadParentId;
+      // Find the parent message — if it's an assistant message, go to its parent (the user message)
+      const parentMsg = tree.find((m) => m.id === reloadParentId);
+      const actualParent = parentMsg?.role === 'assistant' ? parentMsg.parentId : reloadParentId;
 
-    // Clear retitle dedup so the regenerated response can trigger a title update
-    lastRetitleCount.delete(convId);
+      // Clear retitle dedup so the regenerated response can trigger a title update
+      lastRetitleCount.delete(convId);
 
-    setHeadId(actualParent);
-    setIsRunning(true);
+      setHeadId(actualParent);
+      setIsRunning(true);
 
-    const newTree = [...tree]; // keep all existing messages (old branches preserved)
-    streamAccumulators.set(convId, {
-      messages: newTree,
-      headId: actualParent,
-      pendingAssistantTiming: createPendingAssistantTiming(),
-    });
-    const branch = getActiveBranch(newTree, actualParent);
-    persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
-    console.info(`[UI:stream:reload] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`);
-    app.agent.stream(
-      convId,
-      branch,
-      selectedModelKey ?? undefined,
-      reasoningEffort ?? 'medium',
-      selectedProfileKey ?? undefined,
-      fallbackEnabled ?? false,
-      currentWorkingDirectoryRef.current ?? undefined,
-      executionMode ?? 'auto',
-      threadOverrides ?? undefined,
-    );
-  }, [tree, headId, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides]);
+      const newTree = [...tree]; // keep all existing messages (old branches preserved)
+      streamAccumulators.set(convId, {
+        messages: newTree,
+        headId: actualParent,
+        pendingAssistantTiming: createPendingAssistantTiming(),
+      });
+      const branch = getActiveBranch(newTree, actualParent);
+      persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
+      console.info(
+        `[UI:stream:reload] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`,
+      );
+      app.agent.stream(
+        convId,
+        branch,
+        selectedModelKey ?? undefined,
+        reasoningEffort ?? 'medium',
+        selectedProfileKey ?? undefined,
+        fallbackEnabled ?? false,
+        currentWorkingDirectoryRef.current ?? undefined,
+        executionMode ?? 'auto',
+        threadOverrides ?? undefined,
+      );
+    },
+    [
+      tree,
+      headId,
+      selectedModelKey,
+      reasoningEffort,
+      executionMode,
+      selectedProfileKey,
+      fallbackEnabled,
+      threadOverrides,
+    ],
+  );
 
   const onCancel = useCallback(async () => {
     const convId = activeIdRef.current;
@@ -2227,7 +2519,11 @@ export function RuntimeProvider({
       setTree(newTree);
       setHeadId(newHead);
       setIsRunning(false);
-      try { await app.agent.cancelStream(convId); } catch { /* ignore */ }
+      try {
+        await app.agent.cancelStream(convId);
+      } catch {
+        /* ignore */
+      }
       persistConversation(convId, newTree, newHead, { runStatus: 'idle' });
       return;
     }
@@ -2245,23 +2541,26 @@ export function RuntimeProvider({
   }, []);
 
   // Branch navigation
-  const goToBranch = useCallback((siblingId: string) => {
-    // Walk from this sibling down to the deepest descendant on the "latest" path
-    let newHead = siblingId;
-    // Find the deepest child chain from this sibling
-    const childrenOf = (parentId: string) => {
-      return tree.filter((m) => m.parentId === parentId);
-    };
-    let children = childrenOf(newHead);
-    while (children.length > 0) {
-      newHead = children[children.length - 1].id; // take last child (most recent)
-      children = childrenOf(newHead);
-    }
-    setHeadId(newHead);
-    // Persist
-    const convId = activeIdRef.current;
-    if (convId) persistConversation(convId, tree, newHead);
-  }, [tree]);
+  const goToBranch = useCallback(
+    (siblingId: string) => {
+      // Walk from this sibling down to the deepest descendant on the "latest" path
+      let newHead = siblingId;
+      // Find the deepest child chain from this sibling
+      const childrenOf = (parentId: string) => {
+        return tree.filter((m) => m.parentId === parentId);
+      };
+      let children = childrenOf(newHead);
+      while (children.length > 0) {
+        newHead = children[children.length - 1].id; // take last child (most recent)
+        children = childrenOf(newHead);
+      }
+      setHeadId(newHead);
+      // Persist
+      const convId = activeIdRef.current;
+      if (convId) persistConversation(convId, tree, newHead);
+    },
+    [tree],
+  );
 
   const goToPreviousBranch = useCallback(() => {
     if (!branchInfo || branchInfo.currentIdx <= 0) return;
@@ -2273,82 +2572,126 @@ export function RuntimeProvider({
     goToBranch(branchInfo.siblings[branchInfo.currentIdx + 1].id);
   }, [branchInfo, goToBranch]);
 
-  const branchNav: BranchNav | null = branchInfo && branchInfo.total > 1
-    ? { total: branchInfo.total, current: branchInfo.currentIdx + 1, goToPrevious: goToPreviousBranch, goToNext: goToNextBranch }
-    : null;
+  const branchNav: BranchNav | null =
+    branchInfo && branchInfo.total > 1
+      ? {
+          total: branchInfo.total,
+          current: branchInfo.currentIdx + 1,
+          goToPrevious: goToPreviousBranch,
+          goToNext: goToNextBranch,
+        }
+      : null;
 
-  const assistantResponseTiming = useMemo<AssistantResponseTimingState>(() => ({
-    activeRunStartedAt,
-  }), [activeRunStartedAt]);
-  const promptHistory = useMemo<PromptHistoryState>(() => ({
-    conversationId: activeConversationId,
-    prompts: [...activeBranch]
-      .reverse()
-      .map((message) => extractPromptHistoryText(message))
-      .filter((message): message is string => Boolean(message)),
-  }), [activeBranch, activeConversationId]);
-  const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(() => ({
-    currentWorkingDirectory,
-    setCurrentWorkingDirectory,
-  }), [currentWorkingDirectory, setCurrentWorkingDirectory]);
+  const assistantResponseTiming = useMemo<AssistantResponseTimingState>(
+    () => ({
+      activeRunStartedAt,
+    }),
+    [activeRunStartedAt],
+  );
+  const promptHistory = useMemo<PromptHistoryState>(
+    () => ({
+      conversationId: activeConversationId,
+      prompts: [...activeBranch]
+        .reverse()
+        .map((message) => extractPromptHistoryText(message))
+        .filter((message): message is string => Boolean(message)),
+    }),
+    [activeBranch, activeConversationId],
+  );
+  const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
+    () => ({
+      currentWorkingDirectory,
+      setCurrentWorkingDirectory,
+    }),
+    [currentWorkingDirectory, setCurrentWorkingDirectory],
+  );
 
   // Sub-agent actions
-  const sendSubAgentMessage = useCallback(async (subAgentConversationId: string, text: string) => {
-    // For RUNNING sub-agents (accumulator exists): add locally for instant UI display.
-    // The backend won't broadcast a sub-agent-user-message event for queue-sourced follow-ups.
-    // For COMPLETED sub-agents (no accumulator): DON'T add locally.
-    // The backend's resumeSubAgent will broadcast a sub-agent-user-message event.
-    const saAcc = globalSubAgentAccumulators.get(subAgentConversationId);
-    if (saAcc) {
-      const userMsg: StoredMessage = {
-        id: msgId(),
-        parentId: saAcc.headId,
-        role: 'user',
-        content: toStoredContent([{ type: 'text', text }]),
-        createdAt: new Date(),
-      };
-      saAcc.messages.push(userMsg);
-      saAcc.headId = userMsg.id;
-      const existing = globalSubAgentThreads.get(subAgentConversationId);
-      if (existing) {
-        globalSubAgentThreads.set(subAgentConversationId, { ...existing, messages: [...saAcc.messages], headId: saAcc.headId });
+  const sendSubAgentMessage = useCallback(
+    async (subAgentConversationId: string, text: string) => {
+      // For RUNNING sub-agents (accumulator exists): add locally for instant UI display.
+      // The backend won't broadcast a sub-agent-user-message event for queue-sourced follow-ups.
+      // For COMPLETED sub-agents (no accumulator): DON'T add locally.
+      // The backend's resumeSubAgent will broadcast a sub-agent-user-message event.
+      const saAcc = globalSubAgentAccumulators.get(subAgentConversationId);
+      if (saAcc) {
+        const userMsg: StoredMessage = {
+          id: msgId(),
+          parentId: saAcc.headId,
+          role: 'user',
+          content: toStoredContent([{ type: 'text', text }]),
+          createdAt: new Date(),
+        };
+        saAcc.messages.push(userMsg);
+        saAcc.headId = userMsg.id;
+        const existing = globalSubAgentThreads.get(subAgentConversationId);
+        if (existing) {
+          globalSubAgentThreads.set(subAgentConversationId, {
+            ...existing,
+            messages: [...saAcc.messages],
+            headId: saAcc.headId,
+          });
+        }
+        bumpSubAgentVersion();
       }
-      bumpSubAgentVersion();
-    }
-    try { await app.agent.sendSubAgentMessage(subAgentConversationId, text); } catch (err) { console.error('[Runtime] Sub-agent message failed:', err); }
-  }, [bumpSubAgentVersion]);
-
-  const stopSubAgentAction = useCallback(async (subAgentConversationId: string) => {
-    try {
-      await app.agent.stopSubAgent(subAgentConversationId);
-      const existing = globalSubAgentThreads.get(subAgentConversationId);
-      if (existing) {
-        globalSubAgentThreads.set(subAgentConversationId, { ...existing, status: 'stopped' });
+      try {
+        await app.agent.sendSubAgentMessage(subAgentConversationId, text);
+      } catch (err) {
+        console.error('[Runtime] Sub-agent message failed:', err);
       }
-      bumpSubAgentVersion();
-    } catch (err) { console.error('[Runtime] Sub-agent stop failed:', err); }
-  }, [bumpSubAgentVersion]);
+    },
+    [bumpSubAgentVersion],
+  );
 
-  const deleteSubAgentThread = useCallback((subAgentConversationId: string) => {
-    globalSubAgentThreads.delete(subAgentConversationId);
-    globalSubAgentAccumulators.delete(subAgentConversationId);
-    if (activeSubAgentView === subAgentConversationId) setActiveSubAgentView(null);
-    bumpSubAgentVersion();
-  }, [bumpSubAgentVersion, activeSubAgentView]);
+  const stopSubAgentAction = useCallback(
+    async (subAgentConversationId: string) => {
+      try {
+        await app.agent.stopSubAgent(subAgentConversationId);
+        const existing = globalSubAgentThreads.get(subAgentConversationId);
+        if (existing) {
+          globalSubAgentThreads.set(subAgentConversationId, { ...existing, status: 'stopped' });
+        }
+        bumpSubAgentVersion();
+      } catch (err) {
+        console.error('[Runtime] Sub-agent stop failed:', err);
+      }
+    },
+    [bumpSubAgentVersion],
+  );
+
+  const deleteSubAgentThread = useCallback(
+    (subAgentConversationId: string) => {
+      globalSubAgentThreads.delete(subAgentConversationId);
+      globalSubAgentAccumulators.delete(subAgentConversationId);
+      if (activeSubAgentView === subAgentConversationId) setActiveSubAgentView(null);
+      bumpSubAgentVersion();
+    },
+    [bumpSubAgentVersion, activeSubAgentView],
+  );
 
   const navigateToSubAgent = useCallback((subAgentConversationId: string) => {
     setActiveSubAgentView(subAgentConversationId);
   }, []);
 
-  const subAgentActions = useMemo<SubAgentActions>(() => ({
-    threads: subAgentThreads,
-    sendMessage: sendSubAgentMessage,
-    stop: stopSubAgentAction,
-    deleteThread: deleteSubAgentThread,
-    navigateTo: navigateToSubAgent,
-    activeSubAgentView,
-    setActiveSubAgentView,
-  }), [subAgentThreads, sendSubAgentMessage, stopSubAgentAction, deleteSubAgentThread, navigateToSubAgent, activeSubAgentView]);
+  const subAgentActions = useMemo<SubAgentActions>(
+    () => ({
+      threads: subAgentThreads,
+      sendMessage: sendSubAgentMessage,
+      stop: stopSubAgentAction,
+      deleteThread: deleteSubAgentThread,
+      navigateTo: navigateToSubAgent,
+      activeSubAgentView,
+      setActiveSubAgentView,
+    }),
+    [
+      subAgentThreads,
+      sendSubAgentMessage,
+      stopSubAgentAction,
+      deleteSubAgentThread,
+      navigateToSubAgent,
+      activeSubAgentView,
+    ],
+  );
 
   const runtime = useExternalStoreRuntime({
     messages: activeBranch,
@@ -2358,7 +2701,15 @@ export function RuntimeProvider({
     onCancel,
     convertMessage: (m: ThreadMessageLike) => {
       if (!Array.isArray(m.content)) return m;
-      const KNOWN_ASSISTANT_UI_TYPES = new Set(['text', 'image', 'tool-call', 'tool-result', 'audio', 'file', 'enrichments']);
+      const KNOWN_ASSISTANT_UI_TYPES = new Set([
+        'text',
+        'image',
+        'tool-call',
+        'tool-result',
+        'audio',
+        'file',
+        'enrichments',
+      ]);
       const stripped: string[] = [];
       const known = (m.content as ContentPart[]).filter((p) => {
         if (KNOWN_ASSISTANT_UI_TYPES.has(p.type)) return true;
@@ -2366,7 +2717,9 @@ export function RuntimeProvider({
         return false;
       });
       if (stripped.length > 0) {
-        console.warn(`[RuntimeProvider] Stripped unsupported content part type(s) before rendering: ${[...new Set(stripped)].join(', ')}`);
+        console.warn(
+          `[RuntimeProvider] Stripped unsupported content part type(s) before rendering: ${[...new Set(stripped)].join(', ')}`,
+        );
       }
       if (known.length === m.content.length) return m;
       return { ...m, content: toStoredContent(known) };
@@ -2378,42 +2731,50 @@ export function RuntimeProvider({
     },
   });
 
-  const handleContinueAfterMaxTurns = useCallback((messageId: string) => {
-    const convId = activeIdRef.current;
-    if (!convId || isRunning) return;
+  const handleContinueAfterMaxTurns = useCallback(
+    (messageId: string) => {
+      const convId = activeIdRef.current;
+      if (!convId || isRunning) return;
 
-    // Update the max-turns-reached part status to 'continued'
-    setTree(prev => {
-      const updated = prev.map(msg => {
-        if (msg.id !== messageId) return msg;
-        const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
-        const updatedContent = content.map(p =>
-          (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
-            ? { ...p, status: 'continued' as const }
-            : p
+      // Update the max-turns-reached part status to 'continued'
+      setTree((prev) => {
+        const updated = prev.map((msg) => {
+          if (msg.id !== messageId) return msg;
+          const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+          const updatedContent = content.map((p) =>
+            (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
+              ? { ...p, status: 'continued' as const }
+              : p,
+          );
+          return { ...msg, content: toStoredContent(updatedContent) };
+        });
+        // Re-invoke stream with updated tree
+        const cfg = streamHandlerRef.current;
+        const newHead = cfg.headId;
+        const branch = getActiveBranch(updated, newHead);
+        streamAccumulators.set(convId, {
+          messages: [...updated],
+          headId: newHead,
+          pendingAssistantTiming: createPendingAssistantTiming(),
+        });
+        persistConversation(convId, updated, newHead, { runStatus: 'running' });
+        app.agent.stream(
+          convId,
+          branch,
+          cfg.selectedModelKey ?? undefined,
+          cfg.reasoningEffort ?? 'medium',
+          cfg.selectedProfileKey ?? undefined,
+          cfg.fallbackEnabled ?? false,
+          currentWorkingDirectoryRef.current ?? undefined,
+          executionMode ?? 'auto',
+          cfg.threadOverrides ?? undefined,
         );
-        return { ...msg, content: toStoredContent(updatedContent) };
+        return updated;
       });
-      // Re-invoke stream with updated tree
-      const cfg = streamHandlerRef.current;
-      const newHead = cfg.headId;
-      const branch = getActiveBranch(updated, newHead);
-      streamAccumulators.set(convId, { messages: [...updated], headId: newHead, pendingAssistantTiming: createPendingAssistantTiming() });
-      persistConversation(convId, updated, newHead, { runStatus: 'running' });
-      app.agent.stream(
-        convId, branch,
-        cfg.selectedModelKey ?? undefined,
-        cfg.reasoningEffort ?? 'medium',
-        cfg.selectedProfileKey ?? undefined,
-        cfg.fallbackEnabled ?? false,
-        currentWorkingDirectoryRef.current ?? undefined,
-        executionMode ?? 'auto',
-        cfg.threadOverrides ?? undefined,
-      );
-      return updated;
-    });
-    setIsRunning(true);
-  }, [isRunning, executionMode]);
+      setIsRunning(true);
+    },
+    [isRunning, executionMode],
+  );
 
   const dismissFallbackBanner = useCallback(() => {
     setFallbackBanner(null);
@@ -2423,10 +2784,13 @@ export function RuntimeProvider({
     }
   }, []);
 
-  const fallbackBannerActions = useMemo<FallbackBannerActions>(() => ({
-    banner: fallbackBanner,
-    dismiss: dismissFallbackBanner,
-  }), [fallbackBanner, dismissFallbackBanner]);
+  const fallbackBannerActions = useMemo<FallbackBannerActions>(
+    () => ({
+      banner: fallbackBanner,
+      dismiss: dismissFallbackBanner,
+    }),
+    [fallbackBanner, dismissFallbackBanner],
+  );
 
   // Step tracking callbacks
   const handleContinueTask = useCallback(() => {
@@ -2455,11 +2819,16 @@ export function RuntimeProvider({
     setShowIncompleteTaskBanner(false);
     setStepInfo(null);
 
-    streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming: createPendingAssistantTiming() });
+    streamAccumulators.set(convId, {
+      messages: [...newTree],
+      headId: newHead,
+      pendingAssistantTiming: createPendingAssistantTiming(),
+    });
     const branch = getActiveBranch(newTree, newHead);
     persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     app.agent.stream(
-      convId, branch,
+      convId,
+      branch,
       cfg.selectedModelKey ?? undefined,
       cfg.reasoningEffort ?? 'medium',
       cfg.selectedProfileKey ?? undefined,
@@ -2478,9 +2847,11 @@ export function RuntimeProvider({
 
     window.dispatchEvent(new CustomEvent('kai:open-settings'));
     setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('kai:navigate-settings', {
-        detail: { section: 'advanced' }
-      }));
+      window.dispatchEvent(
+        new CustomEvent('kai:navigate-settings', {
+          detail: { section: 'advanced' },
+        }),
+      );
     }, 100);
 
     console.info('[Analytics] step_limit_adjust_settings_clicked');
@@ -2495,13 +2866,16 @@ export function RuntimeProvider({
     console.info('[RuntimeProvider] Incomplete task banner dismissed', { conversationId: convId });
   }, []);
 
-  const stepTrackingState = useMemo<StepTrackingState>(() => ({
-    stepInfo,
-    showIncompleteTaskBanner,
-    onContinueTask: handleContinueTask,
-    onAdjustSettings: handleAdjustSettings,
-    onDismissBanner: handleDismissBanner,
-  }), [stepInfo, showIncompleteTaskBanner, handleContinueTask, handleAdjustSettings, handleDismissBanner]);
+  const stepTrackingState = useMemo<StepTrackingState>(
+    () => ({
+      stepInfo,
+      showIncompleteTaskBanner,
+      onContinueTask: handleContinueTask,
+      onAdjustSettings: handleAdjustSettings,
+      onDismissBanner: handleDismissBanner,
+    }),
+    [stepInfo, showIncompleteTaskBanner, handleContinueTask, handleAdjustSettings, handleDismissBanner],
+  );
 
   return (
     <MaxTurnsContinueContext.Provider value={handleContinueAfterMaxTurns}>
@@ -2513,9 +2887,7 @@ export function RuntimeProvider({
                 <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
                   <StepTrackingContext.Provider value={stepTrackingState}>
                     <RuntimeConversationIdContext.Provider value={activeConversationId}>
-                      <AssistantRuntimeProvider runtime={runtime}>
-                        {children}
-                      </AssistantRuntimeProvider>
+                      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
                     </RuntimeConversationIdContext.Provider>
                   </StepTrackingContext.Provider>
                 </CurrentWorkingDirectoryContext.Provider>

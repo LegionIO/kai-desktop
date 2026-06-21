@@ -105,7 +105,7 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
         )}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
-        {activeSection === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'general' && <ApplicationSettings config={config} updateConfig={updateConfig} />}
       </div>
     </div>
   );
@@ -159,7 +159,49 @@ const CombinedToolsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   );
 };
 
-type VoiceTab = 'realtime' | 'dictation' | 'app-shots';
+type ApplicationTab = 'general' | 'app-shots';
+
+const ApplicationSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const [activeTab, setActiveTab] = useState<ApplicationTab>('general');
+
+  const tabs: Array<{ key: ApplicationTab; label: string }> = [
+    { key: 'general', label: 'General' },
+    { key: 'app-shots', label: 'App Shots' },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className="text-sm font-semibold">Application</h3>
+        <p className="mt-1 text-xs text-muted-foreground">Startup, appearance, and capture shortcuts.</p>
+      </div>
+
+      {/* Tab Bar */}
+      <div className="flex gap-1 border-b border-border/60">
+        {tabs.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => setActiveTab(tab.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
+              activeTab === tab.key
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Content */}
+      {activeTab === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'app-shots' && <AppShotsSettings config={config} updateConfig={updateConfig} hideTitle />}
+    </div>
+  );
+};
+
+type VoiceTab = 'realtime' | 'dictation';
 
 const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const [activeTab, setActiveTab] = useState<VoiceTab>('realtime');
@@ -167,7 +209,6 @@ const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const tabs: Array<{ key: VoiceTab; label: string }> = [
     { key: 'realtime', label: 'Voice Chat' },
     { key: 'dictation', label: 'Dictation' },
-    { key: 'app-shots', label: 'App Shots' },
   ];
 
   return (
@@ -198,7 +239,6 @@ const VoiceSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
       {/* Content */}
       {activeTab === 'realtime' && <RealtimeSettings config={config} updateConfig={updateConfig} hideTitle />}
       {activeTab === 'dictation' && <DictationSettings config={config} updateConfig={updateConfig} />}
-      {activeTab === 'app-shots' && <AppShotsSettings config={config} updateConfig={updateConfig} />}
     </div>
   );
 };

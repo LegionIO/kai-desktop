@@ -12,7 +12,10 @@ const PROVIDER_META_KEYS = ['providerMetadata', 'providerOptions', 'experimental
 function stripProviderMeta(part: PartLike): PartLike {
   let needsClone = false;
   for (const key of PROVIDER_META_KEYS) {
-    if (part[key] != null) { needsClone = true; break; }
+    if (part[key] != null) {
+      needsClone = true;
+      break;
+    }
   }
   if (!needsClone) return part;
 
@@ -43,10 +46,7 @@ function sanitizeContentParts(content: unknown): unknown {
  * their metadata. Messages with a different sourceModel or no tag at all have
  * provider metadata stripped defensively.
  */
-export function sanitizeMessagesForModel(
-  messages: unknown[],
-  targetModelId: string,
-): unknown[] {
+export function sanitizeMessagesForModel(messages: unknown[], targetModelId: string): unknown[] {
   let changed = false;
   const result = messages.map((rawMsg) => {
     const msg = rawMsg as MessageLike;
@@ -60,6 +60,30 @@ export function sanitizeMessagesForModel(
 
     changed = true;
     return { ...msg, content: cleaned };
+  });
+
+  return changed ? result : messages;
+}
+
+/**
+ * Strip user-message `file` parts flagged `displayOnly` — the renderer keeps
+ * these for the attachment chip but already inlines their content as a
+ * sibling text part, so providers (which reject e.g. `application/json`)
+ * should never see them.
+ */
+export function stripDisplayOnlyParts(messages: unknown[]): unknown[] {
+  let changed = false;
+  const result = messages.map((rawMsg) => {
+    const msg = rawMsg as MessageLike;
+    if (msg?.role !== 'user' || !Array.isArray(msg.content)) return rawMsg;
+
+    const filtered = (msg.content as PartLike[]).filter(
+      (p) => !(p && typeof p === 'object' && p.type === 'file' && p.displayOnly === true),
+    );
+    if (filtered.length === msg.content.length) return rawMsg;
+
+    changed = true;
+    return { ...msg, content: filtered };
   });
 
   return changed ? result : messages;

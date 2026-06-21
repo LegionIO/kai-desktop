@@ -14,7 +14,7 @@ type AppShotsConfig = {
   autoAttach?: boolean;
 };
 
-export const AppShotsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const cfg = (config.appShots ?? {}) as AppShotsConfig;
   const [caps, setCaps] = useState<{ kind: string; capabilities: AdapterCapabilities } | null>(null);
 
@@ -41,7 +41,7 @@ export const AppShotsSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-sm font-semibold">App Shots</h3>
+        {!hideTitle && <h3 className="text-sm font-semibold">App Shots</h3>}
         <p className="mt-1 text-xs text-muted-foreground">
           Press a global shortcut to capture the focused window plus its title, process, selected text and accessibility
           tree, and drop everything into the composer as an attachment.

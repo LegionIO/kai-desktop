@@ -3,7 +3,7 @@ import { Trash2Icon, LoaderIcon, CheckCircle2Icon, AlertTriangleIcon, HardDriveI
 import { app } from '@/lib/ipc-client';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
-export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const ui = config.ui as {
     theme: string;
     sidebarWidth: number;
@@ -11,19 +11,22 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
     splashBackground?: string;
     composer?: { showModelProfileSelector?: boolean };
   };
-  const titleGen = (config.titleGeneration as {
-    enabled?: boolean;
-  } | undefined) ?? {};
+  const titleGen =
+    (config.titleGeneration as
+      | {
+          enabled?: boolean;
+        }
+      | undefined) ?? {};
   const titleGenEnabled = titleGen.enabled ?? true;
 
   return (
     <div className="space-y-6">
-      <div>
-        <h3 className="text-sm font-semibold">Application</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Startup behavior and appearance preferences.
-        </p>
-      </div>
+      {!hideTitle && (
+        <div>
+          <h3 className="text-sm font-semibold">Application</h3>
+          <p className="mt-1 text-xs text-muted-foreground">Startup behavior and appearance preferences.</p>
+        </div>
+      )}
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Startup</legend>
@@ -39,7 +42,11 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
 
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Color scheme</label>
-          <select className={settingsSelectClass} value={ui.theme} onChange={(e) => updateConfig('ui.theme', e.target.value)}>
+          <select
+            className={settingsSelectClass}
+            value={ui.theme}
+            onChange={(e) => updateConfig('ui.theme', e.target.value)}
+          >
             <option value="system">System</option>
             <option value="light">Light</option>
             <option value="dark">Dark</option>
@@ -48,7 +55,11 @@ export const GeneralSettings: FC<SettingsProps> = ({ config, updateConfig }) => 
 
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Splash background</label>
-          <select className={settingsSelectClass} value={ui.splashBackground ?? 'random'} onChange={(e) => updateConfig('ui.splashBackground', e.target.value)}>
+          <select
+            className={settingsSelectClass}
+            value={ui.splashBackground ?? 'random'}
+            onChange={(e) => updateConfig('ui.splashBackground', e.target.value)}
+          >
             <option value="random">Random</option>
             <option value="matrix">Matrix</option>
             <option value="constellations">Constellations</option>
@@ -151,12 +162,16 @@ const PartitionManager: FC = () => {
     }
   };
 
-  const reset = () => { setStatus('idle'); setResult(null); };
+  const reset = () => {
+    setStatus('idle');
+    setResult(null);
+  };
 
   const toggleSelected = (name: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name); else next.add(name);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
       return next;
     });
   };
@@ -170,8 +185,8 @@ const PartitionManager: FC = () => {
         Browser Partitions
       </legend>
       <p className="text-[10px] text-muted-foreground">
-        Plugins create isolated browser sessions (partitions) for authentication and browsing.
-        Deleting a partition clears its cookies, cache, and local storage.
+        Plugins create isolated browser sessions (partitions) for authentication and browsing. Deleting a partition
+        clears its cookies, cache, and local storage.
       </p>
       {loading && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -186,8 +201,16 @@ const PartitionManager: FC = () => {
         <>
           <div className="space-y-1">
             {partitions.map((p) => (
-              <label key={p.name} className="flex items-center gap-2 rounded border px-2 py-1.5 cursor-pointer hover:bg-muted/30 transition-colors">
-                <input type="checkbox" checked={selected.has(p.name)} onChange={() => toggleSelected(p.name)} className="h-3.5 w-3.5 rounded" />
+              <label
+                key={p.name}
+                className="flex items-center gap-2 rounded border px-2 py-1.5 cursor-pointer hover:bg-muted/30 transition-colors"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(p.name)}
+                  onChange={() => toggleSelected(p.name)}
+                  className="h-3.5 w-3.5 rounded"
+                />
                 <span className="text-xs flex-1 truncate font-mono">{p.name}</span>
                 <span className="text-[10px] text-muted-foreground">{formatBytes(p.sizeBytes)}</span>
               </label>
@@ -212,16 +235,30 @@ const PartitionManager: FC = () => {
               <p className="text-xs font-medium text-destructive">Are you sure?</p>
               <p className="text-[10px] text-muted-foreground mt-0.5">
                 This will permanently delete all cookies, cache, and storage for{' '}
-                {targetNames.length === 1
-                  ? <span className="font-mono">{targetNames[0]}</span>
-                  : <span>{targetNames.length} partitions</span>
-                }. You may need to re-authenticate with affected plugins.
+                {targetNames.length === 1 ? (
+                  <span className="font-mono">{targetNames[0]}</span>
+                ) : (
+                  <span>{targetNames.length} partitions</span>
+                )}
+                . You may need to re-authenticate with affected plugins.
               </p>
             </div>
           </div>
           <div className="flex gap-2">
-            <button type="button" onClick={handleDelete} className="rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors">Delete</button>
-            <button type="button" onClick={reset} className="rounded-md border px-3 py-1 text-xs font-medium hover:bg-muted transition-colors">Cancel</button>
+            <button
+              type="button"
+              onClick={handleDelete}
+              className="rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={reset}
+              className="rounded-md border px-3 py-1 text-xs font-medium hover:bg-muted transition-colors"
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}
@@ -241,12 +278,20 @@ const PartitionManager: FC = () => {
               </p>
               <ul className="mt-1 space-y-0.5">
                 {result.deleted.map((name) => (
-                  <li key={name} className="text-[10px] text-muted-foreground font-mono">{name}</li>
+                  <li key={name} className="text-[10px] text-muted-foreground font-mono">
+                    {name}
+                  </li>
                 ))}
               </ul>
             </div>
           </div>
-          <button type="button" onClick={reset} className="text-[10px] text-muted-foreground underline hover:text-foreground transition-colors">Dismiss</button>
+          <button
+            type="button"
+            onClick={reset}
+            className="text-[10px] text-muted-foreground underline hover:text-foreground transition-colors"
+          >
+            Dismiss
+          </button>
         </div>
       )}
       {status === 'error' && result?.error && (
@@ -258,7 +303,13 @@ const PartitionManager: FC = () => {
               <p className="text-[10px] text-muted-foreground mt-0.5">{result.error}</p>
             </div>
           </div>
-          <button type="button" onClick={reset} className="text-[10px] text-muted-foreground underline hover:text-foreground transition-colors">Dismiss</button>
+          <button
+            type="button"
+            onClick={reset}
+            className="text-[10px] text-muted-foreground underline hover:text-foreground transition-colors"
+          >
+            Dismiss
+          </button>
         </div>
       )}
     </fieldset>
