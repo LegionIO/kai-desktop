@@ -34,7 +34,8 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createSwiftHelperStub } from '../../../test-utils/swift-helper-stub.js';
-import { createPermissionsService } from '../permissions.js';
+import { createPermissionsService, parseDisplayInfoArray } from '../permissions.js';
+import { primaryDisplayIndex } from '../../../shared/computer-use.js';
 
 describe('createPermissionsService factory', () => {
   let stub: ReturnType<typeof createSwiftHelperStub>;
@@ -137,5 +138,85 @@ describe('createPermissionsService factory', () => {
 
     expect(stubA.mock).toHaveBeenCalledTimes(1);
     expect(stubB.mock).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe('parseDisplayInfoArray', () => {
+  const raw = [
+    {
+      displayId: '100',
+      name: 'External',
+      pixelWidth: 2560,
+      pixelHeight: 1440,
+      logicalWidth: 2560,
+      logicalHeight: 1440,
+      globalX: -2560,
+      globalY: 0,
+      scaleFactor: 1,
+      isPrimary: false,
+    },
+    {
+      displayId: '1',
+      name: 'Built-in Retina Display',
+      pixelWidth: 1728,
+      pixelHeight: 1117,
+      logicalWidth: 1728,
+      logicalHeight: 1117,
+      globalX: 0,
+      globalY: 0,
+      scaleFactor: 2,
+      isPrimary: true,
+    },
+  ];
+
+  it('assigns displayIndex from native helper order', () => {
+    const out = parseDisplayInfoArray(raw);
+    expect(out.map((d) => [d.displayId, d.displayIndex])).toEqual([
+      ['100', 0],
+      ['1', 1],
+    ]);
+  });
+
+  it('preserves native displayIndex when filtered by allowedDisplays', () => {
+    const out = parseDisplayInfoArray(raw, ['Built-in Retina Display']);
+    expect(out).toHaveLength(1);
+    expect(out[0].displayId).toBe('1');
+    expect(out[0].displayIndex).toBe(1);
+  });
+
+  it('filters by displayId case-insensitively and preserves native index', () => {
+    const out = parseDisplayInfoArray(raw, ['100']);
+    expect(out).toHaveLength(1);
+    expect(out[0].displayIndex).toBe(0);
+  });
+});
+
+describe('primaryDisplayIndex', () => {
+  it('returns 0 for undefined/null layout', () => {
+    expect(primaryDisplayIndex(undefined)).toBe(0);
+    expect(primaryDisplayIndex(null)).toBe(0);
+  });
+
+  it('returns the isPrimary display index even when it is not at position 0', () => {
+    const layout = {
+      displays: parseDisplayInfoArray([
+        { displayId: '100', name: 'External', pixelWidth: 2560, pixelHeight: 1440, isPrimary: false },
+        { displayId: '1', name: 'Built-in', pixelWidth: 1728, pixelHeight: 1117, isPrimary: true },
+      ]),
+    };
+    expect(primaryDisplayIndex(layout)).toBe(1);
+  });
+
+  it('falls back to the first display index when none is marked primary', () => {
+    const layout = {
+      displays: parseDisplayInfoArray(
+        [
+          { displayId: '100', name: 'A', pixelWidth: 1920, pixelHeight: 1080, isPrimary: false },
+          { displayId: '200', name: 'B', pixelWidth: 1920, pixelHeight: 1080, isPrimary: false },
+        ],
+        ['B'],
+      ),
+    };
+    expect(primaryDisplayIndex(layout)).toBe(1);
   });
 });

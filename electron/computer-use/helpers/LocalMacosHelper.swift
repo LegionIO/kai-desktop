@@ -208,6 +208,8 @@ func postMouse(_ type: CGEventType, x: Double, y: Double, button: CGMouseButton 
 
 func warpPointer(to point: CGPoint) {
   CGWarpMouseCursorPosition(convertTopLeftToQuartz(point.x, point.y))
+  CGAssociateMouseAndMouseCursorPosition(1)
+  postMouse(.mouseMoved, x: point.x, y: point.y)
 }
 
 func animatePointerSegment(from start: CGPoint, to end: CGPoint, durationMs: Int, steps: Int, dragMode: Bool = false) {
@@ -545,6 +547,20 @@ func accessibilityElementSignature(_ element: AXUIElement) -> String? {
   }
   if let size {
     parts.append("w=\(Int(size.width.rounded()))")
+    parts.append("h=\(Int(size.height.rounded()))")
+  }
+
+  var windowId: CGWindowID = 0
+  if _AXUIElementGetWindow(element, &windowId) == .success, windowId != 0 {
+    parts.append("win=\(windowId)")
+  }
+  var windowRef: CFTypeRef?
+  if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef) == .success,
+     CFGetTypeID(windowRef) == AXUIElementGetTypeID() {
+    let windowEl = windowRef as! AXUIElement
+    if let title = stringAttribute(windowEl, kAXTitleAttribute as String), !title.isEmpty {
+      parts.append("wt=\(signatureComponent(title))")
+    }
   }
 
   return parts.joined(separator: "|")
@@ -584,6 +600,11 @@ func focusedTextElementMatchesExpected(pid: pid_t? = nil, expectedSignature: Str
     return false
   }
   return elementMatchesExpected(element, expectedSignature: expectedSignature)
+}
+
+func focusedCursorAt(pid: pid_t?, location: Int) -> Bool {
+  guard let r = focusedSelectedTextRange(pid: pid) else { return false }
+  return r.location == location && r.length == 0
 }
 
 func utf16Slice(_ text: String, location: Int, length: Int) -> String? {
@@ -1001,6 +1022,7 @@ final class DictationSessionServer {
   private var debugLogging = false
   private var ownPid: pid_t?
   private var ownAppName = ""
+  private var keyboardStateUnverified = false
   private var monitorTap: CFMachPort?
   private var monitorSource: CFRunLoopSource?
 
@@ -1314,6 +1336,7 @@ final class DictationSessionServer {
     guard let text = params["text"] as? String else {
       return ["ok": false, "error": "Missing partial text", "errorCode": "invalid_request"]
     }
+    recoverKeyboardStateIfNeeded()
     guard hasEnabledPartialStrategy() else {
       return sessionResponse(["ok": true, "applied": false])
     }
@@ -1336,6 +1359,7 @@ final class DictationSessionServer {
     guard let text = params["text"] as? String else {
       return ["ok": false, "error": "Missing final text", "errorCode": "invalid_request"]
     }
+    recoverKeyboardStateIfNeeded()
     let mode: String
     let strategy: String
     if !partialText.isEmpty, let usedMode = partialTypingModeUsed, let usedStrategy = partialTypingStrategyUsed {
@@ -1399,6 +1423,10 @@ final class DictationSessionServer {
         axSuppressed = phase == "partial"
         return false
       }
+      if (result["cursorSet"] as? Bool) == false {
+        axSuppressed = phase == "partial"
+        return false
+      }
       axTypedUtf16Length = (result["textUtf16Length"] as? Int) ?? targetText.utf16.count
       _ = refreshAxSignatureAfterMutation()
       return true
@@ -1423,8 +1451,11 @@ final class DictationSessionServer {
     }
 
     if strategy == "tail-only" {
-      guard targetText.hasPrefix(currentText) else { return false }
-      return postTextForKeyboardMutation(characterSuffix(targetText, droppingFirst: currentText.count))
+      if targetText.hasPrefix(currentText) {
+        return postTextForKeyboardMutation(characterSuffix(targetText, droppingFirst: currentText.count))
+      }
+      guard phase == "final" else { return false }
+      return applyKeyboardPatch(currentText: currentText, targetText: targetText)
     }
 
     return applyKeyboardPatch(currentText: currentText, targetText: targetText)
@@ -1443,55 +1474,82 @@ final class DictationSessionServer {
     return true
   }
 
-  private func postTextForKeyboardMutation(_ text: String) -> Bool {
-    if text.isEmpty { return true }
+  private func keyboardMutationPreflight(
+    verifyCursorAtPartialEnd: Bool
+  ) -> (pid: pid_t, expectedSignature: String?, allowUnverified: Bool)? {
     let allowUnverified = !hasAxSpan && allowBlindKeyboardFullPatch
-    let expectedSignature = allowUnverified ? nil : axElementSignature
-    guard let targetPid else { return false }
-    guard frontmostMatchesPid(targetPid) else { return false }
-    guard !focusedTextTargetIsSecure(pid: targetPid) else { return false }
+    guard let targetPid else { return nil }
+    guard frontmostMatchesPid(targetPid) else { return nil }
+    guard !focusedTextTargetIsSecure(pid: targetPid) else { return nil }
     if !allowUnverified {
-      guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedSignature) else {
-        return false
+      guard let expectedSignature = axElementSignature else { return nil }
+      guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedSignature) else { return nil }
+      if verifyCursorAtPartialEnd, hasAxSpan, let location = axLocation {
+        guard focusedCursorAt(pid: targetPid, location: location + partialText.utf16.count) else { return nil }
       }
+      return (targetPid, expectedSignature, false)
     }
+    return (targetPid, nil, true)
+  }
+
+  private func postTextForKeyboardMutation(_ text: String, verifyCursor: Bool = true) -> Bool {
+    if text.isEmpty { return true }
+    guard let target = keyboardMutationPreflight(verifyCursorAtPartialEnd: verifyCursor) else { return false }
     return postUnicodeTextInChunks(
       text,
-      chunkSize: allowUnverified ? blindKeyboardTextChunkSize : 16,
-      targetPid: targetPid,
-      expectedElementSignature: expectedSignature
+      chunkSize: target.allowUnverified ? blindKeyboardTextChunkSize : 16,
+      targetPid: target.pid,
+      expectedElementSignature: target.expectedSignature
     )
   }
 
-  private func deleteBackForKeyboardMutation(_ count: Int) -> Bool {
+  private func deleteBackForKeyboardMutation(_ count: Int, verifyCursor: Bool = true) -> Bool {
     if count <= 0 { return true }
     if count > maxKeyboardRepeatCount { return false }
-    let allowUnverified = !hasAxSpan && allowBlindKeyboardFullPatch
-    let expectedSignature = allowUnverified ? nil : axElementSignature
-    guard let targetPid else { return false }
-    guard frontmostMatchesPid(targetPid) else { return false }
-    guard !focusedTextTargetIsSecure(pid: targetPid) else { return false }
-    if !allowUnverified {
-      guard focusedTextElementMatchesExpected(pid: targetPid, expectedSignature: expectedSignature) else {
-        return false
-      }
-    }
+    guard let target = keyboardMutationPreflight(verifyCursorAtPartialEnd: verifyCursor) else { return false }
     return pressKeyRepeated(
       keyCode: 51,
       count: count,
       delayMs: 3,
-      targetPid: targetPid,
-      expectedElementSignature: expectedSignature
+      targetPid: target.pid,
+      expectedElementSignature: target.expectedSignature
     )
   }
 
   private func applyKeyboardPatch(currentText: String, targetText: String) -> Bool {
     if currentText == targetText { return true }
+    // Verify focus + element + cursor once against the pre-mutation tail; the
+    // delete/insert sub-steps then skip the cursor check because they move it.
+    guard keyboardMutationPreflight(verifyCursorAtPartialEnd: true) != nil else { return false }
     let commonLength = characterPrefixLength(currentText, targetText)
     let deleteCount = currentText.count - commonLength
     let insertText = characterSuffix(targetText, droppingFirst: commonLength)
-    guard deleteBackForKeyboardMutation(deleteCount) else { return false }
-    return postTextForKeyboardMutation(insertText)
+    guard deleteBackForKeyboardMutation(deleteCount, verifyCursor: false) else { return false }
+    if !postTextForKeyboardMutation(insertText, verifyCursor: false) {
+      if deleteCount > 0 { keyboardStateUnverified = true }
+      return false
+    }
+    return true
+  }
+
+  /// After a partial keyboard mutation failure, re-read AX state and reconcile
+  /// partialText / span length with what is actually in the field.
+  private func recoverKeyboardStateIfNeeded() {
+    guard keyboardStateUnverified else { return }
+    keyboardStateUnverified = false
+    guard hasAxSpan,
+          let location = axLocation,
+          let pid = targetPid,
+          let range = focusedSelectedTextRange(pid: pid),
+          range.length == 0,
+          range.location >= location,
+          let value = focusedTextValue(pid: pid),
+          let actual = utf16Slice(value, location: location, length: range.location - location) else {
+      axSuppressed = true
+      return
+    }
+    partialText = actual
+    axTypedUtf16Length = actual.utf16.count
   }
 
   private func startTargetTracking() -> [String: Any] {
@@ -2196,8 +2254,9 @@ case "monitor":
   CFRunLoopRun()
 
 case "screenshot":
-  // args: screenshot <base64ExcludeApps> <jpegQuality> [displayIndex] [excludePid]
-  // When displayIndex is provided, capture only that display (0-indexed from allDisplaysSorted).
+  // args: screenshot <base64ExcludeApps> <jpegQuality> [displayIdOrIndex] [excludePid]
+  // displayIdOrIndex: a CGDirectDisplayID string, or a 0-based index into the
+  // position-sorted display list (back-compat). Omitted -> primary display.
   // When excludePid is provided, exclude all windows owned by that process (and its children).
   if #available(macOS 12.3, *) {
     let excludeAppNames: [String]
@@ -2214,7 +2273,7 @@ case "screenshot":
     } else {
       jpegQuality = 0.8
     }
-    let requestedDisplayIndex: Int? = args.count >= 5 ? Int(args[4]) : nil
+    let requestedDisplaySelector: String? = args.count >= 5 ? args[4] : nil
     let excludePid: pid_t? = args.count >= 6 ? pid_t(args[5]) : nil
 
     let sem = DispatchSemaphore(value: 0)
@@ -2232,12 +2291,18 @@ case "screenshot":
           return
         }
 
-        // Select the target display
+        // Select the target display: prefer matching by CGDirectDisplayID, fall back
+        // to a position-sorted index, then to the primary display.
         let targetDisplay: SCDisplay
-        if let idx = requestedDisplayIndex, idx >= 0 && idx < allDisplays.count {
+        if let selector = requestedDisplaySelector,
+           let requestedId = UInt32(selector),
+           let byId = allDisplays.first(where: { $0.displayID == requestedId }) {
+          targetDisplay = byId
+        } else if let selector = requestedDisplaySelector,
+                  let idx = Int(selector), idx >= 0 && idx < allDisplays.count {
           targetDisplay = allDisplays[idx]
         } else {
-          targetDisplay = allDisplays.first!
+          targetDisplay = allDisplays.first(where: { $0.displayID == CGMainDisplayID() }) ?? allDisplays.first!
         }
 
         let excludeSet = Set(excludeAppNames.map { $0.lowercased() })
@@ -2293,8 +2358,8 @@ case "screenshot":
         captureResult = [
           "ok": true,
           "imageBase64": base64,
-          "width": captureWidth,
-          "height": captureHeight,
+          "width": image.width,
+          "height": image.height,
           "displayIndex": actualIndex,
           "displayInfo": thisDisplayInfo,
           "displays": displayInfo,
@@ -2513,6 +2578,10 @@ func walkUiNode(_ element: AXUIElement, depth: Int, maxDepth: Int) -> [String: A
 }
 
 func captureWindowScreenshot(windowIdArg: String) -> [String: Any] {
+  guard #available(macOS 12.3, *) else {
+    return ["ok": false, "error": "ScreenCaptureKit requires macOS 12.3+"]
+  }
+
   var windowId: CGWindowID? = nil
   if let parsed = UInt32(windowIdArg), parsed > 0 {
     windowId = parsed
@@ -2530,19 +2599,47 @@ func captureWindowScreenshot(windowIdArg: String) -> [String: Any] {
     }
   }
 
-  guard let wid = windowId,
-        let image = CGWindowListCreateImage(.null, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution]) else {
-    return ["ok": false, "error": "unable to capture window image"]
+  guard let wid = windowId else {
+    return ["ok": false, "error": "unable to resolve target window"]
   }
 
-  let rep = NSBitmapImageRep(cgImage: image)
-  guard let png = rep.representation(using: .png, properties: [:]) else {
-    return ["ok": false, "error": "unable to encode PNG"]
+  let sem = DispatchSemaphore(value: 0)
+  var result: [String: Any] = ["ok": false, "error": "timeout"]
+
+  Task {
+    do {
+      let content = try await SCShareableContent.current
+      guard let scWindow = content.windows.first(where: { $0.windowID == wid }) else {
+        result = ["ok": false, "error": "window not shareable"]
+        sem.signal(); return
+      }
+      let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+      let config = SCStreamConfiguration()
+      let scale = scWindow.frame.width > 0
+        ? max(1.0, CGFloat(CGDisplayPixelsWide(CGMainDisplayID())) / max(CGDisplayBounds(CGMainDisplayID()).width, 1))
+        : 1.0
+      config.width = max(1, Int((scWindow.frame.width * scale).rounded()))
+      config.height = max(1, Int((scWindow.frame.height * scale).rounded()))
+      config.captureResolution = .best
+      config.showsCursor = false
+      let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+      let rep = NSBitmapImageRep(cgImage: image)
+      guard let png = rep.representation(using: .png, properties: [:]) else {
+        result = ["ok": false, "error": "unable to encode PNG"]
+        sem.signal(); return
+      }
+      result = [
+        "ok": true,
+        "imageBase64": png.base64EncodedString(),
+        "width": image.width,
+        "height": image.height,
+      ]
+    } catch {
+      result = ["ok": false, "error": error.localizedDescription]
+    }
+    sem.signal()
   }
-  return [
-    "ok": true,
-    "imageBase64": png.base64EncodedString(),
-    "width": image.width,
-    "height": image.height,
-  ]
+
+  sem.wait()
+  return result
 }

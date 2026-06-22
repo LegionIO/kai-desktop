@@ -5,7 +5,7 @@ import type {
   ComputerFrame,
   ComputerSession,
 } from '../../../shared/computer-use.js';
-import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
+import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../../shared/computer-use.js';
 import type { AppConfig } from '../../config/schema.js';
 import { getFallbackAdapter, getPlatformAdapter } from '../../platform/index.js';
 import type { NativePlatformAdapter } from '../../platform/types.js';
@@ -13,6 +13,9 @@ import { suppressTakeoverEvents } from '../takeover-monitor.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
 
 const DEFAULT_MAX_FRAME_DIMENSION = 1920;
+
+/** Anthropic's vision pipeline downscales images whose long edge exceeds ~1568px. */
+const ANTHROPIC_VISION_MAX_EDGE = 1568;
 
 // Module-level so a paused/aborted session that drops its harness instance
 // can still be recovered by the next initialize(), dispose(), or by the user
@@ -118,7 +121,11 @@ export class LocalDesktopHarness implements ComputerHarness {
 
   async captureFrame(session: ComputerSession): Promise<ComputerFrame> {
     const config = this.getConfig();
-    const maxDimension = config.computerUse.capture.maxDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const configuredMax = config.computerUse.capture.maxDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const maxDimension =
+      session.providerAdapter === 'anthropic-client-tool'
+        ? Math.min(configuredMax, ANTHROPIC_VISION_MAX_EDGE)
+        : configuredMax;
 
     const layout = await (await this.getAdapter()).listDisplays().catch(() => undefined);
     const primary = layout?.displays.find((d) => d.isPrimary) ?? layout?.displays[0];
@@ -139,26 +146,79 @@ export class LocalDesktopHarness implements ComputerHarness {
       await new Promise((resolve) => setTimeout(resolve, 120));
     }
 
-    let shot;
+    const displayFrames: NonNullable<ComputerFrame['displayFrames']> = [];
+    let primaryFrame: {
+      dataUrl: string;
+      width: number;
+      height: number;
+      nativeWidth: number;
+      nativeHeight: number;
+    } | null = null;
     try {
-      shot = await this.withFallback((a) => a.screenshotDisplay(primary?.displayIndex ?? 0));
+      const targets = layout?.displays.length ? layout.displays : [primary ?? { displayIndex: 0, name: 'Primary' }];
+      for (const display of targets) {
+        try {
+          const shot = await this.withFallback((a) => a.screenshotDisplay(display.displayIndex));
+          const resized = resizeForModel(shot.data, shot.width, shot.height, maxDimension);
+          const dataUrl = `data:image/jpeg;base64,${resized.data.toString('base64')}`;
+          displayFrames.push({
+            displayIndex: display.displayIndex,
+            displayName: display.name,
+            dataUrl,
+            width: resized.width,
+            height: resized.height,
+            nativeWidth: shot.width,
+            nativeHeight: shot.height,
+          });
+          if (display.displayIndex === (primary?.displayIndex ?? 0)) {
+            primaryFrame = {
+              dataUrl,
+              width: resized.width,
+              height: resized.height,
+              nativeWidth: shot.width,
+              nativeHeight: shot.height,
+            };
+          }
+        } catch (error) {
+          if (display.displayIndex === (primary?.displayIndex ?? 0)) throw error;
+        }
+      }
     } finally {
       if (!persistHide) restoreLocalDesktopWindows();
     }
-    const frame = resizeForModel(shot.data, shot.width, shot.height, maxDimension);
+
+    if (!primaryFrame) {
+      const first = displayFrames[0];
+      if (!first) throw new Error('Screenshot capture failed for all displays');
+      primaryFrame = {
+        dataUrl: first.dataUrl,
+        width: first.width,
+        height: first.height,
+        nativeWidth: first.nativeWidth ?? first.width,
+        nativeHeight: first.nativeHeight ?? first.height,
+      };
+    }
+
+    // Only advertise the displays we actually captured so the prompt and the
+    // image set agree.
+    const capturedIndices = new Set(displayFrames.map((f) => f.displayIndex));
+    const finalLayout = layout
+      ? { displays: layout.displays.filter((d) => capturedIndices.has(d.displayIndex)) }
+      : undefined;
 
     return {
       id: makeComputerUseId('frame'),
       sessionId: session.id,
       createdAt: nowIso(),
       mimeType: 'image/jpeg',
-      dataUrl: `data:image/jpeg;base64,${frame.data.toString('base64')}`,
-      width: frame.width,
-      height: frame.height,
-      nativeWidth: shot.width,
-      nativeHeight: shot.height,
+      dataUrl: primaryFrame.dataUrl,
+      width: primaryFrame.width,
+      height: primaryFrame.height,
+      nativeWidth: primaryFrame.nativeWidth,
+      nativeHeight: primaryFrame.nativeHeight,
       source: 'local-macos',
-      displayLayout: layout,
+      displayLayout: finalLayout,
+      displayFrames,
     };
   }
 
@@ -174,16 +234,15 @@ export class LocalDesktopHarness implements ComputerHarness {
     originY: number;
   } {
     const layout = session.displayLayout ?? session.latestFrame?.displayLayout;
-    const display =
-      displayIndex != null
-        ? (layout?.displays.find((d) => d.displayIndex === displayIndex) ?? layout?.displays[displayIndex])
-        : (layout?.displays.find((d) => d.isPrimary) ?? layout?.displays[0]);
-    const displayFrame =
-      displayIndex != null
-        ? session.latestFrame?.displayFrames?.find((f) => f.displayIndex === displayIndex)
-        : undefined;
-    const frameWidth = Math.max(1, Math.round(displayFrame?.width ?? session.latestFrame?.width ?? 1));
-    const frameHeight = Math.max(1, Math.round(displayFrame?.height ?? session.latestFrame?.height ?? 1));
+    const resolvedIndex = displayIndex ?? primaryDisplayIndex(layout);
+    const display = layout?.displays.find((d) => d.displayIndex === resolvedIndex);
+    if (layout && layout.displays.length > 0 && !display) {
+      const valid = layout.displays.map((d) => d.displayIndex).join(', ');
+      throw new Error(`Action targets displayIndex ${resolvedIndex}, but only [${valid}] are available.`);
+    }
+    const displayFrame = session.latestFrame?.displayFrames?.find((f) => f.displayIndex === resolvedIndex);
+    const frameWidth = Math.max(1, displayFrame?.width ?? session.latestFrame?.width ?? 1);
+    const frameHeight = Math.max(1, displayFrame?.height ?? session.latestFrame?.height ?? 1);
     return {
       frameWidth,
       frameHeight,
@@ -202,9 +261,11 @@ export class LocalDesktopHarness implements ComputerHarness {
 
   private toDesktop(session: ComputerSession, x: number, y: number, displayIndex?: number): { x: number; y: number } {
     const s = this.resolveSpace(session, displayIndex);
+    const fx = Math.max(0, Math.min(x, s.frameWidth - 1));
+    const fy = Math.max(0, Math.min(y, s.frameHeight - 1));
     return {
-      x: Math.round(s.originX + (x / s.frameWidth) * s.logicalWidth),
-      y: Math.round(s.originY + (y / s.frameHeight) * s.logicalHeight),
+      x: Math.round(s.originX + (fx / s.frameWidth) * s.logicalWidth),
+      y: Math.round(s.originY + (fy / s.frameHeight) * s.logicalHeight),
     };
   }
 
@@ -237,7 +298,7 @@ export class LocalDesktopHarness implements ComputerHarness {
     action: ComputerActionProposal,
     _context?: ComputerHarnessActionContext,
   ): Promise<ComputerHarnessActionResult> {
-    const requested = { x: Math.round(action.x ?? 0), y: Math.round(action.y ?? 0) };
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const target = this.toDesktop(session, requested.x, requested.y, action.displayIndex);
     const duration = action.waitMs ?? 120;
     await this.suppressedInput(duration, (a) => a.movePointer(target.x, target.y, duration));
@@ -245,25 +306,22 @@ export class LocalDesktopHarness implements ComputerHarness {
   }
 
   async click(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const requested = { x: Math.round(action.x ?? 0), y: Math.round(action.y ?? 0) };
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const target = this.toDesktop(session, requested.x, requested.y, action.displayIndex);
     await this.suppressedInput(200, (a) => a.click(target.x, target.y));
     return this.cursorResult(session, 'Clicked at', requested, target, action.displayIndex);
   }
 
   async doubleClick(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const requested = { x: Math.round(action.x ?? 0), y: Math.round(action.y ?? 0) };
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const target = this.toDesktop(session, requested.x, requested.y, action.displayIndex);
     await this.suppressedInput(300, (a) => a.doubleClick(target.x, target.y));
     return this.cursorResult(session, 'Double-clicked at', requested, target, action.displayIndex);
   }
 
   async drag(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const requestedStart = { x: Math.round(action.x ?? 0), y: Math.round(action.y ?? 0) };
-    const requestedEnd = {
-      x: Math.round(action.endX ?? requestedStart.x),
-      y: Math.round(action.endY ?? requestedStart.y),
-    };
+    const requestedStart = { x: action.x ?? 0, y: action.y ?? 0 };
+    const requestedEnd = { x: action.endX ?? requestedStart.x, y: action.endY ?? requestedStart.y };
     const start = this.toDesktop(session, requestedStart.x, requestedStart.y, action.displayIndex);
     const end = this.toDesktop(session, requestedEnd.x, requestedEnd.y, action.displayIndex);
     const duration = action.waitMs ?? 200;
@@ -271,9 +329,13 @@ export class LocalDesktopHarness implements ComputerHarness {
     return this.cursorResult(session, `Dragged from ${start.x}, ${start.y} to`, requestedEnd, end, action.displayIndex);
   }
 
-  async scroll(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
+  async scroll(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
     const dx = Math.round(action.deltaX ?? 0);
     const dy = Math.round(action.deltaY ?? 0);
+    if (action.x != null && action.y != null) {
+      const target = this.toDesktop(session, action.x, action.y, action.displayIndex);
+      await this.suppressedInput(50, (a) => a.movePointer(target.x, target.y, 0));
+    }
     await this.suppressedInput(150, (a) => a.scroll(dx, dy));
     return { summary: `Scrolled by ${dx}, ${dy}.` };
   }
@@ -351,5 +413,10 @@ function resizeForModel(
   const targetHeight = Math.max(1, Math.round(height * scale));
   const image = nativeImage.createFromBuffer(data);
   const resized = image.resize({ width: targetWidth, height: targetHeight, quality: 'better' });
-  return { data: Buffer.from(resized.toJPEG(85)), width: targetWidth, height: targetHeight };
+  const actual = resized.getSize();
+  return {
+    data: Buffer.from(resized.toJPEG(85)),
+    width: actual.width > 0 ? actual.width : targetWidth,
+    height: actual.height > 0 ? actual.height : targetHeight,
+  };
 }

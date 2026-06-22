@@ -8,13 +8,13 @@ import type {
   ComputerFrame,
   ComputerSession,
 } from '../../../shared/computer-use.js';
-import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
+import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../../shared/computer-use.js';
 import type { AppConfig } from '../../config/schema.js';
 import {
   buildDisplayLayout,
   buildSwiftFallbackEnv,
   getComputerUsePermissions,
-  getLocalMacDesktopSize,
+  getLocalMacDisplayLayout,
   getLocalMacPointerPosition,
   resolveCompiledHelperBinary,
   resolveMaterializedHelperPath,
@@ -36,6 +36,9 @@ const execFileAsync = promisify(execFile);
  */
 const DEFAULT_MAX_FRAME_DIMENSION = 1920;
 
+/** Anthropic's vision pipeline downscales images whose long edge exceeds ~1568px. */
+const ANTHROPIC_VISION_MAX_EDGE = 1568;
+
 const LOCAL_MACOS_HELPER_COMMANDS = {
   permissions: 'permissions',
   move: 'move',
@@ -50,7 +53,7 @@ const LOCAL_MACOS_HELPER_COMMANDS = {
   screenshot: 'screenshot',
 } as const;
 
-type LocalMacosHelperCommand = typeof LOCAL_MACOS_HELPER_COMMANDS[keyof typeof LOCAL_MACOS_HELPER_COMMANDS];
+type LocalMacosHelperCommand = (typeof LOCAL_MACOS_HELPER_COMMANDS)[keyof typeof LOCAL_MACOS_HELPER_COMMANDS];
 
 export type LocalMacosTakeoverEvent = {
   event: 'takeover';
@@ -80,7 +83,8 @@ function parseMonitorLine(line: string): LocalMacosTakeoverEvent | null {
     };
     if (payload.event !== 'takeover') return null;
     if (typeof payload.kind !== 'string' || typeof payload.eventType !== 'string') return null;
-    if (typeof payload.x !== 'number' || typeof payload.y !== 'number' || typeof payload.timestampMs !== 'number') return null;
+    if (typeof payload.x !== 'number' || typeof payload.y !== 'number' || typeof payload.timestampMs !== 'number')
+      return null;
     return {
       event: 'takeover',
       kind: payload.kind === 'keyboard' || payload.kind === 'mouse' ? payload.kind : 'other',
@@ -172,7 +176,9 @@ function buildResult(summary: string, cursor?: { x: number; y: number }): Comput
   };
 }
 
-function resolveMovementPath(action: ComputerActionProposal): 'teleport' | 'direct' | 'horizontal-first' | 'vertical-first' {
+function resolveMovementPath(
+  action: ComputerActionProposal,
+): 'teleport' | 'direct' | 'horizontal-first' | 'vertical-first' {
   return action.movementPath;
 }
 
@@ -185,48 +191,22 @@ async function resolveActualCursor(fallback: { x: number; y: number }): Promise<
   };
 }
 
-function summarizePointerAction(prefix: string, requested: { x: number; y: number }, actual: { x: number; y: number }, movementPath: 'teleport' | 'direct' | 'horizontal-first' | 'vertical-first'): string {
+function summarizePointerAction(
+  prefix: string,
+  requested: { x: number; y: number },
+  actual: { x: number; y: number },
+  movementPath: 'teleport' | 'direct' | 'horizontal-first' | 'vertical-first',
+): string {
   const pathSuffix = movementPath === 'direct' ? '' : ' via ' + movementPath;
-  if (requested.x === actual.x && requested.y === actual.y) {
-    return prefix + ' ' + requested.x + ', ' + requested.y + pathSuffix + '.';
+  const rx = Math.round(requested.x);
+  const ry = Math.round(requested.y);
+  if (rx === actual.x && ry === actual.y) {
+    return prefix + ' ' + rx + ', ' + ry + pathSuffix + '.';
   }
-  return prefix + ' ' + requested.x + ', ' + requested.y + pathSuffix + ' (actual ' + actual.x + ', ' + actual.y + ').';
+  return prefix + ' ' + rx + ', ' + ry + pathSuffix + ' (actual ' + actual.x + ', ' + actual.y + ').';
 }
-
-type LocalMacCoordinateSpace = {
-  frameWidth: number;
-  frameHeight: number;
-  desktopWidth: number;
-  desktopHeight: number;
-};
 
 type LocalMacModelFrameConfig = AppConfig['computerUse']['capture']['modelFrame'];
-
-async function resolveCoordinateSpace(session: ComputerSession): Promise<LocalMacCoordinateSpace> {
-  const frameWidth = Math.max(1, Math.round(session.latestFrame?.width ?? 1440));
-  const frameHeight = Math.max(1, Math.round(session.latestFrame?.height ?? 900));
-  const desktop = await getLocalMacDesktopSize().catch(() => null);
-  return {
-    frameWidth,
-    frameHeight,
-    desktopWidth: Math.max(1, Math.round(desktop?.width ?? frameWidth)),
-    desktopHeight: Math.max(1, Math.round(desktop?.height ?? frameHeight)),
-  };
-}
-
-function toDesktopPoint(point: { x: number; y: number }, space: LocalMacCoordinateSpace): { x: number; y: number } {
-  return {
-    x: Math.round((point.x / Math.max(space.frameWidth, 1)) * space.desktopWidth),
-    y: Math.round((point.y / Math.max(space.frameHeight, 1)) * space.desktopHeight),
-  };
-}
-
-function toFramePoint(point: { x: number; y: number }, space: LocalMacCoordinateSpace): { x: number; y: number } {
-  return {
-    x: Math.round((point.x / Math.max(space.desktopWidth, 1)) * space.frameWidth),
-    y: Math.round((point.y / Math.max(space.desktopHeight, 1)) * space.frameHeight),
-  };
-}
 
 /**
  * Resize a native screenshot into the model-facing coordinate space.
@@ -251,9 +231,10 @@ function resizeFrameForModel(
     const canonicalHeight = Math.max(1, Math.round(modelFrame.height || 768));
     const originalAspect = nativeWidth / Math.max(nativeHeight, 1);
     const canonicalAspect = canonicalWidth / Math.max(canonicalHeight, 1);
-    const canUseExactCanonical = nativeWidth >= canonicalWidth
-      && nativeHeight >= canonicalHeight
-      && Math.abs(originalAspect - canonicalAspect) / Math.max(canonicalAspect, 0.0001) < 0.01;
+    const canUseExactCanonical =
+      nativeWidth >= canonicalWidth &&
+      nativeHeight >= canonicalHeight &&
+      Math.abs(originalAspect - canonicalAspect) / Math.max(canonicalAspect, 0.0001) < 0.01;
 
     if (canUseExactCanonical) {
       targetWidth = canonicalWidth;
@@ -279,12 +260,13 @@ function resizeFrameForModel(
 
   const image = nativeImage.createFromBuffer(data);
   const resized = image.resize({ width: targetWidth, height: targetHeight, quality: 'better' });
+  const actual = resized.getSize();
   const jpegBuffer = resized.toJPEG(85);
 
   return {
     data: Buffer.from(jpegBuffer),
-    width: targetWidth,
-    height: targetHeight,
+    width: actual.width > 0 ? actual.width : targetWidth,
+    height: actual.height > 0 ? actual.height : targetHeight,
     nativeWidth,
     nativeHeight,
   };
@@ -314,10 +296,15 @@ export class LocalMacosHarness implements ComputerHarness {
         win.setFullScreen(false);
         // Wait for the full-screen exit animation to complete
         await new Promise<void>((resolve) => {
-          const onLeave = () => { resolve(); };
+          const onLeave = () => {
+            resolve();
+          };
           win.once('leave-full-screen', onLeave);
           // Safety timeout in case the event doesn't fire
-          setTimeout(() => { win.removeListener('leave-full-screen', onLeave); resolve(); }, 2000);
+          setTimeout(() => {
+            win.removeListener('leave-full-screen', onLeave);
+            resolve();
+          }, 2000);
         });
       }
     }
@@ -334,9 +321,14 @@ export class LocalMacosHarness implements ComputerHarness {
       if (!win.isDestroyed() && win.isFullScreen()) {
         win.setFullScreen(false);
         await new Promise<void>((resolve) => {
-          const onLeave = () => { resolve(); };
+          const onLeave = () => {
+            resolve();
+          };
           win.once('leave-full-screen', onLeave);
-          setTimeout(() => { win.removeListener('leave-full-screen', onLeave); resolve(); }, 2000);
+          setTimeout(() => {
+            win.removeListener('leave-full-screen', onLeave);
+            resolve();
+          }, 2000);
         });
       }
     }
@@ -344,108 +336,147 @@ export class LocalMacosHarness implements ComputerHarness {
     const config = this.getConfig();
     const excludeApps = config.computerUse.localMacos.captureExcludedApps ?? ['Electron'];
     const jpegQuality = config.computerUse.capture.jpegQuality ?? 0.8;
-    const maxDimension = config.computerUse.capture.maxDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const configuredMax = config.computerUse.capture.maxDimension ?? DEFAULT_MAX_FRAME_DIMENSION;
+    const maxDimension =
+      session.providerAdapter === 'anthropic-client-tool'
+        ? Math.min(configuredMax, ANTHROPIC_VISION_MAX_EDGE)
+        : configuredMax;
     const modelFrame = config.computerUse.capture.modelFrame;
     const allowedDisplays = config.computerUse.localMacos.allowedDisplays;
 
     const excludeArg = Buffer.from(JSON.stringify(excludeApps)).toString('base64');
     const qualityArg = String(jpegQuality);
-    // Always exclude our own process's windows regardless of app name
     const selfPid = String(process.pid);
 
-    // Capture the primary display (display index 0) as the main frame
-    const primaryResult = await runLocalMacMouseCommand(
-      helperArgs(LOCAL_MACOS_HELPER_COMMANDS.screenshot, [excludeArg, qualityArg, '0', selfPid]),
-    );
-
-    if (!primaryResult.imageBase64 || !primaryResult.width || !primaryResult.height) {
-      throw new Error(primaryResult.error ?? 'Screenshot capture failed');
-    }
-
-    const rawData = Buffer.from(primaryResult.imageBase64, 'base64');
-    const rawSize = { width: primaryResult.width, height: primaryResult.height };
-    const frame = resizeFrameForModel(rawData, rawSize, modelFrame, maxDimension);
-
-    // Build display layout from the helper response
-    const displayLayout = buildDisplayLayout(
-      primaryResult.displays,
+    // Resolve the display layout up front so we know exactly which physical
+    // displays to capture (by CGDirectDisplayID), independent of sort position.
+    const displayLayout = await getLocalMacDisplayLayout(
       allowedDisplays && allowedDisplays.length > 0 ? allowedDisplays : undefined,
     );
+    if (!displayLayout || displayLayout.displays.length === 0) {
+      throw new Error('No displays available for capture');
+    }
+    const primaryIdx = primaryDisplayIndex(displayLayout);
 
-    // Capture additional displays in parallel
-    const displayFrames: ComputerFrame['displayFrames'] = [{
-      displayIndex: 0,
-      displayName: displayLayout?.displays[0]?.name ?? 'Primary',
-      dataUrl: `data:image/jpeg;base64,${frame.data.toString('base64')}`,
-      width: frame.width,
-      height: frame.height,
-      nativeWidth: frame.nativeWidth,
-      nativeHeight: frame.nativeHeight,
-    }];
+    const displayFrames: NonNullable<ComputerFrame['displayFrames']> = [];
+    let primaryFrame: {
+      dataUrl: string;
+      width: number;
+      height: number;
+      nativeWidth: number;
+      nativeHeight: number;
+    } | null = null;
+    let helperDisplays: NonNullable<Parameters<typeof buildDisplayLayout>[0]> | undefined;
 
-    if (displayLayout && displayLayout.displays.length > 1) {
-      for (let i = 1; i < displayLayout.displays.length; i++) {
-        try {
-          const extraResult = await runLocalMacMouseCommand(
-            helperArgs(LOCAL_MACOS_HELPER_COMMANDS.screenshot, [excludeArg, qualityArg, String(i), selfPid]),
-          );
-          if (extraResult.imageBase64 && extraResult.width && extraResult.height) {
-            const extraRaw = Buffer.from(extraResult.imageBase64, 'base64');
-            const extraFrame = resizeFrameForModel(extraRaw, { width: extraResult.width, height: extraResult.height }, modelFrame, maxDimension);
-            displayFrames.push({
-              displayIndex: i,
-              displayName: displayLayout.displays[i]?.name ?? `Display ${i + 1}`,
-              dataUrl: `data:image/jpeg;base64,${extraFrame.data.toString('base64')}`,
-              width: extraFrame.width,
-              height: extraFrame.height,
-              nativeWidth: extraFrame.nativeWidth,
-              nativeHeight: extraFrame.nativeHeight,
-            });
-          }
-        } catch {
-          // Non-fatal: skip displays that fail to capture
+    for (const display of displayLayout.displays) {
+      try {
+        const result = await runLocalMacMouseCommand(
+          helperArgs(LOCAL_MACOS_HELPER_COMMANDS.screenshot, [excludeArg, qualityArg, display.displayId, selfPid]),
+        );
+        if (!result.imageBase64 || !result.width || !result.height) {
+          if (display.displayIndex === primaryIdx) throw new Error(result.error ?? 'Screenshot capture failed');
+          continue;
         }
+        helperDisplays ??= result.displays;
+        const raw = Buffer.from(result.imageBase64, 'base64');
+        const resized = resizeFrameForModel(
+          raw,
+          { width: result.width, height: result.height },
+          modelFrame,
+          maxDimension,
+        );
+        const dataUrl = `data:image/jpeg;base64,${resized.data.toString('base64')}`;
+        displayFrames.push({
+          displayIndex: display.displayIndex,
+          displayName: display.name,
+          dataUrl,
+          width: resized.width,
+          height: resized.height,
+          nativeWidth: resized.nativeWidth,
+          nativeHeight: resized.nativeHeight,
+        });
+        if (display.displayIndex === primaryIdx) {
+          primaryFrame = {
+            dataUrl,
+            width: resized.width,
+            height: resized.height,
+            nativeWidth: resized.nativeWidth,
+            nativeHeight: resized.nativeHeight,
+          };
+        }
+      } catch (error) {
+        if (display.displayIndex === primaryIdx) throw error;
       }
     }
+
+    if (!primaryFrame) {
+      const first = displayFrames[0];
+      if (!first) throw new Error('Screenshot capture failed for all displays');
+      primaryFrame = {
+        dataUrl: first.dataUrl,
+        width: first.width,
+        height: first.height,
+        nativeWidth: first.nativeWidth ?? first.width,
+        nativeHeight: first.nativeHeight ?? first.height,
+      };
+    }
+
+    // Prefer the layout reported alongside the screenshot (same SCShareableContent
+    // snapshot the image came from); fall back to the pre-fetched layout.
+    const finalLayout =
+      buildDisplayLayout(helperDisplays, allowedDisplays && allowedDisplays.length > 0 ? allowedDisplays : undefined) ??
+      displayLayout;
 
     return {
       id: makeComputerUseId('frame'),
       sessionId: session.id,
       createdAt: nowIso(),
       mimeType: 'image/jpeg',
-      dataUrl: `data:image/jpeg;base64,${frame.data.toString('base64')}`,
-      width: frame.width,
-      height: frame.height,
-      nativeWidth: frame.nativeWidth,
-      nativeHeight: frame.nativeHeight,
+      dataUrl: primaryFrame.dataUrl,
+      width: primaryFrame.width,
+      height: primaryFrame.height,
+      nativeWidth: primaryFrame.nativeWidth,
+      nativeHeight: primaryFrame.nativeHeight,
       source: 'local-macos',
-      displayLayout,
-      displayFrames: displayFrames.length > 1 ? displayFrames : undefined,
+      displayLayout: finalLayout,
+      displayFrames,
     };
   }
 
   /**
-   * Resolve the display-specific coordinate space for an action.
-   * If the action specifies a displayIndex, use that display's dimensions.
-   * Otherwise fall back to the primary display (existing single-display logic).
+   * Resolve the display-specific coordinate space for an action. Throws when
+   * the requested display is not in the captured layout so the orchestrator
+   * surfaces the error to the model instead of clicking the wrong monitor.
    */
-  private resolveDisplayForAction(session: ComputerSession, action: ComputerActionProposal): {
+  private resolveDisplayForAction(
+    session: ComputerSession,
+    action: ComputerActionProposal,
+  ): {
     display: ComputerDisplayInfo;
     frameWidth: number;
     frameHeight: number;
-  } | null {
-    const layout = session.displayLayout;
-    if (!layout || layout.displays.length <= 1) return null;
+  } {
+    const layout = session.displayLayout ?? session.latestFrame?.displayLayout;
+    if (!layout || layout.displays.length === 0) {
+      throw new Error('No display layout captured for this session yet.');
+    }
 
-    const displayIndex = action.displayIndex ?? 0;
-    const display = layout.displays[displayIndex] ?? layout.displays[0];
+    const displayIndex = action.displayIndex ?? primaryDisplayIndex(layout);
+    const display = layout.displays.find((d) => d.displayIndex === displayIndex);
+    if (!display) {
+      const valid = layout.displays.map((d) => d.displayIndex).join(', ');
+      throw new Error(`Action targets displayIndex ${displayIndex}, but only [${valid}] are available.`);
+    }
 
-    // Find the matching display frame for dimensions
     const displayFrame = session.latestFrame?.displayFrames?.find((f) => f.displayIndex === displayIndex);
-    const frameWidth = displayFrame?.width ?? display.pixelWidth;
-    const frameHeight = displayFrame?.height ?? display.pixelHeight;
-
-    return { display, frameWidth, frameHeight };
+    if (displayFrame) {
+      return { display, frameWidth: displayFrame.width, frameHeight: displayFrame.height };
+    }
+    // Single-display sessions store the frame at the top level without displayFrames.
+    if (layout.displays.length === 1 && session.latestFrame) {
+      return { display, frameWidth: session.latestFrame.width, frameHeight: session.latestFrame.height };
+    }
+    throw new Error(`No captured frame for displayIndex ${displayIndex}; capture may have failed for that monitor.`);
   }
 
   /**
@@ -458,14 +489,13 @@ export class LocalMacosHarness implements ComputerHarness {
     frameWidth: number,
     frameHeight: number,
   ): { x: number; y: number } {
-    // Map from frame coordinates to local logical coordinates on the display
-    const localLogicalX = (point.x / Math.max(frameWidth, 1)) * display.logicalWidth;
-    const localLogicalY = (point.y / Math.max(frameHeight, 1)) * display.logicalHeight;
-
-    // Convert to macOS global coordinates
+    const fw = Math.max(frameWidth, 1);
+    const fh = Math.max(frameHeight, 1);
+    const fx = Math.max(0, Math.min(point.x, fw - 1));
+    const fy = Math.max(0, Math.min(point.y, fh - 1));
     return {
-      x: Math.round(display.globalX + localLogicalX),
-      y: Math.round(display.globalY + localLogicalY),
+      x: Math.round(display.globalX + (fx / fw) * display.logicalWidth),
+      y: Math.round(display.globalY + (fy / fh) * display.logicalHeight),
     };
   }
 
@@ -488,118 +518,119 @@ export class LocalMacosHarness implements ComputerHarness {
     };
   }
 
-  async movePointer(session: ComputerSession, action: ComputerActionProposal, _context?: ComputerHarnessActionContext): Promise<ComputerHarnessActionResult> {
-    const requested = {
-      x: Math.round(action.x ?? 0),
-      y: Math.round(action.y ?? 0),
-    };
+  async movePointer(
+    session: ComputerSession,
+    action: ComputerActionProposal,
+    _context?: ComputerHarnessActionContext,
+  ): Promise<ComputerHarnessActionResult> {
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const movementPath = resolveMovementPath(action);
-    const displayCtx = this.resolveDisplayForAction(session, action);
-
-    if (displayCtx) {
-      const target = this.displayFrameToGlobal(requested, displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      const durationMs = Math.max(60, Math.min(action.waitMs ?? 180, 1200));
-      await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.move, [target.x, target.y, durationMs, 18, movementPath]));
-      const actual = this.globalToDisplayFrame(await resolveActualCursor(target), displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      return buildResult(summarizePointerAction('Moved pointer to', requested, actual, movementPath), actual);
-    }
-
-    // Single-display fallback
-    const space = await resolveCoordinateSpace(session);
-    const target = toDesktopPoint(requested, space);
+    const ctx = this.resolveDisplayForAction(session, action);
+    const target = this.displayFrameToGlobal(requested, ctx.display, ctx.frameWidth, ctx.frameHeight);
     const durationMs = Math.max(60, Math.min(action.waitMs ?? 180, 1200));
-    await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.move, [target.x, target.y, durationMs, 18, movementPath]));
-    const actual = toFramePoint(await resolveActualCursor(target), space);
+    await runLocalMacMouseCommand(
+      helperArgs(LOCAL_MACOS_HELPER_COMMANDS.move, [target.x, target.y, durationMs, 18, movementPath]),
+    );
+    const actual = this.globalToDisplayFrame(
+      await resolveActualCursor(target),
+      ctx.display,
+      ctx.frameWidth,
+      ctx.frameHeight,
+    );
     return buildResult(summarizePointerAction('Moved pointer to', requested, actual, movementPath), actual);
   }
 
   async click(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const requested = {
-      x: Math.round(action.x ?? 0),
-      y: Math.round(action.y ?? 0),
-    };
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const movementPath = resolveMovementPath(action);
-    const displayCtx = this.resolveDisplayForAction(session, action);
-
-    if (displayCtx) {
-      const target = this.displayFrameToGlobal(requested, displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.click, [target.x, target.y, 120, movementPath]));
-      const actual = this.globalToDisplayFrame(await resolveActualCursor(target), displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      return buildResult(summarizePointerAction('Clicked at', requested, actual, movementPath), actual);
-    }
-
-    const space = await resolveCoordinateSpace(session);
-    const target = toDesktopPoint(requested, space);
-    await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.click, [target.x, target.y, 120, movementPath]));
-    const actual = toFramePoint(await resolveActualCursor(target), space);
+    const ctx = this.resolveDisplayForAction(session, action);
+    const target = this.displayFrameToGlobal(requested, ctx.display, ctx.frameWidth, ctx.frameHeight);
+    await runLocalMacMouseCommand(
+      helperArgs(LOCAL_MACOS_HELPER_COMMANDS.click, [target.x, target.y, 120, movementPath]),
+    );
+    const actual = this.globalToDisplayFrame(
+      await resolveActualCursor(target),
+      ctx.display,
+      ctx.frameWidth,
+      ctx.frameHeight,
+    );
     return buildResult(summarizePointerAction('Clicked at', requested, actual, movementPath), actual);
   }
 
   async doubleClick(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const requested = {
-      x: Math.round(action.x ?? 0),
-      y: Math.round(action.y ?? 0),
-    };
+    const requested = { x: action.x ?? 0, y: action.y ?? 0 };
     const movementPath = resolveMovementPath(action);
-    const displayCtx = this.resolveDisplayForAction(session, action);
-
-    if (displayCtx) {
-      const target = this.displayFrameToGlobal(requested, displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.doubleClick, [target.x, target.y, 130, movementPath]));
-      const actual = this.globalToDisplayFrame(await resolveActualCursor(target), displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      return buildResult(summarizePointerAction('Double-clicked at', requested, actual, movementPath), actual);
-    }
-
-    const space = await resolveCoordinateSpace(session);
-    const target = toDesktopPoint(requested, space);
-    await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.doubleClick, [target.x, target.y, 130, movementPath]));
-    const actual = toFramePoint(await resolveActualCursor(target), space);
+    const ctx = this.resolveDisplayForAction(session, action);
+    const target = this.displayFrameToGlobal(requested, ctx.display, ctx.frameWidth, ctx.frameHeight);
+    await runLocalMacMouseCommand(
+      helperArgs(LOCAL_MACOS_HELPER_COMMANDS.doubleClick, [target.x, target.y, 130, movementPath]),
+    );
+    const actual = this.globalToDisplayFrame(
+      await resolveActualCursor(target),
+      ctx.display,
+      ctx.frameWidth,
+      ctx.frameHeight,
+    );
     return buildResult(summarizePointerAction('Double-clicked at', requested, actual, movementPath), actual);
   }
 
-  async drag(session: ComputerSession, action: ComputerActionProposal, _context?: ComputerHarnessActionContext): Promise<ComputerHarnessActionResult> {
-    const requestedStart = {
-      x: Math.round(action.x ?? action.endX ?? 0),
-      y: Math.round(action.y ?? action.endY ?? 0),
-    };
-    const requestedEnd = {
-      x: Math.round(action.endX ?? requestedStart.x),
-      y: Math.round(action.endY ?? requestedStart.y),
-    };
+  async drag(
+    session: ComputerSession,
+    action: ComputerActionProposal,
+    _context?: ComputerHarnessActionContext,
+  ): Promise<ComputerHarnessActionResult> {
+    const requestedStart = { x: action.x ?? action.endX ?? 0, y: action.y ?? action.endY ?? 0 };
+    const requestedEnd = { x: action.endX ?? requestedStart.x, y: action.endY ?? requestedStart.y };
     const movementPath = resolveMovementPath(action);
-    const displayCtx = this.resolveDisplayForAction(session, action);
-
-    if (displayCtx) {
-      const start = this.displayFrameToGlobal(requestedStart, displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      const end = this.displayFrameToGlobal(requestedEnd, displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      const durationMs = Math.max(120, Math.min(action.waitMs ?? 320, 2400));
-      await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.drag, [start.x, start.y, end.x, end.y, durationMs, 28, movementPath]));
-      const actual = this.globalToDisplayFrame(await resolveActualCursor(end), displayCtx.display, displayCtx.frameWidth, displayCtx.frameHeight);
-      const pathSuffix = movementPath === 'direct' ? '' : ' via ' + movementPath;
-      const summary = actual.x === requestedEnd.x && actual.y === requestedEnd.y
-        ? `Dragged from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${pathSuffix}.`
-        : `Dragged from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${pathSuffix} (actual ${actual.x}, ${actual.y}).`;
-      return buildResult(summary, actual);
-    }
-
-    const space = await resolveCoordinateSpace(session);
-    const start = toDesktopPoint(requestedStart, space);
-    const end = toDesktopPoint(requestedEnd, space);
+    const ctx = this.resolveDisplayForAction(session, action);
+    const start = this.displayFrameToGlobal(requestedStart, ctx.display, ctx.frameWidth, ctx.frameHeight);
+    const end = this.displayFrameToGlobal(requestedEnd, ctx.display, ctx.frameWidth, ctx.frameHeight);
     const durationMs = Math.max(120, Math.min(action.waitMs ?? 320, 2400));
-    await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.drag, [start.x, start.y, end.x, end.y, durationMs, 28, movementPath]));
-    const actual = toFramePoint(await resolveActualCursor(end), space);
+    await runLocalMacMouseCommand(
+      helperArgs(LOCAL_MACOS_HELPER_COMMANDS.drag, [start.x, start.y, end.x, end.y, durationMs, 28, movementPath]),
+    );
+    const actual = this.globalToDisplayFrame(
+      await resolveActualCursor(end),
+      ctx.display,
+      ctx.frameWidth,
+      ctx.frameHeight,
+    );
     const pathSuffix = movementPath === 'direct' ? '' : ' via ' + movementPath;
-    const summary = actual.x === requestedEnd.x && actual.y === requestedEnd.y
-      ? `Dragged pointer from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${pathSuffix}.`
-      : `Dragged pointer from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${pathSuffix} (actual ${actual.x}, ${actual.y}).`;
+    const rsx = Math.round(requestedStart.x);
+    const rsy = Math.round(requestedStart.y);
+    const rex = Math.round(requestedEnd.x);
+    const rey = Math.round(requestedEnd.y);
+    const summary =
+      actual.x === rex && actual.y === rey
+        ? `Dragged from ${rsx}, ${rsy} to ${rex}, ${rey}${pathSuffix}.`
+        : `Dragged from ${rsx}, ${rsy} to ${rex}, ${rey}${pathSuffix} (actual ${actual.x}, ${actual.y}).`;
     return buildResult(summary, actual);
   }
 
-  async scroll(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
+  async scroll(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
     const deltaX = Math.round(action.deltaX ?? 0);
     const deltaY = Math.round(action.deltaY ?? 0);
+    let cursor: { x: number; y: number } | undefined;
+    if (action.x != null && action.y != null) {
+      const ctx = this.resolveDisplayForAction(session, action);
+      const target = this.displayFrameToGlobal(
+        { x: action.x, y: action.y },
+        ctx.display,
+        ctx.frameWidth,
+        ctx.frameHeight,
+      );
+      await runLocalMacMouseCommand(
+        helperArgs(LOCAL_MACOS_HELPER_COMMANDS.move, [target.x, target.y, 40, 1, 'teleport']),
+      );
+      cursor = this.globalToDisplayFrame(
+        await resolveActualCursor(target),
+        ctx.display,
+        ctx.frameWidth,
+        ctx.frameHeight,
+      );
+    }
     await runLocalMacMouseCommand(helperArgs(LOCAL_MACOS_HELPER_COMMANDS.scroll, [deltaX, deltaY]));
-    return buildResult(`Scrolled by ${deltaX}, ${deltaY}.`);
+    return buildResult(`Scrolled by ${deltaX}, ${deltaY}.`, cursor);
   }
 
   async typeText(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
@@ -649,10 +680,14 @@ export class LocalMacosHarness implements ComputerHarness {
 
   async getEnvironmentMetadata(_session: ComputerSession): Promise<ComputerEnvironmentMetadata> {
     const permissions = await getComputerUsePermissions({ probeInputMonitoring: false });
-    const appName = await runAppleScript('tell application "System Events" to get name of first application process whose frontmost is true');
+    const appName = await runAppleScript(
+      'tell application "System Events" to get name of first application process whose frontmost is true',
+    );
     let windowTitle = '';
     try {
-      windowTitle = await runAppleScript('tell application "System Events" to tell (first application process whose frontmost is true) to get value of attribute "AXTitle" of front window');
+      windowTitle = await runAppleScript(
+        'tell application "System Events" to tell (first application process whose frontmost is true) to get value of attribute "AXTitle" of front window',
+      );
     } catch {
       windowTitle = '';
     }

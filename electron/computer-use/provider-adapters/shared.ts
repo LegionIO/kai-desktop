@@ -32,15 +32,19 @@ export type FallbackCallbacks = {
 function isRetryableParseError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
-  return lower.includes('could not parse')
-    || lower.includes('no object generated')
-    || lower.includes('ai_noobjectgeneratederror')
-    || (error instanceof Error && error.constructor.name === 'NoObjectGeneratedError');
+  return (
+    lower.includes('could not parse') ||
+    lower.includes('no object generated') ||
+    lower.includes('ai_noobjectgeneratederror') ||
+    (error instanceof Error && error.constructor.name === 'NoObjectGeneratedError')
+  );
 }
 
 function isClaudeOpenAICompatModel(modelConfig: LLMModelConfig): boolean {
-  return modelConfig.provider === 'openai-compatible'
-    && /(?:^|[./:_-])(claude|anthropic)(?:$|[./:_-])|claude|anthropic/i.test(modelConfig.modelName);
+  return (
+    modelConfig.provider === 'openai-compatible' &&
+    /(?:^|[./:_-])(claude|anthropic)(?:$|[./:_-])|claude|anthropic/i.test(modelConfig.modelName)
+  );
 }
 
 function extractJsonCandidate(text: string): string | null {
@@ -182,32 +186,59 @@ const plannerSchema = z.object({
 const nullableString = z.string().nullable();
 const nullableNumber = z.number().nullable();
 const nullableStringArray = z.array(z.string()).nullable();
-const requiredMovementPath = z.enum(['teleport', 'direct', 'horizontal-first', 'vertical-first']).describe('Cursor travel strategy. Prefer teleport by default for pointer actions because it jumps directly to the destination without traversing intermediate hover targets. Use horizontal-first or vertical-first only when you intentionally need a visible routed hover path. Use direct only when a straight visible movement is clearly safe and necessary.');
+const requiredMovementPath = z
+  .enum(['teleport', 'direct', 'horizontal-first', 'vertical-first'])
+  .describe(
+    'Cursor travel strategy. Prefer teleport by default for pointer actions because it jumps directly to the destination without traversing intermediate hover targets. Use horizontal-first or vertical-first only when you intentionally need a visible routed hover path. Use direct only when a straight visible movement is clearly safe and necessary.',
+  );
 
 const actionSchema = z.object({
   complete: z.boolean(),
   summary: z.string().min(1).max(240),
   nextSubgoal: z.string().min(1).max(240).nullable(),
-  actions: z.array(z.object({
-    kind: z.enum(['navigate', 'movePointer', 'click', 'doubleClick', 'drag', 'scroll', 'typeText', 'pressKeys', 'wait', 'openApp', 'focusWindow']),
-    rationale: z.string().min(1).max(240),
-    risk: z.enum(['low', 'medium', 'high']),
-    selector: nullableString,
-    elementId: nullableString,
-    x: nullableNumber,
-    y: nullableNumber,
-    endX: nullableNumber,
-    endY: nullableNumber,
-    url: nullableString,
-    text: nullableString,
-    keys: nullableStringArray,
-    deltaX: nullableNumber,
-    deltaY: nullableNumber,
-    appName: nullableString,
-    waitMs: nullableNumber,
-    movementPath: requiredMovementPath,
-    displayIndex: nullableNumber.describe('Which display/monitor this action targets (0-indexed). 0 = primary. Only needed for multi-monitor setups when targeting a non-primary display.'),
-  })).max(3),
+  actions: z
+    .array(
+      z.object({
+        kind: z.enum([
+          'navigate',
+          'movePointer',
+          'click',
+          'doubleClick',
+          'drag',
+          'scroll',
+          'typeText',
+          'pressKeys',
+          'wait',
+          'openApp',
+          'focusWindow',
+        ]),
+        rationale: z.string().min(1).max(240),
+        risk: z.enum(['low', 'medium', 'high']),
+        selector: nullableString,
+        elementId: nullableString,
+        x: nullableNumber,
+        y: nullableNumber,
+        endX: nullableNumber,
+        endY: nullableNumber,
+        url: nullableString,
+        text: nullableString,
+        keys: nullableStringArray,
+        deltaX: nullableNumber,
+        deltaY: nullableNumber,
+        appName: nullableString,
+        waitMs: nullableNumber,
+        movementPath: requiredMovementPath,
+        displayIndex: z
+          .number()
+          .int()
+          .min(0)
+          .nullable()
+          .describe(
+            'Which display/monitor this action targets, by displayIndex from the multi-monitor layout. Omit (null) to target the primary display. Must be one of the display indices listed in the layout block.',
+          ),
+      }),
+    )
+    .max(3),
 });
 
 export type PlannedActions = {
@@ -256,25 +287,42 @@ function describeInteractiveElements(session: ComputerSession, maxItems = 24): s
   const elements = session.latestEnvironment?.interactiveElements;
   if (!Array.isArray(elements) || elements.length === 0) return undefined;
 
-  const lines = elements
-    .slice(0, maxItems)
-    .map((element, index) => {
-      const role = normalizeText(element.role, 24) || 'element';
-      const label = normalizeText(element.label, 40);
-      const text = normalizeText(element.text, 48);
-      const selector = normalizeText(element.selector, 40);
-      const descriptors = [label && `label="${label}"`, text && `text="${text}"`, selector && `selector=${selector}`]
-        .filter(Boolean)
-        .join(' ');
+  const lines = elements.slice(0, maxItems).map((element, index) => {
+    const role = normalizeText(element.role, 24) || 'element';
+    const label = normalizeText(element.label, 40);
+    const text = normalizeText(element.text, 48);
+    const selector = normalizeText(element.selector, 40);
+    const descriptors = [label && `label="${label}"`, text && `text="${text}"`, selector && `selector=${selector}`]
+      .filter(Boolean)
+      .join(' ');
 
-      return `${index + 1}. ${element.id} ${role} at (${element.x}, ${element.y}) size ${element.width}x${element.height}${descriptors ? ` ${descriptors}` : ''}`;
-    });
+    return `${index + 1}. ${element.id} ${role} at (${element.x}, ${element.y}) size ${element.width}x${element.height}${descriptors ? ` ${descriptors}` : ''}`;
+  });
 
   if (lines.length === 0) return undefined;
   return `Interactive elements (frame coordinates):\n${lines.join('\n')}`;
 }
 
-function actionFingerprint(action: Pick<ComputerActionProposal, 'kind' | 'selector' | 'elementId' | 'x' | 'y' | 'endX' | 'endY' | 'url' | 'text' | 'keys' | 'deltaX' | 'deltaY' | 'appName' | 'waitMs' | 'movementPath'>): string {
+function actionFingerprint(
+  action: Pick<
+    ComputerActionProposal,
+    | 'kind'
+    | 'selector'
+    | 'elementId'
+    | 'x'
+    | 'y'
+    | 'endX'
+    | 'endY'
+    | 'url'
+    | 'text'
+    | 'keys'
+    | 'deltaX'
+    | 'deltaY'
+    | 'appName'
+    | 'waitMs'
+    | 'movementPath'
+  >,
+): string {
   return JSON.stringify({
     kind: action.kind,
     selector: action.selector ?? null,
@@ -294,7 +342,26 @@ function actionFingerprint(action: Pick<ComputerActionProposal, 'kind' | 'select
   });
 }
 
-function describeAction(action: Pick<ComputerActionProposal, 'kind' | 'selector' | 'elementId' | 'x' | 'y' | 'endX' | 'endY' | 'url' | 'text' | 'keys' | 'deltaX' | 'deltaY' | 'appName' | 'waitMs' | 'movementPath'>): string {
+function describeAction(
+  action: Pick<
+    ComputerActionProposal,
+    | 'kind'
+    | 'selector'
+    | 'elementId'
+    | 'x'
+    | 'y'
+    | 'endX'
+    | 'endY'
+    | 'url'
+    | 'text'
+    | 'keys'
+    | 'deltaX'
+    | 'deltaY'
+    | 'appName'
+    | 'waitMs'
+    | 'movementPath'
+  >,
+): string {
   const parts: string[] = [action.kind];
   if (action.selector) parts.push(`selector=${action.selector}`);
   if (action.elementId) parts.push(`element=${action.elementId}`);
@@ -306,7 +373,12 @@ function describeAction(action: Pick<ComputerActionProposal, 'kind' | 'selector'
   if (action.deltaX != null || action.deltaY != null) parts.push(`scroll=${action.deltaX ?? 0},${action.deltaY ?? 0}`);
   if (action.appName) parts.push(`app=${action.appName}`);
   if (action.waitMs != null) parts.push(`wait=${action.waitMs}ms`);
-  if (action.kind === 'movePointer' || action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'drag') {
+  if (
+    action.kind === 'movePointer' ||
+    action.kind === 'click' ||
+    action.kind === 'doubleClick' ||
+    action.kind === 'drag'
+  ) {
     parts.push(`path=${action.movementPath}`);
   }
   return parts.join(' · ');
@@ -340,12 +412,17 @@ function buildLoopAlert(session: ComputerSession): string | undefined {
   if (sameActions.length < 3) return undefined;
 
   const failedCount = sameActions.filter((action) => action.status === 'failed').length;
-  const latestResult = normalizeText(sameActions[sameActions.length - 1]?.resultSummary ?? sameActions[sameActions.length - 1]?.error ?? '', 160);
+  const latestResult = normalizeText(
+    sameActions[sameActions.length - 1]?.resultSummary ?? sameActions[sameActions.length - 1]?.error ?? '',
+    160,
+  );
   const suffix = latestResult ? ` Latest outcome: ${latestResult}.` : '';
   return `Loop alert: the action \"${describeAction(repeatedAction)}\" was attempted ${sameActions.length} times recently${failedCount > 0 ? ` (${failedCount} failed)` : ''}. Do not propose that same action again unless the UI clearly changed and you explain why repeating it is now safe.${suffix}`;
 }
 
-async function createModel(modelConfig: LLMModelConfig): Promise<Awaited<ReturnType<typeof createLanguageModelFromConfig>>> {
+async function createModel(
+  modelConfig: LLMModelConfig,
+): Promise<Awaited<ReturnType<typeof createLanguageModelFromConfig>>> {
   return createLanguageModelFromConfig(modelConfig);
 }
 
@@ -362,9 +439,13 @@ export async function createPlannerState(
     'You are planning a computer-use session. Create a short task graph for the goal below.',
     '',
     `Goal:\n${goal}`,
-    conversationContext ? `Conversation context to resolve references like "that fix":\n${conversationContext}` : undefined,
+    conversationContext
+      ? `Conversation context to resolve references like "that fix":\n${conversationContext}`
+      : undefined,
     'Keep it concise and executable.',
-  ].filter(Boolean).join('\n\n');
+  ]
+    .filter(Boolean)
+    .join('\n\n');
   const result = await generateObjectWithFallback(
     modelChain,
     maxRetries,
@@ -390,21 +471,25 @@ export async function createPlannerState(
 function describeDisplayLayout(layout: ComputerDisplayLayout | undefined): string | undefined {
   if (!layout || layout.displays.length <= 1) return undefined;
 
+  const primaryIdx = layout.displays.find((d) => d.isPrimary)?.displayIndex ?? layout.displays[0].displayIndex;
   const lines: string[] = [
     '--- MULTI-MONITOR SETUP ---',
     `You are viewing ${layout.displays.length} separate monitor screenshots (one image per monitor).`,
     '',
   ];
 
-  for (let i = 0; i < layout.displays.length; i++) {
-    const d = layout.displays[i];
+  for (const d of layout.displays) {
     const primary = d.isPrimary ? ' (PRIMARY)' : '';
     const position = `global position (${d.globalX}, ${d.globalY})`;
-    lines.push(`  Display ${i}${primary}: "${d.name}" — ${d.logicalWidth}x${d.logicalHeight} logical, ${position}`);
+    lines.push(
+      `  Display ${d.displayIndex}${primary}: "${d.name}" — ${d.logicalWidth}x${d.logicalHeight} logical, ${position}`,
+    );
   }
 
   lines.push('');
-  lines.push('IMPORTANT: When specifying x/y coordinates for a pointer action (click, movePointer, doubleClick, drag), also set displayIndex to the display number (0-indexed) where the target element is visible. x/y are relative to THAT display\'s image, not a combined image. If you omit displayIndex or set it to 0, the action targets the primary display.');
+  lines.push(
+    `IMPORTANT: When specifying x/y coordinates for a pointer action (click, movePointer, doubleClick, drag), also set displayIndex to the Display number above where the target is visible. x/y are relative to THAT display's image, not a combined image. If you omit displayIndex it targets Display ${primaryIdx} (the primary). Always set displayIndex explicitly when targeting any other display.`,
+  );
   lines.push('--- END MULTI-MONITOR SETUP ---');
   return lines.join('\n');
 }
@@ -425,14 +510,26 @@ export async function generateNextActions(params: {
     successCriteria: ['Task completed'],
     activeSubgoalIndex: 0,
   };
-  const currentSubgoal = plannerState.subgoals[plannerState.activeSubgoalIndex] ?? plannerState.subgoals[0] ?? session.goal;
-  const recentActions = session.actions.slice(-8).map((action) => {
-    const path = action.kind === 'movePointer' || action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'drag'
-      ? ` [path=${action.movementPath}]`
-      : '';
-    const suffix = action.resultSummary ? ` -> ${action.resultSummary}` : action.error ? ` -> ERROR: ${action.error}` : '';
-    return `${action.kind}${path} (${action.status})${suffix}`;
-  }).join('\n');
+  const currentSubgoal =
+    plannerState.subgoals[plannerState.activeSubgoalIndex] ?? plannerState.subgoals[0] ?? session.goal;
+  const recentActions = session.actions
+    .slice(-8)
+    .map((action) => {
+      const path =
+        action.kind === 'movePointer' ||
+        action.kind === 'click' ||
+        action.kind === 'doubleClick' ||
+        action.kind === 'drag'
+          ? ` [path=${action.movementPath}]`
+          : '';
+      const suffix = action.resultSummary
+        ? ` -> ${action.resultSummary}`
+        : action.error
+          ? ` -> ERROR: ${action.error}`
+          : '';
+      return `${action.kind}${path} (${action.status})${suffix}`;
+    })
+    .join('\n');
   const loopAlert = buildLoopAlert(session);
   const frame = session.latestFrame;
   const imageInput = toImageInput(frame);
@@ -442,20 +539,26 @@ export async function generateNextActions(params: {
     .filter((m) => m.text.trim())
     .slice(-10)
     .map((m) => {
-      const time = new Date(m.createdAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const time = new Date(m.createdAt).toLocaleTimeString('en-US', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
       return `[${time}] "${m.text}"`;
     });
-  const guidanceSection = guidanceMessages.length > 0
-    ? `User guidance (received during this session — treat as highest-priority steering):\n${guidanceMessages.join('\n')}`
-    : undefined;
+  const guidanceSection =
+    guidanceMessages.length > 0
+      ? `User guidance (received during this session — treat as highest-priority steering):\n${guidanceMessages.join('\n')}`
+      : undefined;
   const interactiveElementsSection = describeInteractiveElements(session);
 
   // ── Focused window state & hidden-app detection ──
   const focusedApp = metadata?.appName ?? null;
   const focusedWindowTitle = metadata?.windowTitle ?? null;
   const excludedApps = captureExcludedApps ?? [];
-  const focusedAppIsHidden = focusedApp != null
-    && excludedApps.some((excluded) => focusedApp.toLowerCase() === excluded.toLowerCase());
+  const focusedAppIsHidden =
+    focusedApp != null && excludedApps.some((excluded) => focusedApp.toLowerCase() === excluded.toLowerCase());
 
   // Build a consolidated block describing what the OS reports as the focused window.
   // This is critical because the screenshot only shows *visible* windows — the actual
@@ -489,11 +592,12 @@ export async function generateNextActions(params: {
       ].join(' ')
     : undefined;
   const displayFrames = session.latestFrame?.displayFrames;
-  const coordinateSpaceInstruction = displayFrames && displayFrames.length > 1
-    ? 'Screenshot coordinate space: each labeled display image has its own top-left origin; x increases right; y increases downward; use coordinates relative to the display image named by displayIndex.'
-    : frame
-      ? `Screenshot coordinate space: origin is the top-left corner; x increases right; y increases downward; valid coordinates are x=0..${frame.width} and y=0..${frame.height}.`
-      : undefined;
+  const coordinateSpaceInstruction =
+    displayFrames && displayFrames.length > 1
+      ? 'Screenshot coordinate space: each labeled display image has its own top-left origin; x increases right; y increases downward; use coordinates relative to the display image named by displayIndex.'
+      : frame
+        ? `Screenshot coordinate space: origin is the top-left corner; x increases right; y increases downward; valid coordinates are x in [0, ${frame.width - 1}] and y in [0, ${frame.height - 1}].`
+        : undefined;
 
   const promptParts = [
     // Hidden-focus hard-stop goes first so it is the very first thing the model reads
@@ -539,7 +643,7 @@ export async function generateNextActions(params: {
 
     'Default to teleport: teleport is the safest default for local computer use because it jumps straight to the destination without crossing intermediate hover targets, which avoids accidentally opening the wrong submenu, hover card, dock icon, or flyout on the way. Leave movementPath as teleport unless you have a specific reason not to.',
 
-    'Dock magnification: The macOS dock magnifies icons under the cursor. If your cursor path crosses the dock on the way to a target, the magnification effect shifts every icon\'s position while the pointer is in transit. Teleport avoids that entirely and should be preferred. If you must use a traveled path, approach from the direction that minimizes travel along the dock axis. For a bottom dock, move vertically down to the icon\'s column first (horizontal-first), then slide horizontally only the short distance needed. Avoid sweeping horizontally across the dock — each icon you pass over will magnify and push neighbors out of position.',
+    "Dock magnification: The macOS dock magnifies icons under the cursor. If your cursor path crosses the dock on the way to a target, the magnification effect shifts every icon's position while the pointer is in transit. Teleport avoids that entirely and should be preferred. If you must use a traveled path, approach from the direction that minimizes travel along the dock axis. For a bottom dock, move vertically down to the icon's column first (horizontal-first), then slide horizontally only the short distance needed. Avoid sweeping horizontally across the dock — each icon you pass over will magnify and push neighbors out of position.",
 
     'Context menus & submenus: Teleport is strongly preferred because submenu hover behavior is fragile. When a context menu is open and you need to reach a submenu item, a traveled path can sweep through other top-level items, open a different submenu, or collapse the intended one. Only if teleport is unsuitable should you choose a routed path. In that case, move horizontally into the submenu column first (horizontal-first) when the submenu extends sideways, or move horizontally along the menu bar to the correct parent item before going vertically into the dropdown. The rule is: if you must travel, enter the submenu corridor on the axis that keeps you inside it, then travel along that corridor to the item.',
 
@@ -549,12 +653,14 @@ export async function generateNextActions(params: {
 
     'When to use each mode: Use teleport by default. Use horizontal-first or vertical-first only when you intentionally need hover-driven traversal through a safe corridor. Use direct only when a straight visible movement is clearly short, unobstructed, and preferable to teleport for the task. For all non-pointer actions (typeText, pressKeys, scroll, etc.), always use teleport.',
     'The response schema is strict. Always include complete, summary, nextSubgoal, and every action field. Use null for any field that does not apply to a given action.',
-  ].filter(Boolean).join('\n\n');
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 
   // Build message content with per-display images
-  const contentParts: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer | URL; mediaType?: string }> = [
-    { type: 'text' as const, text: promptParts },
-  ];
+  const contentParts: Array<
+    { type: 'text'; text: string } | { type: 'image'; image: Buffer | URL; mediaType?: string }
+  > = [{ type: 'text' as const, text: promptParts }];
 
   if (displayFrames && displayFrames.length > 1) {
     // Multi-display: send labeled images for each display
@@ -571,9 +677,14 @@ export async function generateNextActions(params: {
     }
   } else if (imageInput) {
     // Single display: send one image (original behavior)
+    const singleIdx =
+      displayFrames?.[0]?.displayIndex ??
+      session.displayLayout?.displays.find((d) => d.isPrimary)?.displayIndex ??
+      session.displayLayout?.displays[0]?.displayIndex ??
+      0;
     contentParts.push({
       type: 'text' as const,
-      text: `[Display 0 — model frame ${frame?.width ?? 'unknown'}x${frame?.height ?? 'unknown'}${frame?.nativeWidth && frame.nativeHeight ? `; native ${frame.nativeWidth}x${frame.nativeHeight}` : ''}; origin top-left; y increases downward]`,
+      text: `[Display ${singleIdx} — model frame ${frame?.width ?? 'unknown'}x${frame?.height ?? 'unknown'}${frame?.nativeWidth && frame.nativeHeight ? `; native ${frame.nativeWidth}x${frame.nativeHeight}` : ''}; origin top-left; y increases downward]`,
     });
     contentParts.push({ type: 'image' as const, image: imageInput.image, mediaType: imageInput.mediaType });
   }

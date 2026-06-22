@@ -40,6 +40,7 @@ import {
   splitGraphemes,
   type DictationPatchOperation,
   type DictationPatchPhase,
+  type DictationPatchPlan,
 } from './text-patch-planner.js';
 import { DictationQueuedPartialGate } from './typing-revision-gate.js';
 import {
@@ -636,6 +637,19 @@ async function startDictationInner(): Promise<void> {
         targetPid: beginResponse.targetPid,
         targetName: beginResponse.targetName,
       });
+      const hardErrorCodes = new Set(['accessibility', 'secure_field', 'target_app', 'cursor_unverified']);
+      if (
+        beginResponse.errorCode &&
+        hardErrorCodes.has(beginResponse.errorCode) &&
+        !canAllowBlindKeyboardFullPatchConfig()
+      ) {
+        broadcastError(
+          beginResponse.error ??
+            `Dictation could not verify the target text field (${beginResponse.errorCode}). Enable blind keyboard mode to dictate here anyway.`,
+        );
+        await nativeSession?.endSession().catch(() => {});
+        return;
+      }
     }
     applyNativeSessionResponse(beginResponse);
     if (nativeSession) {
@@ -2215,6 +2229,48 @@ async function retargetBeforeFirstBlindKeyboardPatch(currentText: string): Promi
   return Boolean(axDictationSpan);
 }
 
+const TERMINAL_LIKE_APP_NAMES = new Set([
+  'terminal',
+  'iterm',
+  'iterm2',
+  'kitty',
+  'alacritty',
+  'wezterm',
+  'warp',
+  'ghostty',
+  'hyper',
+]);
+const TERMINAL_LIKE_BUNDLE_IDS = new Set([
+  'com.apple.terminal',
+  'com.googlecode.iterm2',
+  'net.kovidgoyal.kitty',
+  'io.alacritty',
+  'com.github.wez.wezterm',
+  'dev.warp.warp-stable',
+  'com.mitchellh.ghostty',
+  'co.zeit.hyper',
+]);
+
+function isTerminalLikeDictationTarget(): boolean {
+  const name = getDictationTargetAppName()?.toLowerCase() ?? '';
+  const bundle = getDictationTargetBundleId()?.toLowerCase() ?? '';
+  return TERMINAL_LIKE_APP_NAMES.has(name) || TERMINAL_LIKE_BUNDLE_IDS.has(bundle);
+}
+
+function downgradePatchToTailRewrite(currentText: string, targetText: string): DictationPatchPlan {
+  const cur = splitGraphemes(currentText);
+  const tgt = splitGraphemes(targetText);
+  let prefix = 0;
+  const max = Math.min(cur.length, tgt.length);
+  while (prefix < max && cur[prefix] === tgt[prefix]) prefix++;
+  return {
+    kind: 'tailRewrite',
+    backspaceCount: cur.length - prefix,
+    text: tgt.slice(prefix).join(''),
+    targetText,
+  };
+}
+
 async function applyKeyboardPatchPlan(
   currentText: string,
   targetText: string,
@@ -2225,7 +2281,14 @@ async function applyKeyboardPatchPlan(
   axDebug(
     `applyPatch: using ${allowUnverifiedKeyboard ? 'blind KX' : 'verified KB'} patch (phase=${phase} currentLen=${currentText.length} targetLen=${targetText.length})`,
   );
-  const plan = planDictationTextPatch(currentText, targetText, phase);
+  let plan = planDictationTextPatch(currentText, targetText, phase);
+
+  // Terminal emulators move the caret by codepoint/cell rather than grapheme
+  // cluster, so arrow-key-based 'patch' plans can desync. Downgrade to a tail
+  // rewrite (backspace + retype) which only relies on backspace semantics.
+  if (plan.kind === 'patch' && isTerminalLikeDictationTarget()) {
+    plan = downgradePatchToTailRewrite(currentText, targetText);
+  }
 
   let applied = false;
   let mutationAttempted = false;
@@ -2484,6 +2547,11 @@ async function replaceDictatedTextViaAx(targetText: string): Promise<boolean> {
     args.push(axDictationSpan.pid != null ? String(axDictationSpan.pid) : '');
     args.push(encodeElementSignature(axDictationSpan.elementSignature));
     const result = await runDictationHelperCommand(args, 'replaceTextAtomically');
+    if (result.cursorSet === false) {
+      suppressAxForCurrentUtterance('AX replacement applied but cursor could not be repositioned');
+      axDebug('replaceViaAx: cursorSet=false, suppressing AX until next final');
+      return false;
+    }
     updateAxDictationSpanLength(targetText, result.textUtf16Length);
     await refreshAxDictationSpanElementSignatureAfterMutation('replaceViaAx');
     axDebug(`replaceViaAx OK: method=${result.method ?? 'unknown'} newTypedLen=${axDictationSpan.typedUtf16Length}`);

@@ -19,6 +19,7 @@ export type ActiveWindowInfo = {
 
 export type TextFieldSnapshot = {
   value: string;
+  /** Selection offsets are UTF-16 code units (JS `String.length` semantics). Adapters whose native API uses codepoint or grapheme offsets must convert. */
   selectionStart: number;
   selectionEnd: number;
   /** Stable identifier for the focused element so callers can detect focus drift. */

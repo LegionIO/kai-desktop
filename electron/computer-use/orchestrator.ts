@@ -4,7 +4,7 @@ import type {
   ComputerUseApprovalMode,
   ComputerUseEvent,
 } from '../../shared/computer-use.js';
-import { makeComputerUseId, nowIso } from '../../shared/computer-use.js';
+import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../shared/computer-use.js';
 import type { AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveModelForThread, type ModelCatalogEntry } from '../agent/model-catalog.js';
 import { anthropicPlanSession } from './provider-adapters/anthropic.js';
@@ -104,7 +104,9 @@ function approvalRequired(mode: ComputerUseApprovalMode, action: ComputerActionP
   return action.requiresApproval;
 }
 
-function getStartingCursor(action: ComputerActionProposal): { x: number; y: number; visible: true } | undefined {
+function getStartingCursor(
+  action: ComputerActionProposal,
+): { x: number; y: number; visible: true; displayIndex?: number } | undefined {
   // For pointer actions, eagerly set the cursor to the target position so the
   // overlay indicator starts animating toward it immediately (before the action
   // completes). For drag, start at the drag origin; the end position is set
@@ -116,7 +118,7 @@ function getStartingCursor(action: ComputerActionProposal): { x: number; y: numb
     action.kind === 'drag'
   ) {
     if (action.x == null || action.y == null) return undefined;
-    return { x: action.x, y: action.y, visible: true };
+    return { x: action.x, y: action.y, visible: true, displayIndex: action.displayIndex };
   }
   return undefined;
 }
@@ -598,7 +600,10 @@ export class ComputerUseOrchestrator {
       }
     }
 
-    const actionDisplayIndex = action.displayIndex ?? 0;
+    const actionDisplayIndex =
+      action.displayIndex ??
+      result.cursor?.displayIndex ??
+      primaryDisplayIndex(this.readSession(sessionId)?.displayLayout);
     const cursor = result.cursor
       ? {
           x: result.cursor.x ?? this.readSession(sessionId)?.cursor?.x ?? action.endX ?? action.x ?? 0,

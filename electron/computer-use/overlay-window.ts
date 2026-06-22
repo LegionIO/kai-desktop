@@ -188,13 +188,16 @@ export function createOverlayWindow(
     }
   }
 
-  return firstWin ?? (() => {
-    // Absolute fallback: create on primary
-    const pd = screen.getPrimaryDisplay();
-    const win = createSingleOverlay(sessionId, 'primary', pd.bounds);
-    windowMap.set('primary', win);
-    return win;
-  })();
+  return (
+    firstWin ??
+    (() => {
+      // Absolute fallback: create on primary
+      const pd = screen.getPrimaryDisplay();
+      const win = createSingleOverlay(sessionId, 'primary', pd.bounds);
+      windowMap.set('primary', win);
+      return win;
+    })()
+  );
 }
 
 /**
@@ -214,15 +217,24 @@ export function updateOverlayState(sessionId: string, state: ComputerOverlayStat
   for (const [displayKey, win] of windowMap) {
     if (win.isDestroyed()) continue;
 
-    // Find this overlay's display info from layout or Electron
+    // Find this overlay's display info from the captured layout (Swift sort
+    // order). Electron's display order is not guaranteed to match, so only
+    // fall back to it for screen dimensions, never for display index.
     const thisDisplay = displays?.find((d) => d.displayId === displayKey);
     const thisElectronDisplay = electronDisplays.find((ed) => String(ed.id) === displayKey);
-    const thisDisplayIndex = thisDisplay?.displayIndex ?? electronDisplays.indexOf(thisElectronDisplay!);
+    const thisDisplayIndex = thisDisplay?.displayIndex;
+
+    if (thisDisplayIndex == null && displays && displays.length > 0) {
+      console.warn('[overlay] no displayLayout match for overlay display', displayKey);
+    }
 
     // Only show cursor on the overlay that matches the cursor's target display
-    const cursorForOverlay = state.cursor?.visible && cursorDisplayIndex === thisDisplayIndex
-      ? state.cursor
-      : state.cursor ? { ...state.cursor, visible: false } : undefined;
+    const cursorForOverlay =
+      state.cursor?.visible && thisDisplayIndex != null && cursorDisplayIndex === thisDisplayIndex
+        ? state.cursor
+        : state.cursor
+          ? { ...state.cursor, visible: false }
+          : undefined;
 
     // Screen dimensions for this overlay's display
     const overlayScreenWidth = thisDisplay?.logicalWidth ?? thisElectronDisplay?.bounds.width ?? state.screenWidth;

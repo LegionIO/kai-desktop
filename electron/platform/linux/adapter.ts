@@ -104,6 +104,30 @@ export async function probeLinuxTools(): Promise<LinuxToolProbe> {
   };
 }
 
+function codepointOffsetToUtf16(value: string, codepointOffset: number): number {
+  if (codepointOffset <= 0) return 0;
+  let utf16 = 0;
+  let seen = 0;
+  for (const ch of value) {
+    if (seen >= codepointOffset) break;
+    utf16 += ch.length;
+    seen++;
+  }
+  return utf16;
+}
+
+function utf16OffsetToCodepoint(value: string, utf16Offset: number): number {
+  if (utf16Offset <= 0) return 0;
+  let utf16 = 0;
+  let codepoints = 0;
+  for (const ch of value) {
+    if (utf16 >= utf16Offset) break;
+    utf16 += ch.length;
+    codepoints++;
+  }
+  return codepoints;
+}
+
 export class LinuxAdapter implements NativePlatformAdapter {
   readonly kind = 'linux' as const;
 
@@ -279,7 +303,15 @@ export class LinuxAdapter implements NativePlatformAdapter {
     if (!this.resolvedCapabilities.textIntrospection) return null;
     const helper = this.getAtspiHelper();
     if (!helper) return null;
-    return helper.call<TextFieldSnapshot>('readTextField', undefined, 5000).catch(() => null);
+    const raw = await helper.call<TextFieldSnapshot>('readTextField', undefined, 5000).catch(() => null);
+    if (!raw) return null;
+    // AT-SPI reports caret/selection in Unicode codepoint offsets; normalize to
+    // UTF-16 code units per the TextFieldSnapshot contract.
+    return {
+      ...raw,
+      selectionStart: codepointOffsetToUtf16(raw.value, raw.selectionStart),
+      selectionEnd: codepointOffsetToUtf16(raw.value, raw.selectionEnd),
+    };
   }
 
   async writeFocusedTextField(value: string, selectionStart?: number, selectionEnd?: number): Promise<boolean> {
@@ -288,7 +320,15 @@ export class LinuxAdapter implements NativePlatformAdapter {
     const helper = this.getAtspiHelper();
     if (!helper) return false;
     const r = await helper
-      .call<{ ok: boolean }>('writeTextField', { value, selectionStart, selectionEnd }, 5000)
+      .call<{ ok: boolean }>(
+        'writeTextField',
+        {
+          value,
+          selectionStart: selectionStart != null ? utf16OffsetToCodepoint(value, selectionStart) : undefined,
+          selectionEnd: selectionEnd != null ? utf16OffsetToCodepoint(value, selectionEnd) : undefined,
+        },
+        5000,
+      )
       .catch(() => null);
     return r?.ok === true;
   }

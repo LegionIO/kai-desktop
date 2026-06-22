@@ -209,7 +209,7 @@ export const realSwiftHelperRunner: HelperRunner = async (subcommand, args = [])
     // available in dev after running `pnpm compile:swift`).
     const binaryPath = resolveCompiledHelperBinary();
     if (binaryPath) {
-      const { stdout } = await execFileAsync(binaryPath, fullArgs, { timeout: 15000 });
+      const { stdout } = await execFileAsync(binaryPath, fullArgs, { timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
       return { ok: true, data: JSON.parse(stdout || '{}') as LocalMacosHelperResponse };
     }
 
@@ -218,6 +218,7 @@ export const realSwiftHelperRunner: HelperRunner = async (subcommand, args = [])
     const helperScriptPath = resolveMaterializedHelperPath();
     const { stdout } = await execFileAsync('xcrun', ['swift', helperScriptPath, ...fullArgs], {
       timeout: 15000,
+      maxBuffer: 64 * 1024 * 1024,
       env: buildSwiftFallbackEnv(),
     });
     return { ok: true, data: JSON.parse(stdout || '{}') as LocalMacosHelperResponse };
@@ -589,14 +590,11 @@ export function parseDisplayInfoArray(
       displayIndex: index,
     }));
 
-  // Filter by allowed displays (by ID or name) if specified
+  // Filter by allowed displays (by ID or name) if specified. Native displayIndex is
+  // intentionally preserved so it stays aligned with the Swift helper's sort order.
   if (allowedDisplays && allowedDisplays.length > 0) {
     const allowed = new Set(allowedDisplays.map((s) => s.toLowerCase()));
     displays = displays.filter((d) => allowed.has(d.displayId.toLowerCase()) || allowed.has(d.name.toLowerCase()));
-    // Re-index after filtering
-    displays.forEach((d, i) => {
-      d.displayIndex = i;
-    });
   }
 
   return displays;

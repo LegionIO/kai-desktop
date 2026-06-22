@@ -96,6 +96,10 @@ export type ComputerDisplayLayout = {
   displays: ComputerDisplayInfo[];
 };
 
+export function primaryDisplayIndex(layout?: ComputerDisplayLayout | null): number {
+  return layout?.displays.find((d) => d.isPrimary)?.displayIndex ?? layout?.displays[0]?.displayIndex ?? 0;
+}
+
 export type ComputerInteractiveElement = {
   id: string;
   selector?: string;
@@ -177,7 +181,7 @@ export type ComputerActionProposal = {
   appName?: string;
   waitMs?: number;
   movementPath: ComputerUseMovementPath;
-  /** Which display the action targets (0-indexed). When omitted, defaults to primary (0). */
+  /** Which display the action targets (native displayIndex from the layout). When omitted, defaults to the primary display's index — see {@link primaryDisplayIndex}. */
   displayIndex?: number;
   resultSummary?: string;
   error?: string;
