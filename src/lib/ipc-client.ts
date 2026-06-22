@@ -164,6 +164,9 @@ type AppAPI = {
     onUIStateChanged: (callback: (state: unknown) => void) => () => void;
     getAvailableUpdateCount: () => Promise<number>;
     onUpdatesAvailable: (callback: (data: { count: number }) => void) => () => void;
+    getPendingRestart: () => Promise<string[]>;
+    restartApp: () => Promise<{ success: boolean }>;
+    onPendingRestartChanged: (callback: (data: { plugins: string[] }) => void) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;
     onNavigateDirect: (callback: (data: unknown) => void) => () => void;

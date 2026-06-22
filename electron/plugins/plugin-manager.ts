@@ -34,11 +34,7 @@ import type {
 } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
-import {
-  toPluginSafeConfig,
-  resolvePluginConfigView,
-  type PluginSafeConfig,
-} from './safe-config.js';
+import { toPluginSafeConfig, resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
@@ -101,12 +97,15 @@ export class PluginManager {
   private pluginAPIs: Map<string, PluginAPI> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private cliToolChangeCallback: (() => void) | null = null;
-  private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> = new Map();
+  private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> =
+    new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
   private catalogRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private lastUpdateCount = 0;
+  private pendingRestart: Set<string> = new Set();
+  private rendererLoadedThisSession: Set<string> = new Set();
 
   private brandRequiredPluginNamesSet: Set<string>;
 
@@ -221,9 +220,7 @@ export class PluginManager {
     if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
       // Store pending consent and notify renderer
       this.pendingConsent.set(manifest.name, { manifest, fileHash });
-      const dangerousPermissions = manifest.permissions.filter((p) =>
-        PluginManager.DANGEROUS_PERMISSIONS.has(p),
-      );
+      const dangerousPermissions = manifest.permissions.filter((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
       broadcastToAllWindows('plugin:consent-required', {
         pluginName: manifest.name,
         displayName: manifest.displayName,
@@ -232,7 +229,9 @@ export class PluginManager {
         execScope: manifest.execScope,
         fileHash,
       });
-      console.info(`[PluginManager] Plugin "${manifest.name}" requires user consent for: ${manifest.permissions.join(', ')}`);
+      console.info(
+        `[PluginManager] Plugin "${manifest.name}" requires user consent for: ${manifest.permissions.join(', ')}`,
+      );
       return false; // Block loading until user consents
     }
     return true;
@@ -280,7 +279,8 @@ export class PluginManager {
       const installedInfo = this.getConfig().marketplace?.installedPlugins?.[manifest.name];
       if (!installedInfo?.fileHash || installedInfo.fileHash !== fileHash) return false;
       if (installedInfo.version !== manifest.version) return false;
-      if (!installedInfo.permissions || !arePermissionSetsEqual(installedInfo.permissions, manifest.permissions)) return false;
+      if (!installedInfo.permissions || !arePermissionSetsEqual(installedInfo.permissions, manifest.permissions))
+        return false;
 
       const entry = this.marketplaceService.getCachedCatalog()?.find((plugin) => plugin.name === manifest.name);
       if (entry && entry.version !== manifest.version) return false;
@@ -291,9 +291,11 @@ export class PluginManager {
     }
 
     const bundledIntegrity = getBundledPluginIntegrity(manifest.name);
-    return bundledIntegrity?.fileHash === fileHash
-      && bundledIntegrity.version === manifest.version
-      && arePermissionSetsEqual(bundledIntegrity.permissions, manifest.permissions);
+    return (
+      bundledIntegrity?.fileHash === fileHash &&
+      bundledIntegrity.version === manifest.version &&
+      arePermissionSetsEqual(bundledIntegrity.permissions, manifest.permissions)
+    );
   }
 
   private getMarketplaceExpectedFileHash(entry: MarketplaceCatalogEntry): string | undefined {
@@ -424,7 +426,7 @@ export class PluginManager {
       }
 
       const moduleUrl = `${pathToFileURL(backendPath).href}?v=${instance.fileHash}`;
-      const mod = await import(moduleUrl) as PluginModule;
+      const mod = (await import(moduleUrl)) as PluginModule;
       instance.module = mod;
 
       const api = createPluginAPI(instance, {
@@ -478,6 +480,7 @@ export class PluginManager {
           pluginDir: dir,
           rendererPath: 'frontend.js',
         });
+        this.rendererLoadedThisSession.add(manifest.name);
       }
 
       instance.state = 'active';
@@ -638,7 +641,11 @@ export class PluginManager {
           const dir = join(this.appHome, 'plugin-settings', pluginName);
           mkdirSync(dir, { recursive: true });
           writeFileSync(settingsPath, legacyData, 'utf-8');
-          try { unlinkSync(legacyPath); } catch { /* best-effort cleanup */ }
+          try {
+            unlinkSync(legacyPath);
+          } catch {
+            /* best-effort cleanup */
+          }
           console.info(`[PluginManager] Migrated settings for "${pluginName}" from plugin dir to ${settingsPath}`);
         } catch (err) {
           console.warn(`[PluginManager] Failed to migrate legacy settings for "${pluginName}":`, err);
@@ -864,7 +871,9 @@ export class PluginManager {
     return result;
   }
 
-  async runPostReceiveHooks(args: Omit<PostReceiveHookArgs, 'config'> & { config: AppConfig }): Promise<PostReceiveHookResult> {
+  async runPostReceiveHooks(
+    args: Omit<PostReceiveHookArgs, 'config'> & { config: AppConfig },
+  ): Promise<PostReceiveHookResult> {
     let result: PostReceiveHookResult = { response: args.response };
 
     const safeConfig = toPluginSafeConfig(args.config);
@@ -1184,8 +1193,7 @@ export class PluginManager {
     // Annotate with current load status from PluginManager
     return catalog.map((entry) => {
       const installed =
-        this.plugins.has(entry.name) ||
-        this.marketplaceService!.getInstalledPluginNames().includes(entry.name);
+        this.plugins.has(entry.name) || this.marketplaceService!.getInstalledPluginNames().includes(entry.name);
 
       // installedVersion may be absent when a plugin was installed manually (not via
       // marketplace) or when the cache predates version tracking.  Fall back to the
@@ -1242,6 +1250,43 @@ export class PluginManager {
     }
   }
 
+  getPendingRestart(): string[] {
+    return [...this.pendingRestart];
+  }
+
+  private markPendingRestart(pluginName: string): void {
+    if (this.pendingRestart.has(pluginName)) return;
+    this.pendingRestart.add(pluginName);
+    broadcastToAllWindows('plugin:pending-restart-changed', { plugins: this.getPendingRestart() });
+  }
+
+  private clearPendingRestart(pluginName: string): void {
+    if (!this.pendingRestart.delete(pluginName)) return;
+    broadcastToAllWindows('plugin:pending-restart-changed', { plugins: this.getPendingRestart() });
+  }
+
+  private async reloadInstalledPlugin(pluginName: string): Promise<void> {
+    // Renderer-side plugin modules are cached by URL in the renderer process and
+    // won't re-import after a backend hot-reload (and stay registered even if a
+    // later version drops its frontend), so once a renderer bundle has shipped
+    // for this plugin in this session, any subsequent update needs a full app
+    // restart for the frontend to match. Backend-only load failures are NOT
+    // flagged here — restarting reproduces the same error, and the plugin's own
+    // error state already surfaces it.
+    const hadPriorRenderer = this.rendererLoadedThisSession.has(pluginName);
+
+    const newPlugin = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
+    if (newPlugin) {
+      await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
+    }
+
+    if (hadPriorRenderer) {
+      this.markPendingRestart(pluginName);
+    } else if (this.plugins.get(pluginName)?.state === 'active') {
+      this.clearPendingRestart(pluginName);
+    }
+  }
+
   async installFromMarketplace(pluginName: string, opts?: { skipHashCheck?: boolean }): Promise<void> {
     if (!this.marketplaceService) {
       throw new Error('Marketplace is not initialized');
@@ -1266,11 +1311,7 @@ export class PluginManager {
     await this.marketplaceService.installPlugin(entry, opts);
 
     // Discover and load the newly installed plugin
-    const discovered = this.discoverPlugins();
-    const newPlugin = discovered.find((d) => d.manifest.name === pluginName);
-    if (newPlugin) {
-      await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
-    }
+    await this.reloadInstalledPlugin(pluginName);
 
     // Update count changed since we just installed/updated a plugin
     this.broadcastUpdateCount();
@@ -1281,7 +1322,13 @@ export class PluginManager {
       throw new Error('Marketplace is not initialized');
     }
 
-    if (!pluginName || pluginName.includes('/') || pluginName.includes('\\') || pluginName === '.' || pluginName === '..') {
+    if (
+      !pluginName ||
+      pluginName.includes('/') ||
+      pluginName.includes('\\') ||
+      pluginName === '.' ||
+      pluginName === '..'
+    ) {
       throw new Error('Invalid plugin name');
     }
 
@@ -1293,6 +1340,7 @@ export class PluginManager {
 
     this.marketplaceService.uninstallPlugin(pluginName);
 
+    this.clearPendingRestart(pluginName);
     this.broadcastUIState();
     this.notifyToolsChanged();
   }
@@ -1305,10 +1353,19 @@ export class PluginManager {
 
     const catalog = await this.marketplaceService.fetchCatalog(urls);
     if (this.brandRequiredPluginNames.length > 0) {
-      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
-      return this.marketplaceService.getCachedCatalog() ?? catalog;
+      // Reload after install (not before) so a failed background download leaves the
+      // currently-running required plugin intact instead of silently disabling it.
+      const updated = await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
+        afterInstall: async (name) => {
+          await this.unloadPlugin(name);
+          await this.reloadInstalledPlugin(name);
+        },
+      });
+      if (updated.length > 0) {
+        this.broadcastUpdateCount();
+      }
     }
-    return catalog;
+    return this.getMarketplaceCatalog();
   }
 
   private getMarketplaceUrls(): string[] {
@@ -1337,7 +1394,7 @@ export class PluginManager {
       throw new Error('Conversation id is required');
     }
 
-    store.conversations[conversationId] = conversation as typeof store.conversations[string];
+    store.conversations[conversationId] = conversation as (typeof store.conversations)[string];
     writeConversationStore(this.appHome, store);
     broadcastConversationChange(store);
   }
@@ -1366,13 +1423,15 @@ export class PluginManager {
     const messageId = `plugin-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = message.createdAt ?? new Date().toISOString();
     const normalizedRole = message.role === 'user' ? 'user' : 'assistant';
-    const normalizedContent = typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : Array.isArray(message.content)
-        ? message.content
-        : [];
-    const parentId = message.parentId
-      ?? (Array.isArray(conversation.messages) && conversation.messages.length > 0
+    const normalizedContent =
+      typeof message.content === 'string'
+        ? [{ type: 'text', text: message.content }]
+        : Array.isArray(message.content)
+          ? message.content
+          : [];
+    const parentId =
+      message.parentId ??
+      (Array.isArray(conversation.messages) && conversation.messages.length > 0
         ? ((conversation.messages[conversation.messages.length - 1] as { id?: string }).id ?? null)
         : null);
 
@@ -1396,9 +1455,8 @@ export class PluginManager {
       lastMessageAt: createdAt,
       lastAssistantUpdateAt: normalizedRole === 'assistant' ? createdAt : conversation.lastAssistantUpdateAt,
       messageCount: nextMessages.length,
-      userMessageCount: normalizedRole === 'user'
-        ? (conversation.userMessageCount ?? 0) + 1
-        : conversation.userMessageCount ?? 0,
+      userMessageCount:
+        normalizedRole === 'user' ? (conversation.userMessageCount ?? 0) + 1 : (conversation.userMessageCount ?? 0),
       hasUnread: normalizedRole === 'assistant' ? true : conversation.hasUnread,
     };
 

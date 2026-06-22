@@ -1,4 +1,5 @@
 import type { IpcMain } from 'electron';
+import { app } from 'electron';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { UnverifiedPluginError } from '../plugins/marketplace-service.js';
 
@@ -20,33 +21,42 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return { success: true };
   });
 
-  ipcMain.handle('plugin:modal-action', async (_event, pluginName: string, modalId: string, action: string, data?: unknown) => {
-    return pluginManager.handleAction({
-      pluginName,
-      targetId: modalId,
-      action,
-      data,
-    });
-  });
+  ipcMain.handle(
+    'plugin:modal-action',
+    async (_event, pluginName: string, modalId: string, action: string, data?: unknown) => {
+      return pluginManager.handleAction({
+        pluginName,
+        targetId: modalId,
+        action,
+        data,
+      });
+    },
+  );
 
-  ipcMain.handle('plugin:banner-action', async (_event, pluginName: string, bannerId: string, action: string, data?: unknown) => {
-    return pluginManager.handleAction({
-      pluginName,
-      targetId: bannerId,
-      action,
-      data,
-    });
-  });
+  ipcMain.handle(
+    'plugin:banner-action',
+    async (_event, pluginName: string, bannerId: string, action: string, data?: unknown) => {
+      return pluginManager.handleAction({
+        pluginName,
+        targetId: bannerId,
+        action,
+        data,
+      });
+    },
+  );
 
   // Generic plugin action dispatch (for settings sections and any plugin-defined targets)
-  ipcMain.handle('plugin:action', async (_event, pluginName: string, targetId: string, action: string, data?: unknown) => {
-    return pluginManager.handleAction({
-      pluginName,
-      targetId,
-      action,
-      data,
-    });
-  });
+  ipcMain.handle(
+    'plugin:action',
+    async (_event, pluginName: string, targetId: string, action: string, data?: unknown) => {
+      return pluginManager.handleAction({
+        pluginName,
+        targetId,
+        action,
+        data,
+      });
+    },
+  );
 
   // ── Marketplace ──
 
@@ -88,6 +98,18 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
 
   ipcMain.handle('plugin:available-update-count', () => {
     return pluginManager.getAvailableUpdateCount();
+  });
+
+  ipcMain.handle('plugin:pending-restart', () => {
+    return pluginManager.getPendingRestart();
+  });
+
+  ipcMain.handle('plugin:restart-app', () => {
+    setTimeout(() => {
+      app.relaunch();
+      app.quit();
+    }, 200);
+    return { success: true };
   });
 
   // ── Permission Consent ──

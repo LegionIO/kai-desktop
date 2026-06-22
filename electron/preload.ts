@@ -232,6 +232,13 @@ const appAPI = {
       ipcRenderer.on('plugin:updates-available', handler);
       return () => ipcRenderer.removeListener('plugin:updates-available', handler);
     },
+    getPendingRestart: () => ipcRenderer.invoke('plugin:pending-restart') as Promise<string[]>,
+    restartApp: () => ipcRenderer.invoke('plugin:restart-app') as Promise<{ success: boolean }>,
+    onPendingRestartChanged: (callback: (data: { plugins: string[] }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: { plugins: string[] }) => callback(data);
+      ipcRenderer.on('plugin:pending-restart-changed', handler);
+      return () => ipcRenderer.removeListener('plugin:pending-restart-changed', handler);
+    },
     onEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('plugin:event', handler);

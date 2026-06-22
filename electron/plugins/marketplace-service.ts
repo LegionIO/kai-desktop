@@ -4,7 +4,12 @@ import { createHash } from 'crypto';
 import { execFile } from 'child_process';
 import { net } from 'electron';
 import type { AppConfig } from '../config/schema.js';
-import { arePermissionSetsEqual, getPluginIntegrity, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
+import {
+  arePermissionSetsEqual,
+  getPluginIntegrity,
+  hashPluginDirectory,
+  readPluginManifest,
+} from './plugin-integrity.js';
 import type { PluginIntegrity } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
 import type { CompatCheckResult } from './plugin-compat.js';
@@ -114,9 +119,9 @@ export class MarketplaceService {
     const fetchUrl = bustCache ? `${url}?_=${Date.now()}` : url;
     const response = await net.fetch(fetchUrl, {
       headers: {
-        'Accept': 'application/json',
+        Accept: 'application/json',
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
+        Pragma: 'no-cache',
       },
     });
 
@@ -124,7 +129,7 @@ export class MarketplaceService {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
 
-    const data = await response.json() as MarketplaceCatalog;
+    const data = (await response.json()) as MarketplaceCatalog;
     if (!data.plugins || !Array.isArray(data.plugins)) {
       throw new Error('Invalid marketplace catalog: missing plugins array');
     }
@@ -188,7 +193,8 @@ export class MarketplaceService {
       // Download pre-built tarball
       const tag = `v${entry.version}`;
       const assetName = `${entry.name}-v${entry.version}.tar.gz`;
-      const isGitHub = entry.marketplaceUrl.includes('github.com') || entry.marketplaceUrl.includes('raw.githubusercontent.com');
+      const isGitHub =
+        entry.marketplaceUrl.includes('github.com') || entry.marketplaceUrl.includes('raw.githubusercontent.com');
 
       let tarballUrl: string;
       let headers: Record<string, string> = {};
@@ -209,7 +215,7 @@ export class MarketplaceService {
           throw new Error(`Failed to find release "${tag}" for plugin "${entry.name}": HTTP ${releaseResp.status}`);
         }
 
-        const releaseData = await releaseResp.json() as { assets: Array<{ name: string; url: string }> };
+        const releaseData = (await releaseResp.json()) as { assets: Array<{ name: string; url: string }> };
         const asset = releaseData.assets.find((a) => a.name === assetName);
         if (!asset) {
           throw new Error(`Release "${tag}" for plugin "${entry.name}" has no asset named "${assetName}"`);
@@ -255,7 +261,11 @@ export class MarketplaceService {
       });
 
       // Remove tarball from extracted directory
-      try { rmSync(tarballPath); } catch { /* ignore */ }
+      try {
+        rmSync(tarballPath);
+      } catch {
+        /* ignore */
+      }
 
       // Check for plugin.json in extracted content
       if (!existsSync(join(tmpDir, 'plugin.json'))) {
@@ -318,7 +328,11 @@ export class MarketplaceService {
       };
     } catch (err) {
       // Clean up temp directory on failure
-      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
       throw err;
     }
   }
@@ -380,9 +394,7 @@ export class MarketplaceService {
     // Update cached catalog
     if (this.cachedCatalog) {
       this.cachedCatalog = this.cachedCatalog.map((entry) =>
-        entry.name === pluginName
-          ? { ...entry, installed: false, installedVersion: undefined }
-          : entry,
+        entry.name === pluginName ? { ...entry, installed: false, installedVersion: undefined } : entry,
       );
     }
 
@@ -391,7 +403,12 @@ export class MarketplaceService {
 
   /* ── Auto-install required plugins ── */
 
-  async autoInstallRequired(requiredNames: Set<string>, catalog: MarketplaceCatalogEntry[]): Promise<void> {
+  async autoInstallRequired(
+    requiredNames: Set<string>,
+    catalog: MarketplaceCatalogEntry[],
+    hooks?: { afterInstall?: (name: string) => Promise<void> },
+  ): Promise<string[]> {
+    const installed: string[] = [];
     for (const name of requiredNames) {
       const entry = catalog.find((p) => p.name === name);
       if (!entry) {
@@ -405,10 +422,13 @@ export class MarketplaceService {
 
         console.info(`[Marketplace] Auto-installing required plugin "${name}" (${reason})...`);
         await this.installPlugin(entry);
+        installed.push(name);
+        await hooks?.afterInstall?.(name);
       } catch (err) {
         console.error(`[Marketplace] Failed to auto-install required plugin "${name}":`, err);
       }
     }
+    return installed;
   }
 
   /* ── Helpers ── */
@@ -443,11 +463,16 @@ export class MarketplaceService {
     if (installedInfo?.fileHash && installed.fileHash !== installedInfo.fileHash) return 'local files changed';
     if (!installedInfo?.fileHash) return 'untrusted install metadata';
     if (!installedInfo.permissions) return 'untrusted permission metadata';
-    if (installedInfo.version !== entry.version || installed.version !== entry.version) return `update available ${installedInfo.version ?? installed.version} -> ${entry.version}`;
+    if (installedInfo.version !== entry.version || installed.version !== entry.version)
+      return `update available ${installedInfo.version ?? installed.version} -> ${entry.version}`;
     if (!arePermissionSetsEqual(installedInfo.permissions, installed.permissions)) return 'permissions changed';
 
     const approval = this.getConfig().pluginApprovals?.[entry.name];
-    if (!approval || approval.hash !== installed.fileHash || !arePermissionSetsEqual(approval.permissions, installed.permissions)) {
+    if (
+      !approval ||
+      approval.hash !== installed.fileHash ||
+      !arePermissionSetsEqual(approval.permissions, installed.permissions)
+    ) {
       const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
       const hasDangerous = installed.permissions.some((p) => DANGEROUS_PERMISSIONS.has(p));
       if (isBrandRequired || !hasDangerous) {

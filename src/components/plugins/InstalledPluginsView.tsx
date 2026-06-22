@@ -15,6 +15,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
+import { PluginRestartBanner } from '@/components/plugins/PluginRestartBanner';
 import { usePlugins } from '@/providers/PluginProvider';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
@@ -67,7 +68,12 @@ interface InstalledPluginsViewProps {
   onOpenPluginSettings: (pluginName: string) => void;
 }
 
-export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMarketplace, onNavigate, onOpenPluginError, onOpenPluginSettings }) => {
+export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
+  onOpenMarketplace,
+  onNavigate,
+  onOpenPluginError,
+  onOpenPluginSettings,
+}) => {
   const { uiState } = usePlugins();
   const fullWidth = useFullWidthContent();
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
@@ -75,7 +81,10 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const [loading, setLoading] = useState(true);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { const t = setTimeout(() => searchRef.current?.focus(), 50); return () => clearTimeout(t); }, []);
+  useEffect(() => {
+    const t = setTimeout(() => searchRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
@@ -98,7 +107,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   // Refresh marketplace catalog in the background when view is shown (throttled to 30 min)
   useEffect(() => {
@@ -108,18 +119,21 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const catalogMap = new Map(catalog.map((e) => [e.name, e]));
   const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
 
-  const handlePluginClick = useCallback((plugin: InstalledPlugin) => {
-    if (plugin.state === 'error') {
-      onOpenPluginError(plugin.name);
-      return;
-    }
-    const navItem = navigationItems.find((n) => n.pluginName === plugin.name);
-    if (navItem) {
-      onNavigate(navItem.pluginName, navItem.target);
-    } else {
-      onNavigate(plugin.name, { type: 'panel', panelId: 'default' });
-    }
-  }, [navigationItems, onNavigate, onOpenPluginError]);
+  const handlePluginClick = useCallback(
+    (plugin: InstalledPlugin) => {
+      if (plugin.state === 'error') {
+        onOpenPluginError(plugin.name);
+        return;
+      }
+      const navItem = navigationItems.find((n) => n.pluginName === plugin.name);
+      if (navItem) {
+        onNavigate(navItem.pluginName, navItem.target);
+      } else {
+        onNavigate(plugin.name, { type: 'panel', panelId: 'default' });
+      }
+    },
+    [navigationItems, onNavigate, onOpenPluginError],
+  );
 
   const handleInstall = async (pluginName: string) => {
     setInstallingPlugins((prev) => new Set([...prev, pluginName]));
@@ -166,10 +180,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
   const filteredPlugins = searchQuery.trim()
     ? plugins.filter((p) => {
         const q = searchQuery.toLowerCase();
-        return (
-          (p.displayName || p.name).toLowerCase().includes(q) ||
-          p.description.toLowerCase().includes(q)
-        );
+        return (p.displayName || p.name).toLowerCase().includes(q) || p.description.toLowerCase().includes(q);
       })
     : plugins;
 
@@ -195,7 +206,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
               placeholder="Search plugins…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Escape') setSearchQuery(''); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setSearchQuery('');
+              }}
               className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
             />
             {searchQuery && (
@@ -227,15 +240,23 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
 
         {/* "Installed (N)" label floats above the fade */}
         {plugins.length > 0 && (
-          <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-10 flex items-center', !fullWidth && 'max-w-3xl')}>
+          <div
+            className={cn(
+              'absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-10 flex items-center',
+              !fullWidth && 'max-w-3xl',
+            )}
+          >
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-              Installed ({filteredPlugins.length}{filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
+              Installed ({filteredPlugins.length}
+              {filteredPlugins.length !== plugins.length ? ` of ${plugins.length}` : ''})
             </p>
           </div>
         )}
 
         <div className="h-full overflow-y-auto">
           <div className={cn('mx-auto w-full px-4 pt-10 pb-6 space-y-3', !fullWidth && 'max-w-3xl')}>
+            <PluginRestartBanner />
+
             {/* Error banner */}
             {error && (
               <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3">
@@ -278,9 +299,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                 {filteredPlugins.map((plugin) => {
                   const catalogEntry = catalogMap.get(plugin.name);
                   const hasUpdate =
-                    catalogEntry &&
-                    catalogEntry.version &&
-                    isNewerVersion(catalogEntry.version, plugin.version);
+                    catalogEntry && catalogEntry.version && isNewerVersion(catalogEntry.version, plugin.version);
 
                   return (
                     <div
@@ -288,7 +307,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                       role="button"
                       tabIndex={0}
                       onClick={() => handlePluginClick(plugin)}
-                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handlePluginClick(plugin); }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') handlePluginClick(plugin);
+                      }}
                       className="flex items-center gap-3 rounded-xl border border-border/70 bg-card/50 px-4 py-3 min-h-[80px] cursor-pointer transition-colors hover:bg-card/80 hover:border-border"
                     >
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10">
@@ -309,8 +330,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                           <span className="text-[10px] text-muted-foreground">v{plugin.version}</span>
                           {hasUpdate && (
                             <span className="flex items-center gap-1 rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold text-blue-400">
-                              <ArrowUpCircleIcon className="h-2.5 w-2.5" />
-                              v{catalogEntry.version} available
+                              <ArrowUpCircleIcon className="h-2.5 w-2.5" />v{catalogEntry.version} available
                             </span>
                           )}
                           {plugin.brandRequired && (
@@ -321,16 +341,17 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                           )}
                         </div>
                         <p className="line-clamp-2 text-[11px] text-muted-foreground">{plugin.description}</p>
-                        {plugin.error && (
-                          <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>
-                        )}
+                        {plugin.error && <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>}
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         {hasUpdate && (
                           <Tooltip content={`Update to v${catalogEntry.version}`} side="bottom">
                             <button
                               type="button"
-                              onClick={(e) => { e.stopPropagation(); void handleInstall(plugin.name); }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleInstall(plugin.name);
+                              }}
                               disabled={installingPlugins.has(plugin.name)}
                               className="flex items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
                             >
@@ -347,7 +368,10 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                           <Tooltip content="Settings" side="bottom">
                             <button
                               type="button"
-                              onClick={(e) => { e.stopPropagation(); onOpenPluginSettings(plugin.name); }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenPluginSettings(plugin.name);
+                              }}
                               className="flex items-center justify-center rounded-lg border border-border/60 bg-muted/30 p-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
                             >
                               <Settings2Icon className="h-3.5 w-3.5" />
@@ -358,7 +382,10 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                           <Tooltip content="Uninstall" side="bottom">
                             <button
                               type="button"
-                              onClick={(e) => { e.stopPropagation(); setConfirmUninstall(plugin); }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmUninstall(plugin);
+                              }}
                               disabled={uninstallingPlugins.has(plugin.name)}
                               className="flex items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 p-1.5 text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                             >
@@ -376,55 +403,57 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({ onOpenMark
                 })}
               </>
             )}
-
-          </div>{/* end space-y-3 */}
-        </div>{/* end overflow-y-auto */}
-      </div>{/* end relative flex-1 */}
+          </div>
+          {/* end space-y-3 */}
+        </div>
+        {/* end overflow-y-auto */}
+      </div>
+      {/* end relative flex-1 */}
 
       {/* Uninstall confirmation modal */}
-      {confirmUninstall && createPortal(
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center"
-          onClick={() => setConfirmUninstall(null)}
-        >
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      {confirmUninstall &&
+        createPortal(
           <div
-            className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 flex items-center justify-center"
+            onClick={() => setConfirmUninstall(null)}
           >
-            <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              This will uninstall{' '}
-              <span className="font-medium text-foreground">{confirmUninstall.displayName}</span>.
-              This cannot be undone.
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmUninstall(null)}
-                disabled={uninstallingPlugins.has(confirmUninstall.name)}
-                className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const name = confirmUninstall.name;
-                  setConfirmUninstall(null);
-                  void handleUninstall(name);
-                }}
-                disabled={uninstallingPlugins.has(confirmUninstall.name)}
-                className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                <TrashIcon className="h-3.5 w-3.5" />
-                Uninstall
-              </button>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                This will uninstall <span className="font-medium text-foreground">{confirmUninstall.displayName}</span>.
+                This cannot be undone.
+              </p>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmUninstall(null)}
+                  disabled={uninstallingPlugins.has(confirmUninstall.name)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const name = confirmUninstall.name;
+                    setConfirmUninstall(null);
+                    void handleUninstall(name);
+                  }}
+                  disabled={uninstallingPlugins.has(confirmUninstall.name)}
+                  className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+                >
+                  <TrashIcon className="h-3.5 w-3.5" />
+                  Uninstall
+                </button>
+              </div>
             </div>
-          </div>
-        </div>,
-        document.body,
-      )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 };
