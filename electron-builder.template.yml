@@ -22,6 +22,12 @@ files:
   - "!**/node_modules/active-win/lib/binding/napi-*-darwin-*/**"
   - "!**/node_modules/active-win/lib/binding/napi-*-linux-*/**"
   - "!**/node_modules/active-win/build-tmp-*/**"
+# smartUnpack auto-detects most native binaries, but the Codex CLI lives deep
+# under vendor/<triple>/codex/codex inside an optionalDependency and has been
+# missed — leaving it inside app.asar makes spawn() fail with ENOTDIR. List it
+# explicitly so the unpacked copy is guaranteed.
+asarUnpack:
+  - "**/@openai/codex*/**"
 extraResources:
   - from: bundled-plugins
     to: bundled-plugins

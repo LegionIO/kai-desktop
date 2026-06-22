@@ -17,30 +17,77 @@
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
 import { detectCodexSdk } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
-import {
-  buildCodexMcpPrompt,
-  buildCodexMcpServerConfig,
-  CodexMcpBridge,
-} from './codex-mcp-bridge.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { buildCodexMcpPrompt, buildCodexMcpServerConfig, CodexMcpBridge } from './codex-mcp-bridge.js';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { createRequire } from 'module';
+import { dirname, join, sep } from 'path';
 import { tmpdir } from 'os';
+
+// ---------------------------------------------------------------------------
+// Binary path resolution
+// ---------------------------------------------------------------------------
+//
+// The SDK resolves the bundled Codex CLI via require.resolve() relative to
+// import.meta.url. In a packaged app that URL is inside app.asar, so the
+// resulting path is …/app.asar/node_modules/@openai/codex-<platform>-<arch>/…
+// which spawn() rejects with ENOTDIR (app.asar is a file). Resolve the same
+// path here, redirect it to app.asar.unpacked, and hand it to the SDK as
+// codexPathOverride. Returns undefined in any case where the SDK's own
+// resolver should be left to run (dev mode, unknown platform, missing pkg).
+
+const CODEX_TARGET_TRIPLE: Partial<Record<NodeJS.Platform, Partial<Record<NodeJS.Architecture, string>>>> = {
+  darwin: { arm64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' },
+  linux: { arm64: 'aarch64-unknown-linux-musl', x64: 'x86_64-unknown-linux-musl' },
+  win32: { arm64: 'aarch64-pc-windows-msvc', x64: 'x86_64-pc-windows-msvc' },
+};
+
+const CODEX_PLATFORM_PACKAGE: Record<string, string> = {
+  'aarch64-apple-darwin': '@openai/codex-darwin-arm64',
+  'x86_64-apple-darwin': '@openai/codex-darwin-x64',
+  'aarch64-unknown-linux-musl': '@openai/codex-linux-arm64',
+  'x86_64-unknown-linux-musl': '@openai/codex-linux-x64',
+  'aarch64-pc-windows-msvc': '@openai/codex-win32-arm64',
+  'x86_64-pc-windows-msvc': '@openai/codex-win32-x64',
+};
+
+function resolveCodexExecutable(): string | undefined {
+  const triple = CODEX_TARGET_TRIPLE[process.platform]?.[process.arch];
+  const platformPackage = triple ? CODEX_PLATFORM_PACKAGE[triple] : undefined;
+  if (!triple || !platformPackage) return undefined;
+
+  try {
+    const req = createRequire(import.meta.url);
+    const codexPkg = req.resolve('@openai/codex/package.json');
+    const platformPkg = createRequire(codexPkg).resolve(`${platformPackage}/package.json`);
+    const binName = process.platform === 'win32' ? 'codex.exe' : 'codex';
+    let binaryPath = join(dirname(platformPkg), 'vendor', triple, 'codex', binName);
+
+    const asarSegment = `${sep}app.asar${sep}`;
+    if (binaryPath.includes(asarSegment)) {
+      binaryPath = binaryPath.replace(asarSegment, `${sep}app.asar.unpacked${sep}`);
+    }
+
+    return existsSync(binaryPath) ? binaryPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
 
 const CODEX_CAPABILITIES: RuntimeCapabilities = {
-  builtInTools: true,   // Codex has built-in shell, file editing, web search
-  mcpSupport: true,     // Codex supports MCP tool calls
-  toolObserver: false,  // Codex manages its own tool lifecycle
-  compaction: false,    // Codex manages context internally
-  memory: false,        // No Kai memory layer integration
-  fallback: false,      // No model fallback chain
-  multiProvider: false,  // OpenAI models only
-  subAgents: false,     // No sub-agent delegation
-  sessions: true,       // Thread resume via thread ID
-  customTools: true,   // Custom Kai tools via local MCP bridge
+  builtInTools: true, // Codex has built-in shell, file editing, web search
+  mcpSupport: true, // Codex supports MCP tool calls
+  toolObserver: false, // Codex manages its own tool lifecycle
+  compaction: false, // Codex manages context internally
+  memory: false, // No Kai memory layer integration
+  fallback: false, // No model fallback chain
+  multiProvider: false, // OpenAI models only
+  subAgents: false, // No sub-agent delegation
+  sessions: true, // Thread resume via thread ID
+  customTools: true, // Custom Kai tools via local MCP bridge
 };
 
 // ---------------------------------------------------------------------------
@@ -51,6 +98,7 @@ const CODEX_CAPABILITIES: RuntimeCapabilities = {
 type CodexClass = new (options?: {
   apiKey?: string;
   baseUrl?: string;
+  codexPathOverride?: string;
   config?: Record<string, unknown>;
   env?: Record<string, string>;
 }) => {
@@ -62,14 +110,17 @@ type CodexClass = new (options?: {
     approvalPolicy?: string;
     skipGitRepoCheck?: boolean;
   }): ThreadInstance;
-  resumeThread(id: string, options?: {
-    model?: string;
-    sandboxMode?: string;
-    workingDirectory?: string;
-    modelReasoningEffort?: string;
-    approvalPolicy?: string;
-    skipGitRepoCheck?: boolean;
-  }): ThreadInstance;
+  resumeThread(
+    id: string,
+    options?: {
+      model?: string;
+      sandboxMode?: string;
+      workingDirectory?: string;
+      modelReasoningEffort?: string;
+      approvalPolicy?: string;
+      skipGitRepoCheck?: boolean;
+    },
+  ): ThreadInstance;
 };
 
 type CodexUserInput = { type: 'text'; text: string } | { type: 'local_image'; path: string };
@@ -77,10 +128,16 @@ type CodexInput = string | CodexUserInput[];
 
 type ThreadInstance = {
   id: string | null;
-  runStreamed(input: CodexInput, options?: { signal?: AbortSignal }): Promise<{
+  runStreamed(
+    input: CodexInput,
+    options?: { signal?: AbortSignal },
+  ): Promise<{
     events: AsyncGenerator<ThreadEventAny>;
   }>;
-  run(input: CodexInput, options?: { signal?: AbortSignal }): Promise<{
+  run(
+    input: CodexInput,
+    options?: { signal?: AbortSignal },
+  ): Promise<{
     items: ThreadItemAny[];
     finalResponse: string;
     usage: { input_tokens: number; cached_input_tokens: number; output_tokens: number } | null;
@@ -130,15 +187,7 @@ export class CodexRuntime implements AgentRuntime {
   }
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
-    const {
-      conversationId,
-      config,
-      tools,
-      cwd,
-      reasoningEffort,
-      abortSignal,
-      modelAuth,
-    } = options;
+    const { conversationId, config, tools, cwd, reasoningEffort, abortSignal, modelAuth } = options;
 
     // -----------------------------------------------------------------------
     // 1. Dynamic SDK import
@@ -166,7 +215,7 @@ export class CodexRuntime implements AgentRuntime {
 
     // Map Kai approval modes to Codex approval policy
     const approvalMap: Record<string, string> = {
-      'suggest': 'on-request',
+      suggest: 'on-request',
       'auto-edit': 'on-failure',
       'full-auto': 'never',
     };
@@ -174,10 +223,10 @@ export class CodexRuntime implements AgentRuntime {
 
     // Map reasoning effort
     const effortMap: Record<string, string> = {
-      'low': 'low',
-      'medium': 'medium',
-      'high': 'high',
-      'xhigh': 'xhigh',
+      low: 'low',
+      medium: 'medium',
+      high: 'high',
+      xhigh: 'xhigh',
     };
     const modelEffort = effortMap[reasoningEffort ?? 'high'] ?? 'high';
 
@@ -207,9 +256,7 @@ export class CodexRuntime implements AgentRuntime {
     const bridge = new CodexMcpBridge();
     let bridgeUrl: string | undefined;
 
-    const customTools = tools?.filter(
-      (t) => t.source === 'plugin' || t.source === 'skill' || t.source === 'mcp',
-    );
+    const customTools = tools?.filter((t) => t.source === 'plugin' || t.source === 'skill' || t.source === 'mcp');
 
     if (customTools && customTools.length > 0) {
       try {
@@ -232,7 +279,9 @@ export class CodexRuntime implements AgentRuntime {
     // processes and avoids races between concurrent Codex runs.
     const bridgeAuthToken = bridge.getAuthToken();
     const bridgeAuthTokenEnvVar = bridge.getAuthTokenEnvVar();
+    const codexPathOverride = resolveCodexExecutable();
     const codex = new CodexCtor({
+      ...(codexPathOverride ? { codexPathOverride } : {}),
       ...(apiKey ? { apiKey } : {}),
       ...(baseUrl ? { baseUrl } : {}),
       ...(bridgeAuthToken && bridgeAuthTokenEnvVar
@@ -246,16 +295,18 @@ export class CodexRuntime implements AgentRuntime {
             },
           }
         : {}),
-      ...(bridgeUrl ? {
-        config: {
-          features: {
-            tool_search_always_defer_mcp_tools: false,
-          },
-          mcp_servers: {
-            kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
-          },
-        },
-      } : {}),
+      ...(bridgeUrl
+        ? {
+            config: {
+              features: {
+                tool_search_always_defer_mcp_tools: false,
+              },
+              mcp_servers: {
+                kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
+              },
+            },
+          }
+        : {}),
     });
 
     const threadOptions = {
@@ -274,18 +325,15 @@ export class CodexRuntime implements AgentRuntime {
       (options.conversationMetadata?.codexSdkThreadId as string | undefined) ??
       (sdkConfig.resumeThreadId as string | undefined) ??
       undefined;
-    const thread = resumeId
-      ? codex.resumeThread(resumeId, threadOptions)
-      : codex.startThread(threadOptions);
+    const thread = resumeId ? codex.resumeThread(resumeId, threadOptions) : codex.startThread(threadOptions);
 
     // -----------------------------------------------------------------------
     // 6. Stream and translate events
     // -----------------------------------------------------------------------
     try {
       // Build the effective text (with MCP tool hints if needed)
-      let effectiveText = bridgeUrl && customTools
-        ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
-        : (textPrompt ?? '');
+      let effectiveText =
+        bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
 
       // Inject prior context on runtime switch (Codex has no system prompt API)
       if (options.switchContext) {
@@ -293,12 +341,13 @@ export class CodexRuntime implements AgentRuntime {
       }
 
       // If there are images, use structured input; otherwise plain string
-      const codexInput: CodexInput = imagePaths.length > 0
-        ? [
-            ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
-            ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
-          ]
-        : effectiveText;
+      const codexInput: CodexInput =
+        imagePaths.length > 0
+          ? [
+              ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+              ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+            ]
+          : effectiveText;
 
       const { events } = await thread.runStreamed(codexInput, {
         signal: abortSignal,
@@ -321,28 +370,29 @@ export class CodexRuntime implements AgentRuntime {
       }
 
       // If resume failed (thread expired/deleted), retry with a fresh thread
-      const isThreadNotFound = resumeId &&
+      const isThreadNotFound =
+        resumeId &&
         err instanceof Error &&
         (err.message.includes('not found') ||
-         err.message.includes('expired') ||
-         err.message.includes('No thread') ||
-         err.message.includes('invalid_thread'));
+          err.message.includes('expired') ||
+          err.message.includes('No thread') ||
+          err.message.includes('invalid_thread'));
 
       if (isThreadNotFound) {
         console.warn(`[codex-runtime] Thread resume failed (id=${resumeId}), retrying with fresh thread`);
         try {
           const freshThread = codex.startThread(threadOptions);
 
-          const effectiveText = bridgeUrl && customTools
-            ? buildCodexMcpPrompt(textPrompt ?? '', customTools)
-            : (textPrompt ?? '');
+          const effectiveText =
+            bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
 
-          const codexInput: CodexInput = imagePaths.length > 0
-            ? [
-                ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
-                ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
-              ]
-            : effectiveText;
+          const codexInput: CodexInput =
+            imagePaths.length > 0
+              ? [
+                  ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+                  ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+                ]
+              : effectiveText;
 
           const { events: retryEvents } = await freshThread.runStreamed(codexInput, {
             signal: abortSignal,
@@ -381,7 +431,11 @@ export class CodexRuntime implements AgentRuntime {
       yield { conversationId, type: 'done' };
     } finally {
       if (tempImageDir) {
-        try { rmSync(tempImageDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try {
+          rmSync(tempImageDir, { recursive: true, force: true });
+        } catch {
+          /* best-effort */
+        }
       }
       // -----------------------------------------------------------------------
       // 7. Cleanup: stop the MCP bridge
@@ -394,10 +448,7 @@ export class CodexRuntime implements AgentRuntime {
     }
   }
 
-  async generateTitle(
-    _messages: unknown[],
-    _config: AppConfig,
-  ): Promise<string | null> {
+  async generateTitle(_messages: unknown[], _config: AppConfig): Promise<string | null> {
     return null;
   }
 }
@@ -412,9 +463,11 @@ export class CodexRuntime implements AgentRuntime {
  * base64 data URL to a temp file and return the paths. The caller is
  * responsible for deleting them after the stream completes.
  */
-function extractLastUserInput(
-  messages: unknown[],
-): { textPrompt: string | null; imagePaths: string[]; tempImageDir: string | null } {
+function extractLastUserInput(messages: unknown[]): {
+  textPrompt: string | null;
+  imagePaths: string[];
+  tempImageDir: string | null;
+} {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i] as { role?: string; content?: unknown } | undefined;
     if (!msg || msg.role !== 'user') continue;
@@ -456,7 +509,11 @@ function extractLastUserInput(
         }
       } catch (error) {
         if (tempImageDir) {
-          try { rmSync(tempImageDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+          try {
+            rmSync(tempImageDir, { recursive: true, force: true });
+          } catch {
+            /* best-effort */
+          }
         }
         throw error;
       }
@@ -475,7 +532,10 @@ function extractLastUserInput(
 
 function extractOpenAiApiKey(config: AppConfig): string | undefined {
   const providers = (config as Record<string, unknown>).models as Record<string, unknown> | undefined;
-  const providerMap = (providers?.providers ?? {}) as Record<string, { type?: string; apiKey?: string; enabled?: boolean }>;
+  const providerMap = (providers?.providers ?? {}) as Record<
+    string,
+    { type?: string; apiKey?: string; enabled?: boolean }
+  >;
 
   for (const provider of Object.values(providerMap)) {
     if (provider.type === 'openai-compatible' && provider.enabled !== false && provider.apiKey) {
@@ -555,9 +615,7 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
 
         case 'file_change': {
           if (event.type === 'item.completed' && item.changes) {
-            const summary = item.changes
-              .map((c) => `${c.kind}: ${c.path}`)
-              .join('\n');
+            const summary = item.changes.map((c) => `${c.kind}: ${c.path}`).join('\n');
             events.push({
               conversationId,
               type: 'tool-call',
@@ -590,10 +648,11 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
             });
           }
           if (event.type === 'item.completed') {
-            const resultText = item.result?.content
-              ?.filter((c) => c.type === 'text' && c.text)
-              .map((c) => c.text)
-              .join('\n') ?? '';
+            const resultText =
+              item.result?.content
+                ?.filter((c) => c.type === 'text' && c.text)
+                .map((c) => c.text)
+                .join('\n') ?? '';
             events.push({
               conversationId,
               type: 'tool-result',
