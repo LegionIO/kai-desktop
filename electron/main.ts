@@ -83,6 +83,7 @@ import {
   getBrandMarketplaceUrls,
 } from './plugins/plugin-bootstrap.js';
 import { PLUGIN_RENDERER_PROTOCOL } from './plugins/renderer-build.js';
+import { initPluginBrowser } from './plugins/browser-window/index.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
@@ -164,6 +165,7 @@ if (otaRollbackResult) {
 // the active code version. A future enhancement could use a tiny entry.js wrapper
 // to also redirect main process loading.
 const codePaths = resolveCodePaths(__BRAND_APP_SLUG, __APP_VERSION, import.meta.dirname);
+initPluginBrowser(codePaths);
 
 // ── Window state persistence ──────────────────────────────────────────
 const WINDOW_STATE_FILE = join(APP_HOME, 'settings', 'window-state.json');

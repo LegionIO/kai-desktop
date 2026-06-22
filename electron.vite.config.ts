@@ -112,6 +112,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'electron/preload.ts'),
+          'plugin-browser': resolve(__dirname, 'electron/plugins/browser-window/preload.ts'),
         },
       },
     },
@@ -122,7 +123,10 @@ export default defineConfig({
     define: brandDefines,
     build: {
       rollupOptions: {
-        input: resolve(__dirname, 'src/index.html'),
+        input: {
+          index: resolve(__dirname, 'src/index.html'),
+          'browser-chrome': resolve(__dirname, 'src/browser-chrome/index.html'),
+        },
       },
     },
     resolve: {

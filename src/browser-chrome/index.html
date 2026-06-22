@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'"
+    />
+    <title>Browser</title>
+    <link rel="stylesheet" href="./chrome.css" />
+  </head>
+  <body>
+    <div id="chrome">
+      <div id="tabs">
+        <button class="new-tab-btn" id="new-tab-btn" title="New Tab (⌘T)">+</button>
+      </div>
+      <div id="toolbar">
+        <button class="nav-btn" id="back-btn" title="Back (⌘[)" disabled>&#9664;</button>
+        <button class="nav-btn" id="fwd-btn" title="Forward (⌘])" disabled>&#9654;</button>
+        <button class="nav-btn" id="reload-btn" title="Reload (⌘R)">&#8635;</button>
+        <input type="text" id="url-bar" spellcheck="false" />
+        <button class="nav-btn" id="copy-url-btn" title="Copy URL">&#10697;</button>
+        <button class="nav-btn" id="external-btn" title="Open in Default Browser">&#8599;</button>
+      </div>
+
+      <div id="webview-container"></div>
+
+      <div id="find-bar" class="hidden">
+        <input type="text" id="find-input" placeholder="Find in page" spellcheck="false" />
+        <span id="find-count"></span>
+        <button class="find-btn" id="find-prev-btn" title="Previous (⇧Enter)">&#9650;</button>
+        <button class="find-btn" id="find-next-btn" title="Next (Enter)">&#9660;</button>
+        <button class="find-btn" id="find-close-btn" title="Close (Esc)">&times;</button>
+      </div>
+
+      <div id="download-shelf" class="hidden"></div>
+
+      <div id="auth-modal" class="hidden">
+        <div class="auth-card">
+          <div class="auth-title">Authentication Required</div>
+          <div class="auth-detail" id="auth-detail"></div>
+          <input type="text" id="auth-user" placeholder="Username" autocomplete="off" />
+          <input type="password" id="auth-pass" placeholder="Password" autocomplete="off" />
+          <div class="auth-actions">
+            <button id="auth-cancel">Cancel</button>
+            <button id="auth-submit" class="primary">Sign In</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./chrome.ts"></script>
+  </body>
+</html>
