@@ -115,7 +115,7 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
 
   const query: Record<string, string> = {
     url,
-    home: url,
+    home: 'about:blank',
     partition: effectivePartition,
     ua: ua ?? '',
   };
