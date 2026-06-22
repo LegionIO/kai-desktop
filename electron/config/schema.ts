@@ -695,6 +695,11 @@ export const appConfigSchema = z.object({
         showModelProfileSelector: z.boolean(),
       })
       .default({ showModelProfileSelector: true }),
+    editDiffSummary: z
+      .object({
+        enabled: z.boolean().default(true),
+      })
+      .default({ enabled: true }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

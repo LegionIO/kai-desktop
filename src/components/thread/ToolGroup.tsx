@@ -41,6 +41,9 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
 import { useTasksOptional } from '@/providers/TaskProvider';
 import { refocusComposer } from '@/lib/utils';
+import { computeEditStat, buildEditSummary, isEditToolName, type DiffLine as SharedDiffLine } from '../../../shared/edit-diff';
+import { EditDiffSummary } from './EditDiffSummary';
+import { useConfig } from '@/providers/ConfigProvider';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -76,6 +79,20 @@ type ToolCallPart = {
 };
 
 export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: string) => void; onPlanApproved?: (data: { title: string; description: string; planFileName?: string; toolCallId: string }) => Promise<{ id: string; title: string } | null> }> = ({ parts, onSendFeedback, onPlanApproved }) => {
+  const { config } = useConfig();
+  const editDiffEnabled = (config?.ui as Record<string, unknown> | undefined)?.editDiffSummary
+    ? ((config!.ui as Record<string, unknown>).editDiffSummary as Record<string, unknown>).enabled !== false
+    : true;
+
+  // Compute turn-level edit summary (only successful edit parts contribute)
+  const editSummary = useMemo(() => {
+    const stats = parts
+      .filter((p) => isEditToolName(p.toolName) && !p.isError)
+      .map((p) => computeEditStat({ toolName: p.toolName, args: p.args, isError: false }))
+      .filter((s): s is NonNullable<typeof s> => s != null);
+    return buildEditSummary(stats);
+  }, [parts]);
+
   if (parts.length === 0) return null;
 
   return (
@@ -83,6 +100,7 @@ export const ToolGroup: FC<{ parts: ToolCallPart[]; onSendFeedback?: (text: stri
       {parts.map((part) => (
         <ToolCallDisplay key={part.toolCallId} part={part} onSendFeedback={onSendFeedback} onPlanApproved={onPlanApproved} />
       ))}
+      <EditDiffSummary summary={editSummary} enabled={editDiffEnabled} />
     </div>
   );
 };
@@ -2371,7 +2389,8 @@ const GlobResultModal: FC<{ pattern: string; searchPath: string; files: string[]
 
 /* ── Edit Diff Modal ── */
 
-type DiffLine = { text: string; type: 'added' | 'removed' | 'context' };
+// Use the shared DiffLine type from shared/edit-diff.ts
+type DiffLine = SharedDiffLine;
 
 const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLine[]; addedCount: number; removedCount: number; isWrite?: boolean; onClose: () => void }> = ({ fileName, filePath, diffLines, addedCount, removedCount, isWrite, onClose }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -2446,71 +2465,28 @@ const EditDiffModal: FC<{ fileName: string; filePath: string; diffLines: DiffLin
 /* ── Edit / Write Inline View ── */
 
 const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({ part, isRunning, isError }) => {
+  // Derive diff data using the shared computeEditStat utility.
+  // When isError is true we still want to display the error message, so we
+  // call computeEditStat with isError:false to get path/fileName, then
+  // fall through to the error render path below.
+  const editStat = useMemo(() => computeEditStat({ ...part, isError: false }), [part]);
+
   const args = part.args as Record<string, unknown>;
   // Support both 'path' (local tools) and 'file_path' (Claude Code agent tools)
-  const rawPath = typeof args.file_path === 'string' ? args.file_path : typeof args.path === 'string' ? args.path : '';
-  const fileName = rawPath.split('/').pop() ?? rawPath;
-
-  const isWriteTool = part.toolName === 'file_write' || part.toolName === 'mastra_workspace_write_file' || part.toolName === 'write' || part.toolName === 'Write';
-  const oldStr = typeof args.old_string === 'string' ? args.old_string : null;
-  const newStr = typeof args.new_string === 'string' ? args.new_string
-    : typeof args.new_content === 'string' ? args.new_content
-    : typeof args.content === 'string' ? args.content
-    : null;
+  const rawPath = editStat?.filePath
+    ?? (typeof args.file_path === 'string' ? args.file_path : typeof args.path === 'string' ? args.path : '');
+  const fileName = editStat?.fileName ?? (rawPath.split('/').pop() ?? rawPath);
 
   const _language = langFromPath(rawPath);
-  const diffLines: DiffLine[] = useMemo(() => {
-    if (isWriteTool && newStr != null) {
-      return newStr.split('\n').map((text) => ({ text, type: 'added' as const }));
-    }
-    if (oldStr == null && newStr == null) return [];
-    if (oldStr == null) return (newStr ?? '').split('\n').map((text) => ({ text, type: 'added' as const }));
-    if (newStr == null) return oldStr.split('\n').map((text) => ({ text, type: 'removed' as const }));
-
-    const aLines = oldStr.split('\n');
-    const bLines = newStr.split('\n');
-
-    // Simple patience-style LCS diff for small inputs, fallback to block diff for large
-    if (aLines.length + bLines.length > 400) {
-      // Too large for LCS — just show removed block then added block
-      return [
-        ...aLines.map((text) => ({ text, type: 'removed' as const })),
-        ...bLines.map((text) => ({ text, type: 'added' as const })),
-      ];
-    }
-
-    // Myers diff via DP LCS
-    const m = aLines.length, n = bLines.length;
-    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-    for (let i = m - 1; i >= 0; i--) {
-      for (let j = n - 1; j >= 0; j--) {
-        if (aLines[i] === bLines[j]) dp[i][j] = dp[i+1][j+1] + 1;
-        else dp[i][j] = Math.max(dp[i+1][j], dp[i][j+1]);
-      }
-    }
-    const result: DiffLine[] = [];
-    let i = 0, j = 0;
-    while (i < m || j < n) {
-      if (i < m && j < n && aLines[i] === bLines[j]) {
-        result.push({ text: aLines[i], type: 'context' });
-        i++; j++;
-      } else if (j < n && (i >= m || dp[i][j+1] >= dp[i+1][j])) {
-        result.push({ text: bLines[j], type: 'added' });
-        j++;
-      } else {
-        result.push({ text: aLines[i], type: 'removed' });
-        i++;
-      }
-    }
-    return result;
-  }, [isWriteTool, oldStr, newStr]);
+  const diffLines: DiffLine[] = editStat?.diffLines ?? [];
 
   const PREVIEW_LINES = 3;
   const hasMore = diffLines.length > PREVIEW_LINES;
   const previewLines = hasMore ? diffLines.slice(0, PREVIEW_LINES) : diffLines;
 
-  const addedCount = diffLines.filter((l) => l.type === 'added').length;
-  const removedCount = diffLines.filter((l) => l.type === 'removed').length;
+  const addedCount = editStat?.added ?? 0;
+  const removedCount = editStat?.removed ?? 0;
+  const isWriteTool = editStat?.kind === 'write' || editStat?.kind === 'create';
 
   // Result message (success string or error)
   const resultObj = part.result && typeof part.result === 'object' ? part.result as Record<string, unknown> : null;

@@ -168,6 +168,7 @@ function getDefaultConfig() {
       }>,
       activeWorkspaceId: null as string | null,
       composer: { showModelProfileSelector: true },
+      editDiffSummary: { enabled: true },
     },
     webServer: {
       enabled: false,
