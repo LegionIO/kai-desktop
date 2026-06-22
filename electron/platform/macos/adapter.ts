@@ -281,8 +281,16 @@ export class MacosAdapter implements NativePlatformAdapter {
     return typeof result?.rangeText === 'string' ? result.rangeText : null;
   }
 
-  async dumpUiTree(maxDepth: number): Promise<UiNode | null> {
-    const result = await runLocalMacMouseCommand(['uiTree', String(maxDepth)]).catch(() => null);
+  async dumpUiTree(
+    maxDepth: number,
+    target?: { pid?: number | null; windowId?: string | null },
+  ): Promise<UiNode | null> {
+    const args = ['uiTree', String(maxDepth)];
+    if (target?.pid != null) {
+      args.push(String(target.pid));
+      if (target.windowId != null) args.push(String(target.windowId));
+    }
+    const result = await runLocalMacMouseCommand(args).catch(() => null);
     if (!result || !('uiTree' in result)) return null;
     return (result as LocalMacosHelperResponse & { uiTree?: UiNode }).uiTree ?? null;
   }

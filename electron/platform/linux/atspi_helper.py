@@ -163,18 +163,30 @@ def selected_text():
     return None
 
 
-def active_application():
+def active_application(pid: int | None = None):
+    # Prefer an exact pid match when supplied. Fall back to the ACTIVE app if
+    # no match is found — X11 window pids and AT-SPI application pids can
+    # differ for multi-process or portalized (Flatpak/Snap) apps, and a
+    # best-effort tree is better than none. The persistent helper means the
+    # screenshot→uiTree gap is small enough that focus drift here matches
+    # pre-pinning behaviour.
     desktop = Atspi.get_desktop(0)
+    fallback = None
     for i in range(desktop.get_child_count()):
         app = desktop.get_child_at_index(i)
         if app is None:
             continue
         try:
-            if app.get_state_set().contains(Atspi.StateType.ACTIVE):
+            if pid is not None and app.get_process_id() == pid:
                 return app
+            if app.get_state_set().contains(Atspi.StateType.ACTIVE):
+                if pid is None:
+                    return app
+                if fallback is None:
+                    fallback = app
         except Exception:
             continue
-    return None
+    return fallback
 
 
 def walk(node, depth: int, max_depth: int):
@@ -210,11 +222,18 @@ def walk(node, depth: int, max_depth: int):
     return out
 
 
-def ui_tree(max_depth: int):
-    app = active_application()
+def ui_tree(max_depth: int, pid: int | None = None):
+    app = active_application(pid)
     if app is None:
         return None
     return walk(app, 0, max(1, max_depth))
+
+
+def _coerce_pid(v):
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 HANDLERS = {
@@ -222,7 +241,7 @@ HANDLERS = {
     "readTextField": lambda _a: read_text_field(),
     "writeTextField": lambda a: {"ok": write_text_field(a.get("value", ""), a.get("selectionStart"), a.get("selectionEnd"))},
     "selectedText": lambda _a: {"text": selected_text()},
-    "uiTree": lambda a: {"root": ui_tree(int(a.get("maxDepth", 4)))},
+    "uiTree": lambda a: {"root": ui_tree(int(a.get("maxDepth", 4)), _coerce_pid(a.get("pid")))},
 }
 
 

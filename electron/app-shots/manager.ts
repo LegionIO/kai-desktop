@@ -3,7 +3,7 @@ import { BrowserWindow, clipboard, globalShortcut, nativeImage, screen } from 'e
 import { formatAppShotRef, type AppShotMeta, type AppShotPayload } from '../../shared/app-shots.js';
 import type { AppConfig } from '../config/schema.js';
 import { getFallbackAdapter, getPlatformAdapter } from '../platform/index.js';
-import type { NativePlatformAdapter, ScreenshotResult } from '../platform/types.js';
+import type { NativePlatformAdapter } from '../platform/types.js';
 import { broadcastToAllWindows, safelySendToWindow } from '../utils/window-send.js';
 
 export type AppShotsConfig = NonNullable<AppConfig['appShots']>;
@@ -123,6 +123,9 @@ export async function captureAppShot(): Promise<AppShotPayload> {
   const adapter = await getPlatformAdapter();
 
   let activeWindow = await bestEffort((a) => a.getActiveWindow());
+  // Pin the screenshot + uiTree to the window observed *now* so later helper
+  // calls can't drift onto a different frontmost window/app.
+  const treeTarget = { pid: activeWindow?.pid ?? null, windowId: activeWindow?.windowId ?? null };
 
   // Native helpers don't currently extract browser tab URLs; active-win does
   // (via per-browser accessibility hooks). If the native adapter returned a
@@ -151,23 +154,17 @@ export async function captureAppShot(): Promise<AppShotPayload> {
     if (idx >= 0) displayIndex = idx;
   }
 
-  let usedFallback = false;
-  let shot: ScreenshotResult;
-  if (currentConfig.captureMode === 'window') {
-    const result = await withFallback((a) => a.screenshotWindow(activeWindow?.windowId ?? null));
-    shot = result.value;
-    usedFallback = result.usedFallback;
-  } else {
-    const result = await withFallback((a) => a.screenshotDisplay(displayIndex));
-    shot = result.value;
-    usedFallback = result.usedFallback;
-  }
+  const { value: shot, usedFallback } =
+    currentConfig.captureMode === 'window'
+      ? await withFallback((a) => a.screenshotWindow(treeTarget.windowId))
+      : await withFallback((a) => a.screenshotDisplay(displayIndex));
 
-  const selectedText = currentConfig.includeSelectedText ? await bestEffort((a) => a.getSelectedText()) : undefined;
-
-  const uiTree = currentConfig.includeUiTree
-    ? await bestEffort((a) => a.dumpUiTree(currentConfig.uiTreeDepth))
-    : undefined;
+  const [selectedText, uiTree] = await Promise.all([
+    currentConfig.includeSelectedText ? bestEffort((a) => a.getSelectedText()) : Promise.resolve(undefined),
+    currentConfig.includeUiTree
+      ? bestEffort((a) => a.dumpUiTree(currentConfig.uiTreeDepth, treeTarget))
+      : Promise.resolve(undefined),
+  ]);
 
   const meta: AppShotMeta = {
     capturedAt: new Date().toISOString(),

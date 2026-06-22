@@ -188,8 +188,15 @@ export class WindowsAdapter implements NativePlatformAdapter {
     return r?.text ?? null;
   }
 
-  async dumpUiTree(maxDepth: number): Promise<UiNode | null> {
-    const r = await this.call<{ root: UiNode | null }>('uiTree', { maxDepth }, 20000).catch(() => null);
+  async dumpUiTree(
+    maxDepth: number,
+    target?: { pid?: number | null; windowId?: string | null },
+  ): Promise<UiNode | null> {
+    const r = await this.call<{ root: UiNode | null }>(
+      'uiTree',
+      { maxDepth, pid: target?.pid ?? null, windowId: target?.windowId ?? null },
+      20000,
+    ).catch(() => null);
     return r?.root ?? null;
   }
 

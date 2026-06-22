@@ -304,12 +304,19 @@ export class LinuxAdapter implements NativePlatformAdapter {
     return sel?.text ?? null;
   }
 
-  async dumpUiTree(maxDepth: number): Promise<UiNode | null> {
+  async dumpUiTree(
+    maxDepth: number,
+    target?: { pid?: number | null; windowId?: string | null },
+  ): Promise<UiNode | null> {
     await this.ensureProbe();
     if (!this.resolvedCapabilities.uiTree) return null;
     const helper = this.getAtspiHelper();
     if (!helper) return null;
-    const r = await helper.call<{ root: UiNode | null }>('uiTree', { maxDepth }, 20000).catch(() => null);
+    const r = await helper
+      .call<{
+        root: UiNode | null;
+      }>('uiTree', { maxDepth, pid: target?.pid ?? null, windowId: target?.windowId ?? null }, 20000)
+      .catch(() => null);
     return r?.root ?? null;
   }
 

@@ -2328,10 +2328,12 @@ case "selectedText":
 
 case "uiTree":
   let depth = parseIntArg(args, 2, default: 4)
-  if let tree = dumpFrontmostUiTree(maxDepth: max(1, depth)) {
+  let utPid: pid_t? = args.count > 3 ? Int32(args[3]) : nil
+  let utWindowId: CGWindowID? = args.count > 4 ? UInt32(args[4]) : nil
+  if let tree = dumpUiTree(maxDepth: max(1, depth), pid: utPid, windowId: utWindowId) {
     printJson(["ok": true, "uiTree": tree])
   } else {
-    printJson(["ok": false, "error": "no frontmost application"])
+    printJson(["ok": false, "error": "no target application"])
   }
 
 case "screenshotWindow":
@@ -2405,18 +2407,50 @@ func readFocusedSelectedText() -> String? {
   return nil
 }
 
-func dumpFrontmostUiTree(maxDepth: Int) -> [String: Any]? {
-  guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
-  let appElement = AXUIElementCreateApplication(frontApp.processIdentifier)
-  var focusedWindow: CFTypeRef?
-  let root: AXUIElement
-  if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
-     let win = focusedWindow {
-    root = win as! AXUIElement
-  } else {
-    root = appElement
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowId: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func axWindowMatching(appElement: AXUIElement, windowId: CGWindowID) -> AXUIElement? {
+  var windowsRef: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+        let windows = windowsRef as? [AXUIElement] else { return nil }
+  for win in windows {
+    var wid: CGWindowID = 0
+    if _AXUIElementGetWindow(win, &wid) == .success, wid == windowId {
+      return win
+    }
   }
-  return walkUiNode(root, depth: 0, maxDepth: maxDepth)
+  return nil
+}
+
+func dumpUiTree(maxDepth: Int, pid: pid_t?, windowId: CGWindowID?) -> [String: Any]? {
+  let targetPid: pid_t
+  if let p = pid {
+    targetPid = p
+  } else if let frontApp = NSWorkspace.shared.frontmostApplication {
+    targetPid = frontApp.processIdentifier
+  } else {
+    return nil
+  }
+  let appElement = AXUIElementCreateApplication(targetPid)
+
+  // Touching kAXEnhancedUserInterface prompts lazy AX hosts (Chromium/Electron)
+  // to materialise their accessibility tree before we walk it.
+  var enhancedRef: CFTypeRef?
+  _ = AXUIElementCopyAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, &enhancedRef)
+
+  var root: AXUIElement? = nil
+  if let wid = windowId {
+    root = axWindowMatching(appElement: appElement, windowId: wid)
+  }
+  if root == nil {
+    var focusedWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+       let win = focusedWindow {
+      root = (win as! AXUIElement)
+    }
+  }
+  return walkUiNode(root ?? appElement, depth: 0, maxDepth: maxDepth)
 }
 
 func walkUiNode(_ element: AXUIElement, depth: Int, maxDepth: Int) -> [String: Any] {

@@ -764,13 +764,53 @@ const UserImagePart: FC<{ image: string }> = ({ image }) => {
   );
 };
 
+function decodeTextDataUrl(dataUrl: string): string | null {
+  const comma = dataUrl.indexOf(',');
+  if (comma < 0) return null;
+  const header = dataUrl.slice(0, comma);
+  const body = dataUrl.slice(comma + 1);
+  try {
+    if (/;base64/i.test(header)) {
+      const bin = atob(body);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new TextDecoder('utf-8').decode(bytes);
+    }
+    return decodeURIComponent(body);
+  } catch {
+    return null;
+  }
+}
+
 const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; file?: unknown }> = (props) => {
   const [previewOpen, setPreviewOpen] = useState(false);
   const filename = props.filename ?? 'file';
   const mimeType = props.mimeType ?? '';
   const data = props.data ?? '';
   const isPdf = mimeType === 'application/pdf';
-  const isPreviewable = isPdf || mimeType.startsWith('image/');
+  const isText =
+    mimeType.startsWith('text/') ||
+    mimeType === 'application/json' ||
+    /\.(json|md|txt|log|ya?ml|csv|tsx?|jsx?|py|sh)$/i.test(filename);
+  const isPreviewable = isPdf || mimeType.startsWith('image/') || isText;
+
+  const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+  const previewText = useMemo(() => {
+    if (!previewOpen || !isText || !data) return null;
+    if (data.length > TEXT_PREVIEW_MAX_BYTES * 1.4) {
+      return `(${filename} is too large to preview inline — ${(data.length / 1024 / 1024).toFixed(1)} MB encoded.)`;
+    }
+    const decoded = decodeTextDataUrl(data);
+    if (decoded == null) return null;
+    if (mimeType === 'application/json' || /\.json$/i.test(filename)) {
+      try {
+        return JSON.stringify(JSON.parse(decoded), null, 2);
+      } catch {
+        return decoded;
+      }
+    }
+    return decoded;
+  }, [previewOpen, isText, data, mimeType, filename]);
 
   const ext = filename.split('.').pop()?.toUpperCase() ?? 'FILE';
   const iconColors: Record<string, string> = {
@@ -791,6 +831,7 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
       <button
         type="button"
         onClick={() => isPreviewable && data && setPreviewOpen(true)}
+        onDoubleClick={() => isPreviewable && data && setPreviewOpen(true)}
         className={`flex items-center gap-2.5 my-1.5 rounded-lg border px-3 py-2 text-left transition-colors ${isPreviewable ? 'cursor-pointer' : 'cursor-default'}`}
         style={{
           backgroundColor: 'var(--app-file-chip)',
@@ -812,12 +853,20 @@ const UserFilePart: FC<{ data?: string; mimeType?: string; filename?: string; fi
         </div>
         {isPreviewable && <span className="text-[10px] opacity-50 ml-auto shrink-0">Click to preview</span>}
       </button>
-      {previewOpen && data && <FilePreviewModal src={data} onClose={() => setPreviewOpen(false)} />}
+      {previewOpen && data && (
+        <FilePreviewModal src={data} text={previewText} filename={filename} onClose={() => setPreviewOpen(false)} />
+      )}
     </>
   );
 };
 
-const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClose }) => {
+const FilePreviewModal: FC<{ src: string; text?: string | null; filename?: string; onClose: () => void }> = ({
+  src,
+  text,
+  filename,
+  onClose,
+}) => {
+  const [copied, setCopied] = useState(false);
   // Close on Escape key
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -843,7 +892,31 @@ const FilePreviewModal: FC<{ src: string; onClose: () => void }> = ({ src, onClo
         >
           <XIcon className="h-5 w-5 text-white pointer-events-none" />
         </button>
-        {src.startsWith('data:application/pdf') ? (
+        {text != null ? (
+          <div className="w-[80vw] max-w-[1100px] h-[85vh] rounded-lg border border-neutral-700 bg-neutral-900 cursor-default flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between gap-2 border-b border-neutral-700 px-4 py-2">
+              <span className="text-xs font-mono text-neutral-300 truncate">{filename ?? 'file'}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  void copyTextToClipboard(text)
+                    .then(() => {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1200);
+                    })
+                    .catch((err) => logClipboardError('Failed to copy file preview', err));
+                }}
+                className="flex items-center gap-1.5 rounded px-2 py-1 text-[11px] text-neutral-300 hover:bg-neutral-800 hover:text-white"
+              >
+                <CopyIcon className="h-3.5 w-3.5" />
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <pre className="flex-1 overflow-auto p-4 text-xs font-mono leading-5 text-neutral-200 whitespace-pre-wrap break-words">
+              {text}
+            </pre>
+          </div>
+        ) : src.startsWith('data:application/pdf') ? (
           <iframe src={src} className="w-[80vw] h-[85vh] rounded-lg bg-white" title="PDF preview" />
         ) : (
           <img src={src} alt="Preview" className="max-w-[90vw] max-h-[85vh] rounded-lg object-contain" />

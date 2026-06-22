@@ -391,11 +391,11 @@ public static class Kai
         catch { return el.Current.ProcessId + ":" + (el.Current.Name ?? ""); }
     }
 
-    public static Dictionary<string, object> UiTree(int maxDepth)
+    public static Dictionary<string, object> UiTree(int maxDepth, long targetHwnd)
     {
         return OnSta(() =>
         {
-            var hwnd = GetForegroundWindow();
+            var hwnd = targetHwnd != 0 ? new IntPtr(targetHwnd) : GetForegroundWindow();
             if (hwnd == IntPtr.Zero) return null;
             var root = AutomationElement.FromHandle(hwnd);
             return root == null ? null : Walk(root, 0, Math.Max(1, maxDepth));
@@ -658,7 +658,11 @@ while ($true) {
         Respond $id $true @{ ok = [Kai]::WriteFocusedTextField([string]$a.value, $caret) } $null
       }
       'selectedText' { Respond $id $true @{ text = [Kai]::SelectedText() } $null }
-      'uiTree'       { Respond $id $true @{ root = [Kai]::UiTree((As-Int $a.maxDepth 4)) } $null }
+      'uiTree'       {
+        $hwnd = 0L
+        if ($null -ne $a.windowId -and $a.windowId -ne '') { [void][long]::TryParse([string]$a.windowId, [ref]$hwnd) }
+        Respond $id $true @{ root = [Kai]::UiTree((As-Int $a.maxDepth 4), $hwnd) } $null
+      }
 
       'startMonitor' { [Kai]::StartMonitor($emitDelegate); Respond $id $true $null $null }
       'stopMonitor'  { [Kai]::StopMonitor(); Respond $id $true $null $null }

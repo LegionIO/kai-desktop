@@ -157,7 +157,7 @@ export interface NativePlatformAdapter {
   readFocusedTextField(): Promise<TextFieldSnapshot | null>;
   writeFocusedTextField(value: string, selectionStart?: number, selectionEnd?: number): Promise<boolean>;
   getSelectedText(): Promise<string | null>;
-  dumpUiTree(maxDepth: number): Promise<UiNode | null>;
+  dumpUiTree(maxDepth: number, target?: { pid?: number | null; windowId?: string | null }): Promise<UiNode | null>;
 
   // --- monitoring ---
   startInputMonitor(onEvent: (event: InputMonitorEvent) => void, onError?: (err: string) => void): InputMonitorHandle;
