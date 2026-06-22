@@ -319,6 +319,11 @@ function applyTheme(): void {
 
 let updateDownloaded = false;
 let primaryWindowRef: BrowserWindow | null = null;
+let lastFocusedWindowRef: BrowserWindow | null = null;
+
+app.on('browser-window-focus', (_event, win) => {
+  lastFocusedWindowRef = win;
+});
 
 function buildMenu(): void {
   const updateMenuItem: Electron.MenuItemConstructorOptions = updateDownloaded
@@ -1523,9 +1528,18 @@ if (gotSingleInstanceLock) {
         win.once('ready-to-show', () => {
           win.show();
         });
-      } else {
-        focusPrimaryWindow();
+        return;
       }
+
+      const preferred = lastFocusedWindowRef && !lastFocusedWindowRef.isDestroyed() ? lastFocusedWindowRef : null;
+      if (preferred) {
+        if (preferred.isMinimized()) preferred.restore();
+        if (!preferred.isVisible()) preferred.show();
+        preferred.focus();
+        return;
+      }
+
+      focusPrimaryWindow();
     });
   });
 }
