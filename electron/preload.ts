@@ -239,6 +239,24 @@ const appAPI = {
       ipcRenderer.on('plugin:pending-restart-changed', handler);
       return () => ipcRenderer.removeListener('plugin:pending-restart-changed', handler);
     },
+    getFailedUpdates: () =>
+      ipcRenderer.invoke('plugin:failed-updates') as Promise<
+        Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>
+      >,
+    onFailedUpdatesChanged: (
+      callback: (data: {
+        failedUpdates: Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>;
+      }) => void,
+    ) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        data: {
+          failedUpdates: Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>;
+        },
+      ) => callback(data);
+      ipcRenderer.on('plugin:failed-updates-changed', handler);
+      return () => ipcRenderer.removeListener('plugin:failed-updates-changed', handler);
+    },
     onEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('plugin:event', handler);

@@ -104,6 +104,10 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return pluginManager.getPendingRestart();
   });
 
+  ipcMain.handle('plugin:failed-updates', () => {
+    return pluginManager.getFailedUpdates();
+  });
+
   ipcMain.handle('plugin:restart-app', () => {
     setTimeout(() => {
       app.relaunch();

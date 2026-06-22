@@ -167,6 +167,14 @@ type AppAPI = {
     getPendingRestart: () => Promise<string[]>;
     restartApp: () => Promise<{ success: boolean }>;
     onPendingRestartChanged: (callback: (data: { plugins: string[] }) => void) => () => void;
+    getFailedUpdates: () => Promise<
+      Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>
+    >;
+    onFailedUpdatesChanged: (
+      callback: (data: {
+        failedUpdates: Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>;
+      }) => void,
+    ) => () => void;
     onEvent: (callback: (event: unknown) => void) => () => void;
     onNavigationRequest: (callback: (request: unknown) => void) => () => void;
     onNavigateDirect: (callback: (data: unknown) => void) => () => void;

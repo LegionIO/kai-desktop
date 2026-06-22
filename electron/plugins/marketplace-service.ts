@@ -11,6 +11,15 @@ import {
   readPluginManifest,
 } from './plugin-integrity.js';
 import type { PluginIntegrity } from './plugin-integrity.js';
+
+type InstalledPluginRecord = NonNullable<NonNullable<AppConfig['marketplace']>['installedPlugins']>[string];
+type PluginApprovalRecord = NonNullable<AppConfig['pluginApprovals']>[string];
+
+export type InstallResult = PluginIntegrity & {
+  backupDir?: string;
+  priorInstalledRecord?: InstalledPluginRecord;
+  priorApproval?: PluginApprovalRecord;
+};
 import { checkPluginCompatibility } from './plugin-compat.js';
 import type { CompatCheckResult } from './plugin-compat.js';
 
@@ -172,7 +181,7 @@ export class MarketplaceService {
 
   /* ── Plugin install ── */
 
-  async installPlugin(entry: MarketplaceCatalogEntry, opts?: { skipHashCheck?: boolean }): Promise<PluginIntegrity> {
+  async installPlugin(entry: MarketplaceCatalogEntry, opts?: { skipHashCheck?: boolean }): Promise<InstallResult> {
     if (!PLUGIN_NAME_RE.test(entry.name)) {
       throw new Error(`Invalid plugin name in catalog: ${entry.name}`);
     }
@@ -185,6 +194,10 @@ export class MarketplaceService {
 
     const destDir = join(this.pluginsDir, entry.name);
     const tmpDir = join(this.pluginsDir, `.tmp-${entry.name}-${Date.now()}`);
+    const backupDir = `${destDir}.prev`;
+    let backedUp = false;
+    const priorInstalledRecord = this.getConfig().marketplace?.installedPlugins?.[entry.name];
+    const priorApproval = this.getConfig().pluginApprovals?.[entry.name];
 
     try {
       mkdirSync(this.pluginsDir, { recursive: true });
@@ -285,9 +298,14 @@ export class MarketplaceService {
 
       // No build step needed - plugins are pre-built in release assets
 
-      // Swap in the new plugin directory
+      // Swap in the new plugin directory, keeping the previous one as a backup
+      // so the caller can roll back if the new version fails to activate.
+      if (existsSync(backupDir)) {
+        rmSync(backupDir, { recursive: true, force: true });
+      }
       if (existsSync(destDir)) {
-        rmSync(destDir, { recursive: true, force: true });
+        renameSync(destDir, backupDir);
+        backedUp = true;
       }
       renameSync(tmpDir, destDir);
 
@@ -325,6 +343,9 @@ export class MarketplaceService {
         fileHash,
         permissions: manifest.permissions,
         version: manifest.version,
+        backupDir: backedUp ? backupDir : undefined,
+        priorInstalledRecord: priorInstalledRecord ? { ...priorInstalledRecord } : undefined,
+        priorApproval: priorApproval ? { ...priorApproval } : undefined,
       };
     } catch (err) {
       // Clean up temp directory on failure
@@ -333,7 +354,66 @@ export class MarketplaceService {
       } catch {
         /* ignore */
       }
+      if (backedUp && existsSync(backupDir)) {
+        try {
+          if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
+          renameSync(backupDir, destDir);
+        } catch {
+          /* ignore */
+        }
+      }
       throw err;
+    }
+  }
+
+  rollbackInstall(
+    pluginName: string,
+    backupDir: string,
+    prior: Pick<InstallResult, 'priorInstalledRecord' | 'priorApproval'>,
+  ): void {
+    const destDir = join(this.pluginsDir, pluginName);
+    if (!existsSync(backupDir)) return;
+    try {
+      if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
+      renameSync(backupDir, destDir);
+    } catch (err) {
+      console.error(`[Marketplace] Failed to roll back plugin "${pluginName}":`, err);
+      return;
+    }
+
+    try {
+      const installedPlugins = { ...(this.getConfig().marketplace?.installedPlugins ?? {}) };
+      if (prior.priorInstalledRecord) {
+        installedPlugins[pluginName] = { ...prior.priorInstalledRecord };
+      } else {
+        delete installedPlugins[pluginName];
+      }
+      this.setConfig('marketplace.installedPlugins', installedPlugins);
+
+      const approvals = { ...(this.getConfig().pluginApprovals ?? {}) };
+      if (prior.priorApproval) {
+        approvals[pluginName] = { ...prior.priorApproval };
+      } else {
+        delete approvals[pluginName];
+      }
+      this.setConfig('pluginApprovals', approvals);
+
+      if (this.cachedCatalog) {
+        this.cachedCatalog = this.cachedCatalog.map((entry) =>
+          entry.name === pluginName ? { ...entry, installedVersion: prior.priorInstalledRecord?.version } : entry,
+        );
+        this.writeCatalogCache(this.cachedCatalog);
+      }
+    } catch (err) {
+      console.error(`[Marketplace] Failed to restore prior config for "${pluginName}" after rollback:`, err);
+    }
+  }
+
+  discardBackup(backupDir: string): void {
+    try {
+      rmSync(backupDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
     }
   }
 
@@ -375,6 +455,10 @@ export class MarketplaceService {
     if (existsSync(pluginDir)) {
       rmSync(pluginDir, { recursive: true, force: true });
     }
+    const backupDir = `${pluginDir}.prev`;
+    if (existsSync(backupDir)) {
+      rmSync(backupDir, { recursive: true, force: true });
+    }
 
     // Remove from installed tracking
     const installedPlugins = { ...(this.getConfig().marketplace?.installedPlugins ?? {}) };
@@ -406,9 +490,13 @@ export class MarketplaceService {
   async autoInstallRequired(
     requiredNames: Set<string>,
     catalog: MarketplaceCatalogEntry[],
-    hooks?: { afterInstall?: (name: string) => Promise<void> },
+    hooks?: {
+      afterInstall?: (name: string, result: InstallResult) => Promise<void>;
+      serialize?: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
+    },
   ): Promise<string[]> {
     const installed: string[] = [];
+    const serialize = hooks?.serialize ?? (<T>(_name: string, fn: () => Promise<T>) => fn());
     for (const name of requiredNames) {
       const entry = catalog.find((p) => p.name === name);
       if (!entry) {
@@ -421,9 +509,11 @@ export class MarketplaceService {
         if (!reason) continue;
 
         console.info(`[Marketplace] Auto-installing required plugin "${name}" (${reason})...`);
-        await this.installPlugin(entry);
-        installed.push(name);
-        await hooks?.afterInstall?.(name);
+        await serialize(name, async () => {
+          const result = await this.installPlugin(entry);
+          installed.push(name);
+          await hooks?.afterInstall?.(name, result);
+        });
       } catch (err) {
         console.error(`[Marketplace] Failed to auto-install required plugin "${name}":`, err);
       }
@@ -532,6 +622,7 @@ export class MarketplaceService {
     if (!existsSync(this.pluginsDir)) return [];
     try {
       return readdirSync(this.pluginsDir).filter((entry) => {
+        if (entry.startsWith('.') || entry.endsWith('.prev')) return false;
         return existsSync(join(this.pluginsDir, entry, 'plugin.json'));
       });
     } catch {

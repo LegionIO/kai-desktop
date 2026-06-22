@@ -72,6 +72,9 @@ export const PluginMarketplace: FC = () => {
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [failedUpdates, setFailedUpdates] = useState<
+    Map<string, { attemptedVersion: string; runningVersion: string; error: string }>
+  >(new Map());
 
   const loadData = useCallback(async () => {
     try {
@@ -88,6 +91,20 @@ export const PluginMarketplace: FC = () => {
 
   useEffect(() => {
     loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    if (typeof app.plugins.getFailedUpdates !== 'function') return;
+    const apply = (list: Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>) =>
+      setFailedUpdates(new Map(list.map((f) => [f.name, f])));
+    app.plugins
+      .getFailedUpdates()
+      .then(apply)
+      .catch(() => {});
+    return app.plugins.onFailedUpdatesChanged?.(({ failedUpdates: list }) => {
+      apply(list);
+      void loadData();
+    });
   }, [loadData]);
 
   const handleRefresh = async () => {
@@ -377,6 +394,7 @@ export const PluginMarketplace: FC = () => {
                   {updatablePlugins.map((entry) => {
                     const parsedAuthor = parseAuthor(entry.author);
                     const currentVersion = installedVersions.get(entry.name) ?? entry.installedVersion;
+                    const failedUpdate = failedUpdates.get(entry.name);
                     return (
                       <div
                         key={entry.name}
@@ -412,6 +430,15 @@ export const PluginMarketplace: FC = () => {
                             )}
                           </div>
                           <p className="line-clamp-2 text-[11px] text-muted-foreground">{entry.description}</p>
+                          {failedUpdate && (
+                            <p className="mt-1 flex items-start gap-1 text-[10px] text-amber-400">
+                              <AlertCircleIcon className="mt-px h-3 w-3 shrink-0" />
+                              <span>
+                                v{failedUpdate.attemptedVersion} failed to load ({failedUpdate.error}) — still running v
+                                {failedUpdate.runningVersion}.
+                              </span>
+                            </p>
+                          )}
                         </div>
                         <button
                           type="button"
@@ -424,7 +451,7 @@ export const PluginMarketplace: FC = () => {
                           ) : (
                             <ArrowUpCircleIcon className="h-3 w-3" />
                           )}
-                          {installingPlugins.has(entry.name) ? 'Updating…' : 'Update'}
+                          {installingPlugins.has(entry.name) ? 'Updating…' : failedUpdate ? 'Retry' : 'Update'}
                         </button>
                       </div>
                     );

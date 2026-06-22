@@ -88,6 +88,9 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [installingPlugins, setInstallingPlugins] = useState<Set<string>>(new Set());
+  const [failedUpdates, setFailedUpdates] = useState<
+    Map<string, { attemptedVersion: string; runningVersion: string; error: string }>
+  >(new Map());
   const [uninstallingPlugins, setUninstallingPlugins] = useState<Set<string>>(new Set());
   const [confirmUninstall, setConfirmUninstall] = useState<InstalledPlugin | null>(null);
 
@@ -109,6 +112,20 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
 
   useEffect(() => {
     loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    if (typeof app.plugins.getFailedUpdates !== 'function') return;
+    const apply = (list: Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>) =>
+      setFailedUpdates(new Map(list.map((f) => [f.name, f])));
+    app.plugins
+      .getFailedUpdates()
+      .then(apply)
+      .catch(() => {});
+    return app.plugins.onFailedUpdatesChanged?.(({ failedUpdates: list }) => {
+      apply(list);
+      void loadData();
+    });
   }, [loadData]);
 
   // Refresh marketplace catalog in the background when view is shown (throttled to 30 min)
@@ -300,6 +317,7 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
                   const catalogEntry = catalogMap.get(plugin.name);
                   const hasUpdate =
                     catalogEntry && catalogEntry.version && isNewerVersion(catalogEntry.version, plugin.version);
+                  const failedUpdate = failedUpdates.get(plugin.name);
 
                   return (
                     <div
@@ -342,6 +360,16 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
                         </div>
                         <p className="line-clamp-2 text-[11px] text-muted-foreground">{plugin.description}</p>
                         {plugin.error && <p className="mt-1 text-[10px] text-red-400">{plugin.error}</p>}
+                        {failedUpdate && (
+                          <p className="mt-1 flex items-start gap-1 text-[10px] text-amber-400">
+                            <AlertCircleIcon className="mt-px h-3 w-3 shrink-0" />
+                            <span>
+                              v{failedUpdate.attemptedVersion} failed to load ({failedUpdate.error}) — still running v
+                              {failedUpdate.runningVersion}.{' '}
+                              {plugin.brandRequired ? 'Will retry on next refresh.' : 'Click Update to retry.'}
+                            </span>
+                          </p>
+                        )}
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         {hasUpdate && (

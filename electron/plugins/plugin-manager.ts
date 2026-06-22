@@ -41,7 +41,7 @@ import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { buildPluginRendererBundle } from './renderer-build.js';
 import { MarketplaceService, UnverifiedPluginError } from './marketplace-service.js';
-import type { MarketplaceCatalogEntry } from './marketplace-service.js';
+import type { MarketplaceCatalogEntry, InstallResult } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
@@ -106,6 +106,8 @@ export class PluginManager {
   private lastUpdateCount = 0;
   private pendingRestart: Set<string> = new Set();
   private rendererLoadedThisSession: Set<string> = new Set();
+  private failedUpdates: Map<string, { attemptedVersion: string; runningVersion: string; error: string }> = new Map();
+  private installLocks: Map<string, Promise<unknown>> = new Map();
 
   private brandRequiredPluginNamesSet: Set<string>;
 
@@ -134,6 +136,7 @@ export class PluginManager {
     }
 
     for (const entry of entries) {
+      if (entry.startsWith('.') || entry.endsWith('.prev')) continue;
       const pluginDir = join(this.pluginsDir, entry);
       try {
         if (!statSync(pluginDir).isDirectory()) continue;
@@ -199,6 +202,10 @@ export class PluginManager {
 
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */
   private pendingConsent: Map<string, { manifest: PluginManifest; fileHash: string }> = new Map();
+  private pendingConsentRollback: Map<
+    string,
+    { attemptedVersion: string } & Pick<InstallResult, 'backupDir' | 'priorInstalledRecord' | 'priorApproval'>
+  > = new Map();
 
   private hasDangerousPermissions(manifest: PluginManifest): boolean {
     return manifest.permissions.some((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
@@ -248,22 +255,60 @@ export class PluginManager {
     // Re-discover the plugin directory
     const discovered = this.discoverPlugins();
     const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
-    if (!pluginInfo) return false;
+    if (!pluginInfo) {
+      void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval');
+      return false;
+    }
 
     // Load the plugin now that it's approved
     await this.loadPlugin(pluginInfo.manifest, pluginInfo.dir);
+    const instance = this.plugins.get(pluginName);
+    await this.resolvePendingConsentRollback(pluginName, instance?.state === 'active', instance?.error);
     return true;
   }
 
   /** Called by IPC when user denies a dangerous plugin. */
   denyPlugin(pluginName: string): void {
     this.pendingConsent.delete(pluginName);
+    if (this.pendingConsentRollback.has(pluginName)) {
+      void this.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user');
+      return;
+    }
     const instance = this.plugins.get(pluginName);
     if (instance) {
       instance.state = 'error';
       instance.error = 'Permission denied by user';
       this.broadcastUIState();
     }
+  }
+
+  private async resolvePendingConsentRollback(pluginName: string, activated: boolean, error?: string): Promise<void> {
+    const stash = this.pendingConsentRollback.get(pluginName);
+    if (!stash) return;
+    this.pendingConsentRollback.delete(pluginName);
+
+    if (activated || !stash.backupDir) {
+      if (stash.backupDir) this.marketplaceService?.discardBackup(stash.backupDir);
+      this.setFailedUpdate(pluginName, null);
+      return;
+    }
+
+    await this.unloadPlugin(pluginName);
+    this.marketplaceService?.rollbackInstall(pluginName, stash.backupDir, stash);
+    const restored = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
+    if (restored) await this.loadPlugin(restored.manifest, restored.dir);
+
+    const runningVersion =
+      this.plugins.get(pluginName)?.manifest.version ?? stash.priorInstalledRecord?.version ?? 'unknown';
+    this.setFailedUpdate(pluginName, {
+      attemptedVersion: stash.attemptedVersion,
+      runningVersion,
+      error: error ?? 'Update was not approved',
+    });
+    if (this.rendererLoadedThisSession.has(pluginName)) {
+      this.markPendingRestart(pluginName);
+    }
+    this.broadcastUpdateCount();
   }
 
   /** Get list of plugins pending consent. */
@@ -349,6 +394,7 @@ export class PluginManager {
     console.info(`[PluginManager] Discovered ${discovered.length} plugins`);
 
     for (const { manifest, dir } of discovered) {
+      if (this.plugins.has(manifest.name)) continue;
       await this.loadPlugin(manifest, dir);
     }
   }
@@ -1181,7 +1227,29 @@ export class PluginManager {
     }
 
     if (this.brandRequiredPluginNames.length > 0) {
-      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog);
+      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
+        serialize: (name, fn) => this.withInstallLock(name, fn),
+        afterInstall: async (name, result) => {
+          await this.swapToInstalledPlugin(name, result.version, result);
+        },
+      });
+    }
+  }
+
+  private async withInstallLock<T>(pluginName: string, fn: () => Promise<T>): Promise<T> {
+    while (this.installLocks.has(pluginName)) {
+      try {
+        await this.installLocks.get(pluginName);
+      } catch {
+        /* ignore */
+      }
+    }
+    const p = fn();
+    this.installLocks.set(pluginName, p);
+    try {
+      return await p;
+    } finally {
+      if (this.installLocks.get(pluginName) === p) this.installLocks.delete(pluginName);
     }
   }
 
@@ -1265,26 +1333,90 @@ export class PluginManager {
     broadcastToAllWindows('plugin:pending-restart-changed', { plugins: this.getPendingRestart() });
   }
 
-  private async reloadInstalledPlugin(pluginName: string): Promise<void> {
+  getFailedUpdates(): Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }> {
+    return [...this.failedUpdates.entries()].map(([name, info]) => ({ name, ...info }));
+  }
+
+  private setFailedUpdate(
+    pluginName: string,
+    info: { attemptedVersion: string; runningVersion: string; error: string } | null,
+  ): void {
+    if (info) {
+      this.failedUpdates.set(pluginName, info);
+    } else if (!this.failedUpdates.delete(pluginName)) {
+      return;
+    }
+    broadcastToAllWindows('plugin:failed-updates-changed', { failedUpdates: this.getFailedUpdates() });
+  }
+
+  /**
+   * Hot-swap a freshly installed plugin into the running set. If the new
+   * version fails to reach `active`, restore the on-disk backup and reload the
+   * previous version so a broken release never disables a working plugin.
+   */
+  private async swapToInstalledPlugin(
+    pluginName: string,
+    attemptedVersion: string,
+    install: Pick<InstallResult, 'backupDir' | 'priorInstalledRecord' | 'priorApproval'>,
+  ): Promise<{ ok: boolean; error?: string }> {
     // Renderer-side plugin modules are cached by URL in the renderer process and
-    // won't re-import after a backend hot-reload (and stay registered even if a
-    // later version drops its frontend), so once a renderer bundle has shipped
-    // for this plugin in this session, any subsequent update needs a full app
-    // restart for the frontend to match. Backend-only load failures are NOT
-    // flagged here — restarting reproduces the same error, and the plugin's own
-    // error state already surfaces it.
+    // won't re-import after a backend hot-reload, so once a renderer bundle has
+    // shipped for this plugin in this session, any subsequent successful swap
+    // still needs a full app restart for the frontend to match.
     const hadPriorRenderer = this.rendererLoadedThisSession.has(pluginName);
 
-    const newPlugin = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
-    if (newPlugin) {
-      await this.loadPlugin(newPlugin.manifest, newPlugin.dir);
+    await this.unloadPlugin(pluginName);
+
+    const loadFromDisk = async () => {
+      const found = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
+      if (found) await this.loadPlugin(found.manifest, found.dir);
+      return this.plugins.get(pluginName);
+    };
+
+    let instance = await loadFromDisk();
+
+    if (instance?.state === 'active') {
+      if (install.backupDir) this.marketplaceService?.discardBackup(install.backupDir);
+      this.setFailedUpdate(pluginName, null);
+      if (hadPriorRenderer) {
+        this.markPendingRestart(pluginName);
+      } else {
+        this.clearPendingRestart(pluginName);
+      }
+      return { ok: true };
     }
+
+    if (this.pendingConsent.has(pluginName)) {
+      // Hold the backup until the user approves/denies so we can roll back if
+      // the new version is rejected or fails to activate after approval.
+      this.pendingConsentRollback.set(pluginName, { ...install, attemptedVersion });
+      if (hadPriorRenderer) this.markPendingRestart(pluginName);
+      return { ok: true };
+    }
+
+    const error = instance?.error ?? 'Plugin failed to activate';
+
+    if (!install.backupDir) {
+      // Fresh install (no prior version to fall back to) — leave the error state.
+      this.setFailedUpdate(pluginName, null);
+      return { ok: false, error };
+    }
+
+    console.warn(
+      `[PluginManager] "${pluginName}" v${attemptedVersion} failed to activate (${error}); rolling back to previous version`,
+    );
+
+    await this.unloadPlugin(pluginName);
+    this.marketplaceService?.rollbackInstall(pluginName, install.backupDir, install);
+    instance = await loadFromDisk();
+
+    const runningVersion = instance?.manifest.version ?? install.priorInstalledRecord?.version ?? 'unknown';
+    this.setFailedUpdate(pluginName, { attemptedVersion, runningVersion, error });
 
     if (hadPriorRenderer) {
       this.markPendingRestart(pluginName);
-    } else if (this.plugins.get(pluginName)?.state === 'active') {
-      this.clearPendingRestart(pluginName);
     }
+    return { ok: false, error };
   }
 
   async installFromMarketplace(pluginName: string, opts?: { skipHashCheck?: boolean }): Promise<void> {
@@ -1305,13 +1437,10 @@ export class PluginManager {
       throw new UnverifiedPluginError(pluginName);
     }
 
-    // Unload existing instance if present (handles broken or active plugins)
-    await this.unloadPlugin(pluginName);
-
-    await this.marketplaceService.installPlugin(entry, opts);
-
-    // Discover and load the newly installed plugin
-    await this.reloadInstalledPlugin(pluginName);
+    await this.withInstallLock(pluginName, async () => {
+      const result = await this.marketplaceService!.installPlugin(entry, opts);
+      await this.swapToInstalledPlugin(pluginName, entry.version, result);
+    });
 
     // Update count changed since we just installed/updated a plugin
     this.broadcastUpdateCount();
@@ -1336,11 +1465,13 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
     }
 
-    await this.unloadPlugin(pluginName);
-
-    this.marketplaceService.uninstallPlugin(pluginName);
+    await this.withInstallLock(pluginName, async () => {
+      await this.unloadPlugin(pluginName);
+      this.marketplaceService!.uninstallPlugin(pluginName);
+    });
 
     this.clearPendingRestart(pluginName);
+    this.setFailedUpdate(pluginName, null);
     this.broadcastUIState();
     this.notifyToolsChanged();
   }
@@ -1353,12 +1484,12 @@ export class PluginManager {
 
     const catalog = await this.marketplaceService.fetchCatalog(urls);
     if (this.brandRequiredPluginNames.length > 0) {
-      // Reload after install (not before) so a failed background download leaves the
-      // currently-running required plugin intact instead of silently disabling it.
+      // Swap after install (not before) so a failed background download leaves the
+      // currently-running required plugin intact, and a broken release rolls back.
       const updated = await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
-        afterInstall: async (name) => {
-          await this.unloadPlugin(name);
-          await this.reloadInstalledPlugin(name);
+        serialize: (name, fn) => this.withInstallLock(name, fn),
+        afterInstall: async (name, result) => {
+          await this.swapToInstalledPlugin(name, result.version, result);
         },
       });
       if (updated.length > 0) {
