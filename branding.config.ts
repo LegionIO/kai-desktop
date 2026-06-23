@@ -114,7 +114,7 @@ export const branding = {
 
   // ── Required Plugins ──────────────────────────────────────────────────
   /** Plugins that must be installed for this branded deployment. */
-  requiredPlugins: ['legion'] as ReadonlyArray<string>,
+  requiredPlugins: [] as ReadonlyArray<string>,
 
   // ── Marketplace ───────────────────────────────────────────────────────
   /** Raw JSON URLs for plugin marketplace catalogs. Enterprise URLs listed first win on name collisions. */
