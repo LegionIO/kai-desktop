@@ -190,7 +190,7 @@ const PLUGINS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins');
  * Client-side bridge script injected into the HTML served to web clients.
  * Defines `window.app` backed by a WebSocket connection instead of Electron IPC.
  */
-function getBridgeScript(): string {
+export function getBridgeScript(): string {
   return `<script>
 (function() {
   var ws, msgId = 0, pending = {}, listeners = {};
@@ -318,10 +318,27 @@ function getBridgeScript(): string {
       modalAction: function(pn, mid, act, data) { return invoke('plugin:modal-action', pn, mid, act, data); },
       bannerAction: function(pn, bid, act, data) { return invoke('plugin:banner-action', pn, bid, act, data); },
       action: function(pn, tid, act, data) { return invoke('plugin:action', pn, tid, act, data); },
+      marketplaceCatalog: function() { return invoke('plugin:marketplace-catalog'); },
+      marketplaceInstall: function(pn) { return invoke('plugin:marketplace-install', pn); },
+      marketplaceInstallUnverified: function(pn) { return invoke('plugin:marketplace-install-unverified', pn); },
+      marketplaceUninstall: function(pn) { return invoke('plugin:marketplace-uninstall', pn); },
+      marketplaceRefresh: function() { return invoke('plugin:marketplace-refresh'); },
+      getAvailableUpdateCount: function() { return invoke('plugin:available-update-count'); },
+      getPendingRestart: function() { return invoke('plugin:pending-restart'); },
+      restartApp: function() { return invoke('plugin:restart-app'); },
+      getFailedUpdates: function() { return invoke('plugin:failed-updates'); },
+      approveConsent: function(pn) { return invoke('plugin:approve-consent', pn); },
+      denyConsent: function(pn) { return invoke('plugin:deny-consent', pn); },
+      getPendingConsent: function() { return invoke('plugin:pending-consent'); },
       onUIStateChanged: function(cb) { return on('plugin:ui-state-changed', cb); },
       onEvent: function(cb) { return on('plugin:event', cb); },
       onNavigationRequest: function(cb) { return on('plugin:navigation-request', cb); },
-      onModalCallback: function(cb) { return on('plugin:modal-callback', cb); }
+      onNavigateDirect: function(cb) { return on('plugin:navigate-direct', cb); },
+      onModalCallback: function(cb) { return on('plugin:modal-callback', cb); },
+      onUpdatesAvailable: function(cb) { return on('plugin:updates-available', cb); },
+      onPendingRestartChanged: function(cb) { return on('plugin:pending-restart-changed', cb); },
+      onFailedUpdatesChanged: function(cb) { return on('plugin:failed-updates-changed', cb); },
+      onConsentRequired: function(cb) { return on('plugin:consent-required', cb); }
     },
     modelCatalog: function() { return invoke('agent:model-catalog'); },
     realtime: {
