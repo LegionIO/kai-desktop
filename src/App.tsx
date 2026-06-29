@@ -22,6 +22,7 @@ import { PluginModalHost } from '@/components/plugins/PluginModalHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { PermissionConsentModal } from '@/components/plugins/PermissionConsentModal';
 import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
+import { DisablePluginModal } from '@/components/plugins/DisablePluginModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { DictationOverlay } from '@/components/dictation/DictationOverlay';
@@ -41,6 +42,7 @@ import {
   PackageIcon,
   PencilIcon,
   PinIcon,
+  PowerIcon,
   Settings2Icon,
   SettingsIcon,
   SlidersHorizontalIcon,
@@ -537,6 +539,7 @@ function AppShell() {
   const [pluginTitleMenuOpen, setPluginTitleMenuOpen] = useState(false);
   const [confirmPluginUninstall, setConfirmPluginUninstall] = useState<string | null>(null);
   const [isPluginUninstalling, setIsPluginUninstalling] = useState(false);
+  const [confirmPluginDisable, setConfirmPluginDisable] = useState<string | null>(null);
   const [taskTitleMenuOpen, setTaskTitleMenuOpen] = useState(false);
   const [agentTitleMenuOpen, setAgentTitleMenuOpen] = useState(false);
   const [agentRenameModal, setAgentRenameModal] = useState<{ id: string; value: string } | null>(null);
@@ -796,6 +799,16 @@ function AppShell() {
     } finally {
       setIsPluginUninstalling(false);
       setConfirmPluginUninstall(null);
+    }
+  }, []);
+
+  const handlePluginDisable = useCallback(async (pluginName: string, persist: boolean) => {
+    try {
+      await app.plugins.disable(pluginName, { persist });
+      // The plugin's panel/error view is no longer navigable; leave it.
+      setActiveView(PLUGINS_VIEW);
+    } catch (err) {
+      console.error('[AppShell] Plugin disable failed:', err);
     }
   }, []);
 
@@ -1754,6 +1767,17 @@ function AppShell() {
                 </div>,
                 document.body,
               )}
+            {confirmPluginDisable && (
+              <DisablePluginModal
+                displayName={pluginDisplayName(confirmPluginDisable)}
+                onConfirm={(persist) => {
+                  const name = confirmPluginDisable;
+                  setConfirmPluginDisable(null);
+                  void handlePluginDisable(name, persist);
+                }}
+                onCancel={() => setConfirmPluginDisable(null)}
+              />
+            )}
             {renamingTask &&
               tasksCtx?.state.selectedTaskId &&
               createPortal(
@@ -2252,6 +2276,13 @@ function AppShell() {
                                     <>
                                       <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
                                       <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                        onSelect={() => setConfirmPluginDisable(activeErrorPluginName)}
+                                      >
+                                        <PowerIcon className="h-4 w-4 text-muted-foreground" />
+                                        <span>Disable</span>
+                                      </DropdownMenu.Item>
+                                      <DropdownMenu.Item
                                         className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
                                         onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
                                       >
@@ -2313,6 +2344,13 @@ function AppShell() {
                                   {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
                                     <>
                                       <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                      <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                        onSelect={() => setConfirmPluginDisable(activePluginPanel.pluginName)}
+                                      >
+                                        <PowerIcon className="h-4 w-4 text-muted-foreground" />
+                                        <span>Disable</span>
+                                      </DropdownMenu.Item>
                                       <DropdownMenu.Item
                                         className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
                                         onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}

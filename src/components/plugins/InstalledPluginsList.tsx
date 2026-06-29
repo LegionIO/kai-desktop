@@ -11,9 +11,11 @@ import {
   DownloadIcon,
   PlusIcon,
   Settings2Icon,
+  PowerIcon,
 } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginNavigationIcon } from '@/components/plugins/plugin-icons';
+import { DisablePluginModal } from '@/components/plugins/DisablePluginModal';
 import type { PluginNavigationTarget } from '@/providers/PluginProvider';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
@@ -82,6 +84,7 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<string | null>(null);
   const [isUninstalling, setIsUninstalling] = useState(false);
+  const [confirmDisable, setConfirmDisable] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -142,6 +145,23 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
       }
     },
     [onOpenMarketplace],
+  );
+
+  const handleDisable = useCallback(
+    async (pluginName: string, persist: boolean) => {
+      try {
+        await app.plugins.disable(pluginName, { persist });
+        // The plugin's panel is no longer navigable; if we were viewing it, leave.
+        if (activeView.startsWith(`plugin-panel:${pluginName}:`) || activeView === `plugin-error:${pluginName}`) {
+          onOpenPlugins();
+        }
+      } catch (err) {
+        console.error('[InstalledPluginsList] Disable failed:', err);
+      } finally {
+        setConfirmDisable(null);
+      }
+    },
+    [activeView, onOpenPlugins],
   );
 
   const handleContextMenu = useCallback((e: React.MouseEvent, pluginName: string) => {
@@ -419,6 +439,15 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
                 <>
                   <div className="my-1 h-px bg-border/60" />
                   <button
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
+                    onClick={() => {
+                      setConfirmDisable(contextMenu.pluginName);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <PowerIcon className="h-4 w-4 text-muted-foreground" /> Disable
+                  </button>
+                  <button
                     className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
                     onClick={() => {
                       setConfirmUninstall(contextMenu.pluginName);
@@ -488,6 +517,19 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
           </div>,
           document.body,
         )}
+
+      {/* Disable mode choice modal */}
+      {confirmDisable && (
+        <DisablePluginModal
+          displayName={plugins.find((p) => p.name === confirmDisable)?.displayName || confirmDisable}
+          onConfirm={(persist) => {
+            const name = confirmDisable;
+            setConfirmDisable(null);
+            void handleDisable(name, persist);
+          }}
+          onCancel={() => setConfirmDisable(null)}
+        />
+      )}
     </div>
   );
 };
