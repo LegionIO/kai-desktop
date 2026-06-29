@@ -689,6 +689,13 @@ export const appConfigSchema = z.object({
     sidebarWidth: z.number().positive(),
     fullWidthContent: z.boolean().default(true),
     showPluginDockIcons: z.boolean().default(true),
+    dockOrder: z
+      .object({
+        units: z.array(z.string()).default([]),
+        plugins: z.array(z.string()).default([]),
+      })
+      .default({ units: [], plugins: [] }),
+    pluginBubbleExpanded: z.boolean().default(true),
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),

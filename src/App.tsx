@@ -1511,6 +1511,7 @@ function AppShell() {
         id: 'chats',
         label: 'Chats',
         icon: <MessageSquareIcon className="h-[18px] w-[18px]" />,
+        group: 'builtin',
         onClick: () => {
           setSidebarSection('chats');
           setActiveView(lastChatsViewRef.current);
@@ -1521,6 +1522,7 @@ function AppShell() {
         id: 'tasks',
         label: 'Tasks',
         icon: <CheckSquareIcon className="h-[18px] w-[18px]" />,
+        group: 'builtin',
         onClick: () => {
           setSidebarSection('tasks');
           setActiveView(TASKS_VIEW);
@@ -1531,6 +1533,7 @@ function AppShell() {
         id: 'agents',
         label: 'Agents',
         icon: <BotIcon className="h-[18px] w-[18px]" />,
+        group: 'builtin',
         onClick: () => {
           setSidebarSection('agents');
           setActiveView(AGENTS_VIEW);
@@ -1541,6 +1544,7 @@ function AppShell() {
         id: 'plugins',
         label: 'Plugins',
         icon: <PackageIcon className="h-[18px] w-[18px]" />,
+        group: 'builtin',
         onClick: () => {
           setSidebarSection('plugins');
           setActiveView(lastPluginViewRef.current);
@@ -1567,10 +1571,12 @@ function AppShell() {
         const label = navItem?.label || pluginDisplayNames.get(panel.pluginName) || panel.pluginName;
         const icon = navItem?.icon;
         const viewKey = getPluginPanelViewKey(panel.pluginName, panel.id);
+        const navBadge = navItem?.badge;
 
         items.push({
           id: `plugin:${panel.pluginName}`,
           label,
+          group: 'plugin',
           icon: (
             <span className="inline-flex h-[18px] w-[18px] items-center justify-center [&>svg]:h-full [&>svg]:w-full">
               {getPluginNavigationIcon(icon)}
@@ -1581,6 +1587,12 @@ function AppShell() {
             setActiveView(viewKey);
           },
           active: activeView === viewKey,
+          badge:
+            navBadge != null && navBadge !== '' && navBadge !== 0 ? (
+              <span className="absolute -top-0.5 -right-0.5 flex min-w-[15px] items-center justify-center rounded-full bg-blue-500 px-1 text-[9px] font-semibold leading-[15px] text-white">
+                {navBadge}
+              </span>
+            ) : undefined,
         });
       }
     }
@@ -1595,6 +1607,32 @@ function AppShell() {
     pluginUIState?.navigationItems,
     pluginDisplayNames,
   ]);
+
+  // ── Dock ordering + plugin bubble state (persisted in config.ui) ─────────
+  const dockUi = config?.ui as
+    | { dockOrder?: { units?: string[]; plugins?: string[] }; pluginBubbleExpanded?: boolean }
+    | undefined;
+  const dockUnitOrder = dockUi?.dockOrder?.units ?? [];
+  const dockPluginOrder = dockUi?.dockOrder?.plugins ?? [];
+  const pluginBubbleExpanded = dockUi?.pluginBubbleExpanded !== false;
+
+  const handleToggleBubble = useCallback(() => {
+    void updateConfig('ui.pluginBubbleExpanded', !pluginBubbleExpanded);
+  }, [updateConfig, pluginBubbleExpanded]);
+
+  const handleReorderUnits = useCallback(
+    (orderedUnitIds: string[]) => {
+      void updateConfig('ui.dockOrder.units', orderedUnitIds);
+    },
+    [updateConfig],
+  );
+
+  const handleReorderPlugins = useCallback(
+    (orderedPluginIds: string[]) => {
+      void updateConfig('ui.dockOrder.plugins', orderedPluginIds);
+    },
+    [updateConfig],
+  );
 
   return (
     <AttachmentProvider>
@@ -1981,6 +2019,12 @@ function AppShell() {
                     <UpdateCard />
                     <SidebarDock
                       items={dockItems}
+                      bubbleExpanded={pluginBubbleExpanded}
+                      onToggleBubble={handleToggleBubble}
+                      onReorderUnits={handleReorderUnits}
+                      onReorderPlugins={handleReorderPlugins}
+                      unitOrder={dockUnitOrder}
+                      pluginOrder={dockPluginOrder}
                       trailing={
                         <button
                           type="button"

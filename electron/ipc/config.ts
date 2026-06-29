@@ -156,6 +156,8 @@ function getDefaultConfig() {
       sidebarWidth: 280,
       fullWidthContent: true,
       showPluginDockIcons: true,
+      dockOrder: { units: [] as string[], plugins: [] as string[] },
+      pluginBubbleExpanded: true,
       splashBackground: 'random' as const,
       workspaces: [] as Array<{
         id: string;
