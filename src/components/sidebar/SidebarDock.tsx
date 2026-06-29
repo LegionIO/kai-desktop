@@ -10,7 +10,6 @@ import {
 import { DndContext, PointerSensor, useSensors, useSensor, closestCenter, type DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, useSortable, arrayMove, horizontalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVerticalIcon } from 'lucide-react';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { cn } from '@/lib/utils';
 
@@ -221,7 +220,7 @@ export const SidebarDock: FC<SidebarDockProps> = ({
         ref={scrollRef}
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
-        className="dock-scroll min-w-0 flex-1 overflow-x-auto pb-2 pt-3"
+        className="dock-scroll min-w-0 flex-1 overflow-x-auto pb-2 pt-5"
         style={{
           scrollbarWidth: 'none',
         }}
@@ -312,12 +311,36 @@ const PluginBubble: FC<PluginBubbleProps> = ({
   onInnerDragCancel,
   onInnerDragEnd,
 }) => {
-  // The bubble is one sortable UNIT in the outer context. Its drag handle is a
-  // dedicated grip (when expanded) or the box icon itself (when collapsed) —
-  // see below; we attach `listeners` to whichever element is the handle.
+  const pluginCount = pluginById.size;
+  const hasMembers = pluginCount > 0;
+  // Collapsed = the bubble shows only the box icon; the plugin icons are pulled
+  // inward toward the box (animated to zero width). A bubble with no members is
+  // always "collapsed". We also force-collapse during any OUTER (unit) drag so
+  // the bubble's width matches the single-icon built-ins — otherwise dnd-kit's
+  // horizontal sort distorts widths when a built-in is dragged past the wide
+  // expanded pill.
+  const collapsed = !expanded || !hasMembers || outerDragActive;
+
+  // Keep a handle on the pill node so we can magnify its background in step with
+  // the icons. Forward it to dnd-kit's setNodeRef as well.
+  const pillRef = useRef<HTMLDivElement | null>(null);
+
+  // The bubble is one sortable UNIT in the outer dock context. We disable only
+  // the DRAGGABLE side when expanded (so the wide pill can't be picked up and
+  // distort the horizontal sort), but keep it DROPPABLE so other dock items can
+  // still be dropped relative to the group — including at the row edges.
   const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({
     id: PLUGIN_BUBBLE_UNIT,
+    disabled: { draggable: !collapsed, droppable: false },
   });
+
+  const setRefs = useCallback(
+    (node: HTMLDivElement | null) => {
+      pillRef.current = node;
+      setNodeRef(node);
+    },
+    [setNodeRef],
+  );
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -327,67 +350,60 @@ const PluginBubble: FC<PluginBubbleProps> = ({
     touchAction: 'none' as const,
   };
 
-  const pluginCount = pluginById.size;
-  const hasMembers = pluginCount > 0;
-  // Collapse to a single-icon width during any OUTER drag so the bubble unit
-  // matches the built-in icons' width — otherwise dnd-kit's horizontal sorting
-  // stretches/condenses the mismatched-width siblings (the dragged built-in
-  // balloons to the bubble's width; the dragged bubble snaps to one icon).
-  const showMembers = expanded && hasMembers && !outerDragActive;
+  // Magnify the pill background in step with the icons so the rounded boundary
+  // grows to contain the enlarged icons on hover (peak at the icon nearest the
+  // cursor). Icons grow upward from their bottom edge, so the background needs
+  // mostly HEIGHT and only a little WIDTH — a uniform scale balloons sideways
+  // past the icons into neighbouring built-ins. Only when expanded.
+  let bgScaleY = 1;
+  let bgScaleX = 1;
+  if (!collapsed && mouseX !== null && pillRef.current && containerRef.current) {
+    const pillRect = pillRef.current.getBoundingClientRect();
+    const containerRect = containerRef.current.getBoundingClientRect();
+    const left = pillRect.left - containerRect.left + containerRef.current.scrollLeft;
+    const right = left + pillRect.width;
+    // Distance from cursor to the nearest pill edge (0 when cursor is inside).
+    const dist = mouseX < left ? left - mouseX : mouseX > right ? mouseX - right : 0;
+    bgScaleY = getScale(dist);
+    // Width grows only ~15% as much as height.
+    bgScaleX = 1 + (bgScaleY - 1) * 0.15;
+  }
 
   // Aggregate badge dot when collapsed and any member has a badge.
   const hasMemberBadge = useMemo(() => Array.from(pluginById.values()).some((i) => i.badge != null), [pluginById]);
 
-  const boxButton = anchorItem ? (
-    <DockIconButton
-      item={{
-        ...anchorItem,
-        onClick: () => {
-          anchorItem.onClick();
-          if (hasMembers) onToggle();
-        },
-        badge:
-          anchorItem.badge ??
-          (!expanded && hasMemberBadge ? (
-            <span className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
-          ) : undefined),
-      }}
-      mouseX={mouseX}
-      containerRef={containerRef}
-    />
-  ) : null;
-
-  // Collapsed: the whole bubble is just the box icon, and the box icon is the
-  // outer drag handle (long-press to move the bubble among the built-ins).
-  if (!showMembers) {
-    return (
-      <div ref={setNodeRef} style={style} {...listeners} className="flex shrink-0 items-end">
-        {boxButton}
-      </div>
-    );
-  }
-
-  // Expanded: a pill with a grip handle (drags the whole bubble in the outer
-  // context) followed by a NESTED DndContext whose members are the box anchor
-  // and the plugin icons — all reorderable together inside the bubble.
+  // Single always-mounted structure so the collapse animation works: every
+  // inner slot (box anchor + plugins) is rendered in order. The box anchor
+  // never collapses; the plugin slots animate their width/opacity to zero when
+  // collapsed, pulling inward toward the box wherever it sits in the order.
+  // Outer-unit drag listeners go on the pill root only when collapsed (then the
+  // pill is just the box); inner sortables are disabled while collapsed so they
+  // don't compete with the outer drag.
   return (
     <div
-      ref={setNodeRef}
+      ref={setRefs}
       style={style}
-      className="flex shrink-0 items-end gap-0.5 rounded-full bg-sidebar-accent/40 px-1 ring-1 ring-inset ring-sidebar-border/60"
+      {...(collapsed ? listeners : {})}
+      className={cn('relative flex shrink-0 items-end gap-0.5', collapsed ? 'px-0' : 'px-1')}
     >
-      {/* Grip — outer drag handle for moving the whole bubble. */}
-      <Tooltip content="Drag to move plugin group" side="top" sideOffset={6}>
-        <div
-          {...listeners}
-          className="flex h-7 cursor-grab items-center self-center text-muted-foreground/50 hover:text-muted-foreground"
-          style={{ touchAction: 'none' }}
-          aria-label="Drag to move plugin group"
-        >
-          <GripVerticalIcon className="h-3.5 w-3.5" />
-        </div>
-      </Tooltip>
-
+      {/* Magnifying background — scales from the bottom in step with the icons so
+          its rounded boundary expands to contain the grown icons. */}
+      <div
+        aria-hidden
+        className={cn(
+          'pointer-events-none absolute inset-0 origin-bottom rounded-full transition-[background-color,box-shadow,opacity] duration-200 ease-out',
+          collapsed
+            ? 'bg-transparent opacity-0 ring-0'
+            : 'bg-sidebar-accent/40 opacity-100 ring-1 ring-inset ring-sidebar-border/60',
+        )}
+        style={{
+          transform: `scale(${bgScaleX}, ${bgScaleY})`,
+          transition:
+            mouseX !== null
+              ? 'transform 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
+              : 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)',
+        }}
+      />
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -396,21 +412,31 @@ const PluginBubble: FC<PluginBubbleProps> = ({
         onDragEnd={onInnerDragEnd}
       >
         <SortableContext items={orderedInnerIds} strategy={horizontalListSortingStrategy}>
-          <div className="flex items-end gap-0.5">
+          {/* gap-0 when collapsed so the zero-width plugin slots don't each add
+              a gap (which would keep a multi-plugin bubble wider than one icon
+              and distort the outer sort). Expanded uses the same gap-0.5 as the
+              built-in row; magnify spacing is added per-icon via margin. */}
+          <div className={cn('relative z-10 flex items-end', collapsed ? 'gap-0' : 'gap-0.5')}>
             {orderedInnerIds.map((innerId) => {
               if (innerId === PLUGIN_BUBBLE_ANCHOR) {
                 return (
                   <SortableDockIcon
                     key={innerId}
                     id={PLUGIN_BUBBLE_ANCHOR}
+                    disabled={collapsed}
                     item={
                       anchorItem
                         ? {
                             ...anchorItem,
                             onClick: () => {
                               anchorItem.onClick();
-                              onToggle();
+                              if (hasMembers) onToggle();
                             },
+                            badge:
+                              anchorItem.badge ??
+                              (collapsed && hasMemberBadge ? (
+                                <span className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
+                              ) : undefined),
                           }
                         : undefined
                     }
@@ -422,7 +448,15 @@ const PluginBubble: FC<PluginBubbleProps> = ({
               const item = pluginById.get(innerId);
               if (!item) return null;
               return (
-                <SortableDockIcon key={item.id} id={item.id} item={item} mouseX={mouseX} containerRef={containerRef} />
+                <CollapsibleSlot key={item.id} collapsed={collapsed} animate={!outerDragActive}>
+                  <SortableDockIcon
+                    id={item.id}
+                    disabled={collapsed}
+                    item={item}
+                    mouseX={mouseX}
+                    containerRef={containerRef}
+                  />
+                </CollapsibleSlot>
               );
             })}
           </div>
@@ -432,6 +466,37 @@ const PluginBubble: FC<PluginBubbleProps> = ({
   );
 };
 
+/* ── Collapsible slot — animates width to zero, pulling inward ── */
+
+/**
+ * Wraps an inner plugin icon so it can collapse to zero width. The CSS grid
+ * `grid-template-columns: 1fr → 0fr` trick animates an unknown-width child to
+ * nothing; combined with `overflow-hidden` + opacity it makes the icon pull
+ * inward toward the box anchor instead of snapping. While collapsed the slot is
+ * `inert` + `aria-hidden` so its (invisible) button leaves the tab order.
+ *
+ * `overflow` is hidden ONLY while collapsed — when expanded it must stay
+ * visible so on-hover magnification, notification badges, and the drag
+ * transform of a reordering icon are not clipped by the slot box.
+ */
+const CollapsibleSlot: FC<{ collapsed: boolean; animate?: boolean; children: ReactNode }> = ({
+  collapsed,
+  animate = true,
+  children,
+}) => (
+  <div
+    className={cn('grid items-end', animate && 'transition-[grid-template-columns,opacity] duration-200 ease-out')}
+    style={{
+      gridTemplateColumns: collapsed ? '0fr' : '1fr',
+      opacity: collapsed ? 0 : 1,
+    }}
+    aria-hidden={collapsed || undefined}
+    inert={collapsed || undefined}
+  >
+    <div className={collapsed ? 'overflow-hidden' : 'overflow-visible'}>{children}</div>
+  </div>
+);
+
 /* ── Sortable wrapper around a dock icon ──────────────── */
 
 interface SortableDockIconProps {
@@ -440,10 +505,12 @@ interface SortableDockIconProps {
   item: DockItem | undefined;
   mouseX: number | null;
   containerRef: React.RefObject<HTMLDivElement | null>;
+  /** When true, the icon is not draggable (e.g. plugin icons in a collapsed bubble). */
+  disabled?: boolean;
 }
 
-const SortableDockIcon: FC<SortableDockIconProps> = ({ id, item, mouseX, containerRef }) => {
-  const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({ id });
+const SortableDockIcon: FC<SortableDockIconProps> = ({ id, item, mouseX, containerRef, disabled }) => {
+  const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({ id, disabled });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -475,44 +542,79 @@ interface DockIconButtonProps {
 
 const DockIconButton: FC<DockIconButtonProps> = ({ item, mouseX, containerRef }) => {
   const btnRef = useRef<HTMLButtonElement>(null);
+  // The spacer applied on the last render. We subtract it back out when reading
+  // the button's position so a magnified icon's own left margin doesn't shift
+  // the center we measure (which would make scale/spacer chase themselves).
+  const appliedSpacerRef = useRef(0);
 
-  // Compute scale based on distance from cursor
   let scale = 1;
+  let spacer = 0;
   if (mouseX !== null && btnRef.current && containerRef.current) {
     const btnRect = btnRef.current.getBoundingClientRect();
     const containerRect = containerRef.current.getBoundingClientRect();
-    // Account for scroll position so the calculation stays correct when scrolled
-    const btnCenter = btnRect.left + btnRect.width / 2 - containerRect.left + containerRef.current.scrollLeft;
+    // `origin-bottom` scaling keeps center-x fixed; subtracting the previously
+    // applied left margin removes this icon's own contribution to its position,
+    // so the measured center is stable across renders.
+    const btnCenter =
+      btnRect.left +
+      btnRect.width / 2 -
+      containerRect.left +
+      containerRef.current.scrollLeft -
+      appliedSpacerRef.current;
     scale = getScale(Math.abs(mouseX - btnCenter));
+    // `scale` is a CSS transform and doesn't affect layout, so a magnified icon
+    // would overlap its neighbours. Reserve real horizontal margin equal to the
+    // growth (half per side) so siblings are pushed apart ONLY as much as this
+    // icon magnifies — at rest (scale 1) there's no extra spacing, matching the
+    // tight built-in layout. `offsetWidth` ignores the transform, giving a
+    // stable base width.
+    const baseWidth = btnRef.current.offsetWidth;
+    spacer = ((scale - 1) * baseWidth) / 2;
   }
+  appliedSpacerRef.current = spacer;
 
   return (
-    <Tooltip content={item.label} side="top" sideOffset={6}>
-      <button
-        ref={btnRef}
-        type="button"
-        onClick={item.onClick}
-        className={cn(
-          'titlebar-no-drag relative flex shrink-0 items-center justify-center rounded-xl p-1.5 transition-colors',
-          'hover:bg-sidebar-accent/80',
-          'origin-bottom will-change-transform',
-          item.active
-            ? 'bg-[var(--brand-accent)]/20 text-[var(--brand-accent)]'
-            : item.subdued
-              ? 'text-[var(--brand-accent)]/60 ring-1 ring-inset ring-[var(--brand-accent)]/30'
-              : 'text-muted-foreground',
-        )}
-        style={{
-          transform: `scale(${scale})`,
-          transition:
-            mouseX !== null
-              ? 'transform 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
-              : 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)',
-        }}
-      >
-        {item.icon}
-        {item.badge}
-      </button>
-    </Tooltip>
+    // Wrapper carries the magnify spacer margin; the button (inside the Tooltip)
+    // carries the scale transform. Keeping the margin off the measured button —
+    // and subtracting the prior spacer above — avoids a measure->margin->measure
+    // feedback loop. The margin transitions only while hovering so it snaps to
+    // zero instantly on drag start (mouseX cleared), keeping the collapsed
+    // bubble icon-width.
+    <div
+      className="flex shrink-0 items-end"
+      style={{
+        marginLeft: spacer,
+        marginRight: spacer,
+        transition: mouseX !== null ? 'margin 0.15s cubic-bezier(0.22, 1, 0.36, 1)' : undefined,
+      }}
+    >
+      <Tooltip content={item.label} side="top" sideOffset={6}>
+        <button
+          ref={btnRef}
+          type="button"
+          onClick={item.onClick}
+          className={cn(
+            'titlebar-no-drag relative flex shrink-0 items-center justify-center rounded-xl p-1.5 transition-colors',
+            'hover:bg-sidebar-accent/80',
+            'origin-bottom will-change-transform',
+            item.active
+              ? 'bg-[var(--brand-accent)]/20 text-[var(--brand-accent)]'
+              : item.subdued
+                ? 'text-[var(--brand-accent)]/60 ring-1 ring-inset ring-[var(--brand-accent)]/30'
+                : 'text-muted-foreground',
+          )}
+          style={{
+            transform: `scale(${scale})`,
+            transition:
+              mouseX !== null
+                ? 'transform 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
+                : 'transform 0.3s cubic-bezier(0.22, 1, 0.36, 1)',
+          }}
+        >
+          {item.icon}
+          {item.badge}
+        </button>
+      </Tooltip>
+    </div>
   );
 };
