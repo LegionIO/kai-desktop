@@ -145,6 +145,8 @@ type AppAPI = {
     ) => Promise<{ success: boolean; needsConfirmation?: boolean; pluginName?: string; reason?: string }>;
     marketplaceInstallUnverified: (pluginName: string) => Promise<{ success: boolean }>;
     marketplaceUninstall: (pluginName: string) => Promise<{ success: boolean }>;
+    disable: (pluginName: string, opts?: { persist?: boolean }) => Promise<{ success: boolean }>;
+    enable: (pluginName: string) => Promise<{ success: boolean }>;
     marketplaceRefresh: () => Promise<
       Array<{
         name: string;

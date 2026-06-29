@@ -11,6 +11,8 @@ import {
   SearchIcon,
   XIcon,
   Settings2Icon,
+  PowerIcon,
+  PlayIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
@@ -93,6 +95,8 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
   >(new Map());
   const [uninstallingPlugins, setUninstallingPlugins] = useState<Set<string>>(new Set());
   const [confirmUninstall, setConfirmUninstall] = useState<InstalledPlugin | null>(null);
+  const [togglingPlugins, setTogglingPlugins] = useState<Set<string>>(new Set());
+  const [confirmDisable, setConfirmDisable] = useState<InstalledPlugin | null>(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -140,6 +144,11 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
     (plugin: InstalledPlugin) => {
       if (plugin.state === 'error') {
         onOpenPluginError(plugin.name);
+        return;
+      }
+      // Disabled plugins have no live panel to navigate to — clicking the row is
+      // a no-op (use the Enable button to bring it back).
+      if (plugin.state === 'disabled') {
         return;
       }
       const navItem = navigationItems.find((n) => n.pluginName === plugin.name);
@@ -193,6 +202,27 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
       });
     }
   };
+
+  const withToggling = async (pluginName: string, fn: () => Promise<unknown>) => {
+    setTogglingPlugins((prev) => new Set([...prev, pluginName]));
+    try {
+      await fn();
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to toggle ${pluginName}`);
+    } finally {
+      setTogglingPlugins((prev) => {
+        const next = new Set(prev);
+        next.delete(pluginName);
+        return next;
+      });
+    }
+  };
+
+  const handleDisable = (pluginName: string, persist: boolean) =>
+    withToggling(pluginName, () => app.plugins.disable(pluginName, { persist }));
+
+  const handleEnable = (pluginName: string) => withToggling(pluginName, () => app.plugins.enable(pluginName));
 
   const filteredPlugins = searchQuery.trim()
     ? plugins.filter((p) => {
@@ -406,6 +436,44 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
                             </button>
                           </Tooltip>
                         )}
+                        {!plugin.brandRequired &&
+                          (plugin.state === 'disabled' ? (
+                            <Tooltip content="Enable" side="bottom">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleEnable(plugin.name);
+                                }}
+                                disabled={togglingPlugins.has(plugin.name)}
+                                className="flex items-center justify-center rounded-lg border border-green-500/30 bg-green-500/10 p-1.5 text-green-400 transition-colors hover:bg-green-500/20 disabled:opacity-50"
+                              >
+                                {togglingPlugins.has(plugin.name) ? (
+                                  <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <PlayIcon className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            </Tooltip>
+                          ) : (
+                            <Tooltip content="Disable" side="bottom">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setConfirmDisable(plugin);
+                                }}
+                                disabled={togglingPlugins.has(plugin.name)}
+                                className="flex items-center justify-center rounded-lg border border-border/60 bg-muted/30 p-1.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:opacity-50"
+                              >
+                                {togglingPlugins.has(plugin.name) ? (
+                                  <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <PowerIcon className="h-3.5 w-3.5" />
+                                )}
+                              </button>
+                            </Tooltip>
+                          ))}
                         {!plugin.brandRequired && (
                           <Tooltip content="Uninstall" side="bottom">
                             <button
@@ -476,6 +544,62 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
                 >
                   <TrashIcon className="h-3.5 w-3.5" />
                   Uninstall
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+
+      {/* Disable mode choice modal */}
+      {confirmDisable &&
+        createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmDisable(null)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-lg font-semibold text-foreground">Disable plugin</h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Stop <span className="font-medium text-foreground">{confirmDisable.displayName}</span> now. Its tools
+                and background activity are torn down immediately; it stays installed and keeps its settings.
+              </p>
+              <div className="mt-5 flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const name = confirmDisable.name;
+                    setConfirmDisable(null);
+                    void handleDisable(name, true);
+                  }}
+                  className="flex flex-col items-start rounded-xl border border-border/70 px-4 py-3 text-left transition-colors hover:bg-muted/50"
+                >
+                  <span className="text-sm font-medium text-foreground">Disable until I re-enable</span>
+                  <span className="text-xs text-muted-foreground">Stays disabled across restarts.</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const name = confirmDisable.name;
+                    setConfirmDisable(null);
+                    void handleDisable(name, false);
+                  }}
+                  className="flex flex-col items-start rounded-xl border border-border/70 px-4 py-3 text-left transition-colors hover:bg-muted/50"
+                >
+                  <span className="text-sm font-medium text-foreground">Disable for this session</span>
+                  <span className="text-xs text-muted-foreground">
+                    Re-enabled automatically next time the app starts.
+                  </span>
+                </button>
+              </div>
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setConfirmDisable(null)}
+                  className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                >
+                  Cancel
                 </button>
               </div>
             </div>

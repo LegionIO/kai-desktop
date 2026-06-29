@@ -421,8 +421,10 @@ const pluginSystemSchema = z
   .object({
     /** Controls behavior when a plugin's version/capability constraints don't match the host. */
     compatibilityMode: z.enum(['strict', 'warn']).default('warn'),
+    /** Names of non-required plugins the user has disabled until they re-enable them. */
+    disabledPlugins: z.array(z.string()).default([]),
   })
-  .default({ compatibilityMode: 'warn' });
+  .default({ compatibilityMode: 'warn', disabledPlugins: [] });
 
 const cliToolSchema = z.object({
   name: z.string(),

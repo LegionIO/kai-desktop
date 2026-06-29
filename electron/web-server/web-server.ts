@@ -322,6 +322,8 @@ export function getBridgeScript(): string {
       marketplaceInstall: function(pn) { return invoke('plugin:marketplace-install', pn); },
       marketplaceInstallUnverified: function(pn) { return invoke('plugin:marketplace-install-unverified', pn); },
       marketplaceUninstall: function(pn) { return invoke('plugin:marketplace-uninstall', pn); },
+      disable: function(pn, opts) { return invoke('plugin:disable', pn, opts); },
+      enable: function(pn) { return invoke('plugin:enable', pn); },
       marketplaceRefresh: function() { return invoke('plugin:marketplace-refresh'); },
       getAvailableUpdateCount: function() { return invoke('plugin:available-update-count'); },
       getPendingRestart: function() { return invoke('plugin:pending-restart'); },

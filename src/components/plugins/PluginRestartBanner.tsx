@@ -30,11 +30,11 @@ export const PluginRestartBanner: FC = () => {
       <div className="min-w-0 flex-1">
         <p className="text-xs font-medium text-amber-400">
           {pending.length === 1
-            ? `Restart required to finish updating ${pending[0]}`
-            : `Restart required to finish updating ${pending.length} plugins`}
+            ? `Restart required to finish applying changes to ${pending[0]}`
+            : `Restart required to finish applying changes to ${pending.length} plugins`}
         </p>
         <p className="text-[10px] text-amber-400/70">
-          The new version is installed but won&apos;t be fully active until the app restarts.
+          Some plugin changes won&apos;t be fully applied until the app restarts.
         </p>
       </div>
       {canRestart && (

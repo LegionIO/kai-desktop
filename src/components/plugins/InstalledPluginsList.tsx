@@ -175,13 +175,22 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
 
   const navigationItems = uiState?.navigationItems?.filter((i) => i.visible) ?? [];
 
+  // Disabled plugins have their backend torn down, so they're not navigable —
+  // they only appear in the management view (InstalledPluginsView). Exclude them
+  // from this sidebar so users can't open a stale/dead panel for them.
+  const navigablePlugins = plugins.filter((p) => p.state !== 'disabled');
+
+  // Distinguish "everything installed is disabled" from "nothing installed" so the
+  // empty state doesn't wrongly invite a first install when plugins exist.
+  const allInstalledDisabled = plugins.length > 0 && navigablePlugins.length === 0;
+
   const isSearchActive = searchQuery.trim().length > 0;
   const filteredPlugins = isSearchActive
-    ? plugins.filter((p) => {
+    ? navigablePlugins.filter((p) => {
         const q = searchQuery.toLowerCase();
         return (p.displayName || p.name).toLowerCase().includes(q) || p.description.toLowerCase().includes(q);
       })
-    : plugins;
+    : navigablePlugins;
 
   const pinned = filteredPlugins.filter((p) => pinnedNames.has(p.name));
   const unpinned = filteredPlugins.filter((p) => !pinnedNames.has(p.name));
@@ -331,23 +340,32 @@ export const InstalledPluginsList: FC<InstalledPluginsListProps> = ({
               <PackageIcon size={24} strokeWidth={1.3} />
             </div>
             <h3 className="mb-1 text-sm font-medium text-foreground/80">
-              {isSearchActive ? 'No plugins match your search' : 'No plugins installed'}
+              {isSearchActive
+                ? 'No plugins match your search'
+                : allInstalledDisabled
+                  ? 'All plugins are disabled'
+                  : 'No plugins installed'}
             </h3>
-            {!isSearchActive && (
-              <>
-                <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
-                  Extend Kai with plugins for extra tools, integrations, and custom workflows.
+            {!isSearchActive &&
+              (allInstalledDisabled ? (
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Re-enable a plugin from the Plugins page to bring it back here.
                 </p>
-                <button
-                  type="button"
-                  onClick={onOpenMarketplace}
-                  className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                >
-                  <PlusIcon size={13} />
-                  Install Your First Plugin
-                </button>
-              </>
-            )}
+              ) : (
+                <>
+                  <p className="mb-4 text-xs text-muted-foreground leading-relaxed">
+                    Extend Kai with plugins for extra tools, integrations, and custom workflows.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={onOpenMarketplace}
+                    className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                  >
+                    <PlusIcon size={13} />
+                    Install Your First Plugin
+                  </button>
+                </>
+              ))}
           </div>
         ) : (
           <>

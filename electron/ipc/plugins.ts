@@ -91,6 +91,16 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return { success: true };
   });
 
+  ipcMain.handle('plugin:disable', async (_event, pluginName: string, opts?: { persist?: boolean }) => {
+    await pluginManager.disablePlugin(pluginName, { persist: opts?.persist ?? true });
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:enable', async (_event, pluginName: string) => {
+    await pluginManager.enablePlugin(pluginName);
+    return { success: true };
+  });
+
   ipcMain.handle('plugin:marketplace-refresh', async () => {
     const catalog = await pluginManager.refreshMarketplace();
     return catalog;

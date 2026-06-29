@@ -1355,6 +1355,11 @@ function AppShell() {
     const match = activeView.match(/^plugin-panel:([^:]+):default$/);
     if (match) {
       const pluginName = match[1];
+      // Don't synthesize a panel for a disabled plugin — its backend is torn
+      // down, so a stale route should resolve to nothing rather than a dead UI.
+      if (pluginUIState?.pluginStatuses?.[pluginName] === 'disabled') {
+        return null;
+      }
       return {
         id: 'default',
         pluginName,
@@ -1365,7 +1370,7 @@ function AppShell() {
       };
     }
     return null;
-  }, [activeView, pluginPanels]);
+  }, [activeView, pluginPanels, pluginUIState?.pluginStatuses]);
 
   const activeErrorPluginName = activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX)
     ? activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)

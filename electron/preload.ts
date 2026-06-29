@@ -204,6 +204,9 @@ const appAPI = {
       ipcRenderer.invoke('plugin:marketplace-install-unverified', pluginName) as Promise<{ success: boolean }>,
     marketplaceUninstall: (pluginName: string) =>
       ipcRenderer.invoke('plugin:marketplace-uninstall', pluginName) as Promise<{ success: boolean }>,
+    disable: (pluginName: string, opts?: { persist?: boolean }) =>
+      ipcRenderer.invoke('plugin:disable', pluginName, opts) as Promise<{ success: boolean }>,
+    enable: (pluginName: string) => ipcRenderer.invoke('plugin:enable', pluginName) as Promise<{ success: boolean }>,
     marketplaceRefresh: () =>
       ipcRenderer.invoke('plugin:marketplace-refresh') as Promise<
         Array<{

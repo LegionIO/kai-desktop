@@ -108,6 +108,8 @@ export class PluginManager {
   private rendererLoadedThisSession: Set<string> = new Set();
   private failedUpdates: Map<string, { attemptedVersion: string; runningVersion: string; error: string }> = new Map();
   private installLocks: Map<string, Promise<unknown>> = new Map();
+  /** Plugins disabled for the current session only (not persisted to config). */
+  private sessionDisabled: Set<string> = new Set();
 
   private brandRequiredPluginNamesSet: Set<string>;
 
@@ -249,22 +251,33 @@ export class PluginManager {
     const pending = this.pendingConsent.get(pluginName);
     if (!pending) return false;
 
-    this.persistPluginApproval(pluginName, pending.fileHash, pending.manifest.permissions);
-    this.pendingConsent.delete(pluginName);
+    // Serialize with disable/enable and marketplace ops for the same plugin so an
+    // in-flight disable can't interleave with this approval reload and leave the
+    // plugin active after the user disabled it.
+    return this.withInstallLock(pluginName, async () => {
+      // Re-check: a concurrent disable/deny may have cleared the pending consent
+      // while we waited for the lock.
+      const stillPending = this.pendingConsent.get(pluginName);
+      if (!stillPending) return false;
 
-    // Re-discover the plugin directory
-    const discovered = this.discoverPlugins();
-    const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
-    if (!pluginInfo) {
-      void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval');
-      return false;
-    }
+      this.persistPluginApproval(pluginName, stillPending.fileHash, stillPending.manifest.permissions);
+      this.pendingConsent.delete(pluginName);
 
-    // Load the plugin now that it's approved
-    await this.loadPlugin(pluginInfo.manifest, pluginInfo.dir);
-    const instance = this.plugins.get(pluginName);
-    await this.resolvePendingConsentRollback(pluginName, instance?.state === 'active', instance?.error);
-    return true;
+      // Re-discover the plugin directory
+      const discovered = this.discoverPlugins();
+      const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
+      if (!pluginInfo) {
+        void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval');
+        return false;
+      }
+
+      // Load the plugin now that it's approved (loadPlugin honors the disabled
+      // guard, so a plugin disabled meanwhile stays a disabled stub).
+      await this.loadPlugin(pluginInfo.manifest, pluginInfo.dir);
+      const instance = this.plugins.get(pluginName);
+      await this.resolvePendingConsentRollback(pluginName, instance?.state === 'active', instance?.error);
+      return true;
+    });
   }
 
   /** Called by IPC when user denies a dangerous plugin. */
@@ -393,18 +406,23 @@ export class PluginManager {
     const discovered = this.discoverPlugins();
     console.info(`[PluginManager] Discovered ${discovered.length} plugins`);
 
+    // loadPlugin() itself skips persistently-disabled plugins (registering a
+    // 'disabled' stub), so this loop stays simple and that guard is the single
+    // source of truth across all load paths.
     for (const { manifest, dir } of discovered) {
       if (this.plugins.has(manifest.name)) continue;
       await this.loadPlugin(manifest, dir);
     }
+
+    this.broadcastUIState();
   }
 
-  private async loadPlugin(manifest: PluginManifest, dir: string): Promise<void> {
-    const instance: PluginInstance = {
+  private createPluginInstance(manifest: PluginManifest, dir: string, state: PluginInstance['state']): PluginInstance {
+    return {
       manifest,
       dir,
       fileHash: '',
-      state: 'loading',
+      state,
       module: null,
       registeredTools: [],
       preSendHooks: [],
@@ -426,6 +444,60 @@ export class PluginManager {
       inferenceProvider: null,
       contributedCliTools: [],
     };
+  }
+
+  /** Names of plugins the user has persistently disabled (config-backed). */
+  private getPersistentlyDisabled(): Set<string> {
+    return new Set(this.getConfig().pluginSystem?.disabledPlugins ?? []);
+  }
+
+  /** True while a plugin is loading or active — i.e. its API may legitimately fire. */
+  private isPluginLive(pluginName: string): boolean {
+    const state = this.plugins.get(pluginName)?.state;
+    return state === 'active' || state === 'loading';
+  }
+
+  /**
+   * True only when `instance` is still the current activation generation for its
+   * plugin AND that generation is live. A stale callback captured by a previous
+   * activation (before a disable/enable cycle replaced the instance) fails this
+   * check even if a fresh instance is now live under the same name.
+   */
+  private isCurrentInstance(instance: PluginInstance): boolean {
+    const current = this.plugins.get(instance.manifest.name);
+    if (current !== instance) return false;
+    // 'loading'/'active' are normal live states. Also allow privileged calls
+    // while the instance is running its own teardown (deactivate/cleanup), even
+    // if its state is 'error' from a partially-failed activation — otherwise
+    // teardown can't release resources like an HTTP server.
+    return current.state === 'active' || current.state === 'loading' || current.tearingDown === true;
+  }
+
+  /** Clear both persistent and session disabled flags for a plugin. */
+  private clearDisabledState(pluginName: string): void {
+    this.sessionDisabled.delete(pluginName);
+    const persisted = this.getPersistentlyDisabled();
+    if (persisted.delete(pluginName)) {
+      this.setConfig('pluginSystem.disabledPlugins', [...persisted]);
+    }
+  }
+
+  private async loadPlugin(manifest: PluginManifest, dir: string): Promise<void> {
+    // Honor disabled plugins in every load path (startup, marketplace
+    // update/reinstall swaps, etc.) so a disabled plugin can never be silently
+    // reactivated. This covers both persistent disables (config-backed) and
+    // session-only disables (in-memory). Required plugins ignore disables and
+    // always load.
+    const isDisabled = this.getPersistentlyDisabled().has(manifest.name) || this.sessionDisabled.has(manifest.name);
+    if (isDisabled && !this.brandRequiredPluginNamesSet.has(manifest.name)) {
+      this.plugins.set(manifest.name, this.createPluginInstance(manifest, dir, 'disabled'));
+      this.broadcastUIState();
+      this.notifyToolsChanged();
+      console.info(`[PluginManager] Plugin "${manifest.name}" is disabled — skipping load`);
+      return;
+    }
+
+    const instance: PluginInstance = this.createPluginInstance(manifest, dir, 'loading');
 
     this.plugins.set(manifest.name, instance);
 
@@ -477,33 +549,59 @@ export class PluginManager {
 
       const api = createPluginAPI(instance, {
         appHome: this.appHome,
+        isLive: () => this.isCurrentInstance(instance),
         getConfig: () => this.getConfig(),
-        setConfig: (path, value) => this.setConfig(path, value),
+        setConfig: (path, value) => {
+          // Block persistent config writes from a stale activation generation.
+          if (!this.isCurrentInstance(instance)) return;
+          this.setConfig(path, value);
+        },
         getPluginConfig: () => this.getPluginConfig(manifest.name),
-        setPluginConfig: (path, value) => this.setPluginConfig(manifest.name, path, value),
+        setPluginConfig: (path, value) => {
+          if (!this.isCurrentInstance(instance)) return;
+          this.setPluginConfig(manifest.name, path, value);
+        },
         getPluginState: () => ({ ...instance.publishedState }),
         replacePluginState: (next) => {
+          if (!this.isCurrentInstance(instance)) return;
           instance.publishedState = normalizePluginObject(next);
           this.broadcastUIState();
         },
         setPluginState: (path, value) => {
+          if (!this.isCurrentInstance(instance)) return;
           const next = { ...instance.publishedState };
           setNestedValue(next, path, value);
           instance.publishedState = next;
           this.broadcastUIState();
         },
         emitPluginEvent: (eventName, data) => {
+          // Drop events from a stale activation generation (e.g. a timer that
+          // survived a disable/enable cycle). 'loading' is allowed for
+          // activate()-time calls on the current generation.
+          if (!this.isCurrentInstance(instance)) return;
           broadcastToAllWindows('plugin:event', { pluginName: manifest.name, eventName, data });
         },
         onUIStateChanged: () => this.broadcastUIState(),
         onToolsChanged: () => this.notifyToolsChanged(),
         onCliToolsChanged: () => this.notifyCliToolsChanged(),
         registerActionHandler: (targetId, handler) => {
+          // Ignore registrations from a stale activation generation so old async
+          // code can't write into the current generation's action map.
+          if (!this.isCurrentInstance(instance)) return;
           this.registerActionHandler(manifest.name, targetId, handler);
         },
-        showNotification: (descriptor) => this.showPluginNotification(manifest.name, descriptor),
-        dismissNotification: (id) => this.dismissPluginNotification(manifest.name, id),
-        openNavigationTarget: (target) => this.broadcastNavigationRequest(manifest.name, target),
+        showNotification: (descriptor) => {
+          if (!this.isCurrentInstance(instance)) return;
+          this.showPluginNotification(manifest.name, descriptor);
+        },
+        dismissNotification: (id) => {
+          if (!this.isCurrentInstance(instance)) return;
+          this.dismissPluginNotification(manifest.name, id);
+        },
+        openNavigationTarget: (target) => {
+          if (!this.isCurrentInstance(instance)) return;
+          this.broadcastNavigationRequest(manifest.name, target);
+        },
       });
       this.pluginAPIs.set(manifest.name, api);
 
@@ -576,17 +674,23 @@ export class PluginManager {
     });
 
     for (const [name, instance] of sorted) {
+      instance.tearingDown = true;
       try {
         if (instance.module?.deactivate) {
           await instance.module.deactivate();
         }
+      } catch (err) {
+        console.error(`[PluginManager] Error deactivating plugin "${name}":`, err);
+      }
+      try {
         const api = this.pluginAPIs.get(name);
         if (api) {
           await cleanupPluginAPI(api);
         }
       } catch (err) {
-        console.error(`[PluginManager] Error deactivating plugin "${name}":`, err);
+        console.error(`[PluginManager] Error cleaning up plugin API for "${name}":`, err);
       }
+      instance.tearingDown = false;
     }
 
     for (const timer of this.notificationTimers.values()) {
@@ -604,17 +708,25 @@ export class PluginManager {
     const instance = this.plugins.get(pluginName);
     if (!instance) return;
 
+    instance.tearingDown = true;
     try {
       if (instance.module?.deactivate) {
         await instance.module.deactivate();
       }
+    } catch (err) {
+      console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
+    }
+    // Always run API cleanup (e.g. close HTTP servers) even if deactivate() threw,
+    // so a partially-activated/errored plugin can't leak resources.
+    try {
       const api = this.pluginAPIs.get(pluginName);
       if (api) {
         await cleanupPluginAPI(api);
       }
     } catch (err) {
-      console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
+      console.error(`[PluginManager] Error cleaning up plugin API for "${pluginName}":`, err);
     }
+    instance.tearingDown = false;
 
     // Clear hook arrays to prevent dangling references from firing (issue #36)
     instance.preSendHooks = [];
@@ -638,8 +750,163 @@ export class PluginManager {
       }
     }
 
+    // Close and drop any native OS notifications for this plugin. Their click
+    // handler sends 'plugin:navigate-direct'; leaving them alive would let a
+    // disabled/unloaded plugin still drive navigation from a stale notification.
+    for (const [key, notification] of this.nativeNotifications.entries()) {
+      if (key.startsWith(`${pluginName}:`)) {
+        try {
+          notification.close();
+        } catch {
+          /* best-effort */
+        }
+        this.nativeNotifications.delete(key);
+      }
+    }
+
     this.plugins.delete(pluginName);
     this.pluginAPIs.delete(pluginName);
+  }
+
+  /* ── Enable / Disable ── */
+
+  /**
+   * Disable a non-required plugin: tear down its backend (tools, hooks, IPC
+   * action handlers, timers, inference provider) immediately, then leave a
+   * `disabled` stub so it still appears in the UI.
+   *
+   * `persist: true` records the plugin in `pluginSystem.disabledPlugins` so it
+   * stays disabled across restarts. `persist: false` disables it only for the
+   * running session — the next app launch re-enables it.
+   *
+   * The renderer half of a plugin cannot be hot-unloaded (renderer modules are
+   * URL-cached), so if a frontend bundle already shipped this session we flag a
+   * pending restart to fully clear it.
+   */
+  async disablePlugin(pluginName: string, opts: { persist: boolean }): Promise<void> {
+    if (this.brandRequiredPluginNamesSet.has(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is required and cannot be disabled`);
+    }
+
+    // Serialize with marketplace install/update/uninstall for the same plugin so
+    // two unload/load sequences can't interleave and leave duplicate side effects
+    // or a transiently-missing instance.
+    await this.withInstallLock(pluginName, async () => {
+      const existing = this.plugins.get(pluginName);
+      if (!existing) {
+        throw new Error(`Unknown plugin "${pluginName}"`);
+      }
+
+      // A plugin in 'loading' state has an in-flight loadPlugin()/activate()
+      // promise that unloadPlugin() cannot cancel — tearing it down now would race
+      // the activation and could leave handlers/timers registered after the stub
+      // is installed. Reject; the caller can retry once it settles.
+      if (existing.state === 'loading') {
+        throw new Error(`Plugin "${pluginName}" is still loading — try again once it finishes`);
+      }
+
+      // A plugin awaiting permission consent is driven by a blocking consent modal
+      // (pendingConsent / pendingConsentRollback). Disabling it here would leave
+      // that modal stranded and a later approve/deny could reload or roll back a
+      // plugin the user disabled. Make the user resolve consent first.
+      if (this.pendingConsent.has(pluginName) || this.pendingConsentRollback.has(pluginName)) {
+        throw new Error(`Plugin "${pluginName}" is awaiting permission approval — approve or deny it first`);
+      }
+
+      const { manifest, dir } = existing;
+      const hadRenderer = this.rendererLoadedThisSession.has(pluginName);
+
+      await this.unloadPlugin(pluginName);
+
+      // Keep a stub so the plugin remains visible (and re-enablable) in the UI.
+      this.plugins.set(pluginName, this.createPluginInstance(manifest, dir, 'disabled'));
+
+      if (opts.persist) {
+        // A persistent disable supersedes any prior session-only disable.
+        this.sessionDisabled.delete(pluginName);
+        const next = this.getPersistentlyDisabled();
+        next.add(pluginName);
+        this.setConfig('pluginSystem.disabledPlugins', [...next]);
+      } else {
+        // Session-only: tracked in memory so mid-session reload paths (marketplace
+        // update, consent approval) keep it disabled until the next app launch.
+        this.sessionDisabled.add(pluginName);
+      }
+
+      if (hadRenderer) {
+        this.markPendingRestart(pluginName);
+      }
+
+      this.broadcastUIState();
+      this.notifyToolsChanged();
+      this.notifyCliToolsChanged();
+      console.info(`[PluginManager] Plugin "${pluginName}" disabled (persist=${opts.persist})`);
+    });
+  }
+
+  /** Re-enable a previously disabled plugin and load it now. */
+  async enablePlugin(pluginName: string): Promise<void> {
+    // Required plugins are never disablable, so there's nothing to enable.
+    if (this.brandRequiredPluginNamesSet.has(pluginName)) {
+      throw new Error(`Plugin "${pluginName}" is required and is always enabled`);
+    }
+    // Only act on a plugin that is actually disabled — guard against stray
+    // IPC/web-bridge calls for already-active or unknown plugins, which would
+    // otherwise trigger an unintended hot-unload/reload.
+    const current = this.plugins.get(pluginName);
+    const isDisabled =
+      current?.state === 'disabled' ||
+      this.getPersistentlyDisabled().has(pluginName) ||
+      this.sessionDisabled.has(pluginName);
+    if (!isDisabled) {
+      return;
+    }
+
+    // Serialize with marketplace lifecycle ops for the same plugin (see disablePlugin).
+    await this.withInstallLock(pluginName, async () => {
+      this.clearDisabledState(pluginName);
+
+      // If this plugin's frontend bundle already shipped earlier this session, the
+      // renderer has it URL-cached and can't be re-imported without a restart, so
+      // the backend can hot-reload now but a restart is still needed for the
+      // frontend. Otherwise it's safe to clear the restart flag entirely.
+      const rendererStale = this.rendererLoadedThisSession.has(pluginName);
+      if (!rendererStale) {
+        this.clearPendingRestart(pluginName);
+      }
+
+      // Tear down any existing instance through the proper unload path. A disabled
+      // stub has no live module/timers so this is a no-op for it, but if enable is
+      // somehow called over a live instance (web bridge, duplicate request) this
+      // ensures deactivate()/API cleanup run before we reload.
+      if (this.plugins.has(pluginName)) {
+        await this.unloadPlugin(pluginName);
+      }
+
+      const found = this.discoverPlugins().find((d) => d.manifest.name === pluginName);
+      if (!found) {
+        throw new Error(`Plugin "${pluginName}" not found on disk`);
+      }
+
+      await this.loadPlugin(found.manifest, found.dir);
+
+      // If this plugin was updated while disabled, swapToInstalledPlugin deferred
+      // the rollback decision to now: validate the freshly-loaded version and roll
+      // back to the stashed previous version if it failed consent/activation.
+      if (this.pendingConsentRollback.has(pluginName) && !this.pendingConsent.has(pluginName)) {
+        const reloaded = this.plugins.get(pluginName);
+        await this.resolvePendingConsentRollback(pluginName, reloaded?.state === 'active', reloaded?.error);
+      }
+
+      if (rendererStale) {
+        this.markPendingRestart(pluginName);
+      }
+
+      this.broadcastUIState();
+      this.notifyToolsChanged();
+      this.notifyCliToolsChanged();
+      console.info(`[PluginManager] Plugin "${pluginName}" enabled`);
+    });
   }
 
   /* ── Permissions / Queries ── */
@@ -1085,6 +1352,10 @@ export class PluginManager {
     targetId: string,
     handler: (action: string, data?: unknown) => void | Promise<void>,
   ): void {
+    // Refuse late registrations from a disabled/unloaded plugin's stale async
+    // code — otherwise it could repopulate actionHandlers after unloadPlugin()
+    // cleared them and keep executing backend logic via the IPC action endpoints.
+    if (!this.isPluginLive(pluginName)) return;
     let pluginHandlers = this.actionHandlers.get(pluginName);
     if (!pluginHandlers) {
       pluginHandlers = new Map();
@@ -1094,6 +1365,11 @@ export class PluginManager {
   }
 
   async handleAction(payload: PluginActionPayload): Promise<unknown> {
+    // Don't dispatch actions to a plugin that isn't live (disabled/unloaded). The
+    // renderer can't be hot-unloaded, so its UI may still post actions.
+    if (!this.isPluginLive(payload.pluginName)) {
+      return { error: 'Plugin is not active' };
+    }
     const handler = this.actionHandlers.get(payload.pluginName)?.get(payload.targetId);
     if (!handler) {
       console.warn(`[PluginManager] No action handler for ${payload.pluginName}:${payload.targetId}`);
@@ -1122,6 +1398,10 @@ export class PluginManager {
   }
 
   private broadcastNavigationRequest(pluginName: string, target: PluginNavigationTarget): void {
+    // A timer/promise captured inside the plugin before it was disabled/unloaded
+    // could still call api.navigation.open() afterward. Drop it unless the plugin
+    // is still live ('active', or 'loading' during activate()).
+    if (!this.isPluginLive(pluginName)) return;
     broadcastToAllWindows('plugin:navigation-request', { pluginName, target });
   }
 
@@ -1130,7 +1410,9 @@ export class PluginManager {
     descriptor: Omit<PluginNotificationDescriptor, 'pluginName' | 'visible'>,
   ): void {
     const instance = this.plugins.get(pluginName);
-    if (!instance) return;
+    // Ignore late calls from a disabled/unloaded plugin's lingering timers — only
+    // a live plugin ('active', or 'loading' during activate()) may raise notifications.
+    if (!instance || !this.isPluginLive(pluginName)) return;
 
     const full: PluginNotificationDescriptor = {
       ...descriptor,
@@ -1386,6 +1668,29 @@ export class PluginManager {
       return { ok: true };
     }
 
+    if (instance?.state === 'disabled') {
+      // The plugin is disabled, so loadPlugin left a stub without validating the
+      // new version (no consent/activation yet). Defer the success/rollback
+      // decision to enablePlugin() by stashing this install's backup: if the new
+      // version later fails consent or activation on enable, the previous version
+      // is restored; on success the backup is discarded.
+      //
+      // There is a single on-disk backup slot (<dir>.prev) which each install
+      // overwrites, so a fresh update-while-disabled supersedes any prior stash —
+      // discard the now-stale backup reference and track the latest one.
+      const prior = this.pendingConsentRollback.get(pluginName);
+      if (prior?.backupDir && prior.backupDir !== install.backupDir) {
+        this.marketplaceService?.discardBackup(prior.backupDir);
+      }
+      if (install.backupDir) {
+        this.pendingConsentRollback.set(pluginName, { ...install, attemptedVersion });
+      } else {
+        this.pendingConsentRollback.delete(pluginName);
+        this.setFailedUpdate(pluginName, null);
+      }
+      return { ok: true };
+    }
+
     if (this.pendingConsent.has(pluginName)) {
       // Hold the backup until the user approves/denies so we can roll back if
       // the new version is rejected or fails to activate after approval.
@@ -1470,6 +1775,9 @@ export class PluginManager {
       this.marketplaceService!.uninstallPlugin(pluginName);
     });
 
+    // Clear any disable flag so a future reinstall of the same plugin loads
+    // active rather than inheriting a stale disabled state.
+    this.clearDisabledState(pluginName);
     this.clearPendingRestart(pluginName);
     this.setFailedUpdate(pluginName, null);
     this.broadcastUIState();

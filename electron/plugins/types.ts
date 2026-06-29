@@ -130,6 +130,8 @@ export type PluginInstance = {
   fileHash: string;
   state: PluginState;
   error?: string;
+  /** True while this instance is running its deactivate()/cleanup teardown. */
+  tearingDown?: boolean;
   compatWarning?: CompatCheckResult;
   module: PluginModule | null;
   registeredTools: ToolDefinition[];

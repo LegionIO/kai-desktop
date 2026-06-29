@@ -45,7 +45,7 @@ import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandbox
 import { writeAuditEntry } from './audit-log.js';
 import { resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { AppConfig } from '../config/schema.js';
-import type { ToolDefinition } from '../tools/types.js';
+import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
@@ -183,6 +183,8 @@ function configureSessionCookiePromotion(ses: Electron.Session, config?: CookieP
 
 type PluginAPICallbacks = {
   appHome: string;
+  /** True while this API's activation generation is still the current, live one. */
+  isLive?: () => boolean;
   getConfig: () => AppConfig;
   setConfig: (path: string, value: unknown) => void;
   getPluginConfig: () => Record<string, unknown>;
@@ -341,12 +343,33 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
   const { manifest } = instance;
   let httpServer: Server | null = null;
 
-  const requirePermission = (permission: string): void => {
+  // Reject calls from a stale activation generation — e.g. a timer/promise that
+  // survived a disable (and possible re-enable) and would otherwise act for an
+  // instance that's no longer the current, live one. 'loading' is allowed so
+  // activate()/deactivate()-time calls on the current generation still work.
+  const requireLive = (): void => {
+    if (callbacks.isLive && !callbacks.isLive()) {
+      throw new Error(`Plugin "${manifest.name}" is no longer active`);
+    }
+  };
+
+  // Permission-only check (no liveness). Used directly by teardown/cleanup paths
+  // that must run even after the plugin is no longer live (e.g. http.close()
+  // invoked by cleanupPluginAPI during unload of an errored/disabled plugin).
+  const checkPermission = (permission: string): void => {
     if (!manifest.permissions.includes(permission as (typeof manifest.permissions)[number])) {
       throw new Error(
         `Plugin "${manifest.name}" requires permission "${permission}" for this action. Declared: ${listPermission(instance)}`,
       );
     }
+  };
+
+  // Every privileged action funnels through requirePermission, so the liveness
+  // check lives here too — a disabled/superseded generation can do nothing
+  // privileged, regardless of which API method its stale code calls.
+  const requirePermission = (permission: string): void => {
+    checkPermission(permission);
+    requireLive();
   };
 
   const registerOrReplace = <T extends { id: string }>(items: T[], descriptor: T): void => {
@@ -444,8 +467,21 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             }
             seenNames.add(scopedName);
 
+            const originalExecute = tool.execute;
+            const guardedExecute = async (input: unknown, context: ToolExecutionContext) => {
+              // Liveness is checked at invoke time, not registration time: a chat
+              // stream may have captured this tool before the plugin was disabled.
+              // Refuse to run a disabled/superseded plugin's tool even if the model
+              // still calls it mid-run.
+              if (callbacks.isLive && !callbacks.isLive()) {
+                throw new Error(`Plugin "${manifest.name}" is no longer active`);
+              }
+              return originalExecute(input, context);
+            };
+
             return {
               ...tool,
+              execute: guardedExecute,
               name: scopedName,
               source: 'plugin' as const,
               sourceId: manifest.name,
@@ -979,7 +1015,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       },
 
       close: () => {
-        requirePermission('http:listen');
+        // Permission-only (no liveness): cleanup must succeed during unload of an
+        // errored/disabled plugin, when the instance is no longer live.
+        checkPermission('http:listen');
         return new Promise<void>((resolve) => {
           if (!httpServer) {
             resolve();

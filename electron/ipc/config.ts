@@ -135,7 +135,7 @@ function getDefaultConfig() {
     },
     plugins: {} as Record<string, Record<string, unknown>>,
     pluginApprovals: {} as Record<string, { hash: string; permissions?: string[]; approvedAt: string }>,
-    pluginSystem: { compatibilityMode: 'warn' as const },
+    pluginSystem: { compatibilityMode: 'warn' as const, disabledPlugins: [] as string[] },
     marketplace: {
       installedPlugins: {} as Record<
         string,
