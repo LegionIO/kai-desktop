@@ -120,7 +120,13 @@ export const SidebarDock: FC<SidebarDockProps> = ({
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [mouseX, setMouseX] = useState<number | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
+  // Which sortable context is mid-drag: 'unit' (outer dock units), 'inner'
+  // (icons inside the plugin bubble), or null. Tracked separately so the
+  // bubble can collapse to a single-icon width during an OUTER drag — mixing
+  // a wide bubble with narrow built-ins in one horizontal sortable makes
+  // dnd-kit stretch/condense the mismatched-width siblings.
+  const [dragScope, setDragScope] = useState<'unit' | 'inner' | null>(null);
+  const isDragging = dragScope !== null;
 
   const sensors = useSensors(
     // Long-press to drag: a held press starts a drag, a quick click still fires
@@ -160,7 +166,7 @@ export const SidebarDock: FC<SidebarDockProps> = ({
 
   const handleUnitDragEnd = useCallback(
     (event: DragEndEvent) => {
-      setIsDragging(false);
+      setDragScope(null);
       const { active, over } = event;
       if (!over || active.id === over.id) return;
       const activeId = String(active.id);
@@ -175,7 +181,7 @@ export const SidebarDock: FC<SidebarDockProps> = ({
 
   const handleInnerDragEnd = useCallback(
     (event: DragEndEvent) => {
-      setIsDragging(false);
+      setDragScope(null);
       const { active, over } = event;
       if (!over || active.id === over.id) return;
       const activeId = String(active.id);
@@ -188,14 +194,20 @@ export const SidebarDock: FC<SidebarDockProps> = ({
     [orderedInnerIds, onReorderPlugins],
   );
 
-  const handleDragStart = useCallback(() => {
-    setIsDragging(true);
+  const handleUnitDragStart = useCallback(() => {
+    setDragScope('unit');
     setMouseX(null);
   }, []);
 
-  const handleDragCancel = useCallback(() => setIsDragging(false), []);
+  const handleInnerDragStart = useCallback(() => {
+    setDragScope('inner');
+    setMouseX(null);
+  }, []);
+
+  const handleDragCancel = useCallback(() => setDragScope(null), []);
 
   const dragActive = isDragging;
+  const outerDragActive = dragScope === 'unit';
 
   return (
     <div className={cn('flex items-end border-t border-sidebar-border/80', className)}>
@@ -217,7 +229,7 @@ export const SidebarDock: FC<SidebarDockProps> = ({
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
-          onDragStart={handleDragStart}
+          onDragStart={handleUnitDragStart}
           onDragCancel={handleDragCancel}
           onDragEnd={handleUnitDragEnd}
         >
@@ -236,7 +248,8 @@ export const SidebarDock: FC<SidebarDockProps> = ({
                       mouseX={dragActive ? null : mouseX}
                       containerRef={scrollRef}
                       sensors={sensors}
-                      onInnerDragStart={handleDragStart}
+                      outerDragActive={outerDragActive}
+                      onInnerDragStart={handleInnerDragStart}
                       onInnerDragCancel={handleDragCancel}
                       onInnerDragEnd={handleInnerDragEnd}
                     />
@@ -278,6 +291,8 @@ interface PluginBubbleProps {
   mouseX: number | null;
   containerRef: React.RefObject<HTMLDivElement | null>;
   sensors: ReturnType<typeof useSensors>;
+  /** True while an OUTER (unit) drag is in progress anywhere in the dock. */
+  outerDragActive: boolean;
   onInnerDragStart: () => void;
   onInnerDragCancel: () => void;
   onInnerDragEnd: (event: DragEndEvent) => void;
@@ -292,6 +307,7 @@ const PluginBubble: FC<PluginBubbleProps> = ({
   mouseX,
   containerRef,
   sensors,
+  outerDragActive,
   onInnerDragStart,
   onInnerDragCancel,
   onInnerDragEnd,
@@ -313,7 +329,11 @@ const PluginBubble: FC<PluginBubbleProps> = ({
 
   const pluginCount = pluginById.size;
   const hasMembers = pluginCount > 0;
-  const showMembers = expanded && hasMembers;
+  // Collapse to a single-icon width during any OUTER drag so the bubble unit
+  // matches the built-in icons' width — otherwise dnd-kit's horizontal sorting
+  // stretches/condenses the mismatched-width siblings (the dragged built-in
+  // balloons to the bubble's width; the dragged bubble snaps to one icon).
+  const showMembers = expanded && hasMembers && !outerDragActive;
 
   // Aggregate badge dot when collapsed and any member has a badge.
   const hasMemberBadge = useMemo(() => Array.from(pluginById.values()).some((i) => i.badge != null), [pluginById]);
