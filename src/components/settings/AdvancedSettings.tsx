@@ -1,6 +1,6 @@
 import { type FC, useState, useEffect } from 'react';
 import { InfoIcon, AlertTriangleIcon, TrendingUpIcon, CheckCircle2Icon } from 'lucide-react';
-import { Toggle, NumberField, type SettingsProps } from './shared';
+import { Toggle, NumberField, settingsSelectClass, type SettingsProps } from './shared';
 
 type StepUsageStats = {
   totalResponses: number;
@@ -19,7 +19,7 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
     useResponsesApi: boolean;
   };
 
-  const ui = config.ui as { showPluginDockIcons?: boolean } | undefined;
+  const ui = config.ui as { showPluginDockIcons?: boolean; dockBadgeStyle?: 'dot' | 'truncate' | 'full' } | undefined;
 
   const [stats, setStats] = useState<StepUsageStats | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
@@ -264,6 +264,23 @@ export const AdvancedSettings: FC<SettingsProps> = ({ config, updateConfig }) =>
           <p>
             When enabled, plugins that provide a content panel (not settings-only) will appear as icons in the bottom
             dock for quick access.
+          </p>
+        </div>
+
+        <div>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">Dock badge style</label>
+          <select
+            className={settingsSelectClass}
+            value={ui?.dockBadgeStyle ?? 'dot'}
+            onChange={(e) => updateConfig('ui.dockBadgeStyle', e.target.value)}
+          >
+            <option value="dot">Dot (text in tooltip)</option>
+            <option value="truncate">Truncated pill</option>
+            <option value="full">Full text pill</option>
+          </select>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            How word/text notification badges render on dock icons. Numeric badges always show as a count. “Dot” keeps
+            the dock compact and moves the text to the icon’s tooltip; “Full text” may widen the icon to fit.
           </p>
         </div>
       </fieldset>

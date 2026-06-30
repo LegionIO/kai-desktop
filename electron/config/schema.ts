@@ -696,6 +696,14 @@ export const appConfigSchema = z.object({
       })
       .default({ units: [], plugins: [] }),
     pluginBubbleExpanded: z.boolean().default(true),
+    /**
+     * How dock notification badges render when their value is a word/string:
+     * - 'dot': collapse to a corner dot; full text moves to the icon tooltip
+     * - 'truncate': small pill capped with an ellipsis; full text in the tooltip
+     * - 'full': show the full text in a constrained pill
+     * Numeric badges always render as a count pill regardless of this setting.
+     */
+    dockBadgeStyle: z.enum(['dot', 'truncate', 'full']).default('dot'),
     splashBackground: z.enum(['random', 'matrix', 'constellations', 'hexagons', 'smokescreen']).default('random'),
     workspaces: z.array(workspaceSchema).default([]),
     activeWorkspaceId: z.string().nullable().default(null),

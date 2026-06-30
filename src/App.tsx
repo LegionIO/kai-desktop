@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, useRef, type FC } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ConfigProvider, useConfig } from '@/providers/ConfigProvider';
 import { AttachmentProvider } from '@/providers/AttachmentContext';
@@ -1499,6 +1499,8 @@ function AppShell() {
   // ── Dock items for bottom sidebar dock ──────────────────────────────────
   const showPluginDockIcons =
     (config?.ui as { showPluginDockIcons?: boolean } | undefined)?.showPluginDockIcons !== false;
+  const dockBadgeStyle =
+    (config?.ui as { dockBadgeStyle?: 'dot' | 'truncate' | 'full' } | undefined)?.dockBadgeStyle ?? 'dot';
 
   const dockItems: DockItem[] = useMemo(() => {
     // Check if a specific plugin panel dock icon is active
@@ -1568,10 +1570,44 @@ function AppShell() {
         seenPlugins.add(panel.pluginName);
 
         const navItem = navItems.find((n) => n.pluginName === panel.pluginName && n.visible);
-        const label = navItem?.label || pluginDisplayNames.get(panel.pluginName) || panel.pluginName;
+        const baseLabel = navItem?.label || pluginDisplayNames.get(panel.pluginName) || panel.pluginName;
         const icon = navItem?.icon;
         const viewKey = getPluginPanelViewKey(panel.pluginName, panel.id);
         const navBadge = navItem?.badge;
+
+        const hasBadge = navBadge != null && navBadge !== '' && navBadge !== 0;
+        // Numeric badges are short counts and always render as a pill. Word/text
+        // badges follow ui.dockBadgeStyle so a long label can't overflow into
+        // neighbouring icons (the badge is absolutely positioned, so the magnify
+        // spacer can't account for its width).
+        const isNumericBadge = typeof navBadge === 'number' || (typeof navBadge === 'string' && /^\d+$/.test(navBadge));
+        const showAsDot = hasBadge && !isNumericBadge && dockBadgeStyle === 'dot';
+        const showAsTruncated = hasBadge && !isNumericBadge && dockBadgeStyle === 'truncate';
+        // Dot and truncate modes hide/clip the text, so surface the full value in
+        // the tooltip instead of losing it.
+        const label = showAsDot || showAsTruncated ? `${baseLabel} — ${navBadge}` : baseLabel;
+
+        let badge: ReactNode;
+        if (hasBadge) {
+          if (showAsDot) {
+            badge = <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />;
+          } else if (showAsTruncated) {
+            badge = (
+              <span className="absolute -top-1 left-1/2 inline-block max-w-[44px] -translate-x-1/2 truncate rounded-full bg-blue-500 px-1 text-center text-[9px] font-semibold leading-[15px] text-white">
+                {navBadge}
+              </span>
+            );
+          } else {
+            // Numeric count pill, or 'full' text style: centered over the icon's
+            // top so growth is symmetric and doesn't bleed past one neighbour.
+            // Capped + truncated so even 'full' can't grow unbounded into siblings.
+            badge = (
+              <span className="absolute -top-1 left-1/2 inline-block min-w-[15px] max-w-[72px] -translate-x-1/2 truncate rounded-full bg-blue-500 px-1 text-center text-[9px] font-semibold leading-[15px] text-white">
+                {navBadge}
+              </span>
+            );
+          }
+        }
 
         items.push({
           id: `plugin:${panel.pluginName}`,
@@ -1587,12 +1623,7 @@ function AppShell() {
             setActiveView(viewKey);
           },
           active: activeView === viewKey,
-          badge:
-            navBadge != null && navBadge !== '' && navBadge !== 0 ? (
-              <span className="absolute -top-0.5 -right-0.5 flex min-w-[15px] items-center justify-center rounded-full bg-blue-500 px-1 text-[9px] font-semibold leading-[15px] text-white">
-                {navBadge}
-              </span>
-            ) : undefined,
+          badge,
         });
       }
     }
@@ -1603,6 +1634,7 @@ function AppShell() {
     activeView,
     pluginUpdateCount,
     showPluginDockIcons,
+    dockBadgeStyle,
     pluginPanels,
     pluginUIState?.navigationItems,
     pluginDisplayNames,

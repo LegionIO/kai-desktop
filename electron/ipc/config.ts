@@ -158,6 +158,7 @@ function getDefaultConfig() {
       showPluginDockIcons: true,
       dockOrder: { units: [] as string[], plugins: [] as string[] },
       pluginBubbleExpanded: true,
+      dockBadgeStyle: 'dot' as const,
       splashBackground: 'random' as const,
       workspaces: [] as Array<{
         id: string;
