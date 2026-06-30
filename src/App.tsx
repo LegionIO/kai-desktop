@@ -1590,7 +1590,7 @@ function AppShell() {
         let badge: ReactNode;
         if (hasBadge) {
           if (showAsDot) {
-            badge = <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />;
+            badge = <span className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />;
           } else if (showAsTruncated) {
             badge = (
               <span className="absolute -top-1 left-1/2 inline-block max-w-[44px] -translate-x-1/2 truncate rounded-full bg-blue-500 px-1 text-center text-[9px] font-semibold leading-[15px] text-white">
