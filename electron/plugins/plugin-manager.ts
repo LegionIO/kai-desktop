@@ -29,6 +29,7 @@ import type {
   PostUpdateHookArgs,
   PluginAPI,
   PluginPermission,
+  PluginConsentRequest,
   PluginInferenceProvider,
   PluginCliToolContribution,
 } from './types.js';
@@ -213,6 +214,18 @@ export class PluginManager {
     return manifest.permissions.some((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
   }
 
+  private buildConsentRequest(manifest: PluginManifest, fileHash: string): PluginConsentRequest {
+    const permissions = manifest.permissions ?? [];
+    return {
+      pluginName: manifest.name,
+      displayName: manifest.displayName ?? manifest.name,
+      permissions,
+      dangerousPermissions: permissions.filter((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p)),
+      execScope: manifest.execScope,
+      fileHash,
+    };
+  }
+
   private ensurePluginApproved(manifest: PluginManifest, fileHash: string): boolean {
     if (this.brandRequiredPluginNamesSet.has(manifest.name)) {
       if (!this.isRequiredPluginIntegrityTrusted(manifest, fileHash)) {
@@ -229,15 +242,7 @@ export class PluginManager {
     if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
       // Store pending consent and notify renderer
       this.pendingConsent.set(manifest.name, { manifest, fileHash });
-      const dangerousPermissions = manifest.permissions.filter((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
-      broadcastToAllWindows('plugin:consent-required', {
-        pluginName: manifest.name,
-        displayName: manifest.displayName,
-        permissions: manifest.permissions,
-        dangerousPermissions,
-        execScope: manifest.execScope,
-        fileHash,
-      });
+      broadcastToAllWindows('plugin:consent-required', this.buildConsentRequest(manifest, fileHash));
       console.info(
         `[PluginManager] Plugin "${manifest.name}" requires user consent for: ${manifest.permissions.join(', ')}`,
       );
@@ -325,11 +330,10 @@ export class PluginManager {
   }
 
   /** Get list of plugins pending consent. */
-  getPendingConsent(): Array<{ pluginName: string; manifest: PluginManifest; fileHash: string }> {
-    return Array.from(this.pendingConsent.entries()).map(([pluginName, info]) => ({
-      pluginName,
-      ...info,
-    }));
+  getPendingConsent(): PluginConsentRequest[] {
+    return Array.from(this.pendingConsent.values()).map((info) =>
+      this.buildConsentRequest(info.manifest, info.fileHash),
+    );
   }
 
   private isRequiredPluginIntegrityTrusted(manifest: PluginManifest, fileHash: string): boolean {

@@ -286,7 +286,14 @@ const appAPI = {
       ipcRenderer.invoke('plugin:deny-consent', pluginName) as Promise<{ success: boolean }>,
     getPendingConsent: () =>
       ipcRenderer.invoke('plugin:pending-consent') as Promise<
-        Array<{ pluginName: string; manifest: unknown; fileHash: string }>
+        Array<{
+          pluginName: string;
+          displayName: string;
+          permissions: string[];
+          dangerousPermissions: string[];
+          execScope?: { binaries: string[]; argPatterns?: Record<string, string[]> };
+          fileHash: string;
+        }>
       >,
     onConsentRequired: (callback: (data: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);

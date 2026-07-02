@@ -4,6 +4,7 @@ import { useConfig } from '@/providers/ConfigProvider';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { usePlugins, type PluginPanelDescriptor } from '@/providers/PluginProvider';
 import { getPluginComponentByHint } from './PluginComponentRegistry';
+import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { usePluginSettingsSections } from './PluginSettingsSections';
 import { getPluginNavigationIcon } from './plugin-icons';
 
@@ -31,15 +32,20 @@ export const PluginPanelHost: FC<{
 
   void rendererLoadCount;
 
-  const Component = getPluginComponentByHint(panel.pluginName, panel.component, ['PanelView', `${panel.pluginName}Panel`], 'panel');
+  const Component = getPluginComponentByHint(
+    panel.pluginName,
+    panel.component,
+    ['PanelView', `${panel.pluginName}Panel`],
+    'panel',
+  );
   const pluginStatus = getPluginStatus(panel.pluginName);
   const pluginError = getPluginError(panel.pluginName);
   const rendererStatus = getPluginRendererStatus(panel.pluginName);
   const rendererError = getPluginRendererError(panel.pluginName);
-  const waitingForRenderer = !Component && (
-    pluginStatus === 'loading'
-    || (hasRendererScript(panel.pluginName) && rendererStatus !== 'error' && rendererStatus !== 'ready')
-  );
+  const waitingForRenderer =
+    !Component &&
+    (pluginStatus === 'loading' ||
+      (hasRendererScript(panel.pluginName) && rendererStatus !== 'error' && rendererStatus !== 'ready'));
   const sectionsForPlugin = allSettingsSections.filter((s) => s.pluginName === panel.pluginName);
   const hasSettings = sectionsForPlugin.length > 0;
   const pluginState = getPluginState(panel.pluginName);
@@ -69,10 +75,12 @@ export const PluginPanelHost: FC<{
         const sectionRendererStatus = getPluginRendererStatus(pluginSection.pluginName);
         const sectionRendererError = getPluginRendererError(pluginSection.pluginName);
         const sectionPluginError = getPluginError(pluginSection.pluginName);
-        const waitingForSectionRenderer = !SettingsComponent && (
-          getPluginStatus(pluginSection.pluginName) === 'loading'
-          || (hasRendererScript(pluginSection.pluginName) && sectionRendererStatus !== 'error' && sectionRendererStatus !== 'ready')
-        );
+        const waitingForSectionRenderer =
+          !SettingsComponent &&
+          (getPluginStatus(pluginSection.pluginName) === 'loading' ||
+            (hasRendererScript(pluginSection.pluginName) &&
+              sectionRendererStatus !== 'error' &&
+              sectionRendererStatus !== 'ready'));
 
         if (!SettingsComponent) {
           if (waitingForSectionRenderer) {
@@ -93,20 +101,25 @@ export const PluginPanelHost: FC<{
         }
 
         return (
-          <SettingsComponent
+          <PluginErrorBoundary
             key={pluginSection.key}
             pluginName={pluginSection.pluginName}
-            config={config ?? undefined}
-            updateConfig={updateConfig}
-            pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
-            pluginState={pluginState}
-            onAction={(action: string, data?: unknown) => {
-              sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
-            }}
-            setPluginConfig={async (path: string, value: unknown) => {
-              await setPluginConfig(pluginSection.pluginName, path, value);
-            }}
-          />
+            resetKey={rendererLoadCount}
+          >
+            <SettingsComponent
+              pluginName={pluginSection.pluginName}
+              config={config ?? undefined}
+              updateConfig={updateConfig}
+              pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
+              pluginState={pluginState}
+              onAction={(action: string, data?: unknown) => {
+                sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+              }}
+              setPluginConfig={async (path: string, value: unknown) => {
+                await setPluginConfig(pluginSection.pluginName, path, value);
+              }}
+            />
+          </PluginErrorBoundary>
         );
       })}
     </div>
@@ -115,14 +128,10 @@ export const PluginPanelHost: FC<{
   // Fallback unconfigured view — only shown when there's no panel component AND no settings to render inline
   const unconfiguredView = (
     <div className="flex flex-col items-center gap-4 px-6 py-12 text-center">
-      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
-        {pluginIcon}
-      </div>
+      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">{pluginIcon}</div>
       <div>
         <p className="text-sm font-medium text-foreground">Connect to {displayName}</p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          No settings available for this plugin.
-        </p>
+        <p className="mt-1 text-xs text-muted-foreground">No settings available for this plugin.</p>
       </div>
     </div>
   );
@@ -151,19 +160,17 @@ export const PluginPanelHost: FC<{
       // Show the "Open Settings" button so the user configures the plugin before the panel renders.
       return (
         <div className="flex flex-col items-center gap-4 px-6 py-12 text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
-            {pluginIcon}
-          </div>
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">{pluginIcon}</div>
           <div>
             <p className="text-sm font-medium text-foreground">Connect to {displayName}</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Open settings to configure this plugin.
-            </p>
+            <p className="mt-1 text-xs text-muted-foreground">Open settings to configure this plugin.</p>
           </div>
           {hasSettings && (
             <button
               type="button"
-              onClick={() => window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: panel.pluginName } }))}
+              onClick={() =>
+                window.dispatchEvent(new CustomEvent('kai:open-settings', { detail: { plugin: panel.pluginName } }))
+              }
               className="mt-2 rounded-lg bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
             >
               Open Settings
@@ -197,7 +204,9 @@ export const PluginPanelHost: FC<{
         <div className={cn('mx-auto w-full px-4 pt-3 pb-5', !fullWidth && 'max-w-3xl')}>
           {/* Plugin content card */}
           <div className="rounded-2xl border border-border/50 bg-muted/30 overflow-hidden">
-            {renderComponent()}
+            <PluginErrorBoundary pluginName={panel.pluginName} resetKey={`${panel.id}:${rendererLoadCount}`}>
+              {renderComponent()}
+            </PluginErrorBoundary>
           </div>
         </div>
       </div>

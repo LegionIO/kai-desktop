@@ -2,6 +2,7 @@ import type { FC } from 'react';
 import { ShieldAlertIcon, InfoIcon, AlertTriangleIcon, XIcon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
+import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { useConfig } from '@/providers/ConfigProvider';
 
 export const PluginBannerSlot: FC = () => {
@@ -28,23 +29,23 @@ export const PluginBannerSlot: FC = () => {
         if (banner.component) {
           const Component = getPluginComponent(banner.pluginName, banner.component);
           const pluginStatus = getPluginStatus(banner.pluginName);
-          const waitingForRenderer = !Component
-            && (
-              pluginStatus === 'loading'
-              || (hasRendererScript(banner.pluginName) && getPluginRendererStatus(banner.pluginName) !== 'error')
-            );
+          const waitingForRenderer =
+            !Component &&
+            (pluginStatus === 'loading' ||
+              (hasRendererScript(banner.pluginName) && getPluginRendererStatus(banner.pluginName) !== 'error'));
           if (Component) {
             return (
-              <Component
-                key={`${banner.pluginName}-${banner.id}`}
-                pluginName={banner.pluginName}
-                props={banner.props}
-                onAction={(action, data) => sendBannerAction(banner.pluginName, banner.id, action, data)}
-                config={config ?? undefined}
-                updateConfig={updateConfig}
-                pluginConfig={getResolvedPluginConfig(banner.pluginName)}
-                pluginState={getPluginState(banner.pluginName)}
-              />
+              <PluginErrorBoundary key={`${banner.pluginName}-${banner.id}`} pluginName={banner.pluginName}>
+                <Component
+                  pluginName={banner.pluginName}
+                  props={banner.props}
+                  onAction={(action, data) => sendBannerAction(banner.pluginName, banner.id, action, data)}
+                  config={config ?? undefined}
+                  updateConfig={updateConfig}
+                  pluginConfig={getResolvedPluginConfig(banner.pluginName)}
+                  pluginState={getPluginState(banner.pluginName)}
+                />
+              </PluginErrorBoundary>
             );
           }
           if (waitingForRenderer) {

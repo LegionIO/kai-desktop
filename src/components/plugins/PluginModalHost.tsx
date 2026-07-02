@@ -2,6 +2,7 @@ import { type FC } from 'react';
 import { XIcon } from 'lucide-react';
 import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
+import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { useConfig } from '@/providers/ConfigProvider';
 
 export const PluginModalHost: FC = () => {
@@ -37,10 +38,9 @@ export const PluginModalHost: FC = () => {
         const pluginError = getPluginError(modal.pluginName);
         const rendererStatus = getPluginRendererStatus(modal.pluginName);
         const rendererError = getPluginRendererError(modal.pluginName);
-        const waitingForRenderer = !Component && (
-          pluginStatus === 'loading'
-          || (hasRendererScript(modal.pluginName) && rendererStatus !== 'error')
-        );
+        const waitingForRenderer =
+          !Component &&
+          (pluginStatus === 'loading' || (hasRendererScript(modal.pluginName) && rendererStatus !== 'error'));
 
         const handleClose = () => {
           if (modal.closeable) {
@@ -64,7 +64,13 @@ export const PluginModalHost: FC = () => {
             <div
               className="absolute inset-0 bg-black/60 backdrop-blur-sm"
               onClick={modal.closeable ? handleClose : undefined}
-              onKeyDown={modal.closeable ? (e) => { if (e.key === 'Escape') handleClose(); } : undefined}
+              onKeyDown={
+                modal.closeable
+                  ? (e) => {
+                      if (e.key === 'Escape') handleClose();
+                    }
+                  : undefined
+              }
               role={modal.closeable ? 'button' : undefined}
               tabIndex={modal.closeable ? -1 : undefined}
             />
@@ -83,25 +89,25 @@ export const PluginModalHost: FC = () => {
               )}
 
               {/* Title */}
-              {modal.title && (
-                <h2 className="mb-4 text-lg font-semibold">{modal.title}</h2>
-              )}
+              {modal.title && <h2 className="mb-4 text-lg font-semibold">{modal.title}</h2>}
 
               {/* Plugin component or fallback */}
               {Component ? (
-                <Component
-                  pluginName={modal.pluginName}
-                  props={modal.props}
-                  onAction={handleAction}
-                  onClose={modal.closeable ? handleClose : undefined}
-                  config={config ?? undefined}
-                  updateConfig={updateConfig}
-                  pluginConfig={getResolvedPluginConfig(modal.pluginName)}
-                  pluginState={getPluginState(modal.pluginName)}
-                  setPluginConfig={async (path, value) => {
-                    await setPluginConfig(modal.pluginName, path, value);
-                  }}
-                />
+                <PluginErrorBoundary pluginName={modal.pluginName} resetKey={rendererLoadCount}>
+                  <Component
+                    pluginName={modal.pluginName}
+                    props={modal.props}
+                    onAction={handleAction}
+                    onClose={modal.closeable ? handleClose : undefined}
+                    config={config ?? undefined}
+                    updateConfig={updateConfig}
+                    pluginConfig={getResolvedPluginConfig(modal.pluginName)}
+                    pluginState={getPluginState(modal.pluginName)}
+                    setPluginConfig={async (path, value) => {
+                      await setPluginConfig(modal.pluginName, path, value);
+                    }}
+                  />
+                </PluginErrorBoundary>
               ) : waitingForRenderer ? (
                 <div className="text-sm text-muted-foreground">
                   <p>Loading plugin UI for &quot;{modal.pluginName}&quot;...</p>
@@ -113,7 +119,9 @@ export const PluginModalHost: FC = () => {
                 </div>
               ) : (
                 <div className="text-sm text-muted-foreground">
-                  <p>Plugin component &quot;{modal.component}&quot; not found for plugin &quot;{modal.pluginName}&quot;.</p>
+                  <p>
+                    Plugin component &quot;{modal.component}&quot; not found for plugin &quot;{modal.pluginName}&quot;.
+                  </p>
                   <p className="mt-1 text-xs">Ensure the plugin&apos;s UI components are registered.</p>
                 </div>
               )}

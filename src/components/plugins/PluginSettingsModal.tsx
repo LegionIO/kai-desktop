@@ -5,6 +5,7 @@ import { useConfig } from '@/providers/ConfigProvider';
 import { usePlugins } from '@/providers/PluginProvider';
 import { usePluginSettingsSections } from './PluginSettingsSections';
 import { getPluginComponentByHint } from './PluginComponentRegistry';
+import { PluginErrorBoundary } from './PluginErrorBoundary';
 
 interface PluginSettingsModalProps {
   pluginName: string;
@@ -34,7 +35,9 @@ export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, 
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
       onClick={onClose}
-      onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') onClose();
+      }}
     >
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
@@ -58,27 +61,40 @@ export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, 
             </div>
           ) : (
             sectionsForPlugin.map((pluginSection) => {
-              const Component = getPluginComponentByHint(pluginSection.pluginName, pluginSection.component, ['SettingsView', `${pluginSection.pluginName}Settings`], 'settings');
+              const Component = getPluginComponentByHint(
+                pluginSection.pluginName,
+                pluginSection.component,
+                ['SettingsView', `${pluginSection.pluginName}Settings`],
+                'settings',
+              );
               const pluginStatus = getPluginStatus(pluginSection.pluginName);
               const pluginError = getPluginError(pluginSection.pluginName);
               const rendererStatus = getPluginRendererStatus(pluginSection.pluginName);
               const rendererError = getPluginRendererError(pluginSection.pluginName);
-              const waitingForRenderer = !Component && (
-                pluginStatus === 'loading'
-                || (hasRendererScript(pluginSection.pluginName) && rendererStatus !== 'error' && rendererStatus !== 'ready')
-              );
+              const waitingForRenderer =
+                !Component &&
+                (pluginStatus === 'loading' ||
+                  (hasRendererScript(pluginSection.pluginName) &&
+                    rendererStatus !== 'error' &&
+                    rendererStatus !== 'ready'));
 
               if (!Component) {
                 if (waitingForRenderer) {
                   return (
-                    <div key={pluginSection.key} className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+                    <div
+                      key={pluginSection.key}
+                      className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground"
+                    >
                       Loading plugin settings...
                     </div>
                   );
                 }
                 if (pluginError || rendererError) {
                   return (
-                    <div key={pluginSection.key} className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+                    <div
+                      key={pluginSection.key}
+                      className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground"
+                    >
                       Failed to load settings: {pluginError || rendererError}
                     </div>
                   );
@@ -87,20 +103,21 @@ export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, 
               }
 
               return (
-                <Component
-                  key={pluginSection.key}
-                  pluginName={pluginSection.pluginName}
-                  config={config}
-                  updateConfig={updateConfig}
-                  pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
-                  pluginState={getPluginState(pluginSection.pluginName)}
-                  onAction={(action: string, data?: unknown) => {
-                    sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
-                  }}
-                  setPluginConfig={async (path, value) => {
-                    await setPluginConfig(pluginSection.pluginName, path, value);
-                  }}
-                />
+                <PluginErrorBoundary key={pluginSection.key} pluginName={pluginSection.pluginName}>
+                  <Component
+                    pluginName={pluginSection.pluginName}
+                    config={config}
+                    updateConfig={updateConfig}
+                    pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
+                    pluginState={getPluginState(pluginSection.pluginName)}
+                    onAction={(action: string, data?: unknown) => {
+                      sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+                    }}
+                    setPluginConfig={async (path, value) => {
+                      await setPluginConfig(pluginSection.pluginName, path, value);
+                    }}
+                  />
+                </PluginErrorBoundary>
               );
             })
           )}

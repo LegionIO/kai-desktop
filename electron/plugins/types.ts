@@ -66,6 +66,16 @@ export type ExecScopeDeclaration = {
   argPatterns?: Record<string, string[]>;
 };
 
+/** Payload sent to the renderer when a plugin needs user consent to load. */
+export type PluginConsentRequest = {
+  pluginName: string;
+  displayName: string;
+  permissions: PluginPermission[];
+  dangerousPermissions: PluginPermission[];
+  execScope?: ExecScopeDeclaration;
+  fileHash: string;
+};
+
 export type ExecRequest = {
   binary: AllowedBinary;
   args: string[];

@@ -21,6 +21,7 @@ import { PluginPanelHost } from '@/components/plugins/PluginPanelHost';
 import { PluginModalHost } from '@/components/plugins/PluginModalHost';
 import { PluginToastHost } from '@/components/plugins/PluginToastHost';
 import { PermissionConsentModal } from '@/components/plugins/PermissionConsentModal';
+import { PluginErrorBoundary } from '@/components/plugins/PluginErrorBoundary';
 import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { DisablePluginModal } from '@/components/plugins/DisablePluginModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
@@ -1689,9 +1690,15 @@ function AppShell() {
             }}
           />
           <RealtimeProvider>
-            <PluginModalHost />
-            <PluginToastHost />
-            <PermissionConsentModal />
+            <PluginErrorBoundary fallback={() => null}>
+              <PluginModalHost />
+            </PluginErrorBoundary>
+            <PluginErrorBoundary fallback={() => null}>
+              <PluginToastHost />
+            </PluginErrorBoundary>
+            <PluginErrorBoundary fallback={() => null}>
+              <PermissionConsentModal />
+            </PluginErrorBoundary>
             <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
             <ExportDialog
               open={exportOpen}
