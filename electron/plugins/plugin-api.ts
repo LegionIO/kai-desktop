@@ -40,6 +40,7 @@ import type {
   ExecRequest,
   CookiePromotionConfig,
   SessionCookieInfo,
+  AutomationEvent,
 } from './types.js';
 import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandboxed-exec.js';
 import { writeAuditEntry } from './audit-log.js';
@@ -193,6 +194,8 @@ type PluginAPICallbacks = {
   replacePluginState: (next: Record<string, unknown>) => void;
   setPluginState: (path: string, value: unknown) => void;
   emitPluginEvent: (eventName: string, data?: unknown) => void;
+  subscribeBus: (key: string, handler: (event: AutomationEvent) => void) => () => void;
+  onEventsDeclared: () => void;
   showNotification: (descriptor: Omit<PluginNotificationDescriptor, 'pluginName' | 'visible'>) => void;
   dismissNotification: (id: string) => void;
   openNavigationTarget: (target: PluginNavigationTarget) => void;
@@ -372,6 +375,16 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     requireLive();
   };
 
+  const requireAnyPermission = (permissions: string[]): void => {
+    const has = permissions.some((p) => manifest.permissions.includes(p as (typeof manifest.permissions)[number]));
+    if (!has) {
+      throw new Error(
+        `Plugin "${manifest.name}" requires one of [${permissions.join(', ')}] for this action. Declared: ${listPermission(instance)}`,
+      );
+    }
+    requireLive();
+  };
+
   const registerOrReplace = <T extends { id: string }>(items: T[], descriptor: T): void => {
     const index = items.findIndex((item) => item.id === descriptor.id);
     if (index >= 0) {
@@ -440,8 +453,37 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         callbacks.setPluginState(path, value);
       },
       emitEvent: (eventName: string, data?: unknown) => {
-        requirePermission('state:publish');
+        requireAnyPermission(['state:publish', 'events:publish']);
         callbacks.emitPluginEvent(eventName, data);
+      },
+    },
+
+    events: {
+      declare: (decl) => {
+        requirePermission('events:publish');
+        if (decl.events) {
+          const seen = new Set(instance.declaredEvents.map((e) => e.event));
+          for (const ev of decl.events) if (!seen.has(ev.event)) instance.declaredEvents.push(ev);
+        }
+        if (decl.actions) {
+          const seen = new Set(instance.declaredActions.map((a) => a.targetId));
+          for (const ac of decl.actions) if (!seen.has(ac.targetId)) instance.declaredActions.push(ac);
+        }
+        callbacks.onEventsDeclared();
+      },
+      emit: (event: string, payload?: unknown) => {
+        requireAnyPermission(['events:publish', 'state:publish']);
+        callbacks.emitPluginEvent(event, payload);
+      },
+      on: (key: string, handler: (event: AutomationEvent) => void) => {
+        requirePermission('events:subscribe');
+        const off = callbacks.subscribeBus(key, handler);
+        instance.eventUnsubscribers.push(off);
+        return () => {
+          off();
+          const idx = instance.eventUnsubscribers.indexOf(off);
+          if (idx >= 0) instance.eventUnsubscribers.splice(idx, 1);
+        };
       },
     },
 

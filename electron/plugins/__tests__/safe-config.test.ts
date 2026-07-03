@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { appConfigSchema, type AppConfig } from '../../config/schema.js';
-import {
-  resolvePluginConfigView,
-  toPluginSafeConfig,
-  type PluginSafeConfig,
-} from '../safe-config.js';
+import { resolvePluginConfigView, toPluginSafeConfig, type PluginSafeConfig } from '../safe-config.js';
 
 // Mock electron + heavy main-process deps that PluginManager imports at load
 // time. We never construct windows, notifications, or marketplace services in
@@ -322,10 +318,9 @@ describe('toPluginSafeConfig', () => {
     const serialized = JSON.stringify(safe);
 
     for (const [label, secret] of Object.entries(SECRETS)) {
-      expect(
-        serialized.includes(secret),
-        `secret "${label}" (${secret}) leaked through toPluginSafeConfig`,
-      ).toBe(false);
+      expect(serialized.includes(secret), `secret "${label}" (${secret}) leaked through toPluginSafeConfig`).toBe(
+        false,
+      );
     }
   });
 
@@ -408,14 +403,12 @@ describe('toPluginSafeConfig', () => {
     const fixture = buildPopulatedConfig();
     const safe = toPluginSafeConfig(fixture);
 
-    const suspiciousKeyPattern = /(?:^|[._-])(?:api[_-]?key|password|secret(?!ed)|session[_-]?token|access[_-]?key|subscription[_-]?key)(?:$|[._-])/i;
+    const suspiciousKeyPattern =
+      /(?:^|[._-])(?:api[_-]?key|password|secret(?!ed)|session[_-]?token|access[_-]?key|subscription[_-]?key)(?:$|[._-])/i;
     const keys = collectKeys(safe);
     const survivors = keys.filter((k) => suspiciousKeyPattern.test(k));
 
-    expect(
-      survivors,
-      `keys suggesting a credential survived redaction: ${survivors.join(', ')}`,
-    ).toEqual([]);
+    expect(survivors, `keys suggesting a credential survived redaction: ${survivors.join(', ')}`).toEqual([]);
   });
 
   it('schema-walk regression guard: no string leaf longer than 20 chars matches a known secret prefix', () => {
@@ -426,14 +419,9 @@ describe('toPluginSafeConfig', () => {
 
     const strings = collectStringLeaves(safe);
     const knownSecretPrefixes = ['sk-test-', 'sk-ant-test-', 'AKIATEST', 'Bearer test-'];
-    const leaked = strings.filter((s) =>
-      knownSecretPrefixes.some((prefix) => s.startsWith(prefix)),
-    );
+    const leaked = strings.filter((s) => knownSecretPrefixes.some((prefix) => s.startsWith(prefix)));
 
-    expect(
-      leaked,
-      `string values matching known secret prefixes leaked: ${leaked.join(', ')}`,
-    ).toEqual([]);
+    expect(leaked, `string values matching known secret prefixes leaked: ${leaked.join(', ')}`).toEqual([]);
   });
 });
 
@@ -535,6 +523,9 @@ function makeSpyPluginInstance(captured: unknown[]): unknown {
     inferenceProvider: null,
     contributedRuntimes: [],
     contributedCliTools: [],
+    declaredEvents: [],
+    declaredActions: [],
+    eventUnsubscribers: [],
   };
 }
 
@@ -573,10 +564,7 @@ describe('hook fire-site delivers redacted config — spy plugin integration', (
 
   function assertNoLeakStrings(serialized: string): void {
     for (const [label, marker] of Object.entries(LEAK_MARKERS)) {
-      expect(
-        serialized.includes(marker),
-        `leak marker "${label}" (${marker}) reached plugin hook config`,
-      ).toBe(false);
+      expect(serialized.includes(marker), `leak marker "${label}" (${marker}) reached plugin hook config`).toBe(false);
     }
   }
 
@@ -685,10 +673,7 @@ describe('hook fire-site delivers redacted config — spy plugin integration', (
       { name: 'planted LEAK-XYZ sentinel', pattern: /LEAK-XYZ/i },
     ];
     for (const { name, pattern } of suspiciousPatterns) {
-      expect(
-        pattern.test(flat),
-        `credential-shaped pattern survived redaction: ${name} (${pattern})`,
-      ).toBe(false);
+      expect(pattern.test(flat), `credential-shaped pattern survived redaction: ${name} (${pattern})`).toBe(false);
     }
   });
 
@@ -796,10 +781,7 @@ describe('resolvePluginConfigView (config:read-secrets gate)', () => {
     // similar) must NOT satisfy the gate. We test with a sibling
     // permission that shares a prefix.
     const config = buildPopulatedConfig();
-    const view = resolvePluginConfigView(config, [
-      'config:read',
-      'config:read-secrets-not-a-real-permission',
-    ]);
+    const view = resolvePluginConfigView(config, ['config:read', 'config:read-secrets-not-a-real-permission']);
     expect(JSON.stringify(view).includes(SECRETS.openaiApiKey)).toBe(false);
   });
 
@@ -822,7 +804,8 @@ describe('resolvePluginConfigView (config:read-secrets gate)', () => {
     const config = buildPopulatedConfig();
     const view = resolvePluginConfigView(config, ['config:read']);
 
-    const suspiciousKeyPattern = /(?:^|[._-])(?:api[_-]?key|password|secret(?!ed)|session[_-]?token|access[_-]?key|subscription[_-]?key)(?:$|[._-])/i;
+    const suspiciousKeyPattern =
+      /(?:^|[._-])(?:api[_-]?key|password|secret(?!ed)|session[_-]?token|access[_-]?key|subscription[_-]?key)(?:$|[._-])/i;
     const keys = collectKeys(view);
     const survivors = keys.filter((k) => suspiciousKeyPattern.test(k));
 
@@ -936,9 +919,7 @@ describe('resolvePluginConfigView — adversarial runtime mutation', () => {
       {
         get: () => {
           accessCount += 1;
-          return accessCount === 1
-            ? ['config:read']
-            : ['config:read', 'config:read-secrets'];
+          return accessCount === 1 ? ['config:read'] : ['config:read', 'config:read-secrets'];
         },
         configurable: true,
         enumerable: true,
@@ -1054,10 +1035,13 @@ describe('resolvePluginConfigView — adversarial runtime mutation', () => {
     //     own array because the own array has length 0 and no indexed
     //     props of its own.
     const ownEmpty: string[] = [];
-    Object.setPrototypeOf(ownEmpty, Object.assign(Object.create(Array.prototype), {
-      0: 'config:read-secrets',
-      length: 1,
-    }));
+    Object.setPrototypeOf(
+      ownEmpty,
+      Object.assign(Object.create(Array.prototype), {
+        0: 'config:read-secrets',
+        length: 1,
+      }),
+    );
     const viewA = resolvePluginConfigView(config, ownEmpty);
     expect(JSON.stringify(viewA).includes(SECRETS.openaiApiKey)).toBe(false);
 

@@ -151,6 +151,43 @@ const appAPI = {
       ipcRenderer.invoke('skills:toggle', name, enable) as Promise<{ success?: boolean; enabled?: boolean }>,
   },
 
+  automations: {
+    catalog: () =>
+      ipcRenderer.invoke('automations:catalog') as Promise<
+        Array<{
+          source: string;
+          displayName: string;
+          events: Array<{
+            event: string;
+            title: string;
+            description?: string;
+            payloadSchema?: Record<string, unknown>;
+          }>;
+          actions: Array<{
+            targetId: string;
+            title: string;
+            description?: string;
+            inputSchema?: Record<string, unknown>;
+          }>;
+        }>
+      >,
+    log: () => ipcRenderer.invoke('automations:log') as Promise<unknown[]>,
+    test: (ruleId: string, samplePayload: unknown) =>
+      ipcRenderer.invoke('automations:test', ruleId, samplePayload) as Promise<unknown>,
+    emit: (source: string, event: string, payload?: unknown) =>
+      ipcRenderer.invoke('automations:emit', source, event, payload) as Promise<void>,
+    onRun: (callback: (record: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('automations:run', handler);
+      return () => ipcRenderer.removeListener('automations:run', handler);
+    },
+    onCatalogChanged: (callback: () => void) => {
+      const handler = () => callback();
+      ipcRenderer.on('automations:catalog-changed', handler);
+      return () => ipcRenderer.removeListener('automations:catalog-changed', handler);
+    },
+  },
+
   plugins: {
     getUIState: () => ipcRenderer.invoke('plugin:get-ui-state'),
     list: () =>

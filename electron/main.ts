@@ -34,6 +34,10 @@ import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools } from './tools/mcp-client.js';
 import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
+import { registerAutomationsHandlers } from './ipc/automations.js';
+import { eventBus } from './automations/event-bus.js';
+import { registerBuiltinSources } from './automations/builtin-sources.js';
+import { getAutomationEngine, initializeAutomationEngine } from './automations/engine.js';
 import { PluginManager } from './plugins/plugin-manager.js';
 import { registerPluginHandlers } from './ipc/plugins.js';
 import { registerMicRecorderHandlers, cleanupMicRecorder, getRecorderWindow } from './audio/mic-recorder.js';
@@ -736,6 +740,9 @@ if (gotSingleInstanceLock) {
     }
 
     // Track last mcpServers fingerprint to detect changes
+    const fingerprintConfig = (cfg: AppConfig): Record<string, string> =>
+      Object.fromEntries((Object.keys(cfg) as Array<keyof AppConfig>).map((k) => [k, JSON.stringify(cfg[k]) ?? '']));
+    let lastConfigFingerprints = fingerprintConfig(getConfig());
     let lastMcpFingerprint = JSON.stringify(getConfig().mcpServers ?? []);
     let lastSkillsFingerprint = JSON.stringify(getConfig().skills?.enabled ?? []);
     let lastCliToolsFingerprint = JSON.stringify(getConfig().cliTools ?? []);
@@ -853,6 +860,17 @@ if (gotSingleInstanceLock) {
 
       // Plugin config change forwarding
       pluginManager.onConfigChanged(config);
+
+      // Automation rules hot-reload + broadcast as an automation event
+      getAutomationEngine()?.reload(config.automations.rules);
+      const nextFingerprints = fingerprintConfig(config);
+      const changedKeys = Object.keys(nextFingerprints).filter(
+        (k) => nextFingerprints[k] !== lastConfigFingerprints[k],
+      );
+      lastConfigFingerprints = nextFingerprints;
+      if (changedKeys.length > 0) {
+        eventBus.emit('app', 'config-changed', { changedKeys });
+      }
 
       // Dictation hotkey hot-reload
       updateDictationConfig(config);
@@ -1093,6 +1111,19 @@ if (gotSingleInstanceLock) {
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+
+    // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
+    // getRegisteredTools for tool actions, and getConfig for rule reload).
+    registerBuiltinSources(eventBus);
+    const automationEngine = initializeAutomationEngine({
+      bus: eventBus,
+      appHome: APP_HOME,
+      getConfig,
+      getAutomationsConfig: () => getConfig().automations,
+      getRegisteredTools,
+      handlePluginAction: (payload) => pluginManager.handleAction(payload),
+    });
+    registerAutomationsHandlers(ipcMain, automationEngine, eventBus);
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());
@@ -1447,7 +1478,7 @@ if (gotSingleInstanceLock) {
     // Initialize marketplace and plugins immediately. We avoid putting this
     // inside `ready-to-show` because createWindow() calls loadURL(), which may
     // fire the event before any handler registered here can observe it.
-    (async () => {
+    const pluginsReady = (async () => {
       try {
         // Initialize marketplace and auto-install required plugins before loading
         const marketplaceUrls = getBrandMarketplaceUrls();
@@ -1492,7 +1523,7 @@ if (gotSingleInstanceLock) {
     });
 
     // Initialize tools asynchronously
-    shellPathReady
+    const toolsReady = shellPathReady
       .then(() => buildToolRegistry(getConfig, APP_HOME, pluginManager))
       .then((tools) => {
         const pluginTools = pluginManager.getAllPluginTools();
@@ -1522,6 +1553,10 @@ if (gotSingleInstanceLock) {
       .catch((err) => {
         console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
       });
+
+    void Promise.allSettled([pluginsReady, toolsReady]).then(() => {
+      eventBus.emit('app', 'ready', {});
+    });
 
     app.on('activate', () => {
       const allWindows = BrowserWindow.getAllWindows();

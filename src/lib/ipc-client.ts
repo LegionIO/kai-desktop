@@ -10,6 +10,25 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 import type { AppShotPayload } from '../../shared/app-shots';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
 
+export type AutomationSourceCatalogEntry = {
+  source: string;
+  displayName: string;
+  events: Array<{ event: string; title: string; description?: string; payloadSchema?: Record<string, unknown> }>;
+  actions: Array<{ targetId: string; title: string; description?: string; inputSchema?: Record<string, unknown> }>;
+};
+
+export type AutomationRunRecord = {
+  id: string;
+  ruleId: string;
+  ruleName: string;
+  ts: number;
+  event: { key: string; source: string; event: string; payload: unknown };
+  matched: boolean;
+  skippedReason?: 'debounce' | 'rate-limit' | 'conditions';
+  results: Array<{ type: string; ok: boolean; output?: unknown; error?: string; durationMs: number }>;
+  error?: string;
+};
+
 type AppAPI = {
   config: {
     get: () => Promise<unknown>;
@@ -105,6 +124,14 @@ type AppAPI = {
     }>;
     delete: (name: string) => Promise<{ success?: boolean; error?: string }>;
     toggle: (name: string, enable: boolean) => Promise<{ success?: boolean; enabled?: boolean }>;
+  };
+  automations: {
+    catalog: () => Promise<AutomationSourceCatalogEntry[]>;
+    log: () => Promise<AutomationRunRecord[]>;
+    test: (ruleId: string, samplePayload: unknown) => Promise<AutomationRunRecord>;
+    emit: (source: string, event: string, payload?: unknown) => Promise<void>;
+    onRun: (callback: (record: AutomationRunRecord) => void) => () => void;
+    onCatalogChanged: (callback: () => void) => () => void;
   };
   plugins: {
     getUIState: () => Promise<unknown>;

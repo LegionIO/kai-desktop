@@ -638,6 +638,71 @@ export const workspaceSchema = z.object({
 
 export type Workspace = z.infer<typeof workspaceSchema>;
 
+const automationConditionSchema = z.object({
+  path: z.string().default(''),
+  op: z.enum(['equals', 'notEquals', 'contains', 'startsWith', 'endsWith', 'matches', 'in', 'exists', 'expression']),
+  value: z.unknown().optional(),
+  caseSensitive: z.boolean().default(false),
+});
+
+const automationActionSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('agent'),
+    mode: z.enum(['background', 'conversation']).default('background'),
+    prompt: z.string(),
+    modelKey: z.string().optional(),
+    profileKey: z.string().optional(),
+    tools: z.boolean().default(true),
+    conversationTitle: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('plugin-action'),
+    pluginName: z.string(),
+    targetId: z.string(),
+    action: z.string().default('automation'),
+    data: z.record(z.string(), z.unknown()).optional(),
+  }),
+  z.object({
+    type: z.literal('tool'),
+    toolName: z.string(),
+    input: z.record(z.string(), z.unknown()).default({}),
+  }),
+  z.object({
+    type: z.literal('notification'),
+    title: z.string(),
+    body: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('emit'),
+    source: z.string(),
+    event: z.string(),
+    payload: z.record(z.string(), z.unknown()).optional(),
+  }),
+]);
+
+const automationRuleSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  enabled: z.boolean().default(true),
+  trigger: z.object({ source: z.string(), event: z.string() }),
+  conditions: z.array(automationConditionSchema).default([]),
+  conditionMode: z.enum(['all', 'any']).default('all'),
+  actions: z.array(automationActionSchema).min(1),
+  debounceMs: z.number().int().nonnegative().default(0),
+  rateLimitPerMinute: z.number().int().positive().optional(),
+});
+
+const automationsConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  rules: z.array(automationRuleSchema).default([]),
+  log: z.object({ maxEntries: z.number().int().positive().default(200) }).default({ maxEntries: 200 }),
+});
+
+export type AutomationCondition = z.infer<typeof automationConditionSchema>;
+export type AutomationAction = z.infer<typeof automationActionSchema>;
+export type AutomationRule = z.infer<typeof automationRuleSchema>;
+export type AutomationsConfig = z.infer<typeof automationsConfigSchema>;
+
 /** Sidebar tab identifiers — scoped tabs filter by active workspace, global tabs show everything. */
 export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins';
 
@@ -763,6 +828,7 @@ export const appConfigSchema = z.object({
   videoGeneration: videoGenerationConfigSchema.optional(),
   cliTools: z.array(cliToolSchema).optional(),
   autopilot: autopilotConfigSchema.optional(),
+  automations: automationsConfigSchema.default({ enabled: true, rules: [], log: { maxEntries: 200 } }),
 });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;

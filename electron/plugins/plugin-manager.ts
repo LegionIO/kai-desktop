@@ -38,6 +38,7 @@ import type { AppConfig } from '../config/schema.js';
 import { toPluginSafeConfig, resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { eventBus } from '../automations/event-bus.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { buildPluginRendererBundle } from './renderer-build.js';
@@ -447,6 +448,9 @@ export class PluginManager {
       rendererBuild: null,
       inferenceProvider: null,
       contributedCliTools: [],
+      declaredEvents: [],
+      declaredActions: [],
+      eventUnsubscribers: [],
     };
   }
 
@@ -580,10 +584,28 @@ export class PluginManager {
         },
         emitPluginEvent: (eventName, data) => {
           // Drop events from a stale activation generation (e.g. a timer that
-          // survived a disable/enable cycle). 'loading' is allowed for
-          // activate()-time calls on the current generation.
-          if (!this.isCurrentInstance(instance)) return;
-          broadcastToAllWindows('plugin:event', { pluginName: manifest.name, eventName, data });
+          // survived a disable/enable cycle) or from a plugin that is currently
+          // tearing down — a deactivate()-time emit could otherwise re-enter
+          // the same plugin via an automation `plugin-action` rule while its
+          // resources are being released.
+          if (!this.isCurrentInstance(instance) || instance.tearingDown) return;
+          eventBus.emit(`plugin.${manifest.name}`, eventName, data);
+        },
+        subscribeBus: (key, handler) => {
+          if (!this.isCurrentInstance(instance) || instance.tearingDown) return () => {};
+          return eventBus.subscribe((e) => {
+            if (!this.isCurrentInstance(instance) || instance.tearingDown) return;
+            if (key === '*' || e.key === key) handler(e);
+          });
+        },
+        onEventsDeclared: () => {
+          if (!this.isCurrentInstance(instance) || instance.tearingDown) return;
+          eventBus.registerSource({
+            source: `plugin.${manifest.name}`,
+            displayName: manifest.displayName,
+            events: [...instance.declaredEvents],
+            actions: [...instance.declaredActions],
+          });
         },
         onUIStateChanged: () => this.broadcastUIState(),
         onToolsChanged: () => this.notifyToolsChanged(),
@@ -652,6 +674,15 @@ export class PluginManager {
     } catch (err) {
       instance.state = 'error';
       instance.error = err instanceof Error ? err.message : String(err);
+      for (const off of instance.eventUnsubscribers) {
+        try {
+          off();
+        } catch {}
+      }
+      instance.eventUnsubscribers = [];
+      instance.declaredEvents = [];
+      instance.declaredActions = [];
+      eventBus.unregisterSource(`plugin.${manifest.name}`);
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.error(`[PluginManager] Failed to load plugin "${manifest.name}":`, err);
@@ -738,6 +769,16 @@ export class PluginManager {
     instance.preUpdateHooks = [];
     instance.postUpdateHooks = [];
     instance.configChangeListeners = [];
+
+    for (const off of instance.eventUnsubscribers) {
+      try {
+        off();
+      } catch {}
+    }
+    instance.eventUnsubscribers = [];
+    instance.declaredEvents = [];
+    instance.declaredActions = [];
+    eventBus.unregisterSource(`plugin.${pluginName}`);
 
     this.actionHandlers.delete(pluginName);
 

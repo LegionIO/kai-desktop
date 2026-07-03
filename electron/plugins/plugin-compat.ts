@@ -45,6 +45,8 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'conversations:write',
   'navigation:open',
   'state:publish',
+  'events:publish',
+  'events:subscribe',
   'agent:generate',
   'agent:inference-provider',
   'safe-storage',
@@ -55,9 +57,9 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'lifecycle:hook',
 
   // ── Host-level capabilities (not permission-gated) ──
-  'marketplace',            // marketplace service is available
-  'renderer-build',         // host can build frontend.js bundles
-  'plugin-config-schema',   // host validates configSchema via Zod
+  'marketplace', // marketplace service is available
+  'renderer-build', // host can build frontend.js bundles
+  'plugin-config-schema', // host validates configSchema via Zod
 ]);
 
 /**
@@ -74,8 +76,8 @@ export type CompatCheckResult = {
   missingCapabilities: string[];
   /** Present when the engines.kai semver constraint fails. */
   versionMismatch?: {
-    required: string;   // e.g. "^2.0.0"
-    actual: string;     // e.g. "1.0.0"
+    required: string; // e.g. "^2.0.0"
+    actual: string; // e.g. "1.0.0"
   };
 };
 
@@ -100,15 +102,11 @@ export function checkPluginCompatibility(manifest: PluginManifest): CompatCheckR
       if (!satisfies(HOST_PLUGIN_API_VERSION, requiredRange)) {
         result.compatible = false;
         result.versionMismatch = { required: requiredRange, actual: HOST_PLUGIN_API_VERSION };
-        result.errors.push(
-          `Requires Kai plugin API ${requiredRange}, host provides ${HOST_PLUGIN_API_VERSION}`,
-        );
+        result.errors.push(`Requires Kai plugin API ${requiredRange}, host provides ${HOST_PLUGIN_API_VERSION}`);
       }
     } catch {
       // Invalid semver range in the manifest — treat as a warning, not a hard fail
-      result.warnings.push(
-        `Invalid engines.kai semver range "${requiredRange}" — skipping version check`,
-      );
+      result.warnings.push(`Invalid engines.kai semver range "${requiredRange}" — skipping version check`);
     }
   }
 
@@ -122,9 +120,7 @@ export function checkPluginCompatibility(manifest: PluginManifest): CompatCheckR
       }
     }
     if (result.missingCapabilities.length > 0) {
-      result.errors.push(
-        `Missing host capabilities: ${result.missingCapabilities.join(', ')}`,
-      );
+      result.errors.push(`Missing host capabilities: ${result.missingCapabilities.join(', ')}`);
     }
   }
 

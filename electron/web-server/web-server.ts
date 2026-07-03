@@ -342,6 +342,14 @@ export function getBridgeScript(): string {
       onFailedUpdatesChanged: function(cb) { return on('plugin:failed-updates-changed', cb); },
       onConsentRequired: function(cb) { return on('plugin:consent-required', cb); }
     },
+    automations: {
+      catalog: function() { return invoke('automations:catalog'); },
+      log: function() { return invoke('automations:log'); },
+      test: function(ruleId, payload) { return invoke('automations:test', ruleId, payload); },
+      emit: function(source, event, payload) { return invoke('automations:emit', source, event, payload); },
+      onRun: function(cb) { return on('automations:run', cb); },
+      onCatalogChanged: function(cb) { return on('automations:catalog-changed', cb); }
+    },
     modelCatalog: function() { return invoke('agent:model-catalog'); },
     realtime: {
       startSession: function(cId) { return invoke('realtime:start-session', cId); },

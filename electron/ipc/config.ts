@@ -980,6 +980,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     videoGeneration: config.videoGeneration,
     cliTools: config.cliTools,
     autopilot: config.autopilot,
+    automations: config.automations,
   };
 }
 

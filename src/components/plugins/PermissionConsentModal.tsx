@@ -75,6 +75,8 @@ const PERMISSION_DESCRIPTIONS: Record<
   'ui:navigation': { label: 'Register navigation items', icon: Compass, level: 'low' },
   'notifications:send': { label: 'Send notifications', icon: Bell, level: 'low' },
   'state:publish': { label: 'Publish plugin state', icon: Database, level: 'low' },
+  'events:publish': { label: 'Publish automation events', icon: Bell, level: 'low' },
+  'events:subscribe': { label: 'Subscribe to automation events', icon: Bell, level: 'low' },
   'navigation:open': { label: 'Open navigation targets', icon: Compass, level: 'low' },
   'system:env': { label: 'Read environment variables', icon: Eye, level: 'low' },
   'audit:log': { label: 'Write to the audit log', icon: FileText, level: 'low' },

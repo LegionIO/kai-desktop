@@ -4,6 +4,7 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import type { AppConfig } from '../config/schema.js';
+import { eventBus } from '../automations/event-bus.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 
 type ConversationRecord = {
@@ -112,7 +113,7 @@ export function reconcileConversationActivity(
   prev: ConversationRecord | undefined,
   next: ConversationRecord,
 ): ConversationRecord {
-  const messages = Array.isArray(next.messages) ? next.messages as ConversationMessageLike[] : [];
+  const messages = Array.isArray(next.messages) ? (next.messages as ConversationMessageLike[]) : [];
   let derivedLastMessageAt: string | null = null;
   let derivedLastAssistantUpdateAt: string | null = null;
   let derivedUserMessageCount = 0;
@@ -146,7 +147,8 @@ export function reconcileConversationActivity(
 export function isStaleRunningWrite(prev: ConversationRecord, next: ConversationRecord): boolean {
   // Protect both terminal states ('idle' and 'awaiting-approval') from being
   // clobbered by a stale debounced write that still carries runStatus:'running'.
-  if ((prev.runStatus !== 'idle' && prev.runStatus !== 'awaiting-approval') || next.runStatus !== 'running') return false;
+  if ((prev.runStatus !== 'idle' && prev.runStatus !== 'awaiting-approval') || next.runStatus !== 'running')
+    return false;
 
   // A new user turn is allowed to move an idle conversation back to running.
   if (next.userMessageCount > prev.userMessageCount) return false;
@@ -156,19 +158,23 @@ export function isStaleRunningWrite(prev: ConversationRecord, next: Conversation
   if (next.headId !== prev.headId || next.messageCount !== prev.messageCount) return false;
 
   // A legitimate restart will usually change the active branch or head.
-  const sameBranch = next.headId === prev.headId
-    && next.messageCount === prev.messageCount
-    && next.userMessageCount === prev.userMessageCount;
-  const noFreshActivity = timestampMs(next.lastAssistantUpdateAt) <= timestampMs(prev.lastAssistantUpdateAt)
-    && timestampMs(next.lastMessageAt) <= timestampMs(prev.lastMessageAt);
+  const sameBranch =
+    next.headId === prev.headId &&
+    next.messageCount === prev.messageCount &&
+    next.userMessageCount === prev.userMessageCount;
+  const noFreshActivity =
+    timestampMs(next.lastAssistantUpdateAt) <= timestampMs(prev.lastAssistantUpdateAt) &&
+    timestampMs(next.lastMessageAt) <= timestampMs(prev.lastMessageAt);
   if (sameBranch && noFreshActivity) return true;
 
   // Stale async writes often carry an older updatedAt, or they were read before
   // the done handler populated lastAssistantUpdateAt.
-  return timestampMs(next.updatedAt) <= timestampMs(prev.updatedAt)
-    || Boolean(prev.lastAssistantUpdateAt && !next.lastAssistantUpdateAt)
-    || timestampMs(next.lastAssistantUpdateAt) < timestampMs(prev.lastAssistantUpdateAt)
-    || timestampMs(next.lastMessageAt) < timestampMs(prev.lastMessageAt);
+  return (
+    timestampMs(next.updatedAt) <= timestampMs(prev.updatedAt) ||
+    Boolean(prev.lastAssistantUpdateAt && !next.lastAssistantUpdateAt) ||
+    timestampMs(next.lastAssistantUpdateAt) < timestampMs(prev.lastAssistantUpdateAt) ||
+    timestampMs(next.lastMessageAt) < timestampMs(prev.lastMessageAt)
+  );
 }
 
 export function preserveTerminalRunFields(prev: ConversationRecord, next: ConversationRecord): ConversationRecord {
@@ -197,14 +203,15 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     // Add computed metadata for client-side filtering
     return conversations.map((conv) => ({
       ...conv,
-      hasToolCalls: Array.isArray(conv.messages) && conv.messages.some(
-        (msg: unknown) => {
+      hasToolCalls:
+        Array.isArray(conv.messages) &&
+        conv.messages.some((msg: unknown) => {
           const m = msg as Record<string, unknown>;
-          return Array.isArray(m.content) && (m.content as Array<Record<string, unknown>>).some(
-            (part) => part?.type === 'tool-call',
+          return (
+            Array.isArray(m.content) &&
+            (m.content as Array<Record<string, unknown>>).some((part) => part?.type === 'tool-call')
           );
-        },
-      ),
+        }),
     }));
   });
 
@@ -247,6 +254,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     store.conversations[conversation.id] = nextConversation;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
+    if (!prev) {
+      eventBus.emit('conversation', 'created', { id: conversation.id, title: nextConversation.title });
+    }
     return { ok: true };
   });
 

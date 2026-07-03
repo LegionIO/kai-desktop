@@ -1,9 +1,11 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
+import type { ActionDescriptor, AutomationEvent, EventDescriptor } from '../automations/types.js';
 import type { CompatCheckResult } from './plugin-compat.js';
 import type { PluginSafeConfig } from './safe-config.js';
 
 export type { PluginSafeConfig } from './safe-config.js';
+export type { ActionDescriptor, AutomationEvent, EventDescriptor } from '../automations/types.js';
 
 /* ── Manifest ── */
 
@@ -26,6 +28,8 @@ export type PluginPermission =
   | 'conversations:write'
   | 'navigation:open'
   | 'state:publish'
+  | 'events:publish'
+  | 'events:subscribe'
   | 'agent:generate'
   | 'agent:inference-provider'
   | 'agent:register-cli-tool'
@@ -163,6 +167,9 @@ export type PluginInstance = {
   rendererBuild: PluginRendererBuild | null;
   inferenceProvider: PluginInferenceProvider | null;
   contributedCliTools: PluginCliToolContribution[];
+  declaredEvents: EventDescriptor[];
+  declaredActions: ActionDescriptor[];
+  eventUnsubscribers: Array<() => void>;
 };
 
 /* ── Plugin Module (what dist/backend.js must export) ── */
@@ -498,6 +505,15 @@ export type PluginAPI = {
     replace: (next: Record<string, unknown>) => void;
     set: (path: string, value: unknown) => void;
     emitEvent: (eventName: string, data?: unknown) => void;
+  };
+
+  events: {
+    /** Declare events this plugin emits and/or actions it exposes for automations. */
+    declare: (decl: { events?: EventDescriptor[]; actions?: ActionDescriptor[] }) => void;
+    /** Emit an event onto the automation bus (namespaced as `plugin.<name>:<event>`). */
+    emit: (event: string, payload?: unknown) => void;
+    /** Subscribe to bus events. `key` is `<source>:<event>` or `'*'`. Returns an unsubscribe fn. */
+    on: (key: string, handler: (event: AutomationEvent) => void) => () => void;
   };
 
   tools: {
