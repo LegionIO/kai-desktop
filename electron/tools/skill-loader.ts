@@ -79,88 +79,22 @@ function shellQuote(value: string): string {
  * un-quote the value and re-introduce injection).
  */
 export function interpolateTemplateShellSafe(template: string, input: Record<string, unknown>): string {
-  return template.replace(
-    /(['"]?)\{\{input\.([^}]+)\}\}\1/g,
-    (_match, _quote: string, path: string) => {
-      const keys = path.trim().split('.');
-      let current: unknown = input;
-      for (const key of keys) {
-        if (current == null || typeof current !== 'object') return shellQuote('');
-        current = (current as Record<string, unknown>)[key];
-      }
-      return shellQuote(current == null ? '' : String(current));
-    },
-  );
+  return template.replace(/(['"]?)\{\{input\.([^}]+)\}\}\1/g, (_match, _quote: string, path: string) => {
+    const keys = path.trim().split('.');
+    let current: unknown = input;
+    for (const key of keys) {
+      if (current == null || typeof current !== 'object') return shellQuote('');
+      current = (current as Record<string, unknown>)[key];
+    }
+    return shellQuote(current == null ? '' : String(current));
+  });
 }
 
 /* ── JSON Schema → Zod conversion ── */
 
-export function convertJsonSchemaToZod(schema: Record<string, unknown>): z.ZodTypeAny {
-  if (!schema || typeof schema !== 'object') return z.any();
+import { convertJsonSchemaToZod } from './json-schema-zod.js';
 
-  const rawType = schema.type as string | string[] | undefined;
-  const typeList = Array.isArray(rawType) ? rawType : rawType ? [rawType] : [];
-  const type = typeList.find((candidate) => candidate !== 'null');
-  const description = schema.description as string | undefined;
-  const hasNull = typeList.includes('null') || schema.nullable === true;
-  const hasDefault = Object.prototype.hasOwnProperty.call(schema, 'default');
-  const defaultValue = schema.default;
-
-  const applyDesc = <T extends z.ZodTypeAny>(zType: T): T => {
-    return description ? (zType.describe(description) as T) : zType;
-  };
-
-  const finalize = <T extends z.ZodTypeAny>(zType: T): z.ZodTypeAny => {
-    let next: z.ZodTypeAny = zType;
-    if (hasNull) {
-      next = next.nullable();
-    }
-    if (hasDefault) {
-      next = next.default(defaultValue);
-    }
-    return applyDesc(next);
-  };
-
-  switch (type) {
-    case 'string': {
-      const enumVals = schema.enum as string[] | undefined;
-      if (enumVals && enumVals.length > 0) {
-        return finalize(z.enum(enumVals as [string, ...string[]]));
-      }
-      return finalize(z.string());
-    }
-    case 'number':
-    case 'integer': {
-      let n = z.number();
-      if (typeof schema.minimum === 'number') n = n.min(schema.minimum);
-      if (typeof schema.maximum === 'number') n = n.max(schema.maximum);
-      return finalize(n);
-    }
-    case 'boolean':
-      return finalize(z.boolean());
-    case 'array': {
-      const items = schema.items as Record<string, unknown> | undefined;
-      return finalize(z.array(items ? convertJsonSchemaToZod(items) : z.any()));
-    }
-    case 'object': {
-      const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
-      const required = schema.required as string[] | undefined;
-      if (!properties) return finalize(z.record(z.string(), z.any()));
-
-      const shape: Record<string, z.ZodTypeAny> = {};
-      for (const [key, propSchema] of Object.entries(properties)) {
-        let fieldType = convertJsonSchemaToZod(propSchema);
-        if (!required?.includes(key)) {
-          fieldType = fieldType.nullish();
-        }
-        shape[key] = fieldType;
-      }
-      return finalize(z.object(shape).passthrough());
-    }
-    default:
-      return finalize(z.any());
-  }
-}
+export { convertJsonSchemaToZod } from './json-schema-zod.js';
 
 /* ── Skill loading from disk ── */
 
@@ -281,10 +215,7 @@ async function runScriptExecution(
   };
 }
 
-function runPromptExecution(
-  manifest: SkillManifest,
-  input: Record<string, unknown>,
-): Record<string, unknown> {
+function runPromptExecution(manifest: SkillManifest, input: Record<string, unknown>): Record<string, unknown> {
   const template = manifest.execution.promptTemplate ?? '';
   return { prompt: interpolateTemplate(template, input) };
 }
@@ -342,9 +273,7 @@ export function skillToWorkflow(
   getConfig: () => AppConfig,
   allTools?: ToolDefinition[],
 ): AnyWorkflow {
-  const inputSchema = manifest.inputSchema
-    ? convertJsonSchemaToZod(manifest.inputSchema)
-    : anySchema;
+  const inputSchema = manifest.inputSchema ? convertJsonSchemaToZod(manifest.inputSchema) : anySchema;
   const outputSchema = anySchema;
 
   if (manifest.execution.type === 'composite') {
@@ -409,8 +338,10 @@ function buildCompositeWorkflow(
       description: manifest.description,
       inputSchema,
       outputSchema,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    }).then(noOp as any).commit();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    })
+      .then(noOp as any)
+      .commit();
     registerSkillWorkflow(wf);
     return wf;
   }
@@ -472,13 +403,8 @@ function buildCompositeWorkflow(
 
 /* ── Build a ToolDefinition wrapper around a workflow ── */
 
-export function workflowToToolDefinition(
-  manifest: SkillManifest,
-  workflow: AnyWorkflow,
-): ToolDefinition {
-  const inputSchema = manifest.inputSchema
-    ? convertJsonSchemaToZod(manifest.inputSchema)
-    : z.object({}).passthrough();
+export function workflowToToolDefinition(manifest: SkillManifest, workflow: AnyWorkflow): ToolDefinition {
+  const inputSchema = manifest.inputSchema ? convertJsonSchemaToZod(manifest.inputSchema) : z.object({}).passthrough();
 
   return {
     name: getSkillToolName(manifest.name),
@@ -488,34 +414,36 @@ export function workflowToToolDefinition(
     sourceId: manifest.name,
     originalName: manifest.name,
     aliases: [`skill:${manifest.name}`],
-    execute: async (input, context) => runToolExecution({
-      context,
-      run: async () => {
-        const typedInput = (input ?? {}) as Record<string, unknown>;
-        const run = await workflow.createRun();
-        const result = await run.start({ inputData: typedInput });
+    execute: async (input, context) =>
+      runToolExecution({
+        context,
+        run: async () => {
+          const typedInput = (input ?? {}) as Record<string, unknown>;
+          const run = await workflow.createRun();
+          const result = await run.start({ inputData: typedInput });
 
-        if (result.status === 'success') {
-          return result.result ?? { status: 'success', steps: result.steps };
-        }
-        if (result.status === 'failed') {
-          const workflowError = 'error' in result
-            && result.error
-            && typeof result.error === 'object'
-            && 'message' in result.error
-            && typeof result.error.message === 'string'
-            ? result.error.message
-            : 'Workflow failed';
-          return {
-            isError: true,
-            error: workflowError,
-            status: 'failed',
-            steps: result.steps,
-          };
-        }
-        return { status: result.status, steps: result.steps };
-      },
-    }),
+          if (result.status === 'success') {
+            return result.result ?? { status: 'success', steps: result.steps };
+          }
+          if (result.status === 'failed') {
+            const workflowError =
+              'error' in result &&
+              result.error &&
+              typeof result.error === 'object' &&
+              'message' in result.error &&
+              typeof result.error.message === 'string'
+                ? result.error.message
+                : 'Workflow failed';
+            return {
+              isError: true,
+              error: workflowError,
+              status: 'failed',
+              steps: result.steps,
+            };
+          }
+          return { status: result.status, steps: result.steps };
+        },
+      }),
   };
 }
 

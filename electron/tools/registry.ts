@@ -19,6 +19,7 @@ import { createSubAgentTool } from './sub-agent.js';
 import { loadSkillsAsTools } from './skill-loader.js';
 import { createSkillManageTool } from './skill-manage.js';
 import { createCliToolManageTool } from './cli-tool-manage.js';
+import { createAutomationManageTool } from './automation-manage.js';
 import { createWebFetchTool } from './web-fetch.js';
 import { createWebSearchTool } from './web-search.js';
 import { createImageGenTool } from './image-gen.js';
@@ -50,9 +51,7 @@ type ConversationRecordLike = {
 function normalizeSnippet(value: string, maxLength = 240): string {
   const trimmed = value.replace(/\s+/g, ' ').trim();
   if (!trimmed) return '';
-  return trimmed.length <= maxLength
-    ? trimmed
-    : trimmed.slice(0, Math.max(0, maxLength - 3)).trimEnd() + '...';
+  return trimmed.length <= maxLength ? trimmed : trimmed.slice(0, Math.max(0, maxLength - 3)).trimEnd() + '...';
 }
 
 function extractMessageText(message: unknown): string {
@@ -60,42 +59,52 @@ function extractMessageText(message: unknown): string {
     ? (message as { content: unknown[] }).content
     : [];
 
-  return normalizeSnippet(content.flatMap((part) => {
-    const candidate = part as {
-      type?: string;
-      text?: string;
-      filename?: string;
-      toolName?: string;
-      result?: unknown;
-      liveOutput?: { stdout?: string; stderr?: string };
-    };
+  return normalizeSnippet(
+    content
+      .flatMap((part) => {
+        const candidate = part as {
+          type?: string;
+          text?: string;
+          filename?: string;
+          toolName?: string;
+          result?: unknown;
+          liveOutput?: { stdout?: string; stderr?: string };
+        };
 
-    if (candidate.type === 'text' && typeof candidate.text === 'string') {
-      return [candidate.text];
-    }
+        if (candidate.type === 'text' && typeof candidate.text === 'string') {
+          return [candidate.text];
+        }
 
-    if (candidate.type === 'file' && typeof candidate.filename === 'string') {
-      return ['Attached file: ' + candidate.filename];
-    }
+        if (candidate.type === 'file' && typeof candidate.filename === 'string') {
+          return ['Attached file: ' + candidate.filename];
+        }
 
-    if (candidate.type === 'tool-call' && typeof candidate.toolName === 'string') {
-      const outputs = [
-        typeof candidate.result === 'string' ? candidate.result : '',
-        candidate.liveOutput?.stdout ?? '',
-        candidate.liveOutput?.stderr ?? '',
-      ].map((value) => normalizeSnippet(value, 120)).filter(Boolean);
-      return [outputs.length > 0 ? 'Tool ' + candidate.toolName + ': ' + outputs.join(' ') : 'Tool ' + candidate.toolName];
-    }
+        if (candidate.type === 'tool-call' && typeof candidate.toolName === 'string') {
+          const outputs = [
+            typeof candidate.result === 'string' ? candidate.result : '',
+            candidate.liveOutput?.stdout ?? '',
+            candidate.liveOutput?.stderr ?? '',
+          ]
+            .map((value) => normalizeSnippet(value, 120))
+            .filter(Boolean);
+          return [
+            outputs.length > 0 ? 'Tool ' + candidate.toolName + ': ' + outputs.join(' ') : 'Tool ' + candidate.toolName,
+          ];
+        }
 
-    return [];
-  }).join(' '));
+        return [];
+      })
+      .join(' '),
+  );
 }
 
 function resolveConversationMessages(conversation: ConversationRecordLike | null): unknown[] {
   if (Array.isArray(conversation?.messageTree) && conversation.messageTree.length > 0) {
-    const byId = new Map(conversation.messageTree
-      .filter((message) => typeof message.id === 'string')
-      .map((message) => [message.id as string, message]));
+    const byId = new Map(
+      conversation.messageTree
+        .filter((message) => typeof message.id === 'string')
+        .map((message) => [message.id as string, message]),
+    );
     const ordered: ConversationMessageLike[] = [];
     const seen = new Set<string>();
     let cursor = conversation.headId ?? conversation.messageTree[conversation.messageTree.length - 1]?.id ?? null;
@@ -120,9 +129,10 @@ function buildConversationContextSummary(conversation: ConversationRecordLike | 
   const messages = resolveConversationMessages(conversation);
   const excerpts = messages
     .map((message) => {
-      const role = typeof (message as { role?: unknown })?.role === 'string'
-        ? String((message as { role?: string }).role)
-        : 'unknown';
+      const role =
+        typeof (message as { role?: unknown })?.role === 'string'
+          ? String((message as { role?: string }).role)
+          : 'unknown';
       const text = extractMessageText(message);
       return { role, text };
     })
@@ -133,13 +143,9 @@ function buildConversationContextSummary(conversation: ConversationRecordLike | 
   if (excerpts.length === 0) return undefined;
 
   const title = normalizeSnippet(conversation?.title ?? conversation?.fallbackTitle ?? '', 120);
-  const summary = title
-    ? ['Conversation title: ' + title, ...excerpts].join('\n')
-    : excerpts.join('\n');
+  const summary = title ? ['Conversation title: ' + title, ...excerpts].join('\n') : excerpts.join('\n');
 
-  return summary.length <= 1800
-    ? summary
-    : summary.slice(0, 1797).trimEnd() + '...';
+  return summary.length <= 1800 ? summary : summary.slice(0, 1797).trimEnd() + '...';
 }
 
 function readConversationRecord(appHome: string, conversationId: string): ConversationRecordLike | null {
@@ -156,7 +162,11 @@ function readConversationRecord(appHome: string, conversationId: string): Conver
   }
 }
 
-export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: string, pluginManager?: PluginManager): Promise<ToolDefinition[]> {
+export async function buildToolRegistry(
+  getConfig: () => AppConfig,
+  appHome?: string,
+  pluginManager?: PluginManager,
+): Promise<ToolDefinition[]> {
   let config: AppConfig;
   try {
     config = getConfig();
@@ -220,6 +230,7 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
   if (appHome) {
     tools.push(createSkillManageTool(appHome));
     tools.push(createCliToolManageTool(appHome));
+    tools.push(createAutomationManageTool(appHome));
   }
 
   // Plugin info tool (always available when plugin manager is provided)
@@ -234,7 +245,8 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
     const manager = getComputerUseManager(appHome, getConfig);
     tools.push({
       name: 'computer_use_session',
-      description: 'Start a long-lived computer-use session that can control a browser or local desktop with live viewport updates and approval handling.',
+      description:
+        'Start a long-lived computer-use session that can control a browser or local desktop with live viewport updates and approval handling.',
       inputSchema: z.object({
         goal: z.string().describe('The goal the computer-use session should accomplish.'),
         target: z.enum(['isolated-browser', 'local-macos']).optional(),
@@ -242,7 +254,10 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
         approvalMode: z.enum(['step', 'goal', 'autonomous']).optional(),
         modelKey: z.string().optional(),
         profileKey: z.string().optional(),
-        conversationContext: z.enum(['current', 'none']).optional().describe('Whether to include a concise summary of the current conversation. Defaults to current.'),
+        conversationContext: z
+          .enum(['current', 'none'])
+          .optional()
+          .describe('Whether to include a concise summary of the current conversation. Defaults to current.'),
       }),
       execute: async (input, context) => {
         const payload = input as {
@@ -258,9 +273,10 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
         if (!conversationId) {
           throw new Error('Computer use sessions must be tied to the current conversation.');
         }
-        const contextSummary = payload.conversationContext === 'none'
-          ? undefined
-          : buildConversationContextSummary(readConversationRecord(appHome, conversationId));
+        const contextSummary =
+          payload.conversationContext === 'none'
+            ? undefined
+            : buildConversationContextSummary(readConversationRecord(appHome, conversationId));
         const session = await manager.startSession(payload.goal, {
           conversationId,
           target: payload.target,
@@ -281,9 +297,13 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
     });
     tools.push({
       name: 'computer_use_control',
-      description: 'Control an existing computer-use session: pause, resume, stop, continue (resume a completed session with a new goal), approve/reject actions, or change the display surface. If sessionId is omitted, targets the most recent session for the current conversation.',
+      description:
+        'Control an existing computer-use session: pause, resume, stop, continue (resume a completed session with a new goal), approve/reject actions, or change the display surface. If sessionId is omitted, targets the most recent session for the current conversation.',
       inputSchema: z.object({
-        sessionId: z.string().optional().describe('Session ID. If omitted, targets the most recent session for the current conversation.'),
+        sessionId: z
+          .string()
+          .optional()
+          .describe('Session ID. If omitted, targets the most recent session for the current conversation.'),
         action: z.enum(['pause', 'resume', 'stop', 'continue', 'approve', 'reject', 'surface']),
         actionId: z.string().optional().describe('Required for approve/reject actions.'),
         reason: z.string().optional().describe('Optional rejection reason.'),
@@ -304,39 +324,63 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
         if (!targetSessionId && context.conversationId) {
           const all = manager.listSessions();
           // For 'continue', find the most recent terminal session; otherwise find the active one
-          const match = payload.action === 'continue'
-            ? all.find((s) => s.conversationId === context.conversationId
-                && (s.status === 'completed' || s.status === 'stopped' || s.status === 'failed'))
-            : all.find((s) => s.conversationId === context.conversationId
-                && s.status !== 'completed' && s.status !== 'stopped' && s.status !== 'failed');
+          const match =
+            payload.action === 'continue'
+              ? all.find(
+                  (s) =>
+                    s.conversationId === context.conversationId &&
+                    (s.status === 'completed' || s.status === 'stopped' || s.status === 'failed'),
+                )
+              : all.find(
+                  (s) =>
+                    s.conversationId === context.conversationId &&
+                    s.status !== 'completed' &&
+                    s.status !== 'stopped' &&
+                    s.status !== 'failed',
+                );
           targetSessionId = match?.id;
         }
-        if (!targetSessionId) return { isError: true, error: payload.action === 'continue' ? 'No completed computer-use session found to continue.' : 'No active computer-use session found.' };
+        if (!targetSessionId)
+          return {
+            isError: true,
+            error:
+              payload.action === 'continue'
+                ? 'No completed computer-use session found to continue.'
+                : 'No active computer-use session found.',
+          };
 
-        const result = payload.action === 'pause'
-          ? manager.pauseSession(targetSessionId)
-          : payload.action === 'resume'
-            ? manager.resumeSession(targetSessionId)
-            : payload.action === 'stop'
-              ? manager.stopSession(targetSessionId)
-              : payload.action === 'continue'
-                ? await manager.continueSession(targetSessionId, payload.goal ?? '')
-                : payload.action === 'approve'
-                  ? await manager.approveAction(targetSessionId, payload.actionId ?? '')
-                  : payload.action === 'reject'
-                    ? manager.rejectAction(targetSessionId, payload.actionId ?? '', payload.reason)
-                    : manager.setSurface(targetSessionId, payload.surface ?? 'docked');
+        const result =
+          payload.action === 'pause'
+            ? manager.pauseSession(targetSessionId)
+            : payload.action === 'resume'
+              ? manager.resumeSession(targetSessionId)
+              : payload.action === 'stop'
+                ? manager.stopSession(targetSessionId)
+                : payload.action === 'continue'
+                  ? await manager.continueSession(targetSessionId, payload.goal ?? '')
+                  : payload.action === 'approve'
+                    ? await manager.approveAction(targetSessionId, payload.actionId ?? '')
+                    : payload.action === 'reject'
+                      ? manager.rejectAction(targetSessionId, payload.actionId ?? '', payload.reason)
+                      : manager.setSurface(targetSessionId, payload.surface ?? 'docked');
         return result ?? { isError: true, error: 'Computer-use session not found.' };
       },
     });
 
     tools.push({
       name: 'computer_use_session_info',
-      description: 'Fetch information about a computer-use session. Works during and after execution. Returns structured data without screenshots. Use to check progress, audit steps, or get the final result.',
+      description:
+        'Fetch information about a computer-use session. Works during and after execution. Returns structured data without screenshots. Use to check progress, audit steps, or get the final result.',
       inputSchema: z.object({
-        sessionId: z.string().optional().describe('Session ID. If omitted, returns the most recent session for the current conversation.'),
+        sessionId: z
+          .string()
+          .optional()
+          .describe('Session ID. If omitted, returns the most recent session for the current conversation.'),
         includeResult: z.boolean().optional().describe('Include status summary and final result. Defaults to true.'),
-        includeSteps: z.boolean().optional().describe('Include individual action steps (without screenshots). Defaults to false.'),
+        includeSteps: z
+          .boolean()
+          .optional()
+          .describe('Include individual action steps (without screenshots). Defaults to false.'),
         includeCheckpoints: z.boolean().optional().describe('Include checkpoint summaries. Defaults to false.'),
         includeGuidance: z.boolean().optional().describe('Include user guidance messages. Defaults to false.'),
         includePermissions: z.boolean().optional().describe('Include permission state. Defaults to false.'),
@@ -444,9 +488,13 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
 
     tools.push({
       name: 'computer_use_session_message',
-      description: 'Send a guidance message to a computer-use session. If the session is active, the message is queued for the next planning cycle. If the session has completed/stopped/failed, it will be automatically resumed with the message as a follow-up goal. Use this to redirect, clarify, add instructions, or continue a finished session.',
+      description:
+        'Send a guidance message to a computer-use session. If the session is active, the message is queued for the next planning cycle. If the session has completed/stopped/failed, it will be automatically resumed with the message as a follow-up goal. Use this to redirect, clarify, add instructions, or continue a finished session.',
       inputSchema: z.object({
-        sessionId: z.string().optional().describe('Session ID. If omitted, targets the most recent session for the current conversation.'),
+        sessionId: z
+          .string()
+          .optional()
+          .describe('Session ID. If omitted, targets the most recent session for the current conversation.'),
         message: z.string().describe('The guidance or follow-up message to send to the session.'),
       }),
       execute: async (input, context) => {
@@ -456,9 +504,12 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
         if (!targetSessionId && context.conversationId) {
           const all = manager.listSessions();
           // First try to find an active session, then fall back to the most recent terminal one
-          const active = all.find((s) =>
-            s.conversationId === context.conversationId
-            && s.status !== 'completed' && s.status !== 'stopped' && s.status !== 'failed',
+          const active = all.find(
+            (s) =>
+              s.conversationId === context.conversationId &&
+              s.status !== 'completed' &&
+              s.status !== 'stopped' &&
+              s.status !== 'failed',
           );
           if (active) {
             targetSessionId = active.id;
@@ -498,7 +549,7 @@ export async function buildToolRegistry(getConfig: () => AppConfig, appHome?: st
 
   // Skill tools
   if (appHome) {
-    const skillsDir = config.skills?.directory || (appHome + '/skills');
+    const skillsDir = config.skills?.directory || appHome + '/skills';
     const enabledSkills = config.skills?.enabled ?? [];
     const skillTools = loadSkillsAsTools(skillsDir, enabledSkills, getConfig, tools);
     tools.push(...skillTools);

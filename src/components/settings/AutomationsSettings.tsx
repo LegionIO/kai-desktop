@@ -457,85 +457,94 @@ const ConditionRow: FC<{
   const listId = useMemo(() => `paths-${Math.random().toString(36).slice(2)}`, []);
   const isExpr = cond.op === 'expression';
   const needsValue = cond.op !== 'exists';
+  const normalized = cond.path.replace(/\[\d+\]/g, '[0]');
+  const unknownPath = !isExpr && cond.path.length > 0 && paths.length > 0 && !paths.includes(normalized);
 
   return (
-    <div className="flex items-center gap-1.5">
-      {!isExpr && (
-        <>
+    <div>
+      <div className="flex items-center gap-1.5">
+        {!isExpr && (
+          <>
+            <input
+              list={listId}
+              value={cond.path}
+              onChange={(e) => onChange({ ...cond, path: e.target.value })}
+              placeholder="payload.path"
+              className="w-1/3 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 font-mono text-[11px] outline-none"
+            />
+            <datalist id={listId}>
+              {paths.map((p) => (
+                <option key={p} value={p} />
+              ))}
+            </datalist>
+          </>
+        )}
+        <select
+          className="rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 text-[11px] outline-none"
+          value={cond.op}
+          onChange={(e) => onChange({ ...cond, op: e.target.value as ConditionOp })}
+        >
+          {CONDITION_OPS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        {isExpr ? (
           <input
-            list={listId}
-            value={cond.path}
-            onChange={(e) => onChange({ ...cond, path: e.target.value })}
-            placeholder="payload.path"
-            className="w-1/3 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 font-mono text-[11px] outline-none"
+            value={typeof cond.value === 'string' ? cond.value : ''}
+            onChange={(e) => onChange({ ...cond, value: e.target.value })}
+            placeholder="event.from.email === 'boss@corp' && /urgent/i.test(event.body)"
+            className="flex-1 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 font-mono text-[11px] outline-none"
           />
-          <datalist id={listId}>
-            {paths.map((p) => (
-              <option key={p} value={p} />
-            ))}
-          </datalist>
-        </>
-      )}
-      <select
-        className="rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 text-[11px] outline-none"
-        value={cond.op}
-        onChange={(e) => onChange({ ...cond, op: e.target.value as ConditionOp })}
-      >
-        {CONDITION_OPS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-      {isExpr ? (
-        <input
-          value={typeof cond.value === 'string' ? cond.value : ''}
-          onChange={(e) => onChange({ ...cond, value: e.target.value })}
-          placeholder="event.from.email === 'boss@corp' && /urgent/i.test(event.body)"
-          className="flex-1 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 font-mono text-[11px] outline-none"
-        />
-      ) : needsValue ? (
-        <input
-          value={
-            cond.op === 'in' && Array.isArray(cond.value)
-              ? cond.value.join(', ')
-              : typeof cond.value === 'string'
-                ? cond.value
-                : cond.value == null
-                  ? ''
-                  : String(cond.value)
-          }
-          onChange={(e) =>
-            onChange({
-              ...cond,
-              value:
-                cond.op === 'in'
-                  ? e.target.value
-                      .split(',')
-                      .map((s) => s.trim())
-                      .filter(Boolean)
-                  : e.target.value,
-            })
-          }
-          placeholder="value"
-          className="flex-1 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 text-[11px] outline-none"
-        />
-      ) : (
-        <div className="flex-1" />
-      )}
-      {!isExpr && (
-        <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+        ) : needsValue ? (
           <input
-            type="checkbox"
-            checked={cond.caseSensitive}
-            onChange={(e) => onChange({ ...cond, caseSensitive: e.target.checked })}
+            value={
+              cond.op === 'in' && Array.isArray(cond.value)
+                ? cond.value.join(', ')
+                : typeof cond.value === 'string'
+                  ? cond.value
+                  : cond.value == null
+                    ? ''
+                    : String(cond.value)
+            }
+            onChange={(e) =>
+              onChange({
+                ...cond,
+                value:
+                  cond.op === 'in'
+                    ? e.target.value
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                    : e.target.value,
+              })
+            }
+            placeholder="value"
+            className="flex-1 rounded-xl border border-border/70 bg-card/80 px-2 py-1.5 text-[11px] outline-none"
           />
-          Aa
-        </label>
+        ) : (
+          <div className="flex-1" />
+        )}
+        {!isExpr && (
+          <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={cond.caseSensitive}
+              onChange={(e) => onChange({ ...cond, caseSensitive: e.target.checked })}
+            />
+            Aa
+          </label>
+        )}
+        <button type="button" onClick={onRemove} className="text-muted-foreground hover:text-destructive">
+          <Trash2Icon className="h-3 w-3" />
+        </button>
+      </div>
+      {unknownPath && (
+        <span className="mt-0.5 block pl-1 text-[10px] text-amber-500">
+          “{cond.path}” is not in this event’s declared payload schema — check the field name.
+        </span>
       )}
-      <button type="button" onClick={onRemove} className="text-muted-foreground hover:text-destructive">
-        <Trash2Icon className="h-3 w-3" />
-      </button>
     </div>
   );
 };

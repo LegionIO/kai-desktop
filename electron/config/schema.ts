@@ -680,7 +680,7 @@ const automationActionSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
-const automationRuleSchema = z.object({
+export const automationRuleSchema = z.object({
   id: z.string(),
   name: z.string(),
   enabled: z.boolean().default(true),
