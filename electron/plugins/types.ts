@@ -195,8 +195,15 @@ export type PluginModule = {
 
 export type MessageContent =
   | { type: 'text'; text: string }
-  | { type: 'tool-call'; toolCallId: string; toolName: string; args: Record<string, unknown> }
-  | { type: 'tool-result'; toolCallId: string; result: unknown; isError?: boolean }
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      result?: unknown;
+      isError?: boolean;
+    }
+  | { type: 'tool-result'; toolCallId: string; toolName: string; result: unknown; isError?: boolean }
   | { type: 'image'; image: string; mimeType?: string }
   | Record<string, unknown>;
 
@@ -669,7 +676,7 @@ export type PluginHttpResponse = {
 /* ── Plugin Agent Generate Types ── */
 
 export type PluginAgentMessage = {
-  role: 'user' | 'assistant' | 'system';
+  role: 'user' | 'assistant' | 'system' | 'tool';
   content: string | MessageContent[];
 };
 

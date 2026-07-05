@@ -4,6 +4,7 @@ import type { ReasoningEffort, ResolvedStreamConfig } from './model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
+import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
 import { join } from 'path';
 
 export type PluginGenerateOptions = {
@@ -36,54 +37,6 @@ export type PluginGenerateResult = {
 export type PluginGenerateStreamEvent = StreamEvent & {
   modelKey?: string;
 };
-
-type SanitizedContent = string | Array<{ type: 'text'; text: string } | { type: 'image'; image: unknown; mimeType?: string }>;
-
-function sanitizeMessages(
-  messages: Array<{ role: string; content: unknown }>,
-): Array<{ role: 'user' | 'assistant' | 'system'; content: SanitizedContent }> {
-  const clean: Array<{ role: 'user' | 'assistant' | 'system'; content: SanitizedContent }> = [];
-
-  for (const msg of messages) {
-    const role = msg.role;
-    if (role !== 'user' && role !== 'assistant' && role !== 'system') continue;
-
-    if (Array.isArray(msg.content)) {
-      const parts = msg.content as Array<Record<string, unknown>>;
-      const textParts: Array<{ type: 'text'; text: string }> = [];
-      const imageParts: Array<{ type: 'image'; image: unknown; mimeType?: string }> = [];
-
-      for (const part of parts) {
-        if (part.type === 'text' && typeof part.text === 'string') {
-          textParts.push({ type: 'text', text: part.text });
-        } else if (part.type === 'image' && part.image != null) {
-          imageParts.push({
-            type: 'image',
-            image: part.image,
-            ...(typeof part.mimeType === 'string' ? { mimeType: part.mimeType } : {}),
-          });
-        }
-      }
-
-      if (imageParts.length > 0) {
-        const contentArray: SanitizedContent = [...textParts, ...imageParts];
-        if (contentArray.length > 0) {
-          clean.push({ role, content: contentArray });
-        }
-      } else if (textParts.length > 0) {
-        clean.push({ role, content: textParts.map((p) => p.text).join('\n') });
-      }
-      continue;
-    }
-
-    if (typeof msg.content !== 'string') continue;
-    if (!msg.content.trim()) continue;
-
-    clean.push({ role, content: msg.content });
-  }
-
-  return clean;
-}
 
 function configForPluginStream(
   config: AppConfig,
@@ -133,7 +86,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     }
     // Fallback: use default model directly
     const dbPath = join(appHome, 'data', 'memory.db');
-    const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
+    const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
     const configForStream = configForPluginStream(config, null, systemPrompt);
     const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -151,7 +104,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
 
   const modelConfig = streamConfig.primaryModel.modelConfig;
   const dbPath = join(appHome, 'data', 'memory.db');
-  const sanitized = sanitizeMessages(messages as Array<{ role: string; content: unknown }>);
+  const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
   const configForStream = configForPluginStream(config, streamConfig, systemPrompt);
 
   const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
