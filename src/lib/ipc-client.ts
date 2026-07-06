@@ -396,6 +396,8 @@ type AppAPI = {
         transferred?: number;
         total?: number;
         bytesPerSecond?: number;
+        mode?: 'full' | 'differential';
+        fullSize?: number;
       }) => void,
     ) => () => void;
   };

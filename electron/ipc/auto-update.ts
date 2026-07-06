@@ -2,9 +2,47 @@ import { app, dialog, type IpcMain } from 'electron';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
-import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync } from 'fs';
+import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync, appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+
+// Mirror electron-updater's internal logger to disk so differential vs full
+// decisions are inspectable, and sniff those log lines to derive downloadMode.
+let downloadMode: 'full' | 'differential' | undefined;
+const appHome = process.env.KAI_USER_DATA || join(homedir(), '.' + __BRAND_APP_SLUG);
+const updateLogDir = join(appHome, 'logs');
+const updateLogPath = join(updateLogDir, 'auto-update.log');
+try {
+  mkdirSync(updateLogDir, { recursive: true });
+} catch {
+  /* */
+}
+// electron-updater logs full feed/blockmap URLs; strip userinfo and query
+// strings so signed URLs or private-feed tokens never land on disk.
+const redact = (s: string): string =>
+  s.replace(
+    /\b(https?:\/\/)([^\s/@]+@)?([^\s?#]+)(\?[^\s#]*)?/gi,
+    (_m, proto, _u, host, q) => proto + host + (q ? '?<redacted>' : ''),
+  );
+function logLine(level: 'info' | 'warn' | 'error', args: unknown[]): void {
+  const msg = redact(args.map((a) => (a instanceof Error ? a.stack || a.message : String(a))).join(' '));
+  console[level]('[auto-update]', msg);
+  try {
+    appendFileSync(updateLogPath, `${new Date().toISOString()} [${level}] ${msg}\n`);
+  } catch {
+    /* */
+  }
+  if (level === 'info' && /To download: /.test(msg)) downloadMode = 'differential';
+  if (/fall(?:ing)? back to full download/i.test(msg)) downloadMode = 'full';
+}
+// Omit `debug` — electron-updater only calls it when defined, and its
+// differential path would otherwise dump the full operations plan
+// (tens of thousands of entries) through a synchronous appendFileSync.
+autoUpdater.logger = {
+  info: (...a: unknown[]) => logLine('info', a),
+  warn: (...a: unknown[]) => logLine('warn', a),
+  error: (...a: unknown[]) => logLine('error', a),
+};
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
@@ -47,6 +85,8 @@ interface UpdateStatus {
   transferred?: number;
   total?: number;
   bytesPerSecond?: number;
+  mode?: 'full' | 'differential';
+  fullSize?: number;
 }
 
 function broadcast(status: UpdateStatus): void {
@@ -234,6 +274,7 @@ let downloaded = false;
 let downloadedVersion: string | undefined;
 let downloadedFilePath: string | undefined;
 let pendingVersion: string | undefined;
+let pendingFullSize: number | undefined;
 
 export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?: () => void): void {
   autoUpdater.autoDownload = true;
@@ -245,6 +286,18 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   });
   autoUpdater.on('update-available', (info) => {
     pendingVersion = info.version;
+    // Best-effort pick of the artifact MacUpdater will actually download
+    // (arch-matching .zip). This only feeds the fallback heuristic — the
+    // logger sniff is the authoritative mode signal.
+    const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : process.arch;
+    const zips = info.files?.filter((f) => f.url?.endsWith('.zip')) ?? [];
+    const zipEntry =
+      zips.find((f) => f.url.includes(arch) || f.url.includes('universal')) ??
+      zips[0] ??
+      info.files?.find((f) => f.url === info.path) ??
+      info.files?.[0];
+    pendingFullSize = zipEntry?.size;
+    downloadMode = undefined;
     if (!downloaded) broadcast({ state: 'available', version: info.version });
   });
   autoUpdater.on('update-not-available', () => {
@@ -252,6 +305,12 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   });
   autoUpdater.on('download-progress', (progress) => {
     if (!downloaded) {
+      // electron-updater's differential path reports progress.total as the
+      // delta bytes (sum of DOWNLOAD ranges); the full path reports the whole
+      // file. Fall back to that comparison if the logger sniff didn't fire.
+      if (downloadMode === undefined && pendingFullSize) {
+        downloadMode = progress.total < pendingFullSize * 0.98 ? 'differential' : 'full';
+      }
       broadcast({
         state: 'downloading',
         version: pendingVersion,
@@ -259,6 +318,8 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
         transferred: progress.transferred,
         total: progress.total,
         bytesPerSecond: progress.bytesPerSecond,
+        mode: downloadMode,
+        fullSize: pendingFullSize,
       });
     }
   });

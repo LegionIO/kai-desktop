@@ -9,7 +9,11 @@ interface UpdateStatus {
   transferred?: number;
   total?: number;
   bytesPerSecond?: number;
+  mode?: 'full' | 'differential';
+  fullSize?: number;
 }
+
+const fmtMB = (n?: number) => (n == null ? '…' : `${(n / 1024 / 1024).toFixed(1)} MB`);
 
 export const UpdateCard: FC = () => {
   const [status, setStatus] = useState<UpdateStatus>({ state: 'idle' });
@@ -25,7 +29,11 @@ export const UpdateCard: FC = () => {
 
   // Trigger fade-in animation when card first becomes relevant
   useEffect(() => {
-    const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'preparing';
+    const showable =
+      status.state === 'downloading' ||
+      status.state === 'downloaded' ||
+      status.state === 'restarting' ||
+      status.state === 'preparing';
     if (showable && !dismissed && !didAnimate.current) {
       didAnimate.current = true;
       requestAnimationFrame(() => setVisible(true));
@@ -39,7 +47,11 @@ export const UpdateCard: FC = () => {
     }
   }, [status.state, dismissed]);
 
-  const showable = status.state === 'downloading' || status.state === 'downloaded' || status.state === 'restarting' || status.state === 'preparing';
+  const showable =
+    status.state === 'downloading' ||
+    status.state === 'downloaded' ||
+    status.state === 'restarting' ||
+    status.state === 'preparing';
   if (!showable || dismissed) return null;
 
   const percent = Math.round(status.percent ?? 0);
@@ -59,15 +71,28 @@ export const UpdateCard: FC = () => {
           )}
         </div>
         <div className="min-w-0 flex-1">
-          <h3 className="text-base font-semibold text-foreground">
-            {status.state === 'downloading'
-              ? 'Downloading update'
-              : status.state === 'preparing'
-                ? 'Preparing update…'
-                : status.state === 'restarting'
-                  ? 'Restarting…'
-                  : 'Update available'}
-          </h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-base font-semibold text-foreground">
+              {status.state === 'downloading'
+                ? 'Downloading update'
+                : status.state === 'preparing'
+                  ? 'Preparing update…'
+                  : status.state === 'restarting'
+                    ? 'Restarting…'
+                    : 'Update available'}
+            </h3>
+            {status.state === 'downloading' && status.mode && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                  status.mode === 'differential'
+                    ? 'bg-emerald-500/15 text-emerald-500'
+                    : 'bg-amber-500/15 text-amber-600'
+                }`}
+              >
+                {status.mode === 'differential' ? 'delta' : 'full'}
+              </span>
+            )}
+          </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {status.state === 'downloading'
               ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? '…'}) is being downloaded.`
@@ -92,12 +117,21 @@ export const UpdateCard: FC = () => {
 
       {/* Progress bar for downloading state */}
       {status.state === 'downloading' && (
-        <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full rounded-full bg-primary transition-[width] duration-300"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
+        <>
+          <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-300"
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+          <div className="mt-1.5 flex justify-between text-[11px] tabular-nums text-muted-foreground">
+            <span>
+              {fmtMB(status.transferred)} / {fmtMB(status.total)}
+              {status.mode === 'differential' && status.fullSize ? ` of ${fmtMB(status.fullSize)}` : ''}
+            </span>
+            <span>{status.bytesPerSecond ? `${fmtMB(status.bytesPerSecond)}/s` : ''}</span>
+          </div>
+        </>
       )}
 
       {/* Action buttons for downloaded state */}
