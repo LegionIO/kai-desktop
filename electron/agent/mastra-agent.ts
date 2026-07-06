@@ -20,6 +20,7 @@ import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './la
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
 import { isCommandAllowed } from '../tools/shell.js';
+import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
@@ -630,13 +631,26 @@ function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: stri
   return normalized;
 }
 
-function normalizeWorkspaceToolPaths(tools: Record<string, unknown>, cwd: string): void {
+function applyWorkspaceToolGuards(tools: Record<string, unknown>, cwd: string, getConfig: () => AppConfig): void {
   for (const [toolName, tool] of Object.entries(tools)) {
     if (!tool || typeof tool !== 'object') continue;
     const candidate = tool as { execute?: (input: unknown, context: unknown) => Promise<unknown> };
     if (typeof candidate.execute !== 'function') continue;
     const originalExecute = candidate.execute.bind(tool);
-    candidate.execute = (input, context) => originalExecute(normalizeWorkspaceToolInput(toolName, input, cwd), context);
+    candidate.execute = async (input, context) => {
+      const normalized = normalizeWorkspaceToolInput(toolName, input, cwd);
+      if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof (normalized as { path?: unknown })?.path === 'string') {
+        const check = isPathAllowed((normalized as { path: string }).path, getConfig());
+        if (!check.allowed) {
+          throw new Error(`${toolName}: ${check.reason}`);
+        }
+      }
+      const result = await originalExecute(normalized, context);
+      if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
+        return filterGrepOutput(result, getConfig());
+      }
+      return result;
+    };
   }
 }
 
@@ -646,6 +660,7 @@ function normalizeWorkspaceToolPaths(tools: Record<string, unknown>, cwd: string
  */
 async function createWorkspaceForAgent(
   cwd: string,
+  getConfig: () => AppConfig,
   executionMode?: string,
   progressHook?: (toolCallId: string, stream: 'stdout' | 'stderr', data: string) => void,
 ): Promise<{ workspace: Workspace; tools: Record<string, unknown> }> {
@@ -686,7 +701,7 @@ async function createWorkspaceForAgent(
   await workspace.init();
 
   const tools = await createWorkspaceTools(workspace);
-  normalizeWorkspaceToolPaths(tools as Record<string, unknown>, cwd);
+  applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig);
 
   // If in plan-first mode, remove mutating workspace tools
   if (executionMode === 'plan-first') {
@@ -714,7 +729,7 @@ export async function createWorkspaceToolDefinitions(
   cwd: string,
   getConfig: () => AppConfig,
 ): Promise<ToolDefinition[]> {
-  const { tools } = await createWorkspaceForAgent(normalizeAgentCwd(cwd));
+  const { tools } = await createWorkspaceForAgent(normalizeAgentCwd(cwd), getConfig);
   const isExecuteCommand = (name: string) => name === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND;
 
   return Object.entries(tools as Record<string, MastraWorkspaceTool>)
@@ -735,8 +750,6 @@ export async function createWorkspaceToolDefinitions(
             // Mastra execute_command takes `timeout` in seconds; Kai's shell config is in ms.
             effectiveInput = { ...raw, timeout: Math.ceil(config.tools.shell.timeout / 1000) };
           }
-        } else if (config.tools.fileAccess.enabled === false) {
-          throw new Error(`${name}: file access is disabled`);
         }
         return tool.execute!(effectiveInput, { toolCallId: ctx.toolCallId, abortSignal: ctx.abortSignal });
       },
@@ -793,6 +806,7 @@ export async function* streamAgentResponse(
   const executionMode = config.tools?.executionMode;
   const { workspace, tools: workspaceTools } = await createWorkspaceForAgent(
     effectiveCwd,
+    () => config,
     executionMode,
     options?.emitEvent
       ? (toolCallId, stream, data) => {
