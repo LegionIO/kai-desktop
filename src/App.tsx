@@ -1556,7 +1556,9 @@ function AppShell() {
         subdued: pluginPanelActive,
         badge:
           (pluginUpdateCount ?? 0) > 0 ? (
-            <span className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-blue-500" />
+            <span className="absolute -top-0.5 -right-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-blue-500 px-0.5 text-[9px] font-bold leading-none text-white">
+              {pluginUpdateCount > 9 ? '9+' : pluginUpdateCount}
+            </span>
           ) : undefined,
       },
     ];

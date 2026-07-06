@@ -75,17 +75,23 @@ export const PluginMarketplace: FC = () => {
   const [failedUpdates, setFailedUpdates] = useState<
     Map<string, { attemptedVersion: string; runningVersion: string; error: string }>
   >(new Map());
+  const [updatingAll, setUpdatingAll] = useState(false);
+  const updatingAllRef = useRef(false);
+  const loadReqId = useRef(0);
 
   const loadData = useCallback(async () => {
+    const reqId = ++loadReqId.current;
     try {
       const [catalogData, pluginList] = await Promise.all([app.plugins.marketplaceCatalog(), app.plugins.list()]);
+      if (reqId !== loadReqId.current) return;
       setCatalog(catalogData);
       setInstalledVersions(new Map(pluginList.map((p: { name: string; version: string }) => [p.name, p.version])));
       setError(null);
     } catch (err) {
+      if (reqId !== loadReqId.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load marketplace data');
     } finally {
-      setLoading(false);
+      if (reqId === loadReqId.current) setLoading(false);
     }
   }, []);
 
@@ -128,7 +134,7 @@ export const PluginMarketplace: FC = () => {
     }
   };
 
-  const handleInstall = async (pluginName: string) => {
+  const handleInstall = async (pluginName: string): Promise<string | undefined> => {
     setInstallingPlugins((prev) => new Set([...prev, pluginName]));
     try {
       const result = await app.plugins.marketplaceInstall(pluginName);
@@ -144,7 +150,9 @@ export const PluginMarketplace: FC = () => {
       }
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Failed to install ${pluginName}`);
+      const msg = err instanceof Error ? err.message : `Failed to install ${pluginName}`;
+      setError(msg);
+      return msg;
     } finally {
       setInstallingPlugins((prev) => {
         const next = new Set(prev);
@@ -185,6 +193,24 @@ export const PluginMarketplace: FC = () => {
     .filter(matchesSearch);
 
   const updateCount = updatablePlugins.length;
+
+  const handleUpdateAll = async () => {
+    if (updatingAllRef.current) return;
+    const targets = updatablePlugins.map((p) => p.name).filter((name) => !installingPlugins.has(name));
+    if (targets.length === 0) return;
+    updatingAllRef.current = true;
+    setUpdatingAll(true);
+    try {
+      const results = await Promise.all(targets.map((name) => handleInstall(name)));
+      const failures = results.filter((r): r is string => r != null);
+      if (failures.length > 0) {
+        setError(failures.length === 1 ? failures[0] : `${failures.length} updates failed: ${failures.join('; ')}`);
+      }
+    } finally {
+      updatingAllRef.current = false;
+      setUpdatingAll(false);
+    }
+  };
 
   return (
     <div className="relative z-20 flex flex-col h-full min-h-0">
@@ -382,6 +408,24 @@ export const PluginMarketplace: FC = () => {
               {/* ── Updates Tab ── */}
               {activeTab === 'updates' && (
                 <>
+                  {updatablePlugins.length > 0 && (
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => void handleUpdateAll()}
+                        disabled={updatingAll || updatablePlugins.every((p) => installingPlugins.has(p.name))}
+                        className="flex items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/20 px-3 py-1.5 text-[11px] font-medium text-blue-400 transition-colors hover:bg-blue-500/30 disabled:opacity-50"
+                      >
+                        {updatingAll || updatablePlugins.some((p) => installingPlugins.has(p.name)) ? (
+                          <LoaderIcon className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <ArrowUpCircleIcon className="h-3 w-3" />
+                        )}
+                        Update All ({updatablePlugins.length})
+                      </button>
+                    </div>
+                  )}
+
                   {updatablePlugins.length === 0 && (
                     <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-12 text-center">
                       <CheckIcon className="mx-auto h-8 w-8 text-green-400/60" />
