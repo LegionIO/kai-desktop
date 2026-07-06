@@ -103,7 +103,9 @@ export class AutomationEngine {
 
     for (const rule of this.rules) {
       if (!rule.enabled) continue;
-      if (rule.trigger.source !== event.source || rule.trigger.event !== event.event) continue;
+      const sourceMatch = rule.trigger.source === '*' || rule.trigger.source === event.source;
+      const eventMatch = rule.trigger.event === '*' || rule.trigger.event === event.event;
+      if (!sourceMatch || !eventMatch) continue;
       const record = await this.runRule(rule, event, { skipThrottle: false });
       this.pushLog(record);
     }
