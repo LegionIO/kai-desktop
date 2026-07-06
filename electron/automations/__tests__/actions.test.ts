@@ -44,6 +44,7 @@ function deps(over: Partial<ActionDeps> = {}): ActionDeps {
     appHome: '/tmp/kai-test',
     getConfig: () => ({}) as never,
     getRegisteredTools: () => [],
+    getWorkspaceTools: () => [],
     handlePluginAction: vi.fn(async () => ({ ok: true })),
     ...over,
   };

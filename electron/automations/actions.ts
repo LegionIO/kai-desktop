@@ -14,6 +14,7 @@ export type ActionDeps = {
   appHome: string;
   getConfig: () => AppConfig;
   getRegisteredTools: () => ToolDefinition[];
+  getWorkspaceTools: () => ToolDefinition[];
   handlePluginAction: (payload: PluginActionPayload) => Promise<unknown>;
 };
 
@@ -124,7 +125,7 @@ async function runSingleAction(
     }
 
     case 'tool': {
-      const tools = deps.getRegisteredTools();
+      const tools = [...deps.getRegisteredTools(), ...deps.getWorkspaceTools()];
       const tool = tools.find((t) => t.name === action.toolName || t.aliases?.includes(action.toolName));
       if (!tool) throw new Error(`Tool not found: ${action.toolName}`);
       const input = interpolateDeep(action.input, ctx);

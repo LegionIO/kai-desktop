@@ -25,6 +25,8 @@ import {
   updatePluginTools,
   updateCliTools,
   getRegisteredTools,
+  setWorkspaceToolDefinitions,
+  getWorkspaceToolDefinitions,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { buildToolRegistry } from './tools/registry.js';
@@ -1115,12 +1117,21 @@ if (gotSingleInstanceLock) {
     // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
     // getRegisteredTools for tool actions, and getConfig for rule reload).
     registerBuiltinSources(eventBus);
+    const workspaceToolsReady = (async () => {
+      try {
+        const { createWorkspaceToolDefinitions } = await import('./agent/mastra-agent.js');
+        setWorkspaceToolDefinitions(await createWorkspaceToolDefinitions(homedir(), getConfig));
+      } catch (err) {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] Workspace tool init for automations failed (non-fatal):`, err);
+      }
+    })();
     const automationEngine = initializeAutomationEngine({
       bus: eventBus,
       appHome: APP_HOME,
       getConfig,
       getAutomationsConfig: () => getConfig().automations,
       getRegisteredTools,
+      getWorkspaceTools: getWorkspaceToolDefinitions,
       handlePluginAction: (payload) => pluginManager.handleAction(payload),
     });
     registerAutomationsHandlers(ipcMain, automationEngine, eventBus);
@@ -1554,7 +1565,7 @@ if (gotSingleInstanceLock) {
         console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
       });
 
-    void Promise.allSettled([pluginsReady, toolsReady]).then(() => {
+    void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {
       eventBus.emit('app', 'ready', {});
     });
 

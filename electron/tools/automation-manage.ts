@@ -5,7 +5,7 @@ import { getAutomationEngine } from '../automations/engine.js';
 import { validateRulePaths } from '../automations/schema-check.js';
 import type { AutomationRule } from '../config/schema.js';
 import { automationRuleSchema } from '../config/schema.js';
-import { getRegisteredTools } from '../ipc/agent.js';
+import { getRegisteredTools, getWorkspaceToolDefinitions } from '../ipc/agent.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
 import type { ToolDefinition } from './types.js';
 
@@ -85,7 +85,7 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
       switch (action) {
         case 'list': {
           const catalog = eventBus.getCatalog();
-          const toolNames = getRegisteredTools().map((t) => ({
+          const toolNames = [...getRegisteredTools(), ...getWorkspaceToolDefinitions()].map((t) => ({
             name: t.name,
             source: t.source,
             aliases: t.aliases,

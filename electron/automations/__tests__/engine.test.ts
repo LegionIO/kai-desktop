@@ -31,6 +31,7 @@ function makeEngine(rules: AutomationRule[], over: Partial<EngineDeps> = {}) {
     getConfig: () => ({}) as never,
     getAutomationsConfig: () => cfg,
     getRegisteredTools: () => [],
+    getWorkspaceTools: () => [],
     handlePluginAction,
     ...over,
   };

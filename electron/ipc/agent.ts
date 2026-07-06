@@ -271,6 +271,19 @@ export function getRegisteredTools(): ToolDefinition[] {
   return registeredTools;
 }
 
+// Mastra workspace tools (file/shell) adapted as ToolDefinitions. These live
+// outside the main registry because the agent path builds its own workspace
+// per run; this cache exists so automation `tool` actions can reach them.
+let workspaceToolDefinitions: ToolDefinition[] = [];
+
+export function setWorkspaceToolDefinitions(tools: ToolDefinition[]): void {
+  workspaceToolDefinitions = tools;
+}
+
+export function getWorkspaceToolDefinitions(): ToolDefinition[] {
+  return workspaceToolDefinitions;
+}
+
 /** Hot-swap MCP tools without touching built-in, skill, or plugin tools */
 export function updateMcpTools(mcpTools: ToolDefinition[]): void {
   const nonMcp = registeredTools.filter((t) => t.source !== 'mcp');

@@ -19,6 +19,7 @@ import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, Reasoning
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
+import { isCommandAllowed } from '../tools/shell.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
@@ -695,6 +696,51 @@ async function createWorkspaceForAgent(
   }
 
   return { workspace, tools };
+}
+
+type MastraWorkspaceTool = {
+  description?: string;
+  execute?: (input: unknown, context?: unknown) => Promise<unknown>;
+};
+
+/**
+ * Build Mastra workspace tools (read/write/edit/list/grep/execute_command) as
+ * ToolDefinition instances so non-agent callers — currently the automation
+ * engine's `tool` action — can invoke them directly without going through an
+ * agent run. Config guardrails (shell allow/deny patterns, fileAccess.enabled)
+ * are re-checked at execute time since automations run unattended.
+ */
+export async function createWorkspaceToolDefinitions(
+  cwd: string,
+  getConfig: () => AppConfig,
+): Promise<ToolDefinition[]> {
+  const { tools } = await createWorkspaceForAgent(normalizeAgentCwd(cwd));
+  const isExecuteCommand = (name: string) => name === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND;
+
+  return Object.entries(tools as Record<string, MastraWorkspaceTool>)
+    .filter(([, tool]) => typeof tool?.execute === 'function')
+    .map(([name, tool]) => ({
+      name,
+      description: tool.description ?? '',
+      inputSchema: z.any(),
+      source: 'builtin' as const,
+      execute: async (input, ctx) => {
+        const config = getConfig();
+        let effectiveInput = input;
+        if (isExecuteCommand(name)) {
+          const raw = (input ?? {}) as { command?: unknown; timeout?: unknown };
+          const check = isCommandAllowed(typeof raw.command === 'string' ? raw.command : '', config);
+          if (!check.allowed) throw new Error(`${name}: ${check.reason}`);
+          if (raw.timeout == null) {
+            // Mastra execute_command takes `timeout` in seconds; Kai's shell config is in ms.
+            effectiveInput = { ...raw, timeout: Math.ceil(config.tools.shell.timeout / 1000) };
+          }
+        } else if (config.tools.fileAccess.enabled === false) {
+          throw new Error(`${name}: file access is disabled`);
+        }
+        return tool.execute!(effectiveInput, { toolCallId: ctx.toolCallId, abortSignal: ctx.abortSignal });
+      },
+    }));
 }
 
 export async function* streamAgentResponse(
