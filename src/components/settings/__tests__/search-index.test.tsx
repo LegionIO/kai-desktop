@@ -26,6 +26,7 @@ describe('searchSettings', () => {
     const ids = searchSettings('max').map((r) => r.id);
     expect(ids).toContain('agent.maxTurns');
     expect(ids).toContain('profile.maxSteps');
+    expect(ids).toContain('advanced.maxSteps');
   });
 
   it('caps results at 30', () => {

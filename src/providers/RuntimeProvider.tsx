@@ -2864,13 +2864,11 @@ export function RuntimeProvider({
     setShowIncompleteTaskBanner(false);
 
     window.dispatchEvent(new CustomEvent('kai:open-settings'));
-    setTimeout(() => {
-      window.dispatchEvent(
-        new CustomEvent('kai:navigate-settings', {
-          detail: { section: 'advanced' },
-        }),
-      );
-    }, 100);
+    window.dispatchEvent(
+      new CustomEvent('kai:navigate-settings', {
+        detail: { section: 'models', tab: 'runtimes', anchorId: 'agent.maxTurns' },
+      }),
+    );
 
     console.info('[Analytics] step_limit_adjust_settings_clicked');
   }, []);

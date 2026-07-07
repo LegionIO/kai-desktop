@@ -292,17 +292,22 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
       .catch(() => {});
   }, [conversationId, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
 
-  const handleSelectProfile = useCallback((key: string | null, primaryModelKey: string | null) => {
-    setSelectedProfileKey(key);
-    setProfilePrimaryModelKey(primaryModelKey);
-    if (key !== null) {
-      setFallbackEnabled(true);
-      if (primaryModelKey) setSelectedModelKey(primaryModelKey);
-    } else {
-      setFallbackEnabled(false);
-      setSelectedModelKey(null);
-    }
-  }, []);
+  const handleSelectProfile = useCallback(
+    (key: string | null, primaryModelKey: string | null) => {
+      setSelectedProfileKey(key);
+      setProfilePrimaryModelKey(primaryModelKey);
+      const effectiveKey = key ?? ((config?.defaultProfileKey as string | undefined) || null);
+      setReasoningEffort((effectiveKey ? getProfileReasoningEffort(config, effectiveKey) : undefined) ?? 'medium');
+      if (key !== null) {
+        setFallbackEnabled(true);
+        if (primaryModelKey) setSelectedModelKey(primaryModelKey);
+      } else {
+        setFallbackEnabled(false);
+        setSelectedModelKey(null);
+      }
+    },
+    [config],
+  );
 
   const handleToggleFallback = useCallback(
     (enabled: boolean) => {
@@ -437,17 +442,28 @@ function getPluginPanelViewKey(pluginName: string, panelId: string): string {
   return `plugin-panel:${pluginName}:${panelId}`;
 }
 
-function getProfilePrimaryModelKey(config: Record<string, unknown> | null, profileKey: string): string | undefined {
+function findProfile(
+  config: Record<string, unknown> | null,
+  profileKey: string,
+): { primaryModelKey?: unknown; reasoningEffort?: unknown } | undefined {
   const profiles = config?.profiles;
   if (!Array.isArray(profiles)) return undefined;
+  return profiles.find((entry) =>
+    Boolean(entry && typeof entry === 'object' && (entry as { key?: unknown }).key === profileKey),
+  ) as { primaryModelKey?: unknown; reasoningEffort?: unknown } | undefined;
+}
 
-  const profile = profiles.find((entry) => {
-    return Boolean(
-      entry && typeof entry === 'object' && 'key' in entry && (entry as { key?: unknown }).key === profileKey,
-    );
-  }) as { primaryModelKey?: unknown } | undefined;
-
+function getProfilePrimaryModelKey(config: Record<string, unknown> | null, profileKey: string): string | undefined {
+  const profile = findProfile(config, profileKey);
   return typeof profile?.primaryModelKey === 'string' ? profile.primaryModelKey : undefined;
+}
+
+function getProfileReasoningEffort(
+  config: Record<string, unknown> | null,
+  profileKey: string,
+): ReasoningEffort | undefined {
+  const effort = findProfile(config, profileKey)?.reasoningEffort;
+  return effort === 'low' || effort === 'medium' || effort === 'high' || effort === 'xhigh' ? effort : undefined;
 }
 
 function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean {
@@ -1018,17 +1034,22 @@ function AppShell() {
 
   // When selecting a non-default profile, auto-enable fallback routing and
   // update the model selector to show the profile's primary model.
-  const handleSelectProfile = useCallback((key: string | null, primaryModelKey: string | null) => {
-    setSelectedProfileKey(key);
-    setProfilePrimaryModelKey(primaryModelKey);
-    if (key !== null) {
-      setFallbackEnabled(true);
-      if (primaryModelKey) setSelectedModelKey(primaryModelKey);
-    } else {
-      setFallbackEnabled(false);
-      setSelectedModelKey(null);
-    }
-  }, []);
+  const handleSelectProfile = useCallback(
+    (key: string | null, primaryModelKey: string | null) => {
+      setSelectedProfileKey(key);
+      setProfilePrimaryModelKey(primaryModelKey);
+      const effectiveKey = key ?? ((config?.defaultProfileKey as string | undefined) || null);
+      setReasoningEffort((effectiveKey ? getProfileReasoningEffort(config, effectiveKey) : undefined) ?? 'medium');
+      if (key !== null) {
+        setFallbackEnabled(true);
+        if (primaryModelKey) setSelectedModelKey(primaryModelKey);
+      } else {
+        setFallbackEnabled(false);
+        setSelectedModelKey(null);
+      }
+    },
+    [config],
+  );
 
   // When toggling auto-routing back ON with an active profile, restore the
   // profile's primary model in the model selector.

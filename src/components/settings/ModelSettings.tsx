@@ -7,6 +7,7 @@ import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 import { ProfileSettings } from './ProfileSettings';
 import { RuntimeSettings } from './RuntimeSettings';
 import { MastraRuntimeSettings } from './MastraRuntimeSettings';
+import { AdvancedSettings } from './AdvancedSettings';
 
 export type Provider = {
   type: string;
@@ -37,7 +38,7 @@ type CatalogEntry = {
   preferredTarget?: 'isolated-browser' | 'local-macos';
 };
 
-type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts';
+type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts' | 'advanced';
 
 export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab, focusNonce }) => {
   const [activeTab, setActiveTab] = useState<ModelTab>('profiles');
@@ -52,6 +53,7 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig, focusTa
     { key: 'providers', label: 'Providers' },
     { key: 'catalog', label: 'Catalog' },
     { key: 'prompts', label: 'Prompts' },
+    { key: 'advanced', label: 'Advanced' },
   ];
 
   return (
@@ -92,6 +94,7 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig, focusTa
       {activeTab === 'providers' && <ProvidersContent config={config} updateConfig={updateConfig} />}
       {activeTab === 'catalog' && <CatalogContent config={config} updateConfig={updateConfig} />}
       {activeTab === 'prompts' && <PromptsContent config={config} updateConfig={updateConfig} />}
+      {activeTab === 'advanced' && <AdvancedSettings config={config} updateConfig={updateConfig} hideTitle />}
     </div>
   );
 };

@@ -46,6 +46,17 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
 
 type FocusTarget = { tab?: string; anchorId?: string; fallbackId?: string; nonce: number };
 
+type NavigateDetail = { section?: SettingsSection; tab?: string; anchorId?: string };
+
+// Buffer `kai:navigate-settings` events fired before SettingsPanel mounts (e.g. immediately
+// after `kai:open-settings` from the step-limit banner) so the target isn't lost to a race.
+let pendingNav: NavigateDetail | null = null;
+if (typeof window !== 'undefined') {
+  window.addEventListener('kai:navigate-settings', (e) => {
+    pendingNav = (e as CustomEvent<NavigateDetail>).detail ?? null;
+  });
+}
+
 export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
   const { config, updateConfig } = useConfig();
   const [activeSection, setActiveSection] = useState<SettingsSection>('models');
@@ -69,6 +80,20 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
     window.addEventListener('close-settings', handler);
     return () => window.removeEventListener('close-settings', handler);
   }, [onClose]);
+
+  // Programmatic navigation (e.g. "Adjust settings" from the step-limit banner in RuntimeProvider).
+  useEffect(() => {
+    const apply = (detail: NavigateDetail | null) => {
+      if (!detail?.section) return;
+      setActiveSection(detail.section);
+      setFocus({ tab: detail.tab, anchorId: detail.anchorId, nonce: Date.now() });
+      pendingNav = null;
+    };
+    apply(pendingNav);
+    const handler = (e: Event) => apply((e as CustomEvent<NavigateDetail>).detail);
+    window.addEventListener('kai:navigate-settings', handler);
+    return () => window.removeEventListener('kai:navigate-settings', handler);
+  }, []);
 
   // After navigating from a search result, scroll the target field into view and pulse it.
   useEffect(() => {

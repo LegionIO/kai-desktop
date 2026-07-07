@@ -33,6 +33,7 @@ export const TAB_LABELS: Record<string, string> = {
   providers: 'Providers',
   catalog: 'Catalog',
   prompts: 'Prompts',
+  advanced: 'Advanced',
   // Tools
   'built-in': 'System',
   cli: 'CLI',
@@ -50,6 +51,50 @@ export const TAB_LABELS: Record<string, string> = {
 };
 
 export const SETTINGS_INDEX: SettingsSearchEntry[] = [
+  // ─── Models › Advanced (global defaults; profiles override) ───
+  {
+    id: 'advanced.maxSteps',
+    label: 'Max steps per task (global default)',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['turns', 'limit', 'iterations', 'tool calls'],
+  },
+  {
+    id: 'advanced.temperature',
+    label: 'Temperature (global default)',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['sampling', 'creativity', 'randomness'],
+  },
+  {
+    id: 'advanced.maxRetries',
+    label: 'Max retries on transient errors',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['retry', 'error handling', 'rate limit'],
+  },
+  {
+    id: 'advanced.useResponsesApi',
+    label: 'Use Responses API (global default)',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['openai'],
+  },
+  {
+    id: 'ui.showPluginDockIcons',
+    label: 'Show plugin icons in dock',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['sidebar'],
+  },
+  {
+    id: 'ui.dockBadgeStyle',
+    label: 'Dock badge style',
+    section: 'models',
+    tab: 'advanced',
+    keywords: ['notification', 'pill'],
+  },
+
   // ─── Models › Runtimes ───
   {
     id: 'agent.runtime',

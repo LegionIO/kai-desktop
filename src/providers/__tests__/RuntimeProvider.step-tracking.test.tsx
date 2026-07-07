@@ -68,7 +68,9 @@ vi.mock('@/lib/ipc-client', () => ({
       setActiveId: (...args: unknown[]) => mockSetActiveId(...args),
       onChanged: vi.fn().mockImplementation((cb: ConversationsChangedCallback) => {
         _conversationsChangedCallback = cb;
-        return () => { _conversationsChangedCallback = null; };
+        return () => {
+          _conversationsChangedCallback = null;
+        };
       }),
     },
     agent: {
@@ -77,7 +79,9 @@ vi.mock('@/lib/ipc-client', () => ({
       generateTitle: vi.fn().mockResolvedValue({ title: null }),
       onStreamEvent: vi.fn().mockImplementation((cb: StreamEventCallback) => {
         streamEventCallback = cb;
-        return () => { streamEventCallback = null; };
+        return () => {
+          streamEventCallback = null;
+        };
       }),
       sendSubAgentMessage: vi.fn().mockResolvedValue({ ok: true }),
       stopSubAgent: vi.fn().mockResolvedValue({ ok: true }),
@@ -113,7 +117,9 @@ function buildWindowApp() {
       generateTitle: vi.fn().mockResolvedValue({ title: null }),
       onStreamEvent: vi.fn().mockImplementation((cb: StreamEventCallback) => {
         streamEventCallback = cb;
-        return () => { streamEventCallback = null; };
+        return () => {
+          streamEventCallback = null;
+        };
       }),
       sendSubAgentMessage: vi.fn().mockResolvedValue({ ok: true }),
       stopSubAgent: vi.fn().mockResolvedValue({ ok: true }),
@@ -135,7 +141,9 @@ function buildWindowApp() {
       setActiveId: mockSetActiveId,
       onChanged: vi.fn().mockImplementation((cb: ConversationsChangedCallback) => {
         _conversationsChangedCallback = cb;
-        return () => { _conversationsChangedCallback = null; };
+        return () => {
+          _conversationsChangedCallback = null;
+        };
       }),
     },
     platform: { homedir: mockHomedir },
@@ -338,9 +346,15 @@ function StepTrackingConsumer() {
       <span data-testid="max-steps">{stepInfo?.maxSteps ?? 'null'}</span>
       <span data-testid="hit-limit">{stepInfo?.hitLimit ? 'true' : 'false'}</span>
       <span data-testid="show-banner">{showIncompleteTaskBanner ? 'true' : 'false'}</span>
-      <button data-testid="btn-continue" onClick={onContinueTask}>continue</button>
-      <button data-testid="btn-adjust" onClick={onAdjustSettings}>adjust</button>
-      <button data-testid="btn-dismiss" onClick={onDismissBanner}>dismiss</button>
+      <button data-testid="btn-continue" onClick={onContinueTask}>
+        continue
+      </button>
+      <button data-testid="btn-adjust" onClick={onAdjustSettings}>
+        adjust
+      </button>
+      <button data-testid="btn-dismiss" onClick={onDismissBanner}>
+        dismiss
+      </button>
     </div>
   );
 }
@@ -348,9 +362,7 @@ function StepTrackingConsumer() {
 function AllProviders({ children, conversationId = ACTIVE_CONV_ID }: { children: ReactNode; conversationId?: string }) {
   return (
     <AttachmentProvider>
-      <RuntimeProvider conversationId={conversationId}>
-        {children}
-      </RuntimeProvider>
+      <RuntimeProvider conversationId={conversationId}>{children}</RuntimeProvider>
     </AttachmentProvider>
   );
 }
@@ -360,20 +372,26 @@ async function renderWithProviders(conversationId = ACTIVE_CONV_ID) {
   const result = render(
     <AllProviders conversationId={conversationId}>
       <StepTrackingConsumer />
-    </AllProviders>
+    </AllProviders>,
   );
   // Wait until the active conversation ID is loaded into context.
   // Use a longer timeout because under CI load the provider's async
   // mount sequence (load conv -> setActiveConversationId -> re-render
   // -> activeIdRef.current sync via useEffect) can take >1s.
-  await waitFor(() => {
-    expect(screen.getByTestId('active-conv-id').textContent).toBe(conversationId);
-  }, { timeout: 3000 });
+  await waitFor(
+    () => {
+      expect(screen.getByTestId('active-conv-id').textContent).toBe(conversationId);
+    },
+    { timeout: 3000 },
+  );
   // Also wait until the stream event subscription has been registered,
   // otherwise emitStreamEvent will silently no-op via optional chaining.
-  await waitFor(() => {
-    expect(streamEventCallback).not.toBeNull();
-  }, { timeout: 3000 });
+  await waitFor(
+    () => {
+      expect(streamEventCallback).not.toBeNull();
+    },
+    { timeout: 3000 },
+  );
   return result;
 }
 
@@ -453,7 +471,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
 
       // stepInfo should remain null — event was for a different conversation
-      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
       expect(screen.getByTestId('current-step').textContent).toBe('null');
     });
   });
@@ -491,7 +511,9 @@ describe('RuntimeProvider - Step Tracking', () => {
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
       });
 
-      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
       // Banner should remain hidden because this conversation was dismissed
       expect(screen.getByTestId('show-banner').textContent).toBe('false');
     });
@@ -507,9 +529,7 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
 
       await waitFor(() => {
-        expect(warnSpy).toHaveBeenCalledWith(
-          expect.stringContaining('MAX_STEPS'),
-        );
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('MAX_STEPS'));
       });
     });
   });
@@ -525,7 +545,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      act(() => { screen.getByTestId('btn-continue').click(); });
+      act(() => {
+        screen.getByTestId('btn-continue').click();
+      });
 
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('false');
@@ -560,7 +582,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      act(() => { screen.getByTestId('btn-continue').click(); });
+      act(() => {
+        screen.getByTestId('btn-continue').click();
+      });
 
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('false');
@@ -580,9 +604,13 @@ describe('RuntimeProvider - Step Tracking', () => {
         (window.app as unknown as Record<string, Record<string, unknown>>).agent.stream = directStreamSpy;
       }
 
-      act(() => { screen.getByTestId('btn-continue').click(); });
+      act(() => {
+        screen.getByTestId('btn-continue').click();
+      });
 
-      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
       expect(directStreamSpy).not.toHaveBeenCalled();
     });
   });
@@ -595,33 +623,33 @@ describe('RuntimeProvider - Step Tracking', () => {
       const handler = (e: Event) => openSettingsEvents.push(e);
       window.addEventListener('kai:open-settings', handler);
 
-      act(() => { screen.getByTestId('btn-adjust').click(); });
+      act(() => {
+        screen.getByTestId('btn-adjust').click();
+      });
 
       expect(openSettingsEvents).toHaveLength(1);
       window.removeEventListener('kai:open-settings', handler);
     });
 
-    it('navigates to advanced section after delay', async () => {
-      // Render with real timers first, then switch to fake timers for the assertion
+    it('navigates to the max-turns setting synchronously', async () => {
       await renderWithProviders();
-      vi.useFakeTimers({ shouldAdvanceTime: false });
 
       const navigateEvents: Event[] = [];
       const handler = (e: Event) => navigateEvents.push(e);
       window.addEventListener('kai:navigate-settings', handler);
 
-      act(() => { screen.getByTestId('btn-adjust').click(); });
-
-      // Before the delay fires, no navigate event yet
-      expect(navigateEvents).toHaveLength(0);
-
-      await act(async () => { vi.advanceTimersByTime(150); });
+      act(() => {
+        screen.getByTestId('btn-adjust').click();
+      });
 
       expect(navigateEvents).toHaveLength(1);
-      expect((navigateEvents[0] as CustomEvent).detail).toEqual({ section: 'advanced' });
+      expect((navigateEvents[0] as CustomEvent).detail).toEqual({
+        section: 'models',
+        tab: 'runtimes',
+        anchorId: 'agent.maxTurns',
+      });
 
       window.removeEventListener('kai:navigate-settings', handler);
-      vi.useRealTimers();
     });
 
     it('hides banner when called', async () => {
@@ -634,7 +662,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      act(() => { screen.getByTestId('btn-adjust').click(); });
+      act(() => {
+        screen.getByTestId('btn-adjust').click();
+      });
 
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('false');
@@ -654,7 +684,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      act(() => { screen.getByTestId('btn-dismiss').click(); });
+      act(() => {
+        screen.getByTestId('btn-dismiss').click();
+      });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('false'));
 
       // A second max-steps-reached should NOT re-show the banner
@@ -663,7 +695,9 @@ describe('RuntimeProvider - Step Tracking', () => {
         type: 'max-steps-reached',
         stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
       });
-      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
 
       expect(screen.getByTestId('show-banner').textContent).toBe('false');
     });
@@ -678,7 +712,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       });
       await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
-      act(() => { screen.getByTestId('btn-dismiss').click(); });
+      act(() => {
+        screen.getByTestId('btn-dismiss').click();
+      });
 
       await waitFor(() => {
         expect(screen.getByTestId('show-banner').textContent).toBe('false');
@@ -689,7 +725,9 @@ describe('RuntimeProvider - Step Tracking', () => {
       await renderWithProviders();
       const infoSpy = vi.spyOn(console, 'info');
 
-      act(() => { screen.getByTestId('btn-dismiss').click(); });
+      act(() => {
+        screen.getByTestId('btn-dismiss').click();
+      });
 
       await waitFor(() => {
         expect(infoSpy).toHaveBeenCalledWith(
@@ -758,7 +796,9 @@ describe('Step Tracking - Integration', () => {
     });
 
     // 2. Continue task — banner hides and step info clears
-    act(() => { screen.getByTestId('btn-continue').click(); });
+    act(() => {
+      screen.getByTestId('btn-continue').click();
+    });
 
     await waitFor(() => {
       expect(screen.getByTestId('show-banner').textContent).toBe('false');
@@ -779,7 +819,9 @@ describe('Step Tracking - Integration', () => {
     await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
 
     // 2. Dismiss
-    act(() => { screen.getByTestId('btn-dismiss').click(); });
+    act(() => {
+      screen.getByTestId('btn-dismiss').click();
+    });
     await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('false'));
 
     // 3. Another event — banner must remain hidden
@@ -788,7 +830,9 @@ describe('Step Tracking - Integration', () => {
       type: 'max-steps-reached',
       stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
     });
-    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
 
     expect(screen.getByTestId('show-banner').textContent).toBe('false');
   });

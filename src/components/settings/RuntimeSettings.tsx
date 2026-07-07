@@ -137,6 +137,10 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           min={1}
           max={200}
         />
+        <p className="text-[10px] text-muted-foreground/80">
+          Applies to all runtimes. Editing this always sets the effective cap; when unset, each runtime falls back to
+          its own default (Mastra uses Advanced › Max steps).
+        </p>
         <Toggle
           id="agent.autoContinueOnMaxTurns"
           label="Auto-continue when max turns reached"
