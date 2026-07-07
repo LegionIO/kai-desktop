@@ -179,6 +179,7 @@ async function runAgentAction(
       messages,
       config,
       appHome: deps.appHome,
+      conversationId: targetId ?? undefined,
       modelKey: action.modelKey,
       profileKey: action.profileKey,
       tools,

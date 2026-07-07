@@ -353,6 +353,19 @@ describe('agent conversationTarget', () => {
     ]);
   });
 
+  it('passes the resolved target conversationId into generateForPlugin', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }), evt, deps());
+    expect(vi.mocked(generateForPlugin).mock.calls.at(-1)![0].conversationId).toBe('convA');
+
+    vi.mocked(generateForPlugin).mockClear();
+    resetMockStore();
+    await executeActions(agentAction({ type: 'per-invocation' }), evt, deps());
+    expect(vi.mocked(generateForPlugin).mock.calls.at(-1)![0].conversationId).toBeUndefined();
+  });
+
   it('includeHistory filters out tool-call/enrichment parts and empty messages', async () => {
     resetMockStore({
       convA: {

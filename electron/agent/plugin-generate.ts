@@ -11,6 +11,8 @@ export type PluginGenerateOptions = {
   messages: Array<{ role: string; content: unknown }>;
   config: AppConfig;
   appHome: string;
+  /** Optional real conversation id to expose to tool executors and memory scoping; falls back to a synthetic `plugin-*` id when omitted. */
+  conversationId?: string;
   modelKey?: string;
   profileKey?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
@@ -44,10 +46,7 @@ function configForPluginStream(
   systemPrompt?: string,
 ): AppConfig {
   const effectiveSystemPrompt =
-    systemPrompt?.trim() ||
-    streamConfig?.systemPrompt ||
-    config.systemPrompts?.chat ||
-    config.systemPrompt;
+    systemPrompt?.trim() || streamConfig?.systemPrompt || config.systemPrompts?.chat || config.systemPrompt;
 
   return {
     ...config,
@@ -88,7 +87,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     const dbPath = join(appHome, 'data', 'memory.db');
     const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
     const configForStream = configForPluginStream(config, null, systemPrompt);
-    const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const conversationId = options.conversationId ?? `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const stream = streamAgentResponse(
       conversationId,
@@ -107,30 +106,20 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
   const configForStream = configForPluginStream(config, streamConfig, systemPrompt);
 
-  const conversationId = `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const conversationId = options.conversationId ?? `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   let stream: AsyncGenerator<StreamEvent>;
 
   if (streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0) {
-    stream = streamWithFallback(
-      conversationId,
-      sanitized,
-      streamConfig,
-      configForStream,
-      pluginTools ?? [],
-      dbPath,
-      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },
-    );
+    stream = streamWithFallback(conversationId, sanitized, streamConfig, configForStream, pluginTools ?? [], dbPath, {
+      reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
+      abortSignal: options.abortSignal,
+    });
   } else {
-    stream = streamAgentResponse(
-      conversationId,
-      sanitized,
-      modelConfig,
-      configForStream,
-      pluginTools ?? [],
-      dbPath,
-      { reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined, abortSignal: options.abortSignal },
-    );
+    stream = streamAgentResponse(conversationId, sanitized, modelConfig, configForStream, pluginTools ?? [], dbPath, {
+      reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
+      abortSignal: options.abortSignal,
+    });
   }
 
   return { stream, modelKey: streamConfig.primaryModel.key };
