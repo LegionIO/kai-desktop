@@ -7,7 +7,23 @@ import type { AutomationRule } from '../config/schema.js';
 import { automationRuleSchema } from '../config/schema.js';
 import { getRegisteredTools, getWorkspaceToolDefinitions } from '../ipc/agent.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
-import type { ToolDefinition } from './types.js';
+import type { ToolDefinition, ToolExecutionContext } from './types.js';
+
+type MutableAgentAction = {
+  type?: unknown;
+  conversationTarget?: { type?: unknown; conversationId?: unknown };
+};
+
+function defaultExistingTargetToCurrent(actions: unknown, currentConversationId: string | undefined): void {
+  if (!Array.isArray(actions)) return;
+  for (const a of actions as MutableAgentAction[]) {
+    if (a?.type !== 'agent') continue;
+    const target = a.conversationTarget;
+    if (target?.type !== 'existing') continue;
+    if (typeof target.conversationId === 'string' && target.conversationId) continue;
+    if (currentConversationId) target.conversationId = currentConversationId;
+  }
+}
 
 function summarizeRule(rule: AutomationRule) {
   return {
@@ -46,6 +62,12 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
       'Action types: agent (mode "background"|"conversation", prompt supports {{payload.x}} and',
       '{{result[N].text}}), plugin-action (pluginName+targetId+data), tool (toolName+input),',
       'notification (title+body), emit (source+event+payload).',
+      '',
+      'For agent mode "conversation": conversationTarget is one of',
+      '{type:"per-invocation"} (new chat each run, default), {type:"singleton"} (one shared chat',
+      'per rule, created on first run then appended), or {type:"existing", conversationId} (append',
+      'to a specific chat — omit conversationId to target the chat you are running in right now).',
+      "includeHistory (default true) passes the target chat's prior messages as context to the agent.",
     ].join('\n'),
     inputSchema: z.object({
       action: z
@@ -63,7 +85,7 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
         .optional()
         .describe('For "test": event payload to evaluate conditions and interpolation against'),
     }),
-    execute: async (input) => {
+    execute: async (input, context?: ToolExecutionContext) => {
       const { action, id, rule, samplePayload } = input as {
         action: 'list' | 'get' | 'create' | 'update' | 'delete' | 'enable' | 'disable' | 'test';
         id?: string;
@@ -95,7 +117,7 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
             rules: rules.map(summarizeRule),
             catalog,
             availableTools: toolNames,
-            hint: 'Use catalog[].source + catalog[].events[].event for trigger. Use catalog[].events[].payloadSchema property paths for condition.path. Plugin actions live in catalog[].actions[].targetId (source starting with "plugin.").',
+            hint: 'Use catalog[].source + catalog[].events[].event for trigger. Use catalog[].events[].payloadSchema property paths for condition.path. Plugin actions live in catalog[].actions[].targetId (source starting with "plugin."). For agent actions in "conversation" mode, set conversationTarget to {type:"per-invocation"|"singleton"|"existing"}; for "existing", omit conversationId to target this chat.',
           };
         }
 
@@ -107,7 +129,8 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
 
         case 'create': {
           if (!rule) return { error: 'rule is required for create.' };
-          const candidate = { enabled: true, ...rule, id: randomUUID() };
+          const candidate: Record<string, unknown> = { enabled: true, ...rule, id: randomUUID() };
+          defaultExistingTargetToCurrent(candidate.actions, context?.conversationId);
           const parsed = automationRuleSchema.safeParse(candidate);
           if (!parsed.success) {
             return { error: 'Rule failed validation.', issues: parsed.error.issues };
@@ -137,6 +160,7 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
             trigger: patchTrigger ? { ...prev.trigger, ...patchTrigger } : prev.trigger,
             id: prev.id,
           };
+          defaultExistingTargetToCurrent(merged.actions, context?.conversationId);
           const parsed = automationRuleSchema.safeParse(merged);
           if (!parsed.success) {
             return { error: 'Updated rule failed validation.', issues: parsed.error.issues };

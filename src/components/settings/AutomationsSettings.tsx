@@ -27,6 +27,11 @@ type ConditionOp =
 
 type Condition = { path: string; op: ConditionOp; value?: unknown; caseSensitive: boolean };
 
+type ConversationTarget =
+  | { type: 'per-invocation' }
+  | { type: 'singleton' }
+  | { type: 'existing'; conversationId: string };
+
 type Action =
   | {
       type: 'agent';
@@ -36,6 +41,8 @@ type Action =
       profileKey?: string;
       tools: boolean;
       conversationTitle?: string;
+      conversationTarget?: ConversationTarget;
+      includeHistory?: boolean;
     }
   | { type: 'plugin-action'; pluginName: string; targetId: string; action: string; data?: Record<string, unknown> }
   | { type: 'tool'; toolName: string; input: Record<string, unknown> }
@@ -98,7 +105,14 @@ function newRule(): Rule {
 function newAction(type: Action['type']): Action {
   switch (type) {
     case 'agent':
-      return { type, mode: 'background', prompt: '', tools: true };
+      return {
+        type,
+        mode: 'background',
+        prompt: '',
+        tools: true,
+        conversationTarget: { type: 'per-invocation' },
+        includeHistory: true,
+      };
     case 'plugin-action':
       return { type, pluginName: '', targetId: '', action: 'automation' };
     case 'tool':
@@ -552,6 +566,29 @@ const ConditionRow: FC<{
 
 /* ───────────────────────── Action editor ───────────────────────── */
 
+function useConversationOptions(): Array<{ id: string; title: string }> {
+  const [options, setOptions] = useState<Array<{ id: string; title: string }>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    app.conversations
+      .list()
+      .then((convs: unknown) => {
+        if (cancelled) return;
+        setOptions(
+          (convs as Array<{ id: string; title?: string | null; fallbackTitle?: string | null }>).map((c) => ({
+            id: c.id,
+            title: c.title?.trim() || c.fallbackTitle?.trim() || c.id,
+          })),
+        );
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return options;
+}
+
 const ActionEditor: FC<{
   index: number;
   action: Action;
@@ -561,6 +598,10 @@ const ActionEditor: FC<{
   onRemove?: () => void;
 }> = ({ index, action, catalog, pluginSources, onChange, onRemove }) => {
   const changeType = (type: Action['type']) => onChange(newAction(type));
+  const conversationOptions = useConversationOptions();
+  const target: ConversationTarget =
+    action.type === 'agent' ? (action.conversationTarget ?? { type: 'per-invocation' }) : { type: 'per-invocation' };
+  const includeHistory = action.type === 'agent' ? (action.includeHistory ?? true) : true;
 
   return (
     <div className="rounded-lg border border-border/60 bg-background/40 p-2">
@@ -594,7 +635,7 @@ const ActionEditor: FC<{
               onChange={(e) => onChange({ ...action, mode: e.target.value as 'background' | 'conversation' })}
             >
               <option value="background">Background (headless)</option>
-              <option value="conversation">New conversation</option>
+              <option value="conversation">Conversation</option>
             </select>
             <label className="flex items-center gap-1 whitespace-nowrap rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs">
               <input
@@ -616,12 +657,70 @@ const ActionEditor: FC<{
             />
           </div>
           {action.mode === 'conversation' && (
-            <TextField
-              label="Conversation title"
-              value={action.conversationTitle ?? ''}
-              onChange={(v) => onChange({ ...action, conversationTitle: v || undefined })}
-              placeholder="{{payload.from.name}} — auto-reply"
-            />
+            <div className="space-y-2">
+              <div>
+                <label className="mb-0.5 block text-[10px] text-muted-foreground">Conversation target</label>
+                <select
+                  className={settingsSelectClass}
+                  value={target.type}
+                  onChange={(e) => {
+                    const type = e.target.value as ConversationTarget['type'];
+                    onChange({
+                      ...action,
+                      conversationTarget:
+                        type === 'existing'
+                          ? {
+                              type,
+                              conversationId:
+                                target.type === 'existing' ? target.conversationId : (conversationOptions[0]?.id ?? ''),
+                            }
+                          : { type },
+                    });
+                  }}
+                >
+                  <option value="per-invocation">New chat each run</option>
+                  <option value="singleton">One shared chat for this rule</option>
+                  <option value="existing">Append to a specific chat</option>
+                </select>
+              </div>
+              {target.type === 'existing' && (
+                <div>
+                  <label className="mb-0.5 block text-[10px] text-muted-foreground">Chat</label>
+                  <select
+                    className={settingsSelectClass}
+                    value={target.conversationId}
+                    onChange={(e) =>
+                      onChange({
+                        ...action,
+                        conversationTarget: { type: 'existing', conversationId: e.target.value },
+                      })
+                    }
+                  >
+                    <option value="">— select a chat —</option>
+                    {conversationOptions.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {target.type !== 'existing' && (
+                <TextField
+                  label="Conversation title"
+                  value={action.conversationTitle ?? ''}
+                  onChange={(v) => onChange({ ...action, conversationTitle: v || undefined })}
+                  placeholder="{{payload.from.name}} — auto-reply"
+                />
+              )}
+              {target.type !== 'per-invocation' && (
+                <Toggle
+                  label="Include chat history in prompt context"
+                  checked={includeHistory}
+                  onChange={(v) => onChange({ ...action, includeHistory: v })}
+                />
+              )}
+            </div>
           )}
           <div className="grid grid-cols-2 gap-2">
             <TextField

@@ -28,6 +28,14 @@ export function registerBuiltinSources(bus: AutomationEventBus): void {
           properties: { id: { type: 'string' }, title: { type: 'string' } },
         },
       },
+      {
+        event: 'updated',
+        title: 'Conversation updated (automation append)',
+        payloadSchema: {
+          type: 'object',
+          properties: { id: { type: 'string' }, title: { type: 'string' } },
+        },
+      },
     ],
     actions: [],
   });

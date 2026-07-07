@@ -645,6 +645,14 @@ const automationConditionSchema = z.object({
   caseSensitive: z.boolean().default(false),
 });
 
+const automationConversationTargetSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('per-invocation') }),
+  z.object({ type: z.literal('singleton') }),
+  z.object({ type: z.literal('existing'), conversationId: z.string() }),
+]);
+
+export type AutomationConversationTarget = z.infer<typeof automationConversationTargetSchema>;
+
 const automationActionSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('agent'),
@@ -654,6 +662,8 @@ const automationActionSchema = z.discriminatedUnion('type', [
     profileKey: z.string().optional(),
     tools: z.boolean().default(true),
     conversationTitle: z.string().optional(),
+    conversationTarget: automationConversationTargetSchema.default({ type: 'per-invocation' }),
+    includeHistory: z.boolean().default(true),
   }),
   z.object({
     type: z.literal('plugin-action'),

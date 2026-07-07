@@ -73,6 +73,110 @@ export function broadcastConversationChange(store: ConversationsStore): void {
   broadcastToWebClients('conversations:changed', store);
 }
 
+// ── messageTree helpers (main-process append) ──────────────────────────────
+
+export type StoredTreeMessage = {
+  id: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: unknown;
+  parentId: string | null;
+  createdAt: string;
+};
+
+export function ensureConversationTree(conv: ConversationRecord): {
+  tree: StoredTreeMessage[];
+  headId: string | null;
+} {
+  const rawTree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
+  if (rawTree && rawTree.length > 0) {
+    return { tree: rawTree, headId: conv.headId ?? rawTree[rawTree.length - 1]?.id ?? null };
+  }
+  let parentId: string | null = null;
+  const tree = (Array.isArray(conv.messages) ? conv.messages : []).map((m, i) => {
+    const raw = m as Partial<StoredTreeMessage> & Record<string, unknown>;
+    const id = typeof raw.id === 'string' && raw.id ? raw.id : `msg-${Date.now()}-${i}`;
+    const node = {
+      ...raw,
+      id,
+      role: raw.role === 'user' || raw.role === 'system' || raw.role === 'tool' ? raw.role : 'assistant',
+      content: raw.content ?? '',
+      parentId,
+      createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString(),
+    } as StoredTreeMessage;
+    parentId = id;
+    return node;
+  });
+  return { tree, headId: tree[tree.length - 1]?.id ?? null };
+}
+
+export function getConversationBranch(tree: StoredTreeMessage[], headId: string | null): StoredTreeMessage[] {
+  if (!headId) return [];
+  const byId = new Map(tree.map((m) => [m.id, m] as const));
+  const branch: StoredTreeMessage[] = [];
+  const seen = new Set<string>();
+  let cur: string | null = headId;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const node = byId.get(cur);
+    if (!node) break;
+    branch.push(node);
+    cur = node.parentId;
+  }
+  return branch.reverse();
+}
+
+export function appendConversationMessages(
+  appHome: string,
+  conversationId: string,
+  messages: Array<{ role: StoredTreeMessage['role']; content: unknown; createdAt?: string }>,
+  options: { skipIfBusy?: boolean; parentId?: string | null } = {},
+): ConversationRecord | null {
+  const store = readConversationStore(appHome);
+  const conv = store.conversations[conversationId];
+  if (!conv) return null;
+  if (options.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) {
+    return null;
+  }
+
+  const { tree, headId } = ensureConversationTree(conv);
+  let parentId = options.parentId !== undefined ? options.parentId : headId;
+  const now = new Date().toISOString();
+  const appended: StoredTreeMessage[] = messages.map((m, i) => {
+    const node: StoredTreeMessage = {
+      id: `auto-msg-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+      role: m.role,
+      content: m.content,
+      parentId,
+      createdAt: m.createdAt ?? now,
+    };
+    parentId = node.id;
+    return node;
+  });
+
+  const nextTree = [...tree, ...appended];
+  const nextHeadId = parentId;
+  const branch = getConversationBranch(nextTree, nextHeadId);
+  const lastAssistantAt = [...appended].reverse().find((m) => m.role === 'assistant')?.createdAt;
+
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    headId: nextHeadId,
+    updatedAt: now,
+    lastMessageAt: appended[appended.length - 1]?.createdAt ?? now,
+    lastAssistantUpdateAt: lastAssistantAt ?? conv.lastAssistantUpdateAt,
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+    hasUnread: true,
+  };
+
+  store.conversations[conversationId] = next;
+  writeConversationStore(appHome, store);
+  broadcastConversationChange(store);
+  return next;
+}
+
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);
@@ -227,21 +331,43 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
     // Guard: never allow a write that would lose messages compared to what's on disk.
-    // If the incoming tree is shorter than the stored tree, preserve the stored message data
-    // and only apply non-message field updates. This protects against stale-closure races
-    // where title generation, settings persistence, or debounced persists write back
-    // an older snapshot of the conversation.
+    // If the stored tree contains message ids the incoming tree lacks, the incoming
+    // write is stale or concurrent — union the missing stored messages back in and
+    // keep the stored headId so the on-disk branch stays reachable. Any incoming
+    // messages not already on disk are also unioned in as sibling branches so a
+    // concurrent writer's additions survive.
     let nextConversation = conversation;
 
-    if (prev && prevTreeLen > 0 && tree.length < prevTreeLen) {
-      nextConversation = {
-        ...conversation,
-        messages: prev.messages,
-        messageTree: prev.messageTree,
-        headId: prev.headId,
-        messageCount: prev.messageCount,
-        userMessageCount: prev.userMessageCount,
-      };
+    if (prev && prevTreeLen > 0) {
+      const prevTree = prev.messageTree as Array<{ id?: unknown }>;
+      const incomingIds = new Set(
+        (tree as Array<{ id?: unknown }>).map((m) => (typeof m?.id === 'string' ? m.id : null)),
+      );
+      const missingFromIncoming = prevTree.filter((m) => typeof m?.id === 'string' && !incomingIds.has(m.id as string));
+      if (missingFromIncoming.length > 0) {
+        const prevIds = new Set(prevTree.map((m) => (typeof m?.id === 'string' ? m.id : null)));
+        const novel = (tree as Array<{ id?: unknown }>).filter(
+          (m) => typeof m?.id === 'string' && !prevIds.has(m.id as string),
+        );
+        // Take incoming's version of every shared id (so same-id content updates like a
+        // stream's partial→final assistant text are preserved) and union in the stored
+        // ids the incoming write is missing. Stale writers (title-gen, settings persist)
+        // never add messages, so novel.length === 0 → keep prev's head. Concurrent
+        // writers have novel messages → keep the incoming head so the caller's active
+        // branch stays reachable.
+        const mergedTree = [...tree, ...missingFromIncoming];
+        const mergedHead = novel.length > 0 ? (conversation.headId ?? prev.headId) : prev.headId;
+        const branch = getConversationBranch(mergedTree as StoredTreeMessage[], mergedHead ?? null);
+        nextConversation = {
+          ...conversation,
+          messages: branch,
+          messageTree: mergedTree,
+          headId: mergedHead,
+          messageCount: branch.length,
+          userMessageCount: branch.filter((m) => m.role === 'user').length,
+          hasUnread: conversation.hasUnread || prev.hasUnread,
+        };
+      }
     }
 
     if (prev) {

@@ -32,6 +32,9 @@ vi.mock('../../computer-use/service.js', () => ({
 }));
 
 import {
+  appendConversationMessages,
+  ensureConversationTree,
+  getConversationBranch,
   registerConversationHandlers,
   readConversationStore,
   writeConversationStore,
@@ -117,33 +120,137 @@ describe('conversations IPC: list / get / put round-trip', () => {
       updatedAt: '2026-01-02T00:00:00.000Z',
     });
 
-    const putResult = await harness.invoke<{ ok: boolean }>(
-      'conversations:put',
-      FAKE_EVENT,
-      conversation,
-    );
+    const putResult = await harness.invoke<{ ok: boolean }>('conversations:put', FAKE_EVENT, conversation);
     expect(putResult).toEqual({ ok: true });
 
-    const fetched = await harness.invoke<Record<string, unknown> | null>(
-      'conversations:get',
-      FAKE_EVENT,
-      'conv-1',
-    );
+    const fetched = await harness.invoke<Record<string, unknown> | null>('conversations:get', FAKE_EVENT, 'conv-1');
     expect(fetched).not.toBeNull();
     expect(fetched).toMatchObject({ id: 'conv-1', title: 'Hello world' });
 
-    const list = await harness.invoke<Array<{ id: string; hasToolCalls: boolean }>>(
-      'conversations:list',
-      FAKE_EVENT,
-    );
+    const list = await harness.invoke<Array<{ id: string; hasToolCalls: boolean }>>('conversations:list', FAKE_EVENT);
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ id: 'conv-1', hasToolCalls: false });
 
     // The on-disk store should contain the entry as well.
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'));
     expect(onDisk.conversations['conv-1']).toBeDefined();
+  });
+
+  it('conversations:put unions on-disk messages the incoming write is missing', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    const base = makeConversation('c', {
+      messageTree: [
+        { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: 'x' },
+        { id: 'autoU', parentId: 'u', role: 'user', content: 'auto', createdAt: 'x' },
+        { id: 'autoA', parentId: 'autoU', role: 'assistant', content: 'auto', createdAt: 'x' },
+      ],
+      headId: 'autoA',
+      messageCount: 3,
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, base);
+
+    // Concurrent writer (e.g. renderer stream done) has [u, streamA] — same length as
+    // a subset would be, but missing autoU/autoA and adding streamA.
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: 'x' },
+          { id: 'streamA', parentId: 'u', role: 'assistant', content: 'stream', createdAt: 'x' },
+        ],
+        headId: 'streamA',
+        messageCount: 2,
+      }),
+    );
+
+    const merged = readConversationStore(appHome).conversations.c as {
+      messageTree: Array<{ id: string }>;
+      headId: string;
+    };
+    const ids = merged.messageTree.map((m) => m.id);
+    expect(ids).toEqual(expect.arrayContaining(['u', 'autoU', 'autoA', 'streamA']));
+    // Incoming write had a novel message (streamA) → concurrent, not stale → incoming head wins
+    expect(merged.headId).toBe('streamA');
+  });
+
+  it('conversations:put preserves same-id content updates when prev has extra ids', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: 'x' },
+          { id: 'a', parentId: 'u', role: 'assistant', content: 'partial', createdAt: 'x' },
+          { id: 'autoU', parentId: 'a', role: 'user', content: 'auto', createdAt: 'x' },
+        ],
+        headId: 'autoU',
+      }),
+    );
+    // Stream-done write updates 'a' to final content, adds no new ids
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: 'x' },
+          { id: 'a', parentId: 'u', role: 'assistant', content: 'FINAL', createdAt: 'x' },
+        ],
+        headId: 'a',
+      }),
+    );
+
+    const stored = readConversationStore(appHome).conversations.c as {
+      messageTree: Array<{ id: string; content: unknown }>;
+      headId: string;
+    };
+    expect(stored.messageTree.find((m) => m.id === 'a')?.content).toBe('FINAL');
+    expect(stored.messageTree.map((m) => m.id)).toEqual(expect.arrayContaining(['u', 'a', 'autoU']));
+    expect(stored.headId).toBe('autoU');
+  });
+
+  it('conversations:put keeps prev.headId when the incoming write is a stale subset', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'a', parentId: null, role: 'user', content: 'q', createdAt: 'x' },
+          { id: 'b', parentId: 'a', role: 'assistant', content: 'r', createdAt: 'x' },
+        ],
+        headId: 'b',
+      }),
+    );
+    // Stale writer (e.g. title-gen) writes back an older snapshot with no novel messages
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [{ id: 'a', parentId: null, role: 'user', content: 'q', createdAt: 'x' }],
+        headId: 'a',
+      }),
+    );
+
+    const stored = readConversationStore(appHome).conversations.c as { headId: string; messageTree: unknown[] };
+    expect(stored.headId).toBe('b');
+    expect(stored.messageTree).toHaveLength(2);
   });
 });
 
@@ -155,11 +262,7 @@ describe('conversations IPC: error paths', () => {
       },
     });
 
-    const result = await harness.invoke<unknown>(
-      'conversations:get',
-      FAKE_EVENT,
-      'does-not-exist',
-    );
+    const result = await harness.invoke<unknown>('conversations:get', FAKE_EVENT, 'does-not-exist');
     expect(result).toBeNull();
   });
 
@@ -170,18 +273,12 @@ describe('conversations IPC: error paths', () => {
       },
     });
 
-    const result = await harness.invoke<{ ok: boolean }>(
-      'conversations:delete',
-      FAKE_EVENT,
-      'ghost',
-    );
+    const result = await harness.invoke<{ ok: boolean }>('conversations:delete', FAKE_EVENT, 'ghost');
     expect(result).toEqual({ ok: true });
     // No conversation existed, so the store file is created on write but the
     // conversation map stays empty.
     expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
-    const onDisk = JSON.parse(
-      readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'),
-    );
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'));
     expect(onDisk.conversations).toEqual({});
   });
 
@@ -217,11 +314,7 @@ describe('conversations IPC: active-id handling', () => {
     const before = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(before).toBeNull();
 
-    const setResult = await harness.invoke<{ ok: boolean }>(
-      'conversations:set-active-id',
-      FAKE_EVENT,
-      'conv-active',
-    );
+    const setResult = await harness.invoke<{ ok: boolean }>('conversations:set-active-id', FAKE_EVENT, 'conv-active');
     expect(setResult).toEqual({ ok: true });
 
     const after = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
@@ -241,15 +334,9 @@ describe('conversations IPC: active-id handling', () => {
 
     await harness.invoke('conversations:delete', FAKE_EVENT, 'drop');
 
-    const activeAfter = await harness.invoke<string | null>(
-      'conversations:get-active-id',
-      FAKE_EVENT,
-    );
+    const activeAfter = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(activeAfter).toBeNull();
-    const remaining = await harness.invoke<Array<{ id: string }>>(
-      'conversations:list',
-      FAKE_EVENT,
-    );
+    const remaining = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
     expect(remaining.map((c) => c.id)).toEqual(['keep']);
   });
 
@@ -269,10 +356,111 @@ describe('conversations IPC: active-id handling', () => {
 
     const list = await harness.invoke<unknown[]>('conversations:list', FAKE_EVENT);
     expect(list).toEqual([]);
-    const activeId = await harness.invoke<string | null>(
-      'conversations:get-active-id',
-      FAKE_EVENT,
-    );
+    const activeId = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(activeId).toBeNull();
+  });
+});
+
+describe('appendConversationMessages', () => {
+  it('chains parentId from head, updates counts and timestamps', () => {
+    writeConversationStore(appHome, {
+      conversations: {
+        c1: makeConversation('c1', {
+          messageTree: [{ id: 'u1', parentId: null, role: 'user', content: 'hi', createdAt: '2026-01-01T00:00:00Z' }],
+          headId: 'u1',
+          messageCount: 1,
+          userMessageCount: 1,
+        }) as never,
+      },
+      activeConversationId: null,
+      settings: {},
+    });
+
+    const result = appendConversationMessages(appHome, 'c1', [
+      { role: 'user', content: 'follow-up' },
+      { role: 'assistant', content: 'answer' },
+    ]);
+
+    expect(result).not.toBeNull();
+    const stored = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null; role: string }>;
+      headId: string;
+      messageCount: number;
+      userMessageCount: number;
+      hasUnread: boolean;
+      lastAssistantUpdateAt: string | null;
+    };
+    expect(stored.messageTree).toHaveLength(3);
+    expect(stored.messageTree[1].parentId).toBe('u1');
+    expect(stored.messageTree[2].parentId).toBe(stored.messageTree[1].id);
+    expect(stored.headId).toBe(stored.messageTree[2].id);
+    expect(stored.messageCount).toBe(3);
+    expect(stored.userMessageCount).toBe(2);
+    expect(stored.hasUnread).toBe(true);
+    expect(stored.lastAssistantUpdateAt).toBeTruthy();
+  });
+
+  it('converts a legacy flat-messages conversation to a tree before appending', () => {
+    writeConversationStore(appHome, {
+      conversations: {
+        c1: makeConversation('c1', {
+          messageTree: undefined,
+          messages: [
+            { role: 'user', content: 'legacy q' },
+            { role: 'assistant', content: 'legacy a' },
+          ],
+        }) as never,
+      },
+      activeConversationId: null,
+      settings: {},
+    });
+
+    appendConversationMessages(appHome, 'c1', [{ role: 'assistant', content: 'appended' }]);
+
+    const stored = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ parentId: string | null }>;
+    };
+    expect(stored.messageTree).toHaveLength(3);
+    expect(stored.messageTree[0].parentId).toBeNull();
+    expect(stored.messageTree[2].parentId).toBeTruthy();
+  });
+
+  it('returns null for a missing conversation', () => {
+    writeConversationStore(appHome, { conversations: {}, activeConversationId: null, settings: {} });
+    expect(appendConversationMessages(appHome, 'nope', [{ role: 'user', content: 'x' }])).toBeNull();
+  });
+
+  it('skipIfBusy=true refuses when the conversation is running', () => {
+    writeConversationStore(appHome, {
+      conversations: { c1: makeConversation('c1', { runStatus: 'running' }) as never },
+      activeConversationId: null,
+      settings: {},
+    });
+    expect(
+      appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }], { skipIfBusy: true }),
+    ).toBeNull();
+    expect(appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }])).not.toBeNull();
+  });
+});
+
+describe('ensureConversationTree / getConversationBranch', () => {
+  it('passes through an existing messageTree', () => {
+    const conv = makeConversation('c', {
+      messageTree: [{ id: 'a', parentId: null, role: 'user', content: 'x', createdAt: 'z' }],
+      headId: 'a',
+    });
+    const { tree, headId } = ensureConversationTree(conv as never);
+    expect(tree).toHaveLength(1);
+    expect(headId).toBe('a');
+  });
+
+  it('walks the branch back through parentId', () => {
+    const tree = [
+      { id: 'a', parentId: null, role: 'user' as const, content: '', createdAt: '' },
+      { id: 'b', parentId: 'a', role: 'assistant' as const, content: '', createdAt: '' },
+      { id: 'c', parentId: 'a', role: 'assistant' as const, content: '', createdAt: '' },
+    ];
+    expect(getConversationBranch(tree, 'b').map((m) => m.id)).toEqual(['a', 'b']);
+    expect(getConversationBranch(tree, 'c').map((m) => m.id)).toEqual(['a', 'c']);
   });
 });

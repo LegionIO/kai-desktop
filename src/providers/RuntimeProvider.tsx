@@ -1488,6 +1488,23 @@ export function RuntimeProvider({
     void loadConversationState(conversationId);
   }, [conversationId, activeConversationId, loadConversationState]);
 
+  // Reload the active conversation when the main process appends to it (e.g. an
+  // automation targeting this thread). Our own persists never grow the tree past
+  // treeRef.current, so a longer incoming tree reliably signals an external append.
+  useEffect(() => {
+    return app.conversations.onChanged((raw: unknown) => {
+      const activeId = activeIdRef.current;
+      if (!activeId || streamAccumulators.has(activeId)) return;
+      const store = raw as { conversations?: Record<string, { messageTree?: unknown[]; messages?: unknown[] }> };
+      const conv = store.conversations?.[activeId];
+      if (!conv) return;
+      const incomingLen = (conv.messageTree ?? conv.messages ?? []).length;
+      if (incomingLen > treeRef.current.length) {
+        void loadConversationState(activeId);
+      }
+    });
+  }, [loadConversationState]);
+
   useEffect(() => {
     if (!activeConversationId || isRunning || streamAccumulators.has(activeConversationId)) return;
 
