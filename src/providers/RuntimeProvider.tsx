@@ -1098,7 +1098,13 @@ function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: 
   let parentId: string | null = null;
   const tree: StoredMessage[] = (conv.messages ?? []).map((m) => {
     const id = (m as StoredMessage).id || msgId();
-    const sm: StoredMessage = { ...m, id, parentId, role: m.role as 'user' | 'assistant' };
+    const sm: StoredMessage = {
+      ...m,
+      id,
+      parentId,
+      role: m.role as 'user' | 'assistant',
+      createdAt: m.createdAt ? new Date(m.createdAt as unknown as string) : undefined,
+    };
     parentId = id;
     return sm;
   });
@@ -2693,6 +2699,17 @@ export function RuntimeProvider({
     ],
   );
 
+  const threadListAdapter = useMemo(
+    () =>
+      activeConversationId
+        ? {
+            threadId: activeConversationId,
+            threads: [{ status: 'regular' as const, id: activeConversationId }],
+          }
+        : undefined,
+    [activeConversationId],
+  );
+
   const runtime = useExternalStoreRuntime({
     messages: activeBranch,
     setMessages: () => {},
@@ -2726,6 +2743,7 @@ export function RuntimeProvider({
     },
     isRunning,
     adapters: {
+      threadList: threadListAdapter,
       ...(speechAdapter ? { speech: speechAdapter } : {}),
       ...(recordingAdapter ? { dictation: recordingAdapter } : {}),
     },
