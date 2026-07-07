@@ -18,7 +18,7 @@ export type ActionDeps = {
   handlePluginAction: (payload: PluginActionPayload) => Promise<unknown>;
 };
 
-type InterpolationCtx = { payload: unknown; result: unknown[] };
+type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
 
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
 
@@ -162,7 +162,7 @@ export async function executeActions(
     results: [],
   };
 
-  const ctx: InterpolationCtx = { payload: event.payload, result: [] };
+  const ctx: InterpolationCtx = { payload: event.payload, result: [], source: event.source, event: event.event };
 
   for (const action of rule.actions) {
     const started = Date.now();

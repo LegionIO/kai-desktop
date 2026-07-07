@@ -71,6 +71,37 @@ describe('interpolateString', () => {
   it('missing path → empty string', () => {
     expect(interpolateString('[{{payload.nope}}]', { payload: {}, result: [] })).toBe('[]');
   });
+  it('exposes source and event from the trigger', () => {
+    expect(
+      interpolateString('{{source}}:{{event}}', {
+        payload: {},
+        result: [],
+        source: 'plugin.msgraph',
+        event: 'message-received',
+      }),
+    ).toBe('plugin.msgraph:message-received');
+  });
+});
+
+describe('executeActions source/event interpolation', () => {
+  it('passes trigger source and event into tool input templates', async () => {
+    const captured: unknown[] = [];
+    const tool = {
+      name: 'log-tool',
+      description: 't',
+      parameters: {} as never,
+      execute: async (input: unknown) => {
+        captured.push(input);
+        return { ok: true };
+      },
+    };
+    await executeActions(
+      rule([{ type: 'tool', toolName: 'log-tool', input: { line: '{{source}} {{event}}' } }]),
+      evt,
+      deps({ getWorkspaceTools: () => [tool] as never }),
+    );
+    expect(captured[0]).toEqual({ line: 'plugin.teams message-received' });
+  });
 });
 
 describe('executeActions', () => {
