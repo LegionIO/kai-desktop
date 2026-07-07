@@ -90,7 +90,10 @@ const TestConnectionButton: FC = () => {
     setErrorMsg(null);
 
     // Clear any previous success/error reset timer
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
 
     try {
       // Use a temporary conversation ID for the test
@@ -111,10 +114,13 @@ const TestConnectionButton: FC = () => {
     }
 
     // Reset to idle after a few seconds
-    timerRef.current = setTimeout(() => {
-      setState('idle');
-      setErrorMsg(null);
-    }, state === 'success' ? 3000 : 8000);
+    timerRef.current = setTimeout(
+      () => {
+        setState('idle');
+        setErrorMsg(null);
+      },
+      state === 'success' ? 3000 : 8000,
+    );
   }, [state]);
 
   return (
@@ -157,9 +163,7 @@ const TestConnectionButton: FC = () => {
         )}
       </button>
       {state === 'error' && errorMsg && (
-        <p className="text-[10px] text-red-600/80 dark:text-red-400/80 pl-1 break-all">
-          {errorMsg}
-        </p>
+        <p className="text-[10px] text-red-600/80 dark:text-red-400/80 pl-1 break-all">{errorMsg}</p>
       )}
     </div>
   );
@@ -182,8 +186,8 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <div>
           <h3 className="text-sm font-semibold">Realtime Audio</h3>
           <p className="text-xs text-muted-foreground mt-1">
-            Configure bidirectional voice conversations using OpenAI&apos;s Realtime API.
-            Speak directly to the model and hear responses in real time.
+            Configure bidirectional voice conversations using OpenAI&apos;s Realtime API. Speak directly to the model
+            and hear responses in real time.
           </p>
         </div>
       )}
@@ -193,12 +197,13 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <legend className="text-xs font-semibold px-1">Provider</legend>
 
         <Toggle
+          id="realtime.enabled"
           label="Enable realtime audio"
           checked={enabled}
           onChange={(v) => updateConfig('realtime.enabled', v)}
         />
 
-        <div>
+        <div data-setting-id="realtime.provider">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Provider</label>
           <select
             className={settingsSelectClass}
@@ -303,7 +308,7 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       {/* ── Model & Voice ── */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Model & Voice</legend>
-        <div>
+        <div data-setting-id="realtime.model">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Model</label>
           <input
             type="text"
@@ -313,7 +318,7 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
             placeholder="gpt-4o-realtime-preview"
           />
         </div>
-        <div>
+        <div data-setting-id="realtime.voice">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Voice</label>
           <select
             className={settingsSelectClass}
@@ -345,11 +350,12 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Memory Context</legend>
         <p className="text-[10px] text-muted-foreground/60">
-          Include chat memory in the call context so the AI has awareness of prior messages,
-          user preferences, and relevant history. Uses part of the 32k context budget.
+          Include chat memory in the call context so the AI has awareness of prior messages, user preferences, and
+          relevant history. Uses part of the 32k context budget.
         </p>
 
         <Toggle
+          id="realtime.memoryContext.enabled"
           label="Include chat memory in call context"
           checked={memoryCtx?.enabled ?? true}
           onChange={(v) => updateConfig('realtime.memoryContext.enabled', v)}
@@ -426,7 +432,7 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Turn Detection</legend>
 
-        <div>
+        <div data-setting-id="realtime.turnDetection.type">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Type</label>
           <select
             className={settingsSelectClass}
@@ -477,6 +483,7 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <legend className="text-xs font-semibold px-1">Auto-End Call</legend>
 
         <Toggle
+          id="realtime.autoEndCall.enabled"
           label="Automatically end call on silence"
           checked={autoEndCall?.enabled ?? true}
           onChange={(v) => updateConfig('realtime.autoEndCall.enabled', v)}
@@ -509,20 +516,59 @@ export const RealtimeSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Autopilot Updates</legend>
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
-          When a computer-use session is started during a realtime call, updates are streamed back so the voice AI can narrate progress.
+          When a computer-use session is started during a realtime call, updates are streamed back so the voice AI can
+          narrate progress.
         </div>
-        <Toggle label="Enabled" checked={realtime?.computerUseUpdates?.enabled ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.enabled', v)} />
+        <Toggle
+          label="Enabled"
+          checked={realtime?.computerUseUpdates?.enabled ?? true}
+          onChange={(v) => updateConfig('realtime.computerUseUpdates.enabled', v)}
+        />
         {(realtime?.computerUseUpdates?.enabled ?? true) && (
           <>
-            <NumberField label="Throttle (ms)" value={realtime?.computerUseUpdates?.throttleMs ?? 3000} onChange={(v) => updateConfig('realtime.computerUseUpdates.throttleMs', v)} min={1000} max={30000} />
+            <NumberField
+              label="Throttle (ms)"
+              value={realtime?.computerUseUpdates?.throttleMs ?? 3000}
+              onChange={(v) => updateConfig('realtime.computerUseUpdates.throttleMs', v)}
+              min={1000}
+              max={30000}
+            />
             <div className="grid grid-cols-2 gap-2">
-              <Toggle label="Step completed" checked={realtime?.computerUseUpdates?.onStepCompleted ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onStepCompleted', v)} />
-              <Toggle label="Step failed" checked={realtime?.computerUseUpdates?.onStepFailed ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onStepFailed', v)} />
-              <Toggle label="Checkpoint" checked={realtime?.computerUseUpdates?.onCheckpoint ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onCheckpoint', v)} />
-              <Toggle label="Approval needed" checked={realtime?.computerUseUpdates?.onApprovalNeeded ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onApprovalNeeded', v)} />
-              <Toggle label="Guidance received" checked={realtime?.computerUseUpdates?.onGuidanceReceived ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onGuidanceReceived', v)} />
-              <Toggle label="Session completed" checked={realtime?.computerUseUpdates?.onSessionCompleted ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onSessionCompleted', v)} />
-              <Toggle label="Session failed" checked={realtime?.computerUseUpdates?.onSessionFailed ?? true} onChange={(v) => updateConfig('realtime.computerUseUpdates.onSessionFailed', v)} />
+              <Toggle
+                label="Step completed"
+                checked={realtime?.computerUseUpdates?.onStepCompleted ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onStepCompleted', v)}
+              />
+              <Toggle
+                label="Step failed"
+                checked={realtime?.computerUseUpdates?.onStepFailed ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onStepFailed', v)}
+              />
+              <Toggle
+                label="Checkpoint"
+                checked={realtime?.computerUseUpdates?.onCheckpoint ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onCheckpoint', v)}
+              />
+              <Toggle
+                label="Approval needed"
+                checked={realtime?.computerUseUpdates?.onApprovalNeeded ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onApprovalNeeded', v)}
+              />
+              <Toggle
+                label="Guidance received"
+                checked={realtime?.computerUseUpdates?.onGuidanceReceived ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onGuidanceReceived', v)}
+              />
+              <Toggle
+                label="Session completed"
+                checked={realtime?.computerUseUpdates?.onSessionCompleted ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onSessionCompleted', v)}
+              />
+              <Toggle
+                label="Session failed"
+                checked={realtime?.computerUseUpdates?.onSessionFailed ?? true}
+                onChange={(v) => updateConfig('realtime.computerUseUpdates.onSessionFailed', v)}
+              />
             </div>
           </>
         )}

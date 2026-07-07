@@ -153,6 +153,7 @@ export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig })
         <h3 className="text-sm font-semibold">Automations</h3>
         <div className="flex items-center gap-2">
           <Toggle
+            id="automations.enabled"
             label="Enabled"
             checked={automations.enabled}
             onChange={(v) => updateConfig('automations.enabled', v)}
@@ -180,7 +181,7 @@ export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig })
 
       {automations.rules.length === 0 && <p className="text-xs text-muted-foreground">No rules configured.</p>}
 
-      <div className="space-y-2">
+      <div data-setting-id="automations.rules" className="space-y-2">
         {automations.rules.map((rule) => {
           const isOpen = expanded.has(rule.id);
           const last = lastRunByRule.get(rule.id);

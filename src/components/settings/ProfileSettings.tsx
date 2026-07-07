@@ -79,7 +79,7 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       )}
 
       {/* Default profile selector */}
-      <fieldset className="rounded-lg border p-3 space-y-3">
+      <fieldset data-setting-id="profiles" className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Default Profile</legend>
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Active profile for new conversations</label>
@@ -89,14 +89,16 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
             onChange={(e) => handleDefaultProfileChange(e.target.value)}
           >
             {profiles.map((p) => (
-              <option key={p.key} value={p.key}>{p.name}</option>
+              <option key={p.key} value={p.key}>
+                {p.name}
+              </option>
             ))}
           </select>
         </div>
       </fieldset>
 
       {/* Profile list */}
-      <fieldset className="rounded-lg border p-3 space-y-3">
+      <fieldset data-setting-id="profile.maxSteps" className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Profile List</legend>
         <div className="space-y-1.5">
           {profiles.map((profile, i) =>
@@ -105,7 +107,10 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
                 key={`edit-${i}`}
                 initial={profile}
                 models={models}
-                onSave={(p) => { updateProfile(i, p); setEditIndex(null); }}
+                onSave={(p) => {
+                  updateProfile(i, p);
+                  setEditIndex(null);
+                }}
                 onCancel={() => setEditIndex(null)}
                 submitLabel="Save"
               />
@@ -125,7 +130,10 @@ export const ProfileSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           <ProfileForm
             initial={{ key: '', name: '', primaryModelKey: models[0]?.key ?? '', fallbackModelKeys: [] }}
             models={models}
-            onSave={(p) => { addProfile(p); setShowAdd(false); }}
+            onSave={(p) => {
+              addProfile(p);
+              setShowAdd(false);
+            }}
             onCancel={() => setShowAdd(false)}
             submitLabel="Add Profile"
           />
@@ -165,20 +173,23 @@ const ProfileCard: FC<{
         <div className="text-[10px] text-muted-foreground mt-0.5 flex items-center gap-2">
           <span className="font-mono">{profile.key}</span>
           {fallbackCount > 0 && (
-            <span>{fallbackCount} fallback{fallbackCount > 1 ? 's' : ''}</span>
+            <span>
+              {fallbackCount} fallback{fallbackCount > 1 ? 's' : ''}
+            </span>
           )}
-          {profile.temperature !== undefined && (
-            <span>temp {profile.temperature}</span>
-          )}
-          {profile.systemPrompt && (
-            <span>custom prompt</span>
-          )}
+          {profile.temperature !== undefined && <span>temp {profile.temperature}</span>}
+          {profile.systemPrompt && <span>custom prompt</span>}
         </div>
       </div>
       <button type="button" onClick={onEdit} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
         <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
       </button>
-      <button type="button" onClick={onDelete} className="p-1 rounded hover:bg-destructive/10 transition-colors" title="Delete">
+      <button
+        type="button"
+        onClick={onDelete}
+        className="p-1 rounded hover:bg-destructive/10 transition-colors"
+        title="Delete"
+      >
         <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
       </button>
     </div>
@@ -284,7 +295,9 @@ const ProfileForm: FC<{
           }}
         >
           {models.map((m) => (
-            <option key={m.key} value={m.key}>{m.displayName}</option>
+            <option key={m.key} value={m.key}>
+              {m.displayName}
+            </option>
           ))}
         </select>
       </div>
@@ -440,11 +453,7 @@ const ProfileForm: FC<{
           </div>
 
           {/* Use Responses API */}
-          <Toggle
-            label="Use Responses API"
-            checked={useResponsesApi}
-            onChange={setUseResponsesApi}
-          />
+          <Toggle label="Use Responses API" checked={useResponsesApi} onChange={setUseResponsesApi} />
         </div>
       )}
 
@@ -473,5 +482,8 @@ const ProfileForm: FC<{
 };
 
 function toKey(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
 }

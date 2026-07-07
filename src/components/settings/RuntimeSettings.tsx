@@ -12,15 +12,16 @@ type AgentConfig = {
 
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   mastra: 'Built-in runtime with full Kai feature support (memory, observer, compaction, multi-provider models).',
-  'claude-agent-sdk': 'Anthropic\'s Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.',
-  'codex-sdk': 'OpenAI\'s Codex agent. Thread-based execution with session resume.',
+  'claude-agent-sdk':
+    "Anthropic's Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.",
+  'codex-sdk': "OpenAI's Codex agent. Thread-based execution with session resume.",
 };
 
 /** Sort order: available before offline, then by priority. */
 const RUNTIME_PRIORITY: Record<string, number> = {
   'claude-agent-sdk': 1,
   'codex-sdk': 2,
-  'mastra': 3,
+  mastra: 3,
 };
 
 function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
@@ -55,7 +56,9 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       await fetchRuntimes();
       if (cancelled) return;
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [agentConfig.runtime, fetchRuntimes]);
 
   const selectedRuntime = agentConfig.runtime;
@@ -75,7 +78,7 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       {/* Runtime selector */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Runtime</legend>
-        <div>
+        <div data-setting-id="agent.runtime">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Agent runtime</label>
           <select
             className={settingsSelectClass}
@@ -90,12 +93,11 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
         </div>
 
         {/* Runtime descriptions */}
-        {selectedRuntime !== 'auto' && (() => {
-          const desc = RUNTIME_DESCRIPTIONS[selectedRuntime];
-          return desc ? (
-            <p className="text-[10px] text-muted-foreground/80 italic">{desc}</p>
-          ) : null;
-        })()}
+        {selectedRuntime !== 'auto' &&
+          (() => {
+            const desc = RUNTIME_DESCRIPTIONS[selectedRuntime];
+            return desc ? <p className="text-[10px] text-muted-foreground/80 italic">{desc}</p> : null;
+          })()}
       </fieldset>
 
       {/* Availability */}
@@ -110,13 +112,11 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
                   key={rt.id}
                   className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/60 px-3 py-2"
                 >
-                  <span
-                    className={`h-2 w-2 rounded-full ${
-                      rt.available ? 'bg-green-500' : 'bg-red-500'
-                    }`}
-                  />
+                  <span className={`h-2 w-2 rounded-full ${rt.available ? 'bg-green-500' : 'bg-red-500'}`} />
                   <span className="text-xs font-medium flex-1">{rt.name}</span>
-                  <span className={`text-[10px] ${rt.available ? 'text-muted-foreground' : 'text-red-500 dark:text-red-400'}`}>
+                  <span
+                    className={`text-[10px] ${rt.available ? 'text-muted-foreground' : 'text-red-500 dark:text-red-400'}`}
+                  >
                     {rt.available ? 'Available' : 'Unavailable'}
                   </span>
                 </div>
@@ -130,6 +130,7 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Turn Limits</legend>
         <NumberField
+          id="agent.maxTurns"
           label="Max turns"
           value={agentConfig.maxTurns ?? 25}
           onChange={(v) => void updateConfig('agent.maxTurns', v > 0 ? v : undefined)}
@@ -137,12 +138,14 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           max={200}
         />
         <Toggle
+          id="agent.autoContinueOnMaxTurns"
           label="Auto-continue when max turns reached"
           checked={agentConfig.autoContinueOnMaxTurns ?? false}
           onChange={(v) => void updateConfig('agent.autoContinueOnMaxTurns', v)}
         />
         <p className="text-[10px] text-muted-foreground/80">
-          When auto-continue is enabled, the agent will automatically resume after hitting the turn limit instead of prompting you.
+          When auto-continue is enabled, the agent will automatically resume after hitting the turn limit instead of
+          prompting you.
         </p>
       </fieldset>
     </div>

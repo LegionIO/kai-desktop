@@ -86,7 +86,8 @@ const MAX_VAD_SILENCE_DURATION_MS = 5000;
 const PARTIAL_STRATEGY_DETAILS = {
   disabled: {
     label: 'Disabled',
-    summary: 'Shows partial speech in the overlay only. The final transcript is typed once when the target still looks safe.',
+    summary:
+      'Shows partial speech in the overlay only. The final transcript is typed once when the target still looks safe.',
     bestFor: 'Maximum safety in text fields that already contain important text.',
     tradeoff: 'No live text appears in the target app while you speak.',
   },
@@ -104,15 +105,18 @@ const PARTIAL_STRATEGY_DETAILS = {
   },
   'tail-only': {
     label: 'Tail only',
-    summary: 'Uses keyboard events for tail rewrites, but only after AX anchors the dictated span and verifies the result.',
+    summary:
+      'Uses keyboard events for tail rewrites, but only after AX anchors the dictated span and verifies the result.',
     bestFor: 'Lower-risk keyboard live typing when the app exposes an AX text range but direct replacement is flaky.',
     tradeoff: 'Skips live typing when AX cannot verify the exact dictated text.',
   },
   'full-patch': {
     label: 'Full patch',
-    summary: 'Uses cursor movement, forward delete, backspace, and insertion, even when AX cannot verify the text field.',
+    summary:
+      'Uses cursor movement, forward delete, backspace, and insertion, even when AX cannot verify the text field.',
     bestFor: 'Non-AX text fields and simple fields where cursor events are reliable.',
-    tradeoff: 'Highest corruption risk. In unreadable fields Kai cannot detect secure inputs or prove the cursor/text state.',
+    tradeoff:
+      'Highest corruption risk. In unreadable fields Kai cannot detect secure inputs or prove the cursor/text state.',
   },
 } as const;
 
@@ -135,7 +139,10 @@ const DEFAULT_PARTIAL_TYPING: Record<PartialTypingMode, PartialTypingStrategy> =
   kb: 'disabled',
 };
 
-function normalizePartialTypingStrategy(mode: PartialTypingMode, strategy: PartialTypingStrategy): PartialTypingStrategy {
+function normalizePartialTypingStrategy(
+  mode: PartialTypingMode,
+  strategy: PartialTypingStrategy,
+): PartialTypingStrategy {
   if (PARTIAL_STRATEGY_OPTIONS_BY_MODE[mode].includes(strategy)) return strategy;
   return mode === 'ax' ? 'full-replacement' : 'ax-verified';
 }
@@ -186,7 +193,10 @@ function getPartialTypingModeDescription(mode: PartialTypingMode): ReactNode {
         <div className="space-y-1.5">
           <p className="font-medium">Keyboard fallback</p>
           <p>KB/KX means Kai types synthetic keyboard events into the focused app.</p>
-          <p>It works in more places, but cursor position is harder to prove unless the selected strategy also verifies an AX range.</p>
+          <p>
+            It works in more places, but cursor position is harder to prove unless the selected strategy also verifies
+            an AX range.
+          </p>
         </div>
       );
   }
@@ -232,14 +242,20 @@ function PartialStrategyRow({
           onChange={(e) => onChange(e.target.value as PartialTypingStrategy)}
         >
           {options.map((strategy) => (
-            <option key={strategy} value={strategy}>{PARTIAL_STRATEGY_DETAILS[strategy].label}</option>
+            <option key={strategy} value={strategy}>
+              {PARTIAL_STRATEGY_DETAILS[strategy].label}
+            </option>
           ))}
         </select>
         <InfoTip
           content={
             <div className="space-y-1.5">
               <StrategyTooltipContent strategy={value} />
-              {modeNote && <p><span className="font-medium">In {getPartialTypingModeLabel(mode)}:</span> {modeNote}</p>}
+              {modeNote && (
+                <p>
+                  <span className="font-medium">In {getPartialTypingModeLabel(mode)}:</span> {modeNote}
+                </p>
+              )}
             </div>
           }
         />
@@ -248,7 +264,8 @@ function PartialStrategyRow({
   );
 }
 
-const tooltipClassName = 'z-50 max-w-xs rounded-lg bg-popover px-3 py-2 text-[11px] leading-relaxed text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95';
+const tooltipClassName =
+  'z-50 max-w-xs rounded-lg bg-popover px-3 py-2 text-[11px] leading-relaxed text-popover-foreground shadow-lg ring-1 ring-border/50 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95';
 
 function InfoTip({ content }: { content: ReactNode }) {
   return (
@@ -270,8 +287,12 @@ function StrategyTooltipContent({ strategy }: { strategy: PartialTypingStrategy 
     <div className="space-y-1.5">
       <p className="font-medium">{detail.label}</p>
       <p>{detail.summary}</p>
-      <p><span className="font-medium">Good for:</span> {detail.bestFor}</p>
-      <p><span className="font-medium">Tradeoff:</span> {detail.tradeoff}</p>
+      <p>
+        <span className="font-medium">Good for:</span> {detail.bestFor}
+      </p>
+      <p>
+        <span className="font-medium">Tradeoff:</span> {detail.tradeoff}
+      </p>
     </div>
   );
 }
@@ -287,11 +308,17 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
 
   // Load audio devices
   useEffect(() => {
-    app.mic.listDevices().then(setDevices).catch(() => {});
+    app.mic
+      .listDevices()
+      .then(setDevices)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
-    void app.dictation.getState().then((next) => setRuntimeState(next as DictationRuntimeState)).catch(() => {});
+    void app.dictation
+      .getState()
+      .then((next) => setRuntimeState(next as DictationRuntimeState))
+      .catch(() => {});
     return app.dictation.onStateChange((next) => setRuntimeState(next as DictationRuntimeState));
   }, []);
 
@@ -374,31 +401,31 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
     };
   }, [recordingHotkey, updateConfig]);
 
-  const updatePartialStrategy = useCallback((mode: PartialTypingMode, strategy: PartialTypingStrategy) => {
-    const next = { ...partialTyping, [mode]: normalizePartialTypingStrategy(mode, strategy) };
-    void updateConfig('dictation', {
-      enabled: dictation.enabled ?? false,
-      hotkey: dictation.hotkey ?? 'CommandOrControl+Shift+D',
-      mode: dictation.mode ?? 'toggle',
-      ...dictation,
-      partialTyping: next,
-      livePartials: hasEnabledPartialStrategy(next),
-    });
-  }, [dictation, partialTyping, updateConfig]);
+  const updatePartialStrategy = useCallback(
+    (mode: PartialTypingMode, strategy: PartialTypingStrategy) => {
+      const next = { ...partialTyping, [mode]: normalizePartialTypingStrategy(mode, strategy) };
+      void updateConfig('dictation', {
+        enabled: dictation.enabled ?? false,
+        hotkey: dictation.hotkey ?? 'CommandOrControl+Shift+D',
+        mode: dictation.mode ?? 'toggle',
+        ...dictation,
+        partialTyping: next,
+        livePartials: hasEnabledPartialStrategy(next),
+      });
+    },
+    [dictation, partialTyping, updateConfig],
+  );
 
-  const updateVadSilenceDuration = useCallback((value: number) => {
-    const clamped = Math.max(
-      MIN_VAD_SILENCE_DURATION_MS,
-      Math.min(MAX_VAD_SILENCE_DURATION_MS, Math.round(value)),
-    );
-    void updateConfig('dictation.vadSilenceDurationMs', clamped);
-  }, [updateConfig]);
+  const updateVadSilenceDuration = useCallback(
+    (value: number) => {
+      const clamped = Math.max(MIN_VAD_SILENCE_DURATION_MS, Math.min(MAX_VAD_SILENCE_DURATION_MS, Math.round(value)));
+      void updateConfig('dictation.vadSilenceDurationMs', clamped);
+    },
+    [updateConfig],
+  );
 
   const showHotkeyWarning = Boolean(
-    dictation.enabled
-    && runtimeState
-    && runtimeState.hotkeyRegistered === false
-    && runtimeState.hotkeyError,
+    dictation.enabled && runtimeState && runtimeState.hotkeyRegistered === false && runtimeState.hotkeyError,
   );
 
   return (
@@ -406,7 +433,8 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
       <div>
         <h3 className="text-sm font-semibold">Dictation Anywhere</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          System-wide voice dictation. Press a global hotkey to start speaking; Kai types only when the focused macOS text cursor can be verified.
+          System-wide voice dictation. Press a global hotkey to start speaking; Kai types only when the focused macOS
+          text cursor can be verified.
         </p>
       </div>
 
@@ -415,13 +443,14 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         <legend className="px-1 text-[10px] font-medium text-muted-foreground">General</legend>
 
         <Toggle
+          id="dictation.enabled"
           label="Enable Dictation Anywhere"
           checked={dictation.enabled ?? false}
           onChange={(v) => void updateConfig('dictation.enabled', v)}
         />
 
         {/* Speech Provider */}
-        <div>
+        <div data-setting-id="dictation.provider">
           <label className="text-[10px] text-muted-foreground block mb-1">Speech Recognition Provider</label>
           <select
             className={settingsSelectClass}
@@ -474,13 +503,11 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
 
         {/* Azure info note */}
         {(dictation.provider ?? 'azure') === 'azure' && (
-          <p className="text-[9px] text-muted-foreground pl-1">
-            Uses credentials from Audio &amp; Voice settings.
-          </p>
+          <p className="text-[9px] text-muted-foreground pl-1">Uses credentials from Audio &amp; Voice settings.</p>
         )}
 
         {/* Hotkey */}
-        <div>
+        <div data-setting-id="dictation.hotkey">
           <label className="text-[10px] text-muted-foreground block mb-1">Global Hotkey</label>
           <div className="flex items-center gap-2">
             <div className="flex-1 flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2.5">
@@ -488,13 +515,18 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               {recordingHotkey ? (
                 <span className="text-sm text-primary" style={{ fontFamily: 'system-ui' }}>
                   {heldModifiers.length > 0 ? (
-                    <>{prettifyHotkey(heldModifiers.join('+'))}<span className="ml-1 animate-pulse text-muted-foreground">+ …</span></>
+                    <>
+                      {prettifyHotkey(heldModifiers.join('+'))}
+                      <span className="ml-1 animate-pulse text-muted-foreground">+ …</span>
+                    </>
                   ) : (
                     <span className="animate-pulse">Press key combo…</span>
                   )}
                 </span>
               ) : (
-                <kbd className="text-sm tracking-wide text-foreground" style={{ fontFamily: 'system-ui' }}>{prettifyHotkey(hotkeyDisplay)}</kbd>
+                <kbd className="text-sm tracking-wide text-foreground" style={{ fontFamily: 'system-ui' }}>
+                  {prettifyHotkey(hotkeyDisplay)}
+                </kbd>
               )}
             </div>
             <button
@@ -514,7 +546,7 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         </div>
 
         {/* Mode */}
-        <div>
+        <div data-setting-id="dictation.mode">
           <label className="text-[10px] text-muted-foreground block mb-1">Activation Mode</label>
           <select
             className={settingsSelectClass}
@@ -532,7 +564,9 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               </div>
               <button
                 type="button"
-                onClick={() => { void app.computerUse.openLocalMacosPrivacySettings('input-monitoring'); }}
+                onClick={() => {
+                  void app.computerUse.openLocalMacosPrivacySettings('input-monitoring');
+                }}
                 className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border/70 bg-card/80 px-2 py-1 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
               >
                 <ExternalLinkIcon className="h-3 w-3" />
@@ -552,7 +586,10 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               content={
                 <div className="space-y-1.5">
                   <p className="font-medium">Partial typing</p>
-                  <p>Live text that appears before the final result. AX uses macOS Accessibility; KB/KX uses synthetic keyboard events as a fallback.</p>
+                  <p>
+                    Live text that appears before the final result. AX uses macOS Accessibility; KB/KX uses synthetic
+                    keyboard events as a fallback.
+                  </p>
                   <p>Final transcripts are typed once unless Kai cannot verify the target safely.</p>
                 </div>
               }
@@ -587,8 +624,12 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
                   </div>
                   <p className="mt-0.5 text-[10px] leading-relaxed text-muted-foreground">{detail.summary}</p>
                   <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-[9px] text-muted-foreground/80">
-                    <span><span className="font-medium text-muted-foreground">Best for:</span> {detail.bestFor}</span>
-                    <span><span className="font-medium text-muted-foreground">Tradeoff:</span> {detail.tradeoff}</span>
+                    <span>
+                      <span className="font-medium text-muted-foreground">Best for:</span> {detail.bestFor}
+                    </span>
+                    <span>
+                      <span className="font-medium text-muted-foreground">Tradeoff:</span> {detail.tradeoff}
+                    </span>
                   </div>
                 </div>
               );
@@ -607,12 +648,14 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         </legend>
 
         <Toggle
+          id="dictation.finalCleanupEnabled"
           label="Clean up final transcript"
           checked={dictation.finalCleanupEnabled ?? false}
           onChange={(v) => void updateConfig('dictation.finalCleanupEnabled', v)}
         />
         <p className="text-[10px] leading-relaxed text-muted-foreground pl-6">
-          Runs an LLM pass on the final result to fix recognition mistakes, punctuation, capitalization, filler words, and self-corrections before typing.
+          Runs an LLM pass on the final result to fix recognition mistakes, punctuation, capitalization, filler words,
+          and self-corrections before typing.
         </p>
       </fieldset>
 
@@ -661,6 +704,7 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         <legend className="px-1 text-[10px] font-medium text-muted-foreground">Recognition</legend>
 
         <SliderField
+          id="dictation.vadSilenceDurationMs"
           label={`VAD silence threshold: ${dictation.vadSilenceDurationMs ?? DEFAULT_VAD_SILENCE_DURATION_MS}ms`}
           value={dictation.vadSilenceDurationMs ?? DEFAULT_VAD_SILENCE_DURATION_MS}
           min={MIN_VAD_SILENCE_DURATION_MS}
@@ -673,7 +717,8 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
           <span>Longer pauses (5000ms)</span>
         </div>
         <p className="text-[9px] text-muted-foreground/70">
-          How long a silence must last before the speech service finalizes the current phrase. Takes effect on next dictation session.
+          How long a silence must last before the speech service finalizes the current phrase. Takes effect on next
+          dictation session.
         </p>
       </fieldset>
 
@@ -687,7 +732,8 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
           onChange={(v) => void updateConfig('dictation.debugLogging', v)}
         />
         <p className="text-[10px] leading-relaxed text-muted-foreground pl-6">
-          Prints detailed dictation diagnostics to stdout (visible in the terminal when running Kai from the command line). Useful for reporting bugs.
+          Prints detailed dictation diagnostics to stdout (visible in the terminal when running Kai from the command
+          line). Useful for reporting bugs.
         </p>
       </fieldset>
 

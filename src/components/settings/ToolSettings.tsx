@@ -42,22 +42,26 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Shell Tool</legend>
         <Toggle
+          id="tools.shell.enabled"
           label="Enabled"
           checked={tools.shell.enabled}
           onChange={(v) => updateConfig('tools.shell.enabled', v)}
         />
         <NumberField
+          id="tools.shell.timeout"
           label="Timeout (ms)"
           value={tools.shell.timeout}
           onChange={(v) => updateConfig('tools.shell.timeout', v)}
           min={0}
         />
         <PatternList
+          id="tools.shell.allowPatterns"
           label="Allow Patterns"
           patterns={tools.shell.allowPatterns}
           onChange={(patterns) => updateConfig('tools.shell.allowPatterns', patterns)}
         />
         <PatternList
+          id="tools.shell.denyPatterns"
           label="Deny Patterns"
           patterns={tools.shell.denyPatterns}
           onChange={(patterns) => updateConfig('tools.shell.denyPatterns', patterns)}
@@ -67,16 +71,19 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">File Access</legend>
         <Toggle
+          id="tools.fileAccess.enabled"
           label="Enabled"
           checked={tools.fileAccess.enabled}
           onChange={(v) => updateConfig('tools.fileAccess.enabled', v)}
         />
         <PatternList
+          id="tools.fileAccess.allowPaths"
           label="Allow Paths"
           patterns={tools.fileAccess.allowPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.allowPaths', patterns)}
         />
         <PatternList
+          id="tools.fileAccess.denyPaths"
           label="Deny Paths"
           patterns={tools.fileAccess.denyPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.denyPaths', patterns)}
@@ -92,6 +99,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Web Fetch</legend>
         <Toggle
+          id="tools.webFetch.enabled"
           label="Enabled"
           checked={tools.webFetch?.enabled !== false}
           onChange={(v) => updateConfig('tools.webFetch.enabled', v)}
@@ -107,6 +115,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Web Search</legend>
         <Toggle
+          id="tools.webSearch.enabled"
           label="Enabled"
           checked={tools.webSearch?.enabled !== false}
           onChange={(v) => updateConfig('tools.webSearch.enabled', v)}
@@ -122,6 +131,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Process Tool Streaming</legend>
         <Toggle
+          id="tools.processStreaming.enabled"
           label="Enabled"
           checked={tools.processStreaming.enabled}
           onChange={(v) => updateConfig('tools.processStreaming.enabled', v)}
@@ -144,6 +154,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           </select>
         </div>
         <NumberField
+          id="tools.processStreaming.maxOutputBytes"
           label="Max Output Bytes"
           value={tools.processStreaming.maxOutputBytes}
           onChange={(v) => updateConfig('tools.processStreaming.maxOutputBytes', v)}
@@ -175,7 +186,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           onChange={(v) => updateConfig('tools.processStreaming.headTailRatio', v)}
         />
 
-        <fieldset className="rounded-md border p-2 space-y-2">
+        <fieldset data-setting-id="tools.processStreaming.observer.enabled" className="rounded-md border p-2 space-y-2">
           <legend className="text-[10px] font-semibold px-1">Tool Observer</legend>
           <Toggle
             label="Enabled"
@@ -215,12 +226,14 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           Sub-agents allow the AI to delegate tasks to child agents that work autonomously.
         </p>
         <Toggle
+          id="tools.subAgents.enabled"
           label="Enabled"
           checked={subAgents?.enabled ?? true}
           onChange={(v) => updateConfig('tools.subAgents.enabled', v)}
         />
         <div className="grid grid-cols-2 gap-3">
           <NumberField
+            id="tools.subAgents.maxDepth"
             label="Max Nesting Depth (1-10)"
             value={subAgents?.maxDepth ?? 3}
             onChange={(v) => {
@@ -231,6 +244,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
             max={10}
           />
           <NumberField
+            id="tools.subAgents.maxConcurrent"
             label="Max Concurrent (1-20)"
             value={subAgents?.maxConcurrent ?? 5}
             onChange={(v) => {
@@ -266,7 +280,8 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
   );
 };
 
-const PatternList: FC<{ label: string; patterns: string[]; onChange: (patterns: string[]) => void }> = ({
+const PatternList: FC<{ id?: string; label: string; patterns: string[]; onChange: (patterns: string[]) => void }> = ({
+  id,
   label,
   patterns,
   onChange,
@@ -285,7 +300,7 @@ const PatternList: FC<{ label: string; patterns: string[]; onChange: (patterns: 
   };
 
   return (
-    <div>
+    <div data-setting-id={id}>
       <label className="text-[10px] text-muted-foreground block mb-1">{label}</label>
       <div className="space-y-1">
         {patterns.map((p, i) => (

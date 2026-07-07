@@ -39,8 +39,12 @@ type CatalogEntry = {
 
 type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts';
 
-export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab, focusNonce }) => {
   const [activeTab, setActiveTab] = useState<ModelTab>('profiles');
+
+  useEffect(() => {
+    if (focusTab) setActiveTab(focusTab as ModelTab);
+  }, [focusTab, focusNonce]);
 
   const tabs: Array<{ key: ModelTab; label: string }> = [
     { key: 'profiles', label: 'Profiles' },
@@ -148,11 +152,14 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
 
 type PromptKey = 'chat' | 'plan' | 'taskPlan' | 'computerUse' | 'realtimeInstructions';
 
-const DEFAULT_CHAT_PROMPT = 'You are Kai, a powerful local AI assistant with access to the user\'s computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you\'re doing and why.';
+const DEFAULT_CHAT_PROMPT =
+  "You are Kai, a powerful local AI assistant with access to the user's computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you're doing and why.";
 
-const DEFAULT_PLAN_PROMPT = 'You are a thorough planning assistant. Explore the codebase, understand the architecture, and create detailed implementation plans. Use only read-only tools to investigate. Ask the user to clarify requirements or preferences you cannot resolve from code alone. When your plan is ready, call exit_plan_mode with the full plan as markdown.';
+const DEFAULT_PLAN_PROMPT =
+  'You are a thorough planning assistant. Explore the codebase, understand the architecture, and create detailed implementation plans. Use only read-only tools to investigate. Ask the user to clarify requirements or preferences you cannot resolve from code alone. When your plan is ready, call exit_plan_mode with the full plan as markdown.';
 
-const DEFAULT_COMPUTER_USE_PROMPT = 'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
+const DEFAULT_COMPUTER_USE_PROMPT =
+  'You are an autopilot assistant controlling the computer on behalf of the user. Plan actions carefully, prefer navigation when URLs are obvious, and only mark a goal complete when the current screen confirms the final state.';
 
 // Note: this string is duplicated from electron/agent/prompts.ts (TASK_PLAN_SYSTEM_PROMPT).
 // Renderer code cannot import from Node/Electron modules — keep in sync manually.
@@ -185,16 +192,32 @@ Rules:
 
 const promptFields: Array<{ key: PromptKey; label: string; placeholder: string; configPath: string }> = [
   { key: 'chat', label: 'New Chat', placeholder: DEFAULT_CHAT_PROMPT, configPath: 'systemPrompt' },
-  { key: 'realtimeInstructions', label: 'Voice Chat', placeholder: 'You are a helpful assistant. Respond concisely and naturally in conversation.', configPath: 'realtime.instructions' },
+  {
+    key: 'realtimeInstructions',
+    label: 'Voice Chat',
+    placeholder: 'You are a helpful assistant. Respond concisely and naturally in conversation.',
+    configPath: 'realtime.instructions',
+  },
   { key: 'plan', label: 'Create Plan', placeholder: DEFAULT_PLAN_PROMPT, configPath: 'systemPrompts.plan' },
-  { key: 'taskPlan', label: 'Create Task', placeholder: DEFAULT_TASK_PLAN_PROMPT, configPath: 'systemPrompts.taskPlan' },
-  { key: 'computerUse', label: 'Computer Use', placeholder: DEFAULT_COMPUTER_USE_PROMPT, configPath: 'systemPrompts.computerUse' },
+  {
+    key: 'taskPlan',
+    label: 'Create Task',
+    placeholder: DEFAULT_TASK_PLAN_PROMPT,
+    configPath: 'systemPrompts.taskPlan',
+  },
+  {
+    key: 'computerUse',
+    label: 'Computer Use',
+    placeholder: DEFAULT_COMPUTER_USE_PROMPT,
+    configPath: 'systemPrompts.computerUse',
+  },
 ];
 
 const PromptsContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   const configPrompt = (config as { systemPrompt?: string }).systemPrompt ?? '';
   const configPrompts = (config as { systemPrompts?: Partial<Record<string, string>> }).systemPrompts ?? {};
-  const realtimeInstructions = ((config as Record<string, unknown>).realtime as { instructions?: string } | undefined)?.instructions ?? '';
+  const realtimeInstructions =
+    ((config as Record<string, unknown>).realtime as { instructions?: string } | undefined)?.instructions ?? '';
 
   return (
     <div className="space-y-4">
@@ -261,8 +284,13 @@ const PromptFieldset: FC<{
       <textarea
         className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs font-mono outline-none min-h-[100px] resize-y"
         value={draft}
-        onFocus={() => { isFocusedRef.current = true; }}
-        onBlur={() => { isFocusedRef.current = false; flush(draft); }}
+        onFocus={() => {
+          isFocusedRef.current = true;
+        }}
+        onBlur={() => {
+          isFocusedRef.current = false;
+          flush(draft);
+        }}
         onChange={(e) => handleChange(e.target.value)}
         placeholder={placeholder}
         rows={5}
@@ -294,7 +322,10 @@ const ModelCatalog: FC<{
               initial={m}
               providerKeys={providerKeys}
               providers={providers}
-              onSave={(entry) => { onUpdate(i, entry); setEditIndex(null); }}
+              onSave={(entry) => {
+                onUpdate(i, entry);
+                setEditIndex(null);
+              }}
               onCancel={() => setEditIndex(null)}
               submitLabel="Save"
             />
@@ -303,9 +334,13 @@ const ModelCatalog: FC<{
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-medium truncate">{formatModelDisplayName(m.displayName)}</span>
-                  <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5 shrink-0">{m.provider}</span>
+                  <span className="text-[10px] text-muted-foreground bg-muted rounded px-1.5 py-0.5 shrink-0">
+                    {m.provider}
+                  </span>
                   {m.computerUseSupport && m.computerUseSupport !== 'none' && (
-                    <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">Autopilot</span>
+                    <span className="text-[10px] text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">
+                      Autopilot
+                    </span>
                   )}
                 </div>
                 <div className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">
@@ -313,10 +348,20 @@ const ModelCatalog: FC<{
                   {m.maxInputTokens ? ` · ${Math.round(m.maxInputTokens / 1000)}k ctx` : ''}
                 </div>
               </div>
-              <button type="button" onClick={() => setEditIndex(i)} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
+              <button
+                type="button"
+                onClick={() => setEditIndex(i)}
+                className="p-1 rounded hover:bg-muted transition-colors"
+                title="Edit"
+              >
                 <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
-              <button type="button" onClick={() => onDelete(i)} className="p-1 rounded hover:bg-destructive/10 transition-colors" title="Delete">
+              <button
+                type="button"
+                onClick={() => onDelete(i)}
+                className="p-1 rounded hover:bg-destructive/10 transition-colors"
+                title="Delete"
+              >
                 <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
             </div>
@@ -329,7 +374,10 @@ const ModelCatalog: FC<{
           initial={{ key: '', displayName: '', provider: providerKeys[0] ?? '', modelName: '' }}
           providerKeys={providerKeys}
           providers={providers}
-          onSave={(entry) => { onAdd(entry); setShowAdd(false); }}
+          onSave={(entry) => {
+            onAdd(entry);
+            setShowAdd(false);
+          }}
           onCancel={() => setShowAdd(false)}
           submitLabel="Add Model"
         />
@@ -429,7 +477,9 @@ const ModelForm: FC<{
             onChange={(e) => setProvider(e.target.value)}
           >
             {providerKeys.map((p) => (
-              <option key={p} value={p}>{p}</option>
+              <option key={p} value={p}>
+                {p}
+              </option>
             ))}
           </select>
         </div>
@@ -477,7 +527,9 @@ const ModelForm: FC<{
           <select
             className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
             value={computerUseSupport}
-            onChange={(e) => setComputerUseSupport((e.target.value || 'none') as NonNullable<CatalogEntry['computerUseSupport']>)}
+            onChange={(e) =>
+              setComputerUseSupport((e.target.value || 'none') as NonNullable<CatalogEntry['computerUseSupport']>)
+            }
           >
             <option value="none">None</option>
             <option value="openai-responses">OpenAI Responses</option>
@@ -491,7 +543,9 @@ const ModelForm: FC<{
           <select
             className={settingsSelectClass.replace('bg-card/80', 'bg-background')}
             value={preferredTarget}
-            onChange={(e) => setPreferredTarget((e.target.value || 'isolated-browser') as NonNullable<CatalogEntry['preferredTarget']>)}
+            onChange={(e) =>
+              setPreferredTarget((e.target.value || 'isolated-browser') as NonNullable<CatalogEntry['preferredTarget']>)
+            }
           >
             <option value="isolated-browser">Isolated Browser</option>
             {app.platform.os === 'darwin' && <option value="local-macos">Local Mac</option>}
@@ -525,7 +579,10 @@ const ModelForm: FC<{
 };
 
 function toKey(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
 }
 
 function getProviderTypeLabel(type: string): string {
@@ -591,9 +648,7 @@ const ProviderCard: FC<{
 
       {provider.endpoint !== undefined && (
         <div>
-          <label className="text-[10px] text-muted-foreground block mb-0.5">
-            {isOllama ? 'Base URL' : 'Endpoint'}
-          </label>
+          <label className="text-[10px] text-muted-foreground block mb-0.5">{isOllama ? 'Base URL' : 'Endpoint'}</label>
           <EditableInput
             className="w-full rounded border bg-card px-2 py-1 text-xs font-mono"
             value={provider.endpoint ?? ''}
@@ -612,16 +667,10 @@ const ProviderCard: FC<{
       )}
 
       {!isOllama && provider.apiKey !== undefined && (
-        <PasswordField
-          label="API Key"
-          value={provider.apiKey}
-          onChange={(v) => updateConfig(`${prefix}.apiKey`, v)}
-        />
+        <PasswordField label="API Key" value={provider.apiKey} onChange={(v) => updateConfig(`${prefix}.apiKey`, v)} />
       )}
 
-      {isBedrock && (
-        <BedrockCredentials prefix={prefix} provider={provider} updateConfig={updateConfig} />
-      )}
+      {isBedrock && <BedrockCredentials prefix={prefix} provider={provider} updateConfig={updateConfig} />}
     </fieldset>
   );
 };
@@ -657,7 +706,8 @@ const BedrockCredentials: FC<{
 
       {useDefault ? (
         <p className="text-[10px] text-muted-foreground bg-muted/50 rounded px-2 py-1">
-          Credentials resolved automatically via AWS_PROFILE, environment variables, shared credentials file, or instance metadata.
+          Credentials resolved automatically via AWS_PROFILE, environment variables, shared credentials file, or
+          instance metadata.
         </p>
       ) : (
         <fieldset className="rounded-md border p-2 space-y-2">

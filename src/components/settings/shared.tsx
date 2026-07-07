@@ -4,19 +4,39 @@ import { ChevronDownIcon, ChevronRightIcon } from 'lucide-react';
 export type SettingsProps = {
   config: Record<string, unknown>;
   updateConfig: (path: string, value: unknown) => Promise<void>;
+  /** When set, tabbed panels should switch to this inner tab (used by settings search navigation). */
+  focusTab?: string;
+  /** Changes on every search navigation so `focusTab` effects re-fire even for the same tab value. */
+  focusNonce?: number;
 };
 
-export const settingsSelectClass = 'app-settings-select w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none';
+export const settingsSelectClass =
+  'app-settings-select w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none';
 
-export const Toggle: FC<{ label: string; checked: boolean; onChange: (value: boolean) => void }> = ({ label, checked, onChange }) => (
-  <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2">
+export const Toggle: FC<{ id?: string; label: string; checked: boolean; onChange: (value: boolean) => void }> = ({
+  id,
+  label,
+  checked,
+  onChange,
+}) => (
+  <label
+    data-setting-id={id}
+    className="flex cursor-pointer items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2"
+  >
     <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="rounded" />
     <span className="text-xs">{label}</span>
   </label>
 );
 
-export const NumberField: FC<{ label: string; value: number; onChange: (value: number) => void; min?: number; max?: number }> = ({ label, value, onChange, min, max }) => (
-  <div>
+export const NumberField: FC<{
+  id?: string;
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  min?: number;
+  max?: number;
+}> = ({ id, label, value, onChange, min, max }) => (
+  <div data-setting-id={id}>
     <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
     <input
       type="number"
@@ -38,8 +58,16 @@ export function headTailLabel(prefix: string, ratio: number): string {
   return `${prefix}: ${head}% head, ${tail}% tail`;
 }
 
-export const SliderField: FC<{ label: string; value: number; min: number; max: number; step: number; onChange: (value: number) => void }> = ({ label, value, min, max, step, onChange }) => (
-  <div>
+export const SliderField: FC<{
+  id?: string;
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: number) => void;
+}> = ({ id, label, value, min, max, step, onChange }) => (
+  <div data-setting-id={id}>
     <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
     <input
       type="range"
@@ -59,13 +87,14 @@ export const SliderField: FC<{ label: string; value: number; min: number; max: n
  * Prevents cursor-jump issues caused by async config round-trips.
  */
 export const TextField: FC<{
+  id?: string;
   label: string;
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   mono?: boolean;
   hint?: string;
-}> = ({ label, value, onChange, placeholder, mono, hint }) => {
+}> = ({ id, label, value, onChange, placeholder, mono, hint }) => {
   const [local, setLocal] = useState(value);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusedRef = useRef(false);
@@ -88,15 +117,20 @@ export const TextField: FC<{
   };
 
   return (
-    <div>
+    <div data-setting-id={id}>
       <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
       <input
         type="text"
         className={`w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none${mono ? ' font-mono' : ''}`}
         value={local}
         onChange={(e) => handleChange(e.target.value)}
-        onFocus={() => { focusedRef.current = true; }}
-        onBlur={() => { focusedRef.current = false; flush(local); }}
+        onFocus={() => {
+          focusedRef.current = true;
+        }}
+        onBlur={() => {
+          focusedRef.current = false;
+          flush(local);
+        }}
         placeholder={placeholder}
       />
       {hint && <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">{hint}</span>}
@@ -104,12 +138,21 @@ export const TextField: FC<{
   );
 };
 
-export const CollapsibleSection: FC<{ title: string; defaultOpen?: boolean; children: ReactNode }> = ({ title, defaultOpen = false, children }) => {
+export const CollapsibleSection: FC<{ id?: string; title: string; defaultOpen?: boolean; children: ReactNode }> = ({
+  id,
+  title,
+  defaultOpen = false,
+  children,
+}) => {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <fieldset className="rounded-lg border p-3 space-y-3">
+    <fieldset data-setting-id={id} className="rounded-lg border p-3 space-y-3">
       <legend className="text-xs font-semibold px-1">
-        <button type="button" onClick={() => setOpen(!open)} className="inline-flex items-center gap-1 transition-colors hover:text-foreground">
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          className="inline-flex items-center gap-1 transition-colors hover:text-foreground"
+        >
           {open ? <ChevronDownIcon className="h-3 w-3" /> : <ChevronRightIcon className="h-3 w-3" />}
           {title}
         </button>

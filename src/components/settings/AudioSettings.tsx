@@ -189,18 +189,19 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
   const [inputDevices, setInputDevices] = useState<Array<{ deviceId: string; label: string }>>([]);
 
   const isWebBridge = Boolean(
-    (window as unknown as Record<string, unknown>).app &&
-    (window.app as Record<string, unknown>).__isWebBridge,
+    (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
   );
 
   // Load available input devices
   useEffect(() => {
     if (isWebBridge) {
-      WebAudioMonitor.getInstance().listInputDevices()
+      WebAudioMonitor.getInstance()
+        .listInputDevices()
         .then(setInputDevices)
         .catch(() => setInputDevices([]));
     } else {
-      window.app?.mic?.listDevices?.()
+      window.app?.mic
+        ?.listDevices?.()
         .then(setInputDevices)
         .catch(() => setInputDevices([]));
     }
@@ -216,7 +217,10 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
     if (!micTesting) {
       // Cleanup
       if (!isWebBridge) window.app?.mic?.stopMonitor?.();
-      if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+      if (micTimerRef.current) {
+        clearInterval(micTimerRef.current);
+        micTimerRef.current = null;
+      }
       webMonitorUnsubRef.current?.();
       webMonitorUnsubRef.current = null;
       setMicLevel(0);
@@ -233,7 +237,10 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
         setMicLevel(levels[deviceId] ?? 0);
       }, 66);
       return () => {
-        if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+        if (micTimerRef.current) {
+          clearInterval(micTimerRef.current);
+          micTimerRef.current = null;
+        }
         webMonitorUnsubRef.current?.();
         webMonitorUnsubRef.current = null;
       };
@@ -242,14 +249,20 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
       if (!mic) return;
       mic.startMonitor([deviceId]).then(() => {
         micTimerRef.current = setInterval(() => {
-          mic.getLevel().then((levels) => {
-            setMicLevel(levels[deviceId] ?? 0);
-          }).catch(() => setMicLevel(0));
+          mic
+            .getLevel()
+            .then((levels) => {
+              setMicLevel(levels[deviceId] ?? 0);
+            })
+            .catch(() => setMicLevel(0));
         }, 66);
       });
       return () => {
         mic.stopMonitor();
-        if (micTimerRef.current) { clearInterval(micTimerRef.current); micTimerRef.current = null; }
+        if (micTimerRef.current) {
+          clearInterval(micTimerRef.current);
+          micTimerRef.current = null;
+        }
       };
     }
   }, [micTesting, isWebBridge, recording?.inputDeviceId]);
@@ -279,8 +292,8 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
         <div>
           <h3 className="text-sm font-semibold">Audio</h3>
           <p className="text-xs text-muted-foreground mt-1">
-            Configure text-to-speech and voice recording. Choose between your OS&apos;s
-            built-in speech services or Azure AI Speech Service.
+            Configure text-to-speech and voice recording. Choose between your OS&apos;s built-in speech services or
+            Azure AI Speech Service.
           </p>
         </div>
       )}
@@ -288,7 +301,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
       {/* ── Provider Selector ── */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Provider</legend>
-        <div>
+        <div data-setting-id="audio.provider">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Speech Provider</label>
           <select
             className={settingsSelectClass}
@@ -302,15 +315,14 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
       </fieldset>
 
       {/* ── Azure Configuration ── */}
-      {provider === 'azure' && (
-        <AzureConfigPanel azure={azure} updateConfig={updateConfig} />
-      )}
+      {provider === 'azure' && <AzureConfigPanel azure={azure} updateConfig={updateConfig} />}
 
       {/* ── Text-to-Speech ── */}
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Text-to-Speech</legend>
 
         <Toggle
+          id="audio.tts.enabled"
           label="Enable text-to-speech"
           checked={tts?.enabled ?? true}
           onChange={(v) => updateConfig('audio.tts.enabled', v)}
@@ -319,7 +331,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
         {(tts?.enabled ?? true) && provider === 'native' && (
           <div className="space-y-3 pl-1">
             {/* Voice Selection */}
-            <div>
+            <div data-setting-id="audio.tts.voice">
               <label className="text-[10px] text-muted-foreground block mb-0.5">Voice</label>
               <select
                 className={settingsSelectClass}
@@ -342,6 +354,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
 
             {/* Rate Slider */}
             <SliderField
+              id="audio.tts.rate"
               label={`Speed: ${(tts?.rate ?? 1).toFixed(1)}x`}
               value={tts?.rate ?? 1}
               min={0.5}
@@ -351,11 +364,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
             />
 
             {/* Native Voice Preview */}
-            <VoicePreviewButton
-              provider="native"
-              nativeVoice={tts?.voice}
-              nativeRate={tts?.rate}
-            />
+            <VoicePreviewButton provider="native" nativeVoice={tts?.voice} nativeRate={tts?.rate} />
           </div>
         )}
       </fieldset>
@@ -365,6 +374,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
         <legend className="text-xs font-semibold px-1">Voice Recording</legend>
 
         <Toggle
+          id="audio.recording.enabled"
           label="Enable voice recording"
           checked={recording?.enabled ?? true}
           onChange={(v) => updateConfig('audio.recording.enabled', v)}
@@ -373,7 +383,7 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
         {(recording?.enabled ?? true) && (
           <div className="space-y-3 pl-1">
             {/* Input Device */}
-            <div>
+            <div data-setting-id="audio.recording.inputDeviceId">
               <label className="text-[10px] text-muted-foreground block mb-0.5">Input Device</label>
               <select
                 className={settingsSelectClass}
@@ -381,16 +391,16 @@ export const AudioSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ con
                 onChange={(e) => updateConfig('audio.recording.inputDeviceId', e.target.value || undefined)}
               >
                 <option value="">System Default</option>
-                {inputDevices.filter(d => d.deviceId !== 'default').map((d) => (
-                  <option key={d.deviceId} value={d.deviceId}>
-                    {d.label}
-                  </option>
-                ))}
+                {inputDevices
+                  .filter((d) => d.deviceId !== 'default')
+                  .map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label}
+                    </option>
+                  ))}
               </select>
               {inputDevices.length === 0 && (
-                <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">
-                  No input devices found.
-                </span>
+                <span className="text-[10px] text-muted-foreground/60 mt-0.5 block">No input devices found.</span>
               )}
             </div>
 
@@ -487,15 +497,17 @@ const AzureConfigPanel: FC<{
   const hasKey = Boolean(azure?.subscriptionKey);
 
   return (
-    <fieldset className="rounded-lg border p-3 space-y-3">
+    <fieldset data-setting-id="audio.azure.subscriptionKey" className="rounded-lg border p-3 space-y-3">
       <legend className="text-xs font-semibold px-1">
         <span className="inline-flex items-center gap-2">
           Azure AI Configuration
-          <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
-            hasKey
-              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-          }`}>
+          <span
+            className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
+              hasKey
+                ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+            }`}
+          >
             {hasKey ? '✓ Key set' : '⚠ Key missing'}
           </span>
         </span>
@@ -503,7 +515,8 @@ const AzureConfigPanel: FC<{
 
       {!hasKey && (
         <p className="text-[10px] text-amber-600/80 dark:text-amber-400/80">
-          Enter a subscription key to enable Azure AI Speech. Without one, TTS and voice recording will fall back to native.
+          Enter a subscription key to enable Azure AI Speech. Without one, TTS and voice recording will fall back to
+          native.
         </p>
       )}
 
@@ -516,7 +529,7 @@ const AzureConfigPanel: FC<{
       />
 
       {/* Region */}
-      <div>
+      <div data-setting-id="audio.azure.region">
         <label className="text-[10px] text-muted-foreground block mb-0.5">Region</label>
         <input
           type="text"
@@ -547,7 +560,9 @@ const AzureConfigPanel: FC<{
 
       <div className="flex items-center gap-2 pt-1 pb-1">
         <div className="flex-1 h-px bg-border/40" />
-        <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/60">TTS Options</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/60">
+          TTS Options
+        </span>
         <div className="flex-1 h-px bg-border/40" />
       </div>
 
@@ -588,7 +603,9 @@ const AzureConfigPanel: FC<{
 
       <div className="flex items-center gap-2 pt-1 pb-1">
         <div className="flex-1 h-px bg-border/40" />
-        <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/60">STT Options</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/60">
+          STT Options
+        </span>
         <div className="flex-1 h-px bg-border/40" />
       </div>
 
@@ -625,10 +642,7 @@ const AzureVoiceCombobox: FC<{
   const listRef = useRef<HTMLDivElement>(null);
 
   // Find the current voice in the catalog
-  const currentVoice = useMemo(
-    () => AZURE_NEURAL_VOICES.find((v) => v.name === value),
-    [value],
-  );
+  const currentVoice = useMemo(() => AZURE_NEURAL_VOICES.find((v) => v.name === value), [value]);
 
   // Filter voices by query (matches on name, displayName, or locale)
   const filtered = useMemo(() => {
@@ -734,7 +748,10 @@ const AzureVoiceCombobox: FC<{
           <button
             type="button"
             className="p-0.5 rounded text-muted-foreground/60 hover:text-foreground transition-colors"
-            onClick={() => { setQuery(''); inputRef.current?.focus(); }}
+            onClick={() => {
+              setQuery('');
+              inputRef.current?.focus();
+            }}
             tabIndex={-1}
           >
             <XIcon className="h-3 w-3" />
@@ -743,11 +760,7 @@ const AzureVoiceCombobox: FC<{
       </div>
 
       {/* Current value chip (shown below input when closed) */}
-      {!open && (
-        <span className="text-[10px] text-muted-foreground/60 mt-0.5 block font-mono">
-          {value}
-        </span>
-      )}
+      {!open && <span className="text-[10px] text-muted-foreground/60 mt-0.5 block font-mono">{value}</span>}
 
       {/* Dropdown */}
       {open && (
@@ -763,7 +776,10 @@ const AzureVoiceCombobox: FC<{
               className={`flex w-full items-center gap-2 px-3 py-2 text-xs text-left transition-colors ${
                 highlightIdx === 0 ? 'bg-primary/10 text-primary' : 'hover:bg-muted/60'
               }`}
-              onPointerDown={(e) => { e.preventDefault(); selectVoice(query.trim()); }}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                selectVoice(query.trim());
+              }}
             >
               <span className="font-mono font-medium">{query.trim()}</span>
               <span className="text-muted-foreground/60 text-[10px]">Custom voice name</span>
@@ -782,22 +798,27 @@ const AzureVoiceCombobox: FC<{
                   className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors ${
                     idx === highlightIdx ? 'bg-primary/10 text-primary' : 'hover:bg-muted/60'
                   } ${v.name === value ? 'font-medium' : ''}`}
-                  onPointerDown={(e) => { e.preventDefault(); selectVoice(v.name); }}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    selectVoice(v.name);
+                  }}
                 >
                   <span className="min-w-0 truncate">
                     <span className="font-medium">{v.displayName}</span>
                     <span className="text-muted-foreground/70"> ({v.locale})</span>
                   </span>
-                  <span className={`shrink-0 text-[9px] px-1 py-0.5 rounded ${
-                    v.gender === 'Female' ? 'bg-pink-500/10 text-pink-500' :
-                    v.gender === 'Male' ? 'bg-blue-500/10 text-blue-500' :
-                    'bg-gray-500/10 text-gray-500'
-                  }`}>
+                  <span
+                    className={`shrink-0 text-[9px] px-1 py-0.5 rounded ${
+                      v.gender === 'Female'
+                        ? 'bg-pink-500/10 text-pink-500'
+                        : v.gender === 'Male'
+                          ? 'bg-blue-500/10 text-blue-500'
+                          : 'bg-gray-500/10 text-gray-500'
+                    }`}
+                  >
                     {v.gender}
                   </span>
-                  {v.name === value && (
-                    <span className="shrink-0 text-[9px] text-primary">✓</span>
-                  )}
+                  {v.name === value && <span className="shrink-0 text-[9px] text-primary">✓</span>}
                 </button>
               );
             })

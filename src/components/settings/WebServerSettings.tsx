@@ -54,6 +54,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Server</legend>
         <Toggle
+          id="webServer.enabled"
           label="Enable Web UI server"
           checked={ws.enabled}
           onChange={(v) => updateConfig('webServer.enabled', v)}
@@ -62,6 +63,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
         {ws.enabled && (
           <>
             <NumberField
+              id="webServer.port"
               label="Port"
               value={ws.port}
               onChange={(v) => {
@@ -71,6 +73,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
               max={65535}
             />
             <TextField
+              id="webServer.bindAddress"
               label="Bind Address"
               value={ws.bindAddress ?? '0.0.0.0'}
               onChange={(v) => updateConfig('webServer.bindAddress', v)}
@@ -92,17 +95,19 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
           <fieldset className="rounded-lg border p-3 space-y-3">
             <legend className="text-xs font-semibold px-1">TLS / HTTPS</legend>
             <Toggle
+              id="webServer.tls.enabled"
               label="Enable HTTPS"
               checked={ws.tls.enabled}
               onChange={(v) => updateConfig('webServer.tls.enabled', v)}
             />
             <p className="text-[10px] text-muted-foreground">
-              HTTPS is required for microphone access (voice recording, realtime calls) when connecting from other devices.
+              HTTPS is required for microphone access (voice recording, realtime calls) when connecting from other
+              devices.
             </p>
 
             {ws.tls.enabled && (
               <div className="space-y-3 pl-1">
-                <div>
+                <div data-setting-id="webServer.tls.mode">
                   <label className="text-[10px] text-muted-foreground block mb-0.5">Certificate Mode</label>
                   <select
                     className={settingsSelectClass}
@@ -145,7 +150,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
 
           <fieldset className="rounded-lg border p-3 space-y-3">
             <legend className="text-xs font-semibold px-1">Authentication</legend>
-            <div>
+            <div data-setting-id="webServer.auth.mode">
               <label className="text-[10px] text-muted-foreground block mb-0.5">Access Mode</label>
               <select
                 className={settingsSelectClass}
@@ -171,7 +176,7 @@ export const WebServerSettings: FC<SettingsProps> = ({ config, updateConfig }) =
                   onChange={(v) => updateConfig('webServer.auth.username', v)}
                   placeholder="kai"
                 />
-                <div>
+                <div data-setting-id="webServer.auth.password">
                   <label className="text-[10px] text-muted-foreground block mb-0.5">Password</label>
                   <div className="flex gap-1.5">
                     <input

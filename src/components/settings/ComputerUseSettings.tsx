@@ -474,6 +474,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">General</legend>
         <Toggle
+          id="computerUse.enabled"
           label="Enabled"
           checked={computerUse.enabled}
           onChange={(value) => updateConfig('computerUse.enabled', value)}
@@ -495,7 +496,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
               <option value="window">Detached window</option>
             </select>
           </div>
-          <div>
+          <div data-setting-id="computerUse.defaultTarget">
             <label className="text-[10px] text-muted-foreground block mb-0.5">Default Target</label>
             <select
               className={settingsSelectClass}
@@ -512,7 +513,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
               </option>
             </select>
           </div>
-          <div>
+          <div data-setting-id="computerUse.approvalModeDefault">
             <label className="text-[10px] text-muted-foreground block mb-0.5">Approval Mode</label>
             <select
               className={settingsSelectClass}
@@ -538,6 +539,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
             </select>
           </div>
           <NumberField
+            id="computerUse.idleTimeoutSec"
             label="Idle Timeout (sec)"
             value={computerUse.idleTimeoutSec}
             onChange={(value) => updateConfig('computerUse.idleTimeoutSec', value)}
@@ -551,6 +553,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
             max={5000}
           />
           <NumberField
+            id="computerUse.maxSessionDurationMin"
             label="Max Session Duration (min)"
             value={computerUse.maxSessionDurationMin}
             onChange={(value) => updateConfig('computerUse.maxSessionDurationMin', value)}
@@ -559,7 +562,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         </div>
       </fieldset>
 
-      <fieldset className="rounded-lg border p-3 space-y-3">
+      <fieldset data-setting-id="computerUse.models" className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Model Assignments</legend>
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
           Override the default model for each session role. Leave on "Inherit" to use whatever model is selected in the
@@ -593,6 +596,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         <legend className="text-xs font-semibold px-1">Safety</legend>
         <div className="grid grid-cols-2 gap-2">
           <Toggle
+            id="computerUse.safety.pauseOnTerminal"
             label="Pause on Terminal actions"
             checked={computerUse.safety.pauseOnTerminal}
             onChange={(value) => updateConfig('computerUse.safety.pauseOnTerminal', value)}
@@ -624,19 +628,23 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
               onChange={(value) => updateConfig('computerUse.localMacos.autoOpenPrivacySettings', value)}
             />
           </div>
-          <DisplayListPicker
-            label="Allowed Displays"
-            value={computerUse.localMacos.allowedDisplays ?? []}
-            onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)}
-            onDisplaysDiscovered={handleDisplaysDiscovered}
-            hint="Select which displays autopilot can capture. All displays are enabled by default."
-          />
-          <AppListPicker
-            label="Capture Excluded Apps"
-            value={computerUse.localMacos.captureExcludedApps ?? []}
-            onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)}
-            hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID."
-          />
+          <div data-setting-id="computerUse.localMacos.allowedDisplays">
+            <DisplayListPicker
+              label="Allowed Displays"
+              value={computerUse.localMacos.allowedDisplays ?? []}
+              onChange={(value) => updateConfig('computerUse.localMacos.allowedDisplays', value)}
+              onDisplaysDiscovered={handleDisplaysDiscovered}
+              hint="Select which displays autopilot can capture. All displays are enabled by default."
+            />
+          </div>
+          <div data-setting-id="computerUse.localMacos.captureExcludedApps">
+            <AppListPicker
+              label="Capture Excluded Apps"
+              value={computerUse.localMacos.captureExcludedApps ?? []}
+              onChange={(value) => updateConfig('computerUse.localMacos.captureExcludedApps', value)}
+              hint="Apps hidden from screenshots via ScreenCaptureKit. Our own app is always excluded by process ID."
+            />
+          </div>
         </fieldset>
       )}
 
@@ -646,6 +654,7 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
           Shows a status bar on your screen during Local Mac sessions. Excluded from screenshots via ScreenCaptureKit.
         </div>
         <Toggle
+          id="computerUse.overlay.enabled"
           label="Enabled"
           checked={computerUse.overlay.enabled}
           onChange={(value) => updateConfig('computerUse.overlay.enabled', value)}
@@ -683,12 +692,13 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
         )}
       </fieldset>
 
-      <CollapsibleSection title="Capture (Advanced)">
+      <CollapsibleSection id="computerUse.capture" title="Capture (Advanced)">
         <div className="rounded-md border border-border/60 bg-card/50 px-3 py-2 text-xs text-muted-foreground">
           Fine-tune screenshot capture. Most users can leave these at defaults.
         </div>
         <div className="grid grid-cols-2 gap-3">
           <NumberField
+            id="computerUse.capture.maxDimension"
             label="Max Dimension (px)"
             value={computerUse.capture.maxDimension}
             onChange={(value) => updateConfig('computerUse.capture.maxDimension', value)}

@@ -14,7 +14,7 @@ export const MastraRuntimeSettings: FC<SettingsProps> = ({ config, updateConfig 
   ];
 
   return (
-    <CollapsibleSection title="Advanced Runtime Config" defaultOpen={false}>
+    <CollapsibleSection id="mastra.advanced" title="Advanced Runtime Config" defaultOpen={false}>
       <p className="text-[10px] text-muted-foreground">
         Memory and compaction apply to the Mastra runtime only. Claude and Codex manage context internally.
       </p>

@@ -55,25 +55,33 @@ export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         )}
       </div>
 
-      <Toggle label="Enable App Shots" checked={cfg.enabled ?? false} onChange={(v) => set('enabled', v)} />
+      <Toggle
+        id="appShots.enabled"
+        label="Enable App Shots"
+        checked={cfg.enabled ?? false}
+        onChange={(v) => set('enabled', v)}
+      />
 
       <Toggle
+        id="appShots.autoAttach"
         label="Auto-attach to active chat (otherwise paste from clipboard)"
         checked={cfg.autoAttach ?? false}
         onChange={(v) => set('autoAttach', v)}
       />
 
-      <HotkeyRecorder
-        label="Global shortcut"
-        value={cfg.hotkey ?? 'CommandOrControl+Shift+1'}
-        onChange={(accelerator) => set('hotkey', accelerator)}
-        onRecordingStart={() => {
-          void app.appShots.suspendHotkey();
-        }}
-        onRecordingEnd={() => {
-          void app.appShots.resumeHotkey();
-        }}
-      />
+      <div data-setting-id="appShots.hotkey">
+        <HotkeyRecorder
+          label="Global shortcut"
+          value={cfg.hotkey ?? 'CommandOrControl+Shift+1'}
+          onChange={(accelerator) => set('hotkey', accelerator)}
+          onRecordingStart={() => {
+            void app.appShots.suspendHotkey();
+          }}
+          onRecordingEnd={() => {
+            void app.appShots.resumeHotkey();
+          }}
+        />
+      </div>
 
       <div>
         <label className="text-[10px] text-muted-foreground block mb-0.5">Capture mode</label>
@@ -94,6 +102,7 @@ export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           onChange={(v) => set('includeSelectedText', v)}
         />
         <Toggle
+          id="appShots.includeUiTree"
           label="Include UI element tree"
           checked={cfg.includeUiTree ?? true}
           onChange={(v) => set('includeUiTree', v)}

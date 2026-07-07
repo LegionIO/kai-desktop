@@ -578,3 +578,20 @@ html:not(.dark) .app-gradient-text {
 html:not(.dark) .thinking-verb-shimmer {
   animation: verb-glow-light 3s ease-in-out infinite;
 }
+
+@keyframes settings-highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--brand-accent-glow, rgba(99, 102, 241, 0.5));
+  }
+  40% {
+    box-shadow: 0 0 0 6px var(--brand-accent-glow, rgba(99, 102, 241, 0.35));
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.settings-highlight {
+  animation: settings-highlight-pulse 1.5s ease-out;
+  border-radius: 0.75rem;
+}

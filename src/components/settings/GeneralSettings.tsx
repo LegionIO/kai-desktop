@@ -31,6 +31,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Startup</legend>
         <Toggle
+          id="launchAtLogin"
           label="Launch at login"
           checked={!!config.launchAtLogin}
           onChange={(v) => updateConfig('launchAtLogin', v)}
@@ -40,7 +41,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Appearance</legend>
 
-        <div>
+        <div data-setting-id="ui.theme">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Color scheme</label>
           <select
             className={settingsSelectClass}
@@ -53,7 +54,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
           </select>
         </div>
 
-        <div>
+        <div data-setting-id="ui.splashBackground">
           <label className="text-[10px] text-muted-foreground block mb-0.5">Splash background</label>
           <select
             className={settingsSelectClass}
@@ -71,6 +72,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Layout</label>
           <Toggle
+            id="ui.fullWidthContent"
             label="Full width content"
             checked={!!ui.fullWidthContent}
             onChange={(v) => updateConfig('ui.fullWidthContent', v)}
@@ -81,6 +83,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Chat Titles</legend>
         <Toggle
+          id="titleGeneration.enabled"
           label="Auto-generate chat titles"
           checked={titleGenEnabled}
           onChange={(v) => updateConfig('titleGeneration.enabled', v)}
@@ -93,6 +96,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Advanced</legend>
         <Toggle
+          id="ui.composer.showModelProfileSelector"
           label="Show model & profile selector in composer"
           checked={!!ui.composer?.showModelProfileSelector}
           onChange={(v) => updateConfig('ui.composer.showModelProfileSelector', v)}
@@ -179,7 +183,7 @@ const PartitionManager: FC = () => {
   const targetNames = selected.size > 0 ? Array.from(selected) : partitions.map((p) => p.name);
 
   return (
-    <fieldset className="rounded-lg border border-destructive/30 p-3 space-y-3">
+    <fieldset data-setting-id="partitions" className="rounded-lg border border-destructive/30 p-3 space-y-3">
       <legend className="text-xs font-semibold px-1 text-destructive flex items-center gap-1">
         <HardDriveIcon className="h-3 w-3" />
         Browser Partitions

@@ -1,4 +1,4 @@
-import { useState, type FC } from 'react';
+import { useState, useEffect, type FC } from 'react';
 import { EyeIcon, EyeOffIcon } from 'lucide-react';
 import type { SettingsProps } from './shared';
 import { Toggle, NumberField, settingsSelectClass } from './shared';
@@ -77,7 +77,7 @@ const ProviderConfigSection: FC<{
     <fieldset className="rounded-lg border p-3 space-y-3">
       <legend className="text-xs font-semibold px-1">Provider</legend>
 
-      <Toggle label={enableLabel} checked={enabled} onChange={onEnableChange} />
+      <Toggle id={`${prefix}.enabled`} label={enableLabel} checked={enabled} onChange={onEnableChange} />
 
       {/* Provider Selector */}
       <div>
@@ -209,7 +209,7 @@ const ImageOptions: FC<{
     <legend className="text-xs font-semibold px-1">Image Options</legend>
 
     <div className="grid grid-cols-2 gap-3">
-      <div>
+      <div data-setting-id="imageGeneration.size">
         <label className="text-[10px] text-muted-foreground block mb-0.5">Size</label>
         <select
           className={settingsSelectClass}
@@ -223,7 +223,7 @@ const ImageOptions: FC<{
         </select>
       </div>
 
-      <div>
+      <div data-setting-id="imageGeneration.quality">
         <label className="text-[10px] text-muted-foreground block mb-0.5">Quality</label>
         <select
           className={settingsSelectClass}
@@ -284,7 +284,7 @@ const VideoOptions: FC<{
         </select>
       </div>
 
-      <div>
+      <div data-setting-id="videoGeneration.duration">
         <label className="text-[10px] text-muted-foreground block mb-0.5">Duration</label>
         <select
           className={settingsSelectClass}
@@ -319,8 +319,13 @@ const configKeys: Record<MediaTab, string> = {
   video: 'videoGeneration',
 };
 
-export const MediaGenerationSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const MediaGenerationSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab, focusNonce }) => {
   const [activeTab, setActiveTab] = useState<MediaTab>('image');
+
+  useEffect(() => {
+    if (focusTab) setActiveTab(focusTab as MediaTab);
+  }, [focusTab, focusNonce]);
+
   const prefix = configKeys[activeTab];
   const mediaConfig = (config as Record<string, unknown>)[prefix] as MediaGenConfig | undefined;
   const enabled = mediaConfig?.enabled ?? false;
@@ -330,26 +335,24 @@ export const MediaGenerationSettings: FC<SettingsProps> = ({ config, updateConfi
       {/* Header */}
       <div>
         <h3 className="text-sm font-semibold">Media Generation</h3>
-        <p className="text-xs text-muted-foreground mt-1">
-          Configure AI-powered image and video generation.
-        </p>
+        <p className="text-xs text-muted-foreground mt-1">Configure AI-powered image and video generation.</p>
       </div>
 
       {/* Tab Bar */}
       <div className="flex gap-1 border-b border-border/60">
         {tabs.map((t) => (
-            <button
-              key={t.key}
-              type="button"
-              onClick={() => setActiveTab(t.key)}
-              className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
-                activeTab === t.key
-                  ? 'bg-card border border-b-0 border-border/60 text-foreground'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {t.label}
-            </button>
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => setActiveTab(t.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t-lg transition-colors ${
+              activeTab === t.key
+                ? 'bg-card border border-b-0 border-border/60 text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {t.label}
+          </button>
         ))}
       </div>
 
