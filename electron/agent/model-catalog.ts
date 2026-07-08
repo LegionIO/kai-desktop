@@ -1,4 +1,4 @@
-import type { AppConfig } from '../config/schema.js';
+import type { AppConfig, PromptCachingConfig } from '../config/schema.js';
 import type { ComputerUseSupport, ComputerUseTarget } from '../../shared/computer-use.js';
 
 export type LLMProviderType = 'openai-compatible' | 'anthropic' | 'amazon-bedrock' | 'google';
@@ -21,6 +21,7 @@ export type LLMModelConfig = {
   useResponsesApi?: boolean;
   extraHeaders?: Record<string, string>;
   providerTools?: ProviderToolConfig[];
+  promptCaching?: PromptCachingConfig;
   temperature: number;
   maxSteps?: number;
   maxRetries?: number;
@@ -75,6 +76,7 @@ export function resolveModelCatalog(config: AppConfig): {
       modelName: model.modelName,
       maxInputTokens: model.maxInputTokens,
       providerTools: normalizeProviderTools(providerConfig.providerTools, model.providerTools),
+      promptCaching: model.promptCaching,
       temperature: config.advanced.temperature,
       maxSteps: config.advanced.maxSteps,
       maxRetries: config.advanced.maxRetries,

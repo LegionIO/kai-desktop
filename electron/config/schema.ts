@@ -39,6 +39,14 @@ const providerSchema = z.object({
   providerTools: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 
+const promptCachingSchema = z.object({
+  enabled: z.boolean(),
+  /** Anthropic-only: cache TTL for ephemeral cache_control blocks. */
+  ttl: z.enum(['5m', '1h']).optional(),
+});
+
+export type PromptCachingConfig = z.infer<typeof promptCachingSchema>;
+
 const modelEntrySchema = z.object({
   key: z.string(),
   displayName: z.string(),
@@ -51,6 +59,7 @@ const modelEntrySchema = z.object({
   computerUseSupport: computerUseSupportSchema.optional(),
   visionCapable: z.boolean().optional(),
   preferredTarget: computerUseTargetSchema.optional(),
+  promptCaching: promptCachingSchema.optional(),
 });
 
 const modelsConfigSchema = z.object({

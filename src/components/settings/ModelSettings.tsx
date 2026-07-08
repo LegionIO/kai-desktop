@@ -47,6 +47,7 @@ type CatalogEntry = {
   computerUseSupport?: 'openai-responses' | 'anthropic-client-tool' | 'gemini-computer-use' | 'custom' | 'none';
   visionCapable?: boolean;
   preferredTarget?: 'isolated-browser' | 'local-macos';
+  promptCaching?: { enabled: boolean; ttl?: '5m' | '1h' };
 };
 
 type ModelTab = 'profiles' | 'runtimes' | 'providers' | 'catalog' | 'prompts' | 'advanced';
@@ -645,6 +646,12 @@ const ModelForm: FC<{
   const [preferredTarget, setPreferredTarget] = useState(initial.preferredTarget ?? 'isolated-browser');
 
   const selectedProvider = providers[provider];
+  const providerType = selectedProvider?.type;
+  const isAnthropicFamily =
+    providerType === 'anthropic' || (providerType === 'amazon-bedrock' && /anthropic|claude/i.test(modelName));
+  const cachingDefault = isAnthropicFamily;
+  const [promptCachingEnabled, setPromptCachingEnabled] = useState(initial.promptCaching?.enabled ?? cachingDefault);
+  const [promptCachingTtl, setPromptCachingTtl] = useState<'5m' | '1h'>(initial.promptCaching?.ttl ?? '5m');
 
   const canSave = key.trim() && displayName.trim() && provider && modelName.trim();
 
@@ -666,6 +673,14 @@ const ModelForm: FC<{
     entry.computerUseSupport = computerUseSupport;
     entry.visionCapable = visionCapable;
     entry.preferredTarget = preferredTarget;
+    if (isAnthropicFamily) {
+      entry.promptCaching = {
+        enabled: promptCachingEnabled,
+        ...(providerType === 'anthropic' ? { ttl: promptCachingTtl } : {}),
+      };
+    } else if (initial.promptCaching) {
+      entry.promptCaching = initial.promptCaching;
+    }
     onSave(entry);
   };
 
@@ -784,6 +799,29 @@ const ModelForm: FC<{
       </div>
 
       <Toggle label="Vision Capable" checked={visionCapable} onChange={setVisionCapable} />
+
+      {isAnthropicFamily ? (
+        <div className="flex items-center gap-2">
+          <div className="flex-1">
+            <Toggle label="Prompt Caching" checked={promptCachingEnabled} onChange={setPromptCachingEnabled} />
+          </div>
+          {providerType === 'anthropic' && promptCachingEnabled && (
+            <select
+              className={settingsSelectClass.replace('bg-card/80', 'bg-background') + ' w-24'}
+              value={promptCachingTtl}
+              onChange={(e) => setPromptCachingTtl(e.target.value as '5m' | '1h')}
+              aria-label="Cache TTL"
+            >
+              <option value="5m">5m TTL</option>
+              <option value="1h">1h TTL</option>
+            </select>
+          )}
+        </div>
+      ) : providerType === 'openai-compatible' ? (
+        <p className="text-[10px] text-muted-foreground rounded-xl border border-border/70 bg-card/80 px-3 py-2">
+          Prompt caching · automatic (server-side) for prompts &gt;1024 tokens
+        </p>
+      ) : null}
 
       <div className="flex items-center gap-2 pt-1">
         <button

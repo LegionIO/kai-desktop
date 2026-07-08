@@ -25,6 +25,7 @@ import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
 import type { DiffTrackingResultMeta } from '../../shared/diff-types.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
+import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
 
@@ -296,15 +297,20 @@ function buildProviderOptions(
 
   // Anthropic (direct or Bedrock with Claude models): map reasoning effort to thinking config
   const isAnthropic = isAnthropicProviderModel(modelConfig);
+  // Request-level cache_control (Anthropic-direct only; Bedrock uses message-level cachePoint).
+  const cacheControl = buildAnthropicCacheControl(modelConfig);
 
-  if (isAnthropic && reasoningEffort) {
+  if (isAnthropic && (reasoningEffort || cacheControl)) {
     const thinkingByEffort: Record<ReasoningEffort, Record<string, unknown>> = {
       low: { type: 'disabled' },
       medium: { type: 'adaptive' },
       high: { type: 'enabled', budgetTokens: 10_000 },
       xhigh: { type: 'enabled', budgetTokens: 32_000 },
     };
-    return { anthropic: { thinking: thinkingByEffort[reasoningEffort] } };
+    const anthropicOptions: Record<string, unknown> = {};
+    if (reasoningEffort) anthropicOptions.thinking = thinkingByEffort[reasoningEffort];
+    if (cacheControl) anthropicOptions.cacheControl = cacheControl;
+    return { anthropic: anthropicOptions };
   }
 
   return undefined;
@@ -917,7 +923,10 @@ export async function* streamAgentResponse(
   const useGenerate = isReasoningGatewayModel(modelConfig);
 
   const targetModelId = `${modelConfig.provider}:${modelConfig.modelName}`;
-  const sanitizedMessages = sanitizeMessagesForModel(messages, targetModelId);
+  const sanitizedMessages = applyPromptCachingToMessages(
+    sanitizeMessagesForModel(messages, targetModelId),
+    modelConfig,
+  );
 
   if (useGenerate) {
     yield* generateWithSyntheticEvents(
@@ -1383,6 +1392,10 @@ async function* streamWithRealEvents(
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
               accCacheWriteTokens += (anthropicMeta.cacheCreationInputTokens as number | undefined) ?? 0;
+            }
+            const bedrockMeta = stepMeta?.bedrock as Record<string, unknown> | undefined;
+            if (bedrockMeta) {
+              accCacheWriteTokens += (bedrockMeta.cacheWriteInputTokens as number | undefined) ?? 0;
             }
             // openai-compat provider puts cache tokens directly on usage
             if (stepUsage) {
