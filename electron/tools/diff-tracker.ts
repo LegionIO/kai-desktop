@@ -596,6 +596,12 @@ export function revertHunk(
   if (!entry.originalCaptured) {
     return { success: false, error: 'Original content was not captured; cannot compute hunks safely.' };
   }
+  if (hasDrifted(path, entry)) {
+    return {
+      success: false,
+      error: 'File changed on disk since it was last tracked (external/user edit); hunk revert refused.',
+    };
+  }
   const { hunks } = computeUnifiedDiff(entry.original, entry.current, { path });
   const hunk = hunks[hunkIndex];
   if (!hunk) return { success: false, error: `Hunk ${hunkIndex} out of range (0..${hunks.length - 1}).` };
@@ -748,7 +754,15 @@ function reverseApplyHunk(content: string, hunk: UnifiedHunk): string | null {
       preImage.push(l.text);
     }
   }
-  if (postImage.length === 0) return null;
+  // Deletion-only hunk (no post-image lines): the reverse is a pure insertion
+  // of the pre-image at the hunk's recorded position. There's no block to
+  // locate for a drift check here, so this relies on the caller's whole-file
+  // hasDrifted() guard (revertHunk recomputes hunks from tracked `current`).
+  if (postImage.length === 0) {
+    const insertAt = Math.max(0, Math.min(lines.length, hunk.bStart - 1));
+    const next = [...lines.slice(0, insertAt), ...preImage, ...lines.slice(insertAt)];
+    return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline || !content ? '\n' : '');
+  }
 
   const matchesAt = (start: number): boolean => postImage.every((t, i) => lines[start + i] === t);
 

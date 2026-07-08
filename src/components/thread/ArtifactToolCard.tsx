@@ -54,6 +54,11 @@ export const ArtifactToolCard: FC<{
   const hasResult = result !== undefined;
   const payload = hasResult && !isError ? extractArtifact(args, result) : null;
   const firedRef = useRef<string | null>(null);
+  // True when the component first rendered WITHOUT a result — i.e. we're
+  // watching a live stream, so a result arriving is a genuine create/update
+  // and should auto-open. If it mounted WITH a result already (revisiting a
+  // past conversation), upsert silently and don't steal the panel.
+  const sawLiveStreamRef = useRef(!hasResult);
 
   useEffect(() => {
     if (!ctx || !payload) return;
@@ -61,7 +66,7 @@ export const ArtifactToolCard: FC<{
     if (firedRef.current === key) return;
     firedRef.current = key;
     ctx.upsert(payload);
-    ctx.openPanel();
+    if (sawLiveStreamRef.current) ctx.openPanel();
   }, [ctx, payload, toolCallId]);
 
   if (!payload) return null;

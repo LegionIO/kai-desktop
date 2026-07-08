@@ -147,6 +147,7 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
   const [selected, setSelected] = useState<string | null>(null);
   const [reverting, setReverting] = useState(false);
   const [revertingAll, setRevertingAll] = useState(false);
+  const [revertError, setRevertError] = useState<string | null>(null);
 
   const reload = useCallback(() => {
     if (!conversationId) {
@@ -168,6 +169,10 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
     return off;
   }, [conversationId, reload]);
 
+  useEffect(() => {
+    setRevertError(null);
+  }, [selected]);
+
   const tree = useMemo(() => buildTree(diffs), [diffs]);
   const active = useMemo(() => diffs.find((d) => d.path === selected) ?? null, [diffs, selected]);
   const totals = useMemo(
@@ -178,8 +183,10 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
   const handleRevert = useCallback(async () => {
     if (!active) return;
     setReverting(true);
+    setRevertError(null);
     try {
-      await app.diffs.revert(conversationId, active.path);
+      const r = await app.diffs.revert(conversationId, active.path);
+      if (!r.success && r.error) setRevertError(r.error);
     } finally {
       setReverting(false);
       reload();
@@ -189,7 +196,9 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
   const handleRevertHunk = useCallback(
     async (hunkIndex: number) => {
       if (!active) return;
-      await app.diffs.revertHunk(conversationId, active.path, hunkIndex);
+      setRevertError(null);
+      const r = await app.diffs.revertHunk(conversationId, active.path, hunkIndex);
+      if (!r.success && r.error) setRevertError(r.error);
       reload();
     },
     [active, conversationId, reload],
@@ -294,6 +303,11 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
                       defaultOpen
                       onRevertHunk={active.revertable ? handleRevertHunk : undefined}
                     />
+                    {revertError && (
+                      <div className="mx-2 mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+                        {revertError}
+                      </div>
+                    )}
                   </ScrollArea.Viewport>
                   <ScrollArea.Scrollbar orientation="vertical" className="w-1.5">
                     <ScrollArea.Thumb className="rounded bg-muted-foreground/30" />

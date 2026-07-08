@@ -203,13 +203,17 @@ function runShellHook(
       }
       if (mode === 'modify') {
         const trimmed = stdout.trim();
-        if (!trimmed) return settle({ decision: 'allow' });
+        // A modify hook that produces no usable replacement fails CLOSED — for a
+        // DLP/sanitizer this prevents the unmodified payload from passing through.
+        if (!trimmed) {
+          return settle({ decision: 'deny', reason: 'modify hook produced no output; failing closed.' });
+        }
         try {
           const parsed = JSON.parse(trimmed) as HookOutcome;
           return settle(parsed);
         } catch (err) {
           console.warn(`[hooks] modify hook stdout was not valid JSON (${command}):`, err);
-          return settle({ decision: 'allow' });
+          return settle({ decision: 'deny', reason: 'modify hook output was not valid JSON; failing closed.' });
         }
       }
       settle({ decision: 'allow' });
@@ -353,11 +357,13 @@ export class HookDispatcher {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[hooks] ${reg.mode} handler for ${event} failed: ${message}`);
-        if (reg.mode === 'block') {
-          // A throwing/timeout block hook fails closed.
-          return { payload: current, denied: true, reason: message };
-        }
-        continue;
+        // Both block and modify fail CLOSED: a sanitizer/DLP modify hook that
+        // throws or times out must not let the unmodified payload through.
+        return {
+          payload: current,
+          denied: true,
+          reason: `${reg.mode} hook failed (${message}); failing closed to avoid leaking unmodified data.`,
+        };
       }
 
       if (outcome?.decision === 'deny') {

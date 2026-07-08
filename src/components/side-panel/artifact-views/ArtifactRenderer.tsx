@@ -23,11 +23,39 @@ const SandboxedFrame: FC<{ srcDoc: string; title: string }> = memo(({ srcDoc, ti
 const BASE_STYLES =
   'body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#0f172a;background:#ffffff}*,*::before,*::after{box-sizing:border-box}';
 
+/**
+ * CSP for artifact frames. Blocks all network egress by default so a model-
+ * supplied script can't beacon/fetch to external or localhost/private targets.
+ * `img-src` allows only inline data URIs. `react` mode needs the unpkg CDN for
+ * React + Babel, so it widens script-src/connect-src to that origin only.
+ */
+function cspMeta(mode: 'static' | 'react'): string {
+  const scriptSrc = mode === 'react' ? "'self' 'unsafe-inline' https://unpkg.com" : "'unsafe-inline'";
+  const connectSrc = mode === 'react' ? 'https://unpkg.com' : "'none'";
+  const policy = [
+    "default-src 'none'",
+    `script-src ${scriptSrc}`,
+    "style-src 'unsafe-inline'",
+    'img-src data:',
+    'font-src data:',
+    `connect-src ${connectSrc}`,
+    "form-action 'none'",
+    "base-uri 'none'",
+  ].join('; ');
+  return `<meta http-equiv="Content-Security-Policy" content="${policy}">`;
+}
+
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
-  // If the model already emitted a full document, use it verbatim.
-  if (/<html[\s>]/i.test(trimmed) || /^<!doctype/i.test(trimmed)) return trimmed;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>${BASE_STYLES}</style></head><body>${content}</body></html>`;
+  const csp = cspMeta('static');
+  // If the model already emitted a full document, inject the CSP into its head.
+  if (/<html[\s>]/i.test(trimmed) || /^<!doctype/i.test(trimmed)) {
+    if (/<head[\s>]/i.test(trimmed)) {
+      return trimmed.replace(/<head([\s>])/i, `<head$1${csp}`);
+    }
+    return trimmed.replace(/<html([\s>])/i, `<html$1<head>${csp}</head>`);
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style></head><body>${content}</body></html>`;
 }
 
 function wrapSvg(content: string): string {
@@ -35,7 +63,7 @@ function wrapSvg(content: string): string {
   const body = svg.startsWith('<svg')
     ? svg
     : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">${svg}</svg>`;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>${BASE_STYLES}svg{display:block;max-width:100%;height:auto;margin:auto}</style></head><body>${body}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${cspMeta('static')}<style>${BASE_STYLES}svg{display:block;max-width:100%;height:auto;margin:auto}</style></head><body>${body}</body></html>`;
 }
 
 /**
@@ -54,6 +82,7 @@ function wrapReact(content: string): string {
   const escaped = normalized.replace(/<\/script>/gi, '<\\/script>');
   return [
     '<!doctype html><html><head><meta charset="utf-8">',
+    cspMeta('react'),
     `<style>${BASE_STYLES}#root{min-height:100vh}</style>`,
     '<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>',
     '<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>',
