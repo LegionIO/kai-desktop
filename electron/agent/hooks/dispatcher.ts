@@ -90,12 +90,18 @@ function extractToolName(payload: unknown): string | undefined {
 
 const MAX_HOOK_PAYLOAD_BYTES = 256 * 1024;
 
-function jsonSafe(value: unknown): unknown {
+/**
+ * Serialize a hook payload to a JSON-safe value. When `truncate` is true
+ * (observe fan-out to the event bus) an oversized payload is replaced with an
+ * id-only stub to avoid forwarding multi-MB blobs to every automation. For
+ * block/modify shell hooks we pass the FULL payload (truncate=false) — a DLP
+ * scanner must see the whole content, or it could be bypassed by large input.
+ */
+function jsonSafe(value: unknown, truncate = true): unknown {
   try {
     const serialized =
       JSON.stringify(value, (_k, v) => (typeof v === 'function' || typeof v === 'bigint' ? undefined : v)) ?? 'null';
-    // Guard against forwarding multi-MB tool results into every hook/automation.
-    if (serialized.length > MAX_HOOK_PAYLOAD_BYTES) {
+    if (truncate && serialized.length > MAX_HOOK_PAYLOAD_BYTES) {
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         const v = value as Record<string, unknown>;
         return {
@@ -250,7 +256,11 @@ function runShellHook(
       // async EPIPE on this stream after we've returned; swallow it so it can't
       // crash the main process.
       child.stdin?.on('error', () => {});
-      child.stdin?.write(JSON.stringify({ event, payload: jsonSafe(payload) }));
+      // Enforcing (block/modify) hooks must see the full payload — never a
+      // truncated id-only stub, or a DLP scanner could be bypassed by large
+      // input. observe hooks get the size-capped stub.
+      const stdinPayload = jsonSafe(payload, mode === 'observe');
+      child.stdin?.write(JSON.stringify({ event, payload: stdinPayload }));
       child.stdin?.end();
     } catch {
       /* ignore — broken pipe when child exits fast */

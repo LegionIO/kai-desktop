@@ -1580,11 +1580,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // ── Lifecycle hook: PostToolUse ─────────────────────────────
               // `modify` → replace `result` before it is fed back to the model.
               // `block`  → convert to an error result.
+              // Use the redacted/sanitized args (if a PreToolUse hook rewrote or
+              // denied them) so PostToolUse/observers never see the raw args.
+              const execIdForArgs = execToolCallIdByStreamId.get(toolCallId) ?? toolCallId;
+              const postArgs = hookRewrittenArgs.get(toolCallId) ?? hookRewrittenArgs.get(execIdForArgs) ?? args;
               const postTool = await hookDispatcher.dispatch('PostToolUse', {
                 conversationId,
                 toolCallId,
                 toolName,
-                args,
+                args: postArgs,
                 result,
               });
               if (postTool.denied) {

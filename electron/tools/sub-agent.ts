@@ -13,6 +13,7 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { runSubAgent, getActiveSubAgentCount } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
 import { streamAgentResponse } from '../agent/mastra-agent.js';
+import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import type { LLMModelConfig } from '../agent/model-catalog.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
@@ -112,6 +113,8 @@ async function resumeSubAgent(
   followUpQueues.set(subAgentConversationId, []);
 
   try {
+    const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
+    const rewrittenArgs = new Map<string, unknown>();
     const stream = streamAgentResponse(
       subAgentConversationId,
       messages,
@@ -124,14 +127,70 @@ async function resumeSubAgent(
         emitEvent: (event) => {
           broadcastEvent({ ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent);
         },
+        // Enforce lifecycle hooks on resume, same as the initial sub-agent run.
+        onToolExecutionStart: async (state) => {
+          const preTool = await hookDispatcher.dispatch('PreToolUse', {
+            conversationId: subAgentConversationId,
+            parentConversationId,
+            toolCallId: state.toolCallId,
+            toolName: state.toolName,
+            args: state.args,
+          });
+          if (preTool.denied) {
+            const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+            rewrittenArgs.set(state.toolCallId, { redacted: true, reason });
+            return { skip: true as const, result: { isError: true, error: reason } };
+          }
+          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+          if (
+            nextArgs !== undefined &&
+            nextArgs !== state.args &&
+            state.args &&
+            typeof state.args === 'object' &&
+            nextArgs &&
+            typeof nextArgs === 'object' &&
+            !Array.isArray(state.args) &&
+            !Array.isArray(nextArgs)
+          ) {
+            const target = state.args as Record<string, unknown>;
+            for (const k of Object.keys(target)) delete target[k];
+            Object.assign(target, nextArgs as Record<string, unknown>);
+          }
+          rewrittenArgs.set(state.toolCallId, state.args);
+        },
+        augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+          const postTool = await hookDispatcher.dispatch('PostToolUse', {
+            conversationId: subAgentConversationId,
+            parentConversationId,
+            toolCallId,
+            toolName,
+            args,
+            result,
+          });
+          if (postTool.denied) return { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+          const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+          return nextResult !== undefined ? nextResult : result;
+        },
       },
     );
 
     let turnText = '';
     for await (const event of stream) {
       if (event.type === 'text-delta' && event.text) turnText += event.text;
+      const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
+      // Suppress raw tool-call args until the hook resolves; publish rewritten
+      // args once known (renderer upserts by toolCallId).
+      if (event.type === 'tool-call' && event.toolCallId) {
+        const rewritten = rewrittenArgs.get(event.toolCallId);
+        if (rewritten !== undefined) {
+          (enriched as Record<string, unknown>).args = rewritten;
+        } else if (enforcingHooks) {
+          (enriched as Record<string, unknown>).args = { pending: true };
+          (enriched as Record<string, unknown>).argsPending = true;
+        }
+      }
       if (event.type !== 'done') {
-        broadcastEvent({ ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent);
+        broadcastEvent(enriched);
       }
       if (event.type === 'done') break;
     }

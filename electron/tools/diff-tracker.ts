@@ -468,6 +468,13 @@ export async function beginShellSnapshot(
             return r.exists && hashContent(r.content) !== before.hash;
           })();
         if (!mtimeChanged && !hashChanged) continue;
+        // External-edit drift: if a tracked file's pre-command content differs
+        // from what we last recorded, a user/external process edited it between
+        // agent ops — mark it non-revertable so revert can't erase that edit.
+        const trackedEntry = conv.get(p);
+        if (trackedEntry && before.preContent != null && before.preContent !== trackedEntry.current) {
+          trackedEntry.originalCaptured = false;
+        }
         const preRead = conv.has(p)
           ? undefined
           : before.preContent != null
@@ -478,6 +485,10 @@ export async function beginShellSnapshot(
       }
       for (const [p, before] of pre) {
         if (!post.has(p) && existsSync(p) === false) {
+          const trackedEntry = conv.get(p);
+          if (trackedEntry && before.preContent != null && before.preContent !== trackedEntry.current) {
+            trackedEntry.originalCaptured = false;
+          }
           const preRead = conv.has(p)
             ? undefined
             : before.preContent != null
