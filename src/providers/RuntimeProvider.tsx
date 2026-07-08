@@ -1967,6 +1967,12 @@ export function RuntimeProvider({
             ...existing,
             approvalStatus: 'pending',
             approvalId: e.toolCallId as string,
+            // Some approvals carry richer args than the tool was originally
+            // called with (e.g. the dangerous-automation gate sends the full
+            // rule + reason so the user can see the shell command / hook rule
+            // they're approving, even for delete/disable which only passed an
+            // id). Surface those in the card instead of the bare original args.
+            ...(e.args !== undefined ? { args: e.args, argsPending: false } : {}),
             finishedAt: nowIso(),
           };
           acc.messages[idx] = { ...msg, content: toStoredContent(content) };

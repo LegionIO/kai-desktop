@@ -816,24 +816,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // broadcast (showing a pending placeholder) and fill them in via the
         // corrective re-broadcast once the hook has run.
         const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
-        // Union of provider-native tool names across the PRIMARY and every
-        // FALLBACK model. Provider-native tools execute in-provider and never
-        // hit onToolExecutionStart, so their args must not be suppressed
-        // (nothing would ever un-suppress them → stuck {pending}). Because
-        // fallback can switch the active model mid-stream, and fallback models
-        // may expose different provider-native tools, we must recognize the
-        // union — otherwise a fallback model's provider-native tool (e.g.
-        // web_search) would be suppressed to {pending} forever.
-        const providerDefinedToolNames = new Set<string>();
-        if (modelEntry?.modelConfig) {
-          for (const n of getProviderDefinedToolNames(modelEntry.modelConfig)) providerDefinedToolNames.add(n);
-        }
-        if (fallbackEnabled) {
-          for (const fb of streamConfig?.fallbackModels ?? []) {
-            if (!fb?.modelConfig) continue;
-            for (const n of getProviderDefinedToolNames(fb.modelConfig)) providerDefinedToolNames.add(n);
-          }
-        }
+        // Provider-native tool names for the CURRENTLY ACTIVE model. Provider-
+        // native tools execute in-provider and never hit onToolExecutionStart,
+        // so their args must not be suppressed (nothing would un-suppress them →
+        // stuck {pending}). This must track the active model, NOT a union across
+        // fallbacks: unioning would wrongly exempt the primary model's LOCAL
+        // tool (e.g. a client-side `web_search`) just because a fallback model
+        // has a provider-native tool of the same name — letting raw args leak
+        // past a DLP hook. Recomputed on each model-fallback event below.
+        let providerDefinedToolNames = modelEntry?.modelConfig
+          ? getProviderDefinedToolNames(modelEntry.modelConfig)
+          : new Set<string>();
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
@@ -1863,6 +1856,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 if (fallbackEntry?.modelConfig) {
                   activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
                   activeModelDisplayName = fallbackEntry.displayName ?? null;
+                  // Re-point the provider-native exemption at the now-active
+                  // fallback model so its provider tools aren't suppressed and,
+                  // conversely, the previous model's local tools aren't wrongly
+                  // exempted.
+                  providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
                 }
               }
             }

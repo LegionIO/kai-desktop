@@ -136,6 +136,17 @@ export const ToolCallDisplay: FC<{
   const isAgentTool = part.toolName === 'agent';
   const approvalStatus = localApproval ?? part.approvalStatus;
   const isPendingApproval = approvalStatus === 'pending' && !hasResult;
+  // Some approvals attach a human-readable `reason` in the tool args (e.g. the
+  // dangerous-automation gate). Surface it in the prompt so the user has the
+  // context to consent without expanding the card.
+  const approvalReason =
+    part.args && typeof part.args === 'object' && !Array.isArray(part.args)
+      ? (part.args as { reason?: unknown }).reason
+      : undefined;
+  const approvalPrompt =
+    typeof approvalReason === 'string' && approvalReason.trim()
+      ? `Requires approval: ${approvalReason.trim()}`
+      : 'Requires approval to execute';
   const isAskUser = part.toolName === 'ask_user';
   const isRunning = !hasResult && !isHung && !isPendingApproval;
   const hasLiveOutput = Boolean(part.liveOutput?.stdout || part.liveOutput?.stderr);
@@ -386,7 +397,7 @@ export const ToolCallDisplay: FC<{
       {isPendingApproval && !isPlanApproval && !isAskUser && (
         <div className="ml-1 mt-1.5 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
           <AlertTriangleIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-          <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">Requires approval to execute</span>
+          <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">{approvalPrompt}</span>
           <button
             type="button"
             onClick={handleReject}
