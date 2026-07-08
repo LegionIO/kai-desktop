@@ -90,7 +90,7 @@ export function resolveDiffTrackingConfig(config: AppConfig): DiffTrackingConfig
     enabled: raw?.enabled ?? true,
     snapshotFileLimit: raw?.snapshotFileLimit ?? 2000,
     snapshotTimeoutMs: raw?.snapshotTimeoutMs ?? 200,
-    aiFallback: raw?.aiFallback ?? true,
+    aiFallback: raw?.aiFallback ?? false,
   };
 }
 

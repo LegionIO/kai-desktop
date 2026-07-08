@@ -296,6 +296,16 @@ export function getBridgeScript(): string {
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       onChanged: function(cb) { return on('conversations:changed', cb); }
     },
+    diffs: {
+      listForConversation: function(id) { return invoke('diffs:list', id); },
+      get: function(id, path) { return invoke('diffs:get', id, path); },
+      revert: function(id, path) { return invoke('diffs:revert', id, path); },
+      revertAll: function(id) { return invoke('diffs:revertAll', id); },
+      revertHunk: function(id, path, hunkIndex) { return invoke('diffs:revertHunk', id, path, hunkIndex); },
+      revertToOp: function(id, path, opIndex) { return invoke('diffs:revertToOp', id, path, opIndex); },
+      clear: function(id) { return invoke('diffs:clear', id); },
+      onChange: function(cb) { return on('diffs:changed', cb); }
+    },
     memory: {
       clear: function(opts) { return invoke('memory:clear', opts); },
       testEmbedding: function() { return invoke('memory:test-embedding'); }

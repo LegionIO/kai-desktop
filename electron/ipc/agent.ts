@@ -920,6 +920,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (toolName === 'create_artifact' || toolName === 'update_artifact') {
             return { result };
           }
+          // Preserve inline diffs: a result carrying diff-tracking metadata must
+          // not be compacted to a string, or the _diffTracking payload (and the
+          // inline diff view) is lost.
+          if (result && typeof result === 'object' && '_diffTracking' in (result as Record<string, unknown>)) {
+            return { result };
+          }
 
           const originalText = stringifyToolResult(result);
           const userQuery = extractLatestUserQuery(messages);

@@ -222,7 +222,21 @@ function runShellHook(
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return settle({ decision: 'deny', reason: 'modify hook output was not a JSON object; failing closed.' });
           }
-          return settle(parsed as HookOutcome);
+          const obj = parsed as Record<string, unknown>;
+          // An explicit deny is honored. Otherwise a modify hook MUST return a
+          // `payload` — `{}` or `{"decision":"allow"}` with no payload would
+          // otherwise let the original unmodified data through (fail-open). So
+          // require the replacement payload; absent it, fail CLOSED.
+          if (obj.decision === 'deny') {
+            return settle({ decision: 'deny', reason: typeof obj.reason === 'string' ? obj.reason : undefined });
+          }
+          if (!('payload' in obj) || obj.payload === undefined) {
+            return settle({
+              decision: 'deny',
+              reason: 'modify hook returned no replacement payload; failing closed.',
+            });
+          }
+          return settle(obj as HookOutcome);
         } catch (err) {
           console.warn(`[hooks] modify hook stdout was not valid JSON (${command}):`, err);
           return settle({ decision: 'deny', reason: 'modify hook output was not valid JSON; failing closed.' });

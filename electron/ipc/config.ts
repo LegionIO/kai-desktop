@@ -89,7 +89,7 @@ function getDefaultConfig() {
         enabled: true,
         snapshotFileLimit: 2000,
         snapshotTimeoutMs: 200,
-        aiFallback: true,
+        aiFallback: false,
       },
       processStreaming: {
         enabled: true,

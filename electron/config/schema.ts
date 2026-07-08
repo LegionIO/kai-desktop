@@ -154,7 +154,12 @@ const diffTrackingSchema = z.object({
   snapshotFileLimit: z.number().positive(),
   /** Wall-clock budget (ms) for a single snapshot walk. */
   snapshotTimeoutMs: z.number().positive(),
-  /** When true, ask the default model to infer changed paths when the snapshot is skipped or empty. */
+  /**
+   * When true, ask the default model to infer changed paths (sending the
+   * command + up to 6KB of stdout/stderr) if the snapshot found nothing.
+   * OFF by default: shell output can contain secrets, so this network
+   * disclosure is opt-in.
+   */
   aiFallback: z.boolean(),
 });
 
@@ -768,7 +773,7 @@ export const appConfigSchema = z.object({
       enabled: true,
       snapshotFileLimit: 2000,
       snapshotTimeoutMs: 200,
-      aiFallback: true,
+      aiFallback: false,
     }),
     processStreaming: processStreamingSchema,
     subAgents: subAgentConfigSchema,
