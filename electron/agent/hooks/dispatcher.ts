@@ -339,6 +339,20 @@ export class HookDispatcher {
   }
 
   /**
+   * True when at least one block/modify (enforcing) hook is active for a given
+   * event. Used to decide whether an auxiliary model call (e.g. title
+   * generation) must be gated through that event's enforcement too.
+   */
+  hasEnforcingHooksFor(event: HookEvent): boolean {
+    const cfg = this.safeConfig();
+    if (cfg && (cfg.hooks?.enabled ?? true)) this.syncUserHooks(cfg);
+    if (!(cfg?.hooks?.enabled ?? true)) return false;
+    if (!ENFORCING_HOOK_EVENTS.has(event)) return false;
+    const list = this.registry.get(event) ?? [];
+    return list.some((r) => r.mode === 'block' || r.mode === 'modify');
+  }
+
+  /**
    * Register a hook handler. Returns an unregister function.
    * Plugin registrations run before user (shell) registrations so DLP /
    * sanitization plugins see raw data.

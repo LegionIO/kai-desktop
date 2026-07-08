@@ -2006,10 +2006,36 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { title: null };
     }
 
-    const input = buildTitleGenerationInput(messages);
+    // Title generation sends the user's prompt to a model too, so when hook
+    // enforcement is active it must pass through the same UserPromptSubmit gate —
+    // otherwise a DLP block/modify hook that guards the chat request is bypassed
+    // here (the raw prompt would reach the title model). A `deny` suppresses the
+    // title; a `modify` rewrites the messages we summarize. Only dispatched when
+    // enforcing tool hooks exist, so the common no-hook path adds no fan-out.
+    let effectiveMessages = messages;
+    if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+      try {
+        const dispatch = await hookDispatcher.dispatch('UserPromptSubmit', {
+          conversationId: '',
+          messages,
+          systemPrompt: '',
+          modelKey: modelKey ?? config.models.defaultModelKey,
+          purpose: 'title-generation',
+        });
+        if (dispatch.denied) return { title: null };
+        const next = dispatch.payload as { messages?: unknown[] };
+        if (Array.isArray(next?.messages)) effectiveMessages = next.messages;
+      } catch {
+        // Fail closed for a DLP posture: skip the title rather than risk sending
+        // unsanitized content to the title model.
+        return { title: null };
+      }
+    }
+
+    const input = buildTitleGenerationInput(effectiveMessages);
     if (!input) return { title: null };
 
-    const hasImages = messagesContainImages(messages);
+    const hasImages = messagesContainImages(effectiveMessages);
 
     const promptParts = [
       'Generate a concise conversation title using at most 4 words.',

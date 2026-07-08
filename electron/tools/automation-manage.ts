@@ -95,6 +95,14 @@ async function ensureApproved(
       error: `Cannot request interactive approval from this context (no live chat). This rule (${actionLabel}) observes lifecycle hook events or runs shell commands and requires user approval. A user must perform this in Settings → Automations, or set automations.approvalMode to "auto-allow".`,
     };
   }
+  // Surface the actual shell commands (command/mode/matcher) so the approval
+  // card shows exactly what will run — summarizeRule reduces actions to type
+  // names, which is not enough to consent to arbitrary shell execution.
+  const shellActions = rule.actions
+    .filter(
+      (a): a is Extract<AutomationRule['actions'][number], { type: 'runHookCommand' }> => a.type === 'runHookCommand',
+    )
+    .map((a) => ({ command: a.command, mode: a.mode, matcher: a.matcher ?? '*' }));
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
@@ -104,8 +112,11 @@ async function ensureApproved(
       approvalKind: 'dangerous-automation',
       action: actionLabel,
       rule: summarizeRule(rule),
+      ...(shellActions.length ? { shellCommands: shellActions } : {}),
       reason: hasShellHookAction(rule)
-        ? 'This rule runs an arbitrary shell command.'
+        ? `This rule runs ${shellActions.length === 1 ? 'the shell command' : 'shell commands'}: ${shellActions
+            .map((s) => `\`${s.command}\` (${s.mode})`)
+            .join(', ')}`
         : 'This rule subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads.',
     },
   });
