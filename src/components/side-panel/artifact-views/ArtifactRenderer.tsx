@@ -45,7 +45,13 @@ function wrapSvg(content: string): string {
  * simply won't load — the outer app is unaffected).
  */
 function wrapReact(content: string): string {
-  const escaped = content.replace(/<\/script>/gi, '<\\/script>');
+  // Rewrite ES `export` forms so the component lands in a script-scope binding
+  // Babel-standalone can see (non-module `text/babel` scripts otherwise fail to
+  // parse `export`). `export default X` → `const App = X`; drop bare `export `.
+  const normalized = content
+    .replace(/^\s*export\s+default\s+/m, 'const App = ')
+    .replace(/^\s*export\s+(?=(const|let|var|function|class)\b)/gm, '');
+  const escaped = normalized.replace(/<\/script>/gi, '<\\/script>');
   return [
     '<!doctype html><html><head><meta charset="utf-8">',
     `<style>${BASE_STYLES}#root{min-height:100vh}</style>`,

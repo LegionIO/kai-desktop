@@ -72,7 +72,7 @@ export class UnverifiedPluginError extends Error {
  * therefore require explicit user consent. Mirrors
  * PluginManager.DANGEROUS_PERMISSIONS (private) — keep in sync.
  */
-const DANGEROUS_PERMISSIONS = new Set<string>(['exec:whitelisted', 'config:read-secrets']);
+const DANGEROUS_PERMISSIONS = new Set<string>(['exec:whitelisted', 'config:read-secrets', 'agent:hook']);
 
 const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 

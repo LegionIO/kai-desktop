@@ -12,6 +12,8 @@ export type DiffOp = {
   source: DiffSource;
   additions: number;
   deletions: number;
+  /** True when a per-op content snapshot is retained (enables revert-to-op). Wire-safe. */
+  snapshotAvailable?: boolean;
 };
 
 export type FileDiff = {
@@ -28,6 +30,12 @@ export type FileDiff = {
   /** Per-operation trail so the panel can show "3 edits via write/edit/shell". */
   ops: DiffOp[];
   source: DiffSource;
+  /**
+   * Revert is only safe when the tracker holds the true pre-image. Shell/AI
+   * detected changes to previously-untracked files do not, and reverting them
+   * would truncate the file.
+   */
+  revertable: boolean;
 };
 
 export type DiffEvent = {

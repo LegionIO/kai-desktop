@@ -16,30 +16,47 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { BrowserWindow } from 'electron';
 import { generateText } from 'ai';
 import picomatch from 'picomatch';
 import type { AppConfig } from '../config/schema.js';
 import type { DiffEvent, DiffOp, DiffSource, FileDiff } from '../../shared/diff-types.js';
-import { computeUnifiedDiff } from './lib/myers-diff.js';
+import { computeUnifiedDiff, type UnifiedHunk } from './lib/myers-diff.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import { resolveModelCatalog } from '../agent/model-catalog.js';
+import { isPathAllowed } from './file-access.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Store
 // ───────────────────────────────────────────────────────────────────────────
 
+/** Main-process-internal op record. `contentAfter`/`existsAfter` never cross IPC. */
+type InternalOp = {
+  at: string;
+  toolName: string;
+  toolCallId?: string;
+  source: DiffSource;
+  additions: number;
+  deletions: number;
+  /** Full file content after this op — only when under the snapshot cap. */
+  contentAfter?: string;
+  /** Whether the file existed on disk after this op (distinguishes delete from empty file). */
+  existsAfter: boolean;
+};
+
 type TrackedFile = {
   original: string;
+  /** Whether `original` is the true on-disk pre-image (vs. a synthesized empty placeholder). */
+  originalCaptured: boolean;
   current: string;
   created: boolean;
   deleted: boolean;
-  ops: DiffOp[];
+  ops: InternalOp[];
   lastSource: DiffSource;
 };
 
@@ -82,14 +99,23 @@ export function resolveDiffTrackingConfig(config: AppConfig): DiffTrackingConfig
 // ───────────────────────────────────────────────────────────────────────────
 
 const MAX_TRACKED_BYTES = 2 * 1024 * 1024;
+const MAX_SNAPSHOT_PRECONTENT_BYTES = 32 * 1024 * 1024;
+const OP_SNAPSHOT_MAX_BYTES = 256 * 1024;
+const OP_SNAPSHOT_MAX_COUNT = 50;
 
-function safeRead(absPath: string): { exists: boolean; content: string } {
+function safeRead(absPath: string): { exists: boolean; content: string; captured: boolean } {
   try {
     const st = statSync(absPath);
-    if (!st.isFile() || st.size > MAX_TRACKED_BYTES) return { exists: st.isFile(), content: '' };
-    return { exists: true, content: readFileSync(absPath, 'utf-8') };
+    if (!st.isFile()) return { exists: false, content: '', captured: true };
+    if (st.size > MAX_TRACKED_BYTES) return { exists: true, content: '', captured: false };
+    const buf = readFileSync(absPath);
+    // Binary heuristic: NUL byte in the first 8 KiB. Tracking/reverting via a
+    // UTF-8 round-trip would corrupt these, so mark non-revertable.
+    const probe = buf.subarray(0, Math.min(buf.length, 8192));
+    if (probe.includes(0)) return { exists: true, content: '', captured: false };
+    return { exists: true, content: buf.toString('utf-8'), captured: true };
   } catch {
-    return { exists: false, content: '' };
+    return { exists: false, content: '', captured: true };
   }
 }
 
@@ -113,9 +139,27 @@ function toFileDiff(conversationId: string, path: string, entry: TrackedFile): F
     deletions,
     created: entry.created,
     deleted: entry.deleted,
-    ops: entry.ops,
+    ops: entry.ops.map(
+      (op): DiffOp => ({
+        at: op.at,
+        toolName: op.toolName,
+        toolCallId: op.toolCallId,
+        source: op.source,
+        additions: op.additions,
+        deletions: op.deletions,
+        snapshotAvailable: op.contentAfter !== undefined,
+      }),
+    ),
     source: entry.lastSource,
+    revertable: entry.originalCaptured,
   };
+}
+
+/** True when the tracked file is back to its original state (nothing to show/revert). */
+function isBackToOriginal(entry: TrackedFile): boolean {
+  if (!entry.originalCaptured) return false;
+  if (entry.created) return entry.deleted; // created then deleted → net zero
+  return !entry.deleted && entry.current === entry.original;
 }
 
 /**
@@ -127,15 +171,16 @@ function recordMutation(
   conversationId: string,
   absPath: string,
   meta: { toolName: string; toolCallId?: string; source: DiffSource },
-  preRead?: { exists: boolean; content: string },
+  preRead?: { exists: boolean; content: string; captured?: boolean },
 ): DiffEvent | null {
   const conv = getConversationStore(conversationId);
   let entry = conv.get(absPath);
 
   if (!entry) {
-    const before = preRead ?? { exists: false, content: '' };
+    const before = preRead ?? { exists: false, content: '', captured: true };
     entry = {
       original: before.content,
+      originalCaptured: before.captured ?? true,
       current: before.content,
       created: !before.exists,
       deleted: false,
@@ -152,7 +197,14 @@ function recordMutation(
 
   const { unified, additions, deletions } = computeUnifiedDiff(entry.original, entry.current, { path: absPath });
 
-  // Skip no-op writes (e.g. edit tool that made no change).
+  // If the file is back to its original state, drop the entry entirely so it
+  // stops appearing as a pending change in list_file_changes / the Changes panel.
+  if (isBackToOriginal(entry)) {
+    conv.delete(absPath);
+    return null;
+  }
+
+  // Skip no-op writes (e.g. edit tool that made no change) that didn't reach original.
   if (additions === 0 && deletions === 0 && !entry.created && !entry.deleted) {
     return null;
   }
@@ -164,6 +216,13 @@ function recordMutation(
     source: meta.source,
     additions,
     deletions,
+    existsAfter: after.exists,
+    ...(after.captured &&
+    after.exists &&
+    after.content.length <= OP_SNAPSHOT_MAX_BYTES &&
+    entry.ops.length < OP_SNAPSHOT_MAX_COUNT
+      ? { contentAfter: after.content }
+      : {}),
   });
 
   const event: DiffEvent = {
@@ -218,7 +277,7 @@ export function trackFileWrite(
 // Shell / CLI hook (mtime snapshot + AI fallback)
 // ───────────────────────────────────────────────────────────────────────────
 
-type SnapshotEntry = { mtimeMs: number; size: number; hash?: string };
+type SnapshotEntry = { mtimeMs: number; size: number; hash?: string; preContent?: string };
 
 export type ShellSnapshotHandle = {
   snapshotSkipped: boolean;
@@ -245,6 +304,7 @@ async function walk(
   root: string,
   budget: { filesLeft: number; deadline: number },
   out: Map<string, SnapshotEntry>,
+  config: AppConfig,
 ): Promise<void> {
   if (budget.filesLeft <= 0 || Date.now() > budget.deadline) return;
   let entries: Dirent[];
@@ -260,8 +320,9 @@ async function walk(
     }
     if (SKIP_DIRS.has(e.name)) continue;
     const full = join(root, e.name);
+    if (!isPathAllowed(full, config).allowed) continue;
     if (e.isDirectory()) {
-      await walk(full, budget, out);
+      await walk(full, budget, out, config);
     } else if (e.isFile()) {
       try {
         const st = await stat(full);
@@ -298,20 +359,26 @@ export async function beginShellSnapshot(
   const budget = { filesLeft: dt.snapshotFileLimit, deadline: Date.now() + dt.snapshotTimeoutMs };
   const pre = new Map<string, SnapshotEntry>();
   for (const r of roots) {
-    await walk(r, budget, pre);
+    await walk(r, budget, pre, config);
     if (budget.filesLeft <= 0 || Date.now() > budget.deadline) break;
   }
   const snapshotSkipped = budget.filesLeft <= 0 || Date.now() > budget.deadline;
 
-  // For files under the cap, cache content hashes so post-exec we can detect
-  // real content changes even when mtime is unreliable (e.g. some FUSE mounts).
-  // We only hash when the pre-scan completed within budget; hashing every file
-  // when we already blew the cap would compound the cost.
-  if (!snapshotSkipped) {
-    for (const [p, entry] of pre) {
-      if (entry.size <= MAX_TRACKED_BYTES) {
-        const r = safeRead(p);
-        if (r.exists) entry.hash = hashContent(r.content);
+  // Cache content + hash for whatever subset we DID capture — even a partial
+  // pre-scan is worth comparing post-exec. Bounded by the same wall-clock
+  // deadline plus an aggregate byte cap so a large tree can't stall the main
+  // process reading gigabytes; entries past the cap fall back to mtime-only
+  // detection with `captured:false` (revert disabled).
+  const readDeadline = Date.now() + dt.snapshotTimeoutMs;
+  let bytesRead = 0;
+  for (const [p, entry] of pre) {
+    if (Date.now() > readDeadline || bytesRead > MAX_SNAPSHOT_PRECONTENT_BYTES) break;
+    if (entry.size <= MAX_TRACKED_BYTES) {
+      const r = safeRead(p);
+      if (r.exists && r.captured) {
+        entry.hash = hashContent(r.content);
+        entry.preContent = r.content;
+        bytesRead += r.content.length;
       }
     }
   }
@@ -321,44 +388,53 @@ export async function beginShellSnapshot(
   const finish = async (result: { stdout?: string; stderr?: string }): Promise<DiffEvent[]> => {
     const events: DiffEvent[] = [];
 
-    if (!snapshotSkipped) {
+    {
       const postBudget = { filesLeft: dt.snapshotFileLimit, deadline: Date.now() + dt.snapshotTimeoutMs };
       const post = new Map<string, SnapshotEntry>();
       for (const r of roots) {
-        await walk(r, postBudget, post);
+        await walk(r, postBudget, post, config);
         if (postBudget.filesLeft <= 0 || Date.now() > postBudget.deadline) break;
       }
 
       for (const [p, after] of post) {
         const before = pre.get(p);
         if (!before) {
-          // Created — original is empty.
+          // With a partial pre-scan we can't distinguish "created" from
+          // "outside the captured window", so only report creations when the
+          // pre-scan completed.
+          if (snapshotSkipped) continue;
           const ev = recordMutation(
             conversationId,
             p,
             { ...meta, source: 'shell-snapshot' },
-            conv.has(p) ? undefined : { exists: false, content: '' },
+            conv.has(p) ? undefined : { exists: false, content: '', captured: true },
           );
           if (ev) events.push(ev);
           continue;
         }
         const mtimeChanged = after.mtimeMs !== before.mtimeMs || after.size !== before.size;
-        const hashChanged = before.hash != null && (() => {
-          const r = safeRead(p);
-          return r.exists && hashContent(r.content) !== before.hash;
-        })();
+        const hashChanged =
+          before.hash != null &&
+          (() => {
+            const r = safeRead(p);
+            return r.exists && hashContent(r.content) !== before.hash;
+          })();
         if (!mtimeChanged && !hashChanged) continue;
-        // Modified — if not yet tracked we lost the true pre-image; fall back
-        // to marking created=false with an empty original so the diff shows
-        // the whole current file. (Pre-image capture for every scanned file
-        // is too expensive; hash-mismatch is the best we can do here.)
-        const preRead = conv.has(p) ? undefined : { exists: true, content: '' };
+        const preRead = conv.has(p)
+          ? undefined
+          : before.preContent != null
+            ? { exists: true, content: before.preContent, captured: true }
+            : { exists: true, content: '', captured: false };
         const ev = recordMutation(conversationId, p, { ...meta, source: 'shell-snapshot' }, preRead);
         if (ev) events.push(ev);
       }
-      for (const [p] of pre) {
+      for (const [p, before] of pre) {
         if (!post.has(p) && existsSync(p) === false) {
-          const preRead = conv.has(p) ? undefined : { exists: true, content: '' };
+          const preRead = conv.has(p)
+            ? undefined
+            : before.preContent != null
+              ? { exists: true, content: before.preContent, captured: true }
+              : { exists: true, content: '', captured: false };
           const ev = recordMutation(conversationId, p, { ...meta, source: 'shell-snapshot' }, preRead);
           if (ev) events.push(ev);
         }
@@ -366,11 +442,21 @@ export async function beginShellSnapshot(
     }
 
     const looksMutating = MUTATING_CMD_RE.test(meta.command);
-    if (dt.aiFallback && (snapshotSkipped || (events.length === 0 && looksMutating))) {
-      const inferred = await inferChangedPaths(meta.command, result.stdout ?? '', result.stderr ?? '', meta.cwd, config);
+    if (dt.aiFallback && looksMutating && events.length === 0) {
+      const inferred = await inferChangedPaths(
+        meta.command,
+        result.stdout ?? '',
+        result.stderr ?? '',
+        meta.cwd,
+        config,
+      );
       for (const p of inferred) {
         const abs = isAbsolute(p) ? p : resolve(meta.cwd ?? homedir(), p);
-        const preRead = conv.has(abs) ? undefined : safeRead(abs);
+        if (!isPathAllowed(abs, config).allowed) continue;
+        // No pre-image is available on the AI-inferred path; treat as
+        // unknown-original so the diff shows current content and Revert is
+        // disabled rather than truncating the file.
+        const preRead = conv.has(abs) ? undefined : { exists: false, content: '', captured: false };
         const ev = recordMutation(conversationId, abs, { ...meta, source: 'shell-ai' }, preRead);
         if (ev) events.push(ev);
       }
@@ -441,12 +527,25 @@ export function getDiff(conversationId: string, path: string): FileDiff | null {
   return toFileDiff(conversationId, path, entry);
 }
 
-export function revertDiff(conversationId: string, path: string): { success: boolean; error?: string } {
+export function revertDiff(
+  conversationId: string,
+  path: string,
+  opts?: { force?: boolean },
+): { success: boolean; error?: string } {
   const conv = store.get(conversationId);
   const entry = conv?.get(path);
   if (!conv || !entry) return { success: false, error: 'No tracked diff for path' };
+  if (!entry.originalCaptured) {
+    return { success: false, error: 'Original content was not captured for this file; revert would truncate it.' };
+  }
+  if (!opts?.force && hasDrifted(path, entry)) {
+    return {
+      success: false,
+      error: 'File changed on disk since it was last tracked (external/user edit); revert refused to avoid data loss.',
+    };
+  }
   try {
-    writeFileSync(path, entry.original, 'utf-8');
+    restoreFile(path, entry.original, entry.created);
     conv.delete(path);
     broadcast({
       conversationId,
@@ -465,6 +564,218 @@ export function revertDiff(conversationId: string, path: string): { success: boo
   }
 }
 
+/** Restore every tracked file in a conversation to its captured original. */
+export function revertAllDiffs(conversationId: string): { success: boolean; reverted: number; skipped: string[] } {
+  const conv = store.get(conversationId);
+  if (!conv) return { success: true, reverted: 0, skipped: [] };
+  let reverted = 0;
+  const skipped: string[] = [];
+  for (const path of Array.from(conv.keys())) {
+    const r = revertDiff(conversationId, path);
+    if (r.success) reverted++;
+    else skipped.push(path);
+  }
+  return { success: skipped.length === 0, reverted, skipped };
+}
+
+/**
+ * Reverse a single hunk against the file's CURRENT on-disk content. The hunk
+ * index refers to `listDiffsForConversation`/`getDiff` hunk ordering. Fails
+ * (rather than corrupts) if the file has drifted so the hunk no longer applies.
+ */
+export function revertHunk(
+  conversationId: string,
+  path: string,
+  hunkIndex: number,
+): { success: boolean; error?: string } {
+  const conv = store.get(conversationId);
+  const entry = conv?.get(path);
+  if (!conv || !entry) return { success: false, error: 'No tracked diff for path' };
+  if (!entry.originalCaptured) {
+    return { success: false, error: 'Original content was not captured; cannot compute hunks safely.' };
+  }
+  const { hunks } = computeUnifiedDiff(entry.original, entry.current, { path });
+  const hunk = hunks[hunkIndex];
+  if (!hunk) return { success: false, error: `Hunk ${hunkIndex} out of range (0..${hunks.length - 1}).` };
+
+  const current = safeRead(path);
+  if (!current.captured) return { success: false, error: 'Current file is binary/oversized; cannot patch a hunk.' };
+
+  const applied = reverseApplyHunk(current.content, hunk);
+  if (applied === null) {
+    return { success: false, error: 'Hunk no longer matches current file content (file has drifted).' };
+  }
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, applied, 'utf-8');
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  const ev = recordMutation(conversationId, path, { toolName: 'revert-hunk', source: entry.lastSource }, undefined);
+  if (!ev) {
+    // Fully reverted back to original — recordMutation returns null on no-op.
+    broadcast({
+      conversationId,
+      path,
+      unifiedDiff: '',
+      additions: 0,
+      deletions: 0,
+      source: entry.lastSource,
+      toolName: 'revert-hunk',
+      created: false,
+      deleted: false,
+    });
+  }
+  return { success: true };
+}
+
+/**
+ * Roll a file back to the state it was in immediately AFTER op `opIndex`
+ * (i.e. undo every op after it). Requires per-op snapshots, which are only
+ * kept for small files. `opIndex = -1` reverts to the original pre-image.
+ */
+export function revertToOp(
+  conversationId: string,
+  path: string,
+  opIndex: number,
+  opts?: { force?: boolean },
+): { success: boolean; error?: string } {
+  const conv = store.get(conversationId);
+  const entry = conv?.get(path);
+  if (!conv || !entry) return { success: false, error: 'No tracked diff for path' };
+  if (!opts?.force && hasDrifted(path, entry)) {
+    return {
+      success: false,
+      error: 'File changed on disk since it was last tracked (external/user edit); revert refused to avoid data loss.',
+    };
+  }
+
+  let targetContent: string;
+  let targetExists: boolean;
+  if (opIndex < 0) {
+    if (!entry.originalCaptured) return { success: false, error: 'Original content was not captured.' };
+    targetContent = entry.original;
+    // The pre-edit state existed on disk unless the first op created the file.
+    targetExists = !entry.created;
+  } else {
+    const op = entry.ops[opIndex];
+    if (!op) return { success: false, error: `Op ${opIndex} out of range (0..${entry.ops.length - 1}).` };
+    if (op.existsAfter && op.contentAfter === undefined) {
+      return { success: false, error: `No content snapshot for op ${opIndex} (file too large or too many ops).` };
+    }
+    targetExists = op.existsAfter;
+    targetContent = op.contentAfter ?? '';
+  }
+
+  try {
+    restoreFile(path, targetContent, !targetExists);
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (opIndex < 0) {
+    conv.delete(path);
+    broadcast({
+      conversationId,
+      path,
+      unifiedDiff: '',
+      additions: 0,
+      deletions: 0,
+      source: entry.lastSource,
+      toolName: 'revert-to-op',
+      created: false,
+      deleted: false,
+    });
+  } else {
+    entry.ops = entry.ops.slice(0, opIndex + 1);
+    recordMutation(conversationId, path, { toolName: 'revert-to-op', source: entry.lastSource }, undefined);
+  }
+  return { success: true };
+}
+
+/** Plain unified-diff text for the agent-facing tool. */
+export function getDiffText(conversationId: string, path: string): string | null {
+  const entry = store.get(conversationId)?.get(path);
+  if (!entry) return null;
+  return computeUnifiedDiff(entry.original, entry.current, { path }).unified;
+}
+
+function restoreFile(path: string, content: string, shouldDelete: boolean): void {
+  if (shouldDelete) {
+    if (existsSync(path)) unlinkSync(path);
+    return;
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content, 'utf-8');
+}
+
+/**
+ * True when the on-disk file no longer matches the tracked `current` state,
+ * i.e. it was edited outside the tracker (user or another process) since we
+ * last recorded it. Reverting over drift would silently destroy that work.
+ * Uncaptured (binary/oversized) current state can't be compared → treat as
+ * drifted (safe default).
+ */
+function hasDrifted(path: string, entry: TrackedFile): boolean {
+  const disk = safeRead(path);
+  if (entry.deleted) return disk.exists; // we think it's gone but it's back
+  if (!disk.exists) return true; // we think it's present but it's gone
+  if (!disk.captured) return true; // can't verify → refuse
+  return disk.content !== entry.current;
+}
+
+/**
+ * Reverse-apply a unified hunk against `content`: replace the hunk's post-image
+ * (add+context) block with its pre-image (del+context). Returns null if the
+ * post-image block is missing OR matches in more than one place (ambiguous
+ * after drift) — the caller then refuses rather than patching the wrong block.
+ */
+function reverseApplyHunk(content: string, hunk: UnifiedHunk): string | null {
+  const lines = content.length === 0 ? [] : content.split('\n');
+  const hadTrailingNewline = content.endsWith('\n');
+  if (hadTrailingNewline) lines.pop();
+
+  const postImage: string[] = [];
+  const preImage: string[] = [];
+  for (const l of hunk.lines) {
+    if (l.type === 'context') {
+      postImage.push(l.text);
+      preImage.push(l.text);
+    } else if (l.type === 'add') {
+      postImage.push(l.text);
+    } else {
+      preImage.push(l.text);
+    }
+  }
+  if (postImage.length === 0) return null;
+
+  const matchesAt = (start: number): boolean => postImage.every((t, i) => lines[start + i] === t);
+
+  // Prefer the recorded offset; only fall back to scanning if it doesn't match,
+  // and require a UNIQUE match so we never patch a wrong identical-looking block.
+  const guess = Math.max(0, hunk.bStart - 1);
+  let at = -1;
+  if (matchesAt(guess)) {
+    at = guess;
+  } else {
+    let matchCount = 0;
+    for (let i = 0; i + postImage.length <= lines.length; i++) {
+      if (matchesAt(i)) {
+        matchCount++;
+        if (matchCount > 1) return null; // ambiguous → refuse
+        at = i;
+      }
+    }
+    if (matchCount !== 1) return null;
+  }
+
+  const next = [...lines.slice(0, at), ...preImage, ...lines.slice(at + postImage.length)];
+  return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline || !content ? '\n' : '');
+}
+
 export function clearConversationDiffs(conversationId: string): void {
   store.delete(conversationId);
+}
+
+export function clearAllDiffs(): void {
+  store.clear();
 }

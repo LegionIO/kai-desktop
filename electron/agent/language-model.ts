@@ -79,7 +79,7 @@ function createResponsesApiPatchingFetch(): typeof fetch {
       }
 
       // Find function_calls without matching outputs
-      const orphanedIds = [...callIds].filter(id => !outputIds.has(id));
+      const orphanedIds = [...callIds].filter((id) => !outputIds.has(id));
 
       let patched = [...inputItems];
       let patchApplied = false;
@@ -184,10 +184,11 @@ async function createBedrockModel(modelConfig: LLMModelConfig) {
   const configuredHeaders = { ...(modelConfig.extraHeaders ?? {}) };
 
   // Region: use config, fall back to env, default to us-east-1 when using a gateway endpoint
-  const region = modelConfig.region
-    || process.env.AWS_REGION
-    || process.env.AWS_DEFAULT_REGION
-    || (modelConfig.endpoint ? 'us-east-1' : '');
+  const region =
+    modelConfig.region ||
+    process.env.AWS_REGION ||
+    process.env.AWS_DEFAULT_REGION ||
+    (modelConfig.endpoint ? 'us-east-1' : '');
 
   // Build a credential provider when Bedrock is using the default AWS chain
   const hasExplicitKeys = Boolean(modelConfig.accessKeyId && modelConfig.secretAccessKey);
@@ -210,7 +211,9 @@ async function createBedrockModel(modelConfig: LLMModelConfig) {
     ...(hasExplicitKeys ? { secretAccessKey: modelConfig.secretAccessKey! } : {}),
     ...(modelConfig.sessionToken ? { sessionToken: modelConfig.sessionToken } : {}),
     ...(credentialProviderFn ? { credentialProvider: credentialProviderFn } : {}),
-    ...(Object.keys(configuredHeaders).length > 0 ? { headers: withBrandUserAgent(configuredHeaders) } : { headers: withBrandUserAgent() }),
+    ...(Object.keys(configuredHeaders).length > 0
+      ? { headers: withBrandUserAgent(configuredHeaders) }
+      : { headers: withBrandUserAgent() }),
   });
 
   return bedrock(modelConfig.modelName);
@@ -226,8 +229,9 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
   // );
 
   if (modelConfig.provider === 'anthropic') {
+    const endpoint = stripTrailingSlashes(modelConfig.endpoint);
     const anthropic = createAnthropic({
-      baseURL: stripTrailingSlashes(modelConfig.endpoint),
+      ...(endpoint ? { baseURL: endpoint } : {}),
       ...(modelConfig.apiKey ? { apiKey: modelConfig.apiKey } : {}),
       headers: withBrandUserAgent(modelConfig.extraHeaders ?? {}),
       fetch: createTemperatureOmissionFetch(),

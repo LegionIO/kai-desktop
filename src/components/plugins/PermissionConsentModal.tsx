@@ -51,6 +51,11 @@ const PERMISSION_DESCRIPTIONS: Record<
     icon: KeyRound,
     level: 'high',
   },
+  'agent:hook': {
+    label: 'Observe, block, or rewrite prompts, tool calls, and tool results',
+    icon: Bot,
+    level: 'high',
+  },
   'fs:scoped-read': { label: 'Read files within declared directories', icon: Eye, level: 'medium' },
   // ── Medium risk ──
   'messages:hook': { label: 'Intercept messages before/after send', icon: MessageSquare, level: 'medium' },

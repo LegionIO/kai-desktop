@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
+import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 
 type ConversationRecord = {
@@ -410,6 +411,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     }
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
+    clearConversationDiffs(id);
 
     // Clean up associated computer-use sessions
     if (getConfig) {
@@ -441,6 +443,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
     store.conversations = {};
     store.activeConversationId = null;
+    clearAllDiffs();
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
     return { ok: true };
@@ -590,6 +593,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
     eventBus.emit('conversation', 'created', { id: forked.id, title: forked.title });
+    void hookDispatcher.dispatch('ConversationStart', { conversationId: forked.id, title: forked.title });
     return { ok: true, conversation: forked };
   });
 

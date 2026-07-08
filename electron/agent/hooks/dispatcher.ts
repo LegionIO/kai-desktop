@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { AppConfig, AutomationRule } from '../../config/schema.js';
 import { eventBus } from '../../automations/event-bus.js';
+import { evaluateConditions } from '../../automations/conditions.js';
 
 /* ───────────────────────── Types ───────────────────────── */
 
@@ -116,6 +117,8 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
  *  - `modify` mode: stdout must be JSON of the shape `{ "payload": <replacement> }`.
  *    A non-zero exit is treated as a deny (same as `block`).
  */
+const MAX_HOOK_OUTPUT_BYTES = 64 * 1024;
+
 function runShellHook(
   event: HookEvent,
   command: string,
@@ -127,12 +130,26 @@ function runShellHook(
     let stdout = '';
     let stderr = '';
     let settled = false;
+    const detached = process.platform !== 'win32';
 
     const child = spawn(command, {
       shell: true,
+      detached,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, KAI_HOOK_EVENT: event },
     });
+
+    const killTree = (): void => {
+      try {
+        if (detached && typeof child.pid === 'number') {
+          process.kill(-child.pid, 'SIGKILL');
+        } else {
+          child.kill('SIGKILL');
+        }
+      } catch {
+        /* ignore */
+      }
+    };
 
     const settle = (outcome: HookOutcome | void): void => {
       if (settled) return;
@@ -142,20 +159,22 @@ function runShellHook(
     };
 
     const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* ignore */
-      }
+      killTree();
       if (mode === 'observe') return settle(undefined);
       settle({ decision: 'deny', reason: `hook command timed out after ${timeoutMs}ms` });
     }, timeoutMs);
 
     child.stdout?.on('data', (d: Buffer) => {
-      stdout += d.toString('utf8');
+      if (stdout.length < MAX_HOOK_OUTPUT_BYTES) {
+        stdout += d.toString('utf8');
+        if (stdout.length > MAX_HOOK_OUTPUT_BYTES) stdout = stdout.slice(0, MAX_HOOK_OUTPUT_BYTES);
+      }
     });
     child.stderr?.on('data', (d: Buffer) => {
-      stderr += d.toString('utf8');
+      if (stderr.length < MAX_HOOK_OUTPUT_BYTES) {
+        stderr += d.toString('utf8');
+        if (stderr.length > MAX_HOOK_OUTPUT_BYTES) stderr = stderr.slice(0, MAX_HOOK_OUTPUT_BYTES);
+      }
     });
     child.on('error', (err) => {
       if (mode === 'observe') return settle(undefined);
@@ -181,6 +200,10 @@ function runShellHook(
     });
 
     try {
+      // A hook that never reads stdin (e.g. `true`, a notifier) can trigger an
+      // async EPIPE on this stream after we've returned; swallow it so it can't
+      // crash the main process.
+      child.stdin?.on('error', () => {});
       child.stdin?.write(JSON.stringify({ event, payload: jsonSafe(payload) }));
       child.stdin?.end();
     } catch {
@@ -254,14 +277,14 @@ export class HookDispatcher {
     const enabled = cfg?.hooks?.enabled ?? true;
     const timeoutMs = cfg?.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+    if (!enabled) return { payload, denied: false };
+
     // Observe-only fan-out to the automation engine.
     try {
       eventBus.emit('hook', event, jsonSafe(payload));
     } catch (err) {
       console.warn('[hooks] event bus emit failed:', err);
     }
-
-    if (!enabled) return { payload, denied: false };
 
     if (cfg) this.syncUserHooks(cfg);
 
@@ -329,19 +352,28 @@ export class HookDispatcher {
    * triggers are handled by the automation engine via the event-bus emit above.
    */
   private syncUserHooks(config: AppConfig): void {
+    const automationsEnabled = config.automations?.enabled !== false;
     const rules: AutomationRule[] = config.automations?.rules ?? [];
-    const relevant = rules.filter(
-      (r) => r.enabled && r.trigger.source === 'hook' && (HOOK_EVENTS as readonly string[]).includes(r.trigger.event),
-    );
-    const fingerprint = JSON.stringify(
+    const relevant = automationsEnabled
+      ? rules.filter(
+          (r) =>
+            r.enabled && r.trigger.source === 'hook' && (HOOK_EVENTS as readonly string[]).includes(r.trigger.event),
+        )
+      : [];
+    const timeoutMs = config.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const fingerprint = JSON.stringify([
+      timeoutMs,
+      automationsEnabled,
       relevant.map((r) => [
         r.id,
         r.trigger.event,
+        r.conditions,
+        r.conditionMode,
         r.actions
           .filter((a): a is Extract<typeof a, { type: 'runHookCommand' }> => a.type === 'runHookCommand')
           .map((a) => [a.command, a.mode, a.matcher ?? '']),
       ]),
-    );
+    ]);
     if (fingerprint === this.userHookFingerprint) return;
     this.userHookFingerprint = fingerprint;
 
@@ -352,13 +384,21 @@ export class HookDispatcher {
       }
     }
 
-    const timeoutMs = config.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     for (const rule of relevant) {
       const event = rule.trigger.event as HookEvent;
       for (const action of rule.actions) {
         if (action.type !== 'runHookCommand') continue;
         const { command, mode, matcher } = action;
-        this.register(event, (payload) => runShellHook(event, command, mode, payload, timeoutMs), {
+        const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
+          try {
+            const cond = evaluateConditions(rule.conditions, rule.conditionMode, payload);
+            if (!cond.ok) return undefined;
+          } catch {
+            return undefined;
+          }
+          return runShellHook(event, command, mode, payload, timeoutMs);
+        };
+        this.register(event, handler, {
           source: 'user',
           mode,
           matcher,

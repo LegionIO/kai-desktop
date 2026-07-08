@@ -47,3 +47,4 @@ results/
 ota-private*.pem
 ota-public*.pem
 *.signing.key
+.claude/worktrees/

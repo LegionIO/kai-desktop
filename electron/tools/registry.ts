@@ -23,6 +23,7 @@ import { createAutomationManageTool } from './automation-manage.js';
 import { createWebFetchTool } from './web-fetch.js';
 import { createWebSearchTool } from './web-search.js';
 import { createArtifactTools } from './artifact.js';
+import { createFileChangesTools } from './file-changes.js';
 import { createImageGenTool } from './image-gen.js';
 import { createVideoGenTool } from './video-gen.js';
 import { buildCliTools } from './cli-tools.js';
@@ -201,6 +202,11 @@ export async function buildToolRegistry(
   // Artifact tools (agent-rendered live previews)
   if (config?.tools?.artifacts?.enabled !== false) {
     tools.push(...createArtifactTools());
+  }
+
+  // File-change inspection + rollback (agent-facing view of the diff tracker)
+  if (config?.tools?.diffTracking?.enabled !== false) {
+    tools.push(...createFileChangesTools());
   }
 
   // Media generation tools

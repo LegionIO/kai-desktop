@@ -38,6 +38,8 @@ export type FileDiffResultProps = {
   deleted?: boolean;
   defaultOpen?: boolean;
   className?: string;
+  /** When provided, each hunk header shows a revert-hunk button. */
+  onRevertHunk?: (hunkIndex: number) => void;
 };
 
 /**
@@ -54,6 +56,7 @@ export const FileDiffResult: FC<FileDiffResultProps> = ({
   deleted,
   defaultOpen = false,
   className,
+  onRevertHunk,
 }) => {
   const [open, setOpen] = useState(defaultOpen);
   const hunks = useMemo(() => parseHunks(unifiedDiff), [unifiedDiff]);
@@ -115,8 +118,18 @@ export const FileDiffResult: FC<FileDiffResultProps> = ({
           ) : (
             hunks.map((hunk, hi) => (
               <div key={hi} className="border-b border-border/30 dark:border-white/[0.04] last:border-b-0">
-                <div className="px-3 py-0.5 text-[10px] text-sky-700 dark:text-sky-400 bg-sky-500/5 select-none">
-                  {hunk.header}
+                <div className="flex items-center gap-2 px-3 py-0.5 text-[10px] text-sky-700 dark:text-sky-400 bg-sky-500/5 select-none">
+                  <span className="truncate">{hunk.header}</span>
+                  {onRevertHunk && (
+                    <button
+                      type="button"
+                      onClick={() => onRevertHunk(hi)}
+                      className="ml-auto shrink-0 rounded px-1 text-[9px] font-medium text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                      title="Revert just this hunk"
+                    >
+                      revert hunk
+                    </button>
+                  )}
                 </div>
                 <pre className="text-[11px] leading-[1.35rem]">
                   {hunk.lines.map((line, li) => (

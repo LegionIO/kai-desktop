@@ -135,6 +135,12 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!parsed.success) {
             return { error: 'Rule failed validation.', issues: parsed.error.issues };
           }
+          if (parsed.data.actions.some((a) => a.type === 'runHookCommand')) {
+            return {
+              error:
+                'runHookCommand actions execute arbitrary shell without guardrails and can only be configured by the user in Settings → Automations.',
+            };
+          }
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
           persist([...rules, parsed.data]);
           return {
@@ -164,6 +170,15 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           const parsed = automationRuleSchema.safeParse(merged);
           if (!parsed.success) {
             return { error: 'Updated rule failed validation.', issues: parsed.error.issues };
+          }
+          if (
+            parsed.data.actions.some((a) => a.type === 'runHookCommand') ||
+            prev.actions.some((a) => a.type === 'runHookCommand')
+          ) {
+            return {
+              error:
+                'Rules containing runHookCommand actions execute arbitrary shell without guardrails and can only be configured by the user in Settings → Automations.',
+            };
           }
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
           const next = [...rules];

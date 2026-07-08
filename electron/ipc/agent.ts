@@ -890,6 +890,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (!compactionSupported || !toolCompaction?.enabled || controller.signal.aborted) {
             return { result };
           }
+          if (toolName === 'create_artifact' || toolName === 'update_artifact') {
+            return { result };
+          }
 
           const originalText = stringifyToolResult(result);
           const userQuery = extractLatestUserQuery(messages);
@@ -1260,9 +1263,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 args: state.args,
               });
               if (preTool.denied) {
-                hookDeniedToolCalls.set(state.toolCallId, preTool.reason ?? 'Blocked by PreToolUse hook.');
-                state.cancel();
-                return;
+                const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+                hookDeniedToolCalls.set(state.toolCallId, reason);
+                return { skip: true as const, result: { isError: true, error: reason } };
               }
               const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
               if (nextArgs !== undefined && nextArgs !== state.args) {

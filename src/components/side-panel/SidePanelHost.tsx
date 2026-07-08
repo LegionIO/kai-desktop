@@ -60,7 +60,7 @@ export function useSidePanelOptional(): SidePanelContextValue | null {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 export const SidePanelProvider: FC<PropsWithChildren> = ({ children }) => {
-  const [state, setState] = useState<SidePanelState>('closed');
+  const [state, setState] = useState<SidePanelState>('minimized');
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
 
   const openPanel = useCallback((tabId?: string) => {
@@ -93,7 +93,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
   const [widthPct, setWidthPct] = useState(DEFAULT_PCT);
   const dragRef = useRef<{ startX: number; startPct: number; parentWidth: number } | null>(null);
 
-  const effectiveTabId = activeTabId && tabs.some((t) => t.id === activeTabId) ? activeTabId : tabs[0]?.id ?? null;
+  const effectiveTabId = activeTabId && tabs.some((t) => t.id === activeTabId) ? activeTabId : (tabs[0]?.id ?? null);
   const activeTab = tabs.find((t) => t.id === effectiveTabId) ?? null;
 
   const handleDragStart = useCallback(
@@ -147,7 +147,11 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
                   tab.id === effectiveTabId && 'bg-accent/60 text-foreground',
                 )}
               >
-                {Icon ? <Icon className="h-4 w-4" /> : <span className="text-[10px] font-semibold">{tab.label[0]}</span>}
+                {Icon ? (
+                  <Icon className="h-4 w-4" />
+                ) : (
+                  <span className="text-[10px] font-semibold">{tab.label[0]}</span>
+                )}
                 {tab.badge != null && (
                   <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-primary" />
                 )}

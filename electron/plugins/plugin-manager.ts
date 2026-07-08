@@ -202,6 +202,9 @@ export class PluginManager {
     // subscription keys via api.config.get() / onConfigChanged. Without
     // this permission, only the redacted PluginSafeConfig is returned.
     'config:read-secrets',
+    // Full MITM on the agent loop: observe/block/modify prompts, tool args
+    // and tool results. Effectively equivalent to arbitrary tool execution.
+    'agent:hook',
   ]);
 
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */

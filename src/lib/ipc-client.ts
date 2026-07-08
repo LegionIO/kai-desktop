@@ -151,6 +151,17 @@ type AppAPI = {
     listForConversation: (conversationId: string) => Promise<FileDiff[]>;
     get: (conversationId: string, path: string) => Promise<FileDiff | null>;
     revert: (conversationId: string, path: string) => Promise<{ success: boolean; error?: string }>;
+    revertAll: (conversationId: string) => Promise<{ success: boolean; reverted: number; skipped: string[] }>;
+    revertHunk: (
+      conversationId: string,
+      path: string,
+      hunkIndex: number,
+    ) => Promise<{ success: boolean; error?: string }>;
+    revertToOp: (
+      conversationId: string,
+      path: string,
+      opIndex: number,
+    ) => Promise<{ success: boolean; error?: string }>;
     clear: (conversationId: string) => Promise<{ success: boolean }>;
     onChange: (callback: (event: DiffEvent) => void) => () => void;
   };

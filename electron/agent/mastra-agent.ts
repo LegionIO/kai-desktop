@@ -79,6 +79,24 @@ export type StreamEvent = {
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
+
+export type ToolLifecycleHooks = {
+  emitEvent?: (event: StreamEvent) => void;
+  /** Return `{ skip, result }` to short-circuit execution (e.g. PreToolUse deny). */
+  onToolExecutionStart?: (state: {
+    toolCallId: string;
+    toolName: string;
+    args: unknown;
+    cancel: () => void;
+  }) => void | { skip: true; result: unknown } | Promise<void | { skip: true; result: unknown }>;
+  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
+  augmentToolResult?: (state: {
+    toolCallId: string;
+    toolName: string;
+    args: unknown;
+    result: unknown;
+  }) => Promise<unknown> | unknown;
+};
 type JsonStandardSchemaInput = Parameters<typeof toJsonStandardSchema>[0];
 type MastraToolExecutionOptions = {
   toolCallId?: string;
@@ -173,20 +191,7 @@ function toMastraTools(
   tools: ToolDefinition[],
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      cancel: () => void;
-    }) => void | Promise<void>;
-    onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-    augmentToolResult?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      result: unknown;
-    }) => Promise<unknown> | unknown;
-  },
+  } & ToolLifecycleHooks,
   executionContext?: Pick<ToolExecutionContext, 'cwd'>,
 ): Record<string, ReturnType<typeof createTool>> {
   const result: Record<string, ReturnType<typeof createTool>> = {};
@@ -209,39 +214,39 @@ function toMastraTools(
         };
 
         const mergedAbortSignal = mergeAbortSignals(mastraOptions?.abortSignal, localAbortController.signal);
-        await hooks?.onToolExecutionStart?.({
-          toolCallId,
-          toolName: tool.name,
-          args: input,
-          cancel,
-        });
-
-        const ctx: ToolExecutionContext = {
-          toolCallId,
-          conversationId,
-          cwd: executionContext?.cwd,
-          abortSignal: mergedAbortSignal,
-          onProgress: (progress: ToolProgressEvent) => {
-            hooks?.emitEvent?.({
-              conversationId,
-              type: 'tool-progress',
-              toolCallId,
-              toolName: tool.name,
-              data: progress,
-            });
-          },
-        };
         try {
-          const result = await tool.execute(input, ctx);
-          if (hooks?.augmentToolResult) {
-            return await hooks.augmentToolResult({
-              toolCallId,
-              toolName: tool.name,
-              args: input,
-              result,
-            });
+          const startOutcome = await hooks?.onToolExecutionStart?.({
+            toolCallId,
+            toolName: tool.name,
+            args: input,
+            cancel,
+          });
+          if (startOutcome && startOutcome.skip) {
+            const result = startOutcome.result;
+            return hooks?.augmentToolResult
+              ? await hooks.augmentToolResult({ toolCallId, toolName: tool.name, args: input, result })
+              : result;
           }
-          return result;
+
+          const ctx: ToolExecutionContext = {
+            toolCallId,
+            conversationId,
+            cwd: executionContext?.cwd,
+            abortSignal: mergedAbortSignal,
+            onProgress: (progress: ToolProgressEvent) => {
+              hooks?.emitEvent?.({
+                conversationId,
+                type: 'tool-progress',
+                toolCallId,
+                toolName: tool.name,
+                data: progress,
+              });
+            },
+          };
+          const result = await tool.execute(input, ctx);
+          return hooks?.augmentToolResult
+            ? await hooks.augmentToolResult({ toolCallId, toolName: tool.name, args: input, result })
+            : result;
         } finally {
           hooks?.onToolExecutionEnd?.({ toolCallId, toolName: tool.name });
         }
@@ -657,6 +662,7 @@ function applyWorkspaceToolGuards(
   cwd: string,
   getConfig: () => AppConfig,
   conversationId?: string,
+  hooks?: ToolLifecycleHooks,
 ): void {
   for (const [toolName, tool] of Object.entries(tools)) {
     if (!tool || typeof tool !== 'object') continue;
@@ -665,52 +671,75 @@ function applyWorkspaceToolGuards(
     const originalExecute = candidate.execute.bind(tool);
     candidate.execute = async (input, context) => {
       const normalized = normalizeWorkspaceToolInput(toolName, input, cwd);
-      if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof (normalized as { path?: unknown })?.path === 'string') {
-        const check = isPathAllowed((normalized as { path: string }).path, getConfig());
-        if (!check.allowed) {
-          throw new Error(`${toolName}: ${check.reason}`);
+      const toolCallId =
+        (context as { toolCallId?: string } | undefined)?.toolCallId ??
+        `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      const runGuarded = async (args: unknown): Promise<unknown> => {
+        if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof (args as { path?: unknown })?.path === 'string') {
+          const check = isPathAllowed((args as { path: string }).path, getConfig());
+          if (!check.allowed) {
+            throw new Error(`${toolName}: ${check.reason}`);
+          }
         }
-      }
 
-      const toolCallId = (context as { toolCallId?: string } | undefined)?.toolCallId;
+        if (
+          conversationId &&
+          WORKSPACE_FILE_MUTATING_TOOLS.has(toolName) &&
+          typeof (args as { path?: unknown })?.path === 'string'
+        ) {
+          const absPath = (args as { path: string }).path;
+          const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
+          const result = await originalExecute(args, context);
+          const ev = handle.finish();
+          return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
+        }
 
-      // Diff tracking — file write/edit: capture pre-image before executing.
-      if (
-        conversationId &&
-        WORKSPACE_FILE_MUTATING_TOOLS.has(toolName) &&
-        typeof (normalized as { path?: unknown })?.path === 'string'
-      ) {
-        const absPath = (normalized as { path: string }).path;
-        const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
-        const result = await originalExecute(normalized, context);
-        const ev = handle.finish();
-        return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
-      }
+        if (conversationId && toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND) {
+          const cmdInput = args as { command?: unknown; cwd?: unknown };
+          const command = typeof cmdInput.command === 'string' ? cmdInput.command : '';
+          const shellCwd = typeof cmdInput.cwd === 'string' ? cmdInput.cwd : cwd;
+          const snap = await beginShellSnapshot(
+            conversationId,
+            { toolName, toolCallId, command, cwd: shellCwd },
+            getConfig(),
+          );
+          const result = await originalExecute(args, context);
+          const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
+          const events = await snap.finish({
+            stdout: typeof r?.stdout === 'string' ? r.stdout : '',
+            stderr: typeof r?.stderr === 'string' ? r.stderr : '',
+          });
+          return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
+        }
 
-      // Diff tracking — shell/execute_command: mtime snapshot + AI fallback.
-      if (conversationId && toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND) {
-        const cmdInput = normalized as { command?: unknown; cwd?: unknown };
-        const command = typeof cmdInput.command === 'string' ? cmdInput.command : '';
-        const shellCwd = typeof cmdInput.cwd === 'string' ? cmdInput.cwd : cwd;
-        const snap = await beginShellSnapshot(
-          conversationId,
-          { toolName, toolCallId, command, cwd: shellCwd },
-          getConfig(),
-        );
-        const result = await originalExecute(normalized, context);
-        const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
-        const events = await snap.finish({
-          stdout: typeof r?.stdout === 'string' ? r.stdout : '',
-          stderr: typeof r?.stderr === 'string' ? r.stderr : '',
+        const result = await originalExecute(args, context);
+        if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
+          return filterGrepOutput(result, getConfig());
+        }
+        return result;
+      };
+
+      try {
+        const startOutcome = await hooks?.onToolExecutionStart?.({
+          toolCallId,
+          toolName,
+          args: normalized,
+          cancel: () => {},
         });
-        return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
+        if (startOutcome && startOutcome.skip) {
+          const result = startOutcome.result;
+          return hooks?.augmentToolResult
+            ? await hooks.augmentToolResult({ toolCallId, toolName, args: normalized, result })
+            : result;
+        }
+        const result = await runGuarded(normalized);
+        return hooks?.augmentToolResult
+          ? await hooks.augmentToolResult({ toolCallId, toolName, args: normalized, result })
+          : result;
+      } finally {
+        hooks?.onToolExecutionEnd?.({ toolCallId, toolName });
       }
-
-      const result = await originalExecute(normalized, context);
-      if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
-        return filterGrepOutput(result, getConfig());
-      }
-      return result;
     };
   }
 }
@@ -725,6 +754,7 @@ async function createWorkspaceForAgent(
   executionMode?: string,
   progressHook?: (toolCallId: string, stream: 'stdout' | 'stderr', data: string) => void,
   conversationId?: string,
+  hooks?: ToolLifecycleHooks,
 ): Promise<{ workspace: Workspace; tools: Record<string, unknown> }> {
   const backgroundProcesses: BackgroundProcessConfig | undefined = progressHook
     ? {
@@ -763,7 +793,7 @@ async function createWorkspaceForAgent(
   await workspace.init();
 
   const tools = await createWorkspaceTools(workspace);
-  applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig, conversationId);
+  applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig, conversationId, hooks);
 
   // If in plan-first mode, remove mutating workspace tools
   if (executionMode === 'plan-first') {
@@ -830,20 +860,7 @@ export async function* streamAgentResponse(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      cancel: () => void;
-    }) => void | Promise<void>;
-    onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-    augmentToolResult?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      result: unknown;
-    }) => Promise<unknown> | unknown;
-  },
+  } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const msgArray = messages as Array<{ role?: string; content?: unknown }>;
   const apiSurface =
@@ -882,6 +899,11 @@ export async function* streamAgentResponse(
         }
       : undefined,
     conversationId,
+    {
+      onToolExecutionStart: options?.onToolExecutionStart,
+      onToolExecutionEnd: options?.onToolExecutionEnd,
+      augmentToolResult: options?.augmentToolResult,
+    },
   );
 
   // Wrap custom (non-workspace) tools through the bridge
@@ -1393,9 +1415,10 @@ async function* streamWithRealEvents(
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
               accCacheWriteTokens += (anthropicMeta.cacheCreationInputTokens as number | undefined) ?? 0;
             }
-            const bedrockMeta = stepMeta?.bedrock as Record<string, unknown> | undefined;
-            if (bedrockMeta) {
-              accCacheWriteTokens += (bedrockMeta.cacheWriteInputTokens as number | undefined) ?? 0;
+            const bedrockMeta = stepMeta?.bedrock as { usage?: Record<string, unknown> } | undefined;
+            if (bedrockMeta?.usage) {
+              accCacheReadTokens += (bedrockMeta.usage.cacheReadInputTokens as number | undefined) ?? 0;
+              accCacheWriteTokens += (bedrockMeta.usage.cacheWriteInputTokens as number | undefined) ?? 0;
             }
             // openai-compat provider puts cache tokens directly on usage
             if (stepUsage) {
@@ -1564,20 +1587,7 @@ export async function* streamWithFallback(
     abortSignal?: AbortSignal;
     cwd?: string;
     emitEvent?: (event: StreamEvent) => void;
-    onToolExecutionStart?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      cancel: () => void;
-    }) => void | Promise<void>;
-    onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
-    augmentToolResult?: (state: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      result: unknown;
-    }) => Promise<unknown> | unknown;
-  },
+  } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const modelChain: ModelCatalogEntry[] = [
     streamConfig.primaryModel,

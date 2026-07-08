@@ -2700,7 +2700,7 @@ function AppShell() {
                   ) : (
                     <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                       <SidePanelProvider>
-                        <ArtifactProvider>
+                        <ArtifactProvider key={activeConversationId ?? 'no-conv'}>
                           <div className="flex h-full min-h-0">
                             {/* Chat column */}
                             <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">

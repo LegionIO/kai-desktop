@@ -704,6 +704,7 @@ function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig
       type: 'anthropic',
       enabled,
       apiKey: provider?.api_key ?? '',
+      endpoint: provider?.base_url ?? '',
     };
   }
 
@@ -819,6 +820,14 @@ function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models']
       const provider = appProviders[providerKey];
       providers[providerKey] = toAppProvider(providerKey, provider);
       catalog.push(...toCatalogEntries(providerKey, provider));
+    }
+
+    // Overlay desktop-only per-entry fields onto llm.json-rebuilt entries so
+    // settings like promptCaching survive the rebuild.
+    const desktopByKey = new Map((defaults.catalog ?? []).map((e) => [e.key, e as { promptCaching?: unknown }]));
+    for (const entry of catalog) {
+      const d = desktopByKey.get(entry.key as string);
+      if (d?.promptCaching !== undefined) entry.promptCaching = d.promptCaching;
     }
 
     const preferredDefaultModel = llm.default_model ?? undefined;

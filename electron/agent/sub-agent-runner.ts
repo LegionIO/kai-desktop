@@ -11,6 +11,7 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { z } from 'zod';
 import { streamAgentResponse } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
+import { hookDispatcher } from './hooks/dispatcher.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
@@ -24,22 +25,22 @@ import {
 export type SubAgentEvent =
   | (StreamEvent & { subAgentConversationId: string; parentConversationId: string; parentToolCallId: string })
   | {
-    subAgentConversationId: string;
-    parentConversationId: string;
-    parentToolCallId: string;
-    type: 'sub-agent-status';
-    status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed';
-    summary?: string;
-  }
+      subAgentConversationId: string;
+      parentConversationId: string;
+      parentToolCallId: string;
+      type: 'sub-agent-status';
+      status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed';
+      summary?: string;
+    }
   | {
-    subAgentConversationId: string;
-    parentConversationId: string;
-    parentToolCallId: string;
-    conversationId: string;
-    type: 'sub-agent-user-message';
-    text: string;
-    source: 'task' | 'parent' | 'user';
-  };
+      subAgentConversationId: string;
+      parentConversationId: string;
+      parentToolCallId: string;
+      conversationId: string;
+      type: 'sub-agent-user-message';
+      text: string;
+      source: 'task' | 'parent' | 'user';
+    };
 
 export type SubAgentRunOptions = {
   subAgentConversationId: string;
@@ -147,12 +148,20 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
   const maxConcurrent = config.tools?.subAgents?.maxConcurrent ?? 4;
   if (activeSubAgentCount >= maxConcurrent) {
     yield {
-      subAgentConversationId, parentConversationId, parentToolCallId,
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'error',
       error: `Maximum concurrent sub-agents (${maxConcurrent}) reached.`,
     };
-    yield { subAgentConversationId, parentConversationId, parentToolCallId, conversationId: subAgentConversationId, type: 'done' };
+    yield {
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
+      conversationId: subAgentConversationId,
+      type: 'done',
+    };
     return;
   }
 
@@ -161,9 +170,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
   try {
     const basePrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
     const systemPrompt = buildSubAgentSystemPrompt(basePrompt, task, context, depth);
-    const messages: Array<{ role: string; content: unknown }> = [
-      { role: 'user', content: task },
-    ];
+    const messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: task }];
 
     const subAgentConfig: AppConfig = { ...config, systemPrompt };
 
@@ -179,8 +186,19 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     const maxTurns = Math.max(config.advanced.maxSteps, 20); // generous turn limit
 
     // Emit initial status
-    const emitStatus = (_status: never, st: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed', summary?: string) => {
-      const evt: SubAgentEvent = { subAgentConversationId, parentConversationId, parentToolCallId, type: 'sub-agent-status', status: st, summary };
+    const emitStatus = (
+      _status: never,
+      st: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed',
+      summary?: string,
+    ) => {
+      const evt: SubAgentEvent = {
+        subAgentConversationId,
+        parentConversationId,
+        parentToolCallId,
+        type: 'sub-agent-status',
+        status: st,
+        summary,
+      };
       broadcastSubAgentEvent(evt);
       return evt;
     };
@@ -189,9 +207,13 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
     // Emit initial task as user message
     const taskMsgEvent: SubAgentEvent = {
-      subAgentConversationId, parentConversationId, parentToolCallId,
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
       conversationId: subAgentConversationId,
-      type: 'sub-agent-user-message', text: task, source: 'task',
+      type: 'sub-agent-user-message',
+      text: task,
+      source: 'task',
     };
     yield taskMsgEvent;
     broadcastSubAgentEvent(taskMsgEvent);
@@ -205,9 +227,13 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     const addFollowUpMessage = (text: string, source: 'user' | 'parent' | 'task' = 'parent'): SubAgentEvent => {
       messages.push({ role: 'user', content: text });
       const evt: SubAgentEvent = {
-        subAgentConversationId, parentConversationId, parentToolCallId,
+        subAgentConversationId,
+        parentConversationId,
+        parentToolCallId,
         conversationId: subAgentConversationId,
-        type: 'sub-agent-user-message', text, source,
+        type: 'sub-agent-user-message',
+        text,
+        source,
       };
       broadcastSubAgentEvent(evt);
       return evt;
@@ -232,9 +258,12 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           emitMidToolMessage: (text) => {
             if (!abortSignal?.aborted) {
               broadcastSubAgentEvent({
-                subAgentConversationId, parentConversationId, parentToolCallId,
+                subAgentConversationId,
+                parentConversationId,
+                parentToolCallId,
                 conversationId: subAgentConversationId,
-                type: 'observer-message', text,
+                type: 'observer-message',
+                text,
               });
             }
           },
@@ -261,29 +290,76 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               subObserver?.onToolProgress({
                 toolCallId: event.toolCallId,
                 toolName: event.toolName,
-                data: event.data as {
-                  stream?: 'stdout' | 'stderr';
-                  output?: string;
-                  delta?: string;
-                  bytesSeen?: number;
-                  truncated?: boolean;
-                  stopped?: boolean;
-                } | undefined,
+                data: event.data as
+                  | {
+                      stream?: 'stdout' | 'stderr';
+                      output?: string;
+                      delta?: string;
+                      bytesSeen?: number;
+                      truncated?: boolean;
+                      stopped?: boolean;
+                    }
+                  | undefined,
               });
             }
             broadcastSubAgentEvent({
-              ...event, subAgentConversationId, parentConversationId, parentToolCallId,
+              ...event,
+              subAgentConversationId,
+              parentConversationId,
+              parentToolCallId,
             } as SubAgentEvent);
           },
-          onToolExecutionStart: (state) => {
+          onToolExecutionStart: async (state) => {
             toolCancels.set(state.toolCallId, state.cancel);
             subObserver?.onToolExecutionStart(state);
+            const preTool = await hookDispatcher.dispatch('PreToolUse', {
+              conversationId: subAgentConversationId,
+              parentConversationId,
+              toolCallId: state.toolCallId,
+              toolName: state.toolName,
+              args: state.args,
+            });
+            if (preTool.denied) {
+              return {
+                skip: true as const,
+                result: { isError: true, error: preTool.reason ?? 'Blocked by PreToolUse hook.' },
+              };
+            }
+            const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+            if (
+              nextArgs !== undefined &&
+              nextArgs !== state.args &&
+              state.args &&
+              typeof state.args === 'object' &&
+              nextArgs &&
+              typeof nextArgs === 'object' &&
+              !Array.isArray(state.args) &&
+              !Array.isArray(nextArgs)
+            ) {
+              const target = state.args as Record<string, unknown>;
+              for (const k of Object.keys(target)) delete target[k];
+              Object.assign(target, nextArgs as Record<string, unknown>);
+            }
           },
           onToolExecutionEnd: ({ toolCallId }) => {
             toolCancels.delete(toolCallId);
             subObserver?.onToolExecutionEnd(toolCallId);
           },
-          augmentToolResult: async ({ toolCallId, toolName, result }) => {
+          augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+            const postTool = await hookDispatcher.dispatch('PostToolUse', {
+              conversationId: subAgentConversationId,
+              parentConversationId,
+              toolCallId,
+              toolName,
+              args,
+              result,
+            });
+            if (postTool.denied) {
+              result = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+            } else {
+              const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+              if (nextResult !== undefined) result = nextResult;
+            }
             await subObserver?.waitForLinkedLaunchedTools(toolCallId);
             subObserver?.onToolExecutionResult(toolCallId, toolName, result);
             const augmentation = subObserver?.getToolAugmentation(toolCallId);
@@ -326,7 +402,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           yield emitStatus(undefined as never, 'running', 'Processing follow-up');
           continue;
         }
-        const finalSt = signal.action === 'complete' ? 'completed' as const : 'failed' as const;
+        const finalSt = signal.action === 'complete' ? ('completed' as const) : ('failed' as const);
         yield emitStatus(undefined as never, finalSt, signal.message ?? fullResponseText.slice(0, 500));
         break;
       }
@@ -365,7 +441,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       yield emitStatus(undefined as never, 'running', `Continuing (turn ${turnCount + 1})`);
     }
 
-    const finalStatus = abortSignal?.aborted ? 'stopped' : (controlSignal.current?.action === 'failed' ? 'failed' : 'completed');
+    const finalStatus = abortSignal?.aborted
+      ? 'stopped'
+      : controlSignal.current?.action === 'failed'
+        ? 'failed'
+        : 'completed';
     if (finalStatus !== 'completed' && finalStatus !== 'failed') {
       yield emitStatus(undefined as never, finalStatus as 'stopped', fullResponseText.slice(0, 500));
     }
@@ -373,7 +453,6 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // Dispose observer before exiting (inside try to avoid bundler scope issue with finally)
     subObserver?.dispose();
     subObserver = null;
-
   } finally {
     // subObserver already disposed above; only decrement counter here
     activeSubAgentCount--;
@@ -393,18 +472,40 @@ async function waitForFollowUp(
   // Poll with timeout
   return new Promise<string | null>((resolve) => {
     let resolved = false;
-    const finish = (val: string | null) => { if (!resolved) { resolved = true; resolve(val); } };
+    const finish = (val: string | null) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(val);
+      }
+    };
 
     const interval = setInterval(async () => {
-      if (abortSignal?.aborted) { clearInterval(interval); finish(null); return; }
+      if (abortSignal?.aborted) {
+        clearInterval(interval);
+        finish(null);
+        return;
+      }
       const msg = await getFollowUp();
-      if (msg) { clearInterval(interval); finish(msg); }
+      if (msg) {
+        clearInterval(interval);
+        finish(msg);
+      }
     }, 300);
 
-    setTimeout(() => { clearInterval(interval); finish(null); }, timeoutMs);
+    setTimeout(() => {
+      clearInterval(interval);
+      finish(null);
+    }, timeoutMs);
 
     if (abortSignal) {
-      abortSignal.addEventListener('abort', () => { clearInterval(interval); finish(null); }, { once: true });
+      abortSignal.addEventListener(
+        'abort',
+        () => {
+          clearInterval(interval);
+          finish(null);
+        },
+        { once: true },
+      );
     }
   });
 }

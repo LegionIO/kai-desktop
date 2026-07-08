@@ -146,6 +146,7 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
   const [diffs, setDiffs] = useState<FileDiff[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [reverting, setReverting] = useState(false);
+  const [revertingAll, setRevertingAll] = useState(false);
 
   const reload = useCallback(() => {
     if (!conversationId) {
@@ -185,6 +186,28 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
     }
   }, [active, conversationId, reload]);
 
+  const handleRevertHunk = useCallback(
+    async (hunkIndex: number) => {
+      if (!active) return;
+      await app.diffs.revertHunk(conversationId, active.path, hunkIndex);
+      reload();
+    },
+    [active, conversationId, reload],
+  );
+
+  const revertableCount = useMemo(() => diffs.filter((d) => d.revertable).length, [diffs]);
+
+  const handleRevertAll = useCallback(async () => {
+    if (revertableCount === 0) return;
+    setRevertingAll(true);
+    try {
+      await app.diffs.revertAll(conversationId);
+    } finally {
+      setRevertingAll(false);
+      reload();
+    }
+  }, [revertableCount, conversationId, reload]);
+
   return (
     <div className={cn('flex h-full min-h-0 flex-col', className)}>
       <div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
@@ -194,11 +217,25 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
             {diffs.length} file{diffs.length === 1 ? '' : 's'}
           </span>
         </div>
-        <span className="text-[11px] tabular-nums">
-          {totals.add > 0 && <span className="text-emerald-600 dark:text-emerald-400">+{totals.add}</span>}
-          {totals.add > 0 && totals.del > 0 && <span className="text-muted-foreground/30"> </span>}
-          {totals.del > 0 && <span className="text-red-600 dark:text-red-400">−{totals.del}</span>}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] tabular-nums">
+            {totals.add > 0 && <span className="text-emerald-600 dark:text-emerald-400">+{totals.add}</span>}
+            {totals.add > 0 && totals.del > 0 && <span className="text-muted-foreground/30"> </span>}
+            {totals.del > 0 && <span className="text-red-600 dark:text-red-400">−{totals.del}</span>}
+          </span>
+          {revertableCount > 0 && (
+            <button
+              type="button"
+              onClick={handleRevertAll}
+              disabled={revertingAll}
+              className="flex items-center gap-1 rounded border border-border/70 px-2 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+              title={`Revert all ${revertableCount} revertable file${revertableCount === 1 ? '' : 's'} to their originals`}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Revert all
+            </button>
+          )}
+        </div>
       </div>
 
       {diffs.length === 0 ? (
@@ -232,9 +269,13 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
                   <button
                     type="button"
                     onClick={handleRevert}
-                    disabled={reverting || active.created}
+                    disabled={reverting || !active.revertable}
                     className="flex items-center gap-1 rounded border border-border/70 px-2 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
-                    title={active.created ? 'Cannot revert a newly-created file' : 'Restore original content'}
+                    title={
+                      active.revertable
+                        ? 'Restore original content'
+                        : 'Original content was not captured (shell/AI-detected change) — revert unavailable'
+                    }
                   >
                     <RotateCcw className="h-3 w-3" />
                     Revert
@@ -251,6 +292,7 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
                       created={active.created}
                       deleted={active.deleted}
                       defaultOpen
+                      onRevertHunk={active.revertable ? handleRevertHunk : undefined}
                     />
                   </ScrollArea.Viewport>
                   <ScrollArea.Scrollbar orientation="vertical" className="w-1.5">

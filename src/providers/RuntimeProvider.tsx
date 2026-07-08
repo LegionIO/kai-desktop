@@ -2530,11 +2530,11 @@ export function RuntimeProvider({
       const convId = activeIdRef.current;
       if (!convId) return;
 
-      // assistant-ui passes parentId = the parent of the message being edited,
-      // and sourceId = the id of the original message. Re-anchor a fresh user
-      // node at the same parent so the old tail becomes a sibling variant.
+      // assistant-ui's edit action passes sourceId = the original message id and
+      // parentId = that same id. Anchor the new node at the ORIGINAL's parent so
+      // the edit becomes a sibling variant (not a child of the old prompt).
       const source = message.sourceId ? tree.find((m) => m.id === message.sourceId) : undefined;
-      const editParentId = message.parentId ?? source?.parentId ?? null;
+      const editParentId = source ? (source.parentId ?? null) : (message.parentId ?? null);
 
       const userContent: ContentPart[] = [];
       for (const part of message.content) {
@@ -2548,13 +2548,19 @@ export function RuntimeProvider({
           });
         }
       }
-      // Preserve non-text attachments (images/files) from the original turn so
-      // editing the prompt text doesn't silently drop them.
+      // Preserve attachments from the original turn so editing the prompt text
+      // doesn't silently drop them: images, file parts, and inlined text-file
+      // parts (the model-visible `--- File: ... ---` blocks).
       if (source && Array.isArray(source.content)) {
         for (const part of source.content as ContentPart[]) {
           if (part.type === 'image' && !userContent.some((p) => p.type === 'image' && p.image === part.image)) {
             userContent.push(part);
           } else if (part.type === 'file') {
+            userContent.push(part);
+          } else if (
+            part.type === 'text' &&
+            (part.text.startsWith('\n\n--- File:') || part.text.startsWith('\n[Attached file:'))
+          ) {
             userContent.push(part);
           }
         }

@@ -425,7 +425,7 @@ export const ToolCallDisplay: FC<{
           toolCallId={part.toolCallId}
           toolName={part.toolName as 'create_artifact' | 'update_artifact'}
           args={part.args}
-          result={part.result}
+          result={part.originalResult ?? part.result}
           isError={Boolean(isError)}
         />
       )}
@@ -1896,9 +1896,7 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
         )}
       </div>
       {/* Tracked file diffs produced by this shell command */}
-      {!isRunning && (
-        <ToolDiffList diffs={extractDiffTracking(part.result)} className="ml-5 mb-2" />
-      )}
+      {!isRunning && <ToolDiffList diffs={extractDiffTracking(part.result)} className="ml-5 mb-2" />}
       {outputModalOpen && shData && (
         <BashOutputModal command={command} shData={shData} onClose={() => setOutputModalOpen(false)} />
       )}

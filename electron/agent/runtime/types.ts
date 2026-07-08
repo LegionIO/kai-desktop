@@ -84,19 +84,20 @@ export type StreamOptions = {
   /** Side-channel for events that should be broadcast immediately. */
   emitEvent?: (event: StreamEvent) => void;
 
-  /** Called when a tool starts executing (for observer / approval flows). */
+  /**
+   * Called when a tool starts executing (for observer / approval flows).
+   * Return `{ skip, result }` to short-circuit execution — the tool body is
+   * never called and `result` is fed to `augmentToolResult` / the model.
+   */
   onToolExecutionStart?: (state: {
     toolCallId: string;
     toolName: string;
     args: unknown;
     cancel: () => void;
-  }) => void | Promise<void>;
+  }) => void | { skip: true; result: unknown } | Promise<void | { skip: true; result: unknown }>;
 
   /** Called when a tool finishes executing. */
-  onToolExecutionEnd?: (state: {
-    toolCallId: string;
-    toolName: string;
-  }) => void;
+  onToolExecutionEnd?: (state: { toolCallId: string; toolName: string }) => void;
 
   /**
    * Allows the IPC layer to modify / compact a tool result before it is

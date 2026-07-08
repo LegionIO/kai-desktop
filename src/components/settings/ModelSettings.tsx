@@ -129,6 +129,11 @@ const PROVIDER_TYPE_DEFAULTS: Record<ProviderType, string> = {
   google: 'gemini',
 };
 
+// Built-in provider names are backed by ~/.kai/settings/llm.json and re-layered
+// on every config read. Deleting them from `models.providers` alone is a no-op
+// (they resurrect on next read), so the UI disables them instead.
+const BUILTIN_PROVIDER_NAMES = new Set(['anthropic', 'openai', 'gemini', 'bedrock', 'ollama']);
+
 const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   const models = config.models as { providers?: Record<string, Provider>; catalog?: CatalogEntry[] };
   const providers = models.providers ?? {};
@@ -161,9 +166,13 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   };
 
   const handleDelete = (name: string) => {
-    const next = { ...providers };
-    delete next[name];
-    void writeProviders(next);
+    if (BUILTIN_PROVIDER_NAMES.has(name)) {
+      void updateConfig(`models.providers.${name}.enabled`, false);
+    } else {
+      const next = { ...providers };
+      delete next[name];
+      void writeProviders(next);
+    }
     if (editingName === name) setEditingName(null);
   };
 
@@ -179,9 +188,7 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
       {providerNames.length === 0 && !addingType && (
         <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border/70 px-4 py-8 text-center">
           <p className="text-xs font-medium text-muted-foreground">No providers configured</p>
-          <p className="text-[10px] text-muted-foreground/70">
-            Add a provider to connect Kai to an LLM API endpoint.
-          </p>
+          <p className="text-[10px] text-muted-foreground/70">Add a provider to connect Kai to an LLM API endpoint.</p>
           <AddProviderButton onSelect={startAdd} />
         </div>
       )}
@@ -250,15 +257,17 @@ const AddProviderButton: FC<{ onSelect: (type: ProviderType) => void; full?: boo
         sideOffset={4}
         className="z-[9999] min-w-[200px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
       >
-        {(Object.keys(PROVIDER_TYPE_LABELS) as ProviderType[]).map((type) => (
-          <DropdownMenu.Item
-            key={type}
-            onSelect={() => onSelect(type)}
-            className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
-          >
-            {PROVIDER_TYPE_LABELS[type]}
-          </DropdownMenu.Item>
-        ))}
+        {(Object.keys(PROVIDER_TYPE_LABELS) as ProviderType[])
+          .filter((t) => t !== 'google')
+          .map((type) => (
+            <DropdownMenu.Item
+              key={type}
+              onSelect={() => onSelect(type)}
+              className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
+            >
+              {PROVIDER_TYPE_LABELS[type]}
+            </DropdownMenu.Item>
+          ))}
       </DropdownMenu.Content>
     </DropdownMenu.Portal>
   </DropdownMenu.Root>
@@ -652,6 +661,11 @@ const ModelForm: FC<{
   const cachingDefault = isAnthropicFamily;
   const [promptCachingEnabled, setPromptCachingEnabled] = useState(initial.promptCaching?.enabled ?? cachingDefault);
   const [promptCachingTtl, setPromptCachingTtl] = useState<'5m' | '1h'>(initial.promptCaching?.ttl ?? '5m');
+  // Only persist promptCaching once the user explicitly toggles it (or it was
+  // already set on the entry). Otherwise leave it unset so the main-process
+  // resolver applies its provider/model default — avoids writing a stale
+  // `false` captured before the user typed a Claude model id.
+  const [promptCachingTouched, setPromptCachingTouched] = useState(initial.promptCaching !== undefined);
 
   const canSave = key.trim() && displayName.trim() && provider && modelName.trim();
 
@@ -673,7 +687,7 @@ const ModelForm: FC<{
     entry.computerUseSupport = computerUseSupport;
     entry.visionCapable = visionCapable;
     entry.preferredTarget = preferredTarget;
-    if (isAnthropicFamily) {
+    if (isAnthropicFamily && promptCachingTouched) {
       entry.promptCaching = {
         enabled: promptCachingEnabled,
         ...(providerType === 'anthropic' ? { ttl: promptCachingTtl } : {}),
@@ -803,7 +817,14 @@ const ModelForm: FC<{
       {isAnthropicFamily ? (
         <div className="flex items-center gap-2">
           <div className="flex-1">
-            <Toggle label="Prompt Caching" checked={promptCachingEnabled} onChange={setPromptCachingEnabled} />
+            <Toggle
+              label="Prompt Caching"
+              checked={promptCachingEnabled}
+              onChange={(v) => {
+                setPromptCachingEnabled(v);
+                setPromptCachingTouched(true);
+              }}
+            />
           </div>
           {providerType === 'anthropic' && promptCachingEnabled && (
             <select
@@ -1026,11 +1047,7 @@ const ProviderAddForm: FC<{
                   placeholder="2024-10-21"
                 />
               </div>
-              <Toggle
-                label="Use Responses API by default"
-                checked={useResponsesApi}
-                onChange={setUseResponsesApi}
-              />
+              <Toggle label="Use Responses API by default" checked={useResponsesApi} onChange={setUseResponsesApi} />
             </>
           )}
         </>
@@ -1080,9 +1097,7 @@ const ProviderEditor: FC<{
     <fieldset className="space-y-3 rounded-lg border bg-card/40 p-3">
       <legend className="px-1 text-xs font-semibold">
         {name}{' '}
-        <span className="font-normal text-muted-foreground">
-          · {PROVIDER_TYPE_LABELS[type] ?? provider.type}
-        </span>
+        <span className="font-normal text-muted-foreground">· {PROVIDER_TYPE_LABELS[type] ?? provider.type}</span>
       </legend>
 
       <Toggle

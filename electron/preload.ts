@@ -178,6 +178,22 @@ const appAPI = {
       ipcRenderer.invoke('diffs:get', conversationId, path) as Promise<FileDiff | null>,
     revert: (conversationId: string, path: string) =>
       ipcRenderer.invoke('diffs:revert', conversationId, path) as Promise<{ success: boolean; error?: string }>,
+    revertAll: (conversationId: string) =>
+      ipcRenderer.invoke('diffs:revertAll', conversationId) as Promise<{
+        success: boolean;
+        reverted: number;
+        skipped: string[];
+      }>,
+    revertHunk: (conversationId: string, path: string, hunkIndex: number) =>
+      ipcRenderer.invoke('diffs:revertHunk', conversationId, path, hunkIndex) as Promise<{
+        success: boolean;
+        error?: string;
+      }>,
+    revertToOp: (conversationId: string, path: string, opIndex: number) =>
+      ipcRenderer.invoke('diffs:revertToOp', conversationId, path, opIndex) as Promise<{
+        success: boolean;
+        error?: string;
+      }>,
     clear: (conversationId: string) =>
       ipcRenderer.invoke('diffs:clear', conversationId) as Promise<{ success: boolean }>,
     onChange: (callback: (event: DiffEvent) => void) => {
