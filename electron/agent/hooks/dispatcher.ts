@@ -117,6 +117,32 @@ function extractToolName(payload: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Validate a `modify` hook's replacement payload for an enforcing event. The
+ * caller applies a specific field per event, so a replacement that omits it
+ * would leave the caller using the ORIGINAL raw data (fail-open). Require the
+ * field to be present with a plausible type; otherwise the dispatch fails closed.
+ *  - UserPromptSubmit → `messages` array (systemPrompt is optional)
+ *  - PreToolUse       → `args` object
+ *  - PostToolUse      → `result` present (may be any shape) OR `args` object
+ */
+function isUsableModifyReplacement(event: HookEvent, replacement: unknown): boolean {
+  if (replacement === undefined || replacement === null || typeof replacement !== 'object') return false;
+  const r = replacement as Record<string, unknown>;
+  switch (event) {
+    case 'UserPromptSubmit':
+      return Array.isArray(r.messages);
+    case 'PreToolUse':
+      return typeof r.args === 'object' && r.args !== null && !Array.isArray(r.args);
+    case 'PostToolUse':
+      return 'result' in r || (typeof r.args === 'object' && r.args !== null && !Array.isArray(r.args));
+    default:
+      // Non-enforcing events don't reach the modify path (coerced to observe),
+      // but be permissive if they somehow do.
+      return true;
+  }
+}
+
 const MAX_HOOK_PAYLOAD_BYTES = 256 * 1024;
 
 /**
@@ -508,14 +534,22 @@ export class HookDispatcher {
       if (outcome?.decision === 'deny') {
         return { payload: current, denied: true, reason: outcome.reason };
       }
-      if (
-        effectiveMode === 'modify' &&
-        outcome &&
-        typeof outcome === 'object' &&
-        'payload' in outcome &&
-        outcome.payload !== undefined
-      ) {
-        current = outcome.payload as T;
+      if (effectiveMode === 'modify') {
+        // A modify hook MUST return a replacement payload that carries the field
+        // the caller will actually apply for this event. If it returns nothing
+        // usable (e.g. `{}` or `{payload:{}}` missing messages/args/result), the
+        // caller would silently fall back to the ORIGINAL raw data — a fail-open
+        // for a DLP/sanitizer. Reject such replacements: fail CLOSED (deny).
+        const replacement =
+          outcome && typeof outcome === 'object' && 'payload' in outcome ? outcome.payload : undefined;
+        if (!isUsableModifyReplacement(event, replacement)) {
+          return {
+            payload: current,
+            denied: true,
+            reason: `modify hook for ${event} returned no usable replacement (missing the expected field); failing closed to avoid leaking unmodified data.`,
+          };
+        }
+        current = replacement as T;
       }
     }
 

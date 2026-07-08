@@ -122,4 +122,43 @@ describe('HookDispatcher rule throttling', () => {
     await new Promise((r) => setTimeout(r, 5));
     expect(spawnCalls.length).toBe(1);
   });
+
+  it('modify hook returning a malformed replacement fails CLOSED', async () => {
+    const cfg = {
+      hooks: { enabled: true, timeoutMs: 5000 },
+      automations: { enabled: false, rules: [] },
+    } as unknown as AppConfig;
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => cfg });
+
+    // A modify hook that returns a payload missing the required `messages` field
+    // for UserPromptSubmit must NOT be accepted (would leave the caller using the
+    // original raw prompt). The dispatch must be denied.
+    d.register('UserPromptSubmit', () => ({ payload: {} }), { source: 'plugin', mode: 'modify' });
+    const bad = await d.dispatch('UserPromptSubmit', {
+      conversationId: 'c',
+      messages: [{ role: 'user', content: 'secret' }],
+    });
+    expect(bad.denied).toBe(true);
+  });
+
+  it('modify hook returning a valid replacement is applied', async () => {
+    const cfg = {
+      hooks: { enabled: true, timeoutMs: 5000 },
+      automations: { enabled: false, rules: [] },
+    } as unknown as AppConfig;
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => cfg });
+
+    d.register('UserPromptSubmit', () => ({ payload: { messages: [{ role: 'user', content: 'redacted' }] } }), {
+      source: 'plugin',
+      mode: 'modify',
+    });
+    const ok = await d.dispatch('UserPromptSubmit', {
+      conversationId: 'c',
+      messages: [{ role: 'user', content: 'secret' }],
+    });
+    expect(ok.denied).toBe(false);
+    expect((ok.payload as { messages: { content: string }[] }).messages[0].content).toBe('redacted');
+  });
 });
