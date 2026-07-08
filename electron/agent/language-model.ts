@@ -53,6 +53,32 @@ export function shouldUseOpenAIResponsesApi(
  * but fail when the input array has function_call items without matching
  * function_call_output items during multi-step agentic turns.
  */
+/**
+ * Wrap a fetch so every request URL carries `?api-version=<v>`. Azure OpenAI
+ * requires the api-version in the query string, and `@ai-sdk/openai`'s
+ * createOpenAI has no option to add query params — so we rewrite the URL here.
+ */
+function withAzureApiVersion(inner: typeof fetch, apiVersion: string): typeof fetch {
+  return async (input, init) => {
+    try {
+      const rawUrl =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+      const u = new URL(rawUrl);
+      if (!u.searchParams.has('api-version')) {
+        u.searchParams.set('api-version', apiVersion);
+        if (typeof input === 'string' || input instanceof URL) {
+          return inner(u.toString(), init);
+        }
+        // Request object: rebuild with the new URL, preserving the rest.
+        return inner(new Request(u.toString(), input as Request), init);
+      }
+    } catch {
+      /* fall through to the unmodified request */
+    }
+    return inner(input, init);
+  };
+}
+
 function createResponsesApiPatchingFetch(): typeof fetch {
   return async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
@@ -244,20 +270,20 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
   }
 
   const normalizedBaseUrl = normalizeOpenAIBaseUrl(modelConfig.endpoint);
-  // Azure OpenAI requires the api-version as a URL query parameter
-  // (?api-version=...), not just a header. Detect Azure endpoints and pass it
-  // via queryParams; keep the header for other OpenAI-compatible endpoints that
-  // read it from headers.
+  // Azure OpenAI requires api-version as a URL query parameter. @ai-sdk/openai
+  // has no query-param option, so we rewrite the request URL via a fetch
+  // wrapper for Azure endpoints. Non-Azure OpenAI-compatible endpoints that
+  // read api-version from a header still get it via `headers` below.
   const isAzure = /\.openai\.azure\.com/i.test(normalizedBaseUrl ?? '');
+  const baseFetch = createResponsesApiPatchingFetch();
   const openai = createOpenAI({
     ...(normalizedBaseUrl ? { baseURL: normalizedBaseUrl } : {}),
     apiKey: modelConfig.apiKey || 'dummy',
-    ...(isAzure && modelConfig.apiVersion ? { queryParams: { 'api-version': modelConfig.apiVersion } } : {}),
     headers: withBrandUserAgent({
       ...(modelConfig.apiVersion ? { 'api-version': modelConfig.apiVersion } : {}),
       ...(modelConfig.extraHeaders ?? {}),
     }),
-    fetch: createResponsesApiPatchingFetch(),
+    fetch: isAzure && modelConfig.apiVersion ? withAzureApiVersion(baseFetch, modelConfig.apiVersion) : baseFetch,
   });
 
   const modelId = modelConfig.deploymentName || modelConfig.modelName;

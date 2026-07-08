@@ -485,32 +485,40 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
       set: (path: string, value: unknown) => {
         requirePermission('config:write');
-        // Automation rules can read the agent loop two ways, both gated by the
-        // dangerous `agent:hook` permission: (1) a runHookCommand action
-        // (arbitrary shell on hook events), or (2) a hook/wildcard TRIGGER,
-        // which receives raw prompts/tool payloads off the automation bus and
-        // can exfiltrate them via any action interpolating {{payload}}. Require
-        // agent:hook for a plugin config write that introduces either.
-        if (path === 'automations' || path.startsWith('automations.')) {
-          const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
-          if (!hasAgentHook) {
-            // Block if the write ADDS or MODIFIES any hook-capable rule/action.
-            // Compare the multiset of serialized hook-capable entries before vs.
-            // after: unrelated writes (e.g. automations.log.maxEntries) leave it
-            // unchanged; adding a new hook rule OR editing an existing one (same
-            // count, different content) both introduce a new signature → block.
+        const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
+        if (!hasAgentHook) {
+          // Hook enforcement is gated by the dangerous `agent:hook` permission.
+          // A low-perm `config:write` plugin must not be able to add, modify,
+          // OR NEUTER hook coverage — otherwise it could bypass a user's DLP
+          // hooks. Block:
+          //   (1) any `hooks.*` write (e.g. hooks.enabled=false, timeout)
+          //   (2) `automations.enabled` writes when hook-capable rules exist
+          //   (3) any automations write that CHANGES the hook-capable rule set
+          //       (add / modify / remove — a removed signature disables a hook)
+          if (path === 'hooks' || path.startsWith('hooks.')) {
+            throw new Error('Writing hook settings ("hooks.*") requires the "agent:hook" permission.');
+          }
+          if (path === 'automations' || path.startsWith('automations.')) {
             const currentAutomations = (callbacks.getConfig() as { automations?: unknown }).automations;
             const clone =
               currentAutomations && typeof currentAutomations === 'object'
                 ? (JSON.parse(JSON.stringify(currentAutomations)) as Record<string, unknown>)
                 : {};
-            const beforeSigs = new Set(hookDangerSignatures(currentAutomations));
+            const before = hookDangerSignatures(currentAutomations);
             const container: Record<string, unknown> = { automations: clone };
             applyNestedWrite(container, path, value);
-            const introducedHookEntry = hookDangerSignatures(container.automations).some((sig) => !beforeSigs.has(sig));
-            if (introducedHookEntry) {
+            const after = hookDangerSignatures(container.automations);
+            const beforeSet = new Set(before);
+            const afterSet = new Set(after);
+            const changed =
+              before.length !== after.length ||
+              after.some((s) => !beforeSet.has(s)) ||
+              before.some((s) => !afterSet.has(s));
+            // Disabling the whole automations engine also neuters hook coverage.
+            const disablingWithHooks = (path === 'automations.enabled' || path === 'automations') && before.length > 0;
+            if (changed || disablingWithHooks) {
               throw new Error(
-                'Writing automation rules that use hook commands or hook/wildcard triggers requires the "agent:hook" permission (can read/execute the agent loop).',
+                'Adding, modifying, or removing hook commands / hook-triggered automations (or disabling automations while hook rules exist) requires the "agent:hook" permission.',
               );
             }
           }
