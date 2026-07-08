@@ -37,6 +37,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   DownloadIcon,
+  FileDiffIcon,
   LoaderIcon,
   MenuIcon,
   MessageSquareIcon,
@@ -75,6 +76,7 @@ import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { ArtifactProvider, ARTIFACT_PREVIEW_TAB_ID } from '@/providers/ArtifactProvider';
 import { SidePanelProvider, SidePanelHost, ArtifactPanel, type SidePanelTab } from '@/components/side-panel';
+import { DiffPanel } from '@/components/diff';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { AgentProvider, useAgents } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
@@ -88,13 +90,7 @@ import { DeleteAgentModal } from '@/components/agents/DeleteAgentModal';
 import { ChatsListPage } from '@/components/conversations/ChatsListPage';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
-/**
- * Right-side panel tab registry. Ships with the artifact "Preview" tab; the
- * parallel Changes-diff worktree adds a second entry here at merge time.
- */
-const SIDE_PANEL_TABS: SidePanelTab[] = [
-  { id: ARTIFACT_PREVIEW_TAB_ID, label: 'Preview', render: () => <ArtifactPanel /> },
-];
+const CHANGES_PANEL_TAB_ID = 'changes';
 
 export default function App() {
   return (
@@ -508,6 +504,25 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 
 function AppShell() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const sidePanelTabs = useMemo<SidePanelTab[]>(
+    () => [
+      { id: ARTIFACT_PREVIEW_TAB_ID, label: 'Preview', render: () => <ArtifactPanel /> },
+      {
+        id: CHANGES_PANEL_TAB_ID,
+        label: 'Changes',
+        icon: FileDiffIcon,
+        render: () =>
+          activeConversationId ? (
+            <DiffPanel conversationId={activeConversationId} />
+          ) : (
+            <div className="flex h-full items-center justify-center p-6 text-sm text-muted-foreground">
+              No active chat.
+            </div>
+          ),
+      },
+    ],
+    [activeConversationId],
+  );
   const [activeConversationTitle, setActiveConversationTitle] = useState<string | null>(null);
   const [activeConversationHasMessages, setActiveConversationHasMessages] = useState(false);
   const [activeView, setActiveView] = useState<AppView>('chat');
@@ -2705,7 +2720,7 @@ function AppShell() {
                               />
                             </div>
                             {/* Right side panel — artifacts + future tabs (e.g. Changes diff) */}
-                            <SidePanelHost tabs={SIDE_PANEL_TABS} />
+                            <SidePanelHost tabs={sidePanelTabs} />
                             {/* Plan modal */}
                             {planPanel && (
                               <PlanPanel
