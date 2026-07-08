@@ -190,19 +190,26 @@ async function resumeSubAgent(
             return { skip: true as const, result: { isError: true, error: reason } };
           }
           const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
-          if (
-            nextArgs !== undefined &&
-            nextArgs !== state.args &&
-            state.args &&
-            typeof state.args === 'object' &&
-            nextArgs &&
-            typeof nextArgs === 'object' &&
-            !Array.isArray(state.args) &&
-            !Array.isArray(nextArgs)
-          ) {
-            const target = state.args as Record<string, unknown>;
-            for (const k of Object.keys(target)) delete target[k];
-            Object.assign(target, nextArgs as Record<string, unknown>);
+          if (nextArgs !== undefined && nextArgs !== state.args) {
+            const canMutateInPlace =
+              state.args &&
+              typeof state.args === 'object' &&
+              !Array.isArray(state.args) &&
+              nextArgs &&
+              typeof nextArgs === 'object' &&
+              !Array.isArray(nextArgs);
+            if (canMutateInPlace) {
+              const target = state.args as Record<string, unknown>;
+              for (const k of Object.keys(target)) delete target[k];
+              Object.assign(target, nextArgs as Record<string, unknown>);
+            } else {
+              // Non-object modify replacement can't be applied to by-reference
+              // args — fail closed rather than run with unsanitized input.
+              const reason =
+                'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed.';
+              rebroadcast({ redacted: true, reason });
+              return { skip: true as const, result: { isError: true, error: reason } };
+            }
           }
           rebroadcast(state.args);
         },

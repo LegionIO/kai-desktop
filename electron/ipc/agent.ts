@@ -1486,18 +1486,41 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
               const modStreamId = streamToolCallIdByExecId.get(state.toolCallId);
               if (preTool.args !== state.args) {
-                // Mutate in place — the same object reference is passed to tool.execute().
-                if (
+                // The executor passes `state.args` to tool.execute() BY REFERENCE,
+                // so the only way to deliver modified args is to mutate that object
+                // in place. That works when both sides are plain objects. If a
+                // modify hook returned an array or a primitive (or the tool's args
+                // were an array), we cannot swap the reference — running the tool
+                // with the ORIGINAL args would silently fail OPEN. Fail CLOSED
+                // instead: deny the call, mirroring the dispatcher's modify policy.
+                const canMutateInPlace =
                   state.args &&
                   typeof state.args === 'object' &&
+                  !Array.isArray(state.args) &&
                   preTool.args &&
                   typeof preTool.args === 'object' &&
-                  !Array.isArray(state.args) &&
-                  !Array.isArray(preTool.args)
-                ) {
+                  !Array.isArray(preTool.args);
+                if (canMutateInPlace) {
                   const target = state.args as Record<string, unknown>;
                   for (const k of Object.keys(target)) delete target[k];
                   Object.assign(target, preTool.args as Record<string, unknown>);
+                } else {
+                  const reason =
+                    'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed to avoid running with unsanitized input.';
+                  hookDeniedToolCalls.set(state.toolCallId, reason);
+                  hookRewrittenArgs.set(state.toolCallId, preTool.args);
+                  const failStreamId = streamToolCallIdByExecId.get(state.toolCallId);
+                  if (failStreamId) {
+                    hookRewrittenArgs.set(failStreamId, preTool.args);
+                    broadcastStreamEvent({
+                      conversationId,
+                      type: 'tool-call',
+                      toolCallId: failStreamId,
+                      toolName: state.toolName,
+                      args: preTool.args,
+                    });
+                  }
+                  return { skip: true as const, result: { isError: true, error: reason } };
                 }
               }
               // When enforcing hooks are active the initial stream tool-call was
