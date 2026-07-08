@@ -281,7 +281,20 @@ export function trackFileWrite(
   }
 
   const conv = getConversationStore(conversationId);
-  const preRead = conv.has(absPath) ? undefined : safeRead(absPath);
+  const existing = conv.get(absPath);
+  let preRead: { exists: boolean; content: string; captured?: boolean } | undefined;
+  if (!existing) {
+    preRead = safeRead(absPath);
+  } else {
+    // Already tracked: check whether the file changed on disk since we last
+    // recorded it (an external/user edit between two agent edits). If so, the
+    // stored `original` no longer represents a safe revert target — reverting
+    // would erase the user's intervening edit — so mark it non-revertable.
+    const onDisk = safeRead(absPath);
+    if (!onDisk.captured || onDisk.content !== existing.current) {
+      existing.originalCaptured = false;
+    }
+  }
 
   return {
     finish: () => recordMutation(conversationId, absPath, { ...meta, source: 'file-tool' }, preRead),
@@ -781,7 +794,10 @@ function reverseApplyHunk(content: string, hunk: UnifiedHunk): string | null {
   if (postImage.length === 0) {
     const insertAt = Math.max(0, Math.min(lines.length, hunk.bStart - 1));
     const next = [...lines.slice(0, insertAt), ...preImage, ...lines.slice(insertAt)];
-    return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline || !content ? '\n' : '');
+    // Preserve the current file's trailing-newline state; don't force a newline
+    // just because the current content is empty (would corrupt a file whose
+    // original had no final newline).
+    return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline ? '\n' : '');
   }
 
   const matchesAt = (start: number): boolean => postImage.every((t, i) => lines[start + i] === t);
@@ -805,7 +821,7 @@ function reverseApplyHunk(content: string, hunk: UnifiedHunk): string | null {
   }
 
   const next = [...lines.slice(0, at), ...preImage, ...lines.slice(at + postImage.length)];
-  return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline || !content ? '\n' : '');
+  return next.length === 0 ? '' : next.join('\n') + (hadTrailingNewline ? '\n' : '');
 }
 
 export function clearConversationDiffs(conversationId: string): void {

@@ -172,6 +172,16 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
       const next = { ...providers };
       delete next[name];
       void writeProviders(next);
+      // Remove catalog entries that referenced the deleted provider so they
+      // don't linger as dead models (resolveModelCatalog silently skips them,
+      // which can make defaults/profiles fall through to another model).
+      const orphaned = catalog.filter((m) => m.provider === name);
+      if (orphaned.length > 0) {
+        void updateConfig(
+          'models.catalog',
+          catalog.filter((m) => m.provider !== name),
+        );
+      }
     }
     if (editingName === name) setEditingName(null);
   };
