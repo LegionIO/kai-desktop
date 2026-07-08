@@ -165,7 +165,7 @@ type MessageAccumulator = {
   pendingAssistantTiming?: PendingAssistantTiming | null;
   /** Deferred tool approvals keyed by toolName — handles race where
    *  tool-approval-required arrives before the stream-side tool-call event. */
-  deferredApprovals?: Map<string, { toolCallId: string }>;
+  deferredApprovals?: Map<string, { toolCallId: string; args?: unknown }>;
   /** True while a tool is awaiting user approval — suppresses the running indicator */
   awaitingApproval?: boolean;
 };
@@ -1937,6 +1937,9 @@ export function RuntimeProvider({
               ...existing,
               approvalStatus: 'pending',
               approvalId: deferred.toolCallId,
+              // Apply any rich approval args (e.g. dangerous-automation rule +
+              // reason) captured when the approval arrived early.
+              ...(deferred.args !== undefined ? { args: deferred.args, argsPending: false } : {}),
               finishedAt: nowIso(),
             };
             acc.messages[idx] = { ...msg, content: toStoredContent(content) };
@@ -1980,7 +1983,7 @@ export function RuntimeProvider({
           // tool-call event hasn't arrived yet — defer the approval so it can
           // be applied when the matching tool-call stream event is processed.
           if (!acc.deferredApprovals) acc.deferredApprovals = new Map();
-          acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string });
+          acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string, args: e.args });
         }
       } else if (e.type === 'tool-result') {
         acc.awaitingApproval = false;

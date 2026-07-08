@@ -526,16 +526,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // Provider-native tools (e.g. OpenAI/Anthropic server-side web_search)
       // execute inside the provider and never hit our tool wrappers, so
       // PreToolUse/PostToolUse hooks can't see or block their args. Warn when
-      // enforcing hooks are active alongside configured provider tools.
-      const hasProviderTools = (modelEntry?.modelConfig.providerTools?.length ?? 0) > 0;
+      // enforcing hooks are active alongside configured provider tools — across
+      // the PRIMARY and every enabled FALLBACK model, since fallback can switch
+      // to a provider-tool model mid-stream where the hooks would be bypassed.
+      const chainForProviderTools = [modelEntry, ...(fallbackEnabled ? (streamConfig?.fallbackModels ?? []) : [])];
+      const hasProviderTools = chainForProviderTools.some((m) => (m?.modelConfig.providerTools?.length ?? 0) > 0);
       if (runtime.id === 'mastra' && hasProviderTools && hookDispatcher.hasEnforcingToolHooks()) {
         broadcastStreamEvent({
           conversationId,
           type: 'text-delta',
           text:
-            `> ⚠️ This model has provider-native tools enabled (e.g. server-side web search). ` +
+            `> ⚠️ This model (or an enabled fallback model) has provider-native tools enabled (e.g. server-side web search). ` +
             `Those run inside the provider and are NOT covered by your block/modify PreToolUse/PostToolUse hooks. ` +
-            `Disable provider tools for this model if hook enforcement is required.\n\n`,
+            `Disable provider tools for these models if hook enforcement is required.\n\n`,
         });
       }
 
