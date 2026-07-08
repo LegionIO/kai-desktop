@@ -306,6 +306,9 @@ export function getBridgeScript(): string {
       clear: function(id) { return invoke('diffs:clear', id); },
       onChange: function(cb) { return on('diffs:changed', cb); }
     },
+    artifacts: {
+      bundleReact: function(source) { return invoke('artifact:bundle-react', { source: source }); }
+    },
     memory: {
       clear: function(opts) { return invoke('memory:clear', opts); },
       testEmbedding: function() { return invoke('memory:test-embedding'); }
