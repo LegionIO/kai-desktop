@@ -23,6 +23,30 @@ import { sep } from 'path';
 
 export type BundleReactResult = { ok: true; code: string } | { ok: false; error: string };
 
+/**
+ * True when the artifact source already creates a binding for the identifier
+ * `React` — a default import (`import React from 'react'`), a namespace import
+ * (`import * as React from 'react'`), or a named `React` import. A NAMED-ONLY
+ * import (e.g. `import { useState } from 'react'`) does NOT bind `React`, so an
+ * artifact that references `React.*` still needs the injected alias. Exported
+ * for unit testing.
+ */
+export function artifactBindsReact(source: string): boolean {
+  const importRe = /^\s*import\s+([^;]*?)\s+from\s+['"]react['"]/gm;
+  let m: RegExpExecArray | null;
+  while ((m = importRe.exec(source)) !== null) {
+    const clause = m[1];
+    // Default import: `React` / `React, { ... }` (identifier before any `{`/`*`)
+    if (/^\s*React\b/.test(clause)) return true;
+    // Namespace import: `* as React`
+    if (/\*\s*as\s+React\b/.test(clause)) return true;
+    // Named import that includes `React` (or `X as React`)
+    const named = /\{([^}]*)\}/.exec(clause);
+    if (named && /(^|,)\s*(?:\w+\s+as\s+)?React\s*(,|$)/.test(named[1])) return true;
+  }
+  return false;
+}
+
 /** Reject pathologically large sources before handing them to esbuild. */
 const MAX_SOURCE_BYTES = 512 * 1024;
 
@@ -62,12 +86,11 @@ function wrapSource(source: string): string {
     .replace(/^\s*export\s+default\s+/m, 'const __ArtifactRoot = ')
     .replace(/^\s*export\s+(?=(const|let|var|function|class)\b)/gm, '');
 
-  // Does the artifact already import React itself? (default, namespace, or
-  // named). If so, we must NOT also declare a `React` binding — that would be a
-  // duplicate-declaration error. We only inject a `React` alias when absent, so
-  // snippets that use a bare `React.*` without importing still resolve.
-  const importsReact = /^\s*import\s+[^;]*\bfrom\s+['"]react['"]/m.test(source);
-  const reactAlias = importsReact ? '' : `import * as React from 'react';\n`;
+  // A named-only import (e.g. `import { useState } from 'react'`) does NOT bind
+  // `React`, so an artifact that also references `React.*` still needs the alias.
+  // Only suppress it when a real `React` binding already exists (else our
+  // `import * as React` would be a duplicate declaration).
+  const reactAlias = artifactBindsReact(source) ? '' : `import * as React from 'react';\n`;
 
   // Internal-only bindings (double-underscore names avoid clashing with any
   // artifact identifier). `jsx: 'automatic'` handles JSX syntax itself.
