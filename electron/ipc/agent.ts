@@ -66,6 +66,21 @@ function deleteStreamIfOwned(conversationId: string, token: string): void {
     activeStreams.delete(conversationId);
   }
 }
+
+/**
+ * Token-guarded teardown of ALL per-run state for a stream. Only clears the
+ * per-run maps when this token still owns the active stream — otherwise a slow
+ * early-exit (e.g. a UserPromptSubmit hook returning denied after the user
+ * cancelled and restarted the same conversation) would wipe the REPLACEMENT
+ * run's model-key / observer-session state and break its gating + usage
+ * attribution.
+ */
+function cleanupStreamIfOwned(conversationId: string, token: string): void {
+  if (activeStreams.get(conversationId)?.token !== token) return;
+  activeStreams.delete(conversationId);
+  activeStreamModelKeys.delete(conversationId);
+  activeObserverSessions.delete(conversationId);
+}
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
 
@@ -410,9 +425,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          deleteStreamIfOwned(conversationId, streamToken);
-          activeStreamModelKeys.delete(conversationId);
-          activeObserverSessions.delete(conversationId);
+          cleanupStreamIfOwned(conversationId, streamToken);
           return { conversationId };
         }
         const next = promptDispatch.payload as {
@@ -442,9 +455,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          deleteStreamIfOwned(conversationId, streamToken);
-          activeStreamModelKeys.delete(conversationId);
-          activeObserverSessions.delete(conversationId);
+          cleanupStreamIfOwned(conversationId, streamToken);
           return { conversationId };
         }
 
@@ -487,9 +498,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           ...(warningMeta ? { messageMeta: warningMeta } : {}),
         });
         void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-        deleteStreamIfOwned(conversationId, streamToken);
-        activeStreamModelKeys.delete(conversationId);
-        activeObserverSessions.delete(conversationId);
+        cleanupStreamIfOwned(conversationId, streamToken);
         return { conversationId };
       }
 
@@ -631,9 +640,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          deleteStreamIfOwned(conversationId, streamToken);
-          activeStreamModelKeys.delete(conversationId);
-          activeObserverSessions.delete(conversationId);
+          cleanupStreamIfOwned(conversationId, streamToken);
           return;
         }
         if (inferenceProvider) {
@@ -732,9 +739,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             });
 
             // Provider handled the request — clean up and exit
-            deleteStreamIfOwned(conversationId, streamToken);
-            activeStreamModelKeys.delete(conversationId);
-            activeObserverSessions.delete(conversationId);
+            cleanupStreamIfOwned(conversationId, streamToken);
             return;
           } catch (providerError) {
             if (emittedTextDelta) {
@@ -752,9 +757,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               });
               broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
               void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
-              deleteStreamIfOwned(conversationId, streamToken);
-              activeStreamModelKeys.delete(conversationId);
-              activeObserverSessions.delete(conversationId);
+              cleanupStreamIfOwned(conversationId, streamToken);
               return;
             }
             console.error(
@@ -770,9 +773,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             });
             broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
             void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
-            deleteStreamIfOwned(conversationId, streamToken);
-            activeStreamModelKeys.delete(conversationId);
-            activeObserverSessions.delete(conversationId);
+            cleanupStreamIfOwned(conversationId, streamToken);
             return;
           }
         }
@@ -1886,8 +1887,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           observerLaunchesEnabled = false;
           await waitForObserverToolExecutions();
           observer?.dispose();
-          deleteStreamIfOwned(conversationId, streamToken);
-          activeStreamModelKeys.delete(conversationId);
+          // Token-guarded so a replacement run that already took over this
+          // conversation keeps its own stream + model-key state.
+          if (activeStreams.get(conversationId)?.token === streamToken) {
+            activeStreams.delete(conversationId);
+            activeStreamModelKeys.delete(conversationId);
+          }
           if (activeObserverSessions.get(conversationId) === observerSessionId) {
             activeObserverSessions.delete(conversationId);
           }

@@ -154,7 +154,12 @@ function toFileDiff(conversationId: string, path: string, entry: TrackedFile): F
       }),
     ),
     source: entry.lastSource,
-    revertable: entry.originalCaptured,
+    // Revert needs BOTH the original pre-image captured AND a current on-disk
+    // state we can verify: if the file now holds binary/oversized content
+    // (captured:false), revertDiff refuses (hasDrifted treats uncaptured as
+    // drift), so advertising revertable:true would be misleading. A deleted
+    // file has no current content to read and is safely restorable.
+    revertable: entry.originalCaptured && (entry.deleted || safeRead(path).captured),
   };
 }
 

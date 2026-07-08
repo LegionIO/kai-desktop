@@ -34,6 +34,13 @@ asarUnpack:
   - "**/node_modules/react/**"
   - "**/node_modules/react-dom/**"
   - "**/node_modules/scheduler/**"
+  # esbuild is dynamically imported at runtime to bundle React artifacts. Its JS
+  # package spawns a native service binary (node_modules/@esbuild/<platform>/bin);
+  # both must be OUTSIDE app.asar or spawn() fails and every React artifact
+  # preview breaks. smartUnpack doesn't reliably catch the dynamic import, so
+  # list them explicitly (same reasoning as @openai/codex above).
+  - "**/node_modules/esbuild/**"
+  - "**/node_modules/@esbuild/**"
 extraResources:
   - from: bundled-plugins
     to: bundled-plugins
