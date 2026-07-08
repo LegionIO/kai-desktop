@@ -232,6 +232,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // toolName (FIFO); onToolExecutionStart dequeues one and re-broadcasts the
     // resolved args under the stream id the renderer actually rendered.
     const subSuppressedStreamIdsByTool = new Map<string, string[]>();
+    // Reverse direction: when onToolExecutionStart resolves BEFORE the stream
+    // event arrives (exec-first ordering, empty suppressed queue), stash the
+    // resolved args per toolName so the stream loop applies them when its
+    // (possibly different) id shows up.
+    const subResolvedArgsByTool = new Map<string, unknown[]>();
 
     // Helper: add a follow-up message and emit it as a UI event
     const addFollowUpMessage = (text: string, source: 'user' | 'parent' | 'task' = 'parent'): SubAgentEvent => {
@@ -330,30 +335,40 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               toolName: state.toolName,
               args: state.args,
             });
-            // Resolve the stream id the renderer used (may differ from the
-            // exec-side state.toolCallId); fall back to the exec id.
-            const dequeueStreamId = (): string => {
+            // Resolve the stream id the renderer used. If the stream event
+            // already arrived it's queued here; otherwise (exec-first) we get
+            // undefined and stash the resolved args by toolName so the stream
+            // loop applies them when its id shows up.
+            const dequeueStreamId = (): string | undefined => {
               const q = subSuppressedStreamIdsByTool.get(state.toolName);
-              const streamId = q && q.length > 0 ? q.shift()! : undefined;
-              return streamId ?? state.toolCallId;
+              return q && q.length > 0 ? q.shift() : undefined;
             };
-            if (preTool.denied) {
-              const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
-              const redacted = { redacted: true, reason };
+            const publishResolved = (resolved: unknown): void => {
+              if (!subEnforcingHooks) return;
               const streamId = dequeueStreamId();
-              subHookRewrittenArgs.set(state.toolCallId, redacted);
-              subHookRewrittenArgs.set(streamId, redacted);
-              if (subEnforcingHooks) {
+              subHookRewrittenArgs.set(state.toolCallId, resolved);
+              if (streamId) {
+                // Stream event already rendered under streamId — correct it.
+                subHookRewrittenArgs.set(streamId, resolved);
                 broadcastSubAgentEvent({
                   type: 'tool-call',
                   toolCallId: streamId,
                   toolName: state.toolName,
-                  args: redacted,
+                  args: resolved,
                   subAgentConversationId,
                   parentConversationId,
                   parentToolCallId,
                 } as SubAgentEvent);
+              } else {
+                // Exec-first: stash so the later stream event applies it.
+                const q = subResolvedArgsByTool.get(state.toolName) ?? [];
+                q.push(resolved);
+                subResolvedArgsByTool.set(state.toolName, q);
               }
+            };
+            if (preTool.denied) {
+              const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+              publishResolved({ redacted: true, reason });
               return {
                 skip: true as const,
                 result: { isError: true, error: reason },
@@ -376,20 +391,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             }
             // Emit resolved args (sanitized or allowed-unchanged) so the
             // suppressed initial tool-call event is corrected in place.
-            if (subEnforcingHooks) {
-              const streamId = dequeueStreamId();
-              subHookRewrittenArgs.set(state.toolCallId, state.args);
-              subHookRewrittenArgs.set(streamId, state.args);
-              broadcastSubAgentEvent({
-                type: 'tool-call',
-                toolCallId: streamId,
-                toolName: state.toolName,
-                args: state.args,
-                subAgentConversationId,
-                parentConversationId,
-                parentToolCallId,
-              } as SubAgentEvent);
-            }
+            publishResolved(state.args);
             subObserver?.onToolExecutionStart(state);
           },
           onToolExecutionEnd: ({ toolCallId }) => {
@@ -432,8 +434,15 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         // onToolExecutionStart handler re-broadcasts the resolved args.
         if (event.type === 'tool-call' && event.toolCallId) {
           const rewritten = subHookRewrittenArgs.get(event.toolCallId);
+          // Exec-first: onToolExecutionStart already resolved args and stashed
+          // them by toolName (its id differed from this stream id).
+          const stashed = event.toolName ? subResolvedArgsByTool.get(event.toolName) : undefined;
           if (rewritten !== undefined) {
             (enriched as Record<string, unknown>).args = rewritten;
+          } else if (stashed && stashed.length > 0) {
+            const resolved = stashed.shift();
+            (enriched as Record<string, unknown>).args = resolved;
+            subHookRewrittenArgs.set(event.toolCallId, resolved);
           } else if (subEnforcingHooks) {
             (enriched as Record<string, unknown>).args = { pending: true };
             (enriched as Record<string, unknown>).argsPending = true;

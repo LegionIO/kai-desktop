@@ -704,6 +704,18 @@ function applyWorkspaceToolGuards(
           }
         }
 
+        // Apply shell allow/deny guardrails (and shell-disabled) to the workspace
+        // execute_command tool — it must honor the same policy as CLI/execution
+        // tools, or the model can bypass it via this path. Unconditional (not
+        // gated on conversationId/diff tracking).
+        if (toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND) {
+          const cmd = (args as { command?: unknown })?.command;
+          const check = isCommandAllowed(typeof cmd === 'string' ? cmd : '', getConfig());
+          if (!check.allowed) {
+            throw new Error(`${toolName}: ${check.reason}`);
+          }
+        }
+
         if (
           conversationId &&
           WORKSPACE_FILE_MUTATING_TOOLS.has(toolName) &&
