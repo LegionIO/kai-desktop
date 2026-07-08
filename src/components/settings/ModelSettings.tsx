@@ -830,7 +830,10 @@ const ModelForm: FC<{
             <select
               className={settingsSelectClass.replace('bg-card/80', 'bg-background') + ' w-24'}
               value={promptCachingTtl}
-              onChange={(e) => setPromptCachingTtl(e.target.value as '5m' | '1h')}
+              onChange={(e) => {
+                setPromptCachingTtl(e.target.value as '5m' | '1h');
+                setPromptCachingTouched(true);
+              }}
               aria-label="Cache TTL"
             >
               <option value="5m">5m TTL</option>

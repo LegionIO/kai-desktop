@@ -30,7 +30,10 @@ const BASE_STYLES =
  * React + Babel, so it widens script-src/connect-src to that origin only.
  */
 function cspMeta(mode: 'static' | 'react'): string {
-  const scriptSrc = mode === 'react' ? "'self' 'unsafe-inline' https://unpkg.com" : "'unsafe-inline'";
+  // React mode runs Babel-standalone, which compiles JSX via eval/Function —
+  // Chromium blocks that without 'unsafe-eval'. Scoped to the sandboxed react
+  // frame only (no allow-same-origin, connect-src limited to unpkg).
+  const scriptSrc = mode === 'react' ? "'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com" : "'unsafe-inline'";
   const connectSrc = mode === 'react' ? 'https://unpkg.com' : "'none'";
   const policy = [
     "default-src 'none'",
@@ -48,14 +51,20 @@ function cspMeta(mode: 'static' | 'react'): string {
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
   const csp = cspMeta('static');
-  // If the model already emitted a full document, inject the CSP into its head.
-  if (/<html[\s>]/i.test(trimmed) || /^<!doctype/i.test(trimmed)) {
-    if (/<head[\s>]/i.test(trimmed)) {
-      return trimmed.replace(/<head([\s>])/i, `<head$1${csp}`);
-    }
-    return trimmed.replace(/<html([\s>])/i, `<html$1<head>${csp}</head>`);
+  // Inject the CSP into an existing <head>; otherwise ALWAYS build our own
+  // document wrapper so a doctype/body-only fragment can't slip past without a
+  // CSP (a no-op replace previously left such docs unprotected).
+  if (/<head[\s>]/i.test(trimmed)) {
+    return trimmed.replace(/<head([\s>])/i, `<head$1${csp}`);
   }
-  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style></head><body>${content}</body></html>`;
+  // Strip any leading doctype/html/body wrappers the model emitted and re-wrap
+  // in a known-good document that carries the CSP.
+  const body = trimmed
+    .replace(/^<!doctype[^>]*>/i, '')
+    .replace(/<\/?html[^>]*>/gi, '')
+    .replace(/<\/?body[^>]*>/gi, '')
+    .trim();
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style></head><body>${body}</body></html>`;
 }
 
 function wrapSvg(content: string): string {

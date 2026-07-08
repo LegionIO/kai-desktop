@@ -311,7 +311,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           },
           onToolExecutionStart: async (state) => {
             toolCancels.set(state.toolCallId, state.cancel);
-            subObserver?.onToolExecutionStart(state);
+            // PreToolUse BEFORE the observer so a block/modify hook can deny or
+            // sanitize args before the observer model sees them.
             const preTool = await hookDispatcher.dispatch('PreToolUse', {
               conversationId: subAgentConversationId,
               parentConversationId,
@@ -340,6 +341,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               for (const k of Object.keys(target)) delete target[k];
               Object.assign(target, nextArgs as Record<string, unknown>);
             }
+            subObserver?.onToolExecutionStart(state);
           },
           onToolExecutionEnd: ({ toolCallId }) => {
             toolCancels.delete(toolCallId);

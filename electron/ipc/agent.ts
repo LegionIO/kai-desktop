@@ -1278,9 +1278,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               toolCancels.set(state.toolCallId, state.cancel);
               enqueueByToolName(pendingExecIdsByToolName, state.toolName, state.toolCallId);
               pairExecuteAndStreamToolCallIds(state.toolName);
-              observer?.onToolExecutionStart(state);
 
               // ── Lifecycle hook: PreToolUse ──────────────────────────────
+              // Runs BEFORE the observer so a block/modify DLP hook can deny or
+              // sanitize args before the observer model ever sees them.
               // `block` → cancel the tool and surface reason as an error result.
               // `modify` → replace args before the tool executes.
               const preTool = await hookDispatcher.dispatch('PreToolUse', {
@@ -1292,6 +1293,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (preTool.denied) {
                 const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
                 hookDeniedToolCalls.set(state.toolCallId, reason);
+                // Denied → observer never sees the (raw) args.
                 return { skip: true as const, result: { isError: true, error: reason } };
               }
               const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
@@ -1310,6 +1312,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   Object.assign(target, nextArgs as Record<string, unknown>);
                 }
               }
+
+              // Observer sees post-enforcement (allowed, possibly sanitized) args.
+              observer?.onToolExecutionStart(state);
 
               // Gate exit_plan_mode behind user approval regardless of execution mode
               if (state.toolName === 'exit_plan_mode') {

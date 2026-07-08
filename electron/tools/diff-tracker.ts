@@ -198,9 +198,21 @@ function recordMutation(
   const { unified, additions, deletions } = computeUnifiedDiff(entry.original, entry.current, { path: absPath });
 
   // If the file is back to its original state, drop the entry entirely so it
-  // stops appearing as a pending change in list_file_changes / the Changes panel.
+  // stops appearing as a pending change in list_file_changes / the Changes
+  // panel — and broadcast a clear event so an open panel refreshes immediately.
   if (isBackToOriginal(entry)) {
     conv.delete(absPath);
+    broadcast({
+      conversationId,
+      path: absPath,
+      unifiedDiff: '',
+      additions: 0,
+      deletions: 0,
+      source: meta.source,
+      toolName: meta.toolName,
+      created: false,
+      deleted: false,
+    });
     return null;
   }
 
