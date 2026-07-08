@@ -28,6 +28,12 @@ files:
 # explicitly so the unpacked copy is guaranteed.
 asarUnpack:
   - "**/@openai/codex*/**"
+  # React artifacts are esbuild-bundled at runtime (electron/ipc/artifact-bundle.ts).
+  # esbuild's native service reads inputs from the real FS and cannot resolve
+  # modules inside app.asar, so React + its bundling inputs must be unpacked.
+  - "**/node_modules/react/**"
+  - "**/node_modules/react-dom/**"
+  - "**/node_modules/scheduler/**"
 extraResources:
   - from: bundled-plugins
     to: bundled-plugins

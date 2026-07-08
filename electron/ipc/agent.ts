@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
-import { normalizeAgentCwd } from '../agent/mastra-agent.js';
+import { normalizeAgentCwd, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -814,6 +814,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // broadcast (showing a pending placeholder) and fill them in via the
         // corrective re-broadcast once the hook has run.
         const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
+        // Provider-native tools (server-side web_search etc.) execute inside the
+        // provider and never hit onToolExecutionStart, so their args must NOT be
+        // suppressed (nothing would ever un-suppress them → stuck {pending}).
+        const providerDefinedToolNames = modelEntry?.modelConfig
+          ? getProviderDefinedToolNames(modelEntry.modelConfig)
+          : new Set<string>();
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
@@ -1739,12 +1745,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (rewritten !== undefined) {
                 // Hook already resolved — publish the sanitized args.
                 (event as Record<string, unknown>).args = rewritten;
-              } else if (enforcingHooksActive && runtime.id === 'mastra') {
+              } else if (
+                enforcingHooksActive &&
+                runtime.id === 'mastra' &&
+                !providerDefinedToolNames.has(event.toolName)
+              ) {
                 // Suppress raw args until the corrective re-broadcast fills them
-                // in — but ONLY under Mastra, which calls onToolExecutionStart.
-                // Non-Mastra runtimes never un-suppress (and already warn that
-                // they don't enforce hooks), so suppressing there would strand
-                // the args at {pending} forever.
+                // in — but ONLY under Mastra (which calls onToolExecutionStart)
+                // and NOT for provider-native tools (which execute in-provider
+                // and never un-suppress → would stick at {pending} forever).
                 (event as Record<string, unknown>).args = { pending: true };
                 (event as Record<string, unknown>).argsPending = true;
               }

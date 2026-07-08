@@ -244,9 +244,15 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
   }
 
   const normalizedBaseUrl = normalizeOpenAIBaseUrl(modelConfig.endpoint);
+  // Azure OpenAI requires the api-version as a URL query parameter
+  // (?api-version=...), not just a header. Detect Azure endpoints and pass it
+  // via queryParams; keep the header for other OpenAI-compatible endpoints that
+  // read it from headers.
+  const isAzure = /\.openai\.azure\.com/i.test(normalizedBaseUrl ?? '');
   const openai = createOpenAI({
     ...(normalizedBaseUrl ? { baseURL: normalizedBaseUrl } : {}),
     apiKey: modelConfig.apiKey || 'dummy',
+    ...(isAzure && modelConfig.apiVersion ? { queryParams: { 'api-version': modelConfig.apiVersion } } : {}),
     headers: withBrandUserAgent({
       ...(modelConfig.apiVersion ? { 'api-version': modelConfig.apiVersion } : {}),
       ...(modelConfig.extraHeaders ?? {}),

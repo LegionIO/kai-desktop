@@ -119,6 +119,10 @@ async function resumeSubAgent(
     // tool-call event and the exec id differs from the stream id, the stream
     // loop applies the stashed args by toolName when the event arrives.
     const resolvedByTool = new Map<string, unknown[]>();
+    // Stream-first queue: suppressed stream ids awaiting resolution, per tool
+    // name. onToolExecutionStart rebroadcasts under the queued stream id (which
+    // may differ from its exec id) instead of the exec id.
+    const suppressedStreamIdsByTool = new Map<string, string[]>();
     const stream = streamAgentResponse(
       subAgentConversationId,
       messages,
@@ -135,18 +139,22 @@ async function resumeSubAgent(
         onToolExecutionStart: async (state) => {
           const rebroadcast = (resolved: unknown): void => {
             rewrittenArgs.set(state.toolCallId, resolved);
-            // Also stash by toolName so a stream event with a DIFFERENT id can
-            // still pick up the resolved args (exec-first with id divergence).
-            const q = resolvedByTool.get(state.toolName) ?? [];
-            q.push(resolved);
-            resolvedByTool.set(state.toolName, q);
+            // Prefer a suppressed stream id already rendered under {pending}
+            // (stream-first); its id may differ from this exec id. If none is
+            // queued (exec-first), stash by toolName for the stream loop to pick
+            // up when its event arrives, and correct under the exec id too.
+            const streamQ = suppressedStreamIdsByTool.get(state.toolName);
+            const targetId = streamQ && streamQ.length > 0 ? streamQ.shift()! : state.toolCallId;
+            rewrittenArgs.set(targetId, resolved);
+            if (targetId === state.toolCallId) {
+              const q = resolvedByTool.get(state.toolName) ?? [];
+              q.push(resolved);
+              resolvedByTool.set(state.toolName, q);
+            }
             if (enforcingHooks) {
-              // Correct the rendered tool-call in place (renderer upserts by id)
-              // so a suppressed {pending} placeholder is replaced with the
-              // resolved args, even if the stream event already fired.
               broadcastEvent({
                 type: 'tool-call',
-                toolCallId: state.toolCallId,
+                toolCallId: targetId,
                 toolName: state.toolName,
                 args: resolved,
                 subAgentConversationId,
@@ -217,6 +225,13 @@ async function resumeSubAgent(
         } else if (enforcingHooks) {
           (enriched as Record<string, unknown>).args = { pending: true };
           (enriched as Record<string, unknown>).argsPending = true;
+          // Record this suppressed stream id so onToolExecutionStart corrects
+          // it under the id the renderer actually rendered (stream-first).
+          if (event.toolName) {
+            const q = suppressedStreamIdsByTool.get(event.toolName) ?? [];
+            q.push(event.toolCallId);
+            suppressedStreamIdsByTool.set(event.toolName, q);
+          }
         }
       }
       if (event.type !== 'done') {

@@ -520,6 +520,15 @@ function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, 
   return result;
 }
 
+/**
+ * Tool names that execute inside the provider (server-side web_search etc.) and
+ * therefore never flow through our onToolExecutionStart wrapper. Callers use
+ * this to skip UI arg-suppression for these tools (they'd never un-suppress).
+ */
+export function getProviderDefinedToolNames(modelConfig: LLMModelConfig): Set<string> {
+  return new Set(Object.keys(buildProviderDefinedTools(modelConfig)));
+}
+
 function buildMastraMemoryOptions(
   conversationId: string,
   memory: ReturnType<typeof getSharedMemory>,
