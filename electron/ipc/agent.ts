@@ -780,6 +780,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           preToolResults.set(toolCallId, p);
           return p;
         };
+        // When block/modify hooks are active, the UI-facing `tool-call` stream
+        // event can arrive before PreToolUse resolves. To guarantee raw args
+        // never reach the renderer/persistence, we SUPPRESS args on the initial
+        // broadcast (showing a pending placeholder) and fill them in via the
+        // corrective re-broadcast once the hook has run.
+        const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
@@ -1100,10 +1106,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const mergedAbortSignal = mergeAbortSignals(controller.signal, localAbortController.signal);
           toolCancels.set(toolCallId, cancel);
 
+          // ── Lifecycle hook: PreToolUse ──────────────────────────────
+          // Observer-launched tools must go through the same block/modify
+          // enforcement as normal tool calls, or a DLP hook is bypassed.
+          const preTool = await runPreToolUseOnce(toolCallId, toolName, args);
+          if (preTool.denied) {
+            const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+            toolCancels.delete(toolCallId);
+            return { ok: false, details: reason };
+          }
+          // Use the (possibly sanitized) args for observer, UI, and execution.
+          const effectiveArgs = preTool.args;
+
           observer.onToolExecutionStart({
             toolCallId,
             toolName,
-            args,
+            args: effectiveArgs,
             observerInitiated: true,
           });
 
@@ -1112,7 +1130,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             type: 'tool-call',
             toolCallId,
             toolName,
-            args,
+            args: effectiveArgs,
             startedAt,
             observerInitiated: true,
           });
@@ -1143,9 +1161,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 },
               };
 
-              const rawResult = await tool.execute(args, context);
-              observer?.onToolExecutionResult(toolCallId, toolName, rawResult);
-              const observerAugmented = withObserverAugmentation(rawResult, observer?.getToolAugmentation(toolCallId));
+              const rawResult = await tool.execute(effectiveArgs, context);
+              // ── Lifecycle hook: PostToolUse ─────────────────────────────
+              // Same enforcement as the normal path: deny → error result,
+              // modify → replace result, before observer/compaction/broadcast.
+              let hookedResult: unknown = rawResult;
+              const postTool = await hookDispatcher.dispatch('PostToolUse', {
+                conversationId,
+                toolCallId,
+                toolName,
+                args: effectiveArgs,
+                result: rawResult,
+              });
+              if (postTool.denied) {
+                hookedResult = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+              } else {
+                const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+                if (nextResult !== undefined) hookedResult = nextResult;
+              }
+              observer?.onToolExecutionResult(toolCallId, toolName, hookedResult);
+              const observerAugmented = withObserverAugmentation(
+                hookedResult,
+                observer?.getToolAugmentation(toolCallId),
+              );
               const compacted = await maybeCompactToolOutput(toolCallId, toolName, observerAugmented, 'direct');
               const finishedAt = new Date().toISOString();
 
@@ -1354,6 +1392,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 });
                 return { skip: true as const, result: { isError: true, error: reason } };
               }
+              const modStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
               if (preTool.args !== state.args) {
                 // Mutate in place — the same object reference is passed to tool.execute().
                 if (
@@ -1368,10 +1407,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   for (const k of Object.keys(target)) delete target[k];
                   Object.assign(target, preTool.args as Record<string, unknown>);
                 }
-                const modStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              }
+              // When enforcing hooks are active the initial stream tool-call was
+              // broadcast with suppressed ({pending}) args; emit the resolved
+              // args now (sanitized or allowed-unchanged). Renderer upserts by id.
+              if (enforcingHooksActive) {
                 hookRewrittenArgs.set(modStreamId, preTool.args);
-                // Correct the rendered tool-call in place (upsert by toolCallId)
-                // so the sanitized args replace any raw args already shown.
                 broadcastStreamEvent({
                   conversationId,
                   type: 'tool-call',
@@ -1605,11 +1646,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
               enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
               pairExecuteAndStreamToolCallIds(event.toolName);
-              // If a PreToolUse hook redacted/denied this call, replace the
-              // streamed args so the sanitized version is what gets persisted.
               const rewritten = hookRewrittenArgs.get(event.toolCallId);
               if (rewritten !== undefined) {
+                // Hook already resolved — publish the sanitized args.
                 (event as Record<string, unknown>).args = rewritten;
+              } else if (enforcingHooksActive) {
+                // Hook hasn't resolved yet. Suppress raw args so a DLP-redacted
+                // value can't leak into the UI/persistence; the corrective
+                // re-broadcast from onToolExecutionStart fills them in shortly.
+                (event as Record<string, unknown>).args = { pending: true };
+                (event as Record<string, unknown>).argsPending = true;
               }
             }
             if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {

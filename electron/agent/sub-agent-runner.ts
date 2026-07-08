@@ -222,6 +222,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     const observerConfig = resolveToolObserverConfig(config);
     let subObserver: ToolObserverManager | null = null;
     const toolCancels = new Map<string, () => void>();
+    // Suppress raw tool-call args in the sub-agent stream until PreToolUse
+    // resolves, matching the main-agent path, so a DLP block/modify hook can't
+    // leak raw args into the sub-agent UI/persistence.
+    const subEnforcingHooks = hookDispatcher.hasEnforcingToolHooks();
+    const subHookRewrittenArgs = new Map<string, unknown>();
 
     // Helper: add a follow-up message and emit it as a UI event
     const addFollowUpMessage = (text: string, source: 'user' | 'parent' | 'task' = 'parent'): SubAgentEvent => {
@@ -321,6 +326,21 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               args: state.args,
             });
             if (preTool.denied) {
+              subHookRewrittenArgs.set(state.toolCallId, {
+                redacted: true,
+                reason: preTool.reason ?? 'Blocked by PreToolUse hook.',
+              });
+              if (subEnforcingHooks) {
+                broadcastSubAgentEvent({
+                  type: 'tool-call',
+                  toolCallId: state.toolCallId,
+                  toolName: state.toolName,
+                  args: subHookRewrittenArgs.get(state.toolCallId),
+                  subAgentConversationId,
+                  parentConversationId,
+                  parentToolCallId,
+                } as SubAgentEvent);
+              }
               return {
                 skip: true as const,
                 result: { isError: true, error: preTool.reason ?? 'Blocked by PreToolUse hook.' },
@@ -340,6 +360,20 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               const target = state.args as Record<string, unknown>;
               for (const k of Object.keys(target)) delete target[k];
               Object.assign(target, nextArgs as Record<string, unknown>);
+            }
+            // Emit resolved args (sanitized or allowed-unchanged) so the
+            // suppressed initial tool-call event is corrected in place.
+            if (subEnforcingHooks) {
+              subHookRewrittenArgs.set(state.toolCallId, state.args);
+              broadcastSubAgentEvent({
+                type: 'tool-call',
+                toolCallId: state.toolCallId,
+                toolName: state.toolName,
+                args: state.args,
+                subAgentConversationId,
+                parentConversationId,
+                parentToolCallId,
+              } as SubAgentEvent);
             }
             subObserver?.onToolExecutionStart(state);
           },
@@ -379,6 +413,17 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           turnText += event.text;
         }
         const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
+        // Suppress raw args on tool-call events until PreToolUse resolves; the
+        // onToolExecutionStart handler re-broadcasts the resolved args.
+        if (event.type === 'tool-call' && event.toolCallId) {
+          const rewritten = subHookRewrittenArgs.get(event.toolCallId);
+          if (rewritten !== undefined) {
+            (enriched as Record<string, unknown>).args = rewritten;
+          } else if (subEnforcingHooks) {
+            (enriched as Record<string, unknown>).args = { pending: true };
+            (enriched as Record<string, unknown>).argsPending = true;
+          }
+        }
         if (event.type !== 'done') {
           broadcastSubAgentEvent(enriched);
         }
