@@ -66,4 +66,35 @@ describe('HookDispatcher rule throttling', () => {
     await new Promise((r) => setTimeout(r, 5));
     expect(spawnCalls.length).toBe(2);
   });
+
+  it('a multi-action rule runs ALL its actions per matching dispatch (shared throttle budget)', async () => {
+    const rule: AutomationRule = {
+      id: 'r-multi',
+      name: 'two-command hook',
+      enabled: true,
+      trigger: { source: 'hook', event: 'PreToolUse' },
+      conditions: [],
+      conditionMode: 'all',
+      actions: [
+        { type: 'runHookCommand', command: 'cmd-a', mode: 'observe', matcher: '*' },
+        { type: 'runHookCommand', command: 'cmd-b', mode: 'observe', matcher: '*' },
+      ],
+      debounceMs: 0,
+      rateLimitPerMinute: 1, // 1 rule-fire per minute
+    } as AutomationRule;
+
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => makeConfig(rule) });
+
+    // 2 dispatches. Rate limit is 1/min at the RULE level, so only the first
+    // dispatch fires — but it must run BOTH of the rule's actions (not have the
+    // first action consume the budget and starve the second).
+    await d.dispatch('PreToolUse', { conversationId: 'c', toolName: 'shell', args: {} });
+    await d.dispatch('PreToolUse', { conversationId: 'c', toolName: 'shell', args: {} });
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(spawnCalls.filter((c) => c === 'cmd-a').length).toBe(1);
+    expect(spawnCalls.filter((c) => c === 'cmd-b').length).toBe(1);
+    expect(spawnCalls.length).toBe(2);
+  });
 });

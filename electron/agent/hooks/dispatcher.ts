@@ -69,6 +69,21 @@ type HookRegistration = {
   mode: HookMode;
   matcher?: string;
   handler: HookHandler;
+  /**
+   * For user (automation-rule) shell hooks: the rule id and its throttle limits.
+   * Throttling is applied once per rule per dispatch in the dispatch loop, so a
+   * rule with multiple actions doesn't have the first action consume the budget.
+   */
+  ruleId?: string;
+  debounceMs?: number;
+  rateLimitPerMinute?: number;
+  /**
+   * Optional gate evaluated (with the payload) BEFORE throttling in the dispatch
+   * loop. Used by user shell hooks to check the rule's conditions first, so a
+   * non-matching rule doesn't consume its throttle budget (matches the engine's
+   * conditions-then-throttle order).
+   */
+  conditionGate?: (payload: unknown) => boolean;
 };
 
 export type DispatchResult<T = unknown> = {
@@ -296,6 +311,12 @@ export class HookDispatcher {
   // a rule's debounceMs / rateLimitPerMinute apply on the hook path too.
   private readonly ruleLastFireAt = new Map<string, number>();
   private readonly ruleMinuteBuckets = new Map<string, number[]>();
+  // A monotonic id stamped on each dispatch() so all handlers of the SAME rule
+  // fired within one dispatch share a single throttle decision (a rule with
+  // multiple runHookCommand actions must not have the first action consume the
+  // budget and starve the rest — that could fail a later block/modify open).
+  private dispatchSeq = 0;
+  private readonly ruleThrottleDecision = new Map<string, { seq: number; throttled: boolean }>();
 
   configure(opts: DispatcherOptions): void {
     if (opts.getConfig) this.getConfig = opts.getConfig;
@@ -325,7 +346,14 @@ export class HookDispatcher {
   register(
     event: HookEvent,
     handler: HookHandler,
-    opts: HookRegistrationOptions & { source?: 'plugin' | 'user'; pluginId?: string } = {},
+    opts: HookRegistrationOptions & {
+      source?: 'plugin' | 'user';
+      pluginId?: string;
+      ruleId?: string;
+      debounceMs?: number;
+      rateLimitPerMinute?: number;
+      conditionGate?: (payload: unknown) => boolean;
+    } = {},
   ): () => void {
     const reg: HookRegistration = {
       source: opts.source ?? 'plugin',
@@ -333,6 +361,10 @@ export class HookDispatcher {
       mode: opts.mode ?? 'observe',
       matcher: opts.matcher,
       handler,
+      ruleId: opts.ruleId,
+      debounceMs: opts.debounceMs,
+      rateLimitPerMinute: opts.rateLimitPerMinute,
+      conditionGate: opts.conditionGate,
     };
     const list = this.registry.get(event) ?? [];
     list.push(reg);
@@ -371,6 +403,10 @@ export class HookDispatcher {
 
     if (cfg) this.syncUserHooks(cfg);
 
+    // New dispatch cycle: rule-level throttle decisions are memoized against
+    // this id so every handler of the same rule shares one decision.
+    const dispatchId = ++this.dispatchSeq;
+
     const list = this.registry.get(event) ?? [];
 
     // Observe-only fan-out to the automation engine. Emits the FINAL (post-
@@ -397,6 +433,18 @@ export class HookDispatcher {
     for (const reg of ordered) {
       if ((event === 'PreToolUse' || event === 'PostToolUse') && !matchesToolName(reg.matcher, toolName)) {
         continue;
+      }
+
+      // User shell hooks carry their rule's throttle. Decide ONCE per rule per
+      // dispatch (memoized on dispatchId) so a rule with multiple actions
+      // doesn't have the first action consume the budget and skip the rest.
+      // Evaluate the rule's conditions FIRST so a non-matching rule doesn't
+      // consume its throttle budget (matches the engine's ordering).
+      if (reg.source === 'user' && reg.ruleId) {
+        if (reg.conditionGate && !reg.conditionGate(current)) continue;
+        if (this.isRuleThrottled(reg.ruleId, reg.debounceMs ?? 0, reg.rateLimitPerMinute, dispatchId)) {
+          continue;
+        }
       }
 
       // block/modify are only meaningful for awaited (enforcing) events; for
@@ -469,25 +517,37 @@ export class HookDispatcher {
    * True when a user hook rule is currently throttled by its own `debounceMs`
    * or `rateLimitPerMinute`. Mirrors AutomationEngine's throttle so the same
    * limits apply whether a rule fires via the engine or via this hook path.
-   * On a firing decision it records the timestamp (like the engine does).
+   * The decision is memoized per `dispatchId` so all of a rule's actions in one
+   * dispatch share a single decision (and only one advances the counters).
    */
-  private isThrottled(rule: AutomationRule): boolean {
+  private isRuleThrottled(
+    ruleId: string,
+    debounceMs: number,
+    rateLimitPerMinute: number | undefined,
+    dispatchId: number,
+  ): boolean {
+    const cached = this.ruleThrottleDecision.get(ruleId);
+    if (cached && cached.seq === dispatchId) return cached.throttled;
+
     const now = Date.now();
-    if (rule.debounceMs > 0) {
-      const last = this.ruleLastFireAt.get(rule.id) ?? 0;
-      if (now - last < rule.debounceMs) return true;
+    let throttled = false;
+    if (debounceMs > 0) {
+      const last = this.ruleLastFireAt.get(ruleId) ?? 0;
+      if (now - last < debounceMs) throttled = true;
     }
-    if (rule.rateLimitPerMinute) {
-      const bucket = (this.ruleMinuteBuckets.get(rule.id) ?? []).filter((t) => now - t < 60_000);
-      if (bucket.length >= rule.rateLimitPerMinute) {
-        this.ruleMinuteBuckets.set(rule.id, bucket);
-        return true;
+    if (!throttled && rateLimitPerMinute) {
+      const bucket = (this.ruleMinuteBuckets.get(ruleId) ?? []).filter((t) => now - t < 60_000);
+      if (bucket.length >= rateLimitPerMinute) {
+        this.ruleMinuteBuckets.set(ruleId, bucket);
+        throttled = true;
+      } else {
+        bucket.push(now);
+        this.ruleMinuteBuckets.set(ruleId, bucket);
       }
-      bucket.push(now);
-      this.ruleMinuteBuckets.set(rule.id, bucket);
     }
-    this.ruleLastFireAt.set(rule.id, now);
-    return false;
+    if (!throttled) this.ruleLastFireAt.set(ruleId, now);
+    this.ruleThrottleDecision.set(ruleId, { seq: dispatchId, throttled });
+    return throttled;
   }
 
   private syncUserHooks(config: AppConfig): void {
@@ -512,6 +572,8 @@ export class HookDispatcher {
         r.trigger.event,
         r.conditions,
         r.conditionMode,
+        r.debounceMs,
+        r.rateLimitPerMinute ?? 0,
         r.actions
           .filter((a): a is Extract<typeof a, { type: 'runHookCommand' }> => a.type === 'runHookCommand')
           .map((a) => [a.command, a.mode, a.matcher ?? '']),
@@ -538,25 +600,27 @@ export class HookDispatcher {
           if (action.type !== 'runHookCommand') continue;
           const { command, matcher } = action;
           const mode = mode0(action.mode);
-          const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
+          const conditionGate = (payload: unknown): boolean => {
             try {
-              const cond = evaluateConditions(rule.conditions, rule.conditionMode, payload);
-              if (!cond.ok) return undefined;
+              return evaluateConditions(rule.conditions, rule.conditionMode, payload).ok;
             } catch {
-              return undefined;
+              return false;
             }
-            // Apply the rule's debounce / rate-limit, mirroring AutomationEngine,
-            // so a hook rule capped at e.g. 1/min doesn't spawn the shell command
-            // on every matching tool call. When throttled the hook simply does
-            // not fire (returns undefined) — for a block/modify hook that means
-            // the action is allowed through, consistent with the hook not running.
-            if (this.isThrottled(rule)) return undefined;
+          };
+          const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
+            // Conditions + throttling are checked in the dispatch loop before
+            // this runs (conditions first, so a non-matching rule doesn't consume
+            // its throttle budget).
             return runShellHook(event, command, mode, payload, timeoutMs);
           };
           this.register(event, handler, {
             source: 'user',
             mode,
             matcher,
+            ruleId: rule.id,
+            debounceMs: rule.debounceMs,
+            rateLimitPerMinute: rule.rateLimitPerMinute,
+            conditionGate,
           });
         }
       }
