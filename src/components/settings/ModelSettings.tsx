@@ -1,5 +1,16 @@
 import { useState, useEffect, useRef, type FC } from 'react';
-import { PlusIcon, Trash2Icon, PencilIcon, XIcon, CheckIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import {
+  PlusIcon,
+  Trash2Icon,
+  PencilIcon,
+  XIcon,
+  CheckIcon,
+  EyeIcon,
+  EyeOffIcon,
+  CopyIcon,
+  ChevronDownIcon,
+} from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { app } from '@/lib/ipc-client';
@@ -101,14 +112,230 @@ export const ModelSettings: FC<SettingsProps> = ({ config, updateConfig, focusTa
 
 /* ── Providers Content ── */
 
+type ProviderType = 'openai-compatible' | 'anthropic' | 'amazon-bedrock' | 'google';
+
+const PROVIDER_TYPE_LABELS: Record<ProviderType, string> = {
+  'openai-compatible': 'OpenAI-compatible',
+  anthropic: 'Anthropic',
+  'amazon-bedrock': 'Amazon Bedrock',
+  google: 'Google',
+};
+
+const PROVIDER_TYPE_DEFAULTS: Record<ProviderType, string> = {
+  'openai-compatible': 'openai',
+  anthropic: 'anthropic',
+  'amazon-bedrock': 'bedrock',
+  google: 'gemini',
+};
+
 const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
-  const models = config.models as { providers: Record<string, Provider> };
+  const models = config.models as { providers?: Record<string, Provider>; catalog?: CatalogEntry[] };
+  const providers = models.providers ?? {};
+  const catalog = models.catalog ?? [];
+  const providerNames = Object.keys(providers);
+
+  const [addingType, setAddingType] = useState<ProviderType | null>(null);
+  const [editingName, setEditingName] = useState<string | null>(null);
+
+  const writeProviders = (next: Record<string, Provider>) => updateConfig('models.providers', next);
+
+  const uniqueName = (base: string): string => {
+    if (!(base in providers)) return base;
+    let i = 2;
+    while (`${base}-${i}` in providers) i++;
+    return `${base}-${i}`;
+  };
+
+  const handleAdd = (name: string, provider: Provider) => {
+    void writeProviders({ ...providers, [name]: provider });
+    setAddingType(null);
+    setEditingName(name);
+  };
+
+  const handleDuplicate = (name: string) => {
+    const source = providers[name];
+    if (!source) return;
+    const copyName = uniqueName(`${name}-copy`);
+    void writeProviders({ ...providers, [copyName]: { ...source } });
+  };
+
+  const handleDelete = (name: string) => {
+    const next = { ...providers };
+    delete next[name];
+    void writeProviders(next);
+    if (editingName === name) setEditingName(null);
+  };
+
+  const catalogRefCount = (name: string) => catalog.filter((m) => m.provider === name).length;
+
+  const startAdd = (t: ProviderType) => {
+    setEditingName(null);
+    setAddingType(t);
+  };
 
   return (
-    <div className="space-y-3">
-      {Object.entries(models.providers).map(([key, provider]) => (
-        <ProviderCard key={key} name={key} provider={provider} updateConfig={updateConfig} />
-      ))}
+    <div data-setting-id="models.providers" className="space-y-3">
+      {providerNames.length === 0 && !addingType && (
+        <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border/70 px-4 py-8 text-center">
+          <p className="text-xs font-medium text-muted-foreground">No providers configured</p>
+          <p className="text-[10px] text-muted-foreground/70">
+            Add a provider to connect Kai to an LLM API endpoint.
+          </p>
+          <AddProviderButton onSelect={startAdd} />
+        </div>
+      )}
+
+      {providerNames.length > 0 && (
+        <div className="space-y-2">
+          {providerNames.map((name) =>
+            editingName === name ? (
+              <ProviderEditor
+                key={name}
+                name={name}
+                provider={providers[name]}
+                updateConfig={updateConfig}
+                onClose={() => setEditingName(null)}
+              />
+            ) : (
+              <ProviderRow
+                key={name}
+                name={name}
+                provider={providers[name]}
+                catalogRefs={catalogRefCount(name)}
+                onEdit={() => {
+                  setAddingType(null);
+                  setEditingName(name);
+                }}
+                onDuplicate={() => handleDuplicate(name)}
+                onDelete={() => handleDelete(name)}
+              />
+            ),
+          )}
+        </div>
+      )}
+
+      {addingType ? (
+        <ProviderAddForm
+          type={addingType}
+          existingNames={providerNames}
+          defaultName={uniqueName(PROVIDER_TYPE_DEFAULTS[addingType])}
+          onSave={handleAdd}
+          onCancel={() => setAddingType(null)}
+        />
+      ) : (
+        providerNames.length > 0 && <AddProviderButton full onSelect={startAdd} />
+      )}
+    </div>
+  );
+};
+
+const AddProviderButton: FC<{ onSelect: (type: ProviderType) => void; full?: boolean }> = ({ onSelect, full }) => (
+  <DropdownMenu.Root>
+    <DropdownMenu.Trigger asChild>
+      <button
+        type="button"
+        className={`flex items-center justify-center gap-1.5 rounded-lg border border-dashed px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 ${
+          full ? 'w-full' : ''
+        }`}
+      >
+        <PlusIcon className="h-3.5 w-3.5" />
+        Add Provider
+        <ChevronDownIcon className="h-3 w-3 opacity-60" />
+      </button>
+    </DropdownMenu.Trigger>
+    <DropdownMenu.Portal>
+      <DropdownMenu.Content
+        align="start"
+        sideOffset={4}
+        className="z-[9999] min-w-[200px] rounded-xl border border-border/70 bg-popover/95 p-1 text-popover-foreground shadow-xl backdrop-blur-md"
+      >
+        {(Object.keys(PROVIDER_TYPE_LABELS) as ProviderType[]).map((type) => (
+          <DropdownMenu.Item
+            key={type}
+            onSelect={() => onSelect(type)}
+            className="flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs outline-none transition-colors data-[highlighted]:bg-muted/70"
+          >
+            {PROVIDER_TYPE_LABELS[type]}
+          </DropdownMenu.Item>
+        ))}
+      </DropdownMenu.Content>
+    </DropdownMenu.Portal>
+  </DropdownMenu.Root>
+);
+
+const ProviderRow: FC<{
+  name: string;
+  provider: Provider;
+  catalogRefs: number;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}> = ({ name, provider, catalogRefs, onEdit, onDuplicate, onDelete }) => {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const typeLabel = PROVIDER_TYPE_LABELS[provider.type as ProviderType] ?? provider.type;
+  const detail =
+    provider.type === 'amazon-bedrock'
+      ? provider.region || 'default credential chain'
+      : provider.endpoint || (provider.apiKey ? 'API key set' : 'not configured');
+
+  return (
+    <div className="flex items-center gap-2 rounded-lg border px-3 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-xs font-medium">{name}</span>
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{typeLabel}</span>
+          {provider.enabled === false && (
+            <span className="shrink-0 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+              disabled
+            </span>
+          )}
+        </div>
+        <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{detail}</div>
+      </div>
+      {confirmDelete ? (
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">
+            {catalogRefs > 0 ? `${catalogRefs} model${catalogRefs === 1 ? '' : 's'} use this` : 'Delete?'}
+          </span>
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded bg-destructive/10 px-2 py-1 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/20"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(false)}
+            className="rounded p-1 transition-colors hover:bg-muted"
+            title="Cancel"
+          >
+            <XIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </div>
+      ) : (
+        <>
+          <button type="button" onClick={onEdit} className="rounded p-1 transition-colors hover:bg-muted" title="Edit">
+            <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={onDuplicate}
+            className="rounded p-1 transition-colors hover:bg-muted"
+            title="Duplicate"
+          >
+            <CopyIcon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(true)}
+            className="rounded p-1 transition-colors hover:bg-destructive/10"
+            title="Delete"
+          >
+            <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </>
+      )}
     </div>
   );
 };
@@ -588,8 +815,12 @@ function toKey(name: string): string {
     .replace(/^-|-$/g, '');
 }
 
-function getProviderTypeLabel(type: string): string {
-  return type === 'openai-compatible' ? 'openai' : type;
+/** Provider names become dot-path segments in `updateConfig()`; keep them slug-safe. */
+function toProviderName(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
 }
 
 const PasswordField: FC<{
@@ -625,22 +856,195 @@ const PasswordField: FC<{
   );
 };
 
-/* ── Provider Cards ── */
+/* ── Provider Forms ── */
 
-const ProviderCard: FC<{
+/**
+ * Inline form for creating a new provider instance. Holds local state and
+ * writes the whole `models.providers` record once on save so a half-typed
+ * provider never lands in config.
+ */
+const ProviderAddForm: FC<{
+  type: ProviderType;
+  existingNames: string[];
+  defaultName: string;
+  onSave: (name: string, provider: Provider) => void;
+  onCancel: () => void;
+}> = ({ type, existingNames, defaultName, onSave, onCancel }) => {
+  const [name, setName] = useState(defaultName);
+  const [endpoint, setEndpoint] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [apiVersion, setApiVersion] = useState('');
+  const [region, setRegion] = useState('');
+  const [awsProfile, setAwsProfile] = useState('');
+  const [useResponsesApi, setUseResponsesApi] = useState(false);
+  const [useDefaultCredentials, setUseDefaultCredentials] = useState(true);
+
+  const slug = toProviderName(name);
+  const nameError = !slug
+    ? 'Name is required'
+    : existingNames.includes(slug)
+      ? 'A provider with this name already exists'
+      : null;
+
+  const handleSave = () => {
+    if (nameError) return;
+    const provider: Provider = { type, enabled: true };
+    if (type === 'amazon-bedrock') {
+      if (region.trim()) provider.region = region.trim();
+      provider.useDefaultCredentials = useDefaultCredentials;
+      if (!useDefaultCredentials && awsProfile.trim()) provider.awsProfile = awsProfile.trim();
+    } else {
+      if (endpoint.trim()) provider.endpoint = endpoint.trim();
+      if (apiKey.trim()) provider.apiKey = apiKey.trim();
+    }
+    if (type === 'openai-compatible') {
+      provider.useResponsesApi = useResponsesApi;
+      if (apiVersion.trim()) provider.apiVersion = apiVersion.trim();
+    }
+    onSave(slug, provider);
+  };
+
+  return (
+    <div className="space-y-3 rounded-lg border bg-card p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold">New {PROVIDER_TYPE_LABELS[type]} provider</span>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted"
+        >
+          <XIcon className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      <div>
+        <label className="mb-0.5 block text-[10px] text-muted-foreground">
+          Name <span className="text-muted-foreground/60">(used to reference this provider in the catalog)</span>
+        </label>
+        <EditableInput
+          className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+          value={name}
+          onChange={setName}
+          placeholder="my-endpoint"
+        />
+        {slug !== name && slug && (
+          <span className="mt-0.5 block text-[10px] text-muted-foreground/60">Will be saved as: {slug}</span>
+        )}
+        {nameError && <span className="mt-0.5 block text-[10px] text-destructive">{nameError}</span>}
+      </div>
+
+      {type === 'amazon-bedrock' ? (
+        <>
+          <div>
+            <label className="mb-0.5 block text-[10px] text-muted-foreground">Region</label>
+            <EditableInput
+              className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+              value={region}
+              onChange={setRegion}
+              placeholder="us-east-1"
+            />
+          </div>
+          <Toggle
+            label="Use default AWS credential chain"
+            checked={useDefaultCredentials}
+            onChange={setUseDefaultCredentials}
+          />
+          {!useDefaultCredentials && (
+            <div>
+              <label className="mb-0.5 block text-[10px] text-muted-foreground">AWS Profile</label>
+              <EditableInput
+                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+                value={awsProfile}
+                onChange={setAwsProfile}
+                placeholder="default"
+              />
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          {(type === 'openai-compatible' || type === 'anthropic') && (
+            <div>
+              <label className="mb-0.5 block text-[10px] text-muted-foreground">
+                Base URL{type === 'anthropic' ? ' (optional)' : ''}
+              </label>
+              <EditableInput
+                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+                value={endpoint}
+                onChange={setEndpoint}
+                placeholder={type === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'}
+              />
+            </div>
+          )}
+          <PasswordField label="API Key" value={apiKey} onChange={async (v) => setApiKey(v)} />
+          {type === 'openai-compatible' && (
+            <>
+              <div>
+                <label className="mb-0.5 block text-[10px] text-muted-foreground">API Version (optional)</label>
+                <EditableInput
+                  className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+                  value={apiVersion}
+                  onChange={setApiVersion}
+                  placeholder="2024-10-21"
+                />
+              </div>
+              <Toggle
+                label="Use Responses API by default"
+                checked={useResponsesApi}
+                onChange={setUseResponsesApi}
+              />
+            </>
+          )}
+        </>
+      )}
+
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={Boolean(nameError)}
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+        >
+          <CheckIcon className="h-3 w-3" />
+          Add Provider
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md bg-muted px-3 py-1 text-xs transition-colors hover:bg-muted/80"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Inline editor for an existing provider. Writes each field via
+ * `updateConfig('models.providers.<name>.<field>', v)` so built-in provider
+ * names keep syncing to `~/.kai/settings/llm.json` (see electron/ipc/config.ts).
+ */
+const ProviderEditor: FC<{
   name: string;
   provider: Provider;
   updateConfig: (path: string, value: unknown) => Promise<void>;
-}> = ({ name, provider, updateConfig }) => {
+  onClose: () => void;
+}> = ({ name, provider, updateConfig, onClose }) => {
   const prefix = `models.providers.${name}`;
-  const isBedrock = provider.type === 'amazon-bedrock';
+  const type = provider.type as ProviderType;
+  const isBedrock = type === 'amazon-bedrock';
   const isOllama = name === 'ollama';
-  const isOpenAICompatible = provider.type === 'openai-compatible' && !isOllama;
+  const showEndpoint = type === 'openai-compatible' || type === 'anthropic';
+  const showApiKey = !isBedrock && !isOllama;
 
   return (
-    <fieldset className="rounded-lg border p-3 space-y-3">
-      <legend className="text-xs font-semibold px-1">
-        {name} <span className="font-normal text-muted-foreground">[{getProviderTypeLabel(provider.type)}]</span>
+    <fieldset className="space-y-3 rounded-lg border bg-card/40 p-3">
+      <legend className="px-1 text-xs font-semibold">
+        {name}{' '}
+        <span className="font-normal text-muted-foreground">
+          · {PROVIDER_TYPE_LABELS[type] ?? provider.type}
+        </span>
       </legend>
 
       <Toggle
@@ -649,31 +1053,65 @@ const ProviderCard: FC<{
         onChange={(v) => updateConfig(`${prefix}.enabled`, v)}
       />
 
-      {provider.endpoint !== undefined && (
+      {showEndpoint && (
         <div>
-          <label className="text-[10px] text-muted-foreground block mb-0.5">{isOllama ? 'Base URL' : 'Endpoint'}</label>
+          <label className="mb-0.5 block text-[10px] text-muted-foreground">
+            {isOllama ? 'Base URL' : 'Base URL / Endpoint'}
+          </label>
           <EditableInput
-            className="w-full rounded border bg-card px-2 py-1 text-xs font-mono"
+            className="w-full rounded border bg-card px-2 py-1 font-mono text-xs"
             value={provider.endpoint ?? ''}
             onChange={(v) => updateConfig(`${prefix}.endpoint`, v)}
-            placeholder={isOllama ? 'http://localhost:11434' : 'https://api.openai.com/v1'}
+            placeholder={
+              isOllama
+                ? 'http://localhost:11434'
+                : type === 'anthropic'
+                  ? 'https://api.anthropic.com'
+                  : 'https://api.openai.com/v1'
+            }
           />
         </div>
       )}
 
-      {isOpenAICompatible && (
-        <Toggle
-          label="Use Responses API By Default"
-          checked={provider.useResponsesApi ?? false}
-          onChange={(v) => updateConfig(`${prefix}.useResponsesApi`, v)}
+      {showApiKey && (
+        <PasswordField
+          label="API Key"
+          value={provider.apiKey ?? ''}
+          onChange={(v) => updateConfig(`${prefix}.apiKey`, v)}
         />
       )}
 
-      {!isOllama && provider.apiKey !== undefined && (
-        <PasswordField label="API Key" value={provider.apiKey} onChange={(v) => updateConfig(`${prefix}.apiKey`, v)} />
+      {type === 'openai-compatible' && !isOllama && (
+        <>
+          <div>
+            <label className="mb-0.5 block text-[10px] text-muted-foreground">API Version (optional)</label>
+            <EditableInput
+              className="w-full rounded border bg-card px-2 py-1 font-mono text-xs"
+              value={provider.apiVersion ?? ''}
+              onChange={(v) => updateConfig(`${prefix}.apiVersion`, v)}
+              placeholder="2024-10-21"
+            />
+          </div>
+          <Toggle
+            label="Use Responses API by default"
+            checked={provider.useResponsesApi ?? false}
+            onChange={(v) => updateConfig(`${prefix}.useResponsesApi`, v)}
+          />
+        </>
       )}
 
       {isBedrock && <BedrockCredentials prefix={prefix} provider={provider} updateConfig={updateConfig} />}
+
+      <div className="pt-1">
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex items-center gap-1 rounded-md bg-muted px-3 py-1 text-xs transition-colors hover:bg-muted/80"
+        >
+          <CheckIcon className="h-3 w-3" />
+          Done
+        </button>
+      </div>
     </fieldset>
   );
 };
