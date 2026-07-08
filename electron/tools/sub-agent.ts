@@ -129,6 +129,23 @@ async function resumeSubAgent(
         },
         // Enforce lifecycle hooks on resume, same as the initial sub-agent run.
         onToolExecutionStart: async (state) => {
+          const rebroadcast = (resolved: unknown): void => {
+            rewrittenArgs.set(state.toolCallId, resolved);
+            if (enforcingHooks) {
+              // Correct the rendered tool-call in place (renderer upserts by id)
+              // so a suppressed {pending} placeholder is replaced with the
+              // resolved args, even if the stream event already fired.
+              broadcastEvent({
+                type: 'tool-call',
+                toolCallId: state.toolCallId,
+                toolName: state.toolName,
+                args: resolved,
+                subAgentConversationId,
+                parentConversationId,
+                parentToolCallId,
+              } as SubAgentEvent);
+            }
+          };
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
             conversationId: subAgentConversationId,
             parentConversationId,
@@ -138,7 +155,7 @@ async function resumeSubAgent(
           });
           if (preTool.denied) {
             const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
-            rewrittenArgs.set(state.toolCallId, { redacted: true, reason });
+            rebroadcast({ redacted: true, reason });
             return { skip: true as const, result: { isError: true, error: reason } };
           }
           const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
@@ -156,7 +173,7 @@ async function resumeSubAgent(
             for (const k of Object.keys(target)) delete target[k];
             Object.assign(target, nextArgs as Record<string, unknown>);
           }
-          rewrittenArgs.set(state.toolCallId, state.args);
+          rebroadcast(state.args);
         },
         augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
           const postTool = await hookDispatcher.dispatch('PostToolUse', {

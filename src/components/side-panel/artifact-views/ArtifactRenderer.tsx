@@ -106,17 +106,15 @@ function wrapSvg(content: string): string {
 /**
  * React artifacts are wrapped in a standalone document that pulls React 18
  * UMD builds from a CDN and Babel-standalone for JSX. If the network is
- * unavailable the frame degrades to showing the raw source (Babel/React
- * simply won't load — the outer app is unaffected).
+ * unavailable the frame degrades to showing the raw source (a plain fallback
+ * script detects that React/Babel didn't load and renders the source instead).
  */
 function wrapReact(content: string): string {
-  // Rewrite ES `export` forms so the component lands in a script-scope binding
-  // Babel-standalone can see (non-module `text/babel` scripts otherwise fail to
-  // parse `export`). `export default X` → `const App = X`; drop bare `export `.
   const normalized = content
     .replace(/^\s*export\s+default\s+/m, 'const App = ')
     .replace(/^\s*export\s+(?=(const|let|var|function|class)\b)/gm, '');
   const escaped = normalized.replace(/<\/script>/gi, '<\\/script>');
+  const sourceLiteral = JSON.stringify(content);
   return [
     '<!doctype html><html><head><meta charset="utf-8">',
     cspMeta('react'),
@@ -131,7 +129,26 @@ function wrapReact(content: string): string {
     'if(__c){ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(__c));}',
     'else{document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">No component named App or Component was exported.</pre>";}}',
     'catch(e){document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">"+String(e)+"</pre>";}',
-    '</script></body></html>',
+    '</script>',
+    // Offline/CDN-blocked fallback: if React or Babel never loaded, the
+    // text/babel script above is ignored and #root stays empty. Detect that and
+    // render the raw source so the preview degrades gracefully.
+    '<script>',
+    `var __src=${sourceLiteral};`,
+    'setTimeout(function(){',
+    'var loaded=(typeof React!=="undefined"&&typeof ReactDOM!=="undefined"&&typeof Babel!=="undefined");',
+    'var root=document.getElementById("root");',
+    'if(!loaded&&root&&!root.hasChildNodes()){',
+    'var note=document.createElement("div");',
+    'note.style.cssText="padding:0.5rem 1rem;background:#fef3c7;color:#92400e;font:12px sans-serif";',
+    'note.textContent="React runtime unavailable (offline or CDN blocked) — showing source.";',
+    'var pre=document.createElement("pre");',
+    'pre.style.cssText="padding:1rem;white-space:pre-wrap;word-break:break-word";',
+    'pre.textContent=__src;',
+    'root.appendChild(note);root.appendChild(pre);}',
+    '},1500);',
+    '</script>',
+    '</body></html>',
   ].join('');
 }
 

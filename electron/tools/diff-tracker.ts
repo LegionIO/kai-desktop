@@ -393,7 +393,10 @@ export async function beginShellSnapshot(
   config: AppConfig,
 ): Promise<ShellSnapshotHandle> {
   const dt = resolveDiffTrackingConfig(config);
-  if (!dt.enabled || !conversationId) {
+  // Skip entirely when tracking is off, there's no conversation, or file access
+  // is disabled (every path would be rejected, so the walk just burns the
+  // timeout producing nothing).
+  if (!dt.enabled || !conversationId || !config.tools.fileAccess.enabled) {
     return { enabled: false, snapshotSkipped: false, finish: async () => [] };
   }
 
