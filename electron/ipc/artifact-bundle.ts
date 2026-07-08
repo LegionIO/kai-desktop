@@ -62,11 +62,16 @@ function wrapSource(source: string): string {
     .replace(/^\s*export\s+default\s+/m, 'const __ArtifactRoot = ')
     .replace(/^\s*export\s+(?=(const|let|var|function|class)\b)/gm, '');
 
-  // Prelude runs BEFORE the artifact source so a snippet that references a bare
-  // `React` (e.g. `React.useState`) without importing it still resolves — a very
-  // common shape for model-generated components. `jsx: 'automatic'` handles the
-  // JSX syntax itself; this covers explicit `React.*` usage.
-  const prelude = `import * as React from 'react';\nimport * as __ArtifactReact from 'react';\nimport { createRoot as __artifactCreateRoot } from 'react-dom/client';\n`;
+  // Does the artifact already import React itself? (default, namespace, or
+  // named). If so, we must NOT also declare a `React` binding — that would be a
+  // duplicate-declaration error. We only inject a `React` alias when absent, so
+  // snippets that use a bare `React.*` without importing still resolve.
+  const importsReact = /^\s*import\s+[^;]*\bfrom\s+['"]react['"]/m.test(source);
+  const reactAlias = importsReact ? '' : `import * as React from 'react';\n`;
+
+  // Internal-only bindings (double-underscore names avoid clashing with any
+  // artifact identifier). `jsx: 'automatic'` handles JSX syntax itself.
+  const prelude = `${reactAlias}import * as __ArtifactReact from 'react';\nimport { createRoot as __artifactCreateRoot } from 'react-dom/client';\n`;
 
   const bootstrap = `
 ;(function () {

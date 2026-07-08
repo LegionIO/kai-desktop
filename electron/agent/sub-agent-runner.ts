@@ -399,12 +399,15 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             subObserver?.onToolExecutionEnd(toolCallId);
           },
           augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+            // Use redacted/sanitized args (if PreToolUse rewrote/denied them) so
+            // PostToolUse hooks/observers never see the raw denied args.
+            const postArgs = subHookRewrittenArgs.get(toolCallId) ?? args;
             const postTool = await hookDispatcher.dispatch('PostToolUse', {
               conversationId: subAgentConversationId,
               parentConversationId,
               toolCallId,
               toolName,
-              args,
+              args: postArgs,
               result,
             });
             if (postTool.denied) {

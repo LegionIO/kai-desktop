@@ -193,12 +193,15 @@ async function resumeSubAgent(
           rebroadcast(state.args);
         },
         augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+          // Use redacted args (if PreToolUse rewrote/denied) so PostToolUse
+          // never sees the raw denied args.
+          const postArgs = rewrittenArgs.get(toolCallId) ?? args;
           const postTool = await hookDispatcher.dispatch('PostToolUse', {
             conversationId: subAgentConversationId,
             parentConversationId,
             toolCallId,
             toolName,
-            args,
+            args: postArgs,
             result,
           });
           if (postTool.denied) return { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
