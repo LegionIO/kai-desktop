@@ -455,6 +455,10 @@ export function createSubAgentTool(
       try {
         let fullResponse = '';
         let toolsUsed: string[] = [];
+        // Set when the runner emits a terminal `failed` status (e.g. a
+        // UserPromptSubmit hook denied the prompt). Turns the tool result into an
+        // error so the parent agent doesn't treat a blocked sub-agent as success.
+        let lastFailureSummary: string | null = null;
 
         ctx.onProgress?.({
           stream: 'stdout',
@@ -523,6 +527,9 @@ export function createSubAgentTool(
               subAgentConversationId,
             });
           } else if (event.type === 'sub-agent-status') {
+            if (event.status === 'failed') {
+              lastFailureSummary = event.summary ?? 'Sub-agent failed.';
+            }
             ctx.onProgress?.({
               stream: 'stdout',
               delta: `[Status: ${event.status}] ${event.summary ?? ''}\n`,
@@ -556,15 +563,37 @@ export function createSubAgentTool(
         try {
           const memory = getSharedMemory(config, dbPath);
           if (memory) {
-            const finalStatus = localController.signal.aborted ? 'stopped' : 'completed';
+            const finalStatus = localController.signal.aborted
+              ? 'stopped'
+              : lastFailureSummary
+                ? 'failed'
+                : 'completed';
             await updateSubagentStatus(memory, subAgentConversationId, {
               status: finalStatus,
               completedAt: new Date().toISOString(),
-              exitReason: localController.signal.aborted ? 'user_aborted' : 'task_complete',
+              exitReason: localController.signal.aborted
+                ? 'user_aborted'
+                : lastFailureSummary
+                  ? lastFailureSummary.slice(0, 500)
+                  : 'task_complete',
             });
           }
         } catch (err) {
           console.error('[Subagent] Failed to update completion status:', err);
+        }
+
+        // A terminal `failed` status (e.g. a UserPromptSubmit hook denied the
+        // prompt) must surface to the parent as an error, not a completed run.
+        if (lastFailureSummary && !localController.signal.aborted) {
+          return {
+            isError: true,
+            subAgentConversationId,
+            error: lastFailureSummary,
+            response: fullResponse,
+            toolsUsed,
+            depth: currentDepth + 1,
+            status: 'failed',
+          };
         }
 
         return {
