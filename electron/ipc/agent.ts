@@ -1693,10 +1693,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (rewritten !== undefined) {
                 // Hook already resolved — publish the sanitized args.
                 (event as Record<string, unknown>).args = rewritten;
-              } else if (enforcingHooksActive) {
-                // Hook hasn't resolved yet. Suppress raw args so a DLP-redacted
-                // value can't leak into the UI/persistence; the corrective
-                // re-broadcast from onToolExecutionStart fills them in shortly.
+              } else if (enforcingHooksActive && runtime.id === 'mastra') {
+                // Suppress raw args until the corrective re-broadcast fills them
+                // in — but ONLY under Mastra, which calls onToolExecutionStart.
+                // Non-Mastra runtimes never un-suppress (and already warn that
+                // they don't enforce hooks), so suppressing there would strand
+                // the args at {pending} forever.
                 (event as Record<string, unknown>).args = { pending: true };
                 (event as Record<string, unknown>).argsPending = true;
               }
