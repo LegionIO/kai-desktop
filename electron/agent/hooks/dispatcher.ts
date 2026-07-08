@@ -292,6 +292,10 @@ export class HookDispatcher {
   private readonly registry = new Map<HookEvent, HookRegistration[]>();
   private getConfig: (() => AppConfig) | undefined;
   private userHookFingerprint = '';
+  // Per-rule throttle state for user shell hooks, mirroring AutomationEngine so
+  // a rule's debounceMs / rateLimitPerMinute apply on the hook path too.
+  private readonly ruleLastFireAt = new Map<string, number>();
+  private readonly ruleMinuteBuckets = new Map<string, number[]>();
 
   configure(opts: DispatcherOptions): void {
     if (opts.getConfig) this.getConfig = opts.getConfig;
@@ -461,6 +465,31 @@ export class HookDispatcher {
    * one or more `runHookCommand` actions. Other action types on `hook:*`
    * triggers are handled by the automation engine via the event-bus emit above.
    */
+  /**
+   * True when a user hook rule is currently throttled by its own `debounceMs`
+   * or `rateLimitPerMinute`. Mirrors AutomationEngine's throttle so the same
+   * limits apply whether a rule fires via the engine or via this hook path.
+   * On a firing decision it records the timestamp (like the engine does).
+   */
+  private isThrottled(rule: AutomationRule): boolean {
+    const now = Date.now();
+    if (rule.debounceMs > 0) {
+      const last = this.ruleLastFireAt.get(rule.id) ?? 0;
+      if (now - last < rule.debounceMs) return true;
+    }
+    if (rule.rateLimitPerMinute) {
+      const bucket = (this.ruleMinuteBuckets.get(rule.id) ?? []).filter((t) => now - t < 60_000);
+      if (bucket.length >= rule.rateLimitPerMinute) {
+        this.ruleMinuteBuckets.set(rule.id, bucket);
+        return true;
+      }
+      bucket.push(now);
+      this.ruleMinuteBuckets.set(rule.id, bucket);
+    }
+    this.ruleLastFireAt.set(rule.id, now);
+    return false;
+  }
+
   private syncUserHooks(config: AppConfig): void {
     const automationsEnabled = config.automations?.enabled !== false;
     const rules: AutomationRule[] = config.automations?.rules ?? [];
@@ -516,6 +545,12 @@ export class HookDispatcher {
             } catch {
               return undefined;
             }
+            // Apply the rule's debounce / rate-limit, mirroring AutomationEngine,
+            // so a hook rule capped at e.g. 1/min doesn't spawn the shell command
+            // on every matching tool call. When throttled the hook simply does
+            // not fire (returns undefined) — for a block/modify hook that means
+            // the action is allowed through, consistent with the hook not running.
+            if (this.isThrottled(rule)) return undefined;
             return runShellHook(event, command, mode, payload, timeoutMs);
           };
           this.register(event, handler, {
