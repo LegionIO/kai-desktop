@@ -499,6 +499,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         });
       }
 
+      // Provider-native tools (e.g. OpenAI/Anthropic server-side web_search)
+      // execute inside the provider and never hit our tool wrappers, so
+      // PreToolUse/PostToolUse hooks can't see or block their args. Warn when
+      // enforcing hooks are active alongside configured provider tools.
+      const hasProviderTools = (modelEntry?.modelConfig.providerTools?.length ?? 0) > 0;
+      if (runtime.id === 'mastra' && hasProviderTools && hookDispatcher.hasEnforcingToolHooks()) {
+        broadcastStreamEvent({
+          conversationId,
+          type: 'text-delta',
+          text:
+            `> ⚠️ This model has provider-native tools enabled (e.g. server-side web search). ` +
+            `Those run inside the provider and are NOT covered by your block/modify PreToolUse/PostToolUse hooks. ` +
+            `Disable provider tools for this model if hook enforcement is required.\n\n`,
+        });
+      }
+
       // Provider override: a plugin runtime was selected for a non-plugin model.
       // Override the model's provider config to route through the plugin's endpoint.
       if (resolution.providerOverride && modelEntry) {

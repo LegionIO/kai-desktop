@@ -22,6 +22,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { BrowserWindow } from 'electron';
+import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { generateText } from 'ai';
 import picomatch from 'picomatch';
 import type { AppConfig } from '../config/schema.js';
@@ -29,7 +30,7 @@ import type { DiffEvent, DiffOp, DiffSource, FileDiff } from '../../shared/diff-
 import { computeUnifiedDiff, type UnifiedHunk } from './lib/myers-diff.js';
 import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import { resolveModelCatalog } from '../agent/model-catalog.js';
-import { isPathAllowed } from './file-access.js';
+import { isPathAllowed, isPathDenied } from './file-access.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Store
@@ -127,6 +128,8 @@ function broadcast(event: DiffEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('diffs:changed', event);
   }
+  // Mirror to authenticated web clients so the web Changes panel gets live updates.
+  broadcastToWebClients('diffs:changed', event);
 }
 
 function toFileDiff(conversationId: string, path: string, entry: TrackedFile): FileDiff {
@@ -334,10 +337,15 @@ async function walk(
     }
     if (SKIP_DIRS.has(e.name)) continue;
     const full = join(root, e.name);
-    if (!isPathAllowed(full, config).allowed) continue;
     if (e.isDirectory()) {
+      // Only prune a directory if it's explicitly DENIED. We must not prune on
+      // a failed allow-match, because a file glob like `**/*.ts` won't match
+      // intermediate directory paths — pruning here would skip allowed files
+      // below. File-level filtering below enforces the allowlist per file.
+      if (isPathDenied(full, config)) continue;
       await walk(full, budget, out, config);
     } else if (e.isFile()) {
+      if (!isPathAllowed(full, config).allowed) continue;
       try {
         const st = await stat(full);
         out.set(full, { mtimeMs: st.mtimeMs, size: st.size });

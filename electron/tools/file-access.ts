@@ -55,6 +55,19 @@ function matchesEntry(absTarget: string, entry: string): boolean {
   return isWithin(absTarget, root) || (realRoot !== root && isWithin(absTarget, realRoot));
 }
 
+/** True when the path matches a deny rule (used to prune walks without an allow-match). */
+export function isPathDenied(absTarget: string, config: AppConfig): boolean {
+  const fa = config.tools.fileAccess;
+  const real = resolveRealpath(absTarget);
+  const targets = real === absTarget ? [absTarget] : [absTarget, real];
+  for (const t of targets) {
+    for (const entry of fa.denyPaths) {
+      if (entry && matchesEntry(t, entry)) return true;
+    }
+  }
+  return false;
+}
+
 export function isPathAllowed(absTarget: string, config: AppConfig): { allowed: boolean; reason?: string } {
   const fa = config.tools.fileAccess;
   if (!fa.enabled) return { allowed: false, reason: 'File access is disabled' };

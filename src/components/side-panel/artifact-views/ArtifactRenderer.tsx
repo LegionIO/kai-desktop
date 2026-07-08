@@ -75,11 +75,13 @@ function cspMeta(mode: 'static' | 'react'): string {
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
   const csp = cspMeta('static');
-  // Inject the CSP into an existing <head>; otherwise ALWAYS build our own
-  // document wrapper so a doctype/body-only fragment can't slip past without a
-  // CSP (a no-op replace previously left such docs unprotected).
-  if (/<head[\s>]/i.test(trimmed)) {
-    return trimmed.replace(/<head([\s>])/i, `<head$1${csp}`);
+  // Inject the CSP right after a full <head ...> opening tag (attributes and
+  // all); otherwise ALWAYS build our own document wrapper so a doctype/body-only
+  // fragment can't slip past without a CSP.
+  const headMatch = /<head\b[^>]*>/i.exec(trimmed);
+  if (headMatch) {
+    const at = headMatch.index + headMatch[0].length;
+    return trimmed.slice(0, at) + csp + trimmed.slice(at);
   }
   // Strip any leading doctype/html/body wrappers the model emitted and re-wrap
   // in a known-good document that carries the CSP.

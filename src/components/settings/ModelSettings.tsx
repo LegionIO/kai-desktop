@@ -666,6 +666,10 @@ const ModelForm: FC<{
   // resolver applies its provider/model default — avoids writing a stale
   // `false` captured before the user typed a Claude model id.
   const [promptCachingTouched, setPromptCachingTouched] = useState(initial.promptCaching !== undefined);
+  // Displayed value: once touched, honor the user's explicit choice; until
+  // then, reflect the live provider/model default so the toggle stays in sync
+  // as the user changes the model name (matches what the backend will apply).
+  const promptCachingDisplay = promptCachingTouched ? promptCachingEnabled : cachingDefault;
 
   const canSave = key.trim() && displayName.trim() && provider && modelName.trim();
 
@@ -687,9 +691,11 @@ const ModelForm: FC<{
     entry.computerUseSupport = computerUseSupport;
     entry.visionCapable = visionCapable;
     entry.preferredTarget = preferredTarget;
-    if (isAnthropicFamily && promptCachingTouched) {
+    if (isAnthropicFamily) {
+      // Persist the value the UI is showing (explicit choice if touched, else
+      // the provider/model default) so saved state always matches the toggle.
       entry.promptCaching = {
-        enabled: promptCachingEnabled,
+        enabled: promptCachingDisplay,
         ...(providerType === 'anthropic' ? { ttl: promptCachingTtl } : {}),
       };
     } else if (initial.promptCaching) {
@@ -819,14 +825,14 @@ const ModelForm: FC<{
           <div className="flex-1">
             <Toggle
               label="Prompt Caching"
-              checked={promptCachingEnabled}
+              checked={promptCachingDisplay}
               onChange={(v) => {
                 setPromptCachingEnabled(v);
                 setPromptCachingTouched(true);
               }}
             />
           </div>
-          {providerType === 'anthropic' && promptCachingEnabled && (
+          {providerType === 'anthropic' && promptCachingDisplay && (
             <select
               className={settingsSelectClass.replace('bg-card/80', 'bg-background') + ' w-24'}
               value={promptCachingTtl}
