@@ -81,16 +81,22 @@ async function ensureApproved(
     };
   }
 
-  // prompt-user: require a live user decision on the calling tool card.
+  // prompt-user: require a live user decision on the calling tool card. This
+  // needs a resolvable UI owner: a real conversation AND an abort signal (the
+  // signature of a live agent stream). Internal callers — e.g. an automation
+  // `tool` action (electron/automations/actions.ts) invoking this tool with only
+  // a synthetic { toolCallId } — have no owner to answer the prompt, so awaiting
+  // would hang forever and stall the run. Fail CLOSED (deny) in that case rather
+  // than broadcast an unanswerable approval.
   const toolCallId = context?.toolCallId;
-  if (!toolCallId) {
+  if (!context || !toolCallId || !context.conversationId || !context.abortSignal) {
     return {
       ok: false,
-      error: `Cannot request approval (no tool context). This rule (${actionLabel}) observes lifecycle hook events or runs shell commands and needs user approval; ask the user to set automations.approvalMode to "auto-allow" in Settings → Automations, or perform this in Settings themselves.`,
+      error: `Cannot request interactive approval from this context (no live chat). This rule (${actionLabel}) observes lifecycle hook events or runs shell commands and requires user approval. A user must perform this in Settings → Automations, or set automations.approvalMode to "auto-allow".`,
     };
   }
   broadcastStreamEventRaw({
-    conversationId: context?.conversationId ?? '',
+    conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId,
     toolName: 'automations',
@@ -103,7 +109,7 @@ async function ensureApproved(
         : 'This rule subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads.',
     },
   });
-  const decision = await registerPendingApproval(toolCallId, context?.abortSignal);
+  const decision = await registerPendingApproval(toolCallId, context.abortSignal);
   if (decision === true) return { ok: true };
   return {
     ok: false,

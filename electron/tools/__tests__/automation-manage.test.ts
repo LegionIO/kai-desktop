@@ -44,7 +44,7 @@ vi.mock('../../ipc/tool-approval.js', () => ({
 
 import { createAutomationManageTool } from '../automation-manage.js';
 
-const CTX = { toolCallId: 'tc-1', conversationId: 'conv-1' };
+const CTX = { toolCallId: 'tc-1', conversationId: 'conv-1', abortSignal: new AbortController().signal };
 
 function freshConfig(approvalMode: string, rules: unknown[] = []) {
   mockConfig = { automations: { enabled: true, rules, log: { maxEntries: 200 }, approvalMode } };
@@ -180,5 +180,18 @@ describe('automations tool approval gate', () => {
     freshConfig('block', [existing]);
     const res = await run('test', { id: 'r1' });
     expect(res.error).toMatch(/block/i);
+  });
+
+  it('prompt-user with no live owner (internal caller): fails closed, never awaits', async () => {
+    freshConfig('prompt-user');
+    approvalDecision = true; // would approve IF it awaited — it must not
+    const tool = createAutomationManageTool('/tmp');
+    // Synthetic context like an automation `tool` action: toolCallId only.
+    const res = (await tool.execute({ action: 'create', rule: shellRule }, {
+      toolCallId: 'auto-xyz',
+    } as never)) as Record<string, unknown>;
+    expect(broadcastSpy).not.toHaveBeenCalled();
+    expect(res.error).toMatch(/no live chat|Settings/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
   });
 });
