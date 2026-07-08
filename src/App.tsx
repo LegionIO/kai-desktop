@@ -73,6 +73,8 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
+import { ArtifactProvider, ARTIFACT_PREVIEW_TAB_ID } from '@/providers/ArtifactProvider';
+import { SidePanelProvider, SidePanelHost, ArtifactPanel, type SidePanelTab } from '@/components/side-panel';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { AgentProvider, useAgents } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
@@ -85,6 +87,14 @@ import { AgentRenameModal } from '@/components/agents/AgentRenameModal';
 import { DeleteAgentModal } from '@/components/agents/DeleteAgentModal';
 import { ChatsListPage } from '@/components/conversations/ChatsListPage';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+
+/**
+ * Right-side panel tab registry. Ships with the artifact "Preview" tab; the
+ * parallel Changes-diff worktree adds a second entry here at merge time.
+ */
+const SIDE_PANEL_TABS: SidePanelTab[] = [
+  { id: ARTIFACT_PREVIEW_TAB_ID, label: 'Preview', render: () => <ArtifactPanel /> },
+];
 
 export default function App() {
   return (
@@ -2674,33 +2684,39 @@ function AppShell() {
                     </div>
                   ) : (
                     <PlanPanelProvider onOpenPlan={handleOpenPlan}>
-                      <div className="flex h-full min-h-0">
-                        {/* Chat column */}
-                        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                          <ThreadOrSubAgent
-                            mode={threadMode}
-                            onChangeMode={setThreadMode}
-                            selectedModelKey={selectedModelKey}
-                            onSelectModel={setSelectedModelKey}
-                            reasoningEffort={reasoningEffort}
-                            onChangeReasoningEffort={setReasoningEffort}
-                            executionMode={executionMode}
-                            onChangeExecutionMode={setExecutionMode}
-                            selectedProfileKey={selectedProfileKey}
-                            onSelectProfile={handleSelectProfile}
-                            fallbackEnabled={fallbackEnabled}
-                            onToggleFallback={handleToggleFallback}
-                          />
-                        </div>
-                        {/* Plan modal */}
-                        {planPanel && (
-                          <PlanPanel
-                            content={planPanel.content}
-                            filePath={planPanel.filePath}
-                            onClose={() => setPlanPanel(null)}
-                          />
-                        )}
-                      </div>
+                      <SidePanelProvider>
+                        <ArtifactProvider>
+                          <div className="flex h-full min-h-0">
+                            {/* Chat column */}
+                            <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                              <ThreadOrSubAgent
+                                mode={threadMode}
+                                onChangeMode={setThreadMode}
+                                selectedModelKey={selectedModelKey}
+                                onSelectModel={setSelectedModelKey}
+                                reasoningEffort={reasoningEffort}
+                                onChangeReasoningEffort={setReasoningEffort}
+                                executionMode={executionMode}
+                                onChangeExecutionMode={setExecutionMode}
+                                selectedProfileKey={selectedProfileKey}
+                                onSelectProfile={handleSelectProfile}
+                                fallbackEnabled={fallbackEnabled}
+                                onToggleFallback={handleToggleFallback}
+                              />
+                            </div>
+                            {/* Right side panel — artifacts + future tabs (e.g. Changes diff) */}
+                            <SidePanelHost tabs={SIDE_PANEL_TABS} />
+                            {/* Plan modal */}
+                            {planPanel && (
+                              <PlanPanel
+                                content={planPanel.content}
+                                filePath={planPanel.filePath}
+                                onClose={() => setPlanPanel(null)}
+                              />
+                            )}
+                          </div>
+                        </ArtifactProvider>
+                      </SidePanelProvider>
                     </PlanPanelProvider>
                   )}
                 </div>

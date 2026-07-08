@@ -22,6 +22,7 @@ import { createCliToolManageTool } from './cli-tool-manage.js';
 import { createAutomationManageTool } from './automation-manage.js';
 import { createWebFetchTool } from './web-fetch.js';
 import { createWebSearchTool } from './web-search.js';
+import { createArtifactTools } from './artifact.js';
 import { createImageGenTool } from './image-gen.js';
 import { createVideoGenTool } from './video-gen.js';
 import { buildCliTools } from './cli-tools.js';
@@ -195,6 +196,11 @@ export async function buildToolRegistry(
   }
   if (config?.tools?.webSearch?.enabled !== false) {
     tools.push(createWebSearchTool(getConfig));
+  }
+
+  // Artifact tools (agent-rendered live previews)
+  if (config?.tools?.artifacts?.enabled !== false) {
+    tools.push(...createArtifactTools());
   }
 
   // Media generation tools

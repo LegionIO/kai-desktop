@@ -41,6 +41,7 @@ import { app } from '@/lib/ipc-client';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
+import { ArtifactToolCard } from './ArtifactToolCard';
 import { useTasksOptional } from '@/providers/TaskProvider';
 import { refocusComposer } from '@/lib/utils';
 import { FileDiffResult, ToolDiffList, extractDiffTracking } from './tool-results/FileDiffResult';
@@ -174,6 +175,7 @@ export const ToolCallDisplay: FC<{
     part.toolName === 'mastra_workspace_glob' ||
     part.toolName === 'glob_search';
   const isRuntimeSwitch = part.toolName === 'runtime_switch';
+  const isArtifactTool = part.toolName === 'create_artifact' || part.toolName === 'update_artifact';
   const _bashErrorData = hasResult && isError && isBashTool ? detectShResult(part.result) : null;
   // If the tool already has a result, it was already approved/executed in a prior
   // session — don't re-show the approval modal on conversation reload.
@@ -415,6 +417,17 @@ export const ToolCallDisplay: FC<{
           <SquareIcon className="h-3 w-3" />
           <span>{isPlanApproval ? 'Continuing to plan' : 'Rejected'}</span>
         </div>
+      )}
+
+      {/* Artifact tool — upserts into ArtifactProvider + opens the side panel */}
+      {isArtifactTool && (
+        <ArtifactToolCard
+          toolCallId={part.toolCallId}
+          toolName={part.toolName as 'create_artifact' | 'update_artifact'}
+          args={part.args}
+          result={part.result}
+          isError={Boolean(isError)}
+        />
       )}
 
       {/* Todo items — always visible */}
@@ -3207,6 +3220,8 @@ const toolLabels: Record<string, string> = {
   enter_plan_mode: 'Enter Plan Mode',
   exit_plan_mode: 'Exit Plan Mode',
   runtime_switch: 'Runtime Switch',
+  create_artifact: 'Create Artifact',
+  update_artifact: 'Update Artifact',
 };
 
 function isBashGrep(toolName: string, args?: Record<string, unknown>): boolean {
@@ -3268,6 +3283,7 @@ function getToolIcon(toolName: string, args?: Record<string, unknown>): LucideIc
   if (toolName === 'generate_image') return ImageIcon;
   if (toolName === 'generate_video') return VideoIcon;
   if (toolName === 'runtime_switch') return ArrowRightLeftIcon;
+  if (toolName === 'create_artifact' || toolName === 'update_artifact') return CodeIcon;
   return SparklesIcon;
 }
 
@@ -3315,6 +3331,7 @@ function getToolIconColor(toolName: string, args?: Record<string, unknown>): str
     return 'bg-pink-500/15 text-pink-500';
   if (toolName === 'generate_image' || toolName === 'generate_video') return 'bg-rose-500/15 text-rose-500';
   if (toolName === 'runtime_switch') return 'bg-cyan-500/15 text-cyan-500';
+  if (toolName === 'create_artifact' || toolName === 'update_artifact') return 'bg-teal-500/15 text-teal-500';
   return 'bg-muted text-muted-foreground';
 }
 
@@ -3419,6 +3436,8 @@ function getToolSummary(part: ToolCallPart): string {
     return (args as Record<string, unknown>).reason ? String((args as Record<string, unknown>).reason) : '';
   if (part.toolName === 'exit_plan_mode')
     return (args as Record<string, unknown>).summary ? String((args as Record<string, unknown>).summary) : '';
+  if (part.toolName === 'create_artifact' || part.toolName === 'update_artifact')
+    return args.title ? String(args.title).slice(0, 60) : args.id ? String(args.id) : '';
   return '';
 }
 

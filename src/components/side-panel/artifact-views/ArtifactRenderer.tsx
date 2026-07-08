@@ -1,0 +1,112 @@
+import { memo, useMemo, type FC } from 'react';
+import type { ArtifactType } from '@/providers/ArtifactProvider';
+import { MarkdownText } from '@/components/thread/MarkdownText';
+import { CodeBlock } from '@/components/thread/CodeBlock';
+
+/**
+ * Sandboxed iframe host for html / svg / react artifacts.
+ *
+ * SECURITY: `sandbox="allow-scripts"` only — deliberately omits
+ * `allow-same-origin` so artifact scripts cannot reach `window.app`,
+ * cookies, localStorage, or the parent DOM.
+ */
+const SandboxedFrame: FC<{ srcDoc: string; title: string }> = memo(({ srcDoc, title }) => (
+  <iframe
+    title={title}
+    srcDoc={srcDoc}
+    sandbox="allow-scripts"
+    referrerPolicy="no-referrer"
+    className="h-full w-full border-0 bg-white"
+  />
+));
+
+const BASE_STYLES =
+  'body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#0f172a;background:#ffffff}*,*::before,*::after{box-sizing:border-box}';
+
+function wrapHtml(content: string): string {
+  const trimmed = content.trim();
+  // If the model already emitted a full document, use it verbatim.
+  if (/<html[\s>]/i.test(trimmed) || /^<!doctype/i.test(trimmed)) return trimmed;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>${BASE_STYLES}</style></head><body>${content}</body></html>`;
+}
+
+function wrapSvg(content: string): string {
+  const svg = content.trim();
+  const body = svg.startsWith('<svg')
+    ? svg
+    : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">${svg}</svg>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>${BASE_STYLES}svg{display:block;max-width:100%;height:auto;margin:auto}</style></head><body>${body}</body></html>`;
+}
+
+/**
+ * React artifacts are wrapped in a standalone document that pulls React 18
+ * UMD builds from a CDN and Babel-standalone for JSX. If the network is
+ * unavailable the frame degrades to showing the raw source (Babel/React
+ * simply won't load — the outer app is unaffected).
+ */
+function wrapReact(content: string): string {
+  const escaped = content.replace(/<\/script>/gi, '<\\/script>');
+  return [
+    '<!doctype html><html><head><meta charset="utf-8">',
+    `<style>${BASE_STYLES}#root{min-height:100vh}</style>`,
+    '<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>',
+    '<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>',
+    '<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>',
+    '</head><body><div id="root"></div>',
+    '<script type="text/babel" data-presets="react">',
+    escaped,
+    '\n;try{const __c=typeof App!=="undefined"?App:(typeof Component!=="undefined"?Component:null);',
+    'if(__c){ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(__c));}',
+    'else{document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">No component named App or Component was exported.</pre>";}}',
+    'catch(e){document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">"+String(e)+"</pre>";}',
+    '</script></body></html>',
+  ].join('');
+}
+
+/** `mermaid` is not in package.json (npmjs.org is blocked) — render source with a note. */
+const MermaidStub: FC<{ content: string }> = ({ content }) => (
+  <div className="flex h-full flex-col">
+    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-400">
+      Mermaid rendering is not available in this build. Showing diagram source.
+    </div>
+    <div className="min-h-0 flex-1 overflow-auto p-3">
+      <CodeBlock code={content} language="mermaid" maxHeight="none" />
+    </div>
+  </div>
+);
+
+export const ArtifactRenderer: FC<{ type: ArtifactType; content: string; title: string }> = ({
+  type,
+  content,
+  title,
+}) => {
+  const srcDoc = useMemo(() => {
+    if (type === 'html') return wrapHtml(content);
+    if (type === 'svg') return wrapSvg(content);
+    if (type === 'react') return wrapReact(content);
+    return null;
+  }, [type, content]);
+
+  if (type === 'markdown') {
+    return (
+      <div className="h-full overflow-y-auto px-5 py-4">
+        <MarkdownText text={content} />
+      </div>
+    );
+  }
+
+  if (type === 'mermaid') {
+    return <MermaidStub content={content} />;
+  }
+
+  if (srcDoc != null) {
+    return <SandboxedFrame srcDoc={srcDoc} title={title} />;
+  }
+
+  // 'text' fallback
+  return (
+    <div className="h-full overflow-auto p-4">
+      <pre className="whitespace-pre-wrap break-words font-mono text-xs text-foreground">{content}</pre>
+    </div>
+  );
+};

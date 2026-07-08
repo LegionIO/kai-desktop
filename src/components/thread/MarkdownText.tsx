@@ -5,6 +5,7 @@ import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { RefreshCwIcon, CheckIcon, SquareIcon } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
+import { CodeFencePreviewButton } from './CodeFencePreviewButton';
 import { cn } from '@/lib/utils';
 
 const isWebBridge = Boolean(
@@ -156,7 +157,16 @@ const MdPre: FC<{ children?: ReactNode }> = ({ children }) => {
     const { className, children: codeChildren } = codeEl.props as { className?: string; children?: unknown };
     const lang = className?.replace(/^language-/, '') || undefined;
     const text = typeof codeChildren === 'string' ? codeChildren : String(codeChildren ?? '');
-    return <div className="my-4"><CodeBlock code={text.replace(/\n$/, '')} language={lang} /></div>;
+    const trimmed = text.replace(/\n$/, '');
+    return (
+      <div className="my-4">
+        <CodeBlock
+          code={trimmed}
+          language={lang}
+          extraActions={<CodeFencePreviewButton code={trimmed} language={lang} />}
+        />
+      </div>
+    );
   }
   return <pre className="bg-muted rounded-lg p-3 overflow-x-auto text-xs">{children}</pre>;
 };

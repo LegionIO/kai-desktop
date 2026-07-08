@@ -117,6 +117,9 @@ function getDefaultConfig() {
         enabled: true,
         allowPrivateNetworks: false,
       },
+      artifacts: {
+        enabled: true,
+      },
     },
     mcpServers: [] as Array<{
       name: string;

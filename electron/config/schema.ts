@@ -770,6 +770,11 @@ export const appConfigSchema = z.object({
         timeout: z.number().positive().optional(),
       })
       .optional(),
+    artifacts: z
+      .object({
+        enabled: z.boolean().default(true),
+      })
+      .optional(),
   }),
   mcpServers: z.array(mcpServerSchema),
   skills: z.object({
