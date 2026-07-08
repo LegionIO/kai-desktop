@@ -407,9 +407,45 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         },
       };
 
+      if (pluginManager) {
+        const hookResult = await pluginManager.runPreSendHooks({
+          messages: messages as HookMessage[],
+          modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+          config: configWithExecutionMode,
+          systemPrompt: effectiveSystemPrompt,
+        });
+
+        if (hookResult.abort) {
+          // Only surface terminal events if this run still owns the stream — a
+          // slow pre-send hook may resolve after the user cancelled/restarted,
+          // and finalizing here would corrupt the replacement run.
+          if (activeStreams.get(conversationId)?.token === streamToken) {
+            broadcastStreamEvent({
+              conversationId,
+              type: 'error',
+              error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
+            });
+            broadcastStreamEvent({ conversationId, type: 'done' });
+            void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          }
+          cleanupStreamIfOwned(conversationId, streamToken);
+          return { conversationId };
+        }
+
+        messages = stripDisplayOnlyParts(hookResult.messages);
+        if (typeof hookResult.systemPrompt === 'string') {
+          effectiveSystemPrompt = hookResult.systemPrompt;
+          if (streamConfig) {
+            streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
+          }
+        }
+      }
+
       // ── Lifecycle hook: UserPromptSubmit ────────────────────────────────
-      // Runs before the message list reaches the model. `modify` hooks may
-      // rewrite `messages` and/or `systemPrompt`; `block` hooks abort the run.
+      // Runs AFTER plugin pre-send hooks so a block/modify DLP hook sees (and is
+      // authoritative over) the FINAL payload actually sent to the model — a
+      // plugin's messages:hook can't slip past enforcement by mutating after us.
+      // `modify` hooks may rewrite `messages`/`systemPrompt`; `block` aborts.
       {
         const promptDispatch = await hookDispatcher.dispatch('UserPromptSubmit', {
           conversationId,
@@ -418,13 +454,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
         });
         if (promptDispatch.denied) {
-          broadcastStreamEvent({
-            conversationId,
-            type: 'error',
-            error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
-          });
-          broadcastStreamEvent({ conversationId, type: 'done' });
-          void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          // Guard against a stale denial after cancel/restart (see plugin branch).
+          if (activeStreams.get(conversationId)?.token === streamToken) {
+            broadcastStreamEvent({
+              conversationId,
+              type: 'error',
+              error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
+            });
+            broadcastStreamEvent({ conversationId, type: 'done' });
+            void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          }
           cleanupStreamIfOwned(conversationId, streamToken);
           return { conversationId };
         }
@@ -436,35 +475,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (typeof next?.systemPrompt === 'string') {
           effectiveSystemPrompt = next.systemPrompt;
           if (streamConfig) streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
-        }
-      }
-
-      if (pluginManager) {
-        const hookResult = await pluginManager.runPreSendHooks({
-          messages: messages as HookMessage[],
-          modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
-          config: configWithExecutionMode,
-          systemPrompt: effectiveSystemPrompt,
-        });
-
-        if (hookResult.abort) {
-          broadcastStreamEvent({
-            conversationId,
-            type: 'error',
-            error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
-          });
-          broadcastStreamEvent({ conversationId, type: 'done' });
-          void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          cleanupStreamIfOwned(conversationId, streamToken);
-          return { conversationId };
-        }
-
-        messages = stripDisplayOnlyParts(hookResult.messages);
-        if (typeof hookResult.systemPrompt === 'string') {
-          effectiveSystemPrompt = hookResult.systemPrompt;
-          if (streamConfig) {
-            streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
-          }
         }
       }
 
