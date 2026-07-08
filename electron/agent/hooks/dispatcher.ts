@@ -371,7 +371,12 @@ export class HookDispatcher {
         continue;
       }
 
-      if (reg.mode === 'observe') {
+      // block/modify are only meaningful for awaited (enforcing) events; for
+      // fire-and-forget events, downgrade to observe regardless of source so a
+      // plugin can't deny/short-circuit (and suppress the observe fan-out).
+      const effectiveMode = ENFORCING_HOOK_EVENTS.has(event) ? reg.mode : 'observe';
+
+      if (effectiveMode === 'observe') {
         void Promise.resolve()
           .then(() => reg.handler(current))
           .catch((err) => console.warn(`[hooks] observe handler for ${event} threw:`, err));
@@ -387,14 +392,14 @@ export class HookDispatcher {
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[hooks] ${reg.mode} handler for ${event} failed: ${message}`);
+        console.warn(`[hooks] ${effectiveMode} handler for ${event} failed: ${message}`);
         // Both block and modify fail CLOSED: a sanitizer/DLP modify hook that
         // throws or times out must not let the unmodified payload through.
         // Denied → NOT fanned out to observers.
         return {
           payload: current,
           denied: true,
-          reason: `${reg.mode} hook failed (${message}); failing closed to avoid leaking unmodified data.`,
+          reason: `${effectiveMode} hook failed (${message}); failing closed to avoid leaking unmodified data.`,
         };
       }
 
@@ -402,7 +407,7 @@ export class HookDispatcher {
         return { payload: current, denied: true, reason: outcome.reason };
       }
       if (
-        reg.mode === 'modify' &&
+        effectiveMode === 'modify' &&
         outcome &&
         typeof outcome === 'object' &&
         'payload' in outcome &&

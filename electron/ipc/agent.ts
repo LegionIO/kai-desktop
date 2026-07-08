@@ -397,6 +397,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
+          void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
           activeStreams.delete(conversationId);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
@@ -1379,20 +1380,28 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (preTool.denied) {
                 const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
                 hookDeniedToolCalls.set(state.toolCallId, reason);
-                const denyStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-                hookRewrittenArgs.set(denyStreamId, preTool.args);
-                // Correct the rendered tool-call in place (renderer upserts by
-                // toolCallId) so the UI never keeps showing the raw args.
-                broadcastStreamEvent({
-                  conversationId,
-                  type: 'tool-call',
-                  toolCallId: denyStreamId,
-                  toolName: state.toolName,
-                  args: preTool.args,
-                });
+                // Key rewritten args by BOTH the exec id (stable, known now) and
+                // the paired stream id if available. The stream `tool-call`
+                // handler resolves either — so a rebroadcast reaches the correct
+                // rendered card regardless of which side fired first.
+                hookRewrittenArgs.set(state.toolCallId, preTool.args);
+                const denyStreamId = streamToolCallIdByExecId.get(state.toolCallId);
+                if (denyStreamId) hookRewrittenArgs.set(denyStreamId, preTool.args);
+                // Only rebroadcast when the stream id is known; otherwise the
+                // stream `tool-call` handler will apply the stored args when it
+                // fires (avoids emitting a duplicate card under the exec id).
+                if (denyStreamId) {
+                  broadcastStreamEvent({
+                    conversationId,
+                    type: 'tool-call',
+                    toolCallId: denyStreamId,
+                    toolName: state.toolName,
+                    args: preTool.args,
+                  });
+                }
                 return { skip: true as const, result: { isError: true, error: reason } };
               }
-              const modStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              const modStreamId = streamToolCallIdByExecId.get(state.toolCallId);
               if (preTool.args !== state.args) {
                 // Mutate in place — the same object reference is passed to tool.execute().
                 if (
@@ -1412,14 +1421,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // broadcast with suppressed ({pending}) args; emit the resolved
               // args now (sanitized or allowed-unchanged). Renderer upserts by id.
               if (enforcingHooksActive) {
-                hookRewrittenArgs.set(modStreamId, preTool.args);
-                broadcastStreamEvent({
-                  conversationId,
-                  type: 'tool-call',
-                  toolCallId: modStreamId,
-                  toolName: state.toolName,
-                  args: preTool.args,
-                });
+                // Store under exec id always; also under the stream id if paired.
+                // The stream `tool-call` handler resolves either when it fires.
+                hookRewrittenArgs.set(state.toolCallId, preTool.args);
+                if (modStreamId) hookRewrittenArgs.set(modStreamId, preTool.args);
+                // Only rebroadcast when the stream id is known; otherwise the
+                // stream handler applies the stored args on arrival (no dup card).
+                if (modStreamId) {
+                  broadcastStreamEvent({
+                    conversationId,
+                    type: 'tool-call',
+                    toolCallId: modStreamId,
+                    toolName: state.toolName,
+                    args: preTool.args,
+                  });
+                }
               }
 
               // Observer sees post-enforcement (allowed, possibly sanitized) args.
@@ -1646,7 +1662,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
               enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
               pairExecuteAndStreamToolCallIds(event.toolName);
-              const rewritten = hookRewrittenArgs.get(event.toolCallId);
+              // Resolve rewritten args by this stream id OR the now-paired exec
+              // id (onToolExecutionStart may have run first and stored under the
+              // exec id before pairing existed).
+              const pairedExecId = execToolCallIdByStreamId.get(event.toolCallId);
+              const rewritten =
+                hookRewrittenArgs.get(event.toolCallId) ??
+                (pairedExecId ? hookRewrittenArgs.get(pairedExecId) : undefined);
               if (rewritten !== undefined) {
                 // Hook already resolved — publish the sanitized args.
                 (event as Record<string, unknown>).args = rewritten;
