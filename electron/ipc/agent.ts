@@ -1021,8 +1021,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (value && typeof value === 'object' && !Array.isArray(value)) {
               return { ...(value as Record<string, unknown>), _diffTracking: preservedDiffTracking };
             }
-            // Compaction produced a bare string — wrap so _diffTracking survives.
-            return { value, _diffTracking: preservedDiffTracking };
+            // Compaction produced a bare string. Only shell/CLI results carry
+            // _diffTracking, and the shell renderer recognizes { stdout } — so
+            // reattach as a shell-shaped object to keep the output view working
+            // (wrapping as { value } would render as "No output").
+            return { stdout: String(value ?? ''), _diffTracking: preservedDiffTracking };
           };
 
           const originalText = stringifyToolResult(resultForCompaction);

@@ -136,9 +136,11 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
     const esbuild = await import('esbuild');
     type EsbuildPlugin = Parameters<typeof esbuild.build>[0] extends { plugins?: (infer P)[] } ? P : never;
     // Resolve `react` / `react-dom/client` from the app's node_modules. In dev
-    // this is the repo root; in a packaged build it's the asar root, where
-    // react/react-dom ship as runtime dependencies.
-    const resolveDir = app.getAppPath();
+    // this is the repo root; in a packaged build the app path is inside
+    // `app.asar`, which esbuild's native service cannot read — React is
+    // asarUnpack'd (see electron-builder.yml), so point esbuild at the
+    // unpacked path instead.
+    const resolveDir = app.getAppPath().replace(/app\.asar(?=[/\\]|$)/, 'app.asar.unpacked');
 
     const result = await esbuild.build({
       stdin: {

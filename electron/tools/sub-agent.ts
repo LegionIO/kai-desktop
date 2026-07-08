@@ -115,6 +115,10 @@ async function resumeSubAgent(
   try {
     const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
     const rewrittenArgs = new Map<string, unknown>();
+    // Exec-first stash: if onToolExecutionStart resolves before the stream
+    // tool-call event and the exec id differs from the stream id, the stream
+    // loop applies the stashed args by toolName when the event arrives.
+    const resolvedByTool = new Map<string, unknown[]>();
     const stream = streamAgentResponse(
       subAgentConversationId,
       messages,
@@ -131,6 +135,11 @@ async function resumeSubAgent(
         onToolExecutionStart: async (state) => {
           const rebroadcast = (resolved: unknown): void => {
             rewrittenArgs.set(state.toolCallId, resolved);
+            // Also stash by toolName so a stream event with a DIFFERENT id can
+            // still pick up the resolved args (exec-first with id divergence).
+            const q = resolvedByTool.get(state.toolName) ?? [];
+            q.push(resolved);
+            resolvedByTool.set(state.toolName, q);
             if (enforcingHooks) {
               // Correct the rendered tool-call in place (renderer upserts by id)
               // so a suppressed {pending} placeholder is replaced with the
@@ -199,8 +208,12 @@ async function resumeSubAgent(
       // args once known (renderer upserts by toolCallId).
       if (event.type === 'tool-call' && event.toolCallId) {
         const rewritten = rewrittenArgs.get(event.toolCallId);
+        const stashed = event.toolName ? resolvedByTool.get(event.toolName) : undefined;
         if (rewritten !== undefined) {
           (enriched as Record<string, unknown>).args = rewritten;
+        } else if (stashed && stashed.length > 0) {
+          // Exec-first with a divergent id: apply the stashed resolved args.
+          (enriched as Record<string, unknown>).args = stashed.shift();
         } else if (enforcingHooks) {
           (enriched as Record<string, unknown>).args = { pending: true };
           (enriched as Record<string, unknown>).argsPending = true;

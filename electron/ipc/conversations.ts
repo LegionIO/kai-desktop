@@ -115,7 +115,12 @@ export function ensureConversationTree(conv: ConversationRecord): {
 /** Walk from a node down its most-recently-created child chain to the leaf. */
 function findDeepestDescendant(tree: StoredTreeMessage[], startId: string): string {
   let head = startId;
+  // Guard against cyclic/malformed persisted trees (put/switch-variant accept
+  // untrusted messageTree data) — stop if we revisit a node.
+  const seen = new Set<string>();
   for (;;) {
+    if (seen.has(head)) return head;
+    seen.add(head);
     const children = tree.filter((m) => m.parentId === head);
     if (children.length === 0) return head;
     head = children[children.length - 1].id;
