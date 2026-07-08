@@ -837,7 +837,9 @@ const ActionEditor: FC<{
             Only fires for <code className="font-mono">Agent lifecycle</code> triggers. The event payload is written to
             the command’s stdin as JSON. In <em>block</em> mode a non-zero exit cancels the action (stderr is surfaced
             to the agent). In <em>modify</em> mode stdout must be JSON of the form{' '}
-            <code className="font-mono">{'{"payload": …}'}</code>.
+            <code className="font-mono">{'{"payload": …}'}</code>. Note: <em>block</em>/<em>modify</em> only take effect
+            for <code className="font-mono">PreToolUse</code>, <code className="font-mono">PostToolUse</code>, and{' '}
+            <code className="font-mono">UserPromptSubmit</code>; other lifecycle events run observe-only.
           </p>
           <TextField
             label="Command"

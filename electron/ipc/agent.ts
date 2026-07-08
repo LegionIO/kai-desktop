@@ -676,6 +676,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
             }
 
+            // Fire lifecycle hooks so provider-backed streams behave like the
+            // Mastra path (which dispatches these on `done` / in `finally`).
+            if (providerResponseText.length > 0 && !controller.signal.aborted) {
+              void hookDispatcher.dispatch('AssistantMessage', { conversationId, text: providerResponseText });
+            }
+            void hookDispatcher.dispatch('AgentStop', {
+              conversationId,
+              aborted: controller.signal.aborted,
+            });
+
             // Provider handled the request — clean up and exit
             activeStreams.delete(conversationId);
             activeStreamModelKeys.delete(conversationId);
@@ -696,6 +706,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 messageMeta: meta,
               });
               broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+              void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
               activeStreams.delete(conversationId);
               activeStreamModelKeys.delete(conversationId);
               activeObserverSessions.delete(conversationId);
@@ -713,6 +724,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               messageMeta: meta,
             });
             broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+            void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
             activeStreams.delete(conversationId);
             activeStreamModelKeys.delete(conversationId);
             activeObserverSessions.delete(conversationId);

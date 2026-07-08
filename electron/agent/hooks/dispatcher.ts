@@ -22,6 +22,13 @@ export const HOOK_EVENTS: readonly HookEvent[] = [
   'ConversationStart',
 ] as const;
 
+/**
+ * Events whose dispatch is AWAITED and can act on a block/modify result.
+ * The others (AssistantMessage, AgentStop, ConversationStart) are fire-and-
+ * forget, so block/modify there is meaningless and gets coerced to observe.
+ */
+const ENFORCING_HOOK_EVENTS = new Set<HookEvent>(['UserPromptSubmit', 'PreToolUse', 'PostToolUse']);
+
 export type HookMode = 'observe' | 'block' | 'modify';
 
 export type HookOutcome = {
@@ -209,8 +216,13 @@ function runShellHook(
           return settle({ decision: 'deny', reason: 'modify hook produced no output; failing closed.' });
         }
         try {
-          const parsed = JSON.parse(trimmed) as HookOutcome;
-          return settle(parsed);
+          const parsed = JSON.parse(trimmed) as unknown;
+          // Must be a non-null object to be a valid HookOutcome; a bare JSON
+          // primitive (e.g. `"redacted"`, `true`) is malformed → fail closed.
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return settle({ decision: 'deny', reason: 'modify hook output was not a JSON object; failing closed.' });
+          }
+          return settle(parsed as HookOutcome);
         } catch (err) {
           console.warn(`[hooks] modify hook stdout was not valid JSON (${command}):`, err);
           return settle({ decision: 'deny', reason: 'modify hook output was not valid JSON; failing closed.' });
@@ -319,17 +331,22 @@ export class HookDispatcher {
 
     const list = this.registry.get(event) ?? [];
 
-    // Observe-only fan-out to the automation engine — skip entirely (and skip
-    // the potentially large jsonSafe copy) when nothing is listening.
-    if (eventBus.hasListeners()) {
+    // Observe-only fan-out to the automation engine. Emits the FINAL (post-
+    // enforcement) payload and is skipped on deny, so a low-permission event
+    // subscriber never sees raw data that a DLP block/modify hook removed.
+    const emitObserve = (finalPayload: T): void => {
+      if (!eventBus.hasListeners()) return;
       try {
-        eventBus.emit('hook', event, jsonSafe(payload));
+        eventBus.emit('hook', event, jsonSafe(finalPayload));
       } catch (err) {
         console.warn('[hooks] event bus emit failed:', err);
       }
-    }
+    };
 
-    if (list.length === 0) return { payload, denied: false };
+    if (list.length === 0) {
+      emitObserve(payload);
+      return { payload, denied: false };
+    }
 
     const ordered = [...list].sort((a, b) => (a.source === b.source ? 0 : a.source === 'plugin' ? -1 : 1));
     const toolName = extractToolName(payload);
@@ -359,6 +376,7 @@ export class HookDispatcher {
         console.warn(`[hooks] ${reg.mode} handler for ${event} failed: ${message}`);
         // Both block and modify fail CLOSED: a sanitizer/DLP modify hook that
         // throws or times out must not let the unmodified payload through.
+        // Denied → NOT fanned out to observers.
         return {
           payload: current,
           denied: true,
@@ -369,11 +387,18 @@ export class HookDispatcher {
       if (outcome?.decision === 'deny') {
         return { payload: current, denied: true, reason: outcome.reason };
       }
-      if (reg.mode === 'modify' && outcome && 'payload' in outcome && outcome.payload !== undefined) {
+      if (
+        reg.mode === 'modify' &&
+        outcome &&
+        typeof outcome === 'object' &&
+        'payload' in outcome &&
+        outcome.payload !== undefined
+      ) {
         current = outcome.payload as T;
       }
     }
 
+    emitObserve(current);
     return { payload: current, denied: false };
   }
 
@@ -428,9 +453,14 @@ export class HookDispatcher {
 
     for (const rule of relevant) {
       const event = rule.trigger.event as HookEvent;
+      // Only PreToolUse/PostToolUse/UserPromptSubmit are awaited and can act on
+      // a block/modify result. The rest are fire-and-forget, so coerce their
+      // mode to observe — a block/modify there would silently do nothing.
+      const effectiveModeFor = (mode: HookMode): HookMode => (ENFORCING_HOOK_EVENTS.has(event) ? mode : 'observe');
       for (const action of rule.actions) {
         if (action.type !== 'runHookCommand') continue;
-        const { command, mode, matcher } = action;
+        const { command, matcher } = action;
+        const mode = effectiveModeFor(action.mode);
         const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
           try {
             const cond = evaluateConditions(rule.conditions, rule.conditionMode, payload);

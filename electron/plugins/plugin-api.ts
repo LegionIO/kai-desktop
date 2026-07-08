@@ -478,6 +478,13 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       },
       on: (key: string, handler: (event: AutomationEvent) => void) => {
         requirePermission('events:subscribe');
+        // hook:* events carry raw prompts / tool args / tool results. Observing
+        // them is exactly what the dangerous `agent:hook` permission gates, so
+        // subscribing to that source requires it too — otherwise a plugin could
+        // observe the agent loop with only low-risk `events:subscribe`.
+        if (key === 'hook' || key.startsWith('hook:')) {
+          requirePermission('agent:hook');
+        }
         const off = callbacks.subscribeBus(key, handler);
         instance.eventUnsubscribers.push(off);
         return () => {
