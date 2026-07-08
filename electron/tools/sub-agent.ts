@@ -126,11 +126,51 @@ async function resumeSubAgent(
     // the resolved args by toolName (FIFO); the stream loop claims one before
     // suppressing to {pending}, so the card is never left permanently hidden.
     const resolvedArgsByTool = new Map<string, unknown[]>();
+
+    // Gate the resumed sub-agent prompt through UserPromptSubmit so a DLP
+    // block/modify hook covers it (same as normal chats + the initial run).
+    // Enforcement-only (suppressObserve) so a resume doesn't re-fire the
+    // parent's UserPromptSubmit automations.
+    let resumeSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
+    if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+      const gate = await hookDispatcher.dispatch(
+        'UserPromptSubmit',
+        {
+          conversationId: subAgentConversationId,
+          parentConversationId,
+          messages,
+          systemPrompt: resumeSystemPrompt,
+          modelKey: modelConfig.modelName,
+          purpose: 'sub-agent-resume',
+        },
+        { suppressObserve: true },
+      );
+      if (gate.denied) {
+        broadcastEvent({
+          subAgentConversationId,
+          parentConversationId,
+          parentToolCallId,
+          type: 'sub-agent-status',
+          status: 'failed',
+          summary: gate.reason ?? 'Blocked by a UserPromptSubmit hook.',
+        } as SubAgentEvent);
+        activeSubAgentControllers.delete(subAgentConversationId);
+        followUpQueues.delete(subAgentConversationId);
+        return;
+      }
+      const gated = gate.payload as { messages?: unknown[]; systemPrompt?: string };
+      if (Array.isArray(gated?.messages)) {
+        messages.length = 0;
+        messages.push(...(gated.messages as Array<{ role: string; content: unknown }>));
+      }
+      if (typeof gated?.systemPrompt === 'string') resumeSystemPrompt = gated.systemPrompt;
+    }
+
     const stream = streamAgentResponse(
       subAgentConversationId,
       messages,
       modelConfig,
-      { ...config, systemPrompt: config.systemPrompts?.chat?.trim() || config.systemPrompt },
+      { ...config, systemPrompt: resumeSystemPrompt },
       tools,
       dbPath,
       {

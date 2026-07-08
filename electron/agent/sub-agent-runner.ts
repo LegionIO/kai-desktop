@@ -172,7 +172,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     const systemPrompt = buildSubAgentSystemPrompt(basePrompt, task, context, depth);
     const messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: task }];
 
-    const subAgentConfig: AppConfig = { ...config, systemPrompt };
+    let subAgentConfig: AppConfig = { ...config, systemPrompt };
 
     // Control signal shared with the control tool
     const controlSignal: { current: ControlSignal | null } = { current: null };
@@ -263,6 +263,38 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       if (abortSignal?.aborted) break;
       turnCount++;
       controlSignal.current = null; // reset for this turn
+
+      // Gate each sub-agent model call through UserPromptSubmit, so a DLP
+      // block/modify hook covers sub-agent prompts too (they call the model
+      // directly and would otherwise bypass it). Enforcement-only (suppressObserve)
+      // so a sub-agent turn doesn't re-fire the parent's UserPromptSubmit
+      // automations. Only when an enforcing hook exists (no fan-out otherwise).
+      if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+        const gate = await hookDispatcher.dispatch(
+          'UserPromptSubmit',
+          {
+            conversationId: subAgentConversationId,
+            parentConversationId,
+            messages,
+            systemPrompt: subAgentConfig.systemPrompt,
+            modelKey: modelConfig.modelName,
+            purpose: 'sub-agent',
+          },
+          { suppressObserve: true },
+        );
+        if (gate.denied) {
+          yield emitStatus(undefined as never, 'failed', gate.reason ?? 'Blocked by a UserPromptSubmit hook.');
+          break;
+        }
+        const gated = gate.payload as { messages?: unknown[]; systemPrompt?: string };
+        if (Array.isArray(gated?.messages)) {
+          messages.length = 0;
+          messages.push(...(gated.messages as Array<{ role: string; content: unknown }>));
+        }
+        if (typeof gated?.systemPrompt === 'string') {
+          subAgentConfig = { ...subAgentConfig, systemPrompt: gated.systemPrompt };
+        }
+      }
 
       let turnText = '';
 
