@@ -246,6 +246,11 @@ function containsHookTrigger(value: unknown, depth = 0): boolean {
  */
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.');
+  // Reject prototype-pollution segments — this runs on untrusted plugin paths
+  // during validation, before the real config setter's own guard.
+  if (parts.some((p) => p === '__proto__' || p === 'constructor' || p === 'prototype')) {
+    return;
+  }
   let cur: Record<string, unknown> = root;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i];

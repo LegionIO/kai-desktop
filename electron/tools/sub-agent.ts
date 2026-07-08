@@ -117,10 +117,6 @@ async function resumeSubAgent(
     // Provider-native tools execute in-provider; never suppress their args.
     const providerToolNames = getProviderDefinedToolNames(modelConfig);
     const rewrittenArgs = new Map<string, unknown>();
-    // Exec-first stash: if onToolExecutionStart resolves before the stream
-    // tool-call event and the exec id differs from the stream id, the stream
-    // loop applies the stashed args by toolName when the event arrives.
-    const resolvedByTool = new Map<string, unknown[]>();
     // Stream-first queue: suppressed stream ids awaiting resolution, per tool
     // name. onToolExecutionStart rebroadcasts under the queued stream id (which
     // may differ from its exec id) instead of the exec id.
@@ -142,17 +138,14 @@ async function resumeSubAgent(
           const rebroadcast = (resolved: unknown): void => {
             rewrittenArgs.set(state.toolCallId, resolved);
             // Prefer a suppressed stream id already rendered under {pending}
-            // (stream-first); its id may differ from this exec id. If none is
-            // queued (exec-first), stash by toolName for the stream loop to pick
-            // up when its event arrives, and correct under the exec id too.
+            // (stream-first) whose id differs from this exec id — correct it.
+            // Exec-first with a same/not-yet-seen id is handled when the stream
+            // event finds the value by id (no per-tool stash that could leak
+            // onto the next same-named call).
             const streamQ = suppressedStreamIdsByTool.get(state.toolName);
-            const targetId = streamQ && streamQ.length > 0 ? streamQ.shift()! : state.toolCallId;
-            rewrittenArgs.set(targetId, resolved);
-            if (targetId === state.toolCallId) {
-              const q = resolvedByTool.get(state.toolName) ?? [];
-              q.push(resolved);
-              resolvedByTool.set(state.toolName, q);
-            }
+            const streamId = streamQ && streamQ.length > 0 ? streamQ.shift() : undefined;
+            const targetId = streamId && streamId !== state.toolCallId ? streamId : state.toolCallId;
+            if (targetId !== state.toolCallId) rewrittenArgs.set(targetId, resolved);
             if (enforcingHooks) {
               broadcastEvent({
                 type: 'tool-call',
@@ -221,12 +214,8 @@ async function resumeSubAgent(
       // args once known (renderer upserts by toolCallId).
       if (event.type === 'tool-call' && event.toolCallId) {
         const rewritten = rewrittenArgs.get(event.toolCallId);
-        const stashed = event.toolName ? resolvedByTool.get(event.toolName) : undefined;
         if (rewritten !== undefined) {
           (enriched as Record<string, unknown>).args = rewritten;
-        } else if (stashed && stashed.length > 0) {
-          // Exec-first with a divergent id: apply the stashed resolved args.
-          (enriched as Record<string, unknown>).args = stashed.shift();
         } else if (enforcingHooks && !(event.toolName && providerToolNames.has(event.toolName))) {
           (enriched as Record<string, unknown>).args = { pending: true };
           (enriched as Record<string, unknown>).argsPending = true;
