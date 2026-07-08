@@ -89,7 +89,7 @@ const MAX_PCT = 80;
 const DEFAULT_PCT = 45;
 
 export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
-  const { state, activeTabId, openPanel, minimizePanel, setActiveTab } = useSidePanel();
+  const { state, activeTabId, openPanel, closePanel, minimizePanel, setActiveTab } = useSidePanel();
   const [widthPct, setWidthPct] = useState(DEFAULT_PCT);
   const dragRef = useRef<{ startX: number; startPct: number; parentWidth: number } | null>(null);
 
@@ -121,7 +121,25 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
     event.currentTarget.releasePointerCapture(event.pointerId);
   }, []);
 
-  if (state === 'closed' || tabs.length === 0) return null;
+  if (tabs.length === 0) return null;
+
+  if (state === 'closed') {
+    // Distinct from 'minimized' (which shows the full per-tab rail): a single
+    // slim reopen affordance so the panel is never stranded.
+    return (
+      <div className="flex w-8 shrink-0 flex-col items-center border-l border-border/60 bg-card/40 py-3">
+        <Tooltip content="Open panel" side="left">
+          <button
+            type="button"
+            onClick={() => openPanel()}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ChevronsLeftIcon className="h-4 w-4" />
+          </button>
+        </Tooltip>
+      </div>
+    );
+  }
 
   if (state === 'minimized') {
     return (
@@ -220,7 +238,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
         <Tooltip content="Close" side="bottom">
           <button
             type="button"
-            onClick={minimizePanel}
+            onClick={closePanel}
             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <XIcon className="h-4 w-4" />
