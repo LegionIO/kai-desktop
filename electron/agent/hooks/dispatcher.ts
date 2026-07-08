@@ -123,8 +123,10 @@ function extractToolName(payload: unknown): string | undefined {
  * would leave the caller using the ORIGINAL raw data (fail-open). Require the
  * field to be present with a plausible type; otherwise the dispatch fails closed.
  *  - UserPromptSubmit → `messages` array (systemPrompt is optional)
- *  - PreToolUse       → `args` object
- *  - PostToolUse      → `result` present (may be any shape) OR `args` object
+ *  - PreToolUse       → `args` object (the only field the caller applies)
+ *  - PostToolUse      → `result` present (the only field the caller applies —
+ *                        args-only replacements would be silently ignored → a
+ *                        fail-open, so they are rejected)
  */
 function isUsableModifyReplacement(event: HookEvent, replacement: unknown): boolean {
   if (replacement === undefined || replacement === null || typeof replacement !== 'object') return false;
@@ -135,7 +137,7 @@ function isUsableModifyReplacement(event: HookEvent, replacement: unknown): bool
     case 'PreToolUse':
       return typeof r.args === 'object' && r.args !== null && !Array.isArray(r.args);
     case 'PostToolUse':
-      return 'result' in r || (typeof r.args === 'object' && r.args !== null && !Array.isArray(r.args));
+      return 'result' in r;
     default:
       // Non-enforcing events don't reach the modify path (coerced to observe),
       // but be permissive if they somehow do.
