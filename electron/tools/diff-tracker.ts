@@ -340,7 +340,20 @@ async function walk(
   let entries: Dirent[];
   try {
     entries = await readdir(root, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // An allowPaths entry can be an exact FILE path; readdir fails ENOTDIR.
+    // Track it directly instead of silently dropping it.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOTDIR') {
+      try {
+        const st = await stat(root);
+        if (st.isFile() && isPathAllowed(root, config).allowed) {
+          out.set(root, { mtimeMs: st.mtimeMs, size: st.size });
+          budget.filesLeft--;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
     return;
   }
   for (const e of entries) {

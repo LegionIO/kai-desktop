@@ -557,11 +557,12 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const clone = JSON.parse(JSON.stringify(source)) as ConversationRecord;
     const now = new Date().toISOString();
 
-    // Normalize legacy conversations (no messageTree / missing ids / parentIds)
-    // into a valid tree before slicing, so the fork always has valid parent
-    // links and a non-null headId.
-    const { tree: normalizedTree } = ensureConversationTree(clone);
-    const allMessages = normalizedTree;
+    // Normalize legacy conversations, then extract the ACTIVE branch (the
+    // parent chain ending at headId) rather than the flat tree — after
+    // edits/regenerations the tree contains sibling variants, and forking the
+    // flat list would mix branches / fork the wrong one.
+    const { tree: normalizedTree, headId: normalizedHead } = ensureConversationTree(clone);
+    const allMessages = getConversationBranch(normalizedTree, normalizedHead);
     const sliced =
       typeof upToMessageIndex === 'number' && upToMessageIndex >= 0
         ? allMessages.slice(0, upToMessageIndex + 1)

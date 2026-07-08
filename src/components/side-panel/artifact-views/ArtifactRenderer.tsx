@@ -75,21 +75,23 @@ function cspMeta(mode: 'static' | 'react'): string {
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
   const csp = cspMeta('static');
-  // Inject the CSP right after a full <head ...> opening tag (attributes and
-  // all); otherwise ALWAYS build our own document wrapper so a doctype/body-only
-  // fragment can't slip past without a CSP.
-  const headMatch = /<head\b[^>]*>/i.exec(trimmed);
-  if (headMatch) {
-    const at = headMatch.index + headMatch[0].length;
-    return trimmed.slice(0, at) + csp + trimmed.slice(at);
+  // ALWAYS re-wrap into a known-safe document with the CSP as the very first
+  // head element. We never preserve model-supplied <head> or pre-<head> content
+  // (a `<script>` before an injected CSP would execute before the policy
+  // applies). Extract the <body> inner HTML if present, else strip any
+  // doctype/html/head/body wrappers and treat the remainder as body content.
+  let body: string;
+  const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(trimmed);
+  if (bodyMatch) {
+    body = bodyMatch[1];
+  } else {
+    body = trimmed
+      .replace(/^<!doctype[^>]*>/i, '')
+      .replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, '')
+      .replace(/<\/?html[^>]*>/gi, '')
+      .replace(/<\/?body[^>]*>/gi, '')
+      .trim();
   }
-  // Strip any leading doctype/html/body wrappers the model emitted and re-wrap
-  // in a known-good document that carries the CSP.
-  const body = trimmed
-    .replace(/^<!doctype[^>]*>/i, '')
-    .replace(/<\/?html[^>]*>/gi, '')
-    .replace(/<\/?body[^>]*>/gi, '')
-    .trim();
   return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style></head><body>${body}</body></html>`;
 }
 
