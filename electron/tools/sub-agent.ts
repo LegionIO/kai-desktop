@@ -235,6 +235,11 @@ async function resumeSubAgent(
         const rewritten = rewrittenArgs.get(event.toolCallId);
         if (rewritten !== undefined) {
           (enriched as Record<string, unknown>).args = rewritten;
+          // Exec-first + SAME id: rebroadcast recorded args by id AND parked a
+          // copy by toolName speculatively. We resolved by id, so drain that
+          // parked entry, else it leaks onto the next same-named call.
+          const pq = event.toolName ? resolvedArgsByTool.get(event.toolName) : undefined;
+          if (pq && pq.length > 0) pq.shift();
         } else if (enforcingHooks && !(event.toolName && providerToolNames.has(event.toolName))) {
           // Exec-first with a mismatched id: claim a parked resolution instead
           // of suppressing, so the card is never stuck {pending}.

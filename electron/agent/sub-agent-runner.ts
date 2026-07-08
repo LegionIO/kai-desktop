@@ -453,6 +453,12 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           const rewritten = subHookRewrittenArgs.get(event.toolCallId);
           if (rewritten !== undefined) {
             (enriched as Record<string, unknown>).args = rewritten;
+            // Exec-first + SAME id: publishResolved both recorded args by id AND
+            // speculatively parked a copy by toolName (it couldn't yet know the
+            // stream id would match). We resolved by id here, so drain that
+            // parked entry — otherwise it leaks onto the next same-named call.
+            const pq = event.toolName ? subResolvedArgsByTool.get(event.toolName) : undefined;
+            if (pq && pq.length > 0) pq.shift();
           } else if (subEnforcingHooks && !(event.toolName && subProviderToolNames.has(event.toolName))) {
             // Exec-first with a mismatched id: onToolExecutionStart already
             // resolved args and parked them by toolName. Claim one instead of
