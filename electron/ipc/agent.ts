@@ -357,6 +357,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           error: 'Failed to load config: ' + (error instanceof Error ? error.message : String(error)),
         });
         broadcastStreamEvent({ conversationId, type: 'done' });
+        void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         return { conversationId };
       }
 
@@ -429,6 +430,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
+          void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
           activeStreams.delete(conversationId);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
@@ -616,6 +618,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             messageMeta: meta,
           });
           broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+          void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
           activeStreams.delete(conversationId);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
@@ -1202,10 +1205,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 });
               }
             } catch (error) {
-              const errorResult = {
+              let errorResult: unknown = {
                 isError: true,
                 error: error instanceof Error ? error.message : String(error),
               };
+              // PostToolUse on the error path too, so a DLP hook can sanitize
+              // error payloads from observer-launched tools.
+              const postTool = await hookDispatcher.dispatch('PostToolUse', {
+                conversationId,
+                toolCallId,
+                toolName,
+                args: effectiveArgs,
+                result: errorResult,
+              });
+              if (postTool.denied) {
+                errorResult = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+              } else {
+                const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+                if (nextResult !== undefined) errorResult = nextResult;
+              }
               observer?.onToolExecutionResult(toolCallId, toolName, errorResult);
               const observerAugmented = withObserverAugmentation(
                 errorResult,

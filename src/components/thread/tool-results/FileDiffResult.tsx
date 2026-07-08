@@ -14,7 +14,10 @@ function parseHunks(unified: string): ParsedHunk[] {
   const hunks: ParsedHunk[] = [];
   let current: ParsedHunk | null = null;
   for (const raw of unified.split('\n')) {
-    if (raw.startsWith('--- ') || raw.startsWith('+++ ')) continue;
+    // File headers only appear before the first @@ hunk. Once inside a hunk,
+    // a line like `+++ x` / `--- x` is real content (an added/removed line whose
+    // text begins with `++ `/`-- `), so don't drop it.
+    if (!current && (raw.startsWith('--- ') || raw.startsWith('+++ '))) continue;
     if (raw.startsWith('@@')) {
       current = { header: raw, lines: [] };
       hunks.push(current);

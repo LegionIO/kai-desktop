@@ -247,6 +247,13 @@ function toMastraTools(
           return hooks?.augmentToolResult
             ? await hooks.augmentToolResult({ toolCallId, toolName: tool.name, args: input, result })
             : result;
+        } catch (err) {
+          // Run thrown errors through PostToolUse/augment so hooks can sanitize.
+          const errResult = { isError: true, error: err instanceof Error ? err.message : String(err) };
+          if (hooks?.augmentToolResult) {
+            return await hooks.augmentToolResult({ toolCallId, toolName: tool.name, args: input, result: errResult });
+          }
+          throw err;
         } finally {
           hooks?.onToolExecutionEnd?.({ toolCallId, toolName: tool.name });
         }
@@ -647,6 +654,9 @@ function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: stri
 const WORKSPACE_FILE_MUTATING_TOOLS: Set<string> = new Set([
   WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE,
   WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE,
+  // Included for completeness so deletions are tracked/revertable if the delete
+  // tool is ever enabled (it is disabled by default in the workspace config).
+  WORKSPACE_TOOLS.FILESYSTEM.DELETE,
 ]);
 
 function attachDiffMeta(result: unknown, meta: DiffTrackingResultMeta): unknown {
@@ -701,9 +711,20 @@ function applyWorkspaceToolGuards(
         ) {
           const absPath = (args as { path: string }).path;
           const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
-          const result = await originalExecute(args, execContext);
-          const ev = handle.finish();
-          return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
+          try {
+            const result = await originalExecute(args, execContext);
+            const ev = handle.finish();
+            return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
+          } catch (err) {
+            // Tool threw after possibly mutating disk — still finalize the diff
+            // so the change is tracked/revertable, then rethrow.
+            try {
+              handle.finish();
+            } catch {
+              /* ignore */
+            }
+            throw err;
+          }
         }
 
         if (conversationId && toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND) {
@@ -715,13 +736,24 @@ function applyWorkspaceToolGuards(
             { toolName, toolCallId, command, cwd: shellCwd },
             getConfig(),
           );
-          const result = await originalExecute(args, execContext);
-          const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
-          const events = await snap.finish({
-            stdout: typeof r?.stdout === 'string' ? r.stdout : '',
-            stderr: typeof r?.stderr === 'string' ? r.stderr : '',
-          });
-          return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
+          try {
+            const result = await originalExecute(args, execContext);
+            const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
+            const events = await snap.finish({
+              stdout: typeof r?.stdout === 'string' ? r.stdout : '',
+              stderr: typeof r?.stderr === 'string' ? r.stderr : '',
+            });
+            return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
+          } catch (err) {
+            // Command threw after possibly mutating disk — finalize the snapshot
+            // so tracked changes survive, then rethrow.
+            try {
+              await snap.finish({ stdout: '', stderr: '' });
+            } catch {
+              /* ignore */
+            }
+            throw err;
+          }
         }
 
         const result = await originalExecute(args, execContext);
@@ -748,6 +780,14 @@ function applyWorkspaceToolGuards(
         return hooks?.augmentToolResult
           ? await hooks.augmentToolResult({ toolCallId, toolName, args: normalized, result })
           : result;
+      } catch (err) {
+        // Route thrown tool errors through the same PostToolUse/augment path so
+        // a DLP/redaction hook can sanitize error payloads too.
+        const errResult = { isError: true, error: err instanceof Error ? err.message : String(err) };
+        if (hooks?.augmentToolResult) {
+          return await hooks.augmentToolResult({ toolCallId, toolName, args: normalized, result: errResult });
+        }
+        throw err;
       } finally {
         hooks?.onToolExecutionEnd?.({ toolCallId, toolName });
       }
