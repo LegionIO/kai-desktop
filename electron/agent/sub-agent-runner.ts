@@ -105,17 +105,14 @@ function createControlTool(signalRef: { current: ControlSignal | null }): ToolDe
   };
 }
 
-function buildSubAgentSystemPrompt(baseSystemPrompt: string, task: string, context?: string, depth?: number): string {
+function buildSubAgentSystemPrompt(baseSystemPrompt: string, depth?: number): string {
   const parts = [
     baseSystemPrompt,
     '',
     '--- Sub-Agent Context ---',
     `You are a sub-agent (depth ${depth ?? 0}) spawned to handle a specific task.`,
-    `Your assigned task: ${task}`,
+    'Your assigned task (and any parent context) is provided in the conversation messages below.',
   ];
-  if (context) {
-    parts.push('', 'Additional context from parent agent:', context);
-  }
   parts.push(
     '',
     'Instructions:',
@@ -126,6 +123,18 @@ function buildSubAgentSystemPrompt(baseSystemPrompt: string, task: string, conte
     '- The user or parent agent may send you follow-up messages between turns.',
     '- Do NOT just provide a text response without calling sub_agent_control — the system needs the signal.',
   );
+  return parts.join('\n');
+}
+
+/**
+ * The sub-agent's opening user message carries the raw task + parent context.
+ * Keeping it in a MESSAGE (not the system prompt) means a UserPromptSubmit DLP
+ * modify hook that sanitizes `messages` actually covers it — embedding it in the
+ * system prompt would let the raw task leak past a messages-only sanitizer.
+ */
+function buildSubAgentTaskMessage(task: string, context?: string): string {
+  const parts = [`Your assigned task: ${task}`];
+  if (context) parts.push('', 'Additional context from parent agent:', context);
   return parts.join('\n');
 }
 
@@ -169,8 +178,10 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
   try {
     const basePrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
-    const systemPrompt = buildSubAgentSystemPrompt(basePrompt, task, context, depth);
-    const messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: task }];
+    const systemPrompt = buildSubAgentSystemPrompt(basePrompt, depth);
+    const messages: Array<{ role: string; content: unknown }> = [
+      { role: 'user', content: buildSubAgentTaskMessage(task, context) },
+    ];
 
     let subAgentConfig: AppConfig = { ...config, systemPrompt };
 
