@@ -292,6 +292,8 @@ export function getBridgeScript(): string {
       clear: function() { return invoke('conversations:clear'); },
       getActiveId: function() { return invoke('conversations:get-active-id'); },
       setActiveId: function(id) { return invoke('conversations:set-active-id', id); },
+      fork: function(id, upTo) { return invoke('conversations:fork', id, upTo); },
+      export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       onChanged: function(cb) { return on('conversations:changed', cb); }
     },
     memory: {

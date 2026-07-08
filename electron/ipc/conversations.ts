@@ -1,8 +1,9 @@
 import type { IpcMain } from 'electron';
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
 import { getComputerUseManager } from '../computer-use/service.js';
@@ -442,4 +443,155 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     broadcastConversationChange(store);
     return { ok: true };
   });
+
+  ipcMain.handle('conversations:fork', (_event, id: string, upToMessageIndex?: number) => {
+    const store = readConversationStore(appHome);
+    const source = store.conversations[id];
+    if (!source) return { ok: false, error: 'Conversation not found' };
+
+    // Deep-clone via JSON round-trip — the store is JSON-persisted so this is lossless.
+    const clone = JSON.parse(JSON.stringify(source)) as ConversationRecord;
+    const now = new Date().toISOString();
+
+    const allMessages = Array.isArray(clone.messages) ? clone.messages : [];
+    const sliced =
+      typeof upToMessageIndex === 'number' && upToMessageIndex >= 0
+        ? allMessages.slice(0, upToMessageIndex + 1)
+        : allMessages;
+
+    // The active branch is a linear parent chain, so the sliced flat list is a
+    // valid messageTree on its own; headId is simply the last node's id.
+    const lastId =
+      sliced.length > 0 ? ((sliced[sliced.length - 1] as { id?: unknown }).id as string | undefined) : undefined;
+
+    const baseTitle = clone.title ?? clone.fallbackTitle ?? 'Chat';
+    const forked: ConversationRecord = {
+      ...clone,
+      id: randomUUID(),
+      title: `${baseTitle} (fork)`,
+      messages: sliced,
+      messageTree: sliced,
+      headId: lastId ?? null,
+      messageCount: sliced.length,
+      userMessageCount: sliced.filter((m) => (m as { role?: unknown }).role === 'user').length,
+      // Drop compaction state when forking a partial prefix — the summary may
+      // reference messages past the cut point.
+      conversationCompaction: sliced.length === allMessages.length ? clone.conversationCompaction : null,
+      createdAt: now,
+      updatedAt: now,
+      titleStatus: 'ready',
+      titleUpdatedAt: now,
+      runStatus: 'idle',
+      hasUnread: false,
+    };
+
+    store.conversations[forked.id] = forked;
+    writeConversationStore(appHome, store);
+    broadcastConversationChange(store);
+    eventBus.emit('conversation', 'created', { id: forked.id, title: forked.title });
+    return { ok: true, conversation: forked };
+  });
+
+  ipcMain.handle('conversations:export', async (_event, id: string, format: 'markdown' | 'json') => {
+    const store = readConversationStore(appHome);
+    const conv = store.conversations[id];
+    if (!conv) return { ok: false, error: 'Conversation not found' };
+
+    const ext = format === 'json' ? 'json' : 'md';
+    const safeTitle = (conv.title ?? conv.fallbackTitle ?? 'chat')
+      .replace(/[^a-zA-Z0-9-_ ]/g, '')
+      .trim()
+      .replace(/\s+/g, '-')
+      .slice(0, 60);
+    const defaultPath = `${safeTitle || 'chat'}.${ext}`;
+
+    const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
+    const saveOptions = {
+      title: 'Export Chat',
+      defaultPath,
+      filters:
+        format === 'json' ? [{ name: 'JSON', extensions: ['json'] }] : [{ name: 'Markdown', extensions: ['md'] }],
+    };
+    const result = win ? await dialog.showSaveDialog(win, saveOptions) : await dialog.showSaveDialog(saveOptions);
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+
+    const body = format === 'json' ? JSON.stringify(conv, null, 2) : conversationToMarkdown(conv);
+    writeFileSync(result.filePath, body, 'utf-8');
+    return { ok: true, filePath: result.filePath };
+  });
+}
+
+// ── export helpers ─────────────────────────────────────────────────────────
+
+const TOOL_RESULT_TRUNCATE_BYTES = 10 * 1024;
+
+type ExportContentPart = {
+  type?: string;
+  text?: string;
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+};
+
+function roleLabel(role: unknown): string {
+  switch (role) {
+    case 'user':
+      return 'User';
+    case 'assistant':
+      return 'Assistant';
+    case 'system':
+      return 'System';
+    case 'tool':
+      return 'Tool';
+    default:
+      return typeof role === 'string' && role ? role : 'Message';
+  }
+}
+
+function renderToolCallPart(part: ExportContentPart): string {
+  const lines: string[] = [];
+  const name = part.toolName ?? 'tool';
+  lines.push(`#### Tool: \`${name}\``, '');
+  if (part.args !== undefined) {
+    lines.push('```json', JSON.stringify(part.args, null, 2), '```', '');
+  }
+  if (part.result !== undefined) {
+    const raw = typeof part.result === 'string' ? part.result : JSON.stringify(part.result, null, 2);
+    const bytes = Buffer.byteLength(raw, 'utf-8');
+    if (bytes > TOOL_RESULT_TRUNCATE_BYTES) {
+      lines.push(`_[tool result truncated, ${bytes} bytes]_`, '');
+    } else {
+      lines.push('```json', raw, '```', '');
+    }
+  }
+  return lines.join('\n');
+}
+
+function conversationToMarkdown(conv: ConversationRecord): string {
+  const title = conv.title ?? conv.fallbackTitle ?? 'Chat';
+  const lines: string[] = [`# ${title}`, ''];
+  if (conv.createdAt) lines.push(`_Exported ${new Date().toISOString()} · Created ${conv.createdAt}_`, '');
+
+  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  for (const msg of messages) {
+    const m = msg as { role?: unknown; content?: unknown };
+    lines.push(`### ${roleLabel(m.role)}`, '');
+
+    if (typeof m.content === 'string') {
+      lines.push(m.content, '');
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content as ExportContentPart[]) {
+        if (!part) continue;
+        if (part.type === 'text' && typeof part.text === 'string') {
+          lines.push(part.text, '');
+        } else if (part.type === 'tool-call') {
+          lines.push(renderToolCallPart(part));
+        } else if (part.type === 'tool-result') {
+          // Standalone tool-role messages (AI-SDK wire shape) — render like a tool call result.
+          lines.push(renderToolCallPart({ toolName: part.toolName, args: undefined, result: part.result }));
+        }
+      }
+    }
+  }
+  return lines.join('\n');
 }

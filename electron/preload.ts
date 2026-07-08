@@ -77,6 +77,19 @@ const appAPI = {
     clear: () => ipcRenderer.invoke('conversations:clear'),
     getActiveId: () => ipcRenderer.invoke('conversations:get-active-id'),
     setActiveId: (id: string) => ipcRenderer.invoke('conversations:set-active-id', id),
+    fork: (id: string, upToMessageIndex?: number) =>
+      ipcRenderer.invoke('conversations:fork', id, upToMessageIndex) as Promise<{
+        ok: boolean;
+        conversation?: unknown;
+        error?: string;
+      }>,
+    export: (id: string, format: 'markdown' | 'json') =>
+      ipcRenderer.invoke('conversations:export', id, format) as Promise<{
+        ok: boolean;
+        filePath?: string;
+        canceled?: boolean;
+        error?: string;
+      }>,
     onChanged: (callback: (store: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, store: unknown) => callback(store);
       ipcRenderer.on('conversations:changed', handler);

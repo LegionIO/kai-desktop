@@ -75,6 +75,14 @@ type AppAPI = {
     clear: () => Promise<unknown>;
     getActiveId: () => Promise<string | null>;
     setActiveId: (id: string) => Promise<unknown>;
+    fork: (
+      id: string,
+      upToMessageIndex?: number,
+    ) => Promise<{ ok: boolean; conversation?: { id: string } & Record<string, unknown>; error?: string }>;
+    export: (
+      id: string,
+      format: 'markdown' | 'json',
+    ) => Promise<{ ok: boolean; filePath?: string; canceled?: boolean; error?: string }>;
     onChanged: (callback: (store: unknown) => void) => () => void;
   };
   workspaces: {
