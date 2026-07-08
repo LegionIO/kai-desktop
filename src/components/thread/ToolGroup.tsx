@@ -436,7 +436,7 @@ export const ToolCallDisplay: FC<{
           toolCallId={part.toolCallId}
           toolName={part.toolName as 'create_artifact' | 'update_artifact'}
           args={part.args}
-          result={part.originalResult ?? part.result}
+          result={resolveArtifactResult(part.originalResult, part.result)}
           isError={Boolean(isError)}
         />
       )}
@@ -523,6 +523,24 @@ export const ToolCallDisplay: FC<{
 };
 
 /* ── Friendly error display for ask_user tool failures ── */
+
+/**
+ * Resolve the artifact tool result to feed ArtifactToolCard. Prefer the
+ * pre-compaction `originalResult`; if tool-output compaction turned it into a
+ * JSON string, parse it back to the object so the generated artifact id (which
+ * may only live in the result, not the args) survives and the preview opens.
+ */
+function resolveArtifactResult(originalResult: unknown, result: unknown): unknown {
+  const preferred = originalResult ?? result;
+  if (typeof preferred === 'string') {
+    try {
+      return JSON.parse(preferred);
+    } catch {
+      return preferred;
+    }
+  }
+  return preferred;
+}
 
 function extractAskUserErrorMessage(result: unknown): string {
   if (!result || typeof result !== 'object') return 'The question could not be displayed.';

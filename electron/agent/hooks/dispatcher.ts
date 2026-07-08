@@ -137,7 +137,9 @@ function isUsableModifyReplacement(event: HookEvent, replacement: unknown): bool
     case 'PreToolUse':
       return typeof r.args === 'object' && r.args !== null && !Array.isArray(r.args);
     case 'PostToolUse':
-      return 'result' in r;
+      // Require a DEFINED result — callers only apply `result` when it is not
+      // undefined, so `{ result: undefined }` (key present) would fail open.
+      return 'result' in r && r.result !== undefined;
     default:
       // Non-enforcing events don't reach the modify path (coerced to observe),
       // but be permissive if they somehow do.
