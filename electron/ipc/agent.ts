@@ -815,12 +815,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // broadcast (showing a pending placeholder) and fill them in via the
         // corrective re-broadcast once the hook has run.
         const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
-        // Provider-native tools (server-side web_search etc.) execute inside the
-        // provider and never hit onToolExecutionStart, so their args must NOT be
-        // suppressed (nothing would ever un-suppress them → stuck {pending}).
-        const providerDefinedToolNames = modelEntry?.modelConfig
-          ? getProviderDefinedToolNames(modelEntry.modelConfig)
-          : new Set<string>();
+        // Union of provider-native tool names across the PRIMARY and every
+        // FALLBACK model. Provider-native tools execute in-provider and never
+        // hit onToolExecutionStart, so their args must not be suppressed
+        // (nothing would ever un-suppress them → stuck {pending}). Because
+        // fallback can switch the active model mid-stream, and fallback models
+        // may expose different provider-native tools, we must recognize the
+        // union — otherwise a fallback model's provider-native tool (e.g.
+        // web_search) would be suppressed to {pending} forever.
+        const providerDefinedToolNames = new Set<string>();
+        if (modelEntry?.modelConfig) {
+          for (const n of getProviderDefinedToolNames(modelEntry.modelConfig)) providerDefinedToolNames.add(n);
+        }
+        if (fallbackEnabled) {
+          for (const fb of streamConfig?.fallbackModels ?? []) {
+            if (!fb?.modelConfig) continue;
+            for (const n of getProviderDefinedToolNames(fb.modelConfig)) providerDefinedToolNames.add(n);
+          }
+        }
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
