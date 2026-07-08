@@ -47,7 +47,8 @@ type Action =
   | { type: 'plugin-action'; pluginName: string; targetId: string; action: string; data?: Record<string, unknown> }
   | { type: 'tool'; toolName: string; input: Record<string, unknown> }
   | { type: 'notification'; title: string; body?: string }
-  | { type: 'emit'; source: string; event: string; payload?: Record<string, unknown> };
+  | { type: 'emit'; source: string; event: string; payload?: Record<string, unknown> }
+  | { type: 'runHookCommand'; command: string; mode: 'observe' | 'block' | 'modify'; matcher?: string };
 
 type Rule = {
   id: string;
@@ -85,6 +86,7 @@ const ACTION_TYPES: Array<{ value: Action['type']; label: string }> = [
   { value: 'tool', label: 'Run tool' },
   { value: 'notification', label: 'Show notification' },
   { value: 'emit', label: 'Emit event' },
+  { value: 'runHookCommand', label: 'Run hook command' },
 ];
 
 function newRule(): Rule {
@@ -121,6 +123,8 @@ function newAction(type: Action['type']): Action {
       return { type, title: '' };
     case 'emit':
       return { type, source: '', event: '' };
+    case 'runHookCommand':
+      return { type, command: '', mode: 'observe' };
   }
 }
 
@@ -824,6 +828,45 @@ const ActionEditor: FC<{
             value={action.payload ?? {}}
             onChange={(v) => onChange({ ...action, payload: v })}
           />
+        </div>
+      )}
+
+      {action.type === 'runHookCommand' && (
+        <div className="space-y-2">
+          <p className="text-[10px] text-muted-foreground/70">
+            Only fires for <code className="font-mono">Agent lifecycle</code> triggers. The event payload is written to
+            the command’s stdin as JSON. In <em>block</em> mode a non-zero exit cancels the action (stderr is surfaced
+            to the agent). In <em>modify</em> mode stdout must be JSON of the form{' '}
+            <code className="font-mono">{'{"payload": …}'}</code>.
+          </p>
+          <TextField
+            label="Command"
+            value={action.command}
+            onChange={(v) => onChange({ ...action, command: v })}
+            placeholder="~/.kai/hooks/redact.sh"
+            mono
+          />
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="mb-0.5 block text-[10px] text-muted-foreground">Mode</label>
+              <select
+                className={settingsSelectClass}
+                value={action.mode}
+                onChange={(e) => onChange({ ...action, mode: e.target.value as 'observe' | 'block' | 'modify' })}
+              >
+                <option value="observe">observe (fire & forget)</option>
+                <option value="block">block (deny on non-zero exit)</option>
+                <option value="modify">modify (replace payload from stdout)</option>
+              </select>
+            </div>
+            <TextField
+              label="Tool matcher (Pre/PostToolUse only)"
+              value={action.matcher ?? ''}
+              onChange={(v) => onChange({ ...action, matcher: v || undefined })}
+              placeholder="mastra_workspace_*"
+              mono
+            />
+          </div>
         </div>
       )}
     </div>

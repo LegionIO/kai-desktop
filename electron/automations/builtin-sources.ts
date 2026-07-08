@@ -17,6 +17,63 @@ export function registerBuiltinSources(bus: AutomationEventBus): void {
   });
 
   bus.registerSource({
+    source: 'hook',
+    displayName: 'Agent lifecycle',
+    events: [
+      {
+        event: 'UserPromptSubmit',
+        title: 'User prompt submitted',
+        description: 'Fires before the user message is sent to the model',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, messages: { type: 'array' } },
+        },
+      },
+      {
+        event: 'PreToolUse',
+        title: 'Before tool executes',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, toolName: { type: 'string' }, args: {} },
+        },
+      },
+      {
+        event: 'PostToolUse',
+        title: 'After tool executes',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, toolName: { type: 'string' }, args: {}, result: {} },
+        },
+      },
+      {
+        event: 'AssistantMessage',
+        title: 'Assistant turn complete',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, text: { type: 'string' } },
+        },
+      },
+      {
+        event: 'AgentStop',
+        title: 'Agent run finished',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, aborted: { type: 'boolean' } },
+        },
+      },
+      {
+        event: 'ConversationStart',
+        title: 'New conversation created',
+        payloadSchema: {
+          type: 'object',
+          properties: { conversationId: { type: 'string' }, title: { type: 'string' } },
+        },
+      },
+    ],
+    actions: [],
+  });
+
+  bus.registerSource({
     source: 'conversation',
     displayName: 'Conversations',
     events: [

@@ -451,6 +451,7 @@ export class PluginManager {
       declaredEvents: [],
       declaredActions: [],
       eventUnsubscribers: [],
+      agentHookUnsubscribers: [],
     };
   }
 
@@ -637,6 +638,12 @@ export class PluginManager {
       instance.preUpdateHooks = [];
       instance.postUpdateHooks = [];
       instance.configChangeListeners = [];
+      for (const off of instance.agentHookUnsubscribers) {
+        try {
+          off();
+        } catch {}
+      }
+      instance.agentHookUnsubscribers = [];
 
       if (typeof mod.activate === 'function') {
         await mod.activate(api);
@@ -680,6 +687,12 @@ export class PluginManager {
         } catch {}
       }
       instance.eventUnsubscribers = [];
+      for (const off of instance.agentHookUnsubscribers) {
+        try {
+          off();
+        } catch {}
+      }
+      instance.agentHookUnsubscribers = [];
       instance.declaredEvents = [];
       instance.declaredActions = [];
       eventBus.unregisterSource(`plugin.${manifest.name}`);
@@ -776,6 +789,12 @@ export class PluginManager {
       } catch {}
     }
     instance.eventUnsubscribers = [];
+    for (const off of instance.agentHookUnsubscribers) {
+      try {
+        off();
+      } catch {}
+    }
+    instance.agentHookUnsubscribers = [];
     instance.declaredEvents = [];
     instance.declaredActions = [];
     eventBus.unregisterSource(`plugin.${pluginName}`);

@@ -6,6 +6,7 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
+import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 
 type ConversationRecord = {
@@ -393,6 +394,10 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     broadcastConversationChange(store);
     if (!prev) {
       eventBus.emit('conversation', 'created', { id: conversation.id, title: nextConversation.title });
+      void hookDispatcher.dispatch('ConversationStart', {
+        conversationId: conversation.id,
+        title: nextConversation.title,
+      });
     }
     return { ok: true };
   });

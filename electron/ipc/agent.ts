@@ -53,6 +53,7 @@ import { recordUsageEvent } from './usage.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { normalizeTokenUsage } from '../../shared/token-usage.js';
 import type { HookMessage } from '../plugins/types.js';
+import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 
 const activeStreams = new Map<string, { abort: () => void }>();
 const activeObserverSessions = new Map<string, string>();
@@ -309,6 +310,8 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
+  hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
+
   ipcMain.handle(
     'agent:stream',
     async (
@@ -376,6 +379,39 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           executionMode: effectiveExecutionMode,
         },
       };
+
+      // ── Lifecycle hook: UserPromptSubmit ────────────────────────────────
+      // Runs before the message list reaches the model. `modify` hooks may
+      // rewrite `messages` and/or `systemPrompt`; `block` hooks abort the run.
+      {
+        const promptDispatch = await hookDispatcher.dispatch('UserPromptSubmit', {
+          conversationId,
+          messages,
+          systemPrompt: effectiveSystemPrompt,
+          modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+        });
+        if (promptDispatch.denied) {
+          broadcastStreamEvent({
+            conversationId,
+            type: 'error',
+            error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
+          });
+          broadcastStreamEvent({ conversationId, type: 'done' });
+          activeStreams.delete(conversationId);
+          activeStreamModelKeys.delete(conversationId);
+          activeObserverSessions.delete(conversationId);
+          return { conversationId };
+        }
+        const next = promptDispatch.payload as {
+          messages?: unknown[];
+          systemPrompt?: string;
+        };
+        if (Array.isArray(next?.messages)) messages = stripDisplayOnlyParts(next.messages);
+        if (typeof next?.systemPrompt === 'string') {
+          effectiveSystemPrompt = next.systemPrompt;
+          if (streamConfig) streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
+        }
+      }
 
       if (pluginManager) {
         const hookResult = await pluginManager.runPreSendHooks({
@@ -670,6 +706,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
 
         const toolCancels = new Map<string, () => void>();
+        const hookDeniedToolCalls = new Map<string, string>();
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
@@ -1213,6 +1250,37 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               pairExecuteAndStreamToolCallIds(state.toolName);
               observer?.onToolExecutionStart(state);
 
+              // ── Lifecycle hook: PreToolUse ──────────────────────────────
+              // `block` → cancel the tool and surface reason as an error result.
+              // `modify` → replace args before the tool executes.
+              const preTool = await hookDispatcher.dispatch('PreToolUse', {
+                conversationId,
+                toolCallId: state.toolCallId,
+                toolName: state.toolName,
+                args: state.args,
+              });
+              if (preTool.denied) {
+                hookDeniedToolCalls.set(state.toolCallId, preTool.reason ?? 'Blocked by PreToolUse hook.');
+                state.cancel();
+                return;
+              }
+              const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+              if (nextArgs !== undefined && nextArgs !== state.args) {
+                // Mutate in place — the same object reference is passed to tool.execute().
+                if (
+                  state.args &&
+                  typeof state.args === 'object' &&
+                  nextArgs &&
+                  typeof nextArgs === 'object' &&
+                  !Array.isArray(state.args) &&
+                  !Array.isArray(nextArgs)
+                ) {
+                  const target = state.args as Record<string, unknown>;
+                  for (const k of Object.keys(target)) delete target[k];
+                  Object.assign(target, nextArgs as Record<string, unknown>);
+                }
+              }
+
               // Gate exit_plan_mode behind user approval regardless of execution mode
               if (state.toolName === 'exit_plan_mode') {
                 const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
@@ -1287,6 +1355,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             augmentToolResult: async ({
               toolCallId,
               toolName,
+              args,
               result,
             }: {
               toolCallId: string;
@@ -1294,6 +1363,32 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               args: unknown;
               result: unknown;
             }) => {
+              // If PreToolUse denied this call, the tool was cancelled and `result`
+              // is whatever the aborted execute() produced. Replace it with an
+              // explicit error so the model sees the deny reason.
+              const denyReason = hookDeniedToolCalls.get(toolCallId);
+              if (denyReason !== undefined) {
+                hookDeniedToolCalls.delete(toolCallId);
+                result = { isError: true, error: denyReason };
+              }
+
+              // ── Lifecycle hook: PostToolUse ─────────────────────────────
+              // `modify` → replace `result` before it is fed back to the model.
+              // `block`  → convert to an error result.
+              const postTool = await hookDispatcher.dispatch('PostToolUse', {
+                conversationId,
+                toolCallId,
+                toolName,
+                args,
+                result,
+              });
+              if (postTool.denied) {
+                result = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+              } else {
+                const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+                if (nextResult !== undefined) result = nextResult;
+              }
+
               await observer?.waitForLinkedLaunchedTools(toolCallId);
               observer?.onToolExecutionResult(toolCallId, toolName, result);
               const observerAugmented = withObserverAugmentation(result, observer?.getToolAugmentation(toolCallId));
@@ -1448,6 +1543,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               observerLaunchesEnabled = false;
               await waitForObserverToolExecutions();
 
+              // ── Lifecycle hook: AssistantMessage ────────────────────────
+              if (accumulatedResponseText.length > 0) {
+                void hookDispatcher.dispatch('AssistantMessage', {
+                  conversationId,
+                  text: accumulatedResponseText,
+                });
+              }
+
               // Run post-receive hooks (e.g. plugin learning pipelines)
               if (pluginManager && accumulatedResponseText.length > 0) {
                 try {
@@ -1507,6 +1610,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
         } finally {
           ipcDebugLog(`[LOOP-FINALLY] conv=${conversationId} cleaning up`);
+          // ── Lifecycle hook: AgentStop ───────────────────────────────────
+          void hookDispatcher.dispatch('AgentStop', {
+            conversationId,
+            aborted: controller.signal.aborted,
+          });
           observerLaunchesEnabled = false;
           await waitForObserverToolExecutions();
           observer?.dispose();

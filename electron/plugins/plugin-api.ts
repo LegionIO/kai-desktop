@@ -52,6 +52,7 @@ import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
+import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
@@ -582,6 +583,30 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       registerPostUpdateHook: (hook: PostUpdateHook) => {
         requirePermission('lifecycle:hook');
         instance.postUpdateHooks.push(hook);
+      },
+    },
+
+    hooks: {
+      register: (event, handler, opts) => {
+        requirePermission('agent:hook');
+        // Wrap so a stale activation generation (disabled/reloaded plugin) can
+        // never run, even if the dispatcher still holds the registration.
+        const guarded = (payload: unknown) => {
+          if (callbacks.isLive && !callbacks.isLive()) return undefined;
+          return handler(payload);
+        };
+        const off = hookDispatcher.register(event, guarded, {
+          mode: opts?.mode ?? 'observe',
+          matcher: opts?.matcher,
+          source: 'plugin',
+          pluginId: manifest.name,
+        });
+        instance.agentHookUnsubscribers.push(off);
+        return () => {
+          off();
+          const idx = instance.agentHookUnsubscribers.indexOf(off);
+          if (idx >= 0) instance.agentHookUnsubscribers.splice(idx, 1);
+        };
       },
     },
 

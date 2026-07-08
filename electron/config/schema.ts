@@ -707,6 +707,13 @@ const automationActionSchema = z.discriminatedUnion('type', [
     event: z.string(),
     payload: z.record(z.string(), z.unknown()).optional(),
   }),
+  z.object({
+    type: z.literal('runHookCommand'),
+    command: z.string(),
+    mode: z.enum(['observe', 'block', 'modify']).default('observe'),
+    /** Glob against payload.toolName (PreToolUse / PostToolUse only). */
+    matcher: z.string().optional(),
+  }),
 ]);
 
 export const automationRuleSchema = z.object({
@@ -731,6 +738,15 @@ export type AutomationCondition = z.infer<typeof automationConditionSchema>;
 export type AutomationAction = z.infer<typeof automationActionSchema>;
 export type AutomationRule = z.infer<typeof automationRuleSchema>;
 export type AutomationsConfig = z.infer<typeof automationsConfigSchema>;
+
+const hooksConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    timeoutMs: z.number().int().positive().default(5000),
+  })
+  .default({ enabled: true, timeoutMs: 5000 });
+
+export type HooksConfig = z.infer<typeof hooksConfigSchema>;
 
 /** Sidebar tab identifiers — scoped tabs filter by active workspace, global tabs show everything. */
 export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins';
@@ -869,6 +885,7 @@ export const appConfigSchema = z.object({
   cliTools: z.array(cliToolSchema).optional(),
   autopilot: autopilotConfigSchema.optional(),
   automations: automationsConfigSchema.default({ enabled: true, rules: [], log: { maxEntries: 200 } }),
+  hooks: hooksConfigSchema,
 });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;

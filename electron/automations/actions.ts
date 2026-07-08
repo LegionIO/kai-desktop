@@ -271,6 +271,13 @@ async function runSingleAction(
       deps.bus.emit(action.source, action.event, payload, event.depth + 1);
       return { emitted: `${action.source}:${action.event}` };
     }
+
+    case 'runHookCommand':
+      // runHookCommand actions on `hook:*` triggers are executed inline by the
+      // hook dispatcher (electron/agent/hooks/dispatcher.ts) so that block/modify
+      // modes can gate the agent synchronously. The automation engine only sees
+      // the observe-mode fan-out on the event bus, so this branch is a no-op.
+      return { note: 'executed inline by hook dispatcher' };
   }
 }
 

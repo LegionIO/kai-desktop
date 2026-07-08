@@ -1,11 +1,23 @@
 import type { ToolDefinition } from '../tools/types.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ActionDescriptor, AutomationEvent, EventDescriptor } from '../automations/types.js';
+import type {
+  HookEvent as AgentHookEvent,
+  HookHandler as AgentHookHandler,
+  HookRegistrationOptions as AgentHookRegistrationOptions,
+} from '../agent/hooks/dispatcher.js';
 import type { CompatCheckResult } from './plugin-compat.js';
 import type { PluginSafeConfig } from './safe-config.js';
 
 export type { PluginSafeConfig } from './safe-config.js';
 export type { ActionDescriptor, AutomationEvent, EventDescriptor } from '../automations/types.js';
+export type {
+  HookEvent as AgentHookEvent,
+  HookMode as AgentHookMode,
+  HookHandler as AgentHookHandler,
+  HookOutcome as AgentHookOutcome,
+  HookRegistrationOptions as AgentHookRegistrationOptions,
+} from '../agent/hooks/dispatcher.js';
 
 /* ── Manifest ── */
 
@@ -31,6 +43,7 @@ export type PluginPermission =
   | 'events:publish'
   | 'events:subscribe'
   | 'agent:generate'
+  | 'agent:hook'
   | 'agent:inference-provider'
   | 'agent:register-cli-tool'
   | 'safe-storage'
@@ -170,6 +183,7 @@ export type PluginInstance = {
   declaredEvents: EventDescriptor[];
   declaredActions: ActionDescriptor[];
   eventUnsubscribers: Array<() => void>;
+  agentHookUnsubscribers: Array<() => void>;
 };
 
 /* ── Plugin Module (what dist/backend.js must export) ── */
@@ -536,6 +550,17 @@ export type PluginAPI = {
   lifecycle: {
     registerPreUpdateHook: (hook: PreUpdateHook) => void;
     registerPostUpdateHook: (hook: PostUpdateHook) => void;
+  };
+
+  /**
+   * Agent lifecycle hooks (UserPromptSubmit / PreToolUse / PostToolUse /
+   * AssistantMessage / AgentStop / ConversationStart). Plugin hooks run before
+   * user shell hooks so DLP / sanitization sees raw payloads. Returns an
+   * unregister function; all registrations are also cleared automatically when
+   * the plugin is disabled or unloaded.
+   */
+  hooks: {
+    register: (event: AgentHookEvent, handler: AgentHookHandler, opts?: AgentHookRegistrationOptions) => () => void;
   };
 
   ui: {

@@ -990,6 +990,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     cliTools: config.cliTools,
     autopilot: config.autopilot,
     automations: config.automations,
+    hooks: config.hooks,
   };
 }
 

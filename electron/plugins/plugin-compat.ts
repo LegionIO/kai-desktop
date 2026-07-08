@@ -48,6 +48,7 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'events:publish',
   'events:subscribe',
   'agent:generate',
+  'agent:hook',
   'agent:inference-provider',
   'safe-storage',
   'browser:window',
