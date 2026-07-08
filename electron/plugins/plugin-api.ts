@@ -52,7 +52,7 @@ import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
-import { hookDispatcher } from '../agent/hooks/dispatcher.js';
+import { hookDispatcher, HOOK_EVENTS } from '../agent/hooks/dispatcher.js';
 
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
@@ -212,31 +212,45 @@ function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
   );
 }
 
-/**
- * Deep-scan a value (a config write payload) for any `{ type: 'runHookCommand' }`
- * automation action. Used to gate plugin config writes behind `agent:hook`.
- * Depth-bounded to avoid pathological nesting.
- */
-function containsRunHookCommand(value: unknown, depth = 0): boolean {
-  if (depth > 8 || value === null || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some((v) => containsRunHookCommand(v, depth + 1));
-  const obj = value as Record<string, unknown>;
-  if (obj.type === 'runHookCommand') return true;
-  return Object.values(obj).some((v) => containsRunHookCommand(v, depth + 1));
+const HOOK_EVENT_SET: ReadonlySet<string> = new Set(HOOK_EVENTS as readonly string[]);
+
+/** A rule subscribes to hook events: source hook/* AND event `*` or a hook event. */
+function ruleSubscribesToHooks(rule: Record<string, unknown>): boolean {
+  const trigger = rule.trigger as { source?: unknown; event?: unknown } | undefined;
+  if (!trigger) return false;
+  const { source, event } = trigger;
+  if (source !== 'hook' && source !== '*') return false;
+  return event === '*' || (typeof event === 'string' && HOOK_EVENT_SET.has(event));
 }
 
 /**
- * Deep-scan a config-write payload for an automation trigger that subscribes to
- * hook events (`trigger.source === 'hook'` or wildcard `'*'`). Such triggers
- * receive raw prompts/tool payloads, so they are gated by `agent:hook`.
+ * Collect a signature for every "hook-capable" entry in an automations config
+ * subtree: automation rules that run a hook command OR subscribe to hook events
+ * (source `hook`/`*` with a hook or `*` event), plus standalone runHookCommand
+ * actions. Each signature is the JSON of the entry, so ADDING or MODIFYING a
+ * hook-capable rule changes the signature set — the plugin config-write gate
+ * blocks a non-agent:hook plugin from introducing any new signature (not just
+ * from increasing the count, which a same-count edit would bypass).
  */
-function containsHookTrigger(value: unknown, depth = 0): boolean {
-  if (depth > 8 || value === null || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some((v) => containsHookTrigger(v, depth + 1));
+function hookDangerSignatures(value: unknown, depth = 0, out: string[] = []): string[] {
+  if (depth > 8 || value === null || typeof value !== 'object') return out;
+  if (Array.isArray(value)) {
+    for (const v of value) hookDangerSignatures(v, depth + 1, out);
+    return out;
+  }
   const obj = value as Record<string, unknown>;
-  const trigger = obj.trigger as { source?: unknown } | undefined;
-  if (trigger && (trigger.source === 'hook' || trigger.source === '*')) return true;
-  return Object.values(obj).some((v) => containsHookTrigger(v, depth + 1));
+  if (obj.type === 'runHookCommand') out.push('cmd:' + safeJson(obj));
+  if (obj.trigger && ruleSubscribesToHooks(obj)) out.push('rule:' + safeJson(obj));
+  for (const v of Object.values(obj)) hookDangerSignatures(v, depth + 1, out);
+  return out;
+}
+
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
 }
 
 /**
@@ -480,17 +494,21 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         if (path === 'automations' || path.startsWith('automations.')) {
           const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
           if (!hasAgentHook) {
-            // Validate the RESULTING automations config, not just the incoming
-            // value — a leaf write like `automations.rules.0.trigger.source =
-            // 'hook'` wouldn't be caught by scanning the value alone.
+            // Block if the write ADDS or MODIFIES any hook-capable rule/action.
+            // Compare the multiset of serialized hook-capable entries before vs.
+            // after: unrelated writes (e.g. automations.log.maxEntries) leave it
+            // unchanged; adding a new hook rule OR editing an existing one (same
+            // count, different content) both introduce a new signature → block.
             const currentAutomations = (callbacks.getConfig() as { automations?: unknown }).automations;
             const clone =
               currentAutomations && typeof currentAutomations === 'object'
                 ? (JSON.parse(JSON.stringify(currentAutomations)) as Record<string, unknown>)
                 : {};
+            const beforeSigs = new Set(hookDangerSignatures(currentAutomations));
             const container: Record<string, unknown> = { automations: clone };
             applyNestedWrite(container, path, value);
-            if (containsRunHookCommand(container.automations) || containsHookTrigger(container.automations)) {
+            const introducedHookEntry = hookDangerSignatures(container.automations).some((sig) => !beforeSigs.has(sig));
+            if (introducedHookEntry) {
               throw new Error(
                 'Writing automation rules that use hook commands or hook/wildcard triggers requires the "agent:hook" permission (can read/execute the agent loop).',
               );

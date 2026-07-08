@@ -23,16 +23,17 @@ export const HOOK_EVENTS: readonly HookEvent[] = [
 ] as const;
 
 /**
- * True when an automation rule's trigger would receive `hook:*` events — i.e.
- * `source === 'hook'` or a wildcard `source === '*'`. Such rules can read raw
- * prompts / tool args / tool results off the automation bus, so writing them
- * is gated the same as the dangerous `agent:hook` permission.
+ * True when an automation rule's trigger would receive hook events — source is
+ * `hook` or wildcard `*`, AND the event is `*` or a concrete hook event. Such
+ * rules can read raw prompts / tool args / tool results off the automation bus.
  */
 export function ruleTriggersOnHookEvents(rule: unknown): boolean {
   if (!rule || typeof rule !== 'object') return false;
-  const trigger = (rule as { trigger?: { source?: unknown } }).trigger;
-  const source = trigger?.source;
-  return source === 'hook' || source === '*';
+  const trigger = (rule as { trigger?: { source?: unknown; event?: unknown } }).trigger;
+  if (!trigger) return false;
+  const { source, event } = trigger;
+  if (source !== 'hook' && source !== '*') return false;
+  return event === '*' || (typeof event === 'string' && (HOOK_EVENTS as readonly string[]).includes(event));
 }
 
 /**
