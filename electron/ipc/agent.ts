@@ -2015,13 +2015,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     let effectiveMessages = messages;
     if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
       try {
-        const dispatch = await hookDispatcher.dispatch('UserPromptSubmit', {
-          conversationId: '',
-          messages,
-          systemPrompt: '',
-          modelKey: modelKey ?? config.models.defaultModelKey,
-          purpose: 'title-generation',
-        });
+        const dispatch = await hookDispatcher.dispatch(
+          'UserPromptSubmit',
+          {
+            conversationId: '',
+            messages,
+            systemPrompt: '',
+            modelKey: modelKey ?? config.models.defaultModelKey,
+            purpose: 'title-generation',
+          },
+          // Enforcement only: don't fan out to the automation bus or observe
+          // handlers, or generating a title would re-trigger the user's
+          // UserPromptSubmit automations a second time for the same prompt.
+          { suppressObserve: true },
+        );
         if (dispatch.denied) return { title: null };
         const next = dispatch.payload as { messages?: unknown[] };
         if (Array.isArray(next?.messages)) effectiveMessages = next.messages;

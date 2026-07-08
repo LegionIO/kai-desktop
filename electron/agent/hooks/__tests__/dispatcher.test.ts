@@ -97,4 +97,29 @@ describe('HookDispatcher rule throttling', () => {
     expect(spawnCalls.filter((c) => c === 'cmd-b').length).toBe(1);
     expect(spawnCalls.length).toBe(2);
   });
+
+  it('suppressObserve skips observe handlers (enforcement-only dispatch)', async () => {
+    const rule: AutomationRule = {
+      id: 'r-observe',
+      name: 'observe hook',
+      enabled: true,
+      trigger: { source: 'hook', event: 'UserPromptSubmit' },
+      conditions: [],
+      conditionMode: 'all',
+      actions: [{ type: 'runHookCommand', command: 'observe-cmd', mode: 'observe' }],
+      debounceMs: 0,
+    } as AutomationRule;
+
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => makeConfig(rule) });
+
+    await d.dispatch('UserPromptSubmit', { conversationId: 'c', messages: [] }, { suppressObserve: true });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawnCalls.length).toBe(0);
+
+    // Without suppressObserve the same observe hook DOES fire.
+    await d.dispatch('UserPromptSubmit', { conversationId: 'c', messages: [] });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawnCalls.length).toBe(1);
+  });
 });

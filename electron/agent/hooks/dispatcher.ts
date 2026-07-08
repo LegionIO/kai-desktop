@@ -408,7 +408,11 @@ export class HookDispatcher {
    * (notifications, agent runs, …) can react to lifecycle events in
    * observe-only fashion.
    */
-  async dispatch<T = unknown>(event: HookEvent, payload: T): Promise<DispatchResult<T>> {
+  async dispatch<T = unknown>(
+    event: HookEvent,
+    payload: T,
+    opts?: { suppressObserve?: boolean },
+  ): Promise<DispatchResult<T>> {
     const cfg = this.safeConfig();
     const enabled = cfg?.hooks?.enabled ?? true;
     const timeoutMs = cfg?.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -426,7 +430,11 @@ export class HookDispatcher {
     // Observe-only fan-out to the automation engine. Emits the FINAL (post-
     // enforcement) payload and is skipped on deny, so a low-permission event
     // subscriber never sees raw data that a DLP block/modify hook removed.
+    // `suppressObserve` skips the fan-out entirely — used for auxiliary calls
+    // (e.g. title generation) that must run ENFORCEMENT only and must not
+    // re-trigger the user's automations for the same prompt.
     const emitObserve = (finalPayload: T): void => {
+      if (opts?.suppressObserve) return;
       if (!eventBus.hasListeners()) return;
       try {
         eventBus.emit('hook', event, jsonSafe(finalPayload));
@@ -467,6 +475,10 @@ export class HookDispatcher {
       const effectiveMode = ENFORCING_HOOK_EVENTS.has(event) ? reg.mode : 'observe';
 
       if (effectiveMode === 'observe') {
+        // suppressObserve → enforcement-only dispatch (e.g. title generation):
+        // skip observe handlers too, so their side effects don't fire for the
+        // auxiliary call.
+        if (opts?.suppressObserve) continue;
         void Promise.resolve()
           .then(() => reg.handler(current))
           .catch((err) => console.warn(`[hooks] observe handler for ${event} threw:`, err));
