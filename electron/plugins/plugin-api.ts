@@ -516,9 +516,17 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
               before.some((s) => !afterSet.has(s));
             // Disabling the whole automations engine also neuters hook coverage.
             const disablingWithHooks = (path === 'automations.enabled' || path === 'automations') && before.length > 0;
-            if (changed || disablingWithHooks) {
+            // `approvalMode` decides whether the agent's `automations` tool prompts
+            // the user (or silently allows) before creating dangerous hook/shell
+            // rules. Loosening it (e.g. to "auto-allow") is itself a hook-enforcement
+            // change, so gate any modification to it behind agent:hook.
+            const readApprovalMode = (a: unknown): unknown =>
+              a && typeof a === 'object' ? (a as { approvalMode?: unknown }).approvalMode : undefined;
+            const approvalModeChanged =
+              readApprovalMode(currentAutomations) !== readApprovalMode(container.automations);
+            if (changed || disablingWithHooks || approvalModeChanged) {
               throw new Error(
-                'Adding, modifying, or removing hook commands / hook-triggered automations (or disabling automations while hook rules exist) requires the "agent:hook" permission.',
+                'Adding, modifying, or removing hook commands / hook-triggered automations, changing the automations approval mode, or disabling automations while hook rules exist requires the "agent:hook" permission.',
               );
             }
           }
