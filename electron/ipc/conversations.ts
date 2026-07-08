@@ -592,6 +592,14 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       titleUpdatedAt: now,
       runStatus: 'idle',
       hasUnread: false,
+      // Strip SDK session/thread resume ids so the fork starts an isolated
+      // session instead of resuming the original chat's Claude/Codex session.
+      metadata: (() => {
+        const meta = { ...((clone.metadata as Record<string, unknown> | undefined) ?? {}) };
+        delete meta.claudeSdkSessionId;
+        delete meta.codexSdkThreadId;
+        return meta;
+      })(),
     };
 
     store.conversations[forked.id] = forked;

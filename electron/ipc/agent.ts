@@ -55,7 +55,17 @@ import { normalizeTokenUsage } from '../../shared/token-usage.js';
 import type { HookMessage } from '../plugins/types.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 
-const activeStreams = new Map<string, { abort: () => void }>();
+const activeStreams = new Map<string, { abort: () => void; token: string }>();
+
+// Delete the active-stream entry only if it still belongs to this run. A newer
+// run (e.g. from an edit/regenerate mid-stream) replaces the entry with its own
+// token; the old run's cleanup must not remove the new run's controller, or
+// cancel/replacement would no longer abort the live run.
+function deleteStreamIfOwned(conversationId: string, token: string): void {
+  if (activeStreams.get(conversationId)?.token === token) {
+    activeStreams.delete(conversationId);
+  }
+}
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
 
@@ -341,7 +351,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (existing) existing.abort();
 
       const controller = new AbortController();
-      activeStreams.set(conversationId, { abort: () => controller.abort() });
+      const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
       const randomBytes = new Uint8Array(4);
       crypto.getRandomValues(randomBytes);
       const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
@@ -399,7 +410,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          activeStreams.delete(conversationId);
+          deleteStreamIfOwned(conversationId, streamToken);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
           return { conversationId };
@@ -431,7 +442,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          activeStreams.delete(conversationId);
+          deleteStreamIfOwned(conversationId, streamToken);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
           return { conversationId };
@@ -475,7 +486,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           type: 'done',
           ...(warningMeta ? { messageMeta: warningMeta } : {}),
         });
-        activeStreams.delete(conversationId);
+        deleteStreamIfOwned(conversationId, streamToken);
         activeStreamModelKeys.delete(conversationId);
         activeObserverSessions.delete(conversationId);
         return { conversationId };
@@ -619,7 +630,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
-          activeStreams.delete(conversationId);
+          deleteStreamIfOwned(conversationId, streamToken);
           activeStreamModelKeys.delete(conversationId);
           activeObserverSessions.delete(conversationId);
           return;
@@ -720,7 +731,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             });
 
             // Provider handled the request — clean up and exit
-            activeStreams.delete(conversationId);
+            deleteStreamIfOwned(conversationId, streamToken);
             activeStreamModelKeys.delete(conversationId);
             activeObserverSessions.delete(conversationId);
             return;
@@ -740,7 +751,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               });
               broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
               void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
-              activeStreams.delete(conversationId);
+              deleteStreamIfOwned(conversationId, streamToken);
               activeStreamModelKeys.delete(conversationId);
               activeObserverSessions.delete(conversationId);
               return;
@@ -758,7 +769,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             });
             broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
             void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
-            activeStreams.delete(conversationId);
+            deleteStreamIfOwned(conversationId, streamToken);
             activeStreamModelKeys.delete(conversationId);
             activeObserverSessions.delete(conversationId);
             return;
@@ -1831,7 +1842,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           observerLaunchesEnabled = false;
           await waitForObserverToolExecutions();
           observer?.dispose();
-          activeStreams.delete(conversationId);
+          deleteStreamIfOwned(conversationId, streamToken);
           activeStreamModelKeys.delete(conversationId);
           if (activeObserverSessions.get(conversationId) === observerSessionId) {
             activeObserverSessions.delete(conversationId);
@@ -1847,7 +1858,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const controller = activeStreams.get(conversationId);
     if (controller) {
       controller.abort();
-      activeStreams.delete(conversationId);
+      // Delete only the entry we just aborted (guard against a race where a
+      // replacement run already took over).
+      deleteStreamIfOwned(conversationId, controller.token);
       activeStreamModelKeys.delete(conversationId);
     }
     activeObserverSessions.delete(conversationId);

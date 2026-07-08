@@ -1204,6 +1204,7 @@ export function RuntimeProvider({
   const dismissedBannersRef = useRef<Set<string>>(new Set());
 
   const activeIdRef = useRef<string | null>(null);
+  const isRunningRef = useRef(false);
   const treeRef = useRef<StoredMessage[]>([]);
   const headIdRef = useRef<string | null>(null);
   const currentWorkingDirectoryRef = useRef<string | null>(null);
@@ -1314,6 +1315,9 @@ export function RuntimeProvider({
   useEffect(() => {
     activeIdRef.current = activeConversationId;
   }, [activeConversationId]);
+  useEffect(() => {
+    isRunningRef.current = isRunning;
+  }, [isRunning]);
   useEffect(() => {
     treeRef.current = tree;
   }, [tree]);
@@ -2529,6 +2533,10 @@ export function RuntimeProvider({
     async (message: AppendMessage) => {
       const convId = activeIdRef.current;
       if (!convId) return;
+      // Don't start a concurrent run: if a response is streaming, editing would
+      // spawn a second run whose controller replaces the live one in
+      // activeStreams, breaking cancel. Ignore edits while running.
+      if (isRunningRef.current) return;
 
       // assistant-ui's edit action passes sourceId = the original message id and
       // parentId = that same id. Anchor the new node at the ORIGINAL's parent so
