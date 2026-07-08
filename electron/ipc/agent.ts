@@ -976,11 +976,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (toolName === 'create_artifact' || toolName === 'update_artifact') {
             return { result };
           }
-          // Preserve inline diffs: a result carrying diff-tracking metadata must
-          // not be compacted to a string, or the _diffTracking payload (and the
-          // inline diff view) is lost.
-          if (result && typeof result === 'object' && '_diffTracking' in (result as Record<string, unknown>)) {
-            return { result };
+          // Preserve inline diffs: only skip compaction when the result carries
+          // ACTUAL tracked diffs. A skipped snapshot (diffs: [], snapshotSkipped)
+          // has nothing to preserve, so large shell output should still compact.
+          if (result && typeof result === 'object') {
+            const dt = (result as Record<string, unknown>)._diffTracking as { diffs?: unknown[] } | undefined;
+            if (dt && Array.isArray(dt.diffs) && dt.diffs.length > 0) {
+              return { result };
+            }
           }
 
           const originalText = stringifyToolResult(result);

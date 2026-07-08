@@ -206,7 +206,7 @@ export async function buildToolRegistry(
 
   // File-change inspection + rollback (agent-facing view of the diff tracker)
   if (config?.tools?.diffTracking?.enabled !== false) {
-    tools.push(...createFileChangesTools());
+    tools.push(...createFileChangesTools(getConfig));
   }
 
   // Media generation tools

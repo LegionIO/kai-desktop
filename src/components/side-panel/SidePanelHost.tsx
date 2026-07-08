@@ -89,7 +89,7 @@ const MAX_PCT = 80;
 const DEFAULT_PCT = 45;
 
 export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
-  const { state, activeTabId, openPanel, closePanel, minimizePanel, setActiveTab } = useSidePanel();
+  const { state, activeTabId, openPanel, minimizePanel, setActiveTab } = useSidePanel();
   const [widthPct, setWidthPct] = useState(DEFAULT_PCT);
   const dragRef = useRef<{ startX: number; startPct: number; parentWidth: number } | null>(null);
 
@@ -220,7 +220,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
         <Tooltip content="Close" side="bottom">
           <button
             type="button"
-            onClick={closePanel}
+            onClick={minimizePanel}
             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <XIcon className="h-4 w-4" />

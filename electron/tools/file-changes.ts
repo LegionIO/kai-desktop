@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
-import { getDiffText, listDiffsForConversation, revertAllDiffs, revertDiff, revertToOp } from './diff-tracker.js';
+import { getDiffText, listDiffsForConversation, revertDiff, revertToOp } from './diff-tracker.js';
+import { isPathAllowed } from './file-access.js';
 
 /**
  * Agent-facing view of the per-conversation file-edit diff tracker so the model
@@ -29,7 +31,7 @@ const revertInputSchema = z.object({
     ),
 });
 
-export function createFileChangesTools(): ToolDefinition[] {
+export function createFileChangesTools(getConfig: () => AppConfig): ToolDefinition[] {
   const list: ToolDefinition = {
     name: 'list_file_changes',
     description: [
@@ -41,7 +43,11 @@ export function createFileChangesTools(): ToolDefinition[] {
     execute: async (_input, context) => {
       const conversationId = (context as ToolExecutionContext | undefined)?.conversationId;
       if (!conversationId) return { ok: false, error: 'No conversation context available.' };
-      const diffs = listDiffsForConversation(conversationId);
+      const config = getConfig();
+      // Re-check current file-access policy: a path tracked while allowed may
+      // since have been denied (or file access disabled). Don't expose or allow
+      // reverting content the agent can no longer access.
+      const diffs = listDiffsForConversation(conversationId).filter((d) => isPathAllowed(d.path, config).allowed);
       return {
         ok: true,
         fileCount: diffs.length,
@@ -75,6 +81,9 @@ export function createFileChangesTools(): ToolDefinition[] {
       const conversationId = (context as ToolExecutionContext | undefined)?.conversationId;
       if (!conversationId) return { ok: false, error: 'No conversation context available.' };
       const { path } = input as z.infer<typeof getInputSchema>;
+      if (!isPathAllowed(path, getConfig()).allowed) {
+        return { ok: false, error: `Path ${path} is not currently allowed by file-access policy.` };
+      }
       const unifiedDiff = getDiffText(conversationId, path);
       if (unifiedDiff === null) return { ok: false, error: `No tracked changes for ${path}.` };
       return { ok: true, path, unifiedDiff };
@@ -92,11 +101,23 @@ export function createFileChangesTools(): ToolDefinition[] {
     execute: async (input, context) => {
       const conversationId = (context as ToolExecutionContext | undefined)?.conversationId;
       if (!conversationId) return { ok: false, error: 'No conversation context available.' };
+      const config = getConfig();
       const { path, toOpIndex } = input as z.infer<typeof revertInputSchema>;
       if (!path) {
         if (toOpIndex !== undefined) return { ok: false, error: 'toOpIndex requires a single path.' };
-        const r = revertAllDiffs(conversationId);
-        return { ok: r.success, reverted: r.reverted, skipped: r.skipped };
+        // Only revert paths still permitted by the current policy.
+        const allowed = listDiffsForConversation(conversationId).filter((d) => isPathAllowed(d.path, config).allowed);
+        let reverted = 0;
+        const skipped: string[] = [];
+        for (const d of allowed) {
+          const r = revertDiff(conversationId, d.path);
+          if (r.success) reverted++;
+          else skipped.push(d.path);
+        }
+        return { ok: skipped.length === 0, reverted, skipped };
+      }
+      if (!isPathAllowed(path, config).allowed) {
+        return { ok: false, error: `Path ${path} is not currently allowed by file-access policy.` };
       }
       const r =
         toOpIndex !== undefined ? revertToOp(conversationId, path, toOpIndex) : revertDiff(conversationId, path);
