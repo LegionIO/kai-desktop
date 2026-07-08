@@ -734,6 +734,36 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
         const toolCancels = new Map<string, () => void>();
         const hookDeniedToolCalls = new Map<string, string>();
+        // toolCallId → sanitized args, set when a PreToolUse hook modifies/denies.
+        // Used to rewrite the streamed `tool-call` event so raw args aren't
+        // persisted into chat history after a DLP hook redacted them.
+        const hookRewrittenArgs = new Map<string, unknown>();
+        // Memoized PreToolUse result per execution toolCallId, so the stream
+        // `tool-call` handler (which the UI renders) and `onToolExecutionStart`
+        // (which runs the tool) share ONE dispatch — no double-fire, and no race
+        // where the UI shows raw args before the hook resolves.
+        type PreToolResult = { denied: boolean; reason?: string; args: unknown };
+        const preToolResults = new Map<string, Promise<PreToolResult>>();
+        const runPreToolUseOnce = (toolCallId: string, toolName: string, args: unknown): Promise<PreToolResult> => {
+          const existing = preToolResults.get(toolCallId);
+          if (existing) return existing;
+          const p = (async (): Promise<PreToolResult> => {
+            const preTool = await hookDispatcher.dispatch('PreToolUse', {
+              conversationId,
+              toolCallId,
+              toolName,
+              args,
+            });
+            if (preTool.denied) {
+              const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+              return { denied: true, reason, args: { redacted: true, reason } };
+            }
+            const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+            return { denied: false, args: nextArgs !== undefined ? nextArgs : args };
+          })();
+          preToolResults.set(toolCallId, p);
+          return p;
+        };
         const pendingObserverToolExecutions = new Set<Promise<void>>();
         let observerLaunchesEnabled = true;
         let observer: ToolObserverManager | null = null;
@@ -1285,38 +1315,54 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               enqueueByToolName(pendingExecIdsByToolName, state.toolName, state.toolCallId);
               pairExecuteAndStreamToolCallIds(state.toolName);
 
-              // ── Lifecycle hook: PreToolUse ──────────────────────────────
-              // Runs BEFORE the observer so a block/modify DLP hook can deny or
-              // sanitize args before the observer model ever sees them.
-              // `block` → cancel the tool and surface reason as an error result.
-              // `modify` → replace args before the tool executes.
-              const preTool = await hookDispatcher.dispatch('PreToolUse', {
-                conversationId,
-                toolCallId: state.toolCallId,
-                toolName: state.toolName,
-                args: state.args,
-              });
+              // ── Lifecycle hook: PreToolUse (memoized) ───────────────────
+              // Shared with the stream `tool-call` handler so the UI and the
+              // executor agree on one outcome. Runs BEFORE the observer so a
+              // block/modify DLP hook denies/sanitizes args before the observer
+              // model sees them. `block` → skip execution with an error result;
+              // `modify` → replace args in place before the tool runs.
+              const preTool = await runPreToolUseOnce(state.toolCallId, state.toolName, state.args);
               if (preTool.denied) {
                 const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
                 hookDeniedToolCalls.set(state.toolCallId, reason);
-                // Denied → observer never sees the (raw) args.
+                const denyStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+                hookRewrittenArgs.set(denyStreamId, preTool.args);
+                // Correct the rendered tool-call in place (renderer upserts by
+                // toolCallId) so the UI never keeps showing the raw args.
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-call',
+                  toolCallId: denyStreamId,
+                  toolName: state.toolName,
+                  args: preTool.args,
+                });
                 return { skip: true as const, result: { isError: true, error: reason } };
               }
-              const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
-              if (nextArgs !== undefined && nextArgs !== state.args) {
+              if (preTool.args !== state.args) {
                 // Mutate in place — the same object reference is passed to tool.execute().
                 if (
                   state.args &&
                   typeof state.args === 'object' &&
-                  nextArgs &&
-                  typeof nextArgs === 'object' &&
+                  preTool.args &&
+                  typeof preTool.args === 'object' &&
                   !Array.isArray(state.args) &&
-                  !Array.isArray(nextArgs)
+                  !Array.isArray(preTool.args)
                 ) {
                   const target = state.args as Record<string, unknown>;
                   for (const k of Object.keys(target)) delete target[k];
-                  Object.assign(target, nextArgs as Record<string, unknown>);
+                  Object.assign(target, preTool.args as Record<string, unknown>);
                 }
+                const modStreamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+                hookRewrittenArgs.set(modStreamId, preTool.args);
+                // Correct the rendered tool-call in place (upsert by toolCallId)
+                // so the sanitized args replace any raw args already shown.
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'tool-call',
+                  toolCallId: modStreamId,
+                  toolName: state.toolName,
+                  args: preTool.args,
+                });
               }
 
               // Observer sees post-enforcement (allowed, possibly sanitized) args.
@@ -1543,6 +1589,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
               enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
               pairExecuteAndStreamToolCallIds(event.toolName);
+              // If a PreToolUse hook redacted/denied this call, replace the
+              // streamed args so the sanitized version is what gets persisted.
+              const rewritten = hookRewrittenArgs.get(event.toolCallId);
+              if (rewritten !== undefined) {
+                (event as Record<string, unknown>).args = rewritten;
+              }
             }
             if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
               // Plan mode was entered mid-stream. Abort this stream so the renderer

