@@ -1000,17 +1000,32 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (toolName === 'create_artifact' || toolName === 'update_artifact') {
             return { result };
           }
-          // Preserve inline diffs: only skip compaction when the result carries
-          // ACTUAL tracked diffs. A skipped snapshot (diffs: [], snapshotSkipped)
-          // has nothing to preserve, so large shell output should still compact.
-          if (result && typeof result === 'object') {
-            const dt = (result as Record<string, unknown>)._diffTracking as { diffs?: unknown[] } | undefined;
+          // Preserve inline diffs THROUGH compaction: capture the diff metadata,
+          // compact the (possibly large) rest, then re-attach the metadata so a
+          // build/install that both prints a lot and touches a lockfile still
+          // gets its stdout shrunk without losing the inline diff.
+          let preservedDiffTracking: unknown;
+          let resultForCompaction = result;
+          if (result && typeof result === 'object' && !Array.isArray(result)) {
+            const r = result as Record<string, unknown>;
+            const dt = r._diffTracking as { diffs?: unknown[] } | undefined;
             if (dt && Array.isArray(dt.diffs) && dt.diffs.length > 0) {
-              return { result };
+              preservedDiffTracking = dt;
+              const { _diffTracking, ...rest } = r;
+              void _diffTracking;
+              resultForCompaction = rest;
             }
           }
+          const reattach = (value: unknown): unknown => {
+            if (preservedDiffTracking === undefined) return value;
+            if (value && typeof value === 'object' && !Array.isArray(value)) {
+              return { ...(value as Record<string, unknown>), _diffTracking: preservedDiffTracking };
+            }
+            // Compaction produced a bare string — wrap so _diffTracking survives.
+            return { value, _diffTracking: preservedDiffTracking };
+          };
 
-          const originalText = stringifyToolResult(result);
+          const originalText = stringifyToolResult(resultForCompaction);
           const userQuery = extractLatestUserQuery(messages);
           const shouldAttemptCompaction =
             originalText.length > 0 &&
@@ -1028,7 +1043,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
 
           if (!shouldAttemptCompaction) {
-            return { result };
+            return { result: reattach(resultForCompaction) };
           }
 
           queueOrBroadcastToolCompaction(
@@ -1074,7 +1089,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               });
 
               return {
-                result: compactionResult.content,
+                result: reattach(compactionResult.content),
                 compaction: {
                   originalContent: originalText,
                   wasCompacted: true,
@@ -1093,7 +1108,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             console.warn('[Agent] Tool compaction failed for', toolName, ':', compactionError);
           }
 
-          return { result };
+          return { result: reattach(resultForCompaction) };
         };
 
         const waitForObserverToolExecutions = async (): Promise<void> => {

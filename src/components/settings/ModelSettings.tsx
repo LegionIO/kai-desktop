@@ -177,10 +177,16 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
       // which can make defaults/profiles fall through to another model).
       const orphaned = catalog.filter((m) => m.provider === name);
       if (orphaned.length > 0) {
-        void updateConfig(
-          'models.catalog',
-          catalog.filter((m) => m.provider !== name),
-        );
+        const remaining = catalog.filter((m) => m.provider !== name);
+        void updateConfig('models.catalog', remaining);
+        // If the current default model belonged to the deleted provider, point
+        // it at a surviving model instead of letting it silently fall through
+        // to whatever resolveStreamConfig picks first.
+        const defaultKey = (config.models as { defaultModelKey?: string }).defaultModelKey;
+        const removedKeys = new Set(orphaned.map((m) => m.key));
+        if (defaultKey && removedKeys.has(defaultKey)) {
+          void updateConfig('models.defaultModelKey', remaining[0]?.key ?? '');
+        }
       }
     }
     if (editingName === name) setEditingName(null);

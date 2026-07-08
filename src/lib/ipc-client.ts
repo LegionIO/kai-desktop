@@ -165,6 +165,9 @@ type AppAPI = {
     clear: (conversationId: string) => Promise<{ success: boolean }>;
     onChange: (callback: (event: DiffEvent) => void) => () => void;
   };
+  artifacts: {
+    bundleReact: (source: string) => Promise<{ ok: true; code: string } | { ok: false; error: string }>;
+  };
   automations: {
     catalog: () => Promise<AutomationSourceCatalogEntry[]>;
     log: () => Promise<AutomationRunRecord[]>;

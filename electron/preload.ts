@@ -203,6 +203,13 @@ const appAPI = {
     },
   },
 
+  artifacts: {
+    bundleReact: (source: string) =>
+      ipcRenderer.invoke('artifact:bundle-react', { source }) as Promise<
+        { ok: true; code: string } | { ok: false; error: string }
+      >,
+  },
+
   automations: {
     catalog: () =>
       ipcRenderer.invoke('automations:catalog') as Promise<

@@ -1,7 +1,8 @@
-import { memo, useCallback, useMemo, useRef, type FC } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type FC } from 'react';
 import type { ArtifactType } from '@/providers/ArtifactProvider';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { CodeBlock } from '@/components/thread/CodeBlock';
+import { app } from '@/lib/ipc-client';
 
 /**
  * Sandboxed iframe host for html / svg / react artifacts.
@@ -47,24 +48,29 @@ const BASE_STYLES =
   'body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#0f172a;background:#ffffff}*,*::before,*::after{box-sizing:border-box}';
 
 /**
- * CSP for artifact frames. Blocks all network egress by default so a model-
- * supplied script can't beacon/fetch to external or localhost/private targets.
- * `img-src` allows only inline data URIs. `react` mode needs the unpkg CDN for
- * React + Babel, so it widens script-src/connect-src to that origin only.
+ * CSP for artifact frames. Blocks all network egress so a model-supplied script
+ * can't beacon/fetch to external or localhost/private targets. `img-src` allows
+ * only inline data URIs.
+ *
+ * `react` mode is fully network-free: React is bundled locally in the main
+ * process (see electron/ipc/artifact-bundle.ts) and inlined into the document,
+ * so there are NO remote scripts and NO allowed connect origins. It only needs
+ * `script-src 'unsafe-inline'` to execute the inlined IIFE — no `'unsafe-eval'`
+ * (production React does not use eval/Function) and no CDN origin (which would
+ * be a data-exfiltration channel for untrusted model code).
+ *
+ * The policy is identical for every artifact mode: closed by default, inline
+ * scripts only (all script content is constructed by us, never model-supplied
+ * as an external reference), and no network egress whatsoever.
  */
-function cspMeta(mode: 'static' | 'react'): string {
-  // React mode runs Babel-standalone, which compiles JSX via eval/Function —
-  // Chromium blocks that without 'unsafe-eval'. Scoped to the sandboxed react
-  // frame only (no allow-same-origin, connect-src limited to unpkg).
-  const scriptSrc = mode === 'react' ? "'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com" : "'unsafe-inline'";
-  const connectSrc = mode === 'react' ? 'https://unpkg.com' : "'none'";
+function cspMeta(): string {
   const policy = [
     "default-src 'none'",
-    `script-src ${scriptSrc}`,
+    "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     'img-src data:',
     'font-src data:',
-    `connect-src ${connectSrc}`,
+    "connect-src 'none'",
     "form-action 'none'",
     "navigate-to 'none'",
     "base-uri 'none'",
@@ -74,7 +80,7 @@ function cspMeta(mode: 'static' | 'react'): string {
 
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
-  const csp = cspMeta('static');
+  const csp = cspMeta();
   // ALWAYS re-wrap into a known-safe document with the CSP as the very first
   // head element. We never preserve model-supplied <head> or pre-<head> content
   // (a `<script>` before an injected CSP would execute before the policy
@@ -100,57 +106,85 @@ function wrapSvg(content: string): string {
   const body = svg.startsWith('<svg')
     ? svg
     : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">${svg}</svg>`;
-  return `<!doctype html><html><head><meta charset="utf-8">${cspMeta('static')}<style>${BASE_STYLES}svg{display:block;max-width:100%;height:auto;margin:auto}</style></head><body>${body}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${cspMeta()}<style>${BASE_STYLES}svg{display:block;max-width:100%;height:auto;margin:auto}</style></head><body>${body}</body></html>`;
 }
 
 /**
- * React artifacts are wrapped in a standalone document that pulls React 18
- * UMD builds from a CDN and Babel-standalone for JSX. If the network is
- * unavailable the frame degrades to showing the raw source (a plain fallback
- * script detects that React/Babel didn't load and renders the source instead).
+ * Build the standalone document for a React artifact. React is bundled locally
+ * in the main process (electron/ipc/artifact-bundle.ts) into a self-contained
+ * IIFE with zero remote references, so we inline it directly under a fully
+ * network-free CSP — no CDN, no `connect-src`, no data-exfiltration surface.
+ * The mount + error-reporting bootstrap is baked into the bundle itself.
  */
-function wrapReact(content: string): string {
-  const normalized = content
-    .replace(/^\s*export\s+default\s+/m, 'const App = ')
-    .replace(/^\s*export\s+(?=(const|let|var|function|class)\b)/gm, '');
-  const escaped = normalized.replace(/<\/script>/gi, '<\\/script>');
-  const sourceLiteral = JSON.stringify(content);
+function wrapReactBundle(bundledCode: string): string {
+  // Neutralize any literal `</script>` sequence in the bundle so it can't
+  // prematurely close the inline <script> tag we drop it into.
+  const escaped = bundledCode.replace(/<\/script>/gi, '<\\/script>');
   return [
     '<!doctype html><html><head><meta charset="utf-8">',
-    cspMeta('react'),
+    cspMeta(),
     `<style>${BASE_STYLES}#root{min-height:100vh}</style>`,
-    '<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>',
-    '<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>',
-    '<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>',
     '</head><body><div id="root"></div>',
-    '<script type="text/babel" data-presets="react">',
-    escaped,
-    '\n;try{const __c=typeof App!=="undefined"?App:(typeof Component!=="undefined"?Component:null);',
-    'if(__c){ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(__c));}',
-    'else{document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">No component named App or Component was exported.</pre>";}}',
-    'catch(e){document.getElementById("root").innerHTML="<pre style=\\"padding:1rem;color:#b91c1c\\">"+String(e)+"</pre>";}',
-    '</script>',
-    // Offline/CDN-blocked fallback: if React or Babel never loaded, the
-    // text/babel script above is ignored and #root stays empty. Detect that and
-    // render the raw source so the preview degrades gracefully.
     '<script>',
-    `var __src=${sourceLiteral};`,
-    'setTimeout(function(){',
-    'var loaded=(typeof React!=="undefined"&&typeof ReactDOM!=="undefined"&&typeof Babel!=="undefined");',
-    'var root=document.getElementById("root");',
-    'if(!loaded&&root&&!root.hasChildNodes()){',
-    'var note=document.createElement("div");',
-    'note.style.cssText="padding:0.5rem 1rem;background:#fef3c7;color:#92400e;font:12px sans-serif";',
-    'note.textContent="React runtime unavailable (offline or CDN blocked) — showing source.";',
-    'var pre=document.createElement("pre");',
-    'pre.style.cssText="padding:1rem;white-space:pre-wrap;word-break:break-word";',
-    'pre.textContent=__src;',
-    'root.appendChild(note);root.appendChild(pre);}',
-    '},1500);',
+    escaped,
     '</script>',
     '</body></html>',
   ].join('');
 }
+
+/**
+ * React artifacts are compiled to a self-contained bundle in the main process
+ * (see electron/ipc/artifact-bundle.ts) before rendering. While that IPC round
+ * trip is in flight we show a lightweight "Rendering…" state; on failure we
+ * show the bundler error alongside the raw source so the preview degrades
+ * gracefully (there is no network dependency to fall back to anymore).
+ */
+const ReactArtifact: FC<{ content: string; title: string }> = ({ content, title }) => {
+  const [state, setState] = useState<
+    { status: 'loading' } | { status: 'ready'; srcDoc: string } | { status: 'error'; error: string }
+  >({ status: 'loading' });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ status: 'loading' });
+    app.artifacts
+      .bundleReact(content)
+      .then((result) => {
+        if (cancelled) return;
+        if (result.ok) {
+          setState({ status: 'ready', srcDoc: wrapReactBundle(result.code) });
+        } else {
+          setState({ status: 'error', error: result.error });
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setState({ status: 'error', error: err instanceof Error ? err.message : String(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [content]);
+
+  if (state.status === 'loading') {
+    return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">Rendering…</div>;
+  }
+
+  if (state.status === 'error') {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="border-b border-red-500/30 bg-red-500/10 px-4 py-2 text-xs text-red-700 dark:text-red-400">
+          Failed to build React preview: {state.error}
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-3">
+          <CodeBlock code={content} language="jsx" maxHeight="none" />
+        </div>
+      </div>
+    );
+  }
+
+  return <SandboxedFrame srcDoc={state.srcDoc} title={title} />;
+};
 
 /** `mermaid` is not in package.json (npmjs.org is blocked) — render source with a note. */
 const MermaidStub: FC<{ content: string }> = ({ content }) => (
@@ -172,7 +206,6 @@ export const ArtifactRenderer: FC<{ type: ArtifactType; content: string; title: 
   const srcDoc = useMemo(() => {
     if (type === 'html') return wrapHtml(content);
     if (type === 'svg') return wrapSvg(content);
-    if (type === 'react') return wrapReact(content);
     return null;
   }, [type, content]);
 
@@ -186,6 +219,10 @@ export const ArtifactRenderer: FC<{ type: ArtifactType; content: string; title: 
 
   if (type === 'mermaid') {
     return <MermaidStub content={content} />;
+  }
+
+  if (type === 'react') {
+    return <ReactArtifact content={content} title={title} />;
   }
 
   if (srcDoc != null) {
