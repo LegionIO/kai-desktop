@@ -79,11 +79,27 @@ function withAzureApiVersion(inner: typeof fetch, apiVersion: string): typeof fe
   };
 }
 
+/** True when the URL's PATH ends in `/responses`, ignoring any query string. */
+function isResponsesEndpoint(url: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    // Not absolute (shouldn't happen for a fetch URL) — fall back to the raw
+    // string, but strip any query/hash so `?api-version=…` doesn't defeat us.
+    pathname = url.split(/[?#]/, 1)[0];
+  }
+  return stripTrailingSlashes(pathname).endsWith('/responses');
+}
+
 function createResponsesApiPatchingFetch(): typeof fetch {
   return async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
 
-    if (!url.endsWith('/responses') || typeof init?.body !== 'string') {
+    // Match on the URL PATH, not the whole string — the Azure api-version
+    // wrapper appends `?api-version=…`, which would otherwise defeat a naive
+    // `endsWith('/responses')` and silently skip the body repair.
+    if (!isResponsesEndpoint(url) || typeof init?.body !== 'string') {
       return fetch(input, init);
     }
 

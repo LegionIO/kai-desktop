@@ -236,6 +236,12 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // toolName (FIFO); onToolExecutionStart dequeues one and re-broadcasts the
     // resolved args under the stream id the renderer actually rendered.
     const subSuppressedStreamIdsByTool = new Map<string, string[]>();
+    // Symmetric case: onToolExecutionStart resolved args BEFORE the stream
+    // tool-call event arrived AND the exec id differs from the stream id. There
+    // is no stream id to correct yet, so the resolved args are parked here per
+    // toolName (FIFO); the stream loop consumes one before falling back to
+    // {pending}, so the card is never left permanently suppressed.
+    const subResolvedArgsByTool = new Map<string, unknown[]>();
 
     // Helper: add a follow-up message and emit it as a UI event
     const addFollowUpMessage = (text: string, source: 'user' | 'parent' | 'task' = 'parent'): SubAgentEvent => {
@@ -360,10 +366,16 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
                   parentConversationId,
                   parentToolCallId,
                 } as SubAgentEvent);
+              } else if (!streamId) {
+                // Exec-first: the stream event hasn't arrived yet. If it later
+                // uses the SAME id, it finds `resolved` via subHookRewrittenArgs
+                // by id. If it uses a DIFFERENT id, that by-id lookup misses and
+                // it would suppress to {pending} forever — so also park the
+                // resolved args by toolName (FIFO) for the stream loop to claim.
+                const q = subResolvedArgsByTool.get(state.toolName) ?? [];
+                q.push(resolved);
+                subResolvedArgsByTool.set(state.toolName, q);
               }
-              // Exec-first with a not-yet-seen stream id is handled when the
-              // stream event arrives and finds the value by id (same id) — no
-              // separate per-tool stash (which could leak onto the next call).
             };
             if (preTool.denied) {
               const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
@@ -439,14 +451,24 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           if (rewritten !== undefined) {
             (enriched as Record<string, unknown>).args = rewritten;
           } else if (subEnforcingHooks && !(event.toolName && subProviderToolNames.has(event.toolName))) {
-            (enriched as Record<string, unknown>).args = { pending: true };
-            (enriched as Record<string, unknown>).argsPending = true;
-            // Record this stream id so onToolExecutionStart can re-broadcast the
-            // resolved args under it even if the exec-side id differs.
-            if (event.toolName) {
-              const q = subSuppressedStreamIdsByTool.get(event.toolName) ?? [];
-              q.push(event.toolCallId);
-              subSuppressedStreamIdsByTool.set(event.toolName, q);
+            // Exec-first with a mismatched id: onToolExecutionStart already
+            // resolved args and parked them by toolName. Claim one instead of
+            // suppressing, so the card is never stuck {pending}.
+            const parkedQueue = event.toolName ? subResolvedArgsByTool.get(event.toolName) : undefined;
+            const parked = parkedQueue && parkedQueue.length > 0 ? parkedQueue.shift() : undefined;
+            if (parked !== undefined) {
+              (enriched as Record<string, unknown>).args = parked;
+              subHookRewrittenArgs.set(event.toolCallId, parked);
+            } else {
+              (enriched as Record<string, unknown>).args = { pending: true };
+              (enriched as Record<string, unknown>).argsPending = true;
+              // Record this stream id so onToolExecutionStart can re-broadcast the
+              // resolved args under it even if the exec-side id differs.
+              if (event.toolName) {
+                const q = subSuppressedStreamIdsByTool.get(event.toolName) ?? [];
+                q.push(event.toolCallId);
+                subSuppressedStreamIdsByTool.set(event.toolName, q);
+              }
             }
           }
         }
