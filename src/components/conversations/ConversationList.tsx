@@ -336,6 +336,15 @@ export const ConversationList: FC<ConversationListProps> = ({
   const handleExport = async (id: string, format: 'markdown' | 'json') => {
     setContextMenu(null);
     setExportSubmenuOpen(false);
+    // The native quick export opens an Electron save dialog on the main process,
+    // which produces nothing for a browser client. In web mode, fall back to the
+    // ExportDialog, which builds the file client-side and triggers a Blob
+    // download in the browser.
+    const isWebBridge = Boolean((window as unknown as { app?: { __isWebBridge?: boolean } }).app?.__isWebBridge);
+    if (isWebBridge) {
+      setExportConvId(id);
+      return;
+    }
     await app.conversations.export(id, format);
   };
 
