@@ -212,6 +212,19 @@ function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
   );
 }
 
+/**
+ * Deep-scan a value (a config write payload) for any `{ type: 'runHookCommand' }`
+ * automation action. Used to gate plugin config writes behind `agent:hook`.
+ * Depth-bounded to avoid pathological nesting.
+ */
+function containsRunHookCommand(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((v) => containsRunHookCommand(v, depth + 1));
+  const obj = value as Record<string, unknown>;
+  if (obj.type === 'runHookCommand') return true;
+  return Object.values(obj).some((v) => containsRunHookCommand(v, depth + 1));
+}
+
 function normalizePluginTool(tool: ToolDefinition): ToolDefinition {
   const rawSchema = tool.inputSchema as unknown;
   const inputSchema = isZodSchema(rawSchema)
@@ -420,6 +433,19 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
       set: (path: string, value: unknown) => {
         requirePermission('config:write');
+        // runHookCommand automation actions execute arbitrary shell on hook
+        // events. Writing them via config would bypass both the agent:hook
+        // dangerous-permission gate and the automation-manage tool block, so
+        // require agent:hook when a plugin config write introduces one.
+        if (
+          (path === 'automations' || path.startsWith('automations.')) &&
+          containsRunHookCommand(value) &&
+          !manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number])
+        ) {
+          throw new Error(
+            'Writing runHookCommand automation actions requires the "agent:hook" permission (arbitrary shell execution).',
+          );
+        }
         callbacks.setConfig(path, value);
       },
 

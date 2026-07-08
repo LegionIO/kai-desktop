@@ -9,7 +9,7 @@
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { z } from 'zod';
-import { streamAgentResponse } from './mastra-agent.js';
+import { streamAgentResponse, getProviderDefinedToolNames } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import { hookDispatcher } from './hooks/dispatcher.js';
 import type { LLMModelConfig } from './model-catalog.js';
@@ -226,6 +226,10 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // resolves, matching the main-agent path, so a DLP block/modify hook can't
     // leak raw args into the sub-agent UI/persistence.
     const subEnforcingHooks = hookDispatcher.hasEnforcingToolHooks();
+    // Provider-native tools execute in-provider and never hit
+    // onToolExecutionStart, so their args must not be suppressed (nothing would
+    // un-suppress them → stuck {pending}).
+    const subProviderToolNames = getProviderDefinedToolNames(modelConfig);
     const subHookRewrittenArgs = new Map<string, unknown>();
     // Sub-agent runtime has no exec/stream id pairing map. To reconcile a
     // possible id mismatch, the stream loop records suppressed stream ids per
@@ -446,7 +450,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             const resolved = stashed.shift();
             (enriched as Record<string, unknown>).args = resolved;
             subHookRewrittenArgs.set(event.toolCallId, resolved);
-          } else if (subEnforcingHooks) {
+          } else if (subEnforcingHooks && !(event.toolName && subProviderToolNames.has(event.toolName))) {
             (enriched as Record<string, unknown>).args = { pending: true };
             (enriched as Record<string, unknown>).argsPending = true;
             // Record this stream id so onToolExecutionStart can re-broadcast the

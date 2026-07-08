@@ -486,6 +486,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           type: 'done',
           ...(warningMeta ? { messageMeta: warningMeta } : {}),
         });
+        void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         deleteStreamIfOwned(conversationId, streamToken);
         activeStreamModelKeys.delete(conversationId);
         activeObserverSessions.delete(conversationId);

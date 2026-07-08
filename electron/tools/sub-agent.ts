@@ -12,7 +12,7 @@ import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { runSubAgent, getActiveSubAgentCount } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
-import { streamAgentResponse } from '../agent/mastra-agent.js';
+import { streamAgentResponse, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import type { LLMModelConfig } from '../agent/model-catalog.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
@@ -114,6 +114,8 @@ async function resumeSubAgent(
 
   try {
     const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
+    // Provider-native tools execute in-provider; never suppress their args.
+    const providerToolNames = getProviderDefinedToolNames(modelConfig);
     const rewrittenArgs = new Map<string, unknown>();
     // Exec-first stash: if onToolExecutionStart resolves before the stream
     // tool-call event and the exec id differs from the stream id, the stream
@@ -225,7 +227,7 @@ async function resumeSubAgent(
         } else if (stashed && stashed.length > 0) {
           // Exec-first with a divergent id: apply the stashed resolved args.
           (enriched as Record<string, unknown>).args = stashed.shift();
-        } else if (enforcingHooks) {
+        } else if (enforcingHooks && !(event.toolName && providerToolNames.has(event.toolName))) {
           (enriched as Record<string, unknown>).args = { pending: true };
           (enriched as Record<string, unknown>).argsPending = true;
           // Record this suppressed stream id so onToolExecutionStart corrects
