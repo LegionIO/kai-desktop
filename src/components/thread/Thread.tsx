@@ -45,6 +45,7 @@ import {
   LoaderIcon,
   MessageSquareTextIcon,
   ArrowUpIcon,
+  PencilIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
@@ -237,6 +238,7 @@ export const Thread: FC<{
                     components={{
                       UserMessage,
                       AssistantMessage,
+                      EditComposer,
                     }}
                   />
 
@@ -737,14 +739,50 @@ const UserMessage: FC = () => {
         <div
           className={`flex items-center justify-end gap-1 mt-1 transition-opacity ${message.isLast ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
         >
+          <BranchPicker />
           <MessageTimestamp date={message.createdAt} align="right" />
           <ActionBarPrimitive.Root className="flex items-center gap-1">
+            <Tooltip content="Edit">
+              <ActionBarPrimitive.Edit className="flex h-7 w-7 items-center justify-center rounded-xl hover:bg-muted transition-colors">
+                <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              </ActionBarPrimitive.Edit>
+            </Tooltip>
             <CopyButton />
             {ttsEnabled && <SpeakButton />}
           </ActionBarPrimitive.Root>
         </div>
       </div>
     </MessagePrimitive.Root>
+  );
+};
+
+/** Inline editor shown in place of a user bubble when ActionBarPrimitive.Edit is
+ *  triggered. Submitting fires the external-store `onEdit` handler which forks a
+ *  sibling variant and re-runs the agent. */
+const EditComposer: FC = () => {
+  return (
+    <ComposerPrimitive.Root className="mb-6 flex justify-end">
+      <div
+        className="flex w-full max-w-[88%] flex-col gap-2 rounded-xl border px-3 py-2.5 md:max-w-[72%]"
+        style={{
+          backgroundColor: 'var(--app-user-bubble)',
+          borderColor: 'var(--app-user-bubble-border)',
+        }}
+      >
+        <ComposerPrimitive.Input
+          autoFocus
+          className="max-h-60 min-h-[2.5rem] w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
+        />
+        <div className="flex items-center justify-end gap-2">
+          <ComposerPrimitive.Cancel className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+            Cancel
+          </ComposerPrimitive.Cancel>
+          <ComposerPrimitive.Send className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50">
+            Send
+          </ComposerPrimitive.Send>
+        </div>
+      </div>
+    </ComposerPrimitive.Root>
   );
 };
 
@@ -1528,9 +1566,13 @@ const MessageInfoIndicator: FC = () => {
   );
 };
 
-/** Custom branch picker using our tree-based branching */
+/** Custom branch picker using our tree-based branching. Renders under any
+ *  message on the active branch that has sibling variants (regenerated
+ *  assistant replies or edited user prompts). */
 const BranchPicker: FC = () => {
-  const nav = useBranchNav();
+  const message = useMessage();
+  const lookup = useBranchNav();
+  const nav = lookup(message.id);
   if (!nav || nav.total <= 1) return null;
 
   return (

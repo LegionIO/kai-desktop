@@ -95,6 +95,12 @@ const appAPI = {
       ipcRenderer.on('conversations:changed', handler);
       return () => ipcRenderer.removeListener('conversations:changed', handler);
     },
+    editMessage: (conversationId: string, messageId: string, newContent: unknown) =>
+      ipcRenderer.invoke('conversations:edit-message', conversationId, messageId, newContent),
+    regenerate: (conversationId: string, assistantMessageId: string) =>
+      ipcRenderer.invoke('conversations:regenerate', conversationId, assistantMessageId),
+    switchVariant: (conversationId: string, variantId: string) =>
+      ipcRenderer.invoke('conversations:switch-variant', conversationId, variantId),
   },
 
   workspaces: {

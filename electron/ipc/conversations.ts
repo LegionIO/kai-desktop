@@ -110,6 +110,16 @@ export function ensureConversationTree(conv: ConversationRecord): {
   return { tree, headId: tree[tree.length - 1]?.id ?? null };
 }
 
+/** Walk from a node down its most-recently-created child chain to the leaf. */
+function findDeepestDescendant(tree: StoredTreeMessage[], startId: string): string {
+  let head = startId;
+  for (;;) {
+    const children = tree.filter((m) => m.parentId === head);
+    if (children.length === 0) return head;
+    head = children[children.length - 1].id;
+  }
+}
+
 export function getConversationBranch(tree: StoredTreeMessage[], headId: string | null): StoredTreeMessage[] {
   if (!headId) return [];
   const byId = new Map(tree.map((m) => [m.id, m] as const));
@@ -429,6 +439,92 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
     return { ok: true };
+  });
+
+  // ── edit / regenerate / variant navigation ────────────────────────────────
+  // The renderer normally drives these via local tree state + `conversations:put`,
+  // but exposing them as IPC lets plugins, automations, and the web bridge
+  // perform the same operations without duplicating tree logic.
+
+  const commitTreeUpdate = (
+    store: ConversationsStore,
+    conv: ConversationRecord,
+    tree: StoredTreeMessage[],
+    headId: string | null,
+    extra: Partial<ConversationRecord> = {},
+  ): ConversationRecord => {
+    const branch = getConversationBranch(tree, headId);
+    const now = new Date().toISOString();
+    const next: ConversationRecord = {
+      ...conv,
+      messageTree: tree,
+      messages: branch,
+      headId,
+      updatedAt: now,
+      messageCount: branch.length,
+      userMessageCount: branch.filter((m) => m.role === 'user').length,
+      ...extra,
+    };
+    store.conversations[conv.id] = next;
+    writeConversationStore(appHome, store);
+    broadcastConversationChange(store);
+    return next;
+  };
+
+  ipcMain.handle(
+    'conversations:edit-message',
+    (_event, conversationId: string, messageId: string, newContent: unknown) => {
+      const store = readConversationStore(appHome);
+      const conv = store.conversations[conversationId];
+      if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+      const { tree } = ensureConversationTree(conv);
+      const source = tree.find((m) => m.id === messageId);
+      if (!source) return { ok: false, error: 'message-not-found' };
+
+      // Shelve the current tail by leaving it in the tree; create a sibling with
+      // the edited content anchored at the same parent. headId moves to the new
+      // sibling so a fresh assistant run can append underneath it.
+      const content = Array.isArray(newContent)
+        ? newContent
+        : [{ type: 'text', text: typeof newContent === 'string' ? newContent : String(newContent ?? '') }];
+      const edited: StoredTreeMessage = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        role: source.role,
+        content,
+        parentId: source.parentId,
+        createdAt: new Date().toISOString(),
+      };
+      const nextTree = [...tree, edited];
+      return { ok: true, conversation: commitTreeUpdate(store, conv, nextTree, edited.id) };
+    },
+  );
+
+  ipcMain.handle('conversations:regenerate', (_event, conversationId: string, assistantMessageId: string) => {
+    const store = readConversationStore(appHome);
+    const conv = store.conversations[conversationId];
+    if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+    const { tree, headId } = ensureConversationTree(conv);
+    const target = tree.find((m) => m.id === assistantMessageId);
+    if (!target) return { ok: false, error: 'message-not-found' };
+
+    // Move head to the preceding user turn; the old assistant tail remains in
+    // the tree as a sibling variant the user can flip back to.
+    const nextHead = target.role === 'assistant' ? target.parentId : (target.id ?? headId);
+    return { ok: true, conversation: commitTreeUpdate(store, conv, tree, nextHead) };
+  });
+
+  ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
+    const store = readConversationStore(appHome);
+    const conv = store.conversations[conversationId];
+    if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+    const { tree } = ensureConversationTree(conv);
+    if (!tree.some((m) => m.id === variantId)) return { ok: false, error: 'variant-not-found' };
+
+    const nextHead = findDeepestDescendant(tree, variantId);
+    return { ok: true, conversation: commitTreeUpdate(store, conv, tree, nextHead) };
   });
 
   ipcMain.handle('conversations:get-active-id', () => {

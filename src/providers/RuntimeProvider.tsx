@@ -331,9 +331,14 @@ type BranchNav = {
   goToNext: () => void;
 };
 
-const BranchNavContext = createCtx<BranchNav | null>(null);
+/** Per-message branch navigation lookup — returns nav for any message on the
+ *  active branch that has sibling variants, or null. Called with no argument,
+ *  returns nav for the last assistant message (legacy behaviour). */
+type BranchNavLookup = (messageId?: string) => BranchNav | null;
 
-export function useBranchNav(): BranchNav | null {
+const BranchNavContext = createCtx<BranchNavLookup>(() => null);
+
+export function useBranchNav(): BranchNavLookup {
   return useCtx(BranchNavContext);
 }
 
@@ -1326,18 +1331,32 @@ export function RuntimeProvider({
     return getAccumulatorStartedAt(streamAccumulators.get(activeConversationId));
   }, [activeConversationId, isRunning, tree, headId]);
 
-  // Track siblings for branch picking — only when not streaming to avoid transient wrong counts
+  // Track siblings for branch picking — computed per-message on the active
+  // branch so both regenerated assistant replies and edited user prompts
+  // surface a ◀ n/m ▶ control at their branch point.
+  type BranchPoint = { siblings: StoredMessage[]; currentIdx: number; total: number };
+  const branchPoints = useMemo<Map<string, BranchPoint>>(() => {
+    const points = new Map<string, BranchPoint>();
+    if (isRunning) return points; // don't show branches while generating
+    const branch = getActiveBranch(tree, headId);
+    for (const msg of branch) {
+      const siblings = tree.filter((m) => m.parentId === msg.parentId && m.role === msg.role);
+      if (siblings.length <= 1) continue;
+      const currentIdx = siblings.findIndex((m) => m.id === msg.id);
+      points.set(msg.id, { siblings, currentIdx, total: siblings.length });
+    }
+    return points;
+  }, [tree, headId, isRunning]);
+
+  // Legacy single-branch info for the last assistant message (kept so existing
+  // callers of useBranchNav() with no messageId continue to work).
   const branchInfo = useMemo(() => {
-    if (isRunning) return null; // don't show branches while generating
+    if (isRunning) return null;
     const branch = getActiveBranch(tree, headId);
     const lastAssistant = [...branch].reverse().find((m) => m.role === 'assistant');
     if (!lastAssistant) return null;
-    const parentId = lastAssistant.parentId;
-    const siblings = tree.filter((m) => m.parentId === parentId && m.role === 'assistant');
-    if (siblings.length <= 1) return null; // no branches
-    const currentIdx = siblings.findIndex((m) => m.id === lastAssistant.id);
-    return { siblings, currentIdx, total: siblings.length, parentId };
-  }, [tree, headId, isRunning]);
+    return branchPoints.get(lastAssistant.id) ?? null;
+  }, [branchPoints, tree, headId, isRunning]);
 
   const loadConversationState = useCallback(async (id: string) => {
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
@@ -2506,6 +2525,81 @@ export function RuntimeProvider({
     ],
   );
 
+  const onEdit = useCallback(
+    async (message: AppendMessage) => {
+      const convId = activeIdRef.current;
+      if (!convId) return;
+
+      // assistant-ui passes parentId = the parent of the message being edited,
+      // and sourceId = the id of the original message. Re-anchor a fresh user
+      // node at the same parent so the old tail becomes a sibling variant.
+      const source = message.sourceId ? tree.find((m) => m.id === message.sourceId) : undefined;
+      const editParentId = message.parentId ?? source?.parentId ?? null;
+
+      const userContent: ContentPart[] = [];
+      for (const part of message.content) {
+        if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
+        else if (part.type === 'image') {
+          const imagePart = part as { image: string; mimeType?: string };
+          userContent.push({
+            type: 'image',
+            image: imagePart.image,
+            ...(imagePart.mimeType ? { mimeType: imagePart.mimeType } : {}),
+          });
+        }
+      }
+      // Preserve non-text attachments (images/files) from the original turn so
+      // editing the prompt text doesn't silently drop them.
+      if (source && Array.isArray(source.content)) {
+        for (const part of source.content as ContentPart[]) {
+          if (part.type === 'image' && !userContent.some((p) => p.type === 'image' && p.image === part.image)) {
+            userContent.push(part);
+          } else if (part.type === 'file') {
+            userContent.push(part);
+          }
+        }
+      }
+      if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
+
+      const editedMsg: StoredMessage = {
+        id: msgId(),
+        parentId: editParentId,
+        role: 'user',
+        content: toStoredContent(userContent),
+        createdAt: new Date(),
+      };
+      const newTree = [...tree, editedMsg];
+      const newHead = editedMsg.id;
+      const pendingAssistantTiming = createPendingAssistantTiming();
+
+      lastRetitleCount.delete(convId);
+      setTree(newTree);
+      setHeadId(newHead);
+      setIsRunning(true);
+
+      streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
+      const branch = getActiveBranch(newTree, newHead);
+
+      await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+      void maybeGenerateTitle(convId, branch);
+      console.info(
+        `[UI:stream:edit] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} sourceId=${message.sourceId ?? '(none)'}`,
+      );
+      app.agent.stream(
+        convId,
+        branch,
+        selectedModelKey ?? undefined,
+        reasoningEffort ?? 'medium',
+        selectedProfileKey ?? undefined,
+        fallbackEnabled ?? false,
+        currentWorkingDirectoryRef.current ?? undefined,
+        executionMode ?? 'auto',
+        threadOverrides ?? undefined,
+      );
+    },
+    [tree, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides],
+  );
+
   const onCancel = useCallback(async () => {
     const convId = activeIdRef.current;
     if (!convId) return;
@@ -2585,25 +2679,25 @@ export function RuntimeProvider({
     [tree],
   );
 
-  const goToPreviousBranch = useCallback(() => {
-    if (!branchInfo || branchInfo.currentIdx <= 0) return;
-    goToBranch(branchInfo.siblings[branchInfo.currentIdx - 1].id);
-  }, [branchInfo, goToBranch]);
-
-  const goToNextBranch = useCallback(() => {
-    if (!branchInfo || branchInfo.currentIdx >= branchInfo.total - 1) return;
-    goToBranch(branchInfo.siblings[branchInfo.currentIdx + 1].id);
-  }, [branchInfo, goToBranch]);
-
-  const branchNav: BranchNav | null =
-    branchInfo && branchInfo.total > 1
-      ? {
-          total: branchInfo.total,
-          current: branchInfo.currentIdx + 1,
-          goToPrevious: goToPreviousBranch,
-          goToNext: goToNextBranch,
-        }
-      : null;
+  const branchNav = useCallback<BranchNavLookup>(
+    (messageId) => {
+      const point = messageId ? branchPoints.get(messageId) : branchInfo;
+      if (!point || point.total <= 1) return null;
+      return {
+        total: point.total,
+        current: point.currentIdx + 1,
+        goToPrevious: () => {
+          if (point.currentIdx <= 0) return;
+          goToBranch(point.siblings[point.currentIdx - 1].id);
+        },
+        goToNext: () => {
+          if (point.currentIdx >= point.total - 1) return;
+          goToBranch(point.siblings[point.currentIdx + 1].id);
+        },
+      };
+    },
+    [branchPoints, branchInfo, goToBranch],
+  );
 
   const assistantResponseTiming = useMemo<AssistantResponseTimingState>(
     () => ({
@@ -2731,6 +2825,7 @@ export function RuntimeProvider({
     messages: activeBranch,
     setMessages: () => {},
     onNew,
+    onEdit,
     onReload,
     onCancel,
     convertMessage: (m: ThreadMessageLike) => {

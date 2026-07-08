@@ -84,6 +84,19 @@ type AppAPI = {
       format: 'markdown' | 'json',
     ) => Promise<{ ok: boolean; filePath?: string; canceled?: boolean; error?: string }>;
     onChanged: (callback: (store: unknown) => void) => () => void;
+    editMessage: (
+      conversationId: string,
+      messageId: string,
+      newContent: unknown,
+    ) => Promise<{ ok: boolean; conversation?: unknown; error?: string }>;
+    regenerate: (
+      conversationId: string,
+      assistantMessageId: string,
+    ) => Promise<{ ok: boolean; conversation?: unknown; error?: string }>;
+    switchVariant: (
+      conversationId: string,
+      variantId: string,
+    ) => Promise<{ ok: boolean; conversation?: unknown; error?: string }>;
   };
   workspaces: {
     create: (args: { name: string; directory: string }) => Promise<unknown>;
