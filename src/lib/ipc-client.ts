@@ -8,6 +8,7 @@ import type {
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 import type { AppShotPayload } from '../../shared/app-shots';
+import type { DiffEvent, FileDiff } from '../../shared/diff-types';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
 
 export type AutomationSourceCatalogEntry = {
@@ -124,6 +125,13 @@ type AppAPI = {
     }>;
     delete: (name: string) => Promise<{ success?: boolean; error?: string }>;
     toggle: (name: string, enable: boolean) => Promise<{ success?: boolean; enabled?: boolean }>;
+  };
+  diffs: {
+    listForConversation: (conversationId: string) => Promise<FileDiff[]>;
+    get: (conversationId: string, path: string) => Promise<FileDiff | null>;
+    revert: (conversationId: string, path: string) => Promise<{ success: boolean; error?: string }>;
+    clear: (conversationId: string) => Promise<{ success: boolean }>;
+    onChange: (callback: (event: DiffEvent) => void) => () => void;
   };
   automations: {
     catalog: () => Promise<AutomationSourceCatalogEntry[]>;

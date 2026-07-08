@@ -36,6 +36,7 @@ import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools } from './tools/mcp-client.js';
 import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
+import { registerDiffHandlers } from './ipc/diffs.js';
 import { registerAutomationsHandlers } from './ipc/automations.js';
 import { eventBus } from './automations/event-bus.js';
 import { registerBuiltinSources } from './automations/builtin-sources.js';
@@ -913,6 +914,7 @@ if (gotSingleInstanceLock) {
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
+    registerDiffHandlers(ipcMain);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
     registerBatchTranscribeHandlers(ipcMain, getConfig);

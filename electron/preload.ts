@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface } from '../shared/computer-use.js';
 import type { AppShotPayload } from '../shared/app-shots.js';
+import type { DiffEvent, FileDiff } from '../shared/diff-types.js';
 import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
 
 export type AppAPI = typeof appAPI;
@@ -149,6 +150,22 @@ const appAPI = {
       ipcRenderer.invoke('skills:delete', name) as Promise<{ success?: boolean; error?: string }>,
     toggle: (name: string, enable: boolean) =>
       ipcRenderer.invoke('skills:toggle', name, enable) as Promise<{ success?: boolean; enabled?: boolean }>,
+  },
+
+  diffs: {
+    listForConversation: (conversationId: string) =>
+      ipcRenderer.invoke('diffs:list', conversationId) as Promise<FileDiff[]>,
+    get: (conversationId: string, path: string) =>
+      ipcRenderer.invoke('diffs:get', conversationId, path) as Promise<FileDiff | null>,
+    revert: (conversationId: string, path: string) =>
+      ipcRenderer.invoke('diffs:revert', conversationId, path) as Promise<{ success: boolean; error?: string }>,
+    clear: (conversationId: string) =>
+      ipcRenderer.invoke('diffs:clear', conversationId) as Promise<{ success: boolean }>,
+    onChange: (callback: (event: DiffEvent) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: DiffEvent) => callback(payload);
+      ipcRenderer.on('diffs:changed', handler);
+      return () => ipcRenderer.removeListener('diffs:changed', handler);
+    },
   },
 
   automations: {

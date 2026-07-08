@@ -139,6 +139,16 @@ const fileAccessSchema = z.object({
   denyPaths: z.array(z.string()),
 });
 
+const diffTrackingSchema = z.object({
+  enabled: z.boolean(),
+  /** Max files to stat during a pre/post shell snapshot before falling back to AI inference. */
+  snapshotFileLimit: z.number().positive(),
+  /** Wall-clock budget (ms) for a single snapshot walk. */
+  snapshotTimeoutMs: z.number().positive(),
+  /** When true, ask the default model to infer changed paths when the snapshot is skipped or empty. */
+  aiFallback: z.boolean(),
+});
+
 const processStreamingSchema = z.object({
   enabled: z.boolean(),
   updateIntervalMs: z.number().positive(),
@@ -729,6 +739,12 @@ export const appConfigSchema = z.object({
   tools: z.object({
     shell: shellGuardrailsSchema,
     fileAccess: fileAccessSchema,
+    diffTracking: diffTrackingSchema.default({
+      enabled: true,
+      snapshotFileLimit: 2000,
+      snapshotTimeoutMs: 200,
+      aiFallback: true,
+    }),
     processStreaming: processStreamingSchema,
     subAgents: subAgentConfigSchema,
     executionMode: executionModeSchema.default('auto'),

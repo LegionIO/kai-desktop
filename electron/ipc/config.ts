@@ -85,6 +85,12 @@ function getDefaultConfig() {
         allowPaths: ['~'],
         denyPaths: [],
       },
+      diffTracking: {
+        enabled: true,
+        snapshotFileLimit: 2000,
+        snapshotTimeoutMs: 200,
+        aiFallback: true,
+      },
       processStreaming: {
         enabled: true,
         updateIntervalMs: 250,

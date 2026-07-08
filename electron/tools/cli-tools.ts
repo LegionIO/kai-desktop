@@ -6,6 +6,7 @@ import type { PluginCliToolContribution } from '../plugins/types.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { runToolExecution } from './execution.js';
 import { isCommandAllowed } from './shell.js';
+import { beginShellSnapshot } from './diff-tracker.js';
 import { binaryExistsInResolvedPath } from '../utils/shell-env.js';
 
 export function binaryExists(name: string): boolean {
@@ -77,21 +78,32 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
         }
 
         const streaming = resolveProcessStreamingConfig(config);
+        const effectiveCwd = cwd || context.cwd || process.env.HOME;
+        const diffSnap = await beginShellSnapshot(
+          context.conversationId,
+          { toolName: spec.name, toolCallId: context.toolCallId, command, cwd: effectiveCwd },
+          config,
+        );
         const result = await runCommandWithStreaming({
           command,
           argv,
-          cwd: cwd || context.cwd || process.env.HOME,
+          cwd: effectiveCwd,
           timeoutMs: timeout || config.tools.shell.timeout,
           env: { ...process.env },
           context,
           streaming,
         });
 
+        const diffEvents = await diffSnap.finish({ stdout: result.stdout, stderr: result.stderr });
+
         const payload: Record<string, unknown> = {
           exitCode: result.exitCode,
           stdout: result.stdout,
           stderr: result.stderr,
         };
+        if (diffEvents.length > 0 || diffSnap.snapshotSkipped) {
+          payload._diffTracking = { diffs: diffEvents, snapshotSkipped: diffSnap.snapshotSkipped };
+        }
 
         if (result.timedOut) payload.error = 'Command timed out';
         if (result.cancelled) payload.error = 'Command cancelled';

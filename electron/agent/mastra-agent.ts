@@ -21,6 +21,8 @@ import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
 import { isCommandAllowed } from '../tools/shell.js';
 import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
+import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
+import type { DiffTrackingResultMeta } from '../../shared/diff-types.js';
 import { classifyError, calculateDelay } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
@@ -631,7 +633,25 @@ function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: stri
   return normalized;
 }
 
-function applyWorkspaceToolGuards(tools: Record<string, unknown>, cwd: string, getConfig: () => AppConfig): void {
+const WORKSPACE_FILE_MUTATING_TOOLS: Set<string> = new Set([
+  WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE,
+  WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE,
+]);
+
+function attachDiffMeta(result: unknown, meta: DiffTrackingResultMeta): unknown {
+  if (meta.diffs.length === 0 && !meta.snapshotSkipped) return result;
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    return { ...(result as Record<string, unknown>), _diffTracking: meta };
+  }
+  return { value: result, _diffTracking: meta };
+}
+
+function applyWorkspaceToolGuards(
+  tools: Record<string, unknown>,
+  cwd: string,
+  getConfig: () => AppConfig,
+  conversationId?: string,
+): void {
   for (const [toolName, tool] of Object.entries(tools)) {
     if (!tool || typeof tool !== 'object') continue;
     const candidate = tool as { execute?: (input: unknown, context: unknown) => Promise<unknown> };
@@ -645,6 +665,41 @@ function applyWorkspaceToolGuards(tools: Record<string, unknown>, cwd: string, g
           throw new Error(`${toolName}: ${check.reason}`);
         }
       }
+
+      const toolCallId = (context as { toolCallId?: string } | undefined)?.toolCallId;
+
+      // Diff tracking — file write/edit: capture pre-image before executing.
+      if (
+        conversationId &&
+        WORKSPACE_FILE_MUTATING_TOOLS.has(toolName) &&
+        typeof (normalized as { path?: unknown })?.path === 'string'
+      ) {
+        const absPath = (normalized as { path: string }).path;
+        const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
+        const result = await originalExecute(normalized, context);
+        const ev = handle.finish();
+        return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
+      }
+
+      // Diff tracking — shell/execute_command: mtime snapshot + AI fallback.
+      if (conversationId && toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND) {
+        const cmdInput = normalized as { command?: unknown; cwd?: unknown };
+        const command = typeof cmdInput.command === 'string' ? cmdInput.command : '';
+        const shellCwd = typeof cmdInput.cwd === 'string' ? cmdInput.cwd : cwd;
+        const snap = await beginShellSnapshot(
+          conversationId,
+          { toolName, toolCallId, command, cwd: shellCwd },
+          getConfig(),
+        );
+        const result = await originalExecute(normalized, context);
+        const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
+        const events = await snap.finish({
+          stdout: typeof r?.stdout === 'string' ? r.stdout : '',
+          stderr: typeof r?.stderr === 'string' ? r.stderr : '',
+        });
+        return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
+      }
+
       const result = await originalExecute(normalized, context);
       if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
         return filterGrepOutput(result, getConfig());
@@ -663,6 +718,7 @@ async function createWorkspaceForAgent(
   getConfig: () => AppConfig,
   executionMode?: string,
   progressHook?: (toolCallId: string, stream: 'stdout' | 'stderr', data: string) => void,
+  conversationId?: string,
 ): Promise<{ workspace: Workspace; tools: Record<string, unknown> }> {
   const backgroundProcesses: BackgroundProcessConfig | undefined = progressHook
     ? {
@@ -701,7 +757,7 @@ async function createWorkspaceForAgent(
   await workspace.init();
 
   const tools = await createWorkspaceTools(workspace);
-  applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig);
+  applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig, conversationId);
 
   // If in plan-first mode, remove mutating workspace tools
   if (executionMode === 'plan-first') {
@@ -819,6 +875,7 @@ export async function* streamAgentResponse(
           });
         }
       : undefined,
+    conversationId,
   );
 
   // Wrap custom (non-workspace) tools through the bridge

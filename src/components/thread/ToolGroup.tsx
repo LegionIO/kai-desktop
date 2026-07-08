@@ -43,6 +43,7 @@ import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
 import { useTasksOptional } from '@/providers/TaskProvider';
 import { refocusComposer } from '@/lib/utils';
+import { FileDiffResult, ToolDiffList, extractDiffTracking } from './tool-results/FileDiffResult';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -1881,6 +1882,10 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
           </div>
         )}
       </div>
+      {/* Tracked file diffs produced by this shell command */}
+      {!isRunning && (
+        <ToolDiffList diffs={extractDiffTracking(part.result)} className="ml-5 mb-2" />
+      )}
       {outputModalOpen && shData && (
         <BashOutputModal command={command} shData={shData} onClose={() => setOutputModalOpen(false)} />
       )}
@@ -2938,6 +2943,11 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
 
   const [diffModalOpen, setDiffModalOpen] = useState(false);
 
+  // Tracked unified diff (original-on-disk vs. after-write). Rendered below the
+  // arg-derived preview so the user gets both the intent and the actual result.
+  const trackedDiffs = extractDiffTracking(part.result);
+  const trackedDiff = trackedDiffs.find((d) => d.path === rawPath) ?? trackedDiffs[0] ?? null;
+
   return (
     <>
       <div className="ml-5 mt-1 mb-2 rounded-xs border border-border/70 bg-muted dark:bg-[#111] dark:border-white/10 overflow-hidden text-xs font-mono">
@@ -3032,6 +3042,19 @@ const EditInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
           <div className="px-3 py-2 text-muted-foreground/40 italic">No changes</div>
         )}
       </div>
+
+      {trackedDiff && !isRunning && (
+        <FileDiffResult
+          path={trackedDiff.path}
+          unifiedDiff={trackedDiff.unifiedDiff}
+          additions={trackedDiff.additions}
+          deletions={trackedDiff.deletions}
+          source={trackedDiff.source}
+          created={trackedDiff.created}
+          deleted={trackedDiff.deleted}
+          className="ml-5 mb-2"
+        />
+      )}
 
       {diffModalOpen && (
         <EditDiffModal
