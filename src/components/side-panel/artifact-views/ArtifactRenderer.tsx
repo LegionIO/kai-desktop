@@ -81,11 +81,18 @@ function cspMeta(): string {
 function wrapHtml(content: string): string {
   const trimmed = content.trim();
   const csp = cspMeta();
-  // ALWAYS re-wrap into a known-safe document with the CSP as the very first
-  // head element. We never preserve model-supplied <head> or pre-<head> content
-  // (a `<script>` before an injected CSP would execute before the policy
-  // applies). Extract the <body> inner HTML if present, else strip any
-  // doctype/html/head/body wrappers and treat the remainder as body content.
+  // Always re-wrap into a known-safe document with the CSP as the FIRST head
+  // element, so nothing (esp. a <script>) can run before the policy applies.
+  // We DO preserve safe head children (<style>/<link>/<meta>) so full-document
+  // artifacts keep their styling, but strip <script> from the head (it would
+  // execute pre-CSP) — inline scripts in <body> still run under the CSP.
+  const headMatch = /<head\b[^>]*>([\s\S]*?)<\/head>/i.exec(trimmed);
+  let safeHead = '';
+  if (headMatch) {
+    safeHead = headMatch[1]
+      .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+      .replace(/<meta\b[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi, '');
+  }
   let body: string;
   const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(trimmed);
   if (bodyMatch) {
@@ -98,7 +105,7 @@ function wrapHtml(content: string): string {
       .replace(/<\/?body[^>]*>/gi, '')
       .trim();
   }
-  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style></head><body>${body}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>${BASE_STYLES}</style>${safeHead}</head><body>${body}</body></html>`;
 }
 
 function wrapSvg(content: string): string {

@@ -463,18 +463,22 @@ export class HookDispatcher {
   private syncUserHooks(config: AppConfig): void {
     const automationsEnabled = config.automations?.enabled !== false;
     const rules: AutomationRule[] = config.automations?.rules ?? [];
-    const relevant = automationsEnabled
-      ? rules.filter(
-          (r) =>
-            r.enabled && r.trigger.source === 'hook' && (HOOK_EVENTS as readonly string[]).includes(r.trigger.event),
-        )
-      : [];
+    // A rule contributes user hooks when its trigger subscribes to hook events:
+    // source 'hook' or wildcard '*', and event is a specific hook event or '*'.
+    const targetsHook = (r: AutomationRule): boolean =>
+      (r.trigger.source === 'hook' || r.trigger.source === '*') &&
+      (r.trigger.event === '*' || (HOOK_EVENTS as readonly string[]).includes(r.trigger.event));
+    const relevant = automationsEnabled ? rules.filter((r) => r.enabled && targetsHook(r)) : [];
+    // The concrete hook events a rule maps to (wildcard event → all events).
+    const eventsFor = (r: AutomationRule): HookEvent[] =>
+      r.trigger.event === '*' ? [...HOOK_EVENTS] : [r.trigger.event as HookEvent];
     const timeoutMs = config.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const fingerprint = JSON.stringify([
       timeoutMs,
       automationsEnabled,
       relevant.map((r) => [
         r.id,
+        r.trigger.source,
         r.trigger.event,
         r.conditions,
         r.conditionMode,
@@ -494,29 +498,31 @@ export class HookDispatcher {
     }
 
     for (const rule of relevant) {
-      const event = rule.trigger.event as HookEvent;
-      // Only PreToolUse/PostToolUse/UserPromptSubmit are awaited and can act on
-      // a block/modify result. The rest are fire-and-forget, so coerce their
-      // mode to observe — a block/modify there would silently do nothing.
-      const effectiveModeFor = (mode: HookMode): HookMode => (ENFORCING_HOOK_EVENTS.has(event) ? mode : 'observe');
-      for (const action of rule.actions) {
-        if (action.type !== 'runHookCommand') continue;
-        const { command, matcher } = action;
-        const mode = effectiveModeFor(action.mode);
-        const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
-          try {
-            const cond = evaluateConditions(rule.conditions, rule.conditionMode, payload);
-            if (!cond.ok) return undefined;
-          } catch {
-            return undefined;
-          }
-          return runShellHook(event, command, mode, payload, timeoutMs);
-        };
-        this.register(event, handler, {
-          source: 'user',
-          mode,
-          matcher,
-        });
+      // A wildcard-event rule registers against every concrete hook event.
+      for (const event of eventsFor(rule)) {
+        // Only PreToolUse/PostToolUse/UserPromptSubmit are awaited and can act
+        // on a block/modify result. The rest are fire-and-forget, so coerce
+        // their mode to observe — a block/modify there would silently do nothing.
+        const mode0 = (m: HookMode): HookMode => (ENFORCING_HOOK_EVENTS.has(event) ? m : 'observe');
+        for (const action of rule.actions) {
+          if (action.type !== 'runHookCommand') continue;
+          const { command, matcher } = action;
+          const mode = mode0(action.mode);
+          const handler = (payload: unknown): Promise<HookOutcome | void> | void => {
+            try {
+              const cond = evaluateConditions(rule.conditions, rule.conditionMode, payload);
+              if (!cond.ok) return undefined;
+            } catch {
+              return undefined;
+            }
+            return runShellHook(event, command, mode, payload, timeoutMs);
+          };
+          this.register(event, handler, {
+            source: 'user',
+            mode,
+            matcher,
+          });
+        }
       }
     }
   }

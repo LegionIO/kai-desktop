@@ -169,43 +169,29 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
         {
           name: 'artifact-import-allowlist',
           setup(build) {
-            build.onResolve({ filter: /.*/ }, async (args) => {
+            build.onResolve({ filter: /.*/ }, (args) => {
               if (args.kind === 'entry-point') return null;
-              // Avoid infinite recursion through build.resolve() below.
-              if (args.pluginData === '__artifact_checked') return null;
 
-              const isBare = !args.path.startsWith('.') && !args.path.startsWith('/');
-              // React and react-dom pull in their own bare deps (e.g.
-              // `scheduler`) with an importer inside node_modules — allow those.
+              // React's own transitive imports (importer already inside
+              // node_modules) resolve normally — bare deps like `scheduler` and
+              // relative internals like `./cjs/...`.
               const importerInNodeModules = args.importer.split(sep).includes('node_modules');
-              if (isBare) {
-                if (importerInNodeModules || IMPORT_ALLOWLIST.has(args.path)) return null;
-                // Bare specifier written in the artifact source: reject.
-                return {
-                  errors: [
-                    { text: `Import of "${args.path}" is not allowed in React artifacts (only React is permitted).` },
-                  ],
-                };
-              }
-              // Relative/absolute import: resolve it, then reject anything that
-              // lands outside node_modules (blocks pulling in arbitrary local
-              // files like ~/.kai/config.json). React's own relative internals
-              // resolve inside node_modules and pass.
-              const resolved = await build.resolve(args.path, {
-                kind: args.kind,
-                importer: args.importer,
-                resolveDir: args.resolveDir,
-                pluginData: '__artifact_checked',
-              });
-              if (resolved.errors.length > 0) return resolved;
-              if (!resolved.path.split(sep).includes('node_modules')) {
-                return {
-                  errors: [
-                    { text: `Import of "${args.path}" is not allowed: only React may be bundled into an artifact.` },
-                  ],
-                };
-              }
-              return resolved;
+              if (importerInNodeModules) return null;
+
+              // Everything else originates from the ARTIFACT source. It may ONLY
+              // reference the allowlisted React bare specifiers. Relative and
+              // absolute imports are rejected outright — otherwise a model could
+              // reach arbitrary files (`../../secret`) or arbitrary packages via
+              // `./node_modules/<pkg>` (whose resolved path contains
+              // node_modules but is not React).
+              if (IMPORT_ALLOWLIST.has(args.path)) return null;
+              return {
+                errors: [
+                  {
+                    text: `Import of "${args.path}" is not allowed in React artifacts (only 'react', 'react-dom', and 'react-dom/client' may be imported).`,
+                  },
+                ],
+              };
             });
           },
         } as EsbuildPlugin,
