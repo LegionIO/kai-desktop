@@ -8,6 +8,7 @@ import { automationRuleSchema } from '../config/schema.js';
 import { getRegisteredTools, getWorkspaceToolDefinitions } from '../ipc/agent.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
+import { ruleTriggersOnHookEvents } from '../agent/hooks/dispatcher.js';
 
 type MutableAgentAction = {
   type?: unknown;
@@ -141,7 +142,11 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
                 'runHookCommand actions execute arbitrary shell without guardrails and can only be configured by the user in Settings → Automations.',
             };
           }
+          const hookTriggerWarning = ruleTriggersOnHookEvents(parsed.data)
+            ? 'This rule triggers on agent lifecycle hook events (or a wildcard that includes them), so its actions can observe raw prompts and tool payloads. Confirm this is intended.'
+            : undefined;
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
+          if (hookTriggerWarning) warnings.unshift(hookTriggerWarning);
           persist([...rules, parsed.data]);
           return {
             success: true,
@@ -181,6 +186,11 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
             };
           }
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
+          if (ruleTriggersOnHookEvents(parsed.data)) {
+            warnings.unshift(
+              'This rule triggers on agent lifecycle hook events (or a wildcard that includes them), so its actions can observe raw prompts and tool payloads. Confirm this is intended.',
+            );
+          }
           const next = [...rules];
           next[idx] = parsed.data;
           persist(next);

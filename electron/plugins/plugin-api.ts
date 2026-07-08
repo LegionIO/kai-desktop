@@ -225,6 +225,39 @@ function containsRunHookCommand(value: unknown, depth = 0): boolean {
   return Object.values(obj).some((v) => containsRunHookCommand(v, depth + 1));
 }
 
+/**
+ * Deep-scan a config-write payload for an automation trigger that subscribes to
+ * hook events (`trigger.source === 'hook'` or wildcard `'*'`). Such triggers
+ * receive raw prompts/tool payloads, so they are gated by `agent:hook`.
+ */
+function containsHookTrigger(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((v) => containsHookTrigger(v, depth + 1));
+  const obj = value as Record<string, unknown>;
+  const trigger = obj.trigger as { source?: unknown } | undefined;
+  if (trigger && (trigger.source === 'hook' || trigger.source === '*')) return true;
+  return Object.values(obj).some((v) => containsHookTrigger(v, depth + 1));
+}
+
+/**
+ * Apply a dotted-path write to a nested object in place (numeric segments index
+ * into arrays). Used to compute the resulting config for validation before a
+ * plugin's config write is persisted.
+ */
+function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = path.split('.');
+  let cur: Record<string, unknown> = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const key = parts[i];
+    const next = cur[key];
+    if (next === null || typeof next !== 'object') {
+      cur[key] = /^\d+$/.test(parts[i + 1]) ? [] : {};
+    }
+    cur = cur[key] as Record<string, unknown>;
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
 function normalizePluginTool(tool: ToolDefinition): ToolDefinition {
   const rawSchema = tool.inputSchema as unknown;
   const inputSchema = isZodSchema(rawSchema)
@@ -433,18 +466,31 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
       set: (path: string, value: unknown) => {
         requirePermission('config:write');
-        // runHookCommand automation actions execute arbitrary shell on hook
-        // events. Writing them via config would bypass both the agent:hook
-        // dangerous-permission gate and the automation-manage tool block, so
-        // require agent:hook when a plugin config write introduces one.
-        if (
-          (path === 'automations' || path.startsWith('automations.')) &&
-          containsRunHookCommand(value) &&
-          !manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number])
-        ) {
-          throw new Error(
-            'Writing runHookCommand automation actions requires the "agent:hook" permission (arbitrary shell execution).',
-          );
+        // Automation rules can read the agent loop two ways, both gated by the
+        // dangerous `agent:hook` permission: (1) a runHookCommand action
+        // (arbitrary shell on hook events), or (2) a hook/wildcard TRIGGER,
+        // which receives raw prompts/tool payloads off the automation bus and
+        // can exfiltrate them via any action interpolating {{payload}}. Require
+        // agent:hook for a plugin config write that introduces either.
+        if (path === 'automations' || path.startsWith('automations.')) {
+          const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
+          if (!hasAgentHook) {
+            // Validate the RESULTING automations config, not just the incoming
+            // value — a leaf write like `automations.rules.0.trigger.source =
+            // 'hook'` wouldn't be caught by scanning the value alone.
+            const currentAutomations = (callbacks.getConfig() as { automations?: unknown }).automations;
+            const clone =
+              currentAutomations && typeof currentAutomations === 'object'
+                ? (JSON.parse(JSON.stringify(currentAutomations)) as Record<string, unknown>)
+                : {};
+            const container: Record<string, unknown> = { automations: clone };
+            applyNestedWrite(container, path, value);
+            if (containsRunHookCommand(container.automations) || containsHookTrigger(container.automations)) {
+              throw new Error(
+                'Writing automation rules that use hook commands or hook/wildcard triggers requires the "agent:hook" permission (can read/execute the agent loop).',
+              );
+            }
+          }
         }
         callbacks.setConfig(path, value);
       },

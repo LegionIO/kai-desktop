@@ -23,6 +23,19 @@ export const HOOK_EVENTS: readonly HookEvent[] = [
 ] as const;
 
 /**
+ * True when an automation rule's trigger would receive `hook:*` events — i.e.
+ * `source === 'hook'` or a wildcard `source === '*'`. Such rules can read raw
+ * prompts / tool args / tool results off the automation bus, so writing them
+ * is gated the same as the dangerous `agent:hook` permission.
+ */
+export function ruleTriggersOnHookEvents(rule: unknown): boolean {
+  if (!rule || typeof rule !== 'object') return false;
+  const trigger = (rule as { trigger?: { source?: unknown } }).trigger;
+  const source = trigger?.source;
+  return source === 'hook' || source === '*';
+}
+
+/**
  * Events whose dispatch is AWAITED and can act on a block/modify result.
  * The others (AssistantMessage, AgentStop, ConversationStart) are fire-and-
  * forget, so block/modify there is meaningless and gets coerced to observe.
