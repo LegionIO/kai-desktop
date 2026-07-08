@@ -149,27 +149,32 @@ async function resumeSubAgent(
             // onto the next same-named call).
             const streamQ = suppressedStreamIdsByTool.get(state.toolName);
             const streamId = streamQ && streamQ.length > 0 ? streamQ.shift() : undefined;
-            const targetId = streamId && streamId !== state.toolCallId ? streamId : state.toolCallId;
-            if (targetId !== state.toolCallId) rewrittenArgs.set(targetId, resolved);
-            if (!streamId && enforcingHooks) {
-              // Exec-first: no suppressed stream id yet. If the stream event
-              // later uses the SAME id it finds `resolved` by id; if it uses a
-              // DIFFERENT id the by-id lookup misses and it would suppress to
-              // {pending} forever — so park by toolName for the loop to claim.
+            if (streamId) {
+              // Stream-first: a card was already rendered under `streamId` as
+              // {pending}. Correct it in place. Alias the extra key only when the
+              // ids differ. Broadcast even when streamId === exec id, since the
+              // renderer will not re-emit that card on its own.
+              if (streamId !== state.toolCallId) rewrittenArgs.set(streamId, resolved);
+              if (enforcingHooks) {
+                broadcastEvent({
+                  type: 'tool-call',
+                  toolCallId: streamId,
+                  toolName: state.toolName,
+                  args: resolved,
+                  subAgentConversationId,
+                  parentConversationId,
+                  parentToolCallId,
+                } as SubAgentEvent);
+              }
+            } else if (enforcingHooks) {
+              // Exec-first: the stream event hasn't arrived yet. Do NOT broadcast
+              // a card under the exec id here — the stream event will render it.
+              // If it uses the SAME id it finds `resolved` via rewrittenArgs by
+              // id; if it uses a DIFFERENT id it claims the parked args below.
+              // Broadcasting now would duplicate the card (renderer upserts by id).
               const q = resolvedArgsByTool.get(state.toolName) ?? [];
               q.push(resolved);
               resolvedArgsByTool.set(state.toolName, q);
-            }
-            if (enforcingHooks) {
-              broadcastEvent({
-                type: 'tool-call',
-                toolCallId: targetId,
-                toolName: state.toolName,
-                args: resolved,
-                subAgentConversationId,
-                parentConversationId,
-                parentToolCallId,
-              } as SubAgentEvent);
             }
           };
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
