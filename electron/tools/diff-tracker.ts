@@ -674,8 +674,12 @@ export function revertHunk(
     return { success: false, error: 'Hunk no longer matches current file content (file has drifted).' };
   }
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, applied, 'utf-8');
+    // If this hunk revert lands the file back on its original pre-image AND the
+    // file was newly created by the tracked edits, the correct restoration is to
+    // DELETE it (its pre-edit state was "absent"), not to leave an empty file.
+    // Mirror restoreFile so this matches revertAll's created-file handling.
+    const fullyRestored = entry.created && applied === entry.original;
+    restoreFile(path, applied, fullyRestored);
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : String(error) };
   }

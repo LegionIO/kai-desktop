@@ -353,10 +353,13 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               const streamId = dequeueStreamId();
               // Record under the exec id (the stream loop checks this by id).
               subHookRewrittenArgs.set(state.toolCallId, resolved);
-              if (streamId && streamId !== state.toolCallId) {
-                // A stream event was already rendered under a DIFFERENT id —
-                // correct that card in place.
-                subHookRewrittenArgs.set(streamId, resolved);
+              if (streamId) {
+                // Stream-first: a card was already rendered under `streamId` as
+                // {pending}. Re-broadcast the resolved args to correct it — even
+                // when streamId === exec id, since the renderer will NOT re-emit
+                // that card on its own. Alias the extra key only when the ids
+                // actually differ.
+                if (streamId !== state.toolCallId) subHookRewrittenArgs.set(streamId, resolved);
                 broadcastSubAgentEvent({
                   type: 'tool-call',
                   toolCallId: streamId,
@@ -366,7 +369,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
                   parentConversationId,
                   parentToolCallId,
                 } as SubAgentEvent);
-              } else if (!streamId) {
+              } else {
                 // Exec-first: the stream event hasn't arrived yet. If it later
                 // uses the SAME id, it finds `resolved` via subHookRewrittenArgs
                 // by id. If it uses a DIFFERENT id, that by-id lookup misses and

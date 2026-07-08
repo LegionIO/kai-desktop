@@ -737,6 +737,18 @@ const automationsConfigSchema = z.object({
   enabled: z.boolean().default(true),
   rules: z.array(automationRuleSchema).default([]),
   log: z.object({ maxEntries: z.number().int().positive().default(200) }).default({ maxEntries: 200 }),
+  /**
+   * Governs what happens when the AGENT (via the model-accessible `automations`
+   * tool) tries to create/enable/test a "dangerous" rule — one whose trigger
+   * subscribes to lifecycle hook events, or that contains a `runHookCommand`
+   * (arbitrary shell) action — or tries to disable/delete a user-configured
+   * `runHookCommand` enforcement rule. Does NOT affect the user configuring
+   * rules directly in Settings.
+   *  - auto-allow: no prompt.
+   *  - prompt-user: runtime approval prompt (like plugin approvals), one-shot.
+   *  - block: always denied for the agent.
+   */
+  approvalMode: z.enum(['auto-allow', 'prompt-user', 'block']).default('prompt-user'),
 });
 
 export type AutomationCondition = z.infer<typeof automationConditionSchema>;
@@ -889,7 +901,12 @@ export const appConfigSchema = z.object({
   videoGeneration: videoGenerationConfigSchema.optional(),
   cliTools: z.array(cliToolSchema).optional(),
   autopilot: autopilotConfigSchema.optional(),
-  automations: automationsConfigSchema.default({ enabled: true, rules: [], log: { maxEntries: 200 } }),
+  automations: automationsConfigSchema.default({
+    enabled: true,
+    rules: [],
+    log: { maxEntries: 200 },
+    approvalMode: 'prompt-user',
+  }),
   hooks: hooksConfigSchema,
 });
 

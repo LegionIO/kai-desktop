@@ -121,6 +121,11 @@ async function resumeSubAgent(
     // name. onToolExecutionStart rebroadcasts under the queued stream id (which
     // may differ from its exec id) instead of the exec id.
     const suppressedStreamIdsByTool = new Map<string, string[]>();
+    // Exec-first queue: onToolExecutionStart resolved args BEFORE the stream
+    // tool-call event arrived AND its exec id differs from the stream id. Park
+    // the resolved args by toolName (FIFO); the stream loop claims one before
+    // suppressing to {pending}, so the card is never left permanently hidden.
+    const resolvedArgsByTool = new Map<string, unknown[]>();
     const stream = streamAgentResponse(
       subAgentConversationId,
       messages,
@@ -146,6 +151,15 @@ async function resumeSubAgent(
             const streamId = streamQ && streamQ.length > 0 ? streamQ.shift() : undefined;
             const targetId = streamId && streamId !== state.toolCallId ? streamId : state.toolCallId;
             if (targetId !== state.toolCallId) rewrittenArgs.set(targetId, resolved);
+            if (!streamId && enforcingHooks) {
+              // Exec-first: no suppressed stream id yet. If the stream event
+              // later uses the SAME id it finds `resolved` by id; if it uses a
+              // DIFFERENT id the by-id lookup misses and it would suppress to
+              // {pending} forever — so park by toolName for the loop to claim.
+              const q = resolvedArgsByTool.get(state.toolName) ?? [];
+              q.push(resolved);
+              resolvedArgsByTool.set(state.toolName, q);
+            }
             if (enforcingHooks) {
               broadcastEvent({
                 type: 'tool-call',
@@ -217,14 +231,23 @@ async function resumeSubAgent(
         if (rewritten !== undefined) {
           (enriched as Record<string, unknown>).args = rewritten;
         } else if (enforcingHooks && !(event.toolName && providerToolNames.has(event.toolName))) {
-          (enriched as Record<string, unknown>).args = { pending: true };
-          (enriched as Record<string, unknown>).argsPending = true;
-          // Record this suppressed stream id so onToolExecutionStart corrects
-          // it under the id the renderer actually rendered (stream-first).
-          if (event.toolName) {
-            const q = suppressedStreamIdsByTool.get(event.toolName) ?? [];
-            q.push(event.toolCallId);
-            suppressedStreamIdsByTool.set(event.toolName, q);
+          // Exec-first with a mismatched id: claim a parked resolution instead
+          // of suppressing, so the card is never stuck {pending}.
+          const parkedQ = event.toolName ? resolvedArgsByTool.get(event.toolName) : undefined;
+          const parked = parkedQ && parkedQ.length > 0 ? parkedQ.shift() : undefined;
+          if (parked !== undefined) {
+            (enriched as Record<string, unknown>).args = parked;
+            rewrittenArgs.set(event.toolCallId, parked);
+          } else {
+            (enriched as Record<string, unknown>).args = { pending: true };
+            (enriched as Record<string, unknown>).argsPending = true;
+            // Record this suppressed stream id so onToolExecutionStart corrects
+            // it under the id the renderer actually rendered (stream-first).
+            if (event.toolName) {
+              const q = suppressedStreamIdsByTool.get(event.toolName) ?? [];
+              q.push(event.toolCallId);
+              suppressedStreamIdsByTool.set(event.toolName, q);
+            }
           }
         }
       }

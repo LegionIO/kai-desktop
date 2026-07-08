@@ -3,12 +3,13 @@ import { z } from 'zod';
 import { eventBus } from '../automations/event-bus.js';
 import { getAutomationEngine } from '../automations/engine.js';
 import { validateRulePaths } from '../automations/schema-check.js';
-import type { AutomationRule } from '../config/schema.js';
+import type { AutomationRule, AutomationsConfig } from '../config/schema.js';
 import { automationRuleSchema } from '../config/schema.js';
 import { getRegisteredTools, getWorkspaceToolDefinitions } from '../ipc/agent.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { ruleTriggersOnHookEvents } from '../agent/hooks/dispatcher.js';
+import { registerPendingApproval, broadcastStreamEventRaw } from '../ipc/tool-approval.js';
 
 type MutableAgentAction = {
   type?: unknown;
@@ -37,6 +38,79 @@ function summarizeRule(rule: AutomationRule) {
     actions: rule.actions.map((a) => a.type),
     debounceMs: rule.debounceMs,
     rateLimitPerMinute: rule.rateLimitPerMinute,
+  };
+}
+
+/** A rule contains an arbitrary-shell hook action. */
+function hasShellHookAction(rule: Pick<AutomationRule, 'actions'>): boolean {
+  return rule.actions.some((a) => a.type === 'runHookCommand');
+}
+
+/**
+ * A rule is "dangerous" when the AGENT creating/enabling it would gain a
+ * powerful capability without the user in the loop: it either subscribes to
+ * lifecycle hook events (can observe raw prompts + tool payloads) or runs an
+ * arbitrary shell command.
+ */
+function isDangerousRule(rule: AutomationRule): boolean {
+  return ruleTriggersOnHookEvents(rule) || hasShellHookAction(rule);
+}
+
+type ApprovalDecision = { ok: true } | { ok: false; error: string };
+
+/**
+ * Gate a dangerous agent-initiated automation mutation behind the configured
+ * approval policy. On `prompt-user` it broadcasts a tool-approval-required event
+ * for the calling `automations` tool card and awaits the user's one-shot
+ * decision.
+ */
+async function ensureApproved(
+  rule: AutomationRule,
+  actionLabel: string,
+  automations: AutomationsConfig,
+  context: ToolExecutionContext | undefined,
+): Promise<ApprovalDecision> {
+  const mode = automations.approvalMode ?? 'prompt-user';
+
+  if (mode === 'auto-allow') return { ok: true };
+
+  if (mode === 'block') {
+    return {
+      ok: false,
+      error: `Blocked: automations.approvalMode is "block", so the agent cannot ${actionLabel} a rule that observes lifecycle hook events or runs shell commands. The user can change this in Settings → Automations.`,
+    };
+  }
+
+  // prompt-user: require a live user decision on the calling tool card.
+  const toolCallId = context?.toolCallId;
+  if (!toolCallId) {
+    return {
+      ok: false,
+      error: `Cannot request approval (no tool context). This rule (${actionLabel}) observes lifecycle hook events or runs shell commands and needs user approval; ask the user to set automations.approvalMode to "auto-allow" in Settings → Automations, or perform this in Settings themselves.`,
+    };
+  }
+  broadcastStreamEventRaw({
+    conversationId: context?.conversationId ?? '',
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'automations',
+    args: {
+      approvalKind: 'dangerous-automation',
+      action: actionLabel,
+      rule: summarizeRule(rule),
+      reason: hasShellHookAction(rule)
+        ? 'This rule runs an arbitrary shell command.'
+        : 'This rule subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads.',
+    },
+  });
+  const decision = await registerPendingApproval(toolCallId, context?.abortSignal);
+  if (decision === true) return { ok: true };
+  return {
+    ok: false,
+    error:
+      decision === 'dismiss'
+        ? `Approval dismissed by the user; did not ${actionLabel} the rule.`
+        : `Approval denied by the user; did not ${actionLabel} the rule.`,
   };
 }
 
@@ -136,17 +210,12 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!parsed.success) {
             return { error: 'Rule failed validation.', issues: parsed.error.issues };
           }
-          if (parsed.data.actions.some((a) => a.type === 'runHookCommand')) {
-            return {
-              error:
-                'runHookCommand actions execute arbitrary shell without guardrails and can only be configured by the user in Settings → Automations.',
-            };
+          // A dangerous, live rule needs approval per automations.approvalMode.
+          if (parsed.data.enabled && isDangerousRule(parsed.data)) {
+            const gate = await ensureApproved(parsed.data, 'create', config.automations, context);
+            if (!gate.ok) return { error: gate.error };
           }
-          const hookTriggerWarning = ruleTriggersOnHookEvents(parsed.data)
-            ? 'This rule triggers on agent lifecycle hook events (or a wildcard that includes them), so its actions can observe raw prompts and tool payloads. Confirm this is intended.'
-            : undefined;
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
-          if (hookTriggerWarning) warnings.unshift(hookTriggerWarning);
           persist([...rules, parsed.data]);
           return {
             success: true,
@@ -176,21 +245,15 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!parsed.success) {
             return { error: 'Updated rule failed validation.', issues: parsed.error.issues };
           }
-          if (
-            parsed.data.actions.some((a) => a.type === 'runHookCommand') ||
-            prev.actions.some((a) => a.type === 'runHookCommand')
-          ) {
-            return {
-              error:
-                'Rules containing runHookCommand actions execute arbitrary shell without guardrails and can only be configured by the user in Settings → Automations.',
-            };
+          // Approval is needed if the RESULT is a dangerous live rule, or if we
+          // are editing an already-dangerous rule (so the agent can't quietly
+          // rewrite a user-configured shell/hook rule).
+          const needsApproval = (parsed.data.enabled && isDangerousRule(parsed.data)) || isDangerousRule(prev);
+          if (needsApproval) {
+            const gate = await ensureApproved(parsed.data, 'update', config.automations, context);
+            if (!gate.ok) return { error: gate.error };
           }
           const warnings = validateRulePaths(parsed.data, eventBus.getCatalog());
-          if (ruleTriggersOnHookEvents(parsed.data)) {
-            warnings.unshift(
-              'This rule triggers on agent lifecycle hook events (or a wildcard that includes them), so its actions can observe raw prompts and tool payloads. Confirm this is intended.',
-            );
-          }
           const next = [...rules];
           next[idx] = parsed.data;
           persist(next);
@@ -205,6 +268,13 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           const idx = findIndex();
           if (idx < 0) return { error: id ? `Rule "${id}" not found.` : 'id is required.' };
           const removed = rules[idx];
+          // Deleting a user-configured shell (enforcement) rule could neuter a
+          // DLP/block hook, so gate it. Non-shell rules (incl. hook-triggered
+          // observe rules the agent created) delete freely.
+          if (hasShellHookAction(removed)) {
+            const gate = await ensureApproved(removed, 'delete', config.automations, context);
+            if (!gate.ok) return { error: gate.error };
+          }
           persist(rules.filter((_, i) => i !== idx));
           return { success: true, deleted: summarizeRule(removed) };
         }
@@ -213,6 +283,15 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
         case 'disable': {
           const idx = findIndex();
           if (idx < 0) return { error: id ? `Rule "${id}" not found.` : 'id is required.' };
+          const target = rules[idx];
+          // Enabling a dangerous rule makes it live → gate. Disabling a
+          // user-configured shell (enforcement) rule could neuter protection →
+          // gate. Disabling a non-shell rule is safe.
+          const gateNeeded = action === 'enable' ? isDangerousRule(target) : hasShellHookAction(target);
+          if (gateNeeded) {
+            const gate = await ensureApproved(target, action, config.automations, context);
+            if (!gate.ok) return { error: gate.error };
+          }
           const next = [...rules];
           next[idx] = { ...next[idx], enabled: action === 'enable' };
           persist(next);
@@ -222,6 +301,12 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
         case 'test': {
           const idx = findIndex();
           if (idx < 0) return { error: id ? `Rule "${id}" not found.` : 'id is required.' };
+          // `test` executes the rule's real actions once, so a dangerous rule
+          // must clear the approval gate too.
+          if (isDangerousRule(rules[idx])) {
+            const gate = await ensureApproved(rules[idx], 'test', config.automations, context);
+            if (!gate.ok) return { error: gate.error };
+          }
           const engine = getAutomationEngine();
           if (!engine) return { error: 'Automation engine not initialized.' };
           const record = await engine.testRule(rules[idx].id, samplePayload === undefined ? {} : samplePayload);

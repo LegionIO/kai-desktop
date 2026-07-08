@@ -62,11 +62,20 @@ type Rule = {
   rateLimitPerMinute?: number;
 };
 
+type AutomationApprovalMode = 'auto-allow' | 'prompt-user' | 'block';
+
 type AutomationsConfig = {
   enabled: boolean;
   rules: Rule[];
   log: { maxEntries: number };
+  approvalMode?: AutomationApprovalMode;
 };
+
+const APPROVAL_MODES: Array<{ value: AutomationApprovalMode; label: string; hint: string }> = [
+  { value: 'auto-allow', label: 'Auto-allow', hint: 'The agent may create/enable these rules with no prompt.' },
+  { value: 'prompt-user', label: 'Prompt me', hint: 'Ask for approval each time the agent tries.' },
+  { value: 'block', label: 'Block', hint: 'The agent can never create/enable these rules.' },
+];
 
 const CONDITION_OPS: Array<{ value: ConditionOp; label: string }> = [
   { value: 'equals', label: 'equals' },
@@ -133,7 +142,9 @@ export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig })
     enabled: true,
     rules: [],
     log: { maxEntries: 200 },
+    approvalMode: 'prompt-user',
   }) as AutomationsConfig;
+  const approvalMode: AutomationApprovalMode = automations.approvalMode ?? 'prompt-user';
 
   const [catalog, setCatalog] = useState<AutomationSourceCatalogEntry[]>([]);
   const [runLog, setRunLog] = useState<AutomationRunRecord[]>([]);
@@ -196,6 +207,34 @@ export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig })
         <code className="font-mono">{'{{result[0].text}}'}</code> in action fields to reference event data and previous
         results.
       </p>
+
+      <div className="space-y-2 rounded-xl border border-border/60 bg-card/50 p-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs font-medium">Agent approval for hook &amp; shell rules</div>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              Controls what happens when the AI agent tries to create, enable, or test a rule that observes lifecycle
+              hook events (raw prompts &amp; tool payloads) or runs a shell command. Does not affect rules you configure
+              here yourself.
+            </p>
+          </div>
+          <select
+            aria-label="Agent approval mode"
+            className={settingsSelectClass}
+            value={approvalMode}
+            onChange={(e) => updateConfig('automations.approvalMode', e.target.value as AutomationApprovalMode)}
+          >
+            {APPROVAL_MODES.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          {APPROVAL_MODES.find((m) => m.value === approvalMode)?.hint}
+        </p>
+      </div>
 
       {automations.rules.length === 0 && <p className="text-xs text-muted-foreground">No rules configured.</p>}
 

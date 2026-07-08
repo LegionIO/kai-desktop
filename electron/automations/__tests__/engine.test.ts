@@ -23,7 +23,12 @@ import { AutomationEventBus } from '../event-bus.js';
 
 function makeEngine(rules: AutomationRule[], over: Partial<EngineDeps> = {}) {
   const bus = new AutomationEventBus();
-  const cfg: AutomationsConfig = { enabled: true, rules, log: { maxEntries: 50 } };
+  const cfg: AutomationsConfig = {
+    enabled: true,
+    rules,
+    log: { maxEntries: 50 },
+    approvalMode: 'prompt-user',
+  };
   const handlePluginAction = vi.fn(async () => 'ok');
   const deps: EngineDeps = {
     bus,
