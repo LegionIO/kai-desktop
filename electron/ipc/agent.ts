@@ -478,6 +478,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       }
 
+      // The pre-send hooks above (plugin + UserPromptSubmit) are awaited and can
+      // be slow. If the user cancelled or restarted this conversation while they
+      // were pending, a newer run now owns the stream. Bail out silently (no
+      // terminal broadcast) so this stale run can't continue into the normal
+      // path and later emit a `done` that finalizes/truncates the replacement.
+      if (controller.signal.aborted || activeStreams.get(conversationId)?.token !== streamToken) {
+        cleanupStreamIfOwned(conversationId, streamToken);
+        return { conversationId };
+      }
+
       // Resolve runtime using model-aware logic:
       //   - auto mode: picks the best runtime for the model's provider type
       //   - explicit mode: validates compatibility, returns a warning on mismatch
