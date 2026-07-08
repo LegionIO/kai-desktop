@@ -87,37 +87,57 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
             { toolName: spec.name, toolCallId: context.toolCallId, command, cwd: effectiveCwd },
             config,
           );
-          const result = await runCommandWithStreaming({
-            command,
-            argv,
-            cwd: effectiveCwd,
-            timeoutMs: timeout || config.tools.shell.timeout,
-            env: { ...process.env },
-            context,
-            streaming,
-          });
-
-          const diffEvents = await diffSnap.finish({ stdout: result.stdout, stderr: result.stderr });
-
-          const payload: Record<string, unknown> = {
-            exitCode: result.exitCode,
-            stdout: result.stdout,
-            stderr: result.stderr,
+          // Finalize the snapshot even if the outer runToolExecution abort race
+          // returns before this promise settles — a cancelled CLI command can
+          // still have mutated files, and they must stay tracked/revertable.
+          let diffEvents: Awaited<ReturnType<typeof diffSnap.finish>> = [];
+          let diffFinalized = false;
+          const finalizeDiff = async (stdout: string, stderr: string): Promise<void> => {
+            if (diffFinalized) return;
+            diffFinalized = true;
+            try {
+              diffEvents = await diffSnap.finish({ stdout, stderr });
+            } catch {
+              /* ignore */
+            }
           };
-          if (diffSnap.enabled && (diffEvents.length > 0 || diffSnap.snapshotSkipped)) {
-            payload._diffTracking = { diffs: diffEvents, snapshotSkipped: diffSnap.snapshotSkipped };
-          }
+          try {
+            const result = await runCommandWithStreaming({
+              command,
+              argv,
+              cwd: effectiveCwd,
+              timeoutMs: timeout || config.tools.shell.timeout,
+              env: { ...process.env },
+              context,
+              streaming,
+            });
 
-          if (result.timedOut) payload.error = 'Command timed out';
-          if (result.cancelled) payload.error = 'Command cancelled';
-          if (result.truncated) {
-            payload.truncated = true;
-            payload.stdoutTruncated = result.stdoutTruncated;
-            payload.stderrTruncated = result.stderrTruncated;
-          }
-          if (result.modelStream) payload.modelStream = result.modelStream;
+            await finalizeDiff(result.stdout, result.stderr);
 
-          return payload;
+            const payload: Record<string, unknown> = {
+              exitCode: result.exitCode,
+              stdout: result.stdout,
+              stderr: result.stderr,
+            };
+            if (diffSnap.enabled && (diffEvents.length > 0 || diffSnap.snapshotSkipped)) {
+              payload._diffTracking = { diffs: diffEvents, snapshotSkipped: diffSnap.snapshotSkipped };
+            }
+
+            if (result.timedOut) payload.error = 'Command timed out';
+            if (result.cancelled) payload.error = 'Command cancelled';
+            if (result.truncated) {
+              payload.truncated = true;
+              payload.stdoutTruncated = result.stdoutTruncated;
+              payload.stderrTruncated = result.stderrTruncated;
+            }
+            if (result.modelStream) payload.modelStream = result.modelStream;
+
+            return payload;
+          } finally {
+            // If the command was abandoned (abort race) without a resolved
+            // result, still finalize so mutations are captured.
+            await finalizeDiff('', '');
+          }
         },
       }),
   };

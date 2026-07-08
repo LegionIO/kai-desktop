@@ -628,6 +628,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           console.info(
             `[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`,
           );
+          // A plugin inference provider executes host tools inside the plugin,
+          // outside our onToolExecutionStart/augmentToolResult wrappers, so
+          // block/modify hooks can't be enforced there. Warn (same posture as
+          // non-Mastra runtimes) since the runtime.id check below won't fire.
+          if (hookDispatcher.hasEnforcingToolHooks()) {
+            broadcastStreamEvent({
+              conversationId,
+              type: 'text-delta',
+              text:
+                `> ⚠️ Block/modify tool hooks are configured but the **${inferenceProvider.name}** inference provider ` +
+                `executes tools outside hook enforcement; tool calls in this chat will not run PreToolUse/PostToolUse hooks.\n\n`,
+            });
+          }
           let emittedTextDelta = false;
           try {
             const providerModelKey =

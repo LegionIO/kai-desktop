@@ -914,7 +914,7 @@ if (gotSingleInstanceLock) {
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
-    registerDiffHandlers(ipcMain);
+    registerDiffHandlers(ipcMain, getConfig);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);
     registerBatchTranscribeHandlers(ipcMain, getConfig);
