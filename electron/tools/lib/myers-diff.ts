@@ -26,6 +26,10 @@ export type UnifiedDiffResult = {
 };
 
 const MAX_EDIT_DISTANCE = 20_000;
+// Myers stores one Int32Array(2*cap+1) snapshot per edit-distance step, so the
+// worst-case trace memory is ~O(cap^2). Cap the combined line count so a large
+// rewrite falls back to a block-replace hunk instead of allocating gigabytes.
+const MAX_MYERS_LINES = 8_000;
 
 function splitLines(s: string): string[] {
   // Keep behaviour stable: an empty string is zero lines, not one empty line.
@@ -47,6 +51,12 @@ function myersLines(a: string[], b: string[]): DiffLine[] {
   if (N === 0 && M === 0) return [];
   if (N === 0) return b.map((text) => ({ type: 'add' as const, text }));
   if (M === 0) return a.map((text) => ({ type: 'del' as const, text }));
+
+  // Preflight: bail to a block replacement before allocating the O(cap^2)
+  // trace for pathologically large inputs.
+  if (N + M > MAX_MYERS_LINES) {
+    return [...a.map((text) => ({ type: 'del' as const, text })), ...b.map((text) => ({ type: 'add' as const, text }))];
+  }
 
   const max = N + M;
   const cap = Math.min(max, MAX_EDIT_DISTANCE);
@@ -85,10 +95,7 @@ function myersLines(a: string[], b: string[]): DiffLine[] {
 
   if (solvedD < 0) {
     // Edit distance exceeded cap — fall back to full replace.
-    return [
-      ...a.map((text) => ({ type: 'del' as const, text })),
-      ...b.map((text) => ({ type: 'add' as const, text })),
-    ];
+    return [...a.map((text) => ({ type: 'del' as const, text })), ...b.map((text) => ({ type: 'add' as const, text }))];
   }
 
   // Backtrack.
@@ -208,9 +215,7 @@ function formatHunk(h: UnifiedHunk): string {
   const aStart = h.aCount === 0 ? Math.max(0, h.aStart - 1) : h.aStart;
   const bStart = h.bCount === 0 ? Math.max(0, h.bStart - 1) : h.bStart;
   const header = `@@ -${aStart},${h.aCount} +${bStart},${h.bCount} @@`;
-  const body = h.lines
-    .map((l) => (l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' ') + l.text)
-    .join('\n');
+  const body = h.lines.map((l) => (l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' ') + l.text).join('\n');
   return header + '\n' + body;
 }
 

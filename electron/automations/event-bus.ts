@@ -38,6 +38,11 @@ export class AutomationEventBus {
     return () => this.listeners.delete(listener);
   }
 
+  /** True when at least one subscriber is attached (lets callers skip payload prep). */
+  hasListeners(): boolean {
+    return this.listeners.size > 0;
+  }
+
   emit(source: string, event: string, payload?: unknown, depth = 0): void {
     const key = `${source}:${event}`;
     this.checkPayload(key, source, event, payload);

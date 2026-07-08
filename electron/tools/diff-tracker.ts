@@ -280,6 +280,8 @@ export function trackFileWrite(
 type SnapshotEntry = { mtimeMs: number; size: number; hash?: string; preContent?: string };
 
 export type ShellSnapshotHandle = {
+  /** True only when diff tracking actually ran for this command. */
+  enabled: boolean;
   snapshotSkipped: boolean;
   finish: (result: { stdout?: string; stderr?: string }) => Promise<DiffEvent[]>;
 };
@@ -346,7 +348,7 @@ export async function beginShellSnapshot(
 ): Promise<ShellSnapshotHandle> {
   const dt = resolveDiffTrackingConfig(config);
   if (!dt.enabled || !conversationId) {
-    return { snapshotSkipped: true, finish: async () => [] };
+    return { enabled: false, snapshotSkipped: false, finish: async () => [] };
   }
 
   const roots = new Set<string>();
@@ -465,7 +467,7 @@ export async function beginShellSnapshot(
     return events;
   };
 
-  return { snapshotSkipped, finish };
+  return { enabled: true, snapshotSkipped, finish };
 }
 
 // ───────────────────────────────────────────────────────────────────────────

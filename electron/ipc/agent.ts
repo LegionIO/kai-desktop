@@ -484,6 +484,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         broadcastStreamEvent({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
       }
 
+      // Lifecycle tool hooks are only enforced by the Mastra runtime. If the
+      // user has block/modify PreToolUse/PostToolUse hooks configured but is
+      // running under an SDK runtime that executes tools directly, warn that
+      // those hooks will NOT be applied — a silently-bypassed DLP/deny policy
+      // is worse than none.
+      if (runtime.id !== 'mastra' && hookDispatcher.hasEnforcingToolHooks()) {
+        broadcastStreamEvent({
+          conversationId,
+          type: 'text-delta',
+          text:
+            `> ⚠️ Block/modify tool hooks are configured but the **${runtime.name}** runtime does not enforce them; ` +
+            `tool calls in this chat will run without PreToolUse/PostToolUse hooks. Switch to the Mastra runtime to enforce them.\n\n`,
+        });
+      }
+
       // Provider override: a plugin runtime was selected for a non-plugin model.
       // Override the model's provider config to route through the plugin's endpoint.
       if (resolution.providerOverride && modelEntry) {

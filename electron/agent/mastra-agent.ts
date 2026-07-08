@@ -675,6 +675,17 @@ function applyWorkspaceToolGuards(
         (context as { toolCallId?: string } | undefined)?.toolCallId ??
         `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+      // Local abort controller so observer/user cancellation can actually stop
+      // long-running workspace tools (esp. execute_command). Merged with any
+      // signal Mastra already put on the context.
+      const localAbort = new AbortController();
+      const existingSignal = (context as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
+      const mergedSignal = mergeAbortSignals(existingSignal, localAbort.signal);
+      const execContext =
+        context && typeof context === 'object'
+          ? { ...(context as Record<string, unknown>), abortSignal: mergedSignal }
+          : { abortSignal: mergedSignal };
+
       const runGuarded = async (args: unknown): Promise<unknown> => {
         if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof (args as { path?: unknown })?.path === 'string') {
           const check = isPathAllowed((args as { path: string }).path, getConfig());
@@ -690,7 +701,7 @@ function applyWorkspaceToolGuards(
         ) {
           const absPath = (args as { path: string }).path;
           const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
-          const result = await originalExecute(args, context);
+          const result = await originalExecute(args, execContext);
           const ev = handle.finish();
           return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
         }
@@ -704,7 +715,7 @@ function applyWorkspaceToolGuards(
             { toolName, toolCallId, command, cwd: shellCwd },
             getConfig(),
           );
-          const result = await originalExecute(args, context);
+          const result = await originalExecute(args, execContext);
           const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
           const events = await snap.finish({
             stdout: typeof r?.stdout === 'string' ? r.stdout : '',
@@ -713,7 +724,7 @@ function applyWorkspaceToolGuards(
           return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
         }
 
-        const result = await originalExecute(args, context);
+        const result = await originalExecute(args, execContext);
         if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
           return filterGrepOutput(result, getConfig());
         }
@@ -725,7 +736,7 @@ function applyWorkspaceToolGuards(
           toolCallId,
           toolName,
           args: normalized,
-          cancel: () => {},
+          cancel: () => localAbort.abort(),
         });
         if (startOutcome && startOutcome.skip) {
           const result = startOutcome.result;

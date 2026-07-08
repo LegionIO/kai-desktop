@@ -81,11 +81,27 @@ function extractToolName(payload: unknown): string | undefined {
   return undefined;
 }
 
+const MAX_HOOK_PAYLOAD_BYTES = 256 * 1024;
+
 function jsonSafe(value: unknown): unknown {
   try {
-    return JSON.parse(
-      JSON.stringify(value, (_k, v) => (typeof v === 'function' || typeof v === 'bigint' ? undefined : v)) ?? 'null',
-    );
+    const serialized =
+      JSON.stringify(value, (_k, v) => (typeof v === 'function' || typeof v === 'bigint' ? undefined : v)) ?? 'null';
+    // Guard against forwarding multi-MB tool results into every hook/automation.
+    if (serialized.length > MAX_HOOK_PAYLOAD_BYTES) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const v = value as Record<string, unknown>;
+        return {
+          ...(typeof v.conversationId === 'string' ? { conversationId: v.conversationId } : {}),
+          ...(typeof v.toolName === 'string' ? { toolName: v.toolName } : {}),
+          ...(typeof v.toolCallId === 'string' ? { toolCallId: v.toolCallId } : {}),
+          _truncated: true,
+          _bytes: serialized.length,
+        };
+      }
+      return { _truncated: true, _bytes: serialized.length };
+    }
+    return JSON.parse(serialized);
   } catch {
     return null;
   }
@@ -228,6 +244,22 @@ export class HookDispatcher {
   }
 
   /**
+   * True when at least one block/modify tool hook (plugin- or user-configured)
+   * is active for PreToolUse/PostToolUse. Used to warn when the selected
+   * runtime does not enforce hooks, so a DLP/deny policy can't silently no-op.
+   */
+  hasEnforcingToolHooks(): boolean {
+    const cfg = this.safeConfig();
+    if (cfg && (cfg.hooks?.enabled ?? true)) this.syncUserHooks(cfg);
+    if (!(cfg?.hooks?.enabled ?? true)) return false;
+    for (const event of ['PreToolUse', 'PostToolUse'] as const) {
+      const list = this.registry.get(event) ?? [];
+      if (list.some((r) => r.mode === 'block' || r.mode === 'modify')) return true;
+    }
+    return false;
+  }
+
+  /**
    * Register a hook handler. Returns an unregister function.
    * Plugin registrations run before user (shell) registrations so DLP /
    * sanitization plugins see raw data.
@@ -279,16 +311,20 @@ export class HookDispatcher {
 
     if (!enabled) return { payload, denied: false };
 
-    // Observe-only fan-out to the automation engine.
-    try {
-      eventBus.emit('hook', event, jsonSafe(payload));
-    } catch (err) {
-      console.warn('[hooks] event bus emit failed:', err);
-    }
-
     if (cfg) this.syncUserHooks(cfg);
 
     const list = this.registry.get(event) ?? [];
+
+    // Observe-only fan-out to the automation engine — skip entirely (and skip
+    // the potentially large jsonSafe copy) when nothing is listening.
+    if (eventBus.hasListeners()) {
+      try {
+        eventBus.emit('hook', event, jsonSafe(payload));
+      } catch (err) {
+        console.warn('[hooks] event bus emit failed:', err);
+      }
+    }
+
     if (list.length === 0) return { payload, denied: false };
 
     const ordered = [...list].sort((a, b) => (a.source === b.source ? 0 : a.source === 'plugin' ? -1 : 1));
