@@ -467,10 +467,13 @@ export function createSubAgentTool(
         // error so the parent agent doesn't treat a blocked sub-agent as success.
         let lastFailureSummary: string | null = null;
 
+        // Don't echo the raw task here — a UserPromptSubmit DLP hook (run inside
+        // runSubAgent) may redact/deny it. The sanitized task is broadcast by the
+        // runner as a sub-agent-user-message after gating.
         ctx.onProgress?.({
           stream: 'stdout',
-          delta: `[Sub-agent started] Task: ${task.slice(0, 200)}\n`,
-          output: `[Sub-agent started] Task: ${task.slice(0, 200)}\n`,
+          delta: `[Sub-agent started]\n`,
+          output: `[Sub-agent started]\n`,
           bytesSeen: 0,
           truncated: false,
           stopped: false,
@@ -490,6 +493,10 @@ export function createSubAgentTool(
           console.error('[Subagent] Failed to set initial status:', err);
         }
 
+        // Captured from the runner's onFinalMessages so resume state persists
+        // the GATED (sanitized) history, not a raw task/context reconstruction.
+        let finalGatedMessages: Array<{ role: string; content: unknown }> | null = null;
+
         const stream = runSubAgent({
           subAgentConversationId,
           parentConversationId: ctx.toolCallId,
@@ -506,6 +513,9 @@ export function createSubAgentTool(
             const queue = followUpQueues.get(subAgentConversationId);
             if (!queue || queue.length === 0) return null;
             return queue.shift() ?? null;
+          },
+          onFinalMessages: (msgs) => {
+            finalGatedMessages = msgs;
           },
         });
 
@@ -549,14 +559,22 @@ export function createSubAgentTool(
           }
         }
 
-        // Persist state for resumption after completion. Reconstruct the opening
-        // message with the SAME task+context the runner used, so a follow-up to a
-        // completed sub-agent keeps the parent context (which now lives in the
-        // message, not the system prompt).
-        const persistedMessages: Array<{ role: string; content: unknown }> = [
-          { role: 'user', content: buildSubAgentTaskMessage(task, context) },
-        ];
-        if (fullResponse) persistedMessages.push({ role: 'assistant', content: fullResponse });
+        // Persist state for resumption. Prefer the runner's GATED message
+        // history (which reflects any UserPromptSubmit DLP redaction) so a later
+        // resume — possibly after the hook is disabled — never sends the raw
+        // original task/context to the model. Fall back to a reconstruction only
+        // if the runner didn't surface its messages (e.g. early error).
+        const gatedHistory = finalGatedMessages as Array<{ role: string; content: unknown }> | null;
+        const persistedMessages: Array<{ role: string; content: unknown }> =
+          gatedHistory && gatedHistory.length > 0
+            ? [...gatedHistory]
+            : [{ role: 'user', content: buildSubAgentTaskMessage(task, context) }];
+        // Ensure the final assistant response is captured (the runner appends it
+        // to its messages on each turn, but guard the fallback path too).
+        const lastMsg = persistedMessages[persistedMessages.length - 1];
+        if (fullResponse && !(lastMsg?.role === 'assistant' && lastMsg.content === fullResponse)) {
+          if (!gatedHistory) persistedMessages.push({ role: 'assistant', content: fullResponse });
+        }
 
         subAgentState.set(subAgentConversationId, {
           messages: persistedMessages,

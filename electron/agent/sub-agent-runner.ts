@@ -56,6 +56,13 @@ export type SubAgentRunOptions = {
   abortSignal?: AbortSignal;
   /** Called between agent turns to check for pending follow-up messages. */
   getFollowUp: () => Promise<string | null>;
+  /**
+   * Called with the runner's final (gated + accumulated) message history so the
+   * caller can persist SANITIZED history for resume — rather than rebuilding it
+   * from the raw task/context, which would let a later resume (after the DLP
+   * hook is disabled) send the unredacted content to the model.
+   */
+  onFinalMessages?: (messages: Array<{ role: string; content: unknown }>) => void;
 };
 
 /** Global counter for enforcing maxConcurrent limit */
@@ -172,6 +179,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     dbPath,
     abortSignal,
     getFollowUp,
+    onFinalMessages,
   } = opts;
 
   const maxConcurrent = config.tools?.subAgents?.maxConcurrent ?? 4;
@@ -671,6 +679,10 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     if (finalStatus !== 'completed' && finalStatus !== 'failed') {
       yield emitStatus(undefined as never, finalStatus as 'stopped', fullResponseText.slice(0, 500));
     }
+
+    // Hand the caller the final GATED message history so it can persist
+    // sanitized resume state (never the raw task/context).
+    onFinalMessages?.([...messages]);
 
     // Dispose observer before exiting (inside try to avoid bundler scope issue with finally)
     subObserver?.dispose();
