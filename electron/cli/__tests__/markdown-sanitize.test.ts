@@ -16,6 +16,14 @@ describe('stripControl', () => {
     expect(clean).toContain('\n');
     expect(clean).toContain('red');
   });
+
+  it('removes C1 controls (8-bit CSI/OSC introducers)', () => {
+    const dirty = 'a\x9bxb\x9dy'; // U+009B (CSI), U+009D (OSC)
+    const clean = stripControl(dirty);
+    expect(clean).not.toContain('\x9b');
+    expect(clean).not.toContain('\x9d');
+    expect(clean).toBe('axby');
+  });
 });
 
 describe('osc8Link', () => {

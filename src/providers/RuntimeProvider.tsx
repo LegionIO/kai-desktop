@@ -1848,12 +1848,13 @@ export function RuntimeProvider({
             `[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`,
           );
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
-        } else if (e.automation) {
-          // Automation streaming into a NON-active conversation: keep a background
-          // accumulator so switching to it mid-run shows streamed-so-far content.
-          // Seed SYNCHRONOUSLY (empty base) and fall through to process this same
-          // event — dropping early events truncated the first thoughts/text from
-          // the live view. Kick off an async disk fetch to backfill the persisted
+        } else if (e.automation || e.serverPersisted) {
+          // Automation OR CLI (serverPersisted) streaming into a NON-active
+          // conversation: keep a background accumulator so switching to it
+          // mid-run shows streamed-so-far content. Seed SYNCHRONOUSLY (empty
+          // base) and fall through to process this same event — dropping early
+          // events truncated the first thoughts/text from the live view. Kick
+          // off an async disk fetch to backfill the persisted
           // prefix (e.g. the user prompt turn) without discarding any deltas; the
           // trailing automation `done` reloads the authoritative tree from disk.
           const seededAcc: MessageAccumulator = { messages: [], headId: null };

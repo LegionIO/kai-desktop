@@ -8,9 +8,10 @@ import { highlight } from 'cli-highlight';
  * afterward, so the incoming text must be inert.
  */
 export function stripControl(s: string): string {
-  // Remove ESC (0x1b) and all other C0 control chars except tab (0x09) and
-  // newline (0x0a). This kills CSI/OSC/SGR/etc. at the source.
-  return s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+  // Remove C0 controls except tab (0x09) and newline (0x0a), DEL (0x7f), AND
+  // the C1 range (0x80-0x9f) — 8-bit CSI/OSC introducers live there and would
+  // otherwise reach the terminal. Kills CSI/OSC/SGR injection at the source.
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 }
 
 /** Protocols allowed in clickable links — never file:, javascript:, data:, etc. */

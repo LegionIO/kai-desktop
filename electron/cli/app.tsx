@@ -48,6 +48,7 @@ type PickerState = {
   title: string;
   items: PickerItem[];
   onSelect: (value: string) => void;
+  onCancel?: () => void; // Esc handler — e.g. reject/dismiss a pending tool so the backend isn't left hung
 } | null;
 
 const CWD = process.cwd();
@@ -269,6 +270,11 @@ export function App({
             answers[q.question] = v;
             askNext(i + 1);
           },
+          // Esc mid-questionnaire → reject so the ask_user tool doesn't hang.
+          onCancel: () => {
+            setStatus('running');
+            void client.invoke('agent:reject-tool', toolCallId).catch(() => {});
+          },
         });
       };
       askNext(0);
@@ -330,6 +336,12 @@ export function App({
                 setPicker(null);
                 setStatus('running');
                 void client.invoke(v === 'approve' ? 'agent:approve-tool' : 'agent:reject-tool', id).catch(() => {});
+              },
+              // Esc → dismiss the tool so the backend's pending approval resolves
+              // (otherwise the stream hangs forever waiting on it).
+              onCancel: () => {
+                setStatus('running');
+                void client.invoke('agent:dismiss-tool', id).catch(() => {});
               },
             });
           }
@@ -665,7 +677,16 @@ export function App({
 
       {/* Picker (approvals, model/profile, resume) overlays the input */}
       {picker ? (
-        <Picker title={picker.title} items={picker.items} onSelect={picker.onSelect} onCancel={() => setPicker(null)} />
+        <Picker
+          title={picker.title}
+          items={picker.items}
+          onSelect={picker.onSelect}
+          onCancel={() => {
+            const c = picker.onCancel;
+            setPicker(null);
+            c?.();
+          }}
+        />
       ) : (
         <InputBox status={status} conversationId={conversationId} onSubmit={submit} />
       )}

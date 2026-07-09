@@ -845,8 +845,10 @@ if (gotSingleInstanceLock) {
       return process.env.PATH ?? '';
     });
 
-    // Request microphone permission on macOS (needed for voice recording / speech-to-text)
-    if (process.platform === 'darwin') {
+    // Request microphone permission on macOS (needed for voice recording /
+    // speech-to-text) — GUI only. A headless CLI backend has no mic UI and must
+    // not trigger a privacy-permission prompt on terminal startup.
+    if (process.platform === 'darwin' && !IS_HEADLESS) {
       systemPreferences
         .askForMediaAccess('microphone')
         .then((granted) => {
@@ -857,10 +859,13 @@ if (gotSingleInstanceLock) {
         });
     }
 
-    // Set dock icon (macOS) — needed for dev mode since packager config doesn't apply.
+    // Set dock icon (macOS) — GUI only; a headless/accessory backend has no Dock
+    // presence, and setting an icon would be a no-op at best.
     // The raw icon.png fills edge-to-edge; createPaddedDockIcon gives it the inset that
     // packaged .icns builds get automatically.
-    setMacDockIcon();
+    if (!IS_HEADLESS) {
+      setMacDockIcon();
+    }
 
     // Config reader (used by tools and OAuth)
     const getConfig = () => readEffectiveConfig(APP_HOME);
@@ -1305,6 +1310,7 @@ if (gotSingleInstanceLock) {
       if (guiInitialized) return;
       guiInitialized = true;
       try {
+        setMacDockIcon(); // headless boot skipped this; a promoted window needs the icon
         initDictation(getConfig(), setConfig);
         initAppShots(getConfig());
       } catch (err) {
@@ -1820,6 +1826,10 @@ if (gotSingleInstanceLock) {
       })
       .catch((err) => {
         console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
+        // Still resolve tools-ready (with whatever registered, possibly none) so
+        // CLI agent:submit calls don't hang forever awaiting a registry that
+        // will never arrive. registerTools() flips the ready latch.
+        registerTools(getRegisteredTools());
       });
 
     void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {
