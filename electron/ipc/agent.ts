@@ -552,21 +552,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // removed attachments/non-text parts) back to the store when it changed.
           // Compare the whole content STRUCTURALLY, not just extracted text, so a
           // hook that strips an attachment while leaving the text intact still
-          // triggers persistence.
+          // triggers persistence. Track the user-message COUNT too: if the hook
+          // removed the just-submitted turn, the "last user message" would shift
+          // to an EARLIER turn — writing that earlier content into the stored
+          // latest turn would be wrong; use the placeholder instead.
+          const countUsers = (ms: unknown[]): number =>
+            ms.filter((m) => m && typeof m === 'object' && (m as { role?: unknown }).role === 'user').length;
           const beforeMsg = lastUserMessage(messages);
           const beforeContent = jsonStableString(beforeMsg?.content);
+          const beforeUsers = countUsers(messages);
           messages = stripDisplayOnlyParts(next.messages);
           const afterMsg = lastUserMessage(messages);
           const afterContent = jsonStableString(afterMsg?.content);
-          if (beforeMsg && afterContent !== beforeContent) {
-            // Persist the sanitized content. If the hook removed the submitted
-            // user turn entirely (no user message remains, or the last one no
-            // longer matches), scrub the stored turn with a placeholder rather
-            // than leaving the raw prompt or overwriting an earlier turn.
+          const afterUsers = countUsers(messages);
+          const submittedTurnRemoved = afterUsers < beforeUsers || !afterMsg;
+          if (beforeMsg && (submittedTurnRemoved || afterContent !== beforeContent)) {
             persistRedactedUserTurn(
               appHome,
               conversationId,
-              afterMsg ? afterMsg.content : '[removed by a policy hook]',
+              submittedTurnRemoved ? '[removed by a policy hook]' : afterMsg!.content,
             );
           }
         }
