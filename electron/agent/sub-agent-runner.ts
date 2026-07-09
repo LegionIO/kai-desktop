@@ -300,16 +300,38 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // {pending}, so the card is never left permanently suppressed.
     const subResolvedArgsByTool = new Map<string, unknown[]>();
 
-    // Helper: add a follow-up message and emit it as a UI event
-    const addFollowUpMessage = (text: string, source: 'user' | 'parent' | 'task' = 'parent'): SubAgentEvent => {
+    // Helper: add a follow-up message and emit it as a UI event. The message is
+    // gated through UserPromptSubmit BEFORE broadcasting, so a DLP block/modify
+    // hook can redact/deny it and the raw follow-up never reaches clients.
+    // Returns null when the follow-up was denied (caller should stop the turn).
+    const addFollowUpMessage = async (
+      text: string,
+      source: 'user' | 'parent' | 'task' = 'parent',
+    ): Promise<SubAgentEvent | null> => {
       messages.push({ role: 'user', content: text });
+      const gate = await gateUserPrompt();
+      if (!gate.ok) {
+        // Broadcast nothing raw; surface a failed status instead.
+        broadcastSubAgentEvent({
+          subAgentConversationId,
+          parentConversationId,
+          parentToolCallId,
+          type: 'sub-agent-status',
+          status: 'failed',
+          summary: gate.reason,
+        } as SubAgentEvent);
+        return null;
+      }
+      // Broadcast the (possibly sanitized) text from the gated last message.
+      const last = messages[messages.length - 1];
+      const gatedText = typeof last?.content === 'string' ? (last.content as string) : text;
       const evt: SubAgentEvent = {
         subAgentConversationId,
         parentConversationId,
         parentToolCallId,
         conversationId: subAgentConversationId,
         type: 'sub-agent-user-message',
-        text,
+        text: gatedText,
         source,
       };
       broadcastSubAgentEvent(evt);
@@ -321,16 +343,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       turnCount++;
       controlSignal.current = null; // reset for this turn
 
-      // The first turn's prompt was already gated up front (before the task
-      // broadcast). Re-gate on FOLLOW-UP turns, whose new user messages were
-      // appended after the last gate, so a DLP block/modify hook covers them too.
-      if (turnCount > 1) {
-        const followUpGate = await gateUserPrompt();
-        if (!followUpGate.ok) {
-          yield emitStatus(undefined as never, 'failed', followUpGate.reason);
-          break;
-        }
-      }
+      // The initial prompt was gated up front; each follow-up is gated inside
+      // addFollowUpMessage before it's added/broadcast. So no per-turn gate here.
 
       let turnText = '';
 
@@ -578,7 +592,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         // Before finalizing, check if a message arrived during this turn
         const pendingFollowUp = await getFollowUp();
         if (pendingFollowUp) {
-          yield addFollowUpMessage(pendingFollowUp);
+          const fu = await addFollowUpMessage(pendingFollowUp);
+          if (!fu) break; // denied by a hook
+          yield fu;
           yield emitStatus(undefined as never, 'running', 'Processing follow-up');
           continue;
         }
@@ -592,7 +608,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         const followUp = await waitForFollowUp(getFollowUp, abortSignal, 300000);
         if (!followUp || abortSignal?.aborted) break;
 
-        yield addFollowUpMessage(followUp);
+        const fu = await addFollowUpMessage(followUp);
+        if (!fu) break; // denied by a hook
+        yield fu;
         yield emitStatus(undefined as never, 'running', 'Processing follow-up');
         continue;
       }
@@ -600,7 +618,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       // signal === 'continue' or no signal — check for opportunistic follow-ups
       const followUp = await getFollowUp();
       if (followUp) {
-        yield addFollowUpMessage(followUp);
+        const fu = await addFollowUpMessage(followUp);
+        if (!fu) break; // denied by a hook
+        yield fu;
         yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
         continue;
       }
@@ -609,7 +629,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       if (!signal) {
         const lateFollowUp = await waitForFollowUp(getFollowUp, abortSignal, 5000);
         if (lateFollowUp) {
-          yield addFollowUpMessage(lateFollowUp);
+          const fu = await addFollowUpMessage(lateFollowUp);
+          if (!fu) break; // denied by a hook
+          yield fu;
           yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
           continue;
         }

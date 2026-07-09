@@ -84,53 +84,19 @@ async function resumeSubAgent(
 ): Promise<void> {
   const { messages, config, modelConfig, tools, dbPath, parentConversationId, parentToolCallId } = state;
 
-  // Add the user message
+  // Add the resume message, but DON'T broadcast it yet — gate it through
+  // UserPromptSubmit first so a DLP block/modify hook can redact/deny before the
+  // raw message reaches renderer/web clients.
   messages.push({ role: 'user', content: message });
-
-  // Emit user message event
-  broadcastEvent({
-    subAgentConversationId,
-    parentConversationId,
-    parentToolCallId,
-    conversationId: subAgentConversationId,
-    type: 'sub-agent-user-message',
-    text: message,
-    source: 'user',
-  });
-
-  // Emit running status
-  broadcastEvent({
-    subAgentConversationId,
-    parentConversationId,
-    parentToolCallId,
-    type: 'sub-agent-status',
-    status: 'running',
-    summary: 'Resuming conversation',
-  });
 
   const localController = new AbortController();
   activeSubAgentControllers.set(subAgentConversationId, localController);
   followUpQueues.set(subAgentConversationId, []);
 
   try {
-    const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
-    // Provider-native tools execute in-provider; never suppress their args.
-    const providerToolNames = getProviderDefinedToolNames(modelConfig);
-    const rewrittenArgs = new Map<string, unknown>();
-    // Stream-first queue: suppressed stream ids awaiting resolution, per tool
-    // name. onToolExecutionStart rebroadcasts under the queued stream id (which
-    // may differ from its exec id) instead of the exec id.
-    const suppressedStreamIdsByTool = new Map<string, string[]>();
-    // Exec-first queue: onToolExecutionStart resolved args BEFORE the stream
-    // tool-call event arrived AND its exec id differs from the stream id. Park
-    // the resolved args by toolName (FIFO); the stream loop claims one before
-    // suppressing to {pending}, so the card is never left permanently hidden.
-    const resolvedArgsByTool = new Map<string, unknown[]>();
-
-    // Gate the resumed sub-agent prompt through UserPromptSubmit so a DLP
-    // block/modify hook covers it (same as normal chats + the initial run).
-    // Enforcement-only (suppressObserve) so a resume doesn't re-fire the
-    // parent's UserPromptSubmit automations.
+    // Gate the resumed sub-agent prompt through UserPromptSubmit (before any
+    // broadcast). Enforcement-only (suppressObserve) so a resume doesn't re-fire
+    // the parent's UserPromptSubmit automations.
     let resumeSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
     if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
       const gate = await hookDispatcher.dispatch(
@@ -165,6 +131,43 @@ async function resumeSubAgent(
       }
       if (typeof gated?.systemPrompt === 'string') resumeSystemPrompt = gated.systemPrompt;
     }
+
+    // Now broadcast the (possibly sanitized) resume message + running status.
+    const gatedResumeText =
+      typeof messages[messages.length - 1]?.content === 'string'
+        ? (messages[messages.length - 1].content as string)
+        : message;
+    broadcastEvent({
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
+      conversationId: subAgentConversationId,
+      type: 'sub-agent-user-message',
+      text: gatedResumeText,
+      source: 'user',
+    });
+    broadcastEvent({
+      subAgentConversationId,
+      parentConversationId,
+      parentToolCallId,
+      type: 'sub-agent-status',
+      status: 'running',
+      summary: 'Resuming conversation',
+    });
+
+    const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
+    // Provider-native tools execute in-provider; never suppress their args.
+    const providerToolNames = getProviderDefinedToolNames(modelConfig);
+    const rewrittenArgs = new Map<string, unknown>();
+    // Stream-first queue: suppressed stream ids awaiting resolution, per tool
+    // name. onToolExecutionStart rebroadcasts under the queued stream id (which
+    // may differ from its exec id) instead of the exec id.
+    const suppressedStreamIdsByTool = new Map<string, string[]>();
+    // Exec-first queue: onToolExecutionStart resolved args BEFORE the stream
+    // tool-call event arrived AND its exec id differs from the stream id. Park
+    // the resolved args by toolName (FIFO); the stream loop claims one before
+    // suppressing to {pending}, so the card is never left permanently hidden.
+    const resolvedArgsByTool = new Map<string, unknown[]>();
 
     const stream = streamAgentResponse(
       subAgentConversationId,

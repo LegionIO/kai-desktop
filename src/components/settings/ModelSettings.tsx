@@ -153,10 +153,13 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   };
 
   const handleAdd = (name: string, provider: Provider) => {
-    void writeProviders({ ...providers, [name]: provider });
-    // Re-adding a previously deleted built-in: clear it from removedBuiltins so
-    // the loader reconstructs it again (and doesn't fight the explicit provider).
     if (BUILTIN_PROVIDER_NAMES.has(name)) {
+      // Re-adding a built-in: its providers are reconstructed from llm.json, and
+      // a whole-object `models.providers` write does NOT sync to llm.json (only
+      // per-field `models.providers.<name>.<field>` writes do). Clear the
+      // removed-builtin flag, then persist each entered field via its own path
+      // so the API key / endpoint / region the user just typed actually land in
+      // llm.json instead of being lost to a stale reconstruction.
       const removed = (config.models as { removedBuiltins?: string[] }).removedBuiltins ?? [];
       if (removed.includes(name)) {
         void updateConfig(
@@ -164,6 +167,26 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
           removed.filter((n) => n !== name),
         );
       }
+      const fields: Array<keyof Provider> = [
+        'enabled',
+        'endpoint',
+        'apiKey',
+        'useResponsesApi',
+        'apiVersion',
+        'region',
+        'accessKeyId',
+        'secretAccessKey',
+        'sessionToken',
+        'awsProfile',
+        'roleArn',
+        'useDefaultCredentials',
+      ];
+      for (const field of fields) {
+        const value = provider[field];
+        if (value !== undefined) void updateConfig(`models.providers.${name}.${field}`, value);
+      }
+    } else {
+      void writeProviders({ ...providers, [name]: provider });
     }
     setAddingType(null);
     setEditingName(name);
