@@ -267,6 +267,7 @@ async function runAgentAction(
     const toolPartById = new Map<string, ToolCallPart>();
     let text = '';
     let error: string | null = null;
+    let caughtStreamError = false;
     let modelKey = '';
     let lastEventWasToolResult = false;
     const toolCalls: PluginGenerateToolCall[] = [];
@@ -295,11 +296,17 @@ async function runAgentAction(
         tools,
         abortSignal: abortController.signal,
       })) {
+        // Don't forward the inner stream's `done` — the renderer treats an
+        // automation `done` as terminal (clears + reloads). We broadcast exactly
+        // one terminal `done` AFTER the authoritative append below. Consume the
+        // inner done only for its modelKey.
+        if (ev.type === 'done') {
+          modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
+          continue;
+        }
         broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
 
-        if (ev.type === 'done' && (ev as { modelKey?: string }).modelKey) {
-          modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
-        } else if (ev.type === 'text-delta' && ev.text) {
+        if (ev.type === 'text-delta' && ev.text) {
           if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
             text += '\n\n';
             appendTextPart('\n\n');
@@ -360,8 +367,9 @@ async function runAgentAction(
       }
     } catch (streamErr) {
       // Setup or mid-stream failure after the prompt was written. Record it and
-      // fall through to finalize (assistant error turn + idle + terminal done).
+      // fall through to finalize (assistant turn + idle + terminal done).
       error = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      caughtStreamError = true;
     }
 
     const aborted = abortController.signal.aborted;
@@ -369,6 +377,10 @@ async function runAgentAction(
       // No text was produced — surface a status line so the message isn't empty.
       const fallbackText = aborted ? '_(stopped)_' : error ? `⚠️ ${error}` : '';
       if (fallbackText) appendTextPart(fallbackText);
+    } else if (caughtStreamError && error) {
+      // Partial text was produced before the throw — append the error so the
+      // failure is visible instead of being silently swallowed.
+      appendTextPart(`\n\n⚠️ ${error}`);
     }
     const assistantContent = contentParts.length > 0 ? contentParts : [{ type: 'text', text: '' }];
 
@@ -394,8 +406,11 @@ async function runAgentAction(
       event.depth + 1,
     );
 
-    if (error && !text && !aborted) {
-      throw new Error(error);
+    // Surface a real failure to the engine's run record — but only AFTER the
+    // conversation has been finalized above. A thrown stream error (or an
+    // `error` event with no output) is a genuine failure; an abort is not.
+    if (!aborted && (caughtStreamError || (error && !text))) {
+      throw new Error(error ?? 'Automation agent run failed');
     }
     return { text, modelKey, toolCalls, conversationId };
   } finally {

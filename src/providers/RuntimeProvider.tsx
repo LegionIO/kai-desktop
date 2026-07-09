@@ -1851,15 +1851,22 @@ export function RuntimeProvider({
           // the live view. Kick off an async disk fetch to backfill the persisted
           // prefix (e.g. the user prompt turn) without discarding any deltas; the
           // trailing automation `done` reloads the authoritative tree from disk.
-          streamAccumulators.set(convId, { messages: [], headId: null });
+          const seededAcc: MessageAccumulator = { messages: [], headId: null };
+          streamAccumulators.set(convId, seededAcc);
           if (!automationSeedInProgress.has(convId)) {
             automationSeedInProgress.add(convId);
             void app.conversations
               .get(convId)
               .then((conv) => {
                 const rec = conv as ConversationRecord | null;
-                const existingAcc = streamAccumulators.get(convId);
-                if (!rec || !existingAcc) return;
+                // Bail unless the SAME accumulator we seeded is still current and
+                // this conversation is still an automation stream. Otherwise the
+                // original run ended (accumulator deleted) and a new interactive/
+                // retry run may own convId now — mutating it or reparenting to a
+                // stale head would corrupt that unrelated run.
+                if (streamAccumulators.get(convId) !== seededAcc) return;
+                if (!automationStreams.has(convId)) return;
+                if (!rec) return;
                 const { tree, headId } = ensureTree(rec);
                 if (tree.length === 0) return;
                 // Merge the persisted prefix (user prompt / prior history) in
@@ -1867,12 +1874,12 @@ export function RuntimeProvider({
                 // dropping them. Skip nodes we already hold, and reparent the
                 // first live (root) node onto the persisted head so the branch
                 // stays connected.
-                const haveIds = new Set(existingAcc.messages.map((m) => m.id));
+                const haveIds = new Set(seededAcc.messages.map((m) => m.id));
                 const prefix = tree.filter((m) => !haveIds.has(m.id));
                 if (prefix.length === 0) return;
-                const live = existingAcc.messages.map((m) => (m.parentId === null ? { ...m, parentId: headId } : m));
-                existingAcc.messages = [...prefix, ...live];
-                if (existingAcc.headId === null) existingAcc.headId = headId;
+                const live = seededAcc.messages.map((m) => (m.parentId === null ? { ...m, parentId: headId } : m));
+                seededAcc.messages = [...prefix, ...live];
+                if (seededAcc.headId === null) seededAcc.headId = headId;
               })
               .catch(() => {})
               .finally(() => automationSeedInProgress.delete(convId));
