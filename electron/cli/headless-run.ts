@@ -49,6 +49,14 @@ export async function runHeadlessOnce(client: LocalBridgeClient): Promise<void> 
   });
 
   await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      off();
+      offDisc();
+      resolve();
+    };
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
       if (e.conversationId !== id) return;
@@ -57,14 +65,17 @@ export async function runHeadlessOnce(client: LocalBridgeClient): Promise<void> 
       else if (e.type === 'error') process.stderr.write(`\n[error: ${e.error ?? 'unknown'}]\n`);
       else if (e.type === 'done') {
         process.stdout.write('\n');
-        off();
-        resolve();
+        finish();
       }
+    });
+    // If the backend dies after submit resolves, don't hang forever.
+    const offDisc = client.onDisconnect(() => {
+      process.stderr.write('\n[backend disconnected]\n');
+      finish();
     });
     void client.invoke('agent:submit', id, prompt.trim(), { cwd }).catch((err) => {
       process.stderr.write(`\n[submit failed: ${err?.message ?? err}]\n`);
-      off();
-      resolve();
+      finish();
     });
   });
 }

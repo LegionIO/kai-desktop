@@ -43,6 +43,8 @@ export class LocalBridgeClient {
   /** Connect once. Rejects if the socket cannot be reached. */
   connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      this.buffer = ''; // fresh connection: never carry partial data across sockets
+      this.intentionalClose = false;
       const socket = net.createConnection(this.socketPath);
       socket.setNoDelay(true);
 
@@ -114,20 +116,42 @@ export class LocalBridgeClient {
       }
     }, HEARTBEAT_INTERVAL_MS);
 
-    const onGone = (): void => {
-      if (!this.connected) return;
-      this.connected = false;
-      this.socket = null;
-      if (this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
+    const onGone = (): void => this.teardown(true);
+
+    socket.on('close', onGone);
+    socket.on('error', onGone);
+  }
+
+  /**
+   * Tear down the current connection exactly once: clear the heartbeat, reject
+   * all in-flight calls, drop the socket. `fireDisconnect` runs the disconnect
+   * handlers (true for an unexpected drop → triggers recovery; false for our own
+   * close() → the caller is quitting intentionally).
+   */
+  private teardown(fireDisconnect: boolean): void {
+    if (!this.connected && !this.socket) return;
+    this.connected = false;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    const sock = this.socket;
+    this.socket = null;
+    if (sock) {
+      try {
+        sock.removeAllListeners();
+        sock.destroy();
+      } catch {
+        /* ignore */
       }
-      // Reject all in-flight calls so callers don't hang on a dead leader.
-      for (const [, call] of this.pending) {
-        clearTimeout(call.timer);
-        call.reject(new Error('local bridge connection closed'));
-      }
-      this.pending.clear();
+    }
+    // Reject all in-flight calls so callers don't hang on a dead leader.
+    for (const [, call] of this.pending) {
+      clearTimeout(call.timer);
+      call.reject(new Error('local bridge connection closed'));
+    }
+    this.pending.clear();
+    if (fireDisconnect) {
       this.disconnectHandlers.forEach((cb) => {
         try {
           cb();
@@ -135,10 +159,7 @@ export class LocalBridgeClient {
           /* ignore */
         }
       });
-    };
-
-    socket.on('close', onGone);
-    socket.on('error', onGone);
+    }
   }
 
   private dispatch(line: string): void {
@@ -276,13 +297,7 @@ export class LocalBridgeClient {
 
   close(): void {
     this.intentionalClose = true;
-    try {
-      this.socket?.destroy();
-    } catch {
-      /* ignore */
-    }
-    this.socket = null;
-    this.connected = false;
+    this.teardown(false); // full cleanup, but don't fire disconnect handlers — this is intentional
   }
 }
 

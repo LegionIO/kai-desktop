@@ -1689,6 +1689,9 @@ export function RuntimeProvider({
         };
         // Set when the event originates from an automation run (see StreamEvent).
         automation?: boolean;
+        // Set when a agent:submit (CLI) turn is persisted by the MAIN process;
+        // a GUI on the same conversation renders live but must not persist.
+        serverPersisted?: boolean;
       };
 
       // Debug: log every event received in renderer
@@ -1833,7 +1836,10 @@ export function RuntimeProvider({
       const convId = e.conversationId;
       const isActiveConv = convId === activeIdRef.current;
 
-      if (e.automation) automationStreams.add(convId);
+      // Both automation runs and CLI (agent:submit) turns are persisted by the
+      // MAIN process; track them in one set so the renderer renders live but
+      // never double-persists. `automationStreams` = "main-owned stream here".
+      if (e.automation || e.serverPersisted) automationStreams.add(convId);
 
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
@@ -2318,7 +2324,7 @@ export function RuntimeProvider({
         );
         // Automation-owned stream: main process persists the terminal state and
         // sends its own `done`. Don't persist from here; just reconcile from disk.
-        if (e.automation || automationStreams.has(convId)) {
+        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
           // Keep the accumulator alive so the trailing automation `done` (which
           // arrives right after) does the final cleanup + reload uniformly.
           if (isActiveConv) {
@@ -2364,7 +2370,7 @@ export function RuntimeProvider({
         // Automation-owned stream: the MAIN process persisted the authoritative
         // [user, assistant] exchange and set runStatus. Don't persist from here
         // (would duplicate). Drop the accumulator + reload from disk to reconcile.
-        if (e.automation || automationStreams.has(convId)) {
+        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
           automationStreams.delete(convId);
           const _ptAuto = persistTimersRef.current.get(convId);
           if (_ptAuto) {
@@ -2499,7 +2505,7 @@ export function RuntimeProvider({
       // The main process writes the authoritative [user, assistant] turns; a
       // debounced renderer persist here could write a partial assistant-only
       // branch before the main write lands, creating duplicate/orphaned nodes.
-      if (e.automation || automationStreams.has(convId)) {
+      if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
         if (isActiveConv && !acc.awaitingApproval) setIsRunning(true);
         return;
       }

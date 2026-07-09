@@ -269,6 +269,15 @@ export function restartIdleShutdown(): void {
 }
 
 export async function stopLocalServer(): Promise<void> {
+  // Cancel any pending idle-shutdown and reset lifecycle state FIRST, so a
+  // stale timer can't fire an old onIdleExit after stop (or after a restart
+  // reconfigures these). Everything is re-set by the next startLocalServer.
+  idleShutdownEnabled = false;
+  cancelIdleTimer();
+  shutdownRequested = false;
+  hasOtherClients = null;
+  onIdleExit = null;
+
   unregisterSink?.();
   unregisterSink = null;
 

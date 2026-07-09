@@ -221,11 +221,16 @@ function broadcastStreamEvent(event: StreamEvent): void {
   // stream and write the assistant reply on `done` so it survives without a
   // renderer. Only for conversations flagged by agent:submit — GUI turns
   // (agent:stream) are persisted by the renderer, so this avoids double-writes.
-  if (event.conversationId && serverPersistAppHome && serverPersistConversations.has(event.conversationId)) {
-    accumulateForPersistence(serverPersistAppHome, event);
-    if (event.type === 'done') {
-      serverPersistConversations.delete(event.conversationId);
-      void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+  // Tag the broadcast `serverPersisted` so a GUI viewing the SAME conversation
+  // renders live but skips its own persistence (main owns the write here).
+  if (event.conversationId && serverPersistConversations.has(event.conversationId)) {
+    eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
+    if (serverPersistAppHome) {
+      accumulateForPersistence(serverPersistAppHome, event);
+      if (event.type === 'done') {
+        serverPersistConversations.delete(event.conversationId);
+        void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+      }
     }
   }
 
@@ -515,6 +520,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
+    // Discard any half-accumulated server-persist buffer from a superseded run
+    // so its partial output can't merge into this fresh turn's assistant message.
+    discardPersistenceAccumulator(conversationId);
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;

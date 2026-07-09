@@ -194,6 +194,11 @@ type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
  */
 let promoteHeadlessToWindowed: () => Promise<void> = async () => {};
 
+/** Set once `promoteHeadlessToWindowed` is wired in whenReady. */
+let promoteReady = false;
+/** A second-instance (GUI launch) that arrived before promotion was wired. */
+let pendingPromote = false;
+
 /**
  * Revert a windowed backend to a dockless headless background backend when its
  * last GUI window closes but socket clients (CLIs) remain. Assigned in
@@ -810,11 +815,16 @@ app.commandLine.appendSwitch('enable-speech-dispatcher');
 
 if (gotSingleInstanceLock) {
   app.on('second-instance', () => {
-    // A second launch arrived. If we're a headless backend (started by the
-    // CLI), this is a GUI trying to open against us — promote to windowed so
-    // the app actually appears. Otherwise just focus the existing window.
-    if (IS_HEADLESS && headlessWindowBlockActive) {
-      void promoteHeadlessToWindowed();
+    // A second launch arrived. If this process is currently a dockless
+    // (headless/demoted) backend, a GUI is trying to open against us — promote
+    // to windowed so the app appears. Gate on the RUNTIME window-block state,
+    // not the immutable IS_HEADLESS, so a GUI leader that demoted after its
+    // windows closed still re-promotes correctly. If promotion isn't wired yet
+    // (second-instance can arrive before whenReady assigns it), remember it and
+    // drain once ready.
+    if (headlessWindowBlockActive) {
+      if (promoteReady) void promoteHeadlessToWindowed();
+      else pendingPromote = true;
     } else {
       focusPrimaryWindow();
     }
@@ -1328,6 +1338,14 @@ if (gotSingleInstanceLock) {
     };
     demoteWindowedToHeadlessRef = demoteWindowedToHeadless;
 
+    // Promotion is now wired. Drain a GUI launch that raced ahead of this
+    // assignment (second-instance arrived during startup).
+    promoteReady = true;
+    if (pendingPromote) {
+      pendingPromote = false;
+      if (headlessWindowBlockActive) void promoteHeadlessToWindowed();
+    }
+
     // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
     // getRegisteredTools for tool actions, and getConfig for rule reload).
     registerBuiltinSources(eventBus);
@@ -1795,6 +1813,14 @@ if (gotSingleInstanceLock) {
     app.on('activate', () => {
       const allWindows = BrowserWindow.getAllWindows();
       if (allWindows.length === 0) {
+        // If we're a dockless (headless/demoted) backend, go through the full
+        // promotion (lift window block, restore dock/activation, init GUI subsystems,
+        // disable idle-shutdown) — a raw createWindow() here would be destroyed by
+        // the window block.
+        if (headlessWindowBlockActive) {
+          void promoteHeadlessToWindowed();
+          return;
+        }
         const win = createWindow();
         win.once('ready-to-show', () => {
           win.show();
