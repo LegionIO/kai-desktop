@@ -149,6 +149,15 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
     conv.messages = getConversationBranch(tree, headId) as never;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
+    // The renderer ignores conversations:changed while a stream accumulator is
+    // active (and then renders/persists its raw in-memory copy), so also emit a
+    // stream event carrying the sanitized content + target node id so the live
+    // chat updates immediately.
+    broadcastStreamEvent({
+      conversationId,
+      type: 'prompt-redacted',
+      data: { messageId: node.id, content: node.content },
+    });
   } catch (err) {
     console.warn('[Agent] Failed to persist redacted user turn:', err);
   }

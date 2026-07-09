@@ -42,6 +42,7 @@ export type StreamEvent = {
     | 'tool-progress'
     | 'tool-compaction'
     | 'tool-approval-required'
+    | 'prompt-redacted'
     | 'error'
     | 'done'
     | 'compaction'

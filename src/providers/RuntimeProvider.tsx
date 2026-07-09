@@ -1913,6 +1913,32 @@ export function RuntimeProvider({
           }
         }
         return;
+      } else if (e.type === 'prompt-redacted') {
+        // A UserPromptSubmit DLP hook redacted/blocked the just-sent prompt. The
+        // main process scrubbed the store, but the live accumulator still holds
+        // the raw user turn — update it in place so the current chat reflects the
+        // redaction without a reload. (conversations:changed is ignored while a
+        // stream accumulator is active.)
+        const data = e.data as { messageId?: string; content?: unknown } | undefined;
+        if (data && data.content !== undefined) {
+          const targetId = typeof data.messageId === 'string' ? data.messageId : undefined;
+          let idx = targetId ? acc.messages.findIndex((m) => m.id === targetId) : -1;
+          if (idx < 0) {
+            for (let i = acc.messages.length - 1; i >= 0; i--) {
+              if (acc.messages[i].role === 'user') {
+                idx = i;
+                break;
+              }
+            }
+          }
+          if (idx >= 0) {
+            const raw = data.content;
+            const parts: ContentPart[] = Array.isArray(raw)
+              ? (raw as ContentPart[])
+              : [{ type: 'text', text: typeof raw === 'string' ? raw : String(raw) }];
+            acc.messages[idx] = { ...acc.messages[idx], content: toStoredContent(parts) };
+          }
+        }
       } else if (e.type === 'observer-message') {
         applyObserverMessage(acc, e.text ?? '', e.messageMeta);
       } else if (e.type === 'tool-call') {
