@@ -2487,6 +2487,10 @@ export function RuntimeProvider({
     async (parentId: string | null) => {
       const convId = activeIdRef.current;
       if (!convId) return;
+      // Same concurrency guard as onEdit: don't start a second run while one is
+      // streaming or awaiting a tool approval (accumulator still present), or the
+      // new controller would replace the live one and break cancel.
+      if (isRunningRef.current || streamAccumulators.has(convId)) return;
 
       // parentId is the message ID to regenerate from (the user message before the assistant response)
       // We keep the old assistant branch (it becomes an alternate sibling) and start a new one
@@ -2544,8 +2548,11 @@ export function RuntimeProvider({
       if (!convId) return;
       // Don't start a concurrent run: if a response is streaming, editing would
       // spawn a second run whose controller replaces the live one in
-      // activeStreams, breaking cancel. Ignore edits while running.
-      if (isRunningRef.current) return;
+      // activeStreams, breaking cancel. Ignore edits while running. `isRunning`
+      // goes false while a tool approval is pending even though the main-process
+      // stream is still alive, so ALSO block when an accumulator exists for this
+      // conversation (covers the awaiting-approval window).
+      if (isRunningRef.current || streamAccumulators.has(convId)) return;
 
       // assistant-ui's edit action passes sourceId = the original message id and
       // parentId = that same id. Anchor the new node at the ORIGINAL's parent so
