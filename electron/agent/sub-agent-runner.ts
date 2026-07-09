@@ -132,7 +132,7 @@ function buildSubAgentSystemPrompt(baseSystemPrompt: string, depth?: number): st
  * modify hook that sanitizes `messages` actually covers it — embedding it in the
  * system prompt would let the raw task leak past a messages-only sanitizer.
  */
-function buildSubAgentTaskMessage(task: string, context?: string): string {
+export function buildSubAgentTaskMessage(task: string, context?: string): string {
   const parts = [`Your assigned task: ${task}`];
   if (context) parts.push('', 'Additional context from parent agent:', context);
   return parts.join('\n');

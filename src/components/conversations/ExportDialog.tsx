@@ -23,6 +23,8 @@ interface Props {
   open: boolean;
   onClose: () => void;
   conversationId: string | null;
+  /** Pre-select a format when opened (e.g. from the sidebar quick-export submenu). */
+  initialFormat?: 'markdown' | 'json' | 'text';
 }
 
 function messagesToMarkdown(conv: Conversation): string {
@@ -32,30 +34,53 @@ function messagesToMarkdown(conv: Conversation): string {
   lines.push('---', '');
 
   for (const msg of conv.messages || []) {
-    const role = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? 'Assistant' : msg.role === 'system' ? 'System' : msg.role;
-    const text = typeof msg.content === 'string'
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
-        : '';
+    const role =
+      msg.role === 'user'
+        ? 'User'
+        : msg.role === 'assistant'
+          ? 'Assistant'
+          : msg.role === 'system'
+            ? 'System'
+            : msg.role;
+    const text =
+      typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((p) => p.type === 'text')
+              .map((p) => p.text || '')
+              .join('\n')
+          : '';
     lines.push(`## ${role}`, '', text, '', '---', '');
   }
   return lines.join('\n');
 }
 
 function messagesToJson(conv: Conversation): string {
-  return JSON.stringify({
-    id: conv.id,
-    title: conv.title || conv.fallbackTitle || null,
-    created_at: conv.createdAt,
-    updated_at: conv.updatedAt,
-    message_count: conv.messages?.length || 0,
-    messages: (conv.messages || []).map((m) => ({
-      role: m.role,
-      content: typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n') : '',
-      created_at: m.createdAt,
-    })),
-  }, null, 2);
+  return JSON.stringify(
+    {
+      id: conv.id,
+      title: conv.title || conv.fallbackTitle || null,
+      created_at: conv.createdAt,
+      updated_at: conv.updatedAt,
+      message_count: conv.messages?.length || 0,
+      messages: (conv.messages || []).map((m) => ({
+        role: m.role,
+        content:
+          typeof m.content === 'string'
+            ? m.content
+            : Array.isArray(m.content)
+              ? m.content
+                  .filter((p) => p.type === 'text')
+                  .map((p) => p.text || '')
+                  .join('\n')
+              : '',
+        created_at: m.createdAt,
+      })),
+    },
+    null,
+    2,
+  );
 }
 
 function messagesToText(conv: Conversation): string {
@@ -64,11 +89,15 @@ function messagesToText(conv: Conversation): string {
 
   for (const msg of conv.messages || []) {
     const role = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? 'Assistant' : msg.role;
-    const text = typeof msg.content === 'string'
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
-        : '';
+    const text =
+      typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((p) => p.type === 'text')
+              .map((p) => p.text || '')
+              .join('\n')
+          : '';
     lines.push(`[${role}]`, text, '');
   }
   return lines.join('\n');
@@ -76,8 +105,13 @@ function messagesToText(conv: Conversation): string {
 
 type ExportFormat = 'markdown' | 'json' | 'text';
 
-export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
-  const [format, setFormat] = useState<ExportFormat>('markdown');
+export const ExportDialog: FC<Props> = ({ open, onClose, conversationId, initialFormat }) => {
+  const [format, setFormat] = useState<ExportFormat>(initialFormat ?? 'markdown');
+
+  // Adopt the requested format each time the dialog is (re)opened with one.
+  useEffect(() => {
+    if (open && initialFormat) setFormat(initialFormat);
+  }, [open, initialFormat]);
   const [preview, setPreview] = useState('');
   const [copied, setCopied] = useState(false);
   const [conv, setConv] = useState<Conversation | null>(null);
@@ -90,17 +124,31 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
   }, [open, conversationId]);
 
   useEffect(() => {
-    if (!conv) { setPreview(''); return; }
+    if (!conv) {
+      setPreview('');
+      return;
+    }
     switch (format) {
-      case 'markdown': setPreview(messagesToMarkdown(conv)); break;
-      case 'json': setPreview(messagesToJson(conv)); break;
-      case 'text': setPreview(messagesToText(conv)); break;
+      case 'markdown':
+        setPreview(messagesToMarkdown(conv));
+        break;
+      case 'json':
+        setPreview(messagesToJson(conv));
+        break;
+      case 'text':
+        setPreview(messagesToText(conv));
+        break;
     }
   }, [conv, format]);
 
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); onClose(); } };
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [open, onClose]);
@@ -119,7 +167,11 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
   const handleDownload = () => {
     const ext = format === 'json' ? '.json' : format === 'markdown' ? '.md' : '.txt';
     const mime = format === 'json' ? 'application/json' : 'text/plain';
-    const name = (conv?.title || conv?.fallbackTitle || 'chat').replace(/[^a-zA-Z0-9-_ ]/g, '').slice(0, 50).trim().replace(/\s+/g, '-');
+    const name = (conv?.title || conv?.fallbackTitle || 'chat')
+      .replace(/[^a-zA-Z0-9-_ ]/g, '')
+      .slice(0, 50)
+      .trim()
+      .replace(/\s+/g, '-');
     const blob = new Blob([preview], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -136,7 +188,10 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div className="relative w-full max-w-xl rounded-xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="relative w-full max-w-xl rounded-xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center justify-between border-b border-border/30 px-5 py-3">
           <div className="flex items-center gap-2">
             <DownloadIcon className="h-4 w-4 text-primary" />
@@ -150,16 +205,21 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
 
         {/* Format selector */}
         <div className="flex items-center gap-2 border-b border-border/30 px-5 py-2">
-          {([
+          {[
             { key: 'markdown' as const, label: 'Markdown', icon: FileTextIcon },
             { key: 'json' as const, label: 'JSON', icon: FileJsonIcon },
             { key: 'text' as const, label: 'Plain Text', icon: FileTextIcon },
-          ]).map((f) => (
-            <button key={f.key} type="button" onClick={() => setFormat(f.key)}
+          ].map((f) => (
+            <button
+              key={f.key}
+              type="button"
+              onClick={() => setFormat(f.key)}
               className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[10px] font-medium transition-colors ${
                 format === f.key ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:bg-muted/40'
-              }`}>
-              <f.icon className="h-3 w-3" />{f.label}
+              }`}
+            >
+              <f.icon className="h-3 w-3" />
+              {f.label}
             </button>
           ))}
         </div>
@@ -173,14 +233,22 @@ export const ExportDialog: FC<Props> = ({ open, onClose, conversationId }) => {
 
         {/* Actions */}
         <div className="flex items-center justify-end gap-2 border-t border-border/30 px-5 py-3">
-          <button type="button" onClick={() => void handleCopy()}
-            className="flex items-center gap-1.5 rounded-lg border border-border/40 px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted/40 transition-colors">
+          <button
+            type="button"
+            onClick={() => void handleCopy()}
+            className="flex items-center gap-1.5 rounded-lg border border-border/40 px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted/40 transition-colors"
+          >
             {copied ? <CheckIcon className="h-3 w-3 text-emerald-400" /> : <CopyIcon className="h-3 w-3" />}
             {copied ? 'Copied' : 'Copy'}
           </button>
-          <button type="button" onClick={handleDownload} disabled={!preview}
-            className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors">
-            <DownloadIcon className="h-3 w-3" />Download
+          <button
+            type="button"
+            onClick={handleDownload}
+            disabled={!preview}
+            className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          >
+            <DownloadIcon className="h-3 w-3" />
+            Download
           </button>
         </div>
       </div>

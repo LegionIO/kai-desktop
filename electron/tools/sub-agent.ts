@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { join } from 'path';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { runSubAgent, getActiveSubAgentCount } from '../agent/sub-agent-runner.js';
+import { runSubAgent, getActiveSubAgentCount, buildSubAgentTaskMessage } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
 import { streamAgentResponse, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
@@ -542,9 +542,13 @@ export function createSubAgentTool(
           }
         }
 
-        // Persist state for resumption after completion
-        // Collect messages from the runner (they were built up in runSubAgent)
-        const persistedMessages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: task }];
+        // Persist state for resumption after completion. Reconstruct the opening
+        // message with the SAME task+context the runner used, so a follow-up to a
+        // completed sub-agent keeps the parent context (which now lives in the
+        // message, not the system prompt).
+        const persistedMessages: Array<{ role: string; content: unknown }> = [
+          { role: 'user', content: buildSubAgentTaskMessage(task, context) },
+        ];
         if (fullResponse) persistedMessages.push({ role: 'assistant', content: fullResponse });
 
         subAgentState.set(subAgentConversationId, {

@@ -140,6 +140,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
+  const [exportFormat, setExportFormat] = useState<'markdown' | 'json'>('markdown');
   const [threadSettingsConvId, setThreadSettingsConvId] = useState<string | null>(null);
   const runtimeConversationId = useRuntimeConversationId();
   const { activeRunStartedAt } = useAssistantResponseTiming();
@@ -342,6 +343,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     // download in the browser.
     const isWebBridge = Boolean((window as unknown as { app?: { __isWebBridge?: boolean } }).app?.__isWebBridge);
     if (isWebBridge) {
+      setExportFormat(format);
       setExportConvId(id);
       return;
     }
@@ -689,7 +691,12 @@ export const ConversationList: FC<ConversationListProps> = ({
           document.body,
         )}
 
-      <ExportDialog open={exportConvId !== null} onClose={() => setExportConvId(null)} conversationId={exportConvId} />
+      <ExportDialog
+        open={exportConvId !== null}
+        onClose={() => setExportConvId(null)}
+        conversationId={exportConvId}
+        initialFormat={exportFormat}
+      />
 
       <ThreadSettingsModal
         open={threadSettingsConvId !== null}
