@@ -313,10 +313,9 @@ function useActiveConversationId(): string | null {
         if (!cancelled) setActiveConversationId(null);
       });
 
-    const unsubscribe = app.conversations.onChanged((store) => {
-      const payload = store as { activeConversationId?: string | null } | null;
+    const unsubscribe = app.conversations.onChanged((change) => {
       if (!cancelled) {
-        setActiveConversationId(payload?.activeConversationId ?? null);
+        setActiveConversationId(change.activeConversationId ?? null);
       }
     });
 

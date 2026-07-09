@@ -1556,12 +1556,15 @@ export function RuntimeProvider({
   // automation targeting this thread). Our own persists never grow the tree past
   // treeRef.current, so a longer incoming tree reliably signals an external append.
   useEffect(() => {
-    return app.conversations.onChanged((raw: unknown) => {
+    return app.conversations.onChanged((change) => {
       const activeId = activeIdRef.current;
       if (!activeId || streamAccumulators.has(activeId)) return;
-      const store = raw as { conversations?: Record<string, { messageTree?: unknown[]; messages?: unknown[] }> };
-      const conv = store.conversations?.[activeId];
-      if (!conv) return;
+      // Only an upsert of the ACTIVE conversation can require a reload (an
+      // external append, e.g. an automation targeting this thread). Our own
+      // persists never grow the tree past treeRef.current, so a longer incoming
+      // tree reliably signals an external write.
+      if (change.kind !== 'upsert' || change.conversation.id !== activeId) return;
+      const conv = change.conversation as { messageTree?: unknown[]; messages?: unknown[] };
       const incomingLen = (conv.messageTree ?? conv.messages ?? []).length;
       if (incomingLen > treeRef.current.length) {
         void loadConversationState(activeId);

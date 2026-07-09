@@ -7,12 +7,12 @@ import { broadcastAgentStreamEvent } from '../ipc/agent.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
-  broadcastConversationChange,
+  broadcastUpsert,
   ensureConversationTree,
   getConversationBranch,
-  readConversationStore,
-  writeConversationStore,
 } from '../ipc/conversations.js';
+import { readIndex, readConversation, writeConversation } from '../ipc/conversation-store.js';
+import type { ConversationRecord } from '../ipc/conversation-store.js';
 import type { PluginActionPayload } from '../plugins/types.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { getPath } from './conditions.js';
@@ -79,8 +79,7 @@ function createAutomationConversation(
 ): string {
   const now = new Date().toISOString();
   const id = `auto-${randomUUID()}`;
-  const store = readConversationStore(appHome);
-  store.conversations[id] = {
+  const conv: ConversationRecord = {
     id,
     title,
     fallbackTitle: title,
@@ -103,8 +102,8 @@ function createAutomationConversation(
     selectedProfileKey: action.profileKey ?? null,
     metadata: { automationRuleId: rule.id, automationSingleton: singleton },
   };
-  writeConversationStore(appHome, store);
-  broadcastConversationChange(store);
+  writeConversation(appHome, conv);
+  broadcastUpsert(appHome, conv);
   return id;
 }
 
@@ -117,12 +116,11 @@ function resolveConversationTarget(
   const target = action.conversationTarget;
   if (target.type === 'per-invocation') return null;
 
-  const store = readConversationStore(appHome);
   const isBusy = (c: { id: string; runStatus?: string }) =>
     c.runStatus === 'running' || c.runStatus === 'awaiting-approval' || inFlightAutomationTargets.has(c.id);
 
   if (target.type === 'existing') {
-    const conv = store.conversations[target.conversationId];
+    const conv = readConversation(appHome, target.conversationId);
     if (!conv) {
       console.warn(
         `[automations] rule "${rule.name}" targets missing conversation ${target.conversationId}; creating a new one`,
@@ -138,7 +136,9 @@ function resolveConversationTarget(
     return { targetId: target.conversationId, created: false };
   }
 
-  for (const conv of Object.values(store.conversations)) {
+  // Singleton lookup uses the lightweight index (metadata + runStatus + id are all
+  // in the index entry — no need to load message bodies).
+  for (const conv of Object.values(readIndex(appHome).conversations)) {
     const meta = conv.metadata as { automationRuleId?: unknown; automationSingleton?: unknown } | undefined;
     if (meta?.automationRuleId === rule.id && meta?.automationSingleton === true) {
       if (isBusy(conv)) {
@@ -194,7 +194,7 @@ async function runAgentAction(
     // user prompt turn immediately with runStatus:'running' so the conversation
     // shows the prompt + a working indicator during generation.
     let messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: prompt }];
-    const existing = readConversationStore(deps.appHome).conversations[conversationId];
+    const existing = readConversation(deps.appHome, conversationId);
     let parentId: string | null | undefined;
     if (existing) {
       const { tree, headId } = ensureConversationTree(existing);
@@ -242,8 +242,7 @@ async function runAgentAction(
         { parentId: null, runStatus: 'running' },
       );
     }
-    const userTurnHeadId =
-      readConversationStore(deps.appHome).conversations[conversationId]?.headId ?? parentId ?? null;
+    const userTurnHeadId = readConversation(deps.appHome, conversationId)?.headId ?? parentId ?? null;
 
     // Stream the model response, broadcasting each event tagged `automation` so
     // the renderer renders it live in this conversation but defers persistence

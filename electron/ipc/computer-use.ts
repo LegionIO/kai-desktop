@@ -12,7 +12,8 @@ import { getComputerUseManager } from '../computer-use/service.js';
 import { getLocalMacDisplayLayout, probeInputMonitoring } from '../computer-use/permissions.js';
 import { getPlatformAdapter } from '../platform/index.js';
 import type { AppConfig } from '../config/schema.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from './conversations.js';
+import { broadcastActive } from './conversations.js';
+import { readConversation, setActiveConversationId } from './conversation-store.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 
 const execFileAsync = promisify(execFile);
@@ -259,11 +260,9 @@ export function registerComputerUseHandlers(ipcMain: IpcMain, appHome: string, g
     if (!session) return { ok: false, error: 'Session not found' };
 
     // Switch active conversation to the one owning this computer-use session
-    const store = readConversationStore(appHome);
-    if (store.conversations[session.conversationId]) {
-      store.activeConversationId = session.conversationId;
-      writeConversationStore(appHome, store);
-      broadcastConversationChange(store);
+    if (readConversation(appHome, session.conversationId)) {
+      setActiveConversationId(appHome, session.conversationId);
+      broadcastActive(appHome);
     }
 
     // Focus the main window and tell its renderer to switch to the computer tab

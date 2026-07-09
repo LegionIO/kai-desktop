@@ -7,13 +7,8 @@ import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
-import {
-  readConversationStore,
-  writeConversationStore,
-  broadcastConversationChange,
-  ensureConversationTree,
-  getConversationBranch,
-} from './conversations.js';
+import { broadcastUpsert, ensureConversationTree, getConversationBranch } from './conversations.js';
+import { readConversation, writeConversation } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import {
@@ -121,8 +116,7 @@ function jsonStableString(value: unknown): string {
  */
 function persistRedactedUserTurn(appHome: string, conversationId: string, sanitizedContent: unknown): void {
   try {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations?.[conversationId];
+    const conv = readConversation(appHome, conversationId);
     if (!conv) return;
     const { tree, headId } = ensureConversationTree(conv);
     const branch = getConversationBranch(tree, headId);
@@ -147,8 +141,8 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
     // Recompute the flat `messages` mirror of the active branch so exports/list
     // reflect the redaction immediately.
     conv.messages = getConversationBranch(tree, headId) as never;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(appHome, conv);
+    broadcastUpsert(appHome, conv);
     // The renderer ignores conversations:changed while a stream accumulator is
     // active (and then renders/persists its raw in-memory copy), so also emit a
     // stream event carrying the sanitized content + target node id so the live
@@ -1819,8 +1813,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
           // Load persisted conversation metadata so runtimes can resume sessions.
           // Claude Code SDK uses `claudeSdkSessionId`; Codex SDK uses `codexSdkThreadId`.
-          const convStore = readConversationStore(appHome);
-          const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
+          const convMetadata = (readConversation(appHome, conversationId)?.metadata ?? {}) as Record<string, unknown>;
 
           // -----------------------------------------------------------------------
           // Cross-runtime switch: detect runtime change and inject prior context

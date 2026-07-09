@@ -10,6 +10,10 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 import type { AppShotPayload } from '../../shared/app-shots';
 import type { DiffEvent, FileDiff } from '../../shared/diff-types';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
+import type { ConversationChange } from '../../electron/ipc/conversations';
+
+export type { ConversationChange } from '../../electron/ipc/conversations';
+export type { ConversationRecord } from '../../electron/ipc/conversation-store';
 
 export type AutomationSourceCatalogEntry = {
   source: string;
@@ -88,7 +92,7 @@ type AppAPI = {
       id: string,
       format: 'markdown' | 'json',
     ) => Promise<{ ok: boolean; filePath?: string; canceled?: boolean; error?: string }>;
-    onChanged: (callback: (store: unknown) => void) => () => void;
+    onChanged: (callback: (change: ConversationChange) => void) => () => void;
     editMessage: (
       conversationId: string,
       messageId: string,

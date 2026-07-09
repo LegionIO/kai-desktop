@@ -49,7 +49,14 @@ import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { buildScopedToolName, getScopedToolPrefix, MAX_TOOL_NAME_LENGTH } from '../tools/naming.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { broadcastUpsert, broadcastActive } from '../ipc/conversations.js';
+import {
+  readConversation,
+  readAllConversations,
+  writeConversation,
+  getActiveConversationId,
+  setActiveConversationId,
+} from '../ipc/conversation-store.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
 import { hookDispatcher, HOOK_EVENTS } from '../agent/hooks/dispatcher.js';
@@ -1428,36 +1435,30 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
   api.conversations.list = () => {
     requirePermission('conversations:read');
-    const store = readConversationStore(callbacks.appHome);
-    return Object.values(store.conversations) as PluginConversationRecord[];
+    return readAllConversations(callbacks.appHome) as PluginConversationRecord[];
   };
 
   api.conversations.get = (conversationId: string) => {
     requirePermission('conversations:read');
-    const store = readConversationStore(callbacks.appHome);
-    return (store.conversations[conversationId] as PluginConversationRecord | undefined) ?? null;
+    return (readConversation(callbacks.appHome, conversationId) as PluginConversationRecord | undefined) ?? null;
   };
 
   api.conversations.upsert = (conversation: PluginConversationRecord) => {
     requirePermission('conversations:write');
-    const store = readConversationStore(callbacks.appHome);
     const normalizedConversation = normalizeConversationRecord(conversation);
-    store.conversations[conversation.id] = normalizedConversation as unknown as (typeof store.conversations)[string];
-    writeConversationStore(callbacks.appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(callbacks.appHome, normalizedConversation as never);
+    broadcastUpsert(callbacks.appHome, normalizedConversation as never);
   };
 
   api.conversations.getActiveId = () => {
     requirePermission('conversations:read');
-    return readConversationStore(callbacks.appHome).activeConversationId;
+    return getActiveConversationId(callbacks.appHome);
   };
 
   api.conversations.setActive = (conversationId: string) => {
     requirePermission('conversations:write');
-    const store = readConversationStore(callbacks.appHome);
-    store.activeConversationId = conversationId;
-    writeConversationStore(callbacks.appHome, store);
-    broadcastConversationChange(store);
+    setActiveConversationId(callbacks.appHome, conversationId);
+    broadcastActive(callbacks.appHome);
     callbacks.openNavigationTarget({ type: 'conversation', conversationId });
   };
 

@@ -40,7 +40,14 @@ import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { eventBus } from '../automations/event-bus.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
-import { readConversationStore, writeConversationStore, broadcastConversationChange } from '../ipc/conversations.js';
+import { broadcastUpsert, broadcastActive } from '../ipc/conversations.js';
+import type { ConversationRecord } from '../ipc/conversation-store.js';
+import {
+  readConversation,
+  readAllConversations,
+  writeConversation,
+  setActiveConversationId,
+} from '../ipc/conversation-store.js';
 import { buildPluginRendererBundle } from './renderer-build.js';
 import { MarketplaceService, UnverifiedPluginError } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry, InstallResult } from './marketplace-service.js';
@@ -1885,31 +1892,25 @@ export class PluginManager {
   /* ── Conversation Helpers ── */
 
   listConversations(): Array<Record<string, unknown>> {
-    const store = readConversationStore(this.appHome);
-    return Object.values(store.conversations);
+    return readAllConversations(this.appHome) as unknown as Array<Record<string, unknown>>;
   }
 
   getConversation(conversationId: string): Record<string, unknown> | null {
-    return readConversationStore(this.appHome).conversations[conversationId] ?? null;
+    return (readConversation(this.appHome, conversationId) as unknown as Record<string, unknown>) ?? null;
   }
 
   upsertConversation(conversation: Record<string, unknown>): void {
-    const store = readConversationStore(this.appHome);
     const conversationId = typeof conversation.id === 'string' ? conversation.id : '';
     if (!conversationId) {
       throw new Error('Conversation id is required');
     }
-
-    store.conversations[conversationId] = conversation as (typeof store.conversations)[string];
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(this.appHome, conversation as unknown as ConversationRecord);
+    broadcastUpsert(this.appHome, conversation as unknown as ConversationRecord);
   }
 
   setActiveConversation(conversationId: string): void {
-    const store = readConversationStore(this.appHome);
-    store.activeConversationId = conversationId;
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    setActiveConversationId(this.appHome, conversationId);
+    broadcastActive(this.appHome);
   }
 
   appendConversationMessage(
@@ -1922,8 +1923,7 @@ export class PluginManager {
       createdAt?: string;
     },
   ): Record<string, unknown> | null {
-    const store = readConversationStore(this.appHome);
-    const conversation = store.conversations[conversationId];
+    const conversation = readConversation(this.appHome, conversationId) as unknown as Record<string, unknown> | null;
     if (!conversation) return null;
 
     const messageId = `plugin-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1962,26 +1962,26 @@ export class PluginManager {
       lastAssistantUpdateAt: normalizedRole === 'assistant' ? createdAt : conversation.lastAssistantUpdateAt,
       messageCount: nextMessages.length,
       userMessageCount:
-        normalizedRole === 'user' ? (conversation.userMessageCount ?? 0) + 1 : (conversation.userMessageCount ?? 0),
+        normalizedRole === 'user'
+          ? ((conversation.userMessageCount as number | undefined) ?? 0) + 1
+          : ((conversation.userMessageCount as number | undefined) ?? 0),
       hasUnread: normalizedRole === 'assistant' ? true : conversation.hasUnread,
     };
 
-    store.conversations[conversationId] = nextConversation;
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(this.appHome, nextConversation as unknown as ConversationRecord);
+    broadcastUpsert(this.appHome, nextConversation as unknown as ConversationRecord);
     return nextConversation;
   }
 
   markConversationUnread(conversationId: string, unread: boolean): void {
-    const store = readConversationStore(this.appHome);
-    const conversation = store.conversations[conversationId];
+    const conversation = readConversation(this.appHome, conversationId);
     if (!conversation) return;
-    store.conversations[conversationId] = {
+    const next: ConversationRecord = {
       ...conversation,
       hasUnread: unread,
       updatedAt: new Date().toISOString(),
     };
-    writeConversationStore(this.appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(this.appHome, next);
+    broadcastUpsert(this.appHome, next);
   }
 }
