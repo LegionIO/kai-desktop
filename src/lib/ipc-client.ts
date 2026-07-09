@@ -59,7 +59,12 @@ type AppAPI = {
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
-    generateTitle: (messages: unknown[], modelKey?: string, hint?: string) => Promise<{ title: string | null }>;
+    generateTitle: (
+      messages: unknown[],
+      modelKey?: string,
+      hint?: string,
+      conversationId?: string,
+    ) => Promise<{ title: string | null; suppressed?: boolean }>;
     onStreamEvent: (callback: (event: unknown) => void) => () => void;
     sendSubAgentMessage: (subAgentConversationId: string, message: string) => Promise<{ ok: boolean }>;
     stopSubAgent: (subAgentConversationId: string) => Promise<{ ok: boolean }>;

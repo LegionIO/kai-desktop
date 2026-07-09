@@ -1051,7 +1051,7 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
       // Brief stagger to avoid simultaneous requests hitting rate limits
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined, hint);
+      const result = await app.agent.generateTitle(messages, conv.selectedModelKey ?? undefined, hint, conversationId);
       if (result.title) {
         await patchConversation(conversationId, {
           title: result.title,
@@ -1059,6 +1059,14 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
           titleStatus: 'ready',
           titleUpdatedAt: nowIso(),
         });
+      } else if (result.suppressed) {
+        // A UserPromptSubmit hook blocked title generation for this prompt. Do
+        // NOT derive a fallback title from the raw messages — that would leak the
+        // blocked/redacted content into the sidebar title. Leave the title empty.
+        const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;
+        if (latest && latest.titleStatus === 'generating') {
+          await patchConversation(conversationId, { titleStatus: 'idle' });
+        }
       } else {
         // Title gen returned nothing — keep the UI moving with a simple fallback.
         const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;

@@ -53,8 +53,8 @@ const appAPI = {
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>) =>
       ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
-    generateTitle: (messages: unknown[], modelKey?: string, hint?: string) =>
-      ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint),
+    generateTitle: (messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint, conversationId),
     onStreamEvent: (callback: (event: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('agent:stream-event', handler);

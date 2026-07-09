@@ -2109,84 +2109,89 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:generate-title', async (_event, messages: unknown[], modelKey?: string, hint?: string) => {
-    let config: AppConfig;
-    try {
-      config = readEffectiveConfig(appHome);
-    } catch {
-      return { title: null };
-    }
-
-    // Title generation sends the user's prompt to a model too, so when hook
-    // enforcement is active it must pass through the same UserPromptSubmit gate —
-    // otherwise a DLP block/modify hook that guards the chat request is bypassed
-    // here (the raw prompt would reach the title model). A `deny` suppresses the
-    // title; a `modify` rewrites the messages we summarize. Only dispatched when
-    // enforcing tool hooks exist, so the common no-hook path adds no fan-out.
-    let effectiveMessages = messages;
-    if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+  ipcMain.handle(
+    'agent:generate-title',
+    async (_event, messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) => {
+      let config: AppConfig;
       try {
-        const dispatch = await hookDispatcher.dispatch(
-          'UserPromptSubmit',
-          {
-            conversationId: '',
-            messages,
-            systemPrompt: '',
-            modelKey: modelKey ?? config.models.defaultModelKey,
-            purpose: 'title-generation',
-          },
-          // Enforcement only: don't fan out to the automation bus or observe
-          // handlers, or generating a title would re-trigger the user's
-          // UserPromptSubmit automations a second time for the same prompt.
-          { suppressObserve: true },
-        );
-        if (dispatch.denied) return { title: null };
-        const next = dispatch.payload as { messages?: unknown[] };
-        if (Array.isArray(next?.messages)) effectiveMessages = next.messages;
+        config = readEffectiveConfig(appHome);
       } catch {
-        // Fail closed for a DLP posture: skip the title rather than risk sending
-        // unsanitized content to the title model.
         return { title: null };
       }
-    }
 
-    const input = buildTitleGenerationInput(effectiveMessages);
-    if (!input) return { title: null };
+      // Title generation sends the user's prompt to a model too, so when hook
+      // enforcement is active it must pass through the same UserPromptSubmit gate.
+      // A `deny` returns { title: null, suppressed: true } so the renderer does
+      // NOT fall back to deriving a title from the raw messages; a `modify`
+      // rewrites the messages we summarize.
+      let effectiveMessages = messages;
+      if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+        try {
+          const dispatch = await hookDispatcher.dispatch(
+            'UserPromptSubmit',
+            {
+              // Pass the real conversation id so a hook whose conditions check
+              // payload.conversationId matches (and thus actually gates) instead
+              // of silently no-op'ing on an empty id.
+              conversationId: conversationId ?? '',
+              messages,
+              systemPrompt: '',
+              modelKey: modelKey ?? config.models.defaultModelKey,
+              purpose: 'title-generation',
+            },
+            // Enforcement only: don't fan out to the automation bus or observe
+            // handlers, or generating a title would re-trigger the user's
+            // UserPromptSubmit automations a second time for the same prompt.
+            { suppressObserve: true },
+          );
+          if (dispatch.denied) return { title: null, suppressed: true };
+          const next = dispatch.payload as { messages?: unknown[] };
+          if (Array.isArray(next?.messages)) effectiveMessages = next.messages;
+        } catch {
+          // Fail closed for a DLP posture: suppress the title rather than risk
+          // sending unsanitized content to the title model OR a raw fallback.
+          return { title: null, suppressed: true };
+        }
+      }
 
-    const hasImages = messagesContainImages(effectiveMessages);
+      const input = buildTitleGenerationInput(effectiveMessages);
+      if (!input) return { title: null };
 
-    const promptParts = [
-      'Generate a concise conversation title using at most 4 words.',
-      "Summarize the user's main topic or task, not the assistant's answer.",
-      'Use a neutral noun phrase, not a sentence.',
-      'Avoid apologies, disclaimers, or copied response text.',
-      'Return only the title text with no quotes or formatting.',
-    ];
+      const hasImages = messagesContainImages(effectiveMessages);
 
-    if (hasImages) {
-      promptParts.push(
-        'The user attached one or more images. [Image] is a placeholder — do not treat it as literal text.',
-        'If the user\'s text is a short generic phrase like "read this image" or "what is this", title it based on the action, e.g. "Image Analysis" or "Analyze Image".',
-        'Never generate text that refers to not seeing an image or being unable to view it.',
-      );
-    }
+      const promptParts = [
+        'Generate a concise conversation title using at most 4 words.',
+        "Summarize the user's main topic or task, not the assistant's answer.",
+        'Use a neutral noun phrase, not a sentence.',
+        'Avoid apologies, disclaimers, or copied response text.',
+        'Return only the title text with no quotes or formatting.',
+      ];
 
-    if (hint) {
-      promptParts.push(`Context: ${hint}.`);
-    }
+      if (hasImages) {
+        promptParts.push(
+          'The user attached one or more images. [Image] is a placeholder — do not treat it as literal text.',
+          'If the user\'s text is a short generic phrase like "read this image" or "what is this", title it based on the action, e.g. "Image Analysis" or "Analyze Image".',
+          'Never generate text that refers to not seeing an image or being unable to view it.',
+        );
+      }
 
-    const CHAT_TITLE_PROMPT = promptParts.join(' ');
+      if (hint) {
+        promptParts.push(`Context: ${hint}.`);
+      }
 
-    const title = await generateTitle({
-      systemPrompt: CHAT_TITLE_PROMPT,
-      maxWords: 4,
-      input,
-      config,
-      modelKey,
-    });
+      const CHAT_TITLE_PROMPT = promptParts.join(' ');
 
-    return { title };
-  });
+      const title = await generateTitle({
+        systemPrompt: CHAT_TITLE_PROMPT,
+        maxWords: 4,
+        input,
+        config,
+        modelKey,
+      });
+
+      return { title };
+    },
+  );
 
   // Sub-agent interaction handlers
   ipcMain.handle('agent:sub-agent-message', async (_event, subAgentConversationId: string, message: string) => {
