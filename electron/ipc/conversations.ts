@@ -509,7 +509,11 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const userIdx = branch.map((m, i) => (m.role === 'user' ? i : -1)).filter((i) => i >= 0);
     if (userIdx.length === 0) return { ok: false, error: 'nothing-to-rewind' };
 
-    const target = Math.max(0, userIdx.length - Math.max(1, steps));
+    // Normalize steps to a finite positive integer — a NaN/negative/fractional
+    // value from the wire would make `target` NaN and null the head.
+    const n = Number(steps);
+    const safeSteps = Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
+    const target = Math.max(0, userIdx.length - safeSteps);
     const cutIndex = userIdx[target]; // this user turn (and everything after) is removed from the active branch
     const nextHead = cutIndex > 0 ? branch[cutIndex - 1].id : null;
     const removed = branch.length - cutIndex;

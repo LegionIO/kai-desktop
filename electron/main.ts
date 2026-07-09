@@ -154,7 +154,13 @@ const IS_CLI = process.argv.includes('--kai-cli') || process.env.KAI_CLI === '1'
 // backend is promoted to windowed (a GUI launched against it — see
 // `promoteHeadlessToWindowed`), so the real app window can then appear.
 let headlessWindowBlockActive = IS_HEADLESS;
-if (IS_HEADLESS) {
+// Install the window-block guard UNCONDITIONALLY (not just when launched
+// headless). It's gated at runtime on `headlessWindowBlockActive`, which is
+// false for a normal GUI launch — so the patch is a no-op there. But a GUI that
+// later DEMOTES to a dockless background backend flips the flag true, and
+// without the guard installed at startup, plugins/GUI subsystems could still
+// open a visible window in the supposedly headless backend.
+{
   const proto = BrowserWindow.prototype as unknown as {
     show: () => void;
     showInactive: () => void;

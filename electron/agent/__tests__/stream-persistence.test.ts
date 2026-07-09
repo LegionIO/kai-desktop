@@ -100,13 +100,14 @@ describe('stream persistence accumulator', () => {
 
     expect(appendMock).toHaveBeenCalledTimes(1);
     const [, , , options] = appendMock.mock.calls[0];
-    expect(options).toEqual({ parentId: 'user-node-42' });
+    expect(options).toEqual({ runStatus: 'idle', parentId: 'user-node-42' });
   });
 
-  it('omits parentId options when no submit-time head was captured', () => {
+  it('omits parentId (but still resets runStatus) when no submit-time head was captured', () => {
     feed({ conversationId: 'p2', type: 'text-delta', text: 'x' });
     feed({ conversationId: 'p2', type: 'done' });
     const [, , , options] = appendMock.mock.calls[0];
-    expect(options).toBeUndefined();
+    expect(options).toEqual({ runStatus: 'idle' });
+    expect(options.parentId).toBeUndefined();
   });
 });

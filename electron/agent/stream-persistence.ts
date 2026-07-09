@@ -159,17 +159,29 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
     case 'done': {
       const acc = accumulators.get(conversationId);
       accumulators.delete(conversationId);
-      if (!acc || !acc.sawContent || acc.parts.length === 0) return;
+      if (!acc || !acc.sawContent || acc.parts.length === 0) {
+        // Nothing to persist, but agent:submit marked the conversation
+        // 'running' for this turn — reset it so it doesn't look stuck busy.
+        try {
+          const conv = readConversation(appHome, conversationId);
+          if (conv && conv.runStatus === 'running') {
+            conv.runStatus = 'idle';
+            writeConversation(appHome, conv);
+          }
+        } catch {
+          // best-effort
+        }
+        return;
+      }
       try {
         // Parent on the head captured at submit so a mid-run branch change
         // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
         // in options falls back to the current head, so only pass it when known.
-        appendConversationMessages(
-          appHome,
-          conversationId,
-          [{ role: 'assistant', content: acc.parts }],
-          acc.parentId !== undefined ? { parentId: acc.parentId } : undefined,
-        );
+        // Reset runStatus to idle: agent:submit set it 'running' for the turn.
+        appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
+          runStatus: 'idle',
+          ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
+        });
       } catch {
         // Persistence is best-effort; a failure must not break the stream.
       }

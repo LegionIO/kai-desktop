@@ -260,11 +260,15 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   if (event.conversationId) {
     const activeToken = activeStreams.get(event.conversationId)?.token;
     // Only the run that currently owns the active stream may drive persistence,
-    // and only when the event actually came from THAT run (emittingToken). A
-    // superseded run's late event carries its own (now-stale) token, so it fails
-    // the emittingToken check and can neither pollute the accumulator nor delete
-    // the replacement run's ownership on a stray `done`.
-    const fromCurrentRun = emittingToken === undefined || emittingToken === activeToken;
+    // and only when the event actually came from THAT run. Every in-run CLI
+    // broadcast is stamped with its streamToken via emit(); external/automation
+    // producers (broadcastAgentStreamEvent) and the raw approval path pass no
+    // token. Requiring an exact token match means a superseded run's late event
+    // (stale token) OR an untagged external broadcast can neither pollute the
+    // accumulator nor clear ownership on a stray `done`. (The raw approval path
+    // still tags serverPersisted for live rendering via tool-approval.ts; that's
+    // separate from the persistence side effects gated here.)
+    const fromCurrentRun = emittingToken !== undefined && emittingToken === activeToken;
     if (fromCurrentRun && isServerPersistOwner(event.conversationId, activeToken)) {
       eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
       if (serverPersistAppHome) {
@@ -288,6 +292,43 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
 }
 
 /**
+ * Run the title-generation messages through the UserPromptSubmit DLP gate
+ * (shared by agent:generate-title and the CLI auto-title path). Title
+ * generation sends the user's prompt to a model, so it must pass the same
+ * enforcement gate as a normal turn. Returns the (possibly hook-modified)
+ * messages, or `suppressed: true` when a hook denies — callers must then NOT
+ * fall back to a raw-message title. Fails closed (suppressed) on hook error.
+ */
+async function gateTitleGenerationMessages(
+  messages: unknown[],
+  config: AppConfig,
+  conversationId: string,
+  modelKey?: string,
+): Promise<{ suppressed: boolean; messages: unknown[] }> {
+  if (!hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+    return { suppressed: false, messages };
+  }
+  try {
+    const dispatch = await hookDispatcher.dispatch(
+      'UserPromptSubmit',
+      {
+        conversationId,
+        messages,
+        systemPrompt: '',
+        modelKey: modelKey ?? config.models.defaultModelKey,
+        purpose: 'title-generation',
+      },
+      { suppressObserve: true },
+    );
+    if (dispatch.denied) return { suppressed: true, messages };
+    const next = dispatch.payload as { messages?: unknown[] };
+    return { suppressed: false, messages: Array.isArray(next?.messages) ? next.messages : messages };
+  } catch {
+    return { suppressed: true, messages };
+  }
+}
+
+/**
  * Auto-title a client-driven (CLI) conversation after its first completed turn,
  * mirroring what the GUI does client-side. No-op if the chat already has a
  * title or has no user turn yet. Best-effort: title failures are swallowed.
@@ -302,10 +343,15 @@ async function maybeAutoTitle(appHome: string, conversationId: string): Promise<
     const branch = getConversationBranch(tree, headId);
     if (!branch.some((m) => m.role === 'user')) return;
 
-    const input = buildTitleGenerationInput(branch);
+    const config = readEffectiveConfig(appHome);
+    // Same DLP gate as agent:generate-title — a title-specific deny/modify hook
+    // must apply to CLI-created conversations too. Suppressed ⇒ no title.
+    const gated = await gateTitleGenerationMessages(branch, config, conversationId);
+    if (gated.suppressed) return;
+
+    const input = buildTitleGenerationInput(gated.messages);
     if (!input) return;
 
-    const config = readEffectiveConfig(appHome);
     const title = await generateTitle({
       systemPrompt:
         "Generate a concise conversation title using at most 4 words. Summarize the user's main topic or task, not the assistant's answer. Use a neutral noun phrase, not a sentence. Return only the title text with no quotes or formatting.",
@@ -2244,9 +2290,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // turn arriving in that window would run tool-less. Wait for tools first.
       await toolsReady;
 
-      appendConversationMessages(appHome, conversationId, [
-        { role: 'user', content: [{ type: 'text', text: userText }] },
-      ]);
+      // Mark the conversation running so automation busy-checks and the GUI
+      // index see a live CLI turn and don't target it with a concurrent write.
+      // The terminal assistant/error persist (or cancel) resets it to idle.
+      appendConversationMessages(
+        appHome,
+        conversationId,
+        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+        { runStatus: 'running' },
+      );
 
       const updated = readConversation(appHome, conversationId);
       if (!updated) return { ok: false, error: 'conversation-not-found' };
@@ -2286,12 +2338,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       activeStreamModelKeys.delete(conversationId);
     }
     activeObserverSessions.delete(conversationId);
-    // Drop any server-side persistence accumulation + ownership for a cancelled turn.
+    // Drop any server-side persistence accumulation + ownership for a cancelled
+    // turn, and reset a CLI turn's runStatus so it doesn't look stuck 'running'.
     pendingServerPersist.delete(conversationId);
     pendingServerPersistParent.delete(conversationId);
     serverPersistParents.delete(conversationId);
-    if (serverPersistTokens.delete(conversationId)) {
+    const wasServerPersist = serverPersistTokens.delete(conversationId);
+    if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
+      try {
+        const conv = readConversation(appHome, conversationId);
+        if (conv && conv.runStatus === 'running') {
+          conv.runStatus = 'idle';
+          writeConversation(appHome, conv);
+          broadcastUpsert(appHome, conv);
+        }
+      } catch {
+        // best-effort
+      }
     }
     return { ok: true };
   });
@@ -2345,39 +2409,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
 
       // Title generation sends the user's prompt to a model too, so when hook
-      // enforcement is active it must pass through the same UserPromptSubmit gate.
-      // A `deny` returns { title: null, suppressed: true } so the renderer does
-      // NOT fall back to deriving a title from the raw messages; a `modify`
-      // rewrites the messages we summarize.
-      let effectiveMessages = messages;
-      if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
-        try {
-          const dispatch = await hookDispatcher.dispatch(
-            'UserPromptSubmit',
-            {
-              // Pass the real conversation id so a hook whose conditions check
-              // payload.conversationId matches (and thus actually gates) instead
-              // of silently no-op'ing on an empty id.
-              conversationId: conversationId ?? '',
-              messages,
-              systemPrompt: '',
-              modelKey: modelKey ?? config.models.defaultModelKey,
-              purpose: 'title-generation',
-            },
-            // Enforcement only: don't fan out to the automation bus or observe
-            // handlers, or generating a title would re-trigger the user's
-            // UserPromptSubmit automations a second time for the same prompt.
-            { suppressObserve: true },
-          );
-          if (dispatch.denied) return { title: null, suppressed: true };
-          const next = dispatch.payload as { messages?: unknown[] };
-          if (Array.isArray(next?.messages)) effectiveMessages = next.messages;
-        } catch {
-          // Fail closed for a DLP posture: suppress the title rather than risk
-          // sending unsanitized content to the title model OR a raw fallback.
-          return { title: null, suppressed: true };
-        }
-      }
+      // enforcement is active it must pass through the same UserPromptSubmit gate
+      // (shared with the CLI auto-title path). A `deny` returns
+      // { title: null, suppressed: true } so the renderer does NOT fall back to
+      // deriving a title from the raw messages; a `modify` rewrites the messages.
+      const gated = await gateTitleGenerationMessages(messages, config, conversationId ?? '', modelKey);
+      if (gated.suppressed) return { title: null, suppressed: true };
+      const effectiveMessages = gated.messages;
 
       const input = buildTitleGenerationInput(effectiveMessages);
       if (!input) return { title: null };

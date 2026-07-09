@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
+import { stripControl } from '../render/markdown.js';
 
 /**
  * Top MOTD banner (Claude-Code / Codex style): product name + version, the
@@ -28,8 +29,12 @@ export function Banner({
   cwd: string;
 }): React.ReactElement {
   const home = process.env.HOME ?? '';
-  const prettyCwd = home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
-  const modelLine = effort ? `${modelLabel} ${effort}` : modelLabel;
+  const rawCwd = home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
+  // model/profile labels come from config and cwd is a filesystem path — strip
+  // ESC/OSC so a crafted model name or repo dir can't inject terminal escapes.
+  const prettyCwd = stripControl(rawCwd);
+  const modelLine = stripControl(effort ? `${modelLabel} ${effort}` : modelLabel);
+  const safeProfileLabel = stripControl(profileLabel);
 
   const trailer = (line: 'model' | 'profile'): React.ReactElement =>
     pending === line ? (
@@ -59,7 +64,7 @@ export function Banner({
       </Box>
       <Box>
         <Text dimColor>profile: </Text>
-        <Text color="yellow">{profileLabel}</Text>
+        <Text color="yellow">{safeProfileLabel}</Text>
         {trailer('profile')}
       </Box>
       <Box>

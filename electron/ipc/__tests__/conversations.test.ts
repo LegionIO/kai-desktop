@@ -609,4 +609,35 @@ describe('conversations IPC: rewind', () => {
     expect(res.ok).toBe(false);
     expect(res.error).toBe('compacted');
   });
+
+  it('normalizes a NaN steps value to 1 instead of nulling the head', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('rwnan', {
+        messages: twoExchangeTree,
+        messageTree: twoExchangeTree,
+        headId: 'a2',
+        messageCount: 4,
+        userMessageCount: 2,
+      }),
+    );
+
+    // A non-numeric steps from the wire must not produce removed: NaN / head: null.
+    const res = await harness.invoke<{ ok: boolean; removed: number }>(
+      'conversations:rewind',
+      FAKE_EVENT,
+      'rwnan',
+      'garbage' as unknown as number,
+    );
+    expect(res.ok).toBe(true);
+    expect(res.removed).toBe(2); // treated as steps=1
+    const after = await harness.invoke<{ messages: unknown[] }>('conversations:get', FAKE_EVENT, 'rwnan');
+    expect(after.messages).toHaveLength(2);
+  });
 });

@@ -709,7 +709,7 @@ function TurnView({ turn }: { turn: Turn }): React.ReactElement {
           <Text color="blue" bold>
             you
           </Text>
-          <Text>{turn.text}</Text>
+          <Text>{stripControl(turn.text)}</Text>
         </Box>
       );
     case 'assistant':
@@ -724,7 +724,9 @@ function TurnView({ turn }: { turn: Turn }): React.ReactElement {
     case 'error':
       return (
         <Box marginTop={1}>
-          <Text color="red">✗ {turn.text}</Text>
+          {/* Error text may carry model/provider-controlled content — strip
+              ESC/OSC at the terminal boundary. */}
+          <Text color="red">✗ {stripControl(turn.text)}</Text>
         </Box>
       );
     case 'note':
@@ -735,7 +737,7 @@ function TurnView({ turn }: { turn: Turn }): React.ReactElement {
               <Spinner type="dots" />{' '}
             </Text>
           ) : null}
-          <Text dimColor>{turn.text}</Text>
+          <Text dimColor>{stripControl(turn.text)}</Text>
         </Box>
       );
   }
