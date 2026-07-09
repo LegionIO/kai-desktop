@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
+import { stripControl } from '../render/markdown.js';
 
 export type ToolStatus = 'running' | 'awaiting' | 'done' | 'error';
 
@@ -15,6 +16,10 @@ export function ToolRow({
   durationMs?: number;
   error?: string;
 }): React.ReactElement {
+  // Tool names + errors are model/tool-controlled; strip ESC/OSC at the terminal
+  // boundary so they can't inject cursor/color/link escapes.
+  name = stripControl(name);
+  error = error !== undefined ? stripControl(error) : error;
   const dur = typeof durationMs === 'number' ? ` ${(durationMs / 1000).toFixed(1)}s` : '';
   switch (status) {
     case 'running':

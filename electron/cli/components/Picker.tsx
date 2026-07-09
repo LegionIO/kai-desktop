@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
+import { stripControl } from '../render/markdown.js';
 
 export type PickerItem = { label: string; value: string };
 
@@ -36,13 +37,15 @@ export function Picker({
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
       <Text bold color="cyan">
-        {title}
+        {/* title/labels may be model-controlled — strip ESC/OSC at the render
+            boundary; `value` (selection payload) is left untouched. */}
+        {stripControl(title)}
       </Text>
       {items.map((item, i) => (
         <Text key={item.value} color={i === index ? 'cyan' : undefined} inverse={i === index}>
           {i === index ? '❯ ' : '  '}
           {i < 9 ? `${i + 1}. ` : '·  '}
-          {item.label}
+          {stripControl(item.label)}
         </Text>
       ))}
       <Text dimColor>↑/↓ move · 1-9 quick-select · enter select · esc cancel</Text>

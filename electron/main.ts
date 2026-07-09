@@ -1335,6 +1335,19 @@ if (gotSingleInstanceLock) {
         app.dock?.show();
       }
       ensureGuiSubsystems();
+      // A headless backend skips the web server at boot (it's a GUI-app feature).
+      // On promotion to a real GUI, honor the config: start it if enabled and not
+      // already running. startWebServer is idempotent (stops any existing first).
+      const webServerConfig = getConfig().webServer;
+      if (webServerConfig?.enabled) {
+        startWebServer(webServerConfig)
+          .then(() =>
+            console.info(
+              `[${__BRAND_PRODUCT_NAME}] Web UI server started on promotion at ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`,
+            ),
+          )
+          .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start on promotion:`, err));
+      }
       const win = createWindow();
       win.once('ready-to-show', () => {
         if (!win.isDestroyed()) {

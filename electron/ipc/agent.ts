@@ -164,7 +164,7 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
 }
 
 // Pending tool approval promises — shared with the Claude Agent SDK MCP bridge
-import { pendingToolApprovals } from './tool-approval.js';
+import { pendingToolApprovals, setServerPersistTagger } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
 import { pendingQuestionAnswers } from '../tools/ask-user.js';
@@ -191,6 +191,13 @@ const activeStreamModelKeys = new Map<string, string>();
 // the conversation's CURRENT active stream token matches the persist owner.
 const pendingServerPersist = new Set<string>();
 const serverPersistTokens = new Map<string, string>();
+// The conversation head captured at submit time (the just-appended user turn),
+// keyed by conversationId. streamHandler binds it to the run's token so the
+// assistant reply is persisted as a child of the turn it actually answered —
+// NOT whatever head is current at `done` (a mid-run /rewind, edit, or variant
+// switch moves the head and would otherwise mis-parent the reply).
+const pendingServerPersistParent = new Map<string, string | null>();
+const serverPersistParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
 
 /** True if the given conversation's active stream is the server-persist owner. */
@@ -261,9 +268,13 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     if (fromCurrentRun && isServerPersistOwner(event.conversationId, activeToken)) {
       eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
       if (serverPersistAppHome) {
-        accumulateForPersistence(serverPersistAppHome, event);
+        // Parent the persisted assistant turn on the head captured at submit
+        // (the user node it answers), so a mid-run branch change can't reparent it.
+        const parentId = serverPersistParents.get(event.conversationId);
+        accumulateForPersistence(serverPersistAppHome, event, parentId ?? undefined);
         if (event.type === 'done') {
           serverPersistTokens.delete(event.conversationId);
+          serverPersistParents.delete(event.conversationId);
           void maybeAutoTitle(serverPersistAppHome, event.conversationId);
         }
       }
@@ -545,6 +556,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
   serverPersistAppHome = appHome;
 
+  // Let the low-level raw broadcaster (used by the Claude SDK approval path)
+  // tag events for CLI/headless-owned turns so a watching GUI renders live but
+  // defers persistence to the main process, avoiding a duplicate/forked branch.
+  setServerPersistTagger((event) => {
+    if (!event.conversationId) return event;
+    const activeToken = activeStreams.get(event.conversationId)?.token;
+    return isServerPersistOwner(event.conversationId, activeToken) ? { ...event, serverPersisted: true } : event;
+  });
+
   const streamHandler = async (
     _event: unknown,
     conversationId: string,
@@ -582,10 +602,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // or clobber it). Consume the one-shot pending marker.
     if (pendingServerPersist.delete(conversationId)) {
       serverPersistTokens.set(conversationId, streamToken);
+      // Bind the submit-time parent head to this run (consume the one-shot).
+      serverPersistParents.set(conversationId, pendingServerPersistParent.get(conversationId) ?? null);
+      pendingServerPersistParent.delete(conversationId);
     } else {
       // A GUI (agent:stream) turn superseding a CLI turn: the new run is NOT
       // server-persisted, so drop any stale ownership for this conversation.
       serverPersistTokens.delete(conversationId);
+      serverPersistParents.delete(conversationId);
+      pendingServerPersistParent.delete(conversationId);
     }
     const randomBytes = new Uint8Array(4);
     crypto.getRandomValues(randomBytes);
@@ -2230,8 +2255,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
       // Flag this turn for server-side assistant persistence — the CLI/headless
       // client won't write the reply itself. streamHandler binds this to the
-      // run's token so a later superseding run can't inherit it.
+      // run's token so a later superseding run can't inherit it. Capture the
+      // post-user head as the intended parent for the assistant reply so a
+      // mid-run branch change doesn't reparent it.
       pendingServerPersist.add(conversationId);
+      pendingServerPersistParent.set(conversationId, headId);
 
       await streamHandler(
         event,
@@ -2260,6 +2288,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     activeObserverSessions.delete(conversationId);
     // Drop any server-side persistence accumulation + ownership for a cancelled turn.
     pendingServerPersist.delete(conversationId);
+    pendingServerPersistParent.delete(conversationId);
+    serverPersistParents.delete(conversationId);
     if (serverPersistTokens.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }

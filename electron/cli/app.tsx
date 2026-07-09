@@ -3,7 +3,7 @@ import { Box, Text, useApp, useStdout, useInput } from 'ink';
 import Spinner from 'ink-spinner';
 import { randomUUID } from 'crypto';
 import type { LocalBridgeClient } from './client.js';
-import { renderMarkdown } from './render/markdown.js';
+import { renderMarkdown, stripControl } from './render/markdown.js';
 import { InputBox } from './components/InputBox.js';
 import { ToolRow, type ToolStatus } from './components/ToolRow.js';
 import { Picker, type PickerItem } from './components/Picker.js';
@@ -263,8 +263,11 @@ export function App({
         }
         const q = questions[i];
         setPicker({
-          title: q.question,
-          items: q.options.map((o) => ({ label: o.label, value: o.label })),
+          // Sanitize model-controlled display text at the terminal boundary
+          // (ESC/OSC injection); keep the ORIGINAL label as the answer value so
+          // the tool receives exactly what it offered.
+          title: stripControl(q.question),
+          items: q.options.map((o) => ({ label: stripControl(o.label), value: o.label })),
           onSelect: (v) => {
             setPicker(null);
             answers[q.question] = v;

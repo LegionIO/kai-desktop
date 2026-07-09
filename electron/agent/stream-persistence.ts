@@ -32,15 +32,21 @@ type Accumulator = {
   parts: ContentPart[];
   toolIndex: Map<string, number>; // toolCallId → index in parts
   sawContent: boolean;
+  /** Head captured at submit (the user node this reply answers). Undefined ⇒
+   *  fall back to the store's current head. Set on first accumulation. */
+  parentId?: string;
 };
 
 const accumulators = new Map<string, Accumulator>();
 
-function ensureAcc(conversationId: string): Accumulator {
+function ensureAcc(conversationId: string, parentId?: string): Accumulator {
   let acc = accumulators.get(conversationId);
   if (!acc) {
-    acc = { parts: [], toolIndex: new Map(), sawContent: false };
+    acc = { parts: [], toolIndex: new Map(), sawContent: false, parentId };
     accumulators.set(conversationId, acc);
+  } else if (acc.parentId === undefined && parentId !== undefined) {
+    // First event that knew the parent — record it (later events may omit it).
+    acc.parentId = parentId;
   }
   return acc;
 }
@@ -60,18 +66,18 @@ function appendText(acc: Accumulator, text: string): void {
  * persist the accumulated assistant turn (if any) and clear state. Returns
  * nothing — invoked for side effects from broadcastStreamEvent.
  */
-export function accumulateForPersistence(appHome: string, event: StreamEvent): void {
+export function accumulateForPersistence(appHome: string, event: StreamEvent, parentId?: string): void {
   const conversationId = event.conversationId;
   if (!conversationId) return;
 
   switch (event.type) {
     case 'text-delta': {
-      if (event.text) appendText(ensureAcc(conversationId), event.text);
+      if (event.text) appendText(ensureAcc(conversationId, parentId), event.text);
       break;
     }
     case 'tool-call': {
       if (!event.toolCallId) break;
-      const acc = ensureAcc(conversationId);
+      const acc = ensureAcc(conversationId, parentId);
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx === undefined) {
         acc.parts.push({
@@ -92,7 +98,7 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent): v
     case 'tool-result':
     case 'tool-error': {
       if (!event.toolCallId) break;
-      const acc = ensureAcc(conversationId);
+      const acc = ensureAcc(conversationId, parentId);
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx !== undefined) {
         const part = acc.parts[idx] as ToolPart;
@@ -146,7 +152,7 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent): v
       break;
     }
     case 'error': {
-      const acc = ensureAcc(conversationId);
+      const acc = ensureAcc(conversationId, parentId);
       appendText(acc, `\n\n**Error:** ${event.error ?? 'unknown error'}`);
       break;
     }
@@ -155,7 +161,15 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent): v
       accumulators.delete(conversationId);
       if (!acc || !acc.sawContent || acc.parts.length === 0) return;
       try {
-        appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }]);
+        // Parent on the head captured at submit so a mid-run branch change
+        // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
+        // in options falls back to the current head, so only pass it when known.
+        appendConversationMessages(
+          appHome,
+          conversationId,
+          [{ role: 'assistant', content: acc.parts }],
+          acc.parentId !== undefined ? { parentId: acc.parentId } : undefined,
+        );
       } catch {
         // Persistence is best-effort; a failure must not break the stream.
       }

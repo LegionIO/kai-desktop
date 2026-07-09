@@ -18,6 +18,8 @@ import type { StreamEvent } from '../mastra-agent.js';
 
 const APP_HOME = '/tmp/fake-home';
 const feed = (e: Partial<StreamEvent>): void => accumulateForPersistence(APP_HOME, e as StreamEvent);
+const feedWithParent = (e: Partial<StreamEvent>, parentId?: string): void =>
+  accumulateForPersistence(APP_HOME, e as StreamEvent, parentId);
 
 describe('stream persistence accumulator', () => {
   beforeEach(() => appendMock.mockReset());
@@ -86,5 +88,25 @@ describe('stream persistence accumulator', () => {
     expect(appendMock).toHaveBeenCalledTimes(2);
     expect(appendMock.mock.calls[0][1]).toBe('a');
     expect(appendMock.mock.calls[1][1]).toBe('b');
+  });
+
+  it('parents the persisted reply on the submit-time head, captured at first event', () => {
+    // parentId is bound on the FIRST accumulation and is immune to a later
+    // head change (rewind/edit/variant) — a subsequent event omitting it, or
+    // passing a different one, must not move the reply off its answered turn.
+    feedWithParent({ conversationId: 'p1', type: 'text-delta', text: 'hi' }, 'user-node-42');
+    feedWithParent({ conversationId: 'p1', type: 'text-delta', text: '!' }, 'stale-head-99');
+    feedWithParent({ conversationId: 'p1', type: 'done' }, 'stale-head-99');
+
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, , , options] = appendMock.mock.calls[0];
+    expect(options).toEqual({ parentId: 'user-node-42' });
+  });
+
+  it('omits parentId options when no submit-time head was captured', () => {
+    feed({ conversationId: 'p2', type: 'text-delta', text: 'x' });
+    feed({ conversationId: 'p2', type: 'done' });
+    const [, , , options] = appendMock.mock.calls[0];
+    expect(options).toBeUndefined();
   });
 });
