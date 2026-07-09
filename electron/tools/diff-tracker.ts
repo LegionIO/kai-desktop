@@ -479,9 +479,14 @@ export async function beginShellSnapshot(
         // External-edit drift: if a tracked file's pre-command content differs
         // from what we last recorded, a user/external process edited it between
         // agent ops — mark it non-revertable so revert can't erase that edit.
+        // If the pre-image was NOT captured (pre-scan hit the timeout/byte cap),
+        // we can't verify the file wasn't edited externally, so fail safe and
+        // also mark it non-revertable rather than risk erasing an unseen edit.
         const trackedEntry = conv.get(p);
-        if (trackedEntry && before.preContent != null && before.preContent !== trackedEntry.current) {
-          trackedEntry.originalCaptured = false;
+        if (trackedEntry) {
+          const drifted = before.preContent != null && before.preContent !== trackedEntry.current;
+          const preImageUnknown = before.preContent == null;
+          if (drifted || preImageUnknown) trackedEntry.originalCaptured = false;
         }
         const preRead = conv.has(p)
           ? undefined
@@ -494,8 +499,10 @@ export async function beginShellSnapshot(
       for (const [p, before] of pre) {
         if (!post.has(p) && existsSync(p) === false) {
           const trackedEntry = conv.get(p);
-          if (trackedEntry && before.preContent != null && before.preContent !== trackedEntry.current) {
-            trackedEntry.originalCaptured = false;
+          if (trackedEntry) {
+            const drifted = before.preContent != null && before.preContent !== trackedEntry.current;
+            const preImageUnknown = before.preContent == null;
+            if (drifted || preImageUnknown) trackedEntry.originalCaptured = false;
           }
           const preRead = conv.has(p)
             ? undefined
