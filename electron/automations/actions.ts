@@ -278,79 +278,90 @@ async function runAgentAction(
       else contentParts.push({ type: 'text', text: delta });
     };
 
-    for await (const ev of streamForPlugin({
-      messages,
-      config,
-      appHome: deps.appHome,
-      conversationId,
-      modelKey: action.modelKey,
-      profileKey: action.profileKey,
-      fallbackEnabled: Boolean(action.profileKey),
-      tools,
-      abortSignal: abortController.signal,
-    })) {
-      broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
+    // The stream (and its setup, e.g. resolving a model) can throw. If it does
+    // AFTER we've written the prompt turn, we must still finalize: write an
+    // assistant (error) turn, flip runStatus back to idle, and broadcast a
+    // terminal `done` — otherwise the conversation is stuck `running` forever
+    // with no reply. Catch here and fall through to the shared finalize path.
+    try {
+      for await (const ev of streamForPlugin({
+        messages,
+        config,
+        appHome: deps.appHome,
+        conversationId,
+        modelKey: action.modelKey,
+        profileKey: action.profileKey,
+        fallbackEnabled: Boolean(action.profileKey),
+        tools,
+        abortSignal: abortController.signal,
+      })) {
+        broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
 
-      if (ev.type === 'done' && (ev as { modelKey?: string }).modelKey) {
-        modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
-      } else if (ev.type === 'text-delta' && ev.text) {
-        if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
-          text += '\n\n';
-          appendTextPart('\n\n');
+        if (ev.type === 'done' && (ev as { modelKey?: string }).modelKey) {
+          modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
+        } else if (ev.type === 'text-delta' && ev.text) {
+          if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
+            text += '\n\n';
+            appendTextPart('\n\n');
+          }
+          text += ev.text;
+          appendTextPart(ev.text);
+          lastEventWasToolResult = false;
+        } else if (ev.type === 'tool-call' && ev.toolCallId) {
+          pendingToolCalls.set(ev.toolCallId, {
+            toolName: ev.toolName ?? 'unknown',
+            args: ev.args,
+            startedAt: Date.now(),
+          });
+          const part: ToolCallPart = {
+            type: 'tool-call',
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName ?? 'unknown',
+            args: ev.args ?? {},
+            argsText: JSON.stringify(ev.args ?? {}, null, 2),
+            startedAt: new Date().toISOString(),
+          };
+          toolPartById.set(ev.toolCallId, part);
+          contentParts.push(part);
+        } else if (ev.type === 'tool-result' && ev.toolCallId) {
+          lastEventWasToolResult = true;
+          const pending = pendingToolCalls.get(ev.toolCallId);
+          toolCalls.push({
+            toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+            args: pending?.args ?? {},
+            result: ev.result,
+            durationMs: pending ? Date.now() - pending.startedAt : undefined,
+          });
+          const part = toolPartById.get(ev.toolCallId);
+          if (part) {
+            part.result = ev.result;
+            part.finishedAt = new Date().toISOString();
+          }
+          pendingToolCalls.delete(ev.toolCallId);
+        } else if (ev.type === 'tool-error' && ev.toolCallId) {
+          const pending = pendingToolCalls.get(ev.toolCallId);
+          toolCalls.push({
+            toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+            args: pending?.args ?? {},
+            result: null,
+            error: ev.error ?? 'Tool execution failed',
+            durationMs: pending ? Date.now() - pending.startedAt : undefined,
+          });
+          const part = toolPartById.get(ev.toolCallId);
+          if (part) {
+            part.error = ev.error ?? 'Tool execution failed';
+            part.result = { isError: true, error: ev.error ?? 'Tool execution failed' };
+            part.finishedAt = new Date().toISOString();
+          }
+          pendingToolCalls.delete(ev.toolCallId);
+        } else if (ev.type === 'error') {
+          error = ev.error ?? 'Unknown error';
         }
-        text += ev.text;
-        appendTextPart(ev.text);
-        lastEventWasToolResult = false;
-      } else if (ev.type === 'tool-call' && ev.toolCallId) {
-        pendingToolCalls.set(ev.toolCallId, {
-          toolName: ev.toolName ?? 'unknown',
-          args: ev.args,
-          startedAt: Date.now(),
-        });
-        const part: ToolCallPart = {
-          type: 'tool-call',
-          toolCallId: ev.toolCallId,
-          toolName: ev.toolName ?? 'unknown',
-          args: ev.args ?? {},
-          argsText: JSON.stringify(ev.args ?? {}, null, 2),
-          startedAt: new Date().toISOString(),
-        };
-        toolPartById.set(ev.toolCallId, part);
-        contentParts.push(part);
-      } else if (ev.type === 'tool-result' && ev.toolCallId) {
-        lastEventWasToolResult = true;
-        const pending = pendingToolCalls.get(ev.toolCallId);
-        toolCalls.push({
-          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
-          args: pending?.args ?? {},
-          result: ev.result,
-          durationMs: pending ? Date.now() - pending.startedAt : undefined,
-        });
-        const part = toolPartById.get(ev.toolCallId);
-        if (part) {
-          part.result = ev.result;
-          part.finishedAt = new Date().toISOString();
-        }
-        pendingToolCalls.delete(ev.toolCallId);
-      } else if (ev.type === 'tool-error' && ev.toolCallId) {
-        const pending = pendingToolCalls.get(ev.toolCallId);
-        toolCalls.push({
-          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
-          args: pending?.args ?? {},
-          result: null,
-          error: ev.error ?? 'Tool execution failed',
-          durationMs: pending ? Date.now() - pending.startedAt : undefined,
-        });
-        const part = toolPartById.get(ev.toolCallId);
-        if (part) {
-          part.error = ev.error ?? 'Tool execution failed';
-          part.result = { isError: true, error: ev.error ?? 'Tool execution failed' };
-          part.finishedAt = new Date().toISOString();
-        }
-        pendingToolCalls.delete(ev.toolCallId);
-      } else if (ev.type === 'error') {
-        error = ev.error ?? 'Unknown error';
       }
+    } catch (streamErr) {
+      // Setup or mid-stream failure after the prompt was written. Record it and
+      // fall through to finalize (assistant error turn + idle + terminal done).
+      error = streamErr instanceof Error ? streamErr.message : String(streamErr);
     }
 
     const aborted = abortController.signal.aborted;

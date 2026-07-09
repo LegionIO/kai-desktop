@@ -1859,13 +1859,20 @@ export function RuntimeProvider({
               .then((conv) => {
                 const rec = conv as ConversationRecord | null;
                 const existingAcc = streamAccumulators.get(convId);
-                // Only backfill if the accumulator hasn't started collecting the
-                // assistant response yet (avoid clobbering live deltas).
-                if (rec && existingAcc && existingAcc.messages.length === 0) {
-                  const { tree, headId } = ensureTree(rec);
-                  existingAcc.messages = [...tree];
-                  existingAcc.headId = headId;
-                }
+                if (!rec || !existingAcc) return;
+                const { tree, headId } = ensureTree(rec);
+                if (tree.length === 0) return;
+                // Merge the persisted prefix (user prompt / prior history) in
+                // FRONT of whatever live deltas we've already collected, without
+                // dropping them. Skip nodes we already hold, and reparent the
+                // first live (root) node onto the persisted head so the branch
+                // stays connected.
+                const haveIds = new Set(existingAcc.messages.map((m) => m.id));
+                const prefix = tree.filter((m) => !haveIds.has(m.id));
+                if (prefix.length === 0) return;
+                const live = existingAcc.messages.map((m) => (m.parentId === null ? { ...m, parentId: headId } : m));
+                existingAcc.messages = [...prefix, ...live];
+                if (existingAcc.headId === null) existingAcc.headId = headId;
               })
               .catch(() => {})
               .finally(() => automationSeedInProgress.delete(convId));
@@ -2482,6 +2489,14 @@ export function RuntimeProvider({
       if (isActiveConv) {
         setTree([...acc.messages]);
         setHeadId(acc.headId);
+      }
+      // Automation-owned stream: render live but NEVER persist from the renderer.
+      // The main process writes the authoritative [user, assistant] turns; a
+      // debounced renderer persist here could write a partial assistant-only
+      // branch before the main write lands, creating duplicate/orphaned nodes.
+      if (e.automation || automationStreams.has(convId)) {
+        if (isActiveConv && !acc.awaitingApproval) setIsRunning(true);
+        return;
       }
       const persistStatus =
         e.type === 'tool-approval-required'
