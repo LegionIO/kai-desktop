@@ -335,24 +335,19 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     const addFollowUpMessage = async (
       text: string,
       source: 'user' | 'parent' | 'task' = 'parent',
-    ): Promise<SubAgentEvent | null> => {
+    ): Promise<{ event: SubAgentEvent } | { deniedReason: string }> => {
       const beforeFollowUp = [...messages];
       messages.push({ role: 'user', content: text });
       const gate = await gateUserPrompt();
       if (!gate.ok) {
         // Roll the raw denied follow-up back out so it isn't surfaced via
-        // onFinalMessages / persisted for resume. Broadcast nothing raw.
+        // onFinalMessages / persisted for resume. Return the reason so the caller
+        // can YIELD a failed status (which both broadcasts it AND lets the tool's
+        // stream consumer mark the run failed — a direct broadcast here would be
+        // seen by clients but not by the caller, so the run would look completed).
         messages.length = 0;
         messages.push(...beforeFollowUp);
-        broadcastSubAgentEvent({
-          subAgentConversationId,
-          parentConversationId,
-          parentToolCallId,
-          type: 'sub-agent-status',
-          status: 'failed',
-          summary: gate.reason,
-        } as SubAgentEvent);
-        return null;
+        return { deniedReason: gate.reason };
       }
       // Broadcast the (possibly sanitized) text from the gated last message.
       const last = messages[messages.length - 1];
@@ -367,7 +362,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         source,
       };
       broadcastSubAgentEvent(evt);
-      return evt;
+      return { event: evt };
     };
 
     while (turnCount < maxTurns) {
@@ -625,8 +620,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         const pendingFollowUp = await getFollowUp();
         if (pendingFollowUp) {
           const fu = await addFollowUpMessage(pendingFollowUp);
-          if (!fu) break; // denied by a hook
-          yield fu;
+          if ('deniedReason' in fu) {
+            yield emitStatus(undefined as never, 'failed', fu.deniedReason);
+            break;
+          }
+          yield fu.event;
           yield emitStatus(undefined as never, 'running', 'Processing follow-up');
           continue;
         }
@@ -641,8 +639,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         if (!followUp || abortSignal?.aborted) break;
 
         const fu = await addFollowUpMessage(followUp);
-        if (!fu) break; // denied by a hook
-        yield fu;
+        if ('deniedReason' in fu) {
+          yield emitStatus(undefined as never, 'failed', fu.deniedReason);
+          break;
+        }
+        yield fu.event;
         yield emitStatus(undefined as never, 'running', 'Processing follow-up');
         continue;
       }
@@ -651,8 +652,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       const followUp = await getFollowUp();
       if (followUp) {
         const fu = await addFollowUpMessage(followUp);
-        if (!fu) break; // denied by a hook
-        yield fu;
+        if ('deniedReason' in fu) {
+          yield emitStatus(undefined as never, 'failed', fu.deniedReason);
+          break;
+        }
+        yield fu.event;
         yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
         continue;
       }
@@ -662,8 +666,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         const lateFollowUp = await waitForFollowUp(getFollowUp, abortSignal, 5000);
         if (lateFollowUp) {
           const fu = await addFollowUpMessage(lateFollowUp);
-          if (!fu) break; // denied by a hook
-          yield fu;
+          if ('deniedReason' in fu) {
+            yield emitStatus(undefined as never, 'failed', fu.deniedReason);
+            break;
+          }
+          yield fu.event;
           yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
           continue;
         }
