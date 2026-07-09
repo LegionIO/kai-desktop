@@ -555,14 +555,18 @@ export function App({
           }
           // Reload the (now shorter) transcript.
           await reloadTranscript(convIdRef.current, `rewound ${res.removed ?? 0} message(s)`);
-          // Offer to revert file edits from the undone turn(s), if any.
+          // Offer to revert file edits. NOTE: the diff tracker is
+          // conversation-scoped, not turn-scoped, and diffs:revertAll reverts
+          // every tracked edit in this chat — including edits from turns that
+          // are still active after the rewind. Say so plainly so the user isn't
+          // misled into discarding changes they meant to keep.
           const diffs = (await client.invoke<unknown[]>('diffs:list', convIdRef.current)) ?? [];
           if (diffs.length > 0) {
             setPicker({
-              title: `Revert ${diffs.length} file edit(s) from the rewound turn(s)?`,
+              title: `Revert ALL ${diffs.length} tracked file edit(s) in this chat? (not just the rewound turn)`,
               items: [
                 { label: 'Keep file changes', value: 'keep' },
-                { label: 'Revert file changes', value: 'revert' },
+                { label: 'Revert ALL file changes in this chat', value: 'revert' },
               ],
               onSelect: (v) => {
                 setPicker(null);

@@ -1,5 +1,5 @@
 import net from 'net';
-import { mkdirSync, existsSync, unlinkSync, chmodSync } from 'fs';
+import { mkdirSync, existsSync, unlinkSync, chmodSync, statSync } from 'fs';
 import type { Socket, Server } from 'net';
 import { localClients, broadcastToLocalClients } from './local-clients.js';
 import { registerBroadcastSink } from '../web-server/web-clients.js';
@@ -186,6 +186,31 @@ export interface LocalServerOptions {
 }
 
 /**
+ * Ensure `runDir` exists as a private (0700), self-owned directory before we
+ * bind the IPC socket inside it. Throws (fail-closed) if the dir exists but is
+ * owned by another uid or is group/world-accessible — we must not host the
+ * handler-invoking socket in a directory another user could plant entries in or
+ * traverse. POSIX-only; win32 named pipes use a different namespace.
+ */
+function ensurePrivateRunDir(runDir: string): void {
+  if (!existsSync(runDir)) {
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  }
+  // mkdir's mode is masked by umask, and a pre-existing dir keeps its old mode,
+  // so tighten explicitly, then verify.
+  chmodSync(runDir, 0o700);
+  const st = statSync(runDir);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    throw new Error(`Run dir ${runDir} is owned by uid ${st.uid}, not this user — refusing to bind IPC socket.`);
+  }
+  if ((st.mode & 0o077) !== 0) {
+    throw new Error(
+      `Run dir ${runDir} is group/world-accessible (mode ${(st.mode & 0o777).toString(8)}) — refusing to bind IPC socket.`,
+    );
+  }
+}
+
+/**
  * Start the leader's local IPC socket. Always called by the leader process
  * (windowed GUI or headless), independent of the user-facing web server toggle.
  * Idempotent: a second call is a no-op while a server is already listening.
@@ -199,7 +224,21 @@ export function startLocalServer(options: LocalServerOptions = {}): Promise<stri
 
   const socketPath = getSocketPath();
   const runDir = getRunDir();
-  if (!existsSync(runDir)) mkdirSync(runDir, { recursive: true });
+  // The socket is our IPC boundary: anyone who can connect can invoke captured
+  // handlers. Socket-inode perms are racy (they only apply after listen()) and
+  // not portable, so the DIRECTORY is the real gate. Create/verify it as an
+  // owner-only (0700), self-owned dir BEFORE binding, and fail closed otherwise
+  // — refusing to serve is safer than exposing the handler surface. Reject
+  // (don't throw synchronously) so the caller's .catch() runs its fail path.
+  try {
+    if (process.platform !== 'win32') {
+      ensurePrivateRunDir(runDir);
+    } else if (!existsSync(runDir)) {
+      mkdirSync(runDir, { recursive: true });
+    }
+  } catch (err) {
+    return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+  }
 
   // Remove a stale socket file left by a previous (crashed) leader. On win32
   // named pipes are not filesystem entries, so this only applies elsewhere.

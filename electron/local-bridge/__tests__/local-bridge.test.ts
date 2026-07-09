@@ -123,3 +123,27 @@ describe('local bridge transport', () => {
     expect(client.wasIntentionalClose()).toBe(true);
   });
 });
+
+describe('local bridge run-dir hardening', () => {
+  // POSIX-only: the socket's directory is the security boundary, so a loose
+  // (world-accessible) run dir we own must be tightened to owner-only before
+  // the handler-invoking socket is bound inside it.
+  const runPosix = process.platform === 'win32' ? it.skip : it;
+
+  afterEach(async () => {
+    await stopLocalServer();
+  });
+
+  runPosix('tightens a loose (0755) run dir to 0700 before binding', async () => {
+    const { getRunDir } = await import('../local-server.js');
+    const { chmodSync, mkdirSync, existsSync, statSync } = await import('node:fs');
+    const runDir = getRunDir();
+    if (!existsSync(runDir)) mkdirSync(runDir, { recursive: true });
+    chmodSync(runDir, 0o755); // world-traversable — must be tightened, not trusted
+
+    const socketPath = await startLocalServer();
+    // Bound only after the dir was made owner-only.
+    expect(statSync(runDir).mode & 0o077).toBe(0);
+    expect(typeof socketPath).toBe('string');
+  });
+});

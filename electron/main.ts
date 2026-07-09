@@ -1891,9 +1891,16 @@ app.on('window-all-closed', () => {
     demoteWindowedToHeadlessRef();
     return;
   }
-  // No windows and no clients: nothing to serve. Quit on every platform (a
-  // windowless, clientless GUI process has no reason to linger, even on macOS).
-  app.quit();
+  // No clients. A backend that only ever existed to serve clients (a headless
+  // CLI-spawned leader, or a GUI that has since demoted) has no reason to
+  // linger, so quit on every platform. But a NORMAL GUI launch must keep the
+  // historical macOS behavior: stay resident (dock icon + main-process
+  // background services — dictation/App Shots global hotkeys, automation
+  // engine) and reopen on `activate`. Only non-darwin quits in that case.
+  const isBackendOnly = IS_HEADLESS || headlessWindowBlockActive;
+  if (isBackendOnly || process.platform !== 'darwin') {
+    app.quit();
+  }
 });
 
 app.on('before-quit', () => {
