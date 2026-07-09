@@ -817,8 +817,14 @@ function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models']
       }
     }
 
+    // Built-in provider keys the user explicitly deleted — don't reconstruct
+    // them from llm.json/defaults, so a deleted built-in stays gone until it's
+    // re-added via Add Provider (which clears it from this list).
+    const removedBuiltins = new Set((defaults.removedBuiltins as string[] | undefined) ?? []);
+
     // Layer llm.json providers/catalog on top
     for (const providerKey of providerOrder) {
+      if (removedBuiltins.has(providerKey)) continue;
       const provider = appProviders[providerKey];
       providers[providerKey] = toAppProvider(providerKey, provider);
       catalog.push(...toCatalogEntries(providerKey, provider));
@@ -846,6 +852,7 @@ function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models']
       defaultModelKey,
       providers: providers as AppConfig['models']['providers'],
       catalog: catalog as AppConfig['models']['catalog'],
+      ...(removedBuiltins.size > 0 ? { removedBuiltins: [...removedBuiltins] } : {}),
     };
   } catch (error) {
     console.error('[Config] Failed to parse LLM config, using empty model catalog:', error);

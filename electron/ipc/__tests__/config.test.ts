@@ -270,3 +270,34 @@ describe('config IPC: renderer contract', () => {
     expect(registered).toContain('cli-tools:check-binaries');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Deleting a built-in provider: removedBuiltins must suppress reconstruction.
+// ---------------------------------------------------------------------------
+
+describe('config: removedBuiltins suppresses built-in provider reconstruction', () => {
+  it('keeps a deleted built-in gone even though llm.json would reconstruct it', () => {
+    // Seed an enabled llm.json that would normally reconstruct the `anthropic`
+    // built-in provider.
+    writeFileSync(
+      join(appHome, 'settings', 'llm.json'),
+      JSON.stringify({ llm: { enabled: true, providers: { anthropic: { api_key: 'sk-test' } } } }, null, 2),
+      'utf-8',
+    );
+
+    // Baseline: anthropic is present.
+    const before = readEffectiveConfig(appHome);
+    expect(before.models.providers.anthropic).toBeDefined();
+
+    // Persist a desktop.json that marks `anthropic` as a removed built-in.
+    const payload = desktopConfigPayload(before) as { models: Record<string, unknown> };
+    payload.models = { ...payload.models, removedBuiltins: ['anthropic'] };
+    writeFileSync(join(appHome, 'settings', 'desktop.json'), JSON.stringify(payload, null, 2), 'utf-8');
+
+    // The loader must now skip reconstructing anthropic (and its catalog).
+    const after = readEffectiveConfig(appHome);
+    expect(after.models.providers.anthropic).toBeUndefined();
+    expect((after.models.catalog ?? []).some((m) => m.provider === 'anthropic')).toBe(false);
+    expect((after.models as { removedBuiltins?: string[] }).removedBuiltins).toContain('anthropic');
+  });
+});

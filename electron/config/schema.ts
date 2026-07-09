@@ -66,6 +66,12 @@ const modelsConfigSchema = z.object({
   defaultModelKey: z.string(),
   providers: z.record(z.string(), providerSchema),
   catalog: z.array(modelEntrySchema),
+  /**
+   * Built-in provider keys the user has explicitly deleted. loadAppModelsConfig
+   * skips reconstructing these from llm.json/defaults, so a deleted built-in
+   * stays gone until re-added via Add Provider (which clears it from this list).
+   */
+  removedBuiltins: z.array(z.string()).optional(),
 });
 
 const embeddingProviderSchema = z.object({

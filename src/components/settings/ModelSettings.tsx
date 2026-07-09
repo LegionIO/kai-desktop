@@ -154,6 +154,17 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
 
   const handleAdd = (name: string, provider: Provider) => {
     void writeProviders({ ...providers, [name]: provider });
+    // Re-adding a previously deleted built-in: clear it from removedBuiltins so
+    // the loader reconstructs it again (and doesn't fight the explicit provider).
+    if (BUILTIN_PROVIDER_NAMES.has(name)) {
+      const removed = (config.models as { removedBuiltins?: string[] }).removedBuiltins ?? [];
+      if (removed.includes(name)) {
+        void updateConfig(
+          'models.removedBuiltins',
+          removed.filter((n) => n !== name),
+        );
+      }
+    }
     setAddingType(null);
     setEditingName(name);
   };
@@ -166,27 +177,32 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   };
 
   const handleDelete = (name: string) => {
+    const next = { ...providers };
+    delete next[name];
+    void writeProviders(next);
+    // Built-in providers are reconstructed by the config loader from llm.json/
+    // defaults, so removing the key isn't enough — record it in removedBuiltins
+    // so the loader skips it. Add Provider clears it from this list to restore.
     if (BUILTIN_PROVIDER_NAMES.has(name)) {
-      void updateConfig(`models.providers.${name}.enabled`, false);
-    } else {
-      const next = { ...providers };
-      delete next[name];
-      void writeProviders(next);
-      // Remove catalog entries that referenced the deleted provider so they
-      // don't linger as dead models (resolveModelCatalog silently skips them,
-      // which can make defaults/profiles fall through to another model).
-      const orphaned = catalog.filter((m) => m.provider === name);
-      if (orphaned.length > 0) {
-        const remaining = catalog.filter((m) => m.provider !== name);
-        void updateConfig('models.catalog', remaining);
-        // If the current default model belonged to the deleted provider, point
-        // it at a surviving model instead of letting it silently fall through
-        // to whatever resolveStreamConfig picks first.
-        const defaultKey = (config.models as { defaultModelKey?: string }).defaultModelKey;
-        const removedKeys = new Set(orphaned.map((m) => m.key));
-        if (defaultKey && removedKeys.has(defaultKey)) {
-          void updateConfig('models.defaultModelKey', remaining[0]?.key ?? '');
-        }
+      const removed = ((config.models as { removedBuiltins?: string[] }).removedBuiltins ?? []).filter(
+        (n) => n !== name,
+      );
+      void updateConfig('models.removedBuiltins', [...removed, name]);
+    }
+    // Remove catalog entries that referenced the deleted provider so they
+    // don't linger as dead models (resolveModelCatalog silently skips them,
+    // which can make defaults/profiles fall through to another model).
+    const orphaned = catalog.filter((m) => m.provider === name);
+    if (orphaned.length > 0) {
+      const remaining = catalog.filter((m) => m.provider !== name);
+      void updateConfig('models.catalog', remaining);
+      // If the current default model belonged to the deleted provider, point
+      // it at a surviving model instead of letting it silently fall through
+      // to whatever resolveStreamConfig picks first.
+      const defaultKey = (config.models as { defaultModelKey?: string }).defaultModelKey;
+      const removedKeys = new Set(orphaned.map((m) => m.key));
+      if (defaultKey && removedKeys.has(defaultKey)) {
+        void updateConfig('models.defaultModelKey', remaining[0]?.key ?? '');
       }
     }
     if (editingName === name) setEditingName(null);
