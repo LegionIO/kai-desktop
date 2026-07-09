@@ -12,23 +12,34 @@ let server: Server | null = null;
 let unregisterSink: (() => void) | null = null;
 
 /**
- * Idle-shutdown wiring. A headless backend that was spawned by the `kai` CLI
- * must NOT outlive its clients — otherwise quitting the CLI leaves an orphaned
- * leader running in the background (still processing events, firing
- * automations, holding the singleton lock). When enabled, the server exits the
- * process a short grace period after its last client disconnects, unless
- * another client (or, when provided, a GUI window) is present. A windowed/GUI
- * leader passes `enabled: false` so it persists as normal.
+ * Backend lifetime for a headless (CLI-spawned) leader. It must NOT outlive its
+ * clients — an orphaned leader keeps firing automations/hooks and holding the
+ * singleton lock. Two mechanisms:
+ *
+ *  1. Client-initiated (primary): the last client, on quit, sends
+ *     `{type:'shutdown'}`. The backend confirms no other clients remain, lets
+ *     in-flight work settle very briefly, and exits — near-immediate.
+ *  2. Idle safety-net (fallback for crashes where no shutdown is sent): if the
+ *     backend has zero clients it exits after a short grace. Kept well under
+ *     10s so a killed client doesn't leave the backend lingering long.
+ *
+ * A windowed/GUI leader passes `idleShutdown: false` so it persists as normal.
  */
-const IDLE_SHUTDOWN_GRACE_MS = 3000;
-/** Longer grace at startup so a slow first client connect doesn't kill the backend. */
-const INITIAL_IDLE_GRACE_MS = 15000;
-/** No inbound traffic for this long ⇒ client considered dead, socket destroyed. */
-const HEARTBEAT_TIMEOUT_MS = 30000;
+const IDLE_SHUTDOWN_GRACE_MS = 4000;
+/** Grace at startup so a slow first client connect doesn't kill the backend. */
+const INITIAL_IDLE_GRACE_MS = 8000;
+/** Brief settle window after an explicit shutdown request for in-flight work. */
+const SHUTDOWN_SETTLE_MS = 400;
+/** No inbound traffic for this long ⇒ client considered dead, socket destroyed.
+ *  Kept low so a half-open socket (Ctrl-C / crash where no FIN is delivered) is
+ *  detected quickly and the backend can reap itself. The client pings ~5s. */
+const HEARTBEAT_TIMEOUT_MS = 12000;
 let idleShutdownEnabled = false;
 let idleTimer: NodeJS.Timeout | null = null;
 let hasOtherClients: (() => boolean) | null = null;
 let onIdleExit: (() => void) | null = null;
+/** Set when a client explicitly requested shutdown — triggers fast exit on disconnect. */
+let shutdownRequested = false;
 
 function clientCount(): number {
   return localClients.size + (hasOtherClients?.() ? 1 : 0);
@@ -45,13 +56,16 @@ function maybeScheduleIdleShutdown(): void {
   if (!idleShutdownEnabled) return;
   cancelIdleTimer();
   if (clientCount() > 0) return;
+  // Explicit shutdown request ⇒ near-immediate exit (short settle for in-flight
+  // automations/hooks). Otherwise the longer idle safety-net grace.
+  const delay = shutdownRequested ? SHUTDOWN_SETTLE_MS : IDLE_SHUTDOWN_GRACE_MS;
   idleTimer = setTimeout(() => {
     idleTimer = null;
     // Re-check under the timer in case a client reconnected during the grace window.
     if (clientCount() === 0) {
       onIdleExit?.();
     }
-  }, IDLE_SHUTDOWN_GRACE_MS);
+  }, delay);
 }
 
 /**
@@ -109,6 +123,16 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
 
   if (msg.type === 'ping') {
     writeLine(socket, { type: 'pong' });
+    return;
+  }
+
+  // Client-initiated shutdown: the last client asks the backend to exit. Ack
+  // so the client can show "Cleaning up…" and close its socket; once it's gone
+  // (and no other clients remain) we exit after a brief settle window. If other
+  // clients are still attached, this is a no-op — another front-end needs it.
+  if (msg.type === 'shutdown') {
+    writeLine(socket, { id: msg.id, type: 'result', data: { ok: true } });
+    if (idleShutdownEnabled) shutdownRequested = true;
     return;
   }
 

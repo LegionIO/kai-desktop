@@ -75,13 +75,22 @@ async function main(): Promise<void> {
     log('attached to running Kai backend');
   }
 
+  // Belt-and-suspenders: on ANY process exit (clean, Ctrl-C, uncaught error)
+  // synchronously destroy the socket so the backend's close handler fires
+  // immediately and it can reap itself — instead of waiting out the heartbeat
+  // timeout on a half-open connection.
+  process.on('exit', () => client.close());
+
   // Interactive TTY → full Ink TUI. Non-TTY (piped/CI) → one-shot text mode,
   // since Ink's input needs raw mode (a real terminal).
   if (process.stdin.isTTY && process.stdout.isTTY) {
     await startRepl(client);
+    process.exit(0);
   } else {
     const { runHeadlessOnce } = await import('./headless-run.js');
     await runHeadlessOnce(client);
+    await client.requestShutdown();
+    client.close();
     process.exit(0);
   }
 }

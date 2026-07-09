@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "node scripts/maybe-compile-swift.mjs && electron-vite dev",
     "build": "node scripts/maybe-compile-swift.mjs && electron-vite build",
-    "kai": "electron-vite build && node out/main/cli.js",
+    "kai": "node out/main/cli.js",
+    "kai:build": "electron-vite build && node out/main/cli.js",
     "preview": "electron-vite preview",
     "start": "electron-vite preview",
     "rebuild": "electron-builder install-app-deps",

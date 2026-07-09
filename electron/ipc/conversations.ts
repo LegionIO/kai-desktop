@@ -571,6 +571,46 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     return { ok: true };
   });
 
+  // Fast single-round-trip selection change for the CLI: patch only the
+  // selected model or profile on one conversation (one read + one write; no
+  // full-record merge), and return the resolved effective-model display name so
+  // the client can update its banner without extra catalog/get round-trips.
+  ipcMain.handle(
+    'conversations:set-selection',
+    (_event, id: string, kind: 'model' | 'profile', value: string | null) => {
+      const store = readConversationStore(appHome);
+      const conv = store.conversations[id];
+      if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+      if (kind === 'model') conv.selectedModelKey = value;
+      else conv.selectedProfileKey = value;
+      conv.updatedAt = new Date().toISOString();
+      writeConversationStore(appHome, store);
+      broadcastConversationChange(store);
+
+      // Resolve the effective model display name for the banner.
+      let modelLabel: string | null = null;
+      let profileLabel: string | null = null;
+      try {
+        const config = getConfig?.();
+        if (config) {
+          const models = config.models?.catalog ?? [];
+          const profiles = config.profiles ?? [];
+          const profile = conv.selectedProfileKey ? profiles.find((p) => p.key === conv.selectedProfileKey) : undefined;
+          profileLabel = profile ? (profile.name ?? profile.key) : null;
+          const effectiveModelKey =
+            profile?.primaryModelKey ?? conv.selectedModelKey ?? config.models?.defaultModelKey ?? null;
+          const entry = models.find((m) => m.key === effectiveModelKey);
+          modelLabel = entry?.displayName ?? effectiveModelKey ?? null;
+        }
+      } catch {
+        // label resolution is best-effort
+      }
+
+      return { ok: true, modelLabel, profileLabel };
+    },
+  );
+
   ipcMain.handle('conversations:fork', (_event, id: string, upToMessageIndex?: number) => {
     const store = readConversationStore(appHome);
     const source = store.conversations[id];

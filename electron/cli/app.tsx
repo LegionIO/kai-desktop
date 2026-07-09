@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Box, Text, useApp, useStdout } from 'ink';
+import { Box, Text, useApp, useStdout, useInput } from 'ink';
+import Spinner from 'ink-spinner';
 import { randomUUID } from 'crypto';
 import type { LocalBridgeClient } from './client.js';
 import { renderMarkdown } from './render/markdown.js';
@@ -29,7 +30,7 @@ type ConversationRecord = {
 type Turn =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
-  | { kind: 'note'; text: string }
+  | { kind: 'note'; text: string; id?: string; loading?: boolean }
   | { kind: 'error'; text: string };
 
 type ToolEntry = { id: string; name: string; status: ToolStatus; durationMs?: number; error?: string };
@@ -84,18 +85,38 @@ function contentToText(content: unknown): string {
 export function App({ client }: { client: LocalBridgeClient }): React.ReactElement {
   const { exit } = useApp();
   const { stdout } = useStdout();
+
+  // Ctrl-C: Ink's built-in exitOnCtrlC is disabled (so startRepl's graceful
+  // shutdown handshake can run) — in raw mode Ctrl-C arrives as input, not a
+  // SIGINT signal, so we catch it here and route to Ink's exit(), which
+  // resolves waitUntilExit() and lets startRepl clean up the backend.
+  useInput((_input, key) => {
+    if (key.ctrl && _input === 'c') exit();
+  });
   const [turns, setTurns] = useState<Turn[]>([]);
   const [tools, setTools] = useState<ToolEntry[]>([]);
   const [status, setStatus] = useState<'idle' | 'running' | 'awaiting-approval'>('idle');
   const [conversationId, setConversationId] = useState<string>('');
   const [picker, setPicker] = useState<PickerState>(null);
   const [modelLabel, setModelLabel] = useState<string>('default');
+  const [fallbackModelLabel, setFallbackModelLabel] = useState<string | null>(null); // runtime model-fallback override
   const [profileLabel, setProfileLabel] = useState<string>('unset');
-  const [pending, setPending] = useState<string | null>(null); // transient "applying…" hint
+  const [pending, setPending] = useState<'model' | 'profile' | null>(null); // which banner line is applying
   const streamingRef = useRef<string>(''); // in-progress assistant text
   const convIdRef = useRef<string>('');
+  const unsavedRecordRef = useRef<Record<string, unknown> | null>(null); // new chat not yet persisted
 
   const pushTurn = useCallback((t: Turn) => setTurns((prev) => [...prev, t]), []);
+
+  // A "loading note" shows a spinner in the transcript body while an async
+  // command runs, then resolves in place to its final text. `resolveNote`
+  // updates the matching id; if it never existed (e.g. cleared) it's a no-op.
+  const pushLoadingNote = useCallback((id: string, text: string) => {
+    setTurns((prev) => [...prev, { kind: 'note', id, text, loading: true }]);
+  }, []);
+  const resolveNote = useCallback((id: string, text: string) => {
+    setTurns((prev) => prev.map((t) => (t.kind === 'note' && t.id === id ? { ...t, text, loading: false } : t)));
+  }, []);
 
   // Fetch model/profile catalog items in a normalized {label,value} shape.
   // agent:model-catalog → { models: [{key, displayName}], defaultKey }
@@ -125,39 +146,71 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
   );
 
   // Resolve the banner's model + profile labels from the conversation's
-  // currently selected keys (null ⇒ model shows the catalog default, profile
-  // shows "unset"). Called on new-chat, resume, and after a /model or /profile
-  // switch so the banner always reflects live state.
-  const refreshBanner = useCallback(async () => {
-    try {
-      const conv =
-        (await client.invoke<{ selectedModelKey?: string | null; selectedProfileKey?: string | null } | null>(
-          'conversations:get',
-          convIdRef.current,
-        )) ?? {};
-      const [model, profile] = await Promise.all([fetchCatalog('model'), fetchCatalog('profile')]);
+  // currently selected keys. Model resolution order:
+  //   1. a selected profile's primaryModelKey (a profile drives the model), else
+  //   2. the thread's selectedModelKey, else
+  //   3. the catalog default.
+  // A live `model-fallback` during a turn overrides this (see stream handler);
+  // refreshBanner clears that override since it starts a fresh baseline.
+  //
+  // Pass `known` selected keys to skip the conversations:get (a full-store read
+  // that is slow on a large store) — the new-chat path knows both are null.
+  const refreshBanner = useCallback(
+    async (known?: { selectedModelKey: string | null; selectedProfileKey: string | null }) => {
+      try {
+        const conv =
+          known ??
+          (await client.invoke<{ selectedModelKey?: string | null; selectedProfileKey?: string | null } | null>(
+            'conversations:get',
+            convIdRef.current,
+          )) ??
+          {};
 
-      const modelKey = conv.selectedModelKey ?? model.defaultKey;
-      setModelLabel(model.items.find((i) => i.value === modelKey)?.label ?? (modelKey || 'default'));
+        const [modelRes, profileRes] = await Promise.all([
+          client.invoke<{ models?: Array<{ key?: string; displayName?: string }>; defaultKey?: string | null }>(
+            'agent:model-catalog',
+          ),
+          client.invoke<{
+            profiles?: Array<{ key?: string; name?: string; primaryModelKey?: string }>;
+            defaultKey?: string | null;
+          }>('agent:profiles'),
+        ]);
 
-      const profileKey = conv.selectedProfileKey ?? null;
-      setProfileLabel(profileKey ? (profile.items.find((i) => i.value === profileKey)?.label ?? profileKey) : 'unset');
-    } catch {
-      // leave existing labels on transient errors
-    }
-  }, [client, fetchCatalog]);
+        const modelName = (key: string | null | undefined): string =>
+          (modelRes?.models ?? []).find((m) => m.key === key)?.displayName ?? (key || 'default');
+
+        const profileKey = conv.selectedProfileKey ?? null;
+        const profile = profileKey ? (profileRes?.profiles ?? []).find((p) => p.key === profileKey) : undefined;
+
+        setProfileLabel(profile ? (profile.name ?? profile.key ?? profileKey!) : 'unset');
+
+        // A selected profile drives the model; otherwise use the thread model or default.
+        const effectiveModelKey = profile?.primaryModelKey ?? conv.selectedModelKey ?? modelRes?.defaultKey ?? null;
+        setFallbackModelLabel(null); // new baseline — clear any prior runtime fallback
+        setModelLabel(modelName(effectiveModelKey));
+      } catch {
+        // leave existing labels on transient errors
+      }
+    },
+    [client],
+  );
 
   // ── conversation setup ──────────────────────────────────────────────
+  // Create a chat IN MEMORY only — defer the (slow, full-store) persistence
+  // until the first message is actually sent. This makes startup and /new
+  // instant instead of paying a full conversations.json write up front for a
+  // chat the user might never send to.
   const createNew = useCallback(async () => {
     const rec = newConversationRecord(CWD);
-    await client.invoke('conversations:put', rec);
-    await client.invoke('conversations:set-active-id', rec.id);
     convIdRef.current = rec.id as string;
     setConversationId(rec.id as string);
+    unsavedRecordRef.current = rec; // persisted lazily on first submit
     setTurns([]);
     setTools([]);
-    void refreshBanner();
-  }, [client, refreshBanner]);
+    // Fresh chat: both selection keys are null, so resolve banner labels from
+    // the catalog directly — no conversations:get needed.
+    void refreshBanner({ selectedModelKey: null, selectedProfileKey: null });
+  }, [refreshBanner]);
 
   useEffect(() => {
     void createNew();
@@ -214,6 +267,13 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
             });
           }
           break;
+        case 'model-fallback': {
+          // Runtime fallback to a different model — reflect the model actually
+          // serving the turn in the banner.
+          const to = (e.data as { toModel?: string } | undefined)?.toModel;
+          if (to) setFallbackModelLabel(to);
+          break;
+        }
         case 'error':
           finalizeAssistant();
           setTurns((prev) => [...prev, { kind: 'error', text: e.error ?? 'unknown error' }]);
@@ -237,13 +297,35 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
   }, [client]);
 
   // ── command + input handling ────────────────────────────────────────
-  const applySelection = useCallback(
-    async (cmd: string, value: string) => {
-      const conv = (await client.invoke<Record<string, unknown> | null>('conversations:get', convIdRef.current)) ?? {};
-      const patch = cmd === 'model' ? { ...conv, selectedModelKey: value } : { ...conv, selectedProfileKey: value };
-      await client.invoke('conversations:put', patch);
+  // Single-round-trip selection change. The backend patches only the selection
+  // field (no full-record merge / 15MB re-read) and returns the resolved
+  // effective-model label — so a /model or /profile switch is one fast IPC call
+  // and the banner reflects a profile's primary model without extra fetches.
+  const applySelectionFast = useCallback(
+    async (cmd: 'model' | 'profile', value: string) => {
+      // If the chat isn't persisted yet (lazy-create), patch the in-memory
+      // record — no server round-trip. It'll be saved with the first message.
+      const unsaved = unsavedRecordRef.current;
+      if (unsaved) {
+        unsaved[cmd === 'model' ? 'selectedModelKey' : 'selectedProfileKey'] = value;
+        // Resolve labels from the catalog for the banner (fast, no store read).
+        await refreshBanner({
+          selectedModelKey: (unsaved.selectedModelKey as string | null) ?? null,
+          selectedProfileKey: (unsaved.selectedProfileKey as string | null) ?? null,
+        });
+        return;
+      }
+      const res = await client.invoke<{ ok?: boolean; modelLabel?: string | null; profileLabel?: string | null }>(
+        'conversations:set-selection',
+        convIdRef.current,
+        cmd,
+        value,
+      );
+      if (res?.modelLabel) setModelLabel(res.modelLabel);
+      if (cmd === 'profile') setProfileLabel(res?.profileLabel ?? 'unset');
+      setFallbackModelLabel(null); // new baseline
     },
-    [client],
+    [client, refreshBanner],
   );
 
   const runCommand = useCallback(
@@ -279,6 +361,7 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
               setPicker(null);
               void (async () => {
                 convIdRef.current = id;
+                unsavedRecordRef.current = null; // resuming a persisted chat — discard any unsaved draft
                 setConversationId(id);
                 await client.invoke('conversations:set-active-id', id);
                 const full = await client.invoke<ConversationRecord | null>('conversations:get', id);
@@ -306,15 +389,16 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
           if (arg) {
             const match = items.find((i) => i.value.toLowerCase().includes(arg.toLowerCase()));
             if (match) {
-              // Optimistic: reflect the choice immediately, show a spinner while
-              // the change propagates to the leader (several socket round-trips).
+              // Optimistic banner update + a body loading note; then a SINGLE
+              // round-trip patches the selection and returns resolved labels.
               if (cmd === 'model') setModelLabel(match.label);
               else setProfileLabel(match.label);
-              setPending(`applying ${cmd}…`);
-              await applySelection(cmd, match.value);
-              await refreshBanner();
+              setPending(cmd);
+              const noteId = `n-${Date.now()}`;
+              pushLoadingNote(noteId, `applying ${cmd} → ${match.label}`);
+              await applySelectionFast(cmd, match.value);
               setPending(null);
-              pushTurn({ kind: 'note', text: `${cmd} → ${match.label}` });
+              resolveNote(noteId, `${cmd} → ${match.label}`);
             } else {
               pushTurn({ kind: 'note', text: `no ${cmd} matching "${arg}"` });
             }
@@ -328,26 +412,29 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
               const label = items.find((i) => i.value === v)?.label ?? v;
               if (cmd === 'model') setModelLabel(label);
               else setProfileLabel(label);
-              setPending(`applying ${cmd}…`);
-              void applySelection(cmd, v)
-                .then(() => refreshBanner())
-                .finally(() => {
-                  setPending(null);
-                  pushTurn({ kind: 'note', text: `${cmd} → ${label}` });
-                });
+              setPending(cmd);
+              const noteId = `n-${Date.now()}`;
+              pushLoadingNote(noteId, `applying ${cmd} → ${label}`);
+              void applySelectionFast(cmd, v).finally(() => {
+                setPending(null);
+                resolveNote(noteId, `${cmd} → ${label}`);
+              });
             },
           });
           break;
         }
-        case 'compact':
-          pushTurn({ kind: 'note', text: 'compacting…' });
+        case 'compact': {
+          const noteId = `n-${Date.now()}`;
+          pushLoadingNote(noteId, 'compacting…');
           try {
             await client.invoke('agent:compact', convIdRef.current);
-            pushTurn({ kind: 'note', text: 'compacted' });
+            resolveNote(noteId, 'compacted');
           } catch (err) {
+            resolveNote(noteId, '');
             pushTurn({ kind: 'error', text: `compact failed: ${err instanceof Error ? err.message : String(err)}` });
           }
           break;
+        }
         case 'rewind':
         case 'revert':
           pushTurn({ kind: 'note', text: '/rewind not yet wired — coming soon' });
@@ -360,7 +447,7 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
           pushTurn({ kind: 'note', text: `unknown command /${cmd} — try /help` });
       }
     },
-    [client, createNew, pushTurn, exit, fetchCatalog, refreshBanner, applySelection],
+    [client, createNew, pushTurn, exit, fetchCatalog, refreshBanner, applySelectionFast, pushLoadingNote, resolveNote],
   );
 
   const submit = useCallback(
@@ -375,10 +462,24 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
       pushTurn({ kind: 'user', text: trimmed });
       setStatus('running');
       streamingRef.current = '';
-      void client.invoke('agent:submit', convIdRef.current, trimmed, { cwd: CWD }).catch((err) => {
-        setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${err?.message ?? err}` }]);
-        setStatus('idle');
-      });
+      void (async () => {
+        try {
+          // Persist a lazily-created chat on its first message (see createNew).
+          const unsaved = unsavedRecordRef.current;
+          if (unsaved) {
+            unsavedRecordRef.current = null;
+            await client.invoke('conversations:put', unsaved);
+            await client.invoke('conversations:set-active-id', unsaved.id);
+          }
+          await client.invoke('agent:submit', convIdRef.current, trimmed, { cwd: CWD });
+        } catch (err) {
+          setTurns((prev) => [
+            ...prev,
+            { kind: 'error', text: `submit failed: ${(err as { message?: string })?.message ?? err}` },
+          ]);
+          setStatus('idle');
+        }
+      })();
     },
     [client, runCommand, pushTurn],
   );
@@ -390,7 +491,8 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
       <Banner
         productName={__BRAND_PRODUCT_NAME}
         version={__APP_VERSION}
-        modelLabel={modelLabel}
+        modelLabel={fallbackModelLabel ?? modelLabel}
+        modelFellBack={fallbackModelLabel !== null}
         profileLabel={profileLabel}
         pending={pending}
         cwd={CWD}
@@ -456,6 +558,11 @@ function TurnView({ turn }: { turn: Turn }): React.ReactElement {
     case 'note':
       return (
         <Box>
+          {turn.loading ? (
+            <Text color="yellow">
+              <Spinner type="dots" />{' '}
+            </Text>
+          ) : null}
           <Text dimColor>{turn.text}</Text>
         </Box>
       );

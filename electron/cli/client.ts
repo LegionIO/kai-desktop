@@ -10,8 +10,8 @@ type PendingCall = {
 type EventHandler = (data: unknown) => void;
 
 const INVOKE_TIMEOUT_MS = 60_000;
-/** Client → backend ping cadence. Must be < the server's heartbeat timeout (30s). */
-const HEARTBEAT_INTERVAL_MS = 10_000;
+/** Client → backend ping cadence. Must be < the server's heartbeat timeout (12s). */
+const HEARTBEAT_INTERVAL_MS = 5_000;
 /** Consecutive missed pongs before the client declares the backend dead. */
 const HEARTBEAT_MAX_MISSED = 2;
 
@@ -183,6 +183,45 @@ export class LocalBridgeClient {
     } catch {
       // stale socket
     }
+  }
+
+  /**
+   * Ask the backend to shut down (used by the last client on quit). The backend
+   * only honors this if no other clients remain; it acks, then exits shortly
+   * after this client disconnects. Resolves on ack or after a short timeout so
+   * quit is never blocked on a slow/dead backend.
+   */
+  requestShutdown(timeoutMs = 1500): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const socket = this.socket;
+      if (!socket || !this.connected) {
+        resolve();
+        return;
+      }
+      const id = String(++this.nextId);
+      const done = setTimeout(() => {
+        this.pending.delete(id);
+        resolve();
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: () => {
+          clearTimeout(done);
+          resolve();
+        },
+        reject: () => {
+          clearTimeout(done);
+          resolve();
+        },
+        timer: done,
+      });
+      try {
+        socket.write(JSON.stringify({ id, type: 'shutdown' }) + '\n');
+      } catch {
+        clearTimeout(done);
+        this.pending.delete(id);
+        resolve();
+      }
+    });
   }
 
   /** Subscribe to a server-pushed event channel. Returns an unsubscribe fn. */

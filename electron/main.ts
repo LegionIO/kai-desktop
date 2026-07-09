@@ -96,7 +96,6 @@ import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
 import { startLocalServer, stopLocalServer } from './local-bridge/local-server.js';
-import { webClients } from './web-server/web-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -127,6 +126,33 @@ const APP_HOME = resolveUserDataDir();
  * be relaunched into headless mode.
  */
 const IS_HEADLESS = process.argv.includes('--kai-headless') || process.env.KAI_HEADLESS === '1';
+
+// In headless mode there is no user and no Dock presence, so NOTHING may open a
+// window — not the app, not a plugin (e.g. skynet's bridge-auth window). A
+// stray window would flash on screen AND, by counting in getAllWindows(), keep
+// the idle-shutdown heuristic from ever firing. Neutralize window display at
+// the source: patch BrowserWindow so any instance created headlessly is forced
+// hidden and destroyed on the next tick. Plugins that await a window simply
+// won't get a visible one (correct — there's no user to interact with it).
+if (IS_HEADLESS) {
+  const proto = BrowserWindow.prototype as unknown as {
+    show: () => void;
+    showInactive: () => void;
+    focus: () => void;
+  };
+  const selfDestruct = function (this: BrowserWindow): void {
+    try {
+      if (!this.isDestroyed()) this.destroy();
+    } catch {
+      /* ignore */
+    }
+  };
+  proto.show = selfDestruct;
+  proto.showInactive = selfDestruct;
+  proto.focus = function (): void {
+    /* no-op: never steal focus headlessly */
+  };
+}
 
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
 
@@ -956,11 +982,19 @@ if (gotSingleInstanceLock) {
     registerBatchTranscribeHandlers(ipcMain, getConfig);
     registerStreamingSttHandlers(ipcMain, getConfig, getRecorderWindow);
 
-    // Initialize dictation system (global hotkey + STT + text insertion)
-    initDictation(getConfig(), setConfig);
+    // Initialize dictation + App Shots (global hotkeys, hidden helper windows,
+    // screenshot capture) ONLY when we have a GUI. A headless CLI backend has
+    // no user to dictate/screenshot, and their hidden BrowserWindows would
+    // otherwise keep the process off the Dock AND suppress idle-shutdown
+    // (getAllWindows() > 0). Handlers above are just IPC — harmless to leave
+    // registered — but these init calls create windows/hotkeys, so skip them.
+    if (!IS_HEADLESS) {
+      // Initialize dictation system (global hotkey + STT + text insertion)
+      initDictation(getConfig(), setConfig);
 
-    // Initialize App Shots (global hotkey → screenshot + window metadata → composer)
-    initAppShots(getConfig());
+      // Initialize App Shots (global hotkey → screenshot + window metadata → composer)
+      initAppShots(getConfig());
+    }
     registerAppShotsHandlers(ipcMain);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
@@ -1151,6 +1185,35 @@ if (gotSingleInstanceLock) {
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+
+    // Start the local IPC socket EARLY — as soon as the conversation/agent IPC
+    // handlers exist — so the `kai` CLI can connect in ~1s instead of waiting
+    // for the slow tool-registry / plugin / marketplace init that follows. The
+    // leader always serves it (it holds the single-instance lock), independent
+    // of the user-facing web server toggle. A headless (CLI-spawned) backend
+    // enables idle shutdown so it doesn't outlive its clients; a windowed GUI
+    // leader persists.
+    startLocalServer({
+      idleShutdown: IS_HEADLESS,
+      // In headless mode a window is never a legitimate reason to stay alive
+      // (there's no user; any window is an errant plugin/auth popup we also
+      // block above). Only real socket clients keep a headless backend up, so
+      // report no "other" clients. A windowed GUI leader doesn't enable
+      // idleShutdown at all, so this predicate is moot there.
+      hasOtherClients: () => false,
+      onIdleExit: () => {
+        console.info(`[${__BRAND_PRODUCT_NAME}] Headless backend idle with no clients — shutting down.`);
+        app.quit();
+        // Hard-exit fallback: if before-quit teardown stalls (async plugin
+        // cleanup, pending work), force the process down so a headless backend
+        // never lingers after its clients are gone.
+        setTimeout(() => {
+          app.exit(0);
+        }, 2000).unref();
+      },
+    })
+      .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
+      .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err));
 
     // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
     // getRegisteredTools for tool actions, and getConfig for rule reload).
@@ -1589,9 +1652,12 @@ if (gotSingleInstanceLock) {
         // Register realtime handlers (needs tool registry)
         registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);
 
-        // Start web UI server if enabled
+        // Start web UI server if enabled — but NOT in headless (CLI-spawned)
+        // mode. The web server is a GUI-app feature; a headless CLI backend
+        // shouldn't expose a network port, and plugin/web bridge connections to
+        // it would otherwise count as "clients" and suppress idle-shutdown.
         const webServerConfig = getConfig().webServer;
-        if (webServerConfig?.enabled) {
+        if (webServerConfig?.enabled && !IS_HEADLESS) {
           startWebServer(webServerConfig)
             .then(() =>
               console.info(
@@ -1600,22 +1666,6 @@ if (gotSingleInstanceLock) {
             )
             .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
         }
-
-        // Start the local IPC socket unconditionally — this process is the
-        // leader (it holds the single-instance lock), so it always serves the
-        // `kai` CLI bridge, independent of the user-facing web server toggle.
-        // A headless (CLI-spawned) backend enables idle shutdown so it doesn't
-        // outlive its clients; a windowed GUI leader persists.
-        startLocalServer({
-          idleShutdown: IS_HEADLESS,
-          hasOtherClients: () => BrowserWindow.getAllWindows().length > 0 || webClients.size > 0,
-          onIdleExit: () => {
-            console.info(`[${__BRAND_PRODUCT_NAME}] Headless backend idle with no clients — shutting down.`);
-            app.quit();
-          },
-        })
-          .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
-          .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err));
 
         // Initialize subagent cleanup cron job
         const dbPath = join(APP_HOME, 'data', 'memory.db');
