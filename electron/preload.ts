@@ -235,6 +235,9 @@ const appAPI = {
       ipcRenderer.invoke('automations:test', ruleId, samplePayload) as Promise<unknown>,
     emit: (source: string, event: string, payload?: unknown) =>
       ipcRenderer.invoke('automations:emit', source, event, payload) as Promise<void>,
+    inFlight: (conversationId: string) =>
+      ipcRenderer.invoke('automations:in-flight', conversationId) as Promise<boolean>,
+    abort: (conversationId: string) => ipcRenderer.invoke('automations:abort', conversationId) as Promise<boolean>,
     onRun: (callback: (record: unknown) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
       ipcRenderer.on('automations:run', handler);

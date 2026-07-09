@@ -8,6 +8,7 @@ import {
   CheckCircle2Icon,
   AlertCircleIcon,
   MinusCircleIcon,
+  MessageSquareIcon,
 } from 'lucide-react';
 import { app, type AutomationRunRecord, type AutomationSourceCatalogEntry } from '@/lib/ipc-client';
 import { flattenJsonSchema } from '@/lib/schema-paths';
@@ -15,22 +16,12 @@ import { generateId } from '@/lib/utils';
 import { NumberField, settingsSelectClass, TextField, Toggle, type SettingsProps } from './shared';
 
 type ConditionOp =
-  | 'equals'
-  | 'notEquals'
-  | 'contains'
-  | 'startsWith'
-  | 'endsWith'
-  | 'matches'
-  | 'in'
-  | 'exists'
-  | 'expression';
+  'equals' | 'notEquals' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'in' | 'exists' | 'expression';
 
 type Condition = { path: string; op: ConditionOp; value?: unknown; caseSensitive: boolean };
 
 type ConversationTarget =
-  | { type: 'per-invocation' }
-  | { type: 'singleton' }
-  | { type: 'existing'; conversationId: string };
+  { type: 'per-invocation' } | { type: 'singleton' } | { type: 'existing'; conversationId: string };
 
 type Action =
   | {
@@ -137,7 +128,11 @@ function newAction(type: Action['type']): Action {
   }
 }
 
-export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id: string) => void }> = ({
+  config,
+  updateConfig,
+  onOpenConversation,
+}) => {
   const automations = ((config as { automations?: AutomationsConfig }).automations ?? {
     enabled: true,
     rules: [],
@@ -302,7 +297,7 @@ export const AutomationsSettings: FC<SettingsProps> = ({ config, updateConfig })
         })}
       </div>
 
-      <ActivityLog runLog={runLog} />
+      <ActivityLog runLog={runLog} onOpenConversation={onOpenConversation} />
     </div>
   );
 };
@@ -632,6 +627,44 @@ function useConversationOptions(): Array<{ id: string; title: string }> {
   return options;
 }
 
+function useModelOptions(): Array<{ key: string; label: string }> {
+  const [options, setOptions] = useState<Array<{ key: string; label: string }>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    app
+      .modelCatalog()
+      .then((data) => {
+        if (cancelled) return;
+        const models = (data as { models?: Array<{ key: string; displayName?: string }> } | null)?.models ?? [];
+        setOptions(models.map((m) => ({ key: m.key, label: m.displayName?.trim() || m.key })));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return options;
+}
+
+function useProfileOptions(): Array<{ key: string; label: string }> {
+  const [options, setOptions] = useState<Array<{ key: string; label: string }>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    app
+      .profileCatalog()
+      .then((data) => {
+        if (cancelled) return;
+        const profiles = (data as { profiles?: Array<{ key: string; name?: string }> } | null)?.profiles ?? [];
+        setOptions(profiles.map((p) => ({ key: p.key, label: p.name?.trim() || p.key })));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return options;
+}
+
 const ActionEditor: FC<{
   index: number;
   action: Action;
@@ -642,6 +675,8 @@ const ActionEditor: FC<{
 }> = ({ index, action, catalog, pluginSources, onChange, onRemove }) => {
   const changeType = (type: Action['type']) => onChange(newAction(type));
   const conversationOptions = useConversationOptions();
+  const modelOptions = useModelOptions();
+  const profileOptions = useProfileOptions();
   const target: ConversationTarget =
     action.type === 'agent' ? (action.conversationTarget ?? { type: 'per-invocation' }) : { type: 'per-invocation' };
   const includeHistory = action.type === 'agent' ? (action.includeHistory ?? true) : true;
@@ -766,16 +801,36 @@ const ActionEditor: FC<{
             </div>
           )}
           <div className="grid grid-cols-2 gap-2">
-            <TextField
-              label="Model key (optional)"
-              value={action.modelKey ?? ''}
-              onChange={(v) => onChange({ ...action, modelKey: v || undefined })}
-            />
-            <TextField
-              label="Profile key (optional)"
-              value={action.profileKey ?? ''}
-              onChange={(v) => onChange({ ...action, profileKey: v || undefined })}
-            />
+            <div>
+              <label className="mb-0.5 block text-[10px] text-muted-foreground">Model (optional)</label>
+              <select
+                className={settingsSelectClass}
+                value={action.modelKey ?? ''}
+                onChange={(e) => onChange({ ...action, modelKey: e.target.value || undefined })}
+              >
+                <option value="">— default —</option>
+                {modelOptions.map((m) => (
+                  <option key={m.key} value={m.key}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-0.5 block text-[10px] text-muted-foreground">Profile (optional)</label>
+              <select
+                className={settingsSelectClass}
+                value={action.profileKey ?? ''}
+                onChange={(e) => onChange({ ...action, profileKey: e.target.value || undefined })}
+              >
+                <option value="">— default —</option>
+                {profileOptions.map((p) => (
+                  <option key={p.key} value={p.key}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
       )}
@@ -955,7 +1010,19 @@ const JsonField: FC<{
 
 /* ───────────────────────── Activity log ───────────────────────── */
 
-const ActivityLog: FC<{ runLog: AutomationRunRecord[] }> = ({ runLog }) => {
+function runConversationIds(r: AutomationRunRecord): string[] {
+  const ids = new Set<string>();
+  for (const res of r.results) {
+    const cid = (res.output as { conversationId?: unknown } | null | undefined)?.conversationId;
+    if (typeof cid === 'string' && cid) ids.add(cid);
+  }
+  return [...ids];
+}
+
+const ActivityLog: FC<{ runLog: AutomationRunRecord[]; onOpenConversation?: (id: string) => void }> = ({
+  runLog,
+  onOpenConversation,
+}) => {
   const [open, setOpen] = useState<Set<string>>(new Set());
   return (
     <div>
@@ -966,6 +1033,7 @@ const ActivityLog: FC<{ runLog: AutomationRunRecord[] }> = ({ runLog }) => {
         {runLog.length === 0 && <p className="text-[10px] text-muted-foreground/60">No runs yet.</p>}
         {runLog.map((r) => {
           const isOpen = open.has(r.id);
+          const convIds = runConversationIds(r);
           return (
             <div key={r.id} className="rounded border border-border/40 bg-background/40">
               <button
@@ -995,9 +1063,26 @@ const ActivityLog: FC<{ runLog: AutomationRunRecord[] }> = ({ runLog }) => {
                 )}
               </button>
               {isOpen && (
-                <pre className="max-h-40 overflow-auto border-t border-border/40 p-2 text-[10px]">
-                  {JSON.stringify({ event: r.event, results: r.results, error: r.error }, null, 2)}
-                </pre>
+                <div className="border-t border-border/40">
+                  {convIds.length > 0 && onOpenConversation && (
+                    <div className="flex flex-wrap gap-1 px-2 pt-2">
+                      {convIds.map((cid) => (
+                        <button
+                          key={cid}
+                          type="button"
+                          onClick={() => onOpenConversation(cid)}
+                          className="flex items-center gap-1 rounded-md border border-border/70 bg-card/80 px-2 py-1 text-[10px] hover:bg-card"
+                        >
+                          <MessageSquareIcon className="h-3 w-3" />
+                          Open chat
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <pre className="max-h-40 overflow-auto p-2 text-[10px]">
+                    {JSON.stringify({ event: r.event, results: r.results, error: r.error }, null, 2)}
+                  </pre>
+                </div>
               )}
             </div>
           );

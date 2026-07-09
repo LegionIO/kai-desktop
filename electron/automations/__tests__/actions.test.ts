@@ -12,8 +12,14 @@ vi.mock('electron', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
 vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: 'AGENT SAYS HI', modelKey: 'test', toolCalls: [] })),
+  // Conversation-mode runs stream; yield a text delta then done carrying modelKey.
+  streamForPlugin: vi.fn(async function* () {
+    yield { type: 'text-delta', text: 'AGENT SAYS HI' };
+    yield { type: 'done', modelKey: 'test' };
+  }),
 }));
 
 type MockStore = {
@@ -30,12 +36,26 @@ vi.mock('../../ipc/conversations.js', () => ({
   readConversationStore: vi.fn(() => mockStore),
   writeConversationStore: vi.fn(),
   broadcastConversationChange: vi.fn(),
-  appendConversationMessages: vi.fn((_home: string, id: string, _msgs: unknown[], opts?: { skipIfBusy?: boolean }) => {
-    const conv = mockStore.conversations[id];
-    if (!conv) return null;
-    if (opts?.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) return null;
-    return conv;
-  }),
+  appendConversationMessages: vi.fn(
+    (
+      _home: string,
+      id: string,
+      msgs: Array<{ role: string; content: unknown }>,
+      opts?: { skipIfBusy?: boolean; runStatus?: string },
+    ) => {
+      const conv = mockStore.conversations[id];
+      if (!conv) return null;
+      if (opts?.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) return null;
+      // Simulate append: grow the tree + advance headId so follow-up reads (the
+      // assistant turn parents off the just-written user turn) see the new head.
+      const tree = (conv.messageTree as unknown[]) ?? [];
+      const appended = msgs.map((m, i) => ({ id: `mock-${id}-${tree.length + i}`, ...m }));
+      conv.messageTree = [...tree, ...appended];
+      conv.headId = appended[appended.length - 1]?.id ?? conv.headId ?? null;
+      if (opts?.runStatus !== undefined) conv.runStatus = opts.runStatus;
+      return conv;
+    },
+  ),
   ensureConversationTree: vi.fn((c: { messageTree?: unknown[]; headId?: string | null }) => ({
     tree: c.messageTree ?? [],
     headId: c.headId ?? null,
@@ -46,7 +66,7 @@ vi.mock('../../ipc/conversations.js', () => ({
 import type { AutomationConversationTarget, AutomationRule } from '../../config/schema.js';
 import { executeActions, interpolateString, type ActionDeps } from '../actions.js';
 import { AutomationEventBus } from '../event-bus.js';
-import { generateForPlugin } from '../../agent/plugin-generate.js';
+import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
 import { appendConversationMessages, writeConversationStore } from '../../ipc/conversations.js';
 
 function rule(actions: AutomationRule['actions']): AutomationRule {
@@ -234,23 +254,28 @@ describe('agent conversationTarget', () => {
     vi.mocked(writeConversationStore).mockClear();
     vi.mocked(appendConversationMessages).mockClear();
     vi.mocked(generateForPlugin).mockClear();
+    vi.mocked(streamForPlugin).mockClear();
   });
 
-  it('per-invocation creates a shell (automationSingleton=false) then appends the exchange', async () => {
+  it('per-invocation creates a shell (automationSingleton=false) then writes prompt + assistant', async () => {
     await executeActions(agentAction({ type: 'per-invocation' }), evt, deps());
     const [, store] = vi.mocked(writeConversationStore).mock.calls[0] as [string, MockStore];
     const conv = Object.values(store.conversations)[0] as Record<string, unknown>;
-    expect(conv.messageTree).toEqual([]);
-    expect(conv.headId).toBeNull();
     expect((conv.metadata as Record<string, unknown>).automationSingleton).toBe(false);
-    expect(appendConversationMessages).toHaveBeenCalledWith(
+    // User prompt is written first (running), assistant second (idle).
+    expect(appendConversationMessages).toHaveBeenNthCalledWith(
+      1,
       '/tmp/kai-test',
       conv.id,
-      [
-        expect.objectContaining({ role: 'user', content: [{ type: 'text', text: 'do the thing' }] }),
-        expect.objectContaining({ role: 'assistant', content: [{ type: 'text', text: 'AGENT SAYS HI' }] }),
-      ],
-      expect.objectContaining({ skipIfBusy: true }),
+      [expect.objectContaining({ role: 'user', content: [{ type: 'text', text: 'do the thing' }] })],
+      expect.objectContaining({ runStatus: 'running' }),
+    );
+    expect(appendConversationMessages).toHaveBeenNthCalledWith(
+      2,
+      '/tmp/kai-test',
+      conv.id,
+      [expect.objectContaining({ role: 'assistant', content: [{ type: 'text', text: 'AGENT SAYS HI' }] })],
+      expect.objectContaining({ runStatus: 'idle' }),
     );
   });
 
@@ -266,51 +291,54 @@ describe('agent conversationTarget', () => {
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, true), evt, deps());
     // History from the busy target must NOT be passed to the model
-    expect(vi.mocked(generateForPlugin).mock.calls.at(-1)![0].messages).toEqual([
+    expect(vi.mocked(streamForPlugin).mock.calls.at(-1)![0].messages).toEqual([
       { role: 'user', content: 'do the thing' },
     ]);
     const [, divertedId] = vi.mocked(appendConversationMessages).mock.calls.at(-1) as [string, string, unknown[]];
     expect(divertedId).not.toBe('convA');
   });
 
-  it('target becomes busy during generation → skipIfBusy diverts at append time', async () => {
+  it('busy existing target diverts to a fresh conversation (never writes to the busy one)', async () => {
     resetMockStore({
-      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
-    });
-    vi.mocked(generateForPlugin).mockImplementationOnce(async () => {
-      mockStore.conversations.convA.runStatus = 'running';
-      return { text: 'AGENT SAYS HI', modelKey: 'test', toolCalls: [] };
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
     });
     const rec = await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }), evt, deps());
-    expect(appendConversationMessages).toHaveBeenNthCalledWith(
-      1,
-      '/tmp/kai-test',
-      'convA',
-      expect.anything(),
-      expect.objectContaining({ skipIfBusy: true }),
-    );
-    const [, divertedId] = vi.mocked(appendConversationMessages).mock.calls[1] as [string, string, unknown[]];
+    const divertedId = (rec.results[0].output as { conversationId: string }).conversationId;
     expect(divertedId).not.toBe('convA');
-    expect((rec.results[0].output as { conversationId: string }).conversationId).toBe(divertedId);
+    for (const call of vi.mocked(appendConversationMessages).mock.calls) {
+      expect(call[1]).not.toBe('convA');
+    }
   });
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {
     await executeActions(agentAction({ type: 'singleton' }), evt, deps());
     const [, store1] = vi.mocked(writeConversationStore).mock.calls[0] as [string, MockStore];
-    const created = Object.values(store1.conversations)[0] as { id: string; metadata: Record<string, unknown> };
+    const created = Object.values(store1.conversations)[0] as {
+      id: string;
+      metadata: Record<string, unknown>;
+      messageTree?: unknown[];
+      headId?: string | null;
+      runStatus?: string;
+    };
     expect(created.metadata.automationSingleton).toBe(true);
 
-    resetMockStore({ [created.id]: created });
+    // Reset the singleton to an idle, empty state for the second run.
+    resetMockStore({ [created.id]: { ...created, messageTree: [], headId: null, runStatus: 'idle' } });
     vi.mocked(appendConversationMessages).mockClear();
     await executeActions(agentAction({ type: 'singleton' }), evt, deps());
-    expect(appendConversationMessages).toHaveBeenCalledWith(
+    expect(appendConversationMessages).toHaveBeenNthCalledWith(
+      1,
       '/tmp/kai-test',
       created.id,
-      [
-        expect.objectContaining({ role: 'user', content: [{ type: 'text', text: 'do the thing' }] }),
-        expect.objectContaining({ role: 'assistant', content: [{ type: 'text', text: 'AGENT SAYS HI' }] }),
-      ],
-      expect.objectContaining({ skipIfBusy: true }),
+      [expect.objectContaining({ role: 'user', content: [{ type: 'text', text: 'do the thing' }] })],
+      expect.objectContaining({ runStatus: 'running' }),
+    );
+    expect(appendConversationMessages).toHaveBeenNthCalledWith(
+      2,
+      '/tmp/kai-test',
+      created.id,
+      [expect.objectContaining({ role: 'assistant', content: [{ type: 'text', text: 'AGENT SAYS HI' }] })],
+      expect.objectContaining({ runStatus: 'idle' }),
     );
   });
 
@@ -323,7 +351,7 @@ describe('agent conversationTarget', () => {
       '/tmp/kai-test',
       'convA',
       expect.arrayContaining([expect.objectContaining({ role: 'assistant' })]),
-      expect.objectContaining({ skipIfBusy: true }),
+      expect.objectContaining({ runStatus: 'idle' }),
     );
 
     vi.mocked(writeConversationStore).mockClear();
@@ -345,7 +373,7 @@ describe('agent conversationTarget', () => {
       },
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, true), evt, deps());
-    const call = vi.mocked(generateForPlugin).mock.calls.at(-1)![0];
+    const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
     expect(call.messages).toEqual([
       { role: 'user', content: 'earlier q' },
       { role: 'assistant', content: 'earlier a' },
@@ -353,17 +381,19 @@ describe('agent conversationTarget', () => {
     ]);
   });
 
-  it('passes the resolved target conversationId into generateForPlugin', async () => {
+  it('passes the resolved target conversationId into the stream', async () => {
     resetMockStore({
       convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }), evt, deps());
-    expect(vi.mocked(generateForPlugin).mock.calls.at(-1)![0].conversationId).toBe('convA');
+    expect(vi.mocked(streamForPlugin).mock.calls.at(-1)![0].conversationId).toBe('convA');
 
-    vi.mocked(generateForPlugin).mockClear();
+    vi.mocked(streamForPlugin).mockClear();
     resetMockStore();
+    // per-invocation now creates a real target up front (so the prompt can stream
+    // live), so the stream always receives a concrete conversationId.
     await executeActions(agentAction({ type: 'per-invocation' }), evt, deps());
-    expect(vi.mocked(generateForPlugin).mock.calls.at(-1)![0].conversationId).toBeUndefined();
+    expect(vi.mocked(streamForPlugin).mock.calls.at(-1)![0].conversationId).toBeTruthy();
   });
 
   it('includeHistory filters out tool-call/enrichment parts and empty messages', async () => {
@@ -396,7 +426,7 @@ describe('agent conversationTarget', () => {
       },
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, true), evt, deps());
-    const call = vi.mocked(generateForPlugin).mock.calls.at(-1)![0];
+    const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
     expect(call.messages).toEqual([
       { role: 'assistant', content: [{ type: 'text', text: 'kept' }] },
       { role: 'user', content: 'do the thing' },
@@ -413,7 +443,7 @@ describe('agent conversationTarget', () => {
       },
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, false), evt, deps());
-    const call = vi.mocked(generateForPlugin).mock.calls.at(-1)![0];
+    const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
     expect(call.messages).toEqual([{ role: 'user', content: 'do the thing' }]);
   });
 });

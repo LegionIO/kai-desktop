@@ -238,6 +238,7 @@ function broadcastStreamEvent(event: StreamEvent): void {
 }
 
 /**
+/**
  * Auto-title a client-driven (CLI) conversation after its first completed turn,
  * mirroring what the GUI does client-side. No-op if the chat already has a
  * title or has no user turn yet. Best-effort: title failures are swallowed.
@@ -277,6 +278,17 @@ async function maybeAutoTitle(appHome: string, conversationId: string): Promise<
   } catch {
     // Best-effort — never let titling break the turn.
   }
+}
+
+/**
+ * Public entry point for non-interactive producers (currently automation runs)
+ * to emit on the same `agent:stream-event` channel the renderer listens on, so
+ * their output renders live in the target conversation. Callers should tag the
+ * event with `automation: true` so the renderer defers persistence to the main
+ * process (which owns the automation conversation's on-disk write).
+ */
+export function broadcastAgentStreamEvent(event: StreamEvent): void {
+  broadcastStreamEvent(event);
 }
 
 function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): AbortSignal | undefined {

@@ -77,6 +77,10 @@ export type StreamEvent = {
     hitLimit: boolean;
     taskComplete: boolean;
   };
+  /** Set when this event originates from an automation run (not an interactive
+   * chat). The renderer uses it to render live but defer persistence to the main
+   * process (which owns the automation conversation's on-disk write). */
+  automation?: boolean;
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -956,7 +960,7 @@ export async function* streamAgentResponse(
   // Create Mastra workspace tools (file read/write/edit, grep, list, shell)
   const effectiveCwd = normalizeAgentCwd(options?.cwd);
   const executionMode = config.tools?.executionMode;
-  const { workspace, tools: workspaceTools } = await createWorkspaceForAgent(
+  const { tools: workspaceTools } = await createWorkspaceForAgent(
     effectiveCwd,
     () => config,
     executionMode,
@@ -1003,8 +1007,11 @@ export async function* streamAgentResponse(
       name: __BRAND_APP_SLUG,
       instructions: buildAgentInstructions(config, executionMode),
       model: model as AgentConfig['model'],
+      // Pass the pre-built, diff-tracking-wrapped workspace tools via `tools`.
+      // Do NOT pass `workspace` here: Mastra's Agent re-derives its own workspace
+      // tools from a `workspace` object (via createWorkspaceTools) at run time,
+      // which would shadow our wrapped tools and bypass diff tracking + guards.
       tools: allTools as AgentConfig['tools'],
-      workspace: workspace as unknown as AgentConfig['workspace'],
       ...(memory ? { memory } : {}),
     });
   };
@@ -1481,8 +1488,7 @@ async function* streamWithRealEvents(
             }
             // Extract Anthropic cache token info from providerMetadata or directly from usage
             const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
-              | Record<string, unknown>
-              | undefined;
+              Record<string, unknown> | undefined;
             const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;

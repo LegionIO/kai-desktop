@@ -178,6 +178,8 @@ type AppAPI = {
     log: () => Promise<AutomationRunRecord[]>;
     test: (ruleId: string, samplePayload: unknown) => Promise<AutomationRunRecord>;
     emit: (source: string, event: string, payload?: unknown) => Promise<void>;
+    inFlight: (conversationId: string) => Promise<boolean>;
+    abort: (conversationId: string) => Promise<boolean>;
     onRun: (callback: (record: AutomationRunRecord) => void) => () => void;
     onCatalogChanged: (callback: () => void) => () => void;
   };
