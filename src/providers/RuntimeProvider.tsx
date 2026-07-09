@@ -423,6 +423,13 @@ let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 // --- Stream accumulator functions ---
 
 const streamAccumulators = new Map<string, MessageAccumulator>();
+/** Conversations whose live accumulator is driven by an automation run (not an
+ *  interactive send). Gates automation-specific behavior: background accumulation,
+ *  open-mid-run seeding, and deferring persistence to the main process. */
+const automationStreams = new Set<string>();
+/** Automation conversations we've begun async-seeding a background accumulator for
+ *  (dedupes the disk fetch while events stream in before the seed resolves). */
+const automationSeedInProgress = new Set<string>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
 /** Per-conversation persist version counter — incremented before each persist, checked before writing.
@@ -1377,6 +1384,14 @@ export function RuntimeProvider({
 
     const { tree: t, headId: h } = ensureTree(conv);
 
+    // If a live accumulator already exists for this conversation (e.g. an
+    // automation streaming into it in the background), prefer its in-progress
+    // messages over the on-disk tree so opening it mid-run shows streamed-so-far
+    // content rather than snapping back to the last persisted state.
+    const existingAcc = streamAccumulators.get(id);
+    const displayTree = existingAcc ? existingAcc.messages : t;
+    const displayHead = existingAcc ? existingAcc.headId : h;
+
     // Only mark orphaned tool-calls as hung if there's no active stream —
     // an active stream or a tool awaiting user approval means the missing
     // result is expected, not an error.
@@ -1409,8 +1424,8 @@ export function RuntimeProvider({
     }
 
     setActiveConversationId(id);
-    setTree(t);
-    setHeadId(h);
+    setTree(displayTree);
+    setHeadId(displayHead);
     setStepInfo(null);
     setShowIncompleteTaskBanner(false);
     currentWorkingDirectoryRef.current = conv.currentWorkingDirectory ?? null;
@@ -1420,9 +1435,25 @@ export function RuntimeProvider({
     // the accumulator is still alive (so hasActiveStream is true) but the model
     // has stopped generating; only user interaction can resume it.
     const accAwait = hasActiveStream && streamAccumulators.get(id)?.awaitingApproval;
-    setIsRunning(hasActiveStream && !accAwait);
-    if (conv.runStatus === 'running' && !hasActiveStream) {
-      void persistConversation(id, t, h, { runStatus: 'idle' });
+    if (hasActiveStream) {
+      setIsRunning(!accAwait);
+    } else if (conv.runStatus === 'running') {
+      // Persisted as running but we have no local accumulator. This is either a
+      // stale flag OR an automation is streaming into it right now (opened
+      // mid-run). Ask the main process; if a run is in flight, seed an
+      // accumulator from the persisted tree so subsequent automation events
+      // render live. Otherwise clear the stale flag.
+      const inFlight = await app.automations.inFlight(id).catch(() => false);
+      if (inFlight) {
+        automationStreams.add(id);
+        streamAccumulators.set(id, { messages: [...t], headId: h });
+        setIsRunning(true);
+      } else {
+        setIsRunning(false);
+        void persistConversation(id, t, h, { runStatus: 'idle' });
+      }
+    } else {
+      setIsRunning(false);
     }
 
     // Restore per-conversation settings (model, profile, fallback, thread overrides)
@@ -1655,6 +1686,8 @@ export function RuntimeProvider({
           hitLimit: boolean;
           taskComplete: boolean;
         };
+        // Set when the event originates from an automation run (see StreamEvent).
+        automation?: boolean;
       };
 
       // Debug: log every event received in renderer
@@ -1801,6 +1834,8 @@ export function RuntimeProvider({
       const convId = e.conversationId;
       const isActiveConv = convId === activeIdRef.current;
 
+      if (e.automation) automationStreams.add(convId);
+
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
           const { tree: curTree, headId: curHead } = streamHandlerRef.current;
@@ -1808,6 +1843,28 @@ export function RuntimeProvider({
             `[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`,
           );
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
+        } else if (e.automation) {
+          // Automation streaming into a NON-active conversation: keep a background
+          // accumulator so switching to it mid-run shows streamed-so-far content.
+          // Seed it from the persisted tree (which already has the user prompt)
+          // asynchronously; drop events until the seed resolves (the final
+          // assistant turn is persisted by the main process, so early dropped
+          // deltas are cosmetic).
+          if (!automationSeedInProgress.has(convId)) {
+            automationSeedInProgress.add(convId);
+            void app.conversations
+              .get(convId)
+              .then((conv) => {
+                const rec = conv as ConversationRecord | null;
+                if (rec && !streamAccumulators.has(convId)) {
+                  const { tree, headId } = ensureTree(rec);
+                  streamAccumulators.set(convId, { messages: [...tree], headId });
+                }
+              })
+              .catch(() => {})
+              .finally(() => automationSeedInProgress.delete(convId));
+          }
+          return;
         } else {
           // No accumulator for a non-active conversation — the stream already
           // completed and was persisted by the done/error handler.  Drop stale events.
@@ -2242,6 +2299,18 @@ export function RuntimeProvider({
         console.warn(
           `[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`,
         );
+        // Automation-owned stream: main process persists the terminal state and
+        // sends its own `done`. Don't persist from here; just reconcile from disk.
+        if (e.automation || automationStreams.has(convId)) {
+          // Keep the accumulator alive so the trailing automation `done` (which
+          // arrives right after) does the final cleanup + reload uniformly.
+          if (isActiveConv) {
+            applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
+          return;
+        }
         applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
         // Apply messageMeta (e.g. runtimeId) from error events so the popover
         // shows the correct runtime even when the response is an error.
@@ -2275,6 +2344,23 @@ export function RuntimeProvider({
         console.warn(
           `[StreamEvent] DONE conv=${convId.slice(0, 8)} accMsgCount=${acc.messages.length} awaitingApproval=${acc.awaitingApproval ?? false} isActive=${isActiveConv} data=${JSON.stringify(e.data ?? null)}`,
         );
+        // Automation-owned stream: the MAIN process persisted the authoritative
+        // [user, assistant] exchange and set runStatus. Don't persist from here
+        // (would duplicate). Drop the accumulator + reload from disk to reconcile.
+        if (e.automation || automationStreams.has(convId)) {
+          automationStreams.delete(convId);
+          const _ptAuto = persistTimersRef.current.get(convId);
+          if (_ptAuto) {
+            clearTimeout(_ptAuto);
+            persistTimersRef.current.delete(convId);
+          }
+          streamAccumulators.delete(convId);
+          if (isActiveConv) {
+            setIsRunning(false);
+            void loadConversationState(convId);
+          }
+          return;
+        }
         // Plan-mode transitions (accept, reject, dismiss) send a done event while
         // a tool is still awaiting approval.  Clear the flag so the normal done
         // path can clean up or restart the stream correctly.
@@ -2669,6 +2755,19 @@ export function RuntimeProvider({
   const onCancel = useCallback(async () => {
     const convId = activeIdRef.current;
     if (!convId) return;
+
+    // Automation-owned stream: abort the automation run instead of cancelling an
+    // interactive agent stream. The main process persists the partial output and
+    // broadcasts a terminal `done` that the automation-done handler reconciles.
+    if (automationStreams.has(convId)) {
+      setIsRunning(false);
+      try {
+        await app.automations.abort(convId);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
 
     // Use refs to get the latest tree/headId (not stale closure values)
     const currentTree = treeRef.current;

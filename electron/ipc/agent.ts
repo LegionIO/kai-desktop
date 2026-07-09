@@ -214,6 +214,17 @@ function broadcastStreamEvent(event: StreamEvent): void {
   broadcastToWebClients('agent:stream-event', eventToBroadcast);
 }
 
+/**
+ * Public entry point for non-interactive producers (currently automation runs)
+ * to emit on the same `agent:stream-event` channel the renderer listens on, so
+ * their output renders live in the target conversation. Callers should tag the
+ * event with `automation: true` so the renderer defers persistence to the main
+ * process (which owns the automation conversation's on-disk write).
+ */
+export function broadcastAgentStreamEvent(event: StreamEvent): void {
+  broadcastStreamEvent(event);
+}
+
 function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): AbortSignal | undefined {
   if (!primary && !secondary) return undefined;
   if (!primary) return secondary;

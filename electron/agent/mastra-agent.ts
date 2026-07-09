@@ -77,6 +77,10 @@ export type StreamEvent = {
     hitLimit: boolean;
     taskComplete: boolean;
   };
+  /** Set when this event originates from an automation run (not an interactive
+   * chat). The renderer uses it to render live but defer persistence to the main
+   * process (which owns the automation conversation's on-disk write). */
+  automation?: boolean;
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];

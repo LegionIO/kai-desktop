@@ -57,7 +57,10 @@ if (typeof window !== 'undefined') {
   });
 }
 
-export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
+export const SettingsPanel: FC<{ onClose: () => void; onOpenConversation?: (id: string) => void }> = ({
+  onClose,
+  onOpenConversation,
+}) => {
   const { config, updateConfig } = useConfig();
   const [activeSection, setActiveSection] = useState<SettingsSection>('models');
   const [query, setQuery] = useState('');
@@ -230,7 +233,9 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
             focusNonce={focusNonce}
           />
         )}
-        {activeSection === 'automations' && <AutomationsSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'automations' && (
+          <AutomationsSettings config={config} updateConfig={updateConfig} onOpenConversation={onOpenConversation} />
+        )}
         {activeSection === 'audio' && <AudioSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'voice' && (
           <VoiceSettings config={config} updateConfig={updateConfig} focusTab={focusTab} focusNonce={focusNonce} />

@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { Notification } from 'electron';
-import { generateForPlugin } from '../agent/plugin-generate.js';
+import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
+import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
+import type { StreamEvent } from '../agent/mastra-agent.js';
+import { broadcastAgentStreamEvent } from '../ipc/agent.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -28,6 +31,23 @@ export type ActionDeps = {
 type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
 
 const inFlightAutomationTargets = new Set<string>();
+
+/** Abort controllers for in-flight agent runs, keyed by target conversationId.
+ * Lets the renderer's stop button interrupt a live automation run. */
+const automationRunAborts = new Map<string, AbortController>();
+
+/** True while an automation agent run is actively streaming into this conversation. */
+export function isAutomationRunInFlight(conversationId: string): boolean {
+  return inFlightAutomationTargets.has(conversationId);
+}
+
+/** Abort the in-flight automation run streaming into this conversation, if any. */
+export function abortAutomationRun(conversationId: string): boolean {
+  const controller = automationRunAborts.get(conversationId);
+  if (!controller) return false;
+  controller.abort();
+  return true;
+}
 
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
 
@@ -144,74 +164,216 @@ async function runAgentAction(
   const tools = action.tools ? deps.getRegisteredTools() : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
-  const resolved = action.mode === 'conversation' ? resolveConversationTarget(action, rule, deps.appHome, title) : null;
-  const targetId = resolved?.targetId ?? null;
-  if (targetId) inFlightAutomationTargets.add(targetId);
+  // Background mode has no conversation to stream into — keep the simple
+  // collect-and-return path.
+  if (action.mode !== 'conversation') {
+    const result = await generateForPlugin({
+      messages: [{ role: 'user', content: prompt }],
+      config,
+      appHome: deps.appHome,
+      modelKey: action.modelKey,
+      profileKey: action.profileKey,
+      fallbackEnabled: Boolean(action.profileKey),
+      tools,
+    });
+    return { text: result.text, modelKey: result.modelKey, toolCalls: result.toolCalls };
+  }
+
+  const resolved = resolveConversationTarget(action, rule, deps.appHome, title);
+  // Ensure a target conversation exists up front so the user prompt (and the
+  // live stream) can render immediately instead of after generation.
+  let conversationId = resolved?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
+  let created = resolved ? (resolved.created ?? false) : true;
+  inFlightAutomationTargets.add(conversationId);
+
+  const abortController = new AbortController();
+  automationRunAborts.set(conversationId, abortController);
 
   try {
+    // Build the model input (optionally including prior history), then write the
+    // user prompt turn immediately with runStatus:'running' so the conversation
+    // shows the prompt + a working indicator during generation.
     let messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: prompt }];
-    let historyHeadId: string | null | undefined;
-    if (targetId) {
-      const existing = readConversationStore(deps.appHome).conversations[targetId];
-      if (existing) {
-        const { tree, headId } = ensureConversationTree(existing);
-        historyHeadId = headId;
-        if (action.includeHistory) {
-          const branch = getConversationBranch(tree, headId);
-          const HISTORY_PART_TYPES = new Set(['text', 'image']);
-          const history = branch
-            .map((m) => ({
-              role: m.role,
-              content: Array.isArray(m.content)
-                ? (m.content as Array<{ type?: unknown }>).filter(
-                    (p) => typeof p?.type === 'string' && HISTORY_PART_TYPES.has(p.type),
-                  )
-                : m.content,
-            }))
-            .filter((m) => (Array.isArray(m.content) ? m.content.length > 0 : Boolean(m.content)))
-            .slice(-40);
-          messages = [...history, { role: 'user', content: prompt }];
-        }
+    const existing = readConversationStore(deps.appHome).conversations[conversationId];
+    let parentId: string | null | undefined;
+    if (existing) {
+      const { tree, headId } = ensureConversationTree(existing);
+      parentId = headId;
+      if (action.includeHistory) {
+        const branch = getConversationBranch(tree, headId);
+        const HISTORY_PART_TYPES = new Set(['text', 'image']);
+        const history = branch
+          .map((m) => ({
+            role: m.role,
+            content: Array.isArray(m.content)
+              ? (m.content as Array<{ type?: unknown }>).filter(
+                  (p) => typeof p?.type === 'string' && HISTORY_PART_TYPES.has(p.type),
+                )
+              : m.content,
+          }))
+          .filter((m) => (Array.isArray(m.content) ? m.content.length > 0 : Boolean(m.content)))
+          .slice(-40);
+        messages = [...history, { role: 'user', content: prompt }];
       }
     }
 
-    const result = await generateForPlugin({
+    const promptWrite = appendConversationMessages(
+      deps.appHome,
+      conversationId,
+      [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+      { skipIfBusy: true, parentId, runStatus: 'running' },
+    );
+    if (!promptWrite) {
+      // Target was genuinely busy (a concurrent run) or deleted mid-flight —
+      // divert to a fresh conversation and write the prompt there.
+      console.warn(
+        `[automations] rule "${rule.name}" target ${conversationId} is busy or was deleted; diverting to a new conversation`,
+      );
+      inFlightAutomationTargets.delete(conversationId);
+      automationRunAborts.delete(conversationId);
+      conversationId = createAutomationConversation(deps.appHome, rule, action, title, false);
+      created = true;
+      inFlightAutomationTargets.add(conversationId);
+      automationRunAborts.set(conversationId, abortController);
+      appendConversationMessages(
+        deps.appHome,
+        conversationId,
+        [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+        { parentId: null, runStatus: 'running' },
+      );
+    }
+    const userTurnHeadId =
+      readConversationStore(deps.appHome).conversations[conversationId]?.headId ?? parentId ?? null;
+
+    // Stream the model response, broadcasting each event tagged `automation` so
+    // the renderer renders it live in this conversation but defers persistence
+    // to us (the main process owns this conversation's on-disk write). We build
+    // the assistant content parts (text interleaved with tool-call parts) in
+    // stream order so the PERSISTED message matches what rendered live — clicking
+    // away and back must still show the tool calls, not just the final text.
+    type ToolCallPart = {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      argsText: string;
+      startedAt: string;
+      result?: unknown;
+      error?: string;
+      finishedAt?: string;
+    };
+    type TextPart = { type: 'text'; text: string };
+    const contentParts: Array<TextPart | ToolCallPart> = [];
+    const toolPartById = new Map<string, ToolCallPart>();
+    let text = '';
+    let error: string | null = null;
+    let modelKey = '';
+    let lastEventWasToolResult = false;
+    const toolCalls: PluginGenerateToolCall[] = [];
+    const pendingToolCalls = new Map<string, { toolName: string; args: unknown; startedAt: number }>();
+
+    const appendTextPart = (delta: string): void => {
+      const last = contentParts[contentParts.length - 1];
+      if (last && last.type === 'text') last.text += delta;
+      else contentParts.push({ type: 'text', text: delta });
+    };
+
+    for await (const ev of streamForPlugin({
       messages,
       config,
       appHome: deps.appHome,
-      conversationId: targetId ?? undefined,
+      conversationId,
       modelKey: action.modelKey,
       profileKey: action.profileKey,
+      fallbackEnabled: Boolean(action.profileKey),
       tools,
-    });
+      abortSignal: abortController.signal,
+    })) {
+      broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
 
-    if (action.mode !== 'conversation') {
-      return { text: result.text, modelKey: result.modelKey, toolCalls: result.toolCalls };
+      if (ev.type === 'done' && (ev as { modelKey?: string }).modelKey) {
+        modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
+      } else if (ev.type === 'text-delta' && ev.text) {
+        if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
+          text += '\n\n';
+          appendTextPart('\n\n');
+        }
+        text += ev.text;
+        appendTextPart(ev.text);
+        lastEventWasToolResult = false;
+      } else if (ev.type === 'tool-call' && ev.toolCallId) {
+        pendingToolCalls.set(ev.toolCallId, {
+          toolName: ev.toolName ?? 'unknown',
+          args: ev.args,
+          startedAt: Date.now(),
+        });
+        const part: ToolCallPart = {
+          type: 'tool-call',
+          toolCallId: ev.toolCallId,
+          toolName: ev.toolName ?? 'unknown',
+          args: ev.args ?? {},
+          argsText: JSON.stringify(ev.args ?? {}, null, 2),
+          startedAt: new Date().toISOString(),
+        };
+        toolPartById.set(ev.toolCallId, part);
+        contentParts.push(part);
+      } else if (ev.type === 'tool-result' && ev.toolCallId) {
+        lastEventWasToolResult = true;
+        const pending = pendingToolCalls.get(ev.toolCallId);
+        toolCalls.push({
+          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+          args: pending?.args ?? {},
+          result: ev.result,
+          durationMs: pending ? Date.now() - pending.startedAt : undefined,
+        });
+        const part = toolPartById.get(ev.toolCallId);
+        if (part) {
+          part.result = ev.result;
+          part.finishedAt = new Date().toISOString();
+        }
+        pendingToolCalls.delete(ev.toolCallId);
+      } else if (ev.type === 'tool-error' && ev.toolCallId) {
+        const pending = pendingToolCalls.get(ev.toolCallId);
+        toolCalls.push({
+          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+          args: pending?.args ?? {},
+          result: null,
+          error: ev.error ?? 'Tool execution failed',
+          durationMs: pending ? Date.now() - pending.startedAt : undefined,
+        });
+        const part = toolPartById.get(ev.toolCallId);
+        if (part) {
+          part.error = ev.error ?? 'Tool execution failed';
+          part.result = { isError: true, error: ev.error ?? 'Tool execution failed' };
+          part.finishedAt = new Date().toISOString();
+        }
+        pendingToolCalls.delete(ev.toolCallId);
+      } else if (ev.type === 'error') {
+        error = ev.error ?? 'Unknown error';
+      }
     }
 
-    const exchange = [
-      { role: 'user' as const, content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() },
-      {
-        role: 'assistant' as const,
-        content: [{ type: 'text', text: result.text }],
-        createdAt: new Date().toISOString(),
-      },
-    ];
-
-    let conversationId = targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
-    let created = !targetId || (resolved?.created ?? false);
-    let appended = appendConversationMessages(deps.appHome, conversationId, exchange, {
-      skipIfBusy: true,
-      parentId: historyHeadId,
-    });
-    if (!appended) {
-      console.warn(
-        `[automations] rule "${rule.name}" target ${conversationId} is busy or was deleted mid-run; diverting to a new conversation`,
-      );
-      conversationId = createAutomationConversation(deps.appHome, rule, action, title, false);
-      created = true;
-      appended = appendConversationMessages(deps.appHome, conversationId, exchange);
+    const aborted = abortController.signal.aborted;
+    if (!text) {
+      // No text was produced — surface a status line so the message isn't empty.
+      const fallbackText = aborted ? '_(stopped)_' : error ? `⚠️ ${error}` : '';
+      if (fallbackText) appendTextPart(fallbackText);
     }
+    const assistantContent = contentParts.length > 0 ? contentParts : [{ type: 'text', text: '' }];
+
+    // Persist the assistant turn (authoritative on-disk write) and return to idle.
+    // Persisting the full content parts (text + tool calls) keeps the tool calls
+    // visible after the conversation is reloaded from disk.
+    const appended = appendConversationMessages(
+      deps.appHome,
+      conversationId,
+      [{ role: 'assistant', content: assistantContent, createdAt: new Date().toISOString() }],
+      { parentId: userTurnHeadId, runStatus: 'idle' },
+    );
+
+    // Tell the renderer the automation stream is finished so it clears the
+    // running indicator and reloads the authoritative tree from disk.
+    broadcastAgentStreamEvent({ conversationId, type: 'done', automation: true });
 
     const emittedTitle = appended?.title ?? appended?.fallbackTitle ?? title;
     deps.bus.emit(
@@ -220,9 +382,14 @@ async function runAgentAction(
       { id: conversationId, title: emittedTitle },
       event.depth + 1,
     );
-    return { text: result.text, modelKey: result.modelKey, toolCalls: result.toolCalls, conversationId };
+
+    if (error && !text && !aborted) {
+      throw new Error(error);
+    }
+    return { text, modelKey, toolCalls, conversationId };
   } finally {
-    if (targetId) inFlightAutomationTargets.delete(targetId);
+    inFlightAutomationTargets.delete(conversationId);
+    automationRunAborts.delete(conversationId);
   }
 }
 

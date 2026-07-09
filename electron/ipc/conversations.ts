@@ -147,7 +147,7 @@ export function appendConversationMessages(
   appHome: string,
   conversationId: string,
   messages: Array<{ role: StoredTreeMessage['role']; content: unknown; createdAt?: string }>,
-  options: { skipIfBusy?: boolean; parentId?: string | null } = {},
+  options: { skipIfBusy?: boolean; parentId?: string | null; runStatus?: ConversationRecord['runStatus'] } = {},
 ): ConversationRecord | null {
   const store = readConversationStore(appHome);
   const conv = store.conversations[conversationId];
@@ -187,6 +187,7 @@ export function appendConversationMessages(
     messageCount: branch.length,
     userMessageCount: branch.filter((m) => m.role === 'user').length,
     hasUnread: true,
+    ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
   };
 
   store.conversations[conversationId] = next;

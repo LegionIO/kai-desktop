@@ -1801,7 +1801,7 @@ function AppShell() {
                       </button>
                     </div>
                     <div className="min-h-0 flex-1">
-                      <SettingsPanel onClose={handleCloseSettings} />
+                      <SettingsPanel onClose={handleCloseSettings} onOpenConversation={handleSwitchConversation} />
                     </div>
                   </div>
                 </div>,
