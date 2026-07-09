@@ -391,6 +391,23 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     if (prev) {
       nextConversation = reconcileConversationActivity(prev, nextConversation);
       nextConversation = preserveTerminalRunFields(prev, nextConversation);
+      // DLP: a UserPromptSubmit modify hook may have redacted a user turn on
+      // disk (flagged redactedByHook). The renderer's stream-done write carries
+      // the same node id with the RAW user text, which the merge above would
+      // otherwise re-persist. Force the stored redacted content back onto any
+      // shared node so the redaction survives.
+      const prevTreeArr = Array.isArray(prev.messageTree) ? (prev.messageTree as StoredTreeMessage[]) : [];
+      const redacted = new Map(
+        prevTreeArr.filter((m) => (m as { redactedByHook?: boolean }).redactedByHook).map((m) => [m.id, m] as const),
+      );
+      if (redacted.size > 0 && Array.isArray(nextConversation.messageTree)) {
+        const nextTree = (nextConversation.messageTree as StoredTreeMessage[]).map((m) => {
+          const r = redacted.get(m.id);
+          return r ? { ...m, content: r.content, redactedByHook: true } : m;
+        });
+        const nextBranch = getConversationBranch(nextTree, nextConversation.headId ?? null);
+        nextConversation = { ...nextConversation, messageTree: nextTree, messages: nextBranch };
+      }
     } else {
       nextConversation = reconcileConversationActivity(undefined, nextConversation);
     }

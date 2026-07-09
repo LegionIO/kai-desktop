@@ -179,6 +179,50 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(merged.headId).toBe('streamA');
   });
 
+  it('conversations:put preserves a redactedByHook user turn against a raw same-id rewrite', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    // On-disk: a UserPromptSubmit modify hook redacted the user turn (flagged).
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: '[redacted]', createdAt: 'x', redactedByHook: true },
+        ],
+        headId: 'u',
+        messageCount: 1,
+      }),
+    );
+
+    // Renderer stream-done write carries the SAME id with the RAW text.
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'my SECRET api key sk-123', createdAt: 'x' },
+          { id: 'a', parentId: 'u', role: 'assistant', content: 'ok', createdAt: 'x' },
+        ],
+        headId: 'a',
+        messageCount: 2,
+      }),
+    );
+
+    const stored = readConversationStore(appHome).conversations.c as {
+      messageTree: Array<{ id: string; content: unknown }>;
+    };
+    const userNode = stored.messageTree.find((m) => m.id === 'u');
+    // The redaction must survive — NOT be overwritten by the raw incoming text.
+    expect(userNode?.content).toBe('[redacted]');
+    // The new assistant turn still lands.
+    expect(stored.messageTree.some((m) => m.id === 'a')).toBe(true);
+  });
+
   it('conversations:put preserves same-id content updates when prev has extra ids', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

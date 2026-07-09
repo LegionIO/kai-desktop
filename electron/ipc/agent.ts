@@ -158,6 +158,11 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
     } else {
       node.content = sanitizedText as never;
     }
+    // Mark the node server-authoritative so conversations:put preserves this
+    // redacted content when the renderer's stream-done write arrives with the
+    // same id but the RAW user text (the merge otherwise takes incoming's
+    // version of shared ids, re-persisting the unredacted prompt).
+    (node as unknown as { redactedByHook?: boolean }).redactedByHook = true;
     conv.messageTree = tree as never;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
