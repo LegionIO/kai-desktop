@@ -9,7 +9,7 @@ import {
   type PropsWithChildren,
   type ReactNode,
 } from 'react';
-import { ChevronsLeftIcon, ChevronsRightIcon, XIcon, type LucideIcon } from 'lucide-react';
+import { ChevronsLeftIcon, ChevronsRightIcon, type LucideIcon } from 'lucide-react';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { cn } from '@/lib/utils';
 
@@ -31,7 +31,7 @@ export type SidePanelTab = {
   render: () => ReactNode;
 };
 
-export type SidePanelState = 'closed' | 'minimized' | 'open';
+export type SidePanelState = 'minimized' | 'open';
 
 type SidePanelContextValue = {
   state: SidePanelState;
@@ -68,7 +68,11 @@ export const SidePanelProvider: FC<PropsWithChildren> = ({ children }) => {
     setState('open');
   }, []);
 
-  const closePanel = useCallback(() => setState('closed'), []);
+  // The panel has just two visible states: `open` (full body) and `minimized`
+  // (slim rail with per-tab icons + expand). We keep `closePanel` in the API for
+  // existing callers, but it now collapses to the SAME minimized rail rather than
+  // a separate near-hidden `closed` state — one clear collapse/expand affordance.
+  const closePanel = useCallback(() => setState('minimized'), []);
   const minimizePanel = useCallback(() => setState('minimized'), []);
   const setActiveTab = useCallback((tabId: string) => setActiveTabId(tabId), []);
 
@@ -89,7 +93,7 @@ const MAX_PCT = 80;
 const DEFAULT_PCT = 45;
 
 export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
-  const { state, activeTabId, openPanel, closePanel, minimizePanel, setActiveTab } = useSidePanel();
+  const { state, activeTabId, openPanel, minimizePanel, setActiveTab } = useSidePanel();
   const [widthPct, setWidthPct] = useState(DEFAULT_PCT);
   const dragRef = useRef<{ startX: number; startPct: number; parentWidth: number } | null>(null);
 
@@ -123,32 +127,17 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
 
   if (tabs.length === 0) return null;
 
-  if (state === 'closed') {
-    // Distinct from 'minimized' (which shows the full per-tab rail): a single
-    // slim reopen affordance so the panel is never stranded.
-    return (
-      <div className="flex w-8 shrink-0 flex-col items-center border-l border-border/60 bg-card/40 py-3">
-        <Tooltip content="Open panel" side="left">
-          <button
-            type="button"
-            onClick={() => openPanel()}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            <ChevronsLeftIcon className="h-4 w-4" />
-          </button>
-        </Tooltip>
-      </div>
-    );
-  }
-
   if (state === 'minimized') {
+    // Slim rail: expand toggle + one icon per tab (Preview / Changes) so the
+    // user can still navigate between panels while collapsed. `titlebar-no-drag`
+    // on every button — this rail sits in the window's drag region.
     return (
-      <div className="flex w-9 shrink-0 flex-col items-center gap-2 border-l border-border/60 bg-card/40 py-3">
+      <div className="titlebar-no-drag relative z-40 flex w-9 shrink-0 flex-col items-center gap-2 border-l border-border/60 bg-card/40 py-3">
         <Tooltip content="Expand panel" side="left">
           <button
             type="button"
             onClick={() => openPanel()}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="titlebar-no-drag flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <ChevronsLeftIcon className="h-4 w-4" />
           </button>
@@ -161,7 +150,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
                 type="button"
                 onClick={() => openPanel(tab.id)}
                 className={cn(
-                  'relative flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                  'titlebar-no-drag relative flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
                   tab.id === effectiveTabId && 'bg-accent/60 text-foreground',
                 )}
               >
@@ -184,7 +173,10 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
   // state === 'open'
   return (
     <div
-      className="relative flex min-h-0 shrink-0 flex-col border-l border-border/60 bg-card/40"
+      // z-40 so the tab bar paints ABOVE the window's absolute z-30 title-bar
+      // overlay that spans the top band — otherwise that overlay occludes the
+      // tab/collapse buttons and swallows their clicks.
+      className="relative z-40 flex min-h-0 shrink-0 flex-col border-l border-border/60 bg-card/40"
       style={{ width: `${widthPct}%` }}
     >
       {/* Drag handle */}
@@ -199,8 +191,10 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
         className="absolute -left-1 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none hover:bg-primary/20 active:bg-primary/30"
       />
 
-      {/* Tab bar */}
-      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border/60 pl-2 pr-1">
+      {/* Tab bar. `titlebar-no-drag` is REQUIRED: this bar sits in the same top
+          band as the window's `-webkit-app-region: drag` title bar, so without it
+          the OS swallows clicks on the tab/collapse buttons as window drags. */}
+      <div className="titlebar-no-drag flex h-10 shrink-0 items-center gap-1 border-b border-border/60 pl-2 pr-1">
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {tabs.map((tab) => {
             const Icon = tab.icon;
@@ -211,7 +205,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
                 className={cn(
-                  'flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+                  'titlebar-no-drag flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
                   active
                     ? 'bg-accent text-foreground'
                     : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
@@ -226,22 +220,13 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
             );
           })}
         </div>
-        <Tooltip content="Minimize" side="bottom">
+        <Tooltip content="Collapse panel" side="bottom">
           <button
             type="button"
             onClick={minimizePanel}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="titlebar-no-drag flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <ChevronsRightIcon className="h-4 w-4" />
-          </button>
-        </Tooltip>
-        <Tooltip content="Close" side="bottom">
-          <button
-            type="button"
-            onClick={closePanel}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            <XIcon className="h-4 w-4" />
           </button>
         </Tooltip>
       </div>
