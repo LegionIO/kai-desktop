@@ -13,8 +13,8 @@ import { App } from './app.js';
  * async "Cleaning up…" → requestShutdown handshake actually completes before
  * the process exits (Ink's default Ctrl-C would kill us mid-handshake).
  */
-export async function startRepl(client: LocalBridgeClient): Promise<void> {
-  const instance = render(<App client={client} />, { exitOnCtrlC: false });
+export async function startRepl(client: LocalBridgeClient, recover?: () => Promise<boolean>): Promise<void> {
+  const instance = render(<App client={client} recover={recover} />, { exitOnCtrlC: false });
 
   let cleaningUp = false;
   const cleanup = async (): Promise<void> => {

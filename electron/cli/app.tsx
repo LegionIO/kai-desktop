@@ -82,7 +82,13 @@ function contentToText(content: unknown): string {
   return '';
 }
 
-export function App({ client }: { client: LocalBridgeClient }): React.ReactElement {
+export function App({
+  client,
+  recover,
+}: {
+  client: LocalBridgeClient;
+  recover?: () => Promise<boolean>;
+}): React.ReactElement {
   const { exit } = useApp();
   const { stdout } = useStdout();
 
@@ -303,15 +309,41 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
     });
 
     const offDisc = client.onDisconnect(() => {
-      setTurns((prev) => [...prev, { kind: 'error', text: 'backend disconnected' }]);
-      setTimeout(() => exit(), 100);
+      // Intentional close (our own /quit) → let the process exit normally.
+      if (client.wasIntentionalClose() || !recover) {
+        setTurns((prev) => [...prev, { kind: 'error', text: 'backend disconnected' }]);
+        setTimeout(() => exit(), 100);
+        return;
+      }
+      // Unexpected drop (leader crash) — try to recover the backend and resume.
+      setTurns((prev) => [
+        ...prev,
+        { kind: 'note', text: 'backend disconnected — reconnecting…', loading: true, id: 'reconnect' },
+      ]);
+      setStatus('idle'); // any in-flight turn is lost with the crashed leader
+      streamingRef.current = '';
+      void (async () => {
+        const ok = await recover();
+        if (!ok) {
+          setTurns((prev) => [...prev, { kind: 'error', text: 'could not reconnect — exiting' }]);
+          setTimeout(() => exit(), 100);
+          return;
+        }
+        // Re-assert the active conversation on the (possibly new) backend so
+        // subsequent turns and broadcasts target it. A freshly-spawned backend
+        // has no active id; a survivor keeps ours.
+        if (convIdRef.current) {
+          await client.invoke('conversations:set-active-id', convIdRef.current).catch(() => {});
+        }
+        resolveNote('reconnect', 'reconnected');
+      })();
     });
 
     return () => {
       off();
       offDisc();
     };
-  }, [client]);
+  }, [client, recover, exit, resolveNote]);
 
   // ── command + input handling ────────────────────────────────────────
   // Single-round-trip selection change. The backend patches only the selection

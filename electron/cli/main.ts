@@ -55,6 +55,23 @@ async function waitForSocket(socketPath: string, deadlineMs: number): Promise<Lo
   }
 }
 
+/**
+ * Recover from an unexpected backend disconnect (leader crash/force-quit):
+ * first try to reconnect to the socket (a surviving GUI/CLI leader may still be
+ * serving, or another survivor is re-electing/respawning). If nothing comes
+ * back within a short window, spawn a fresh headless backend ourselves and
+ * reconnect. Returns true if the same client object is live again. Preserves
+ * the client's event subscriptions so the TUI continues seamlessly.
+ */
+async function recoverBackend(client: LocalBridgeClient): Promise<boolean> {
+  // Give a survivor a chance to keep/relaunch the socket first.
+  if (await client.reconnect(6000)) return true;
+  // No backend came back — become the leader ourselves.
+  log('backend gone — starting a new headless one…');
+  if (!spawnHeadlessLeader()) return false;
+  return client.reconnect(BOOT_TIMEOUT_MS);
+}
+
 async function main(): Promise<void> {
   const socketPath = getSocketPath();
 
@@ -84,7 +101,7 @@ async function main(): Promise<void> {
   // Interactive TTY → full Ink TUI. Non-TTY (piped/CI) → one-shot text mode,
   // since Ink's input needs raw mode (a real terminal).
   if (process.stdin.isTTY && process.stdout.isTTY) {
-    await startRepl(client);
+    await startRepl(client, () => recoverBackend(client));
     process.exit(0);
   } else {
     const { runHeadlessOnce } = await import('./headless-run.js');

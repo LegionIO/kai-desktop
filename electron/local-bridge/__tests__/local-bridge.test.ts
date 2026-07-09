@@ -88,4 +88,38 @@ describe('local bridge transport', () => {
 
     await expect(pending).rejects.toThrow(/connection closed/);
   });
+
+  it('reconnects to a backend that comes back, preserving event subscriptions', async () => {
+    client = new LocalBridgeClient(getSocketPath());
+    await client.connect();
+
+    const received: unknown[] = [];
+    client.on('agent:stream-event', (d) => received.push(d));
+
+    // Simulate a leader crash: stop the server out from under the client.
+    let dropped = false;
+    client.onDisconnect(() => (dropped = true));
+    await stopLocalServer();
+    await vi.waitFor(() => expect(dropped).toBe(true));
+
+    // A new backend comes up (survivor re-election / respawn).
+    await startLocalServer();
+    const ok = await client.reconnect(5000);
+    expect(ok).toBe(true);
+
+    // Subscriptions survive: an event on the new server reaches the same handler.
+    invokeHandlerMock.mockResolvedValue('pong-ish');
+    broadcastToLocalClients('agent:stream-event', { type: 'done', conversationId: 'c1' });
+    await vi.waitFor(() => expect(received.length).toBe(1));
+
+    // And invokes work again on the new connection.
+    await expect(client.invoke('conversations:list')).resolves.toBe('pong-ish');
+  });
+
+  it('does not flag intentional close as recoverable', async () => {
+    client = new LocalBridgeClient(getSocketPath());
+    await client.connect();
+    client.close();
+    expect(client.wasIntentionalClose()).toBe(true);
+  });
 });

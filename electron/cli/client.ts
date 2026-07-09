@@ -36,6 +36,7 @@ export class LocalBridgeClient {
   private connected = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private pongMissed = 0;
+  private intentionalClose = false; // set by close() so disconnect handlers can tell crash from quit
 
   constructor(private readonly socketPath: string) {}
 
@@ -58,6 +59,30 @@ export class LocalBridgeClient {
         resolve();
       });
     });
+  }
+
+  /**
+   * Re-establish the socket after an unexpected drop (leader crash), preserving
+   * event listeners so the caller's subscriptions survive. Retries connecting to
+   * the socket path until `deadlineMs` elapses (a survivor may be re-electing /
+   * respawning a backend). Returns true on success.
+   */
+  async reconnect(deadlineMs: number): Promise<boolean> {
+    const start = Date.now();
+    for (;;) {
+      try {
+        await this.connect();
+        return true;
+      } catch {
+        if (Date.now() - start > deadlineMs) return false;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  }
+
+  /** True if the last disconnect was caused by our own close(), not a drop. */
+  wasIntentionalClose(): boolean {
+    return this.intentionalClose;
   }
 
   private wire(socket: Socket): void {
@@ -250,6 +275,7 @@ export class LocalBridgeClient {
   }
 
   close(): void {
+    this.intentionalClose = true;
     try {
       this.socket?.destroy();
     } catch {
