@@ -95,7 +95,13 @@ import { initPluginBrowser } from './plugins/browser-window/index.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
-import { startLocalServer, stopLocalServer } from './local-bridge/local-server.js';
+import {
+  startLocalServer,
+  stopLocalServer,
+  disableIdleShutdown,
+  restartIdleShutdown,
+} from './local-bridge/local-server.js';
+import { localClients } from './local-bridge/local-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -131,15 +137,20 @@ const IS_HEADLESS = process.argv.includes('--kai-headless') || process.env.KAI_H
 // window — not the app, not a plugin (e.g. skynet's bridge-auth window). A
 // stray window would flash on screen AND, by counting in getAllWindows(), keep
 // the idle-shutdown heuristic from ever firing. Neutralize window display at
-// the source: patch BrowserWindow so any instance created headlessly is forced
-// hidden and destroyed on the next tick. Plugins that await a window simply
-// won't get a visible one (correct — there's no user to interact with it).
+// the source: patch BrowserWindow so any instance created while the block is
+// active is forced hidden and destroyed. The block is LIFTED when a headless
+// backend is promoted to windowed (a GUI launched against it — see
+// `promoteHeadlessToWindowed`), so the real app window can then appear.
+let headlessWindowBlockActive = IS_HEADLESS;
 if (IS_HEADLESS) {
   const proto = BrowserWindow.prototype as unknown as {
     show: () => void;
     showInactive: () => void;
     focus: () => void;
   };
+  const origShow = proto.show;
+  const origShowInactive = proto.showInactive;
+  const origFocus = proto.focus;
   const selfDestruct = function (this: BrowserWindow): void {
     try {
       if (!this.isDestroyed()) this.destroy();
@@ -147,14 +158,37 @@ if (IS_HEADLESS) {
       /* ignore */
     }
   };
-  proto.show = selfDestruct;
-  proto.showInactive = selfDestruct;
-  proto.focus = function (): void {
-    /* no-op: never steal focus headlessly */
+  proto.show = function (this: BrowserWindow): void {
+    if (headlessWindowBlockActive) selfDestruct.call(this);
+    else origShow.call(this);
+  };
+  proto.showInactive = function (this: BrowserWindow): void {
+    if (headlessWindowBlockActive) selfDestruct.call(this);
+    else origShowInactive.call(this);
+  };
+  proto.focus = function (this: BrowserWindow): void {
+    if (!headlessWindowBlockActive) origFocus.call(this);
+    // else no-op: never steal focus while headless
   };
 }
 
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
+
+/**
+ * Promote a headless (CLI-spawned) backend to a windowed GUI. Assigned inside
+ * `whenReady` (it needs getConfig/setConfig + the started local server in
+ * scope); a no-op until then. Fired from `second-instance` when a GUI launches
+ * against a running headless backend — the backend gains a window instead of
+ * the GUI launch silently failing the singleton lock.
+ */
+let promoteHeadlessToWindowed: () => Promise<void> = async () => {};
+
+/**
+ * Revert a windowed backend to a dockless headless background backend when its
+ * last GUI window closes but socket clients (CLIs) remain. Assigned in
+ * `whenReady`; a no-op until then. Fired from `window-all-closed`.
+ */
+let demoteWindowedToHeadlessRef: () => void = () => {};
 
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
 
@@ -763,7 +797,14 @@ app.commandLine.appendSwitch('enable-speech-dispatcher');
 
 if (gotSingleInstanceLock) {
   app.on('second-instance', () => {
-    focusPrimaryWindow();
+    // A second launch arrived. If we're a headless backend (started by the
+    // CLI), this is a GUI trying to open against us — promote to windowed so
+    // the app actually appears. Otherwise just focus the existing window.
+    if (IS_HEADLESS && headlessWindowBlockActive) {
+      void promoteHeadlessToWindowed();
+    } else {
+      focusPrimaryWindow();
+    }
   });
 
   app.whenReady().then(() => {
@@ -1214,6 +1255,65 @@ if (gotSingleInstanceLock) {
     })
       .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
       .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err));
+
+    // ── Headless ⇄ windowed transitions ──────────────────────────────────
+    // A single leader process can start headless (spawned by the CLI) and later
+    // gain/lose a GUI window as GUIs open/close, without ever tearing down the
+    // backend the CLIs depend on.
+    let guiInitialized = !IS_HEADLESS; // GUI-only subsystems already set up at boot?
+
+    const ensureGuiSubsystems = (): void => {
+      if (guiInitialized) return;
+      guiInitialized = true;
+      try {
+        initDictation(getConfig(), setConfig);
+        initAppShots(getConfig());
+      } catch (err) {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] GUI subsystem init on promotion failed (non-fatal):`, err);
+      }
+    };
+
+    promoteHeadlessToWindowed = async (): Promise<void> => {
+      if (!headlessWindowBlockActive) {
+        // Already windowed — just focus.
+        focusPrimaryWindow();
+        return;
+      }
+      console.info(`[${__BRAND_PRODUCT_NAME}] Promoting headless backend to windowed (GUI launched).`);
+      headlessWindowBlockActive = false; // allow windows to show again
+      disableIdleShutdown(); // a GUI now holds this backend; don't idle-exit
+      if (process.platform === 'darwin') {
+        // Return to a normal foreground app: regular activation policy lets an
+        // interactive window paint + focus (accessory apps can't foreground a
+        // standard window), and re-show the Dock icon.
+        app.setActivationPolicy?.('regular');
+        app.dock?.show();
+      }
+      ensureGuiSubsystems();
+      const win = createWindow();
+      win.once('ready-to-show', () => {
+        if (!win.isDestroyed()) {
+          win.show();
+          win.focus();
+        }
+      });
+    };
+
+    // Called from window-all-closed on macOS: if a GUI closes but socket clients
+    // (CLIs) remain, revert to a dockless background backend that idle-exits once
+    // the last client leaves — instead of lingering as a windowless dock app.
+    const demoteWindowedToHeadless = (): void => {
+      if (headlessWindowBlockActive) return; // already headless
+      console.info(`[${__BRAND_PRODUCT_NAME}] No windows left — reverting to headless background backend.`);
+      headlessWindowBlockActive = true;
+      if (process.platform === 'darwin') {
+        app.dock?.hide();
+        app.setActivationPolicy?.('accessory');
+      }
+      // Re-arm idle self-shutdown so the backend reaps once its last CLI leaves.
+      restartIdleShutdown();
+    };
+    demoteWindowedToHeadlessRef = demoteWindowedToHeadless;
 
     // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
     // getRegisteredTools for tool actions, and getConfig for rule reload).
@@ -1703,9 +1803,16 @@ if (gotSingleInstanceLock) {
 }
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
+  // If CLI/socket clients are still attached, don't quit — the backend they
+  // depend on lives here. Revert to a dockless headless background backend that
+  // will idle-exit once the last client disconnects.
+  if (localClients.size > 0) {
+    demoteWindowedToHeadlessRef();
+    return;
   }
+  // No windows and no clients: nothing to serve. Quit on every platform (a
+  // windowless, clientless GUI process has no reason to linger, even on macOS).
+  app.quit();
 });
 
 app.on('before-quit', () => {

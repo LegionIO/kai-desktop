@@ -247,6 +247,27 @@ export function startLocalServer(options: LocalServerOptions = {}): Promise<stri
   });
 }
 
+/**
+ * Turn off idle self-shutdown at runtime. Called when a headless backend is
+ * promoted to windowed (a GUI attached), so the backend now persists like a
+ * normal GUI leader instead of reaping itself when socket clients disconnect.
+ */
+export function disableIdleShutdown(): void {
+  idleShutdownEnabled = false;
+  cancelIdleTimer();
+}
+
+/**
+ * Re-arm idle self-shutdown at runtime. Called when a windowed backend is
+ * demoted back to headless (its last GUI window closed while CLIs remain): the
+ * backend should reap itself once the last socket client disconnects. Schedules
+ * an immediate idle check in case there are already no clients.
+ */
+export function restartIdleShutdown(): void {
+  idleShutdownEnabled = true;
+  maybeScheduleIdleShutdown();
+}
+
 export async function stopLocalServer(): Promise<void> {
   unregisterSink?.();
   unregisterSink = null;
