@@ -493,6 +493,29 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     return { ok: true, conversation: commitTreeUpdate(conv, tree, nextHead) };
   });
 
+  // Rewind the active branch back by N complete turns (default 1): move headId
+  // to the message before the Nth-from-last USER turn, undoing the most recent
+  // exchange(s). The shelved tail stays in the tree as a branch, so nothing is
+  // lost. Refused if the conversation has been compacted (summary nodes make
+  // "a turn" ambiguous and reviving pre-summary messages could double content).
+  ipcMain.handle('conversations:rewind', (_event, conversationId: string, steps = 1) => {
+    const conv = readConversation(appHome, conversationId);
+    if (!conv) return { ok: false, error: 'conversation-not-found' };
+    if (conv.conversationCompaction) return { ok: false, error: 'compacted' };
+
+    const { tree, headId } = ensureConversationTree(conv);
+    const branch = getConversationBranch(tree, headId);
+    // Indices of user turns along the active branch, oldest→newest.
+    const userIdx = branch.map((m, i) => (m.role === 'user' ? i : -1)).filter((i) => i >= 0);
+    if (userIdx.length === 0) return { ok: false, error: 'nothing-to-rewind' };
+
+    const target = Math.max(0, userIdx.length - Math.max(1, steps));
+    const cutIndex = userIdx[target]; // this user turn (and everything after) is removed from the active branch
+    const nextHead = cutIndex > 0 ? branch[cutIndex - 1].id : null;
+    const removed = branch.length - cutIndex;
+    return { ok: true, removed, conversation: commitTreeUpdate(conv, tree, nextHead) };
+  });
+
   ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };

@@ -118,6 +118,23 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
     setTurns((prev) => prev.map((t) => (t.kind === 'note' && t.id === id ? { ...t, text, loading: false } : t)));
   }, []);
 
+  // Reload the active branch's transcript from the store (used by /resume and
+  // /rewind). Shows `note` at the top, then replays each message as a turn.
+  const reloadTranscript = useCallback(
+    async (id: string, note: string) => {
+      const full = await client.invoke<{ messages?: unknown[] } | null>('conversations:get', id);
+      const replay: Turn[] = [];
+      for (const m of full?.messages ?? []) {
+        const msg = m as { role?: string; content?: unknown };
+        const text = contentToText(msg.content).trim();
+        if (text) replay.push({ kind: msg.role === 'user' ? 'user' : 'assistant', text });
+      }
+      setTurns([{ kind: 'note', text: note }, ...replay]);
+      setTools([]);
+    },
+    [client],
+  );
+
   // Fetch model/profile catalog items in a normalized {label,value} shape.
   // agent:model-catalog → { models: [{key, displayName}], defaultKey }
   // agent:profiles      → { profiles: [{key, name}], defaultKey }
@@ -334,7 +351,7 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
         case 'help':
           pushTurn({
             kind: 'note',
-            text: '/new  /resume  /model [name]  /profile [name]  /compact  /rewind  /clear  /quit',
+            text: '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear  /quit',
           });
           break;
         case 'new':
@@ -364,15 +381,7 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
                 unsavedRecordRef.current = null; // resuming a persisted chat — discard any unsaved draft
                 setConversationId(id);
                 await client.invoke('conversations:set-active-id', id);
-                const full = await client.invoke<ConversationRecord | null>('conversations:get', id);
-                const replay: Turn[] = [];
-                for (const m of full?.messages ?? []) {
-                  const msg = m as { role?: string; content?: unknown };
-                  const text = contentToText(msg.content).trim();
-                  if (text) replay.push({ kind: msg.role === 'user' ? 'user' : 'assistant', text });
-                }
-                setTurns([{ kind: 'note', text: `resumed ${id.slice(0, 8)}` }, ...replay]);
-                setTools([]);
+                await reloadTranscript(id, `resumed ${id.slice(0, 8)}`);
                 await refreshBanner();
               })();
             },
@@ -423,22 +432,64 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
           });
           break;
         }
-        case 'compact': {
-          const noteId = `n-${Date.now()}`;
-          pushLoadingNote(noteId, 'compacting…');
-          try {
-            await client.invoke('agent:compact', convIdRef.current);
-            resolveNote(noteId, 'compacted');
-          } catch (err) {
-            resolveNote(noteId, '');
-            pushTurn({ kind: 'error', text: `compact failed: ${err instanceof Error ? err.message : String(err)}` });
+        case 'compact':
+          pushTurn({ kind: 'note', text: '/compact not yet wired — coming soon' });
+          break;
+        case 'rewind':
+        case 'revert': {
+          if (unsavedRecordRef.current) {
+            pushTurn({ kind: 'note', text: 'nothing to rewind yet' });
+            break;
+          }
+          const steps = Math.max(1, parseInt(arg, 10) || 1);
+          const res = await client.invoke<{ ok?: boolean; error?: string; removed?: number }>(
+            'conversations:rewind',
+            convIdRef.current,
+            steps,
+          );
+          if (!res?.ok) {
+            pushTurn({
+              kind: 'note',
+              text:
+                res?.error === 'compacted'
+                  ? 'cannot rewind a compacted chat'
+                  : res?.error === 'nothing-to-rewind'
+                    ? 'nothing to rewind'
+                    : `rewind failed: ${res?.error ?? 'unknown'}`,
+            });
+            break;
+          }
+          // Reload the (now shorter) transcript.
+          await reloadTranscript(convIdRef.current, `rewound ${res.removed ?? 0} message(s)`);
+          // Offer to revert file edits from the undone turn(s), if any.
+          const diffs = (await client.invoke<unknown[]>('diffs:list', convIdRef.current)) ?? [];
+          if (diffs.length > 0) {
+            setPicker({
+              title: `Revert ${diffs.length} file edit(s) from the rewound turn(s)?`,
+              items: [
+                { label: 'Keep file changes', value: 'keep' },
+                { label: 'Revert file changes', value: 'revert' },
+              ],
+              onSelect: (v) => {
+                setPicker(null);
+                if (v === 'revert') {
+                  void client
+                    .invoke('diffs:revertAll', convIdRef.current)
+                    .then(() => pushTurn({ kind: 'note', text: 'file edits reverted' }))
+                    .catch((err) =>
+                      pushTurn({
+                        kind: 'error',
+                        text: `revert failed: ${(err as { message?: string })?.message ?? err}`,
+                      }),
+                    );
+                } else {
+                  pushTurn({ kind: 'note', text: 'kept file changes' });
+                }
+              },
+            });
           }
           break;
         }
-        case 'rewind':
-        case 'revert':
-          pushTurn({ kind: 'note', text: '/rewind not yet wired — coming soon' });
-          break;
         case 'quit':
         case 'exit':
           exit();
@@ -447,7 +498,18 @@ export function App({ client }: { client: LocalBridgeClient }): React.ReactEleme
           pushTurn({ kind: 'note', text: `unknown command /${cmd} — try /help` });
       }
     },
-    [client, createNew, pushTurn, exit, fetchCatalog, refreshBanner, applySelectionFast, pushLoadingNote, resolveNote],
+    [
+      client,
+      createNew,
+      pushTurn,
+      exit,
+      fetchCatalog,
+      refreshBanner,
+      applySelectionFast,
+      pushLoadingNote,
+      resolveNote,
+      reloadTranscript,
+    ],
   );
 
   const submit = useCallback(

@@ -3,7 +3,7 @@ import { Box, Text } from 'ink';
 import TextInput from 'ink-text-input';
 import Spinner from 'ink-spinner';
 
-const SLASH_COMMANDS = ['new', 'resume', 'model', 'profile', 'compact', 'rewind', 'clear', 'help', 'quit'];
+const SLASH_COMMANDS = ['new', 'resume', 'model', 'profile', 'rewind', 'clear', 'help', 'quit'];
 
 export function InputBox({
   status,
