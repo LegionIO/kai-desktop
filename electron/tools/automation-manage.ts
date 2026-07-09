@@ -227,8 +227,12 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!parsed.success) {
             return { error: 'Rule failed validation.', issues: parsed.error.issues };
           }
-          // A dangerous, live rule needs approval per automations.approvalMode.
-          if (parsed.data.enabled && isDangerousRule(parsed.data)) {
+          // Writing a dangerous rule (hook-triggered or runHookCommand) needs
+          // approval per automations.approvalMode — REGARDLESS of enabled state.
+          // A disabled rule is still unapproved shell/hook config the agent must
+          // not plant dormantly; enabling it later wouldn't retroactively gate
+          // the already-persisted config.
+          if (isDangerousRule(parsed.data)) {
             const gate = await ensureApproved(parsed.data, 'create', config.automations, context);
             if (!gate.ok) return { error: gate.error };
           }
@@ -262,10 +266,11 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!parsed.success) {
             return { error: 'Updated rule failed validation.', issues: parsed.error.issues };
           }
-          // Approval is needed if the RESULT is a dangerous live rule, or if we
-          // are editing an already-dangerous rule (so the agent can't quietly
-          // rewrite a user-configured shell/hook rule).
-          const needsApproval = (parsed.data.enabled && isDangerousRule(parsed.data)) || isDangerousRule(prev);
+          // Approval is needed if the RESULT is a dangerous rule (regardless of
+          // enabled state — a disabled dangerous rule is still unapproved config),
+          // or if we're editing an already-dangerous rule (so the agent can't
+          // quietly rewrite a user-configured shell/hook rule).
+          const needsApproval = isDangerousRule(parsed.data) || isDangerousRule(prev);
           if (needsApproval) {
             const gate = await ensureApproved(parsed.data, 'update', config.automations, context);
             if (!gate.ok) return { error: gate.error };

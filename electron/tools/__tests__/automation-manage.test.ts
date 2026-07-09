@@ -102,6 +102,13 @@ describe('automations tool approval gate', () => {
     expect(mockConfig.automations.rules).toHaveLength(0);
   });
 
+  it('block: refuses to create a DISABLED dangerous rule (no dormant-rule bypass)', async () => {
+    freshConfig('block');
+    const res = await run('create', { rule: { ...shellRule, enabled: false } });
+    expect(res.error).toMatch(/block/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
   it('prompt-user + approve: prompts then persists', async () => {
     freshConfig('prompt-user');
     approvalDecision = true;
