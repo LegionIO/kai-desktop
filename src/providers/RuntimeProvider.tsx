@@ -1846,25 +1846,30 @@ export function RuntimeProvider({
         } else if (e.automation) {
           // Automation streaming into a NON-active conversation: keep a background
           // accumulator so switching to it mid-run shows streamed-so-far content.
-          // Seed it from the persisted tree (which already has the user prompt)
-          // asynchronously; drop events until the seed resolves (the final
-          // assistant turn is persisted by the main process, so early dropped
-          // deltas are cosmetic).
+          // Seed SYNCHRONOUSLY (empty base) and fall through to process this same
+          // event — dropping early events truncated the first thoughts/text from
+          // the live view. Kick off an async disk fetch to backfill the persisted
+          // prefix (e.g. the user prompt turn) without discarding any deltas; the
+          // trailing automation `done` reloads the authoritative tree from disk.
+          streamAccumulators.set(convId, { messages: [], headId: null });
           if (!automationSeedInProgress.has(convId)) {
             automationSeedInProgress.add(convId);
             void app.conversations
               .get(convId)
               .then((conv) => {
                 const rec = conv as ConversationRecord | null;
-                if (rec && !streamAccumulators.has(convId)) {
+                const existingAcc = streamAccumulators.get(convId);
+                // Only backfill if the accumulator hasn't started collecting the
+                // assistant response yet (avoid clobbering live deltas).
+                if (rec && existingAcc && existingAcc.messages.length === 0) {
                   const { tree, headId } = ensureTree(rec);
-                  streamAccumulators.set(convId, { messages: [...tree], headId });
+                  existingAcc.messages = [...tree];
+                  existingAcc.headId = headId;
                 }
               })
               .catch(() => {})
               .finally(() => automationSeedInProgress.delete(convId));
           }
-          return;
         } else {
           // No accumulator for a non-active conversation — the stream already
           // completed and was persisted by the done/error handler.  Drop stale events.
