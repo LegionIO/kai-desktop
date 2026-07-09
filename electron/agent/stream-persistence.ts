@@ -95,7 +95,10 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent): v
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx !== undefined) {
         const part = acc.parts[idx] as ToolPart;
-        part.result = event.result;
+        // A direct `tool-error` carries `error` (not `result`); synthesize an
+        // error result so the payload isn't lost. `tool-result` uses `result`.
+        part.result =
+          event.type === 'tool-error' ? { isError: true, error: event.error ?? 'Tool execution failed' } : event.result;
         part.isError = event.type === 'tool-error' || undefined;
         part.durationMs = event.durationMs ?? part.durationMs;
       }

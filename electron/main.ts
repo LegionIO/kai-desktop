@@ -102,6 +102,7 @@ import {
   restartIdleShutdown,
 } from './local-bridge/local-server.js';
 import { localClients } from './local-bridge/local-clients.js';
+import { webClients } from './web-server/web-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -1264,12 +1265,12 @@ if (gotSingleInstanceLock) {
     // leader persists.
     startLocalServer({
       idleShutdown: IS_HEADLESS,
-      // In headless mode a window is never a legitimate reason to stay alive
-      // (there's no user; any window is an errant plugin/auth popup we also
-      // block above). Only real socket clients keep a headless backend up, so
-      // report no "other" clients. A windowed GUI leader doesn't enable
-      // idleShutdown at all, so this predicate is moot there.
-      hasOtherClients: () => false,
+      // What keeps a headless/demoted backend alive besides local CLI sockets:
+      // connected web-UI clients. (Windows don't count — a headless backend
+      // blocks/destroys them; a windowed GUI leader doesn't enable idleShutdown
+      // at all so this predicate is moot there.) A demoted GUI leader that was
+      // serving the web UI must not idle-exit while a browser is still attached.
+      hasOtherClients: () => webClients.size > 0,
       onIdleExit: () => {
         console.info(`[${__BRAND_PRODUCT_NAME}] Headless backend idle with no clients — shutting down.`);
         app.quit();
@@ -1873,10 +1874,10 @@ if (gotSingleInstanceLock) {
 }
 
 app.on('window-all-closed', () => {
-  // If CLI/socket clients are still attached, don't quit — the backend they
-  // depend on lives here. Revert to a dockless headless background backend that
-  // will idle-exit once the last client disconnects.
-  if (localClients.size > 0) {
+  // If CLI/socket clients OR web-UI clients are still attached, don't quit —
+  // the backend they depend on lives here. Revert to a dockless headless
+  // background backend that idle-exits once the last client disconnects.
+  if (localClients.size > 0 || webClients.size > 0) {
     demoteWindowedToHeadlessRef();
     return;
   }

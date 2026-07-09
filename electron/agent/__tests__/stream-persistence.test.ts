@@ -55,13 +55,15 @@ describe('stream persistence accumulator', () => {
     ]);
   });
 
-  it('flags tool errors with isError', () => {
+  it('flags tool errors with isError and preserves the error payload', () => {
     feed({ conversationId: 'c3', type: 'tool-call', toolCallId: 't1', toolName: 'run', args: {} });
     feed({ conversationId: 'c3', type: 'tool-error', toolCallId: 't1', error: 'boom' });
     feed({ conversationId: 'c3', type: 'done' });
 
     const [, , msgs] = appendMock.mock.calls[0];
-    expect((msgs[0].content[0] as { isError?: boolean }).isError).toBe(true);
+    const part = msgs[0].content[0] as { isError?: boolean; result?: { isError?: boolean; error?: string } };
+    expect(part.isError).toBe(true);
+    expect(part.result).toEqual({ isError: true, error: 'boom' });
   });
 
   it('does not persist an empty turn', () => {
