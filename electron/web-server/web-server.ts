@@ -362,6 +362,8 @@ export function getBridgeScript(): string {
       log: function() { return invoke('automations:log'); },
       test: function(ruleId, payload) { return invoke('automations:test', ruleId, payload); },
       emit: function(source, event, payload) { return invoke('automations:emit', source, event, payload); },
+      inFlight: function(conversationId) { return invoke('automations:in-flight', conversationId); },
+      abort: function(conversationId) { return invoke('automations:abort', conversationId); },
       onRun: function(cb) { return on('automations:run', cb); },
       onCatalogChanged: function(cb) { return on('automations:catalog-changed', cb); }
     },

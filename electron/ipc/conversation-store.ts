@@ -212,9 +212,9 @@ export function readAllConversations(appHome: string): ConversationRecord[] {
 
 /** Write one conversation file and update its index entry (single-file cost). */
 export function writeConversation(appHome: string, conv: ConversationRecord): void {
-  // Migrate BEFORE touching per-file state: otherwise a later readIndex() could
-  // run migration and overwrite the file we just wrote from the stale monolith.
-  migrateMonolithIfNeeded(appHome);
+  // Migrate BEFORE touching per-file state, and refuse to write if a legacy
+  // monolith is still un-migrated — a partial index would strand old chats.
+  assertMigratedBeforeWrite(appHome);
   ensureDirs(appHome);
   writeFileSync(conversationPath(appHome, conv.id), JSON.stringify(conv, null, 2), 'utf-8');
   const index = readIndex(appHome);
@@ -223,8 +223,9 @@ export function writeConversation(appHome: string, conv: ConversationRecord): vo
 }
 
 export function deleteConversation(appHome: string, id: string): void {
-  // Migrate first so a subsequent readIndex() can't recreate the file we delete.
-  migrateMonolithIfNeeded(appHome);
+  // Migrate first (and refuse if migration is pending) so a subsequent
+  // readIndex() can't recreate the file we delete or strand old chats.
+  assertMigratedBeforeWrite(appHome);
   try {
     const p = conversationPath(appHome, id);
     if (existsSync(p)) rmSync(p);
@@ -240,8 +241,8 @@ export function deleteConversation(appHome: string, id: string): void {
 }
 
 export function clearAllConversations(appHome: string): void {
-  // Migrate first so the monolith can't be re-split into files after we clear.
-  migrateMonolithIfNeeded(appHome);
+  // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
+  assertMigratedBeforeWrite(appHome);
   const dir = conversationsDir(appHome);
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
@@ -264,6 +265,8 @@ export function getActiveConversationId(appHome: string): string | null {
 }
 
 export function setActiveConversationId(appHome: string, id: string | null): void {
+  // Guard: writing the index before a pending migration would strand the monolith.
+  assertMigratedBeforeWrite(appHome);
   const index = readIndex(appHome);
   index.activeConversationId = id;
   writeIndex(appHome, index);
@@ -272,6 +275,26 @@ export function setActiveConversationId(appHome: string, id: string | null): voi
 // ── migration ────────────────────────────────────────────────────────────────
 
 let migrationChecked = false;
+
+/** True when a legacy monolith still exists AND no index has been written — i.e.
+ *  migration has not (yet) succeeded. A per-file WRITE while this holds would
+ *  create a partial index.json that permanently strands the un-migrated
+ *  conversations (future reads skip migration once index.json exists). */
+function monolithMigrationPending(appHome: string): boolean {
+  return existsSync(monolithPath(appHome)) && !existsSync(indexPath(appHome));
+}
+
+/** Run migration, then refuse to proceed with a mutation if a legacy monolith is
+ *  still un-migrated (migration failed). Called at the top of every write path. */
+function assertMigratedBeforeWrite(appHome: string): void {
+  migrateMonolithIfNeeded(appHome);
+  if (monolithMigrationPending(appHome)) {
+    throw new Error(
+      '[conversation-store] refusing to write: legacy conversations.json migration is pending/failed — ' +
+        'writing now would strand un-migrated conversations. Resolve the monolith first.',
+    );
+  }
+}
 
 /** Split the legacy monolith into per-conversation files + an index on first
  *  load. Idempotent (guarded by index.json existence + an in-process flag).

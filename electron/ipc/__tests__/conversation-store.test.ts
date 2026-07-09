@@ -193,4 +193,16 @@ describe('migration from the monolith', () => {
     expect(readConversation(appHome, 'c1')?.title).toBe('NEW');
     expect(readIndex(appHome).conversations.c1.title).toBe('NEW');
   });
+
+  it('refuses to write (no partial index) if migration is pending/failed', () => {
+    // A corrupt monolith makes migration fail. A write must then THROW rather
+    // than create index.json — a partial index would strand the old chats
+    // because future reads skip migration once index.json exists.
+    writeFileSync(join(appHome, 'data', 'conversations.json'), '{corrupt', 'utf-8');
+    __resetMigrationGuardForTests();
+    expect(() => writeConversation(appHome, makeConv('new'))).toThrow(/migration is pending/);
+    expect(existsSync(join(appHome, 'data', 'index.json'))).toBe(false);
+    // The monolith remains, so migration can be retried once corruption is fixed.
+    expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
+  });
 });

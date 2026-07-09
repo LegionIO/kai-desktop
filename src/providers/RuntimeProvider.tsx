@@ -1487,6 +1487,11 @@ export function RuntimeProvider({
             (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') &&
             !streamAccumulators.has(conv.id)
           ) {
+            // Don't clear a conversation that a main-process automation run is
+            // actively streaming into — its `running` status is real even though
+            // the renderer has no local accumulator yet (the stream may not have
+            // reached us before this mount-time cleanup).
+            if (await app.automations.inFlight(conv.id).catch(() => false)) continue;
             await patchConversation(conv.id, { runStatus: 'idle' });
           }
         }
