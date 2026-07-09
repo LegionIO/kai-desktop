@@ -203,22 +203,23 @@ const ProvidersContent: FC<SettingsProps> = ({ config, updateConfig }) => {
     const next = { ...providers };
     delete next[name];
     void writeProviders(next);
-    // Built-in providers are reconstructed by the config loader from llm.json/
-    // defaults, so removing the key isn't enough — record it in removedBuiltins
-    // so the loader skips it. Add Provider clears it from this list to restore.
-    if (BUILTIN_PROVIDER_NAMES.has(name)) {
+    const isBuiltin = BUILTIN_PROVIDER_NAMES.has(name);
+    if (isBuiltin) {
       const removed = ((config.models as { removedBuiltins?: string[] }).removedBuiltins ?? []).filter(
         (n) => n !== name,
       );
       void updateConfig('models.removedBuiltins', [...removed, name]);
     }
-    // Remove catalog entries that referenced the deleted provider so they
-    // don't linger as dead models (resolveModelCatalog silently skips them,
-    // which can make defaults/profiles fall through to another model).
+    // Prune catalog entries that referenced the deleted provider so they don't
+    // linger as dead models. For BUILT-INS, removedBuiltins already hides the
+    // provider and its catalog entries at the loader level — and writing
+    // models.catalog would sync to llm.json (persistAppModels), destructively
+    // nulling that provider's model slots so a later re-add can't restore them.
+    // So only rewrite the catalog for CUSTOM providers.
     const orphaned = catalog.filter((m) => m.provider === name);
     if (orphaned.length > 0) {
       const remaining = catalog.filter((m) => m.provider !== name);
-      void updateConfig('models.catalog', remaining);
+      if (!isBuiltin) void updateConfig('models.catalog', remaining);
       // If the current default model belonged to the deleted provider, point
       // it at a surviving model instead of letting it silently fall through
       // to whatever resolveStreamConfig picks first.
