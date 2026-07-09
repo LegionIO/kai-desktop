@@ -792,6 +792,14 @@ function createWindow(): BrowserWindow {
     if (primaryWindowRef === mainWindow) {
       primaryWindowRef = null;
     }
+    // The primary window is gone. If CLI/web clients still depend on this
+    // backend, demote to headless NOW rather than waiting on window-all-closed
+    // — which may never fire, because dictation keeps a hidden overlay window
+    // alive that counts in getAllWindows(). demoteWindowedToHeadless tears those
+    // GUI-only windows/services down.
+    if ((localClients.size > 0 || webClients.size > 0) && !headlessWindowBlockActive) {
+      demoteWindowedToHeadlessRef();
+    }
   });
 
   return mainWindow;
@@ -1363,13 +1371,29 @@ if (gotSingleInstanceLock) {
       });
     };
 
-    // Called from window-all-closed on macOS: if a GUI closes but socket clients
-    // (CLIs) remain, revert to a dockless background backend that idle-exits once
-    // the last client leaves — instead of lingering as a windowless dock app.
+    // Called when the primary GUI window closes (or from window-all-closed): if
+    // socket clients (CLIs) or web clients remain, revert to a dockless
+    // background backend that idle-exits once the last client leaves — instead
+    // of lingering as a dock app. Tearing down GUI-only services here is what
+    // actually makes it headless: dictation eagerly creates a HIDDEN overlay
+    // window, so without this a closed main window would leave that window alive
+    // (window-all-closed never fires) and hotkeys/overlays would keep running.
     const demoteWindowedToHeadless = (): void => {
       if (headlessWindowBlockActive) return; // already headless
-      console.info(`[${__BRAND_PRODUCT_NAME}] No windows left — reverting to headless background backend.`);
+      console.info(`[${__BRAND_PRODUCT_NAME}] No primary window — reverting to headless background backend.`);
       headlessWindowBlockActive = true;
+      // Suspend GUI-only subsystems (global hotkeys + hidden overlay/recorder
+      // windows). The web server stays up on purpose — it serves web clients and
+      // is counted by hasOtherClients() to keep the backend alive. Reset the
+      // init latch so a later promotion re-initializes these.
+      try {
+        cleanupDictation();
+        cleanupAppShots();
+        closeAllOverlayWindows();
+      } catch (err) {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] GUI subsystem teardown on demote failed (non-fatal):`, err);
+      }
+      guiInitialized = false;
       if (process.platform === 'darwin') {
         app.dock?.hide();
         app.setActivationPolicy?.('accessory');

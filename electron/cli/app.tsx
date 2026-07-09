@@ -16,6 +16,7 @@ type StreamEvent = {
   toolCallId?: string;
   toolName?: string;
   args?: unknown;
+  result?: unknown;
   error?: string;
   durationMs?: number;
   data?: unknown;
@@ -121,6 +122,11 @@ export function App({
   const streamingRef = useRef<string>(''); // in-progress assistant text
   const convIdRef = useRef<string>('');
   const unsavedRecordRef = useRef<Record<string, unknown> | null>(null); // new chat not yet persisted
+  // Messages typed while a turn is in flight are queued (FIFO) and flushed one
+  // at a time after each `done`, instead of aborting the live turn. A ref (not
+  // state) so the stream-event effect can read/flush without re-subscribing.
+  const queueRef = useRef<string[]>([]);
+  const sendMessageRef = useRef<(text: string) => void>(() => {});
 
   const pushTurn = useCallback((t: Turn) => setTurns((prev) => [...prev, t]), []);
 
@@ -306,14 +312,36 @@ export function App({
           break;
         case 'tool-call':
           if (e.toolCallId) {
-            setTools((prev) => [...prev, { id: e.toolCallId!, name: e.toolName ?? 'tool', status: 'running' }]);
+            // Upsert by id: the backend re-emits tool-call with the same id
+            // after PreToolUse hook sanitization, so appending would duplicate.
+            const id = e.toolCallId;
+            const name = e.toolName ?? 'tool';
+            setTools((prev) =>
+              prev.some((t) => t.id === id)
+                ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running' } : t))
+                : [...prev, { id, name, status: 'running' }],
+            );
           }
           break;
-        case 'tool-result':
+        case 'tool-result': {
+          // A tool-result can still be a failure — the runtime emits errors as
+          // tool-result with { isError: true } / { error }. Don't show success.
+          const res = e.result as { isError?: boolean; error?: string } | undefined;
+          const failed = !!res?.isError || typeof res?.error === 'string';
           setTools((prev) =>
-            prev.map((t) => (t.id === e.toolCallId ? { ...t, status: 'done', durationMs: e.durationMs } : t)),
+            prev.map((t) =>
+              t.id === e.toolCallId
+                ? {
+                    ...t,
+                    status: failed ? 'error' : 'done',
+                    durationMs: e.durationMs,
+                    ...(failed ? { error: res?.error ?? 'tool failed' } : {}),
+                  }
+                : t,
+            ),
           );
           break;
+        }
         case 'tool-error':
           setTools((prev) => prev.map((t) => (t.id === e.toolCallId ? { ...t, status: 'error', error: e.error } : t)));
           break;
@@ -365,10 +393,25 @@ export function App({
         case 'error':
           finalizeAssistant();
           setTurns((prev) => [...prev, { kind: 'error', text: e.error ?? 'unknown error' }]);
+          // The turn ended in error (no `done`). Flush the next queued message
+          // or go idle, so the queue doesn't wedge behind a failed turn.
+          if (queueRef.current.length > 0) {
+            const next = queueRef.current.shift() as string;
+            setTimeout(() => sendMessageRef.current(next), 0);
+          } else {
+            setStatus('idle');
+          }
           break;
         case 'done':
           finalizeAssistant();
-          setStatus('idle');
+          // Flush the next queued message (if any) as the next turn; otherwise
+          // go idle. Deferred a tick so state settles before the next submit.
+          if (queueRef.current.length > 0) {
+            const next = queueRef.current.shift() as string;
+            setTimeout(() => sendMessageRef.current(next), 0);
+          } else {
+            setStatus('idle');
+          }
           break;
       }
     });
@@ -613,15 +656,8 @@ export function App({
     ],
   );
 
-  const submit = useCallback(
-    (input: string) => {
-      const trimmed = input.trim();
-      if (!trimmed) return;
-      if (trimmed.startsWith('/')) {
-        const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
-        void runCommand(cmd, rest.join(' '));
-        return;
-      }
+  const sendMessage = useCallback(
+    (trimmed: string) => {
       pushTurn({ kind: 'user', text: trimmed });
       setStatus('running');
       streamingRef.current = '';
@@ -644,7 +680,31 @@ export function App({
         }
       })();
     },
-    [client, runCommand, pushTurn],
+    [client, pushTurn],
+  );
+  // Keep a ref so the stream-event effect (which doesn't depend on sendMessage)
+  // can flush the queue on `done` without re-subscribing.
+  sendMessageRef.current = sendMessage;
+
+  const submit = useCallback(
+    (input: string) => {
+      const trimmed = input.trim();
+      if (!trimmed) return;
+      if (trimmed.startsWith('/')) {
+        const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
+        void runCommand(cmd, rest.join(' '));
+        return;
+      }
+      // A turn is in flight — queue this message instead of aborting it. It's
+      // flushed after the current turn's `done` (see the stream-event effect).
+      if (status === 'running' || status === 'awaiting-approval') {
+        queueRef.current.push(trimmed);
+        pushTurn({ kind: 'note', text: `queued: ${trimmed}` });
+        return;
+      }
+      sendMessage(trimmed);
+    },
+    [status, runCommand, pushTurn, sendMessage],
   );
 
   const cols = stdout?.columns ?? 80;
