@@ -176,10 +176,28 @@ const activeStreamModelKeys = new Map<string, string>();
 // the assistant reply itself (the `kai` CLI via agent:submit). For these, the
 // main process accumulates the stream and writes the assistant turn on `done`.
 // The GUI renderer still owns persistence for turns it starts via agent:stream,
+// Conversations whose current turn was started by a client that does NOT persist
+// the assistant reply itself (the `kai` CLI via agent:submit). For these, the
+// main process accumulates the stream and writes the assistant turn on `done`.
+// The GUI renderer still owns persistence for turns it starts via agent:stream,
 // so we don't double-write. `serverPersistAppHome` is captured at handler
 // registration so the free `broadcastStreamEvent` can reach the store path.
-const serverPersistConversations = new Set<string>();
+//
+// Ownership is STREAM-TOKEN-scoped, not just conversation-scoped: a superseded
+// CLI run's late `done` (or a mix of CLI + GUI turns on one conversation) must
+// not mis-tag or clear the replacement run. `pendingServerPersist` is set by
+// agent:submit; streamHandler promotes it to `serverPersistTokens[convId] =
+// thisRunToken` once it mints the token. broadcastStreamEvent only acts when
+// the conversation's CURRENT active stream token matches the persist owner.
+const pendingServerPersist = new Set<string>();
+const serverPersistTokens = new Map<string, string>();
 let serverPersistAppHome: string | null = null;
+
+/** True if the given conversation's active stream is the server-persist owner. */
+function isServerPersistOwner(conversationId: string, activeToken: string | undefined): boolean {
+  const owner = serverPersistTokens.get(conversationId);
+  return owner !== undefined && owner === activeToken;
+}
 
 function broadcastStreamEvent(event: StreamEvent): void {
   let eventToBroadcast = event;
@@ -219,17 +237,21 @@ function broadcastStreamEvent(event: StreamEvent): void {
 
   // Server-side persistence for client-driven turns (CLI). Accumulate the
   // stream and write the assistant reply on `done` so it survives without a
-  // renderer. Only for conversations flagged by agent:submit — GUI turns
-  // (agent:stream) are persisted by the renderer, so this avoids double-writes.
-  // Tag the broadcast `serverPersisted` so a GUI viewing the SAME conversation
-  // renders live but skips its own persistence (main owns the write here).
-  if (event.conversationId && serverPersistConversations.has(event.conversationId)) {
-    eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
-    if (serverPersistAppHome) {
-      accumulateForPersistence(serverPersistAppHome, event);
-      if (event.type === 'done') {
-        serverPersistConversations.delete(event.conversationId);
-        void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+  // renderer. Only when THIS conversation's active stream is the server-persist
+  // owner (token match) — GUI turns (agent:stream) are persisted by the
+  // renderer, and a superseded CLI run's stale events are ignored. Tag the
+  // broadcast `serverPersisted` so a GUI viewing the SAME conversation renders
+  // live but skips its own persistence (main owns the write here).
+  if (event.conversationId) {
+    const activeToken = activeStreams.get(event.conversationId)?.token;
+    if (isServerPersistOwner(event.conversationId, activeToken)) {
+      eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
+      if (serverPersistAppHome) {
+        accumulateForPersistence(serverPersistAppHome, event);
+        if (event.type === 'done') {
+          serverPersistTokens.delete(event.conversationId);
+          void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+        }
       }
     }
   }
@@ -527,6 +549,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
+    // If agent:submit flagged this turn for server-side persistence, bind that
+    // ownership to THIS run's token (so a later superseding run doesn't inherit
+    // or clobber it). Consume the one-shot pending marker.
+    if (pendingServerPersist.delete(conversationId)) {
+      serverPersistTokens.set(conversationId, streamToken);
+    } else {
+      // A GUI (agent:stream) turn superseding a CLI turn: the new run is NOT
+      // server-persisted, so drop any stale ownership for this conversation.
+      serverPersistTokens.delete(conversationId);
+    }
     const randomBytes = new Uint8Array(4);
     crypto.getRandomValues(randomBytes);
     const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
@@ -2161,8 +2193,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const branch = getConversationBranch(tree, headId);
 
       // Flag this turn for server-side assistant persistence — the CLI/headless
-      // client won't write the reply itself.
-      serverPersistConversations.add(conversationId);
+      // client won't write the reply itself. streamHandler binds this to the
+      // run's token so a later superseding run can't inherit it.
+      pendingServerPersist.add(conversationId);
 
       await streamHandler(
         event,
@@ -2189,8 +2222,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       activeStreamModelKeys.delete(conversationId);
     }
     activeObserverSessions.delete(conversationId);
-    // Drop any server-side persistence accumulation for a cancelled turn.
-    if (serverPersistConversations.delete(conversationId)) {
+    // Drop any server-side persistence accumulation + ownership for a cancelled turn.
+    pendingServerPersist.delete(conversationId);
+    if (serverPersistTokens.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }
     return { ok: true };

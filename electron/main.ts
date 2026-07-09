@@ -814,14 +814,19 @@ app.commandLine.appendSwitch('enable-speech-api');
 app.commandLine.appendSwitch('enable-speech-dispatcher');
 
 if (gotSingleInstanceLock) {
-  app.on('second-instance', () => {
-    // A second launch arrived. If this process is currently a dockless
-    // (headless/demoted) backend, a GUI is trying to open against us — promote
-    // to windowed so the app appears. Gate on the RUNTIME window-block state,
-    // not the immutable IS_HEADLESS, so a GUI leader that demoted after its
-    // windows closed still re-promotes correctly. If promotion isn't wired yet
-    // (second-instance can arrive before whenReady assigns it), remember it and
-    // drain once ready.
+  app.on('second-instance', (_event, argv) => {
+    // A second launch arrived. Ignore duplicate BACKEND/CLI launches (e.g. two
+    // CLIs racing to spawn a headless backend, or a CLI client attaching) —
+    // only a real GUI launch should promote a dockless backend to windowed.
+    if (argv.includes('--kai-headless') || argv.includes('--kai-cli')) {
+      return;
+    }
+    // If this process is currently a dockless (headless/demoted) backend, a GUI
+    // is trying to open against us — promote to windowed. Gate on the RUNTIME
+    // window-block state, not the immutable IS_HEADLESS, so a GUI leader that
+    // demoted after its windows closed still re-promotes. If promotion isn't
+    // wired yet (second-instance can arrive before whenReady assigns it),
+    // remember it and drain once ready.
     if (headlessWindowBlockActive) {
       if (promoteReady) void promoteHeadlessToWindowed();
       else pendingPromote = true;
@@ -1277,7 +1282,17 @@ if (gotSingleInstanceLock) {
       },
     })
       .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
-      .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err));
+      .catch((err) => {
+        console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err);
+        // A headless backend with no reachable socket is useless AND would hold
+        // the singleton lock forever, blocking every future CLI/GUI launch. Exit
+        // so the next launch can take over. A windowed GUI leader keeps running
+        // (the socket is a bonus there, not its reason to exist).
+        if (IS_HEADLESS) {
+          app.quit();
+          setTimeout(() => app.exit(1), 2000).unref();
+        }
+      });
 
     // ── Headless ⇄ windowed transitions ──────────────────────────────────
     // A single leader process can start headless (spawned by the CLI) and later

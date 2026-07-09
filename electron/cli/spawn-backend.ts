@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { existsSync } from 'fs';
 import { tryConnect, type LocalBridgeClient } from './client.js';
 
@@ -32,9 +32,13 @@ export function spawnHeadlessBackend(fromElectron: boolean): boolean {
     return true;
   }
 
-  // Dev: locate node_modules/.bin/electron + the built main bundle.
-  const root = join(import.meta.dirname, '..', '..');
-  const mainBundle = join(root, 'out', 'main', 'index.js');
+  // Dev: locate the built main bundle + node_modules/.bin/electron. Resolve
+  // from the CLI ENTRY path (process.argv[1] = .../out/main/cli.js), NOT
+  // import.meta.dirname — bundling emits shared code into out/main/chunks/, so
+  // import.meta.dirname would point there and mis-resolve the paths.
+  const entryDir = dirname(process.argv[1] ?? ''); // .../out/main
+  const mainBundle = join(entryDir, 'index.js'); // sibling of cli.js
+  const root = join(entryDir, '..', '..'); // repo root (out/main → up 2)
   const electron =
     process.platform === 'win32'
       ? join(root, 'node_modules', '.bin', 'electron.cmd')
