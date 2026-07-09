@@ -7,7 +7,13 @@ import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
-import { readConversationStore } from './conversations.js';
+import {
+  readConversationStore,
+  writeConversationStore,
+  broadcastConversationChange,
+  ensureConversationTree,
+  getConversationBranch,
+} from './conversations.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import {
@@ -83,6 +89,82 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
 }
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
+
+/** Extract the plain text of the LAST user message from a flat message list. */
+function extractLastUserText(messages: unknown[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: unknown; content?: unknown } | null;
+    if (!m || typeof m !== 'object' || m.role !== 'user') continue;
+    const c = m.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) {
+      return c
+        .filter((p): p is { type?: string; text?: unknown } => !!p && typeof p === 'object')
+        .filter((p) => p.type === 'text' || typeof p.text === 'string')
+        .map((p) => (typeof p.text === 'string' ? p.text : ''))
+        .join('\n');
+    }
+    return '';
+  }
+  return null;
+}
+
+/**
+ * Persist a UserPromptSubmit modify-hook redaction back to the stored
+ * conversation. The renderer appended + persisted the ORIGINAL user turn before
+ * agent:stream ran, so a DLP redaction that only altered the model-facing
+ * `messages` would otherwise leave the raw prompt visible/exportable in local
+ * history. Rewrite the text of the last user turn on the active branch.
+ */
+function persistRedactedUserTurn(appHome: string, conversationId: string, sanitizedText: string): void {
+  try {
+    const store = readConversationStore(appHome);
+    const conv = store.conversations?.[conversationId];
+    if (!conv) return;
+    const { tree, headId } = ensureConversationTree(conv);
+    const branch = getConversationBranch(tree, headId);
+    // Find the last user node on the active branch.
+    let target: (typeof branch)[number] | undefined;
+    for (let i = branch.length - 1; i >= 0; i--) {
+      if (branch[i].role === 'user') {
+        target = branch[i];
+        break;
+      }
+    }
+    if (!target) return;
+    // Rewrite the node's text content to the sanitized text, preserving any
+    // non-text parts (e.g. images) so a text-only redaction doesn't drop them.
+    const node = tree.find((m) => m.id === target!.id);
+    if (!node) return;
+    const content = node.content as unknown;
+    if (Array.isArray(content)) {
+      const parts = content as Array<{ type?: string; text?: string }>;
+      let replaced = false;
+      const nextParts = parts.map((p) => {
+        if (p && typeof p === 'object' && (p.type === 'text' || typeof p.text === 'string')) {
+          if (!replaced) {
+            replaced = true;
+            return { ...p, text: sanitizedText };
+          }
+          // Drop any further text parts — their content was folded into the
+          // single sanitized string.
+          return null;
+        }
+        return p;
+      });
+      node.content = (
+        replaced ? nextParts.filter((p) => p !== null) : [{ type: 'text', text: sanitizedText }]
+      ) as never;
+    } else {
+      node.content = sanitizedText as never;
+    }
+    conv.messageTree = tree as never;
+    writeConversationStore(appHome, store);
+    broadcastConversationChange(store);
+  } catch (err) {
+    console.warn('[Agent] Failed to persist redacted user turn:', err);
+  }
+}
 
 // Pending tool approval promises — shared with the Claude Agent SDK MCP bridge
 import { pendingToolApprovals } from './tool-approval.js';
@@ -471,7 +553,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           messages?: unknown[];
           systemPrompt?: string;
         };
-        if (Array.isArray(next?.messages)) messages = stripDisplayOnlyParts(next.messages);
+        if (Array.isArray(next?.messages)) {
+          // Capture the last user message BEFORE and AFTER the modify hook so we
+          // can persist a redaction back to the stored conversation (the renderer
+          // already persisted the ORIGINAL user turn before agent:stream ran, so
+          // without this a DLP-redacted prompt would stay visible/exportable in
+          // local history).
+          const lastUserBefore = extractLastUserText(messages);
+          messages = stripDisplayOnlyParts(next.messages);
+          const lastUserAfter = extractLastUserText(messages);
+          if (lastUserAfter !== null && lastUserAfter !== lastUserBefore) {
+            persistRedactedUserTurn(appHome, conversationId, lastUserAfter);
+          }
+        }
         if (typeof next?.systemPrompt === 'string') {
           effectiveSystemPrompt = next.systemPrompt;
           if (streamConfig) streamConfig = { ...streamConfig, systemPrompt: effectiveSystemPrompt };
