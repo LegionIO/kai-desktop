@@ -2754,41 +2754,21 @@ export function RuntimeProvider({
   );
 
   // Sub-agent actions
-  const sendSubAgentMessage = useCallback(
-    async (subAgentConversationId: string, text: string) => {
-      // For RUNNING sub-agents (accumulator exists): add locally for instant UI display.
-      // The backend won't broadcast a sub-agent-user-message event for queue-sourced follow-ups.
-      // For COMPLETED sub-agents (no accumulator): DON'T add locally.
-      // The backend's resumeSubAgent will broadcast a sub-agent-user-message event.
-      const saAcc = globalSubAgentAccumulators.get(subAgentConversationId);
-      if (saAcc) {
-        const userMsg: StoredMessage = {
-          id: msgId(),
-          parentId: saAcc.headId,
-          role: 'user',
-          content: toStoredContent([{ type: 'text', text }]),
-          createdAt: new Date(),
-        };
-        saAcc.messages.push(userMsg);
-        saAcc.headId = userMsg.id;
-        const existing = globalSubAgentThreads.get(subAgentConversationId);
-        if (existing) {
-          globalSubAgentThreads.set(subAgentConversationId, {
-            ...existing,
-            messages: [...saAcc.messages],
-            headId: saAcc.headId,
-          });
-        }
-        bumpSubAgentVersion();
-      }
-      try {
-        await app.agent.sendSubAgentMessage(subAgentConversationId, text);
-      } catch (err) {
-        console.error('[Runtime] Sub-agent message failed:', err);
-      }
-    },
-    [bumpSubAgentVersion],
-  );
+  const sendSubAgentMessage = useCallback(async (subAgentConversationId: string, text: string) => {
+    // Do NOT optimistically insert the raw follow-up. The backend runner gates
+    // every follow-up through UserPromptSubmit and then broadcasts a
+    // sub-agent-user-message with the (possibly redacted) text — for both
+    // running (queue-sourced) and completed (resume) sub-agents. Inserting the
+    // raw text here would leave it visible even when a DLP hook redacts it (the
+    // renderer only dedupes identical text, so a redacted broadcast appends a
+    // second message rather than replacing the raw one). The gated broadcast is
+    // the single source of truth.
+    try {
+      await app.agent.sendSubAgentMessage(subAgentConversationId, text);
+    } catch (err) {
+      console.error('[Runtime] Sub-agent message failed:', err);
+    }
+  }, []);
 
   const stopSubAgentAction = useCallback(
     async (subAgentConversationId: string) => {
