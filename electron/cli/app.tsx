@@ -127,6 +127,14 @@ export function App({
   // state) so the stream-event effect can read/flush without re-subscribing.
   const queueRef = useRef<string[]>([]);
   const sendMessageRef = useRef<(text: string) => void>(() => {});
+  // Guards double-draining the queue: the backend can emit `error` THEN `done`
+  // for the same turn. Only the first terminal event of a turn drains one
+  // queued message. Reset when a new turn starts (sendMessage).
+  const turnSettledRef = useRef<boolean>(false);
+  // Mirror of `status` for reads inside callbacks that must not re-create on
+  // every status change (runCommand). Kept in sync below.
+  const statusRef = useRef<'idle' | 'running' | 'awaiting-approval'>('idle');
+  statusRef.current = status;
 
   const pushTurn = useCallback((t: Turn) => setTurns((prev) => [...prev, t]), []);
 
@@ -299,6 +307,20 @@ export function App({
       if (text.trim()) setTurns((prev) => [...prev, { kind: 'assistant', text }]);
     };
 
+    // Terminal handler for a turn (done OR error). Coalesced via turnSettledRef
+    // so an `error`+`done` pair for the same turn drains the queue only once.
+    // Flushes the next queued message as the next turn, else goes idle.
+    const settleTurn = (): void => {
+      if (turnSettledRef.current) return;
+      turnSettledRef.current = true;
+      if (queueRef.current.length > 0) {
+        const next = queueRef.current.shift() as string;
+        setTimeout(() => sendMessageRef.current(next), 0);
+      } else {
+        setStatus('idle');
+      }
+    };
+
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
       if (!e || e.conversationId !== convIdRef.current) return;
@@ -393,25 +415,11 @@ export function App({
         case 'error':
           finalizeAssistant();
           setTurns((prev) => [...prev, { kind: 'error', text: e.error ?? 'unknown error' }]);
-          // The turn ended in error (no `done`). Flush the next queued message
-          // or go idle, so the queue doesn't wedge behind a failed turn.
-          if (queueRef.current.length > 0) {
-            const next = queueRef.current.shift() as string;
-            setTimeout(() => sendMessageRef.current(next), 0);
-          } else {
-            setStatus('idle');
-          }
+          settleTurn();
           break;
         case 'done':
           finalizeAssistant();
-          // Flush the next queued message (if any) as the next turn; otherwise
-          // go idle. Deferred a tick so state settles before the next submit.
-          if (queueRef.current.length > 0) {
-            const next = queueRef.current.shift() as string;
-            setTimeout(() => sendMessageRef.current(next), 0);
-          } else {
-            setStatus('idle');
-          }
+          settleTurn();
           break;
       }
     });
@@ -495,6 +503,13 @@ export function App({
           });
           break;
         case 'new':
+          // Switching conversations mid-turn would orphan the in-flight stream
+          // (its terminal `done` arrives for the OLD id and is dropped, wedging
+          // status at 'running'). Refuse while busy.
+          if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+            pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
+            break;
+          }
           await createNew();
           break;
         case 'clear':
@@ -502,6 +517,10 @@ export function App({
           setTools([]);
           break;
         case 'resume': {
+          if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+            pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
+            break;
+          }
           const list = (await client.invoke<ConversationRecord[]>('conversations:list')) ?? [];
           const here = list.filter((c) => c.currentWorkingDirectory === CWD);
           if (here.length === 0) {
@@ -661,6 +680,7 @@ export function App({
       pushTurn({ kind: 'user', text: trimmed });
       setStatus('running');
       streamingRef.current = '';
+      turnSettledRef.current = false; // new turn — arm the terminal-event guard
       void (async () => {
         try {
           // Persist a lazily-created chat on its first message (see createNew).

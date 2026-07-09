@@ -213,6 +213,14 @@ let pendingPromote = false;
  */
 let demoteWindowedToHeadlessRef: () => void = () => {};
 
+// Monotonic: true once this process has ever presented a GUI window — set at
+// boot for a normal GUI launch, and on promotion for a CLI-spawned headless
+// backend. Gates the web-server config hot-reload so a PURE headless backend
+// (never windowed) can't be made to expose its network port via a config:set
+// over the local bridge. A demoted-after-GUI backend keeps this true (it was
+// already exposed as a GUI), so config-driven restarts still apply there.
+let hasEverBeenWindowed = !IS_HEADLESS;
+
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
 
 function formatMainProcessError(error: unknown): string {
@@ -995,7 +1003,13 @@ if (gotSingleInstanceLock) {
         webServerDebounce = setTimeout(() => {
           webServerDebounce = null;
           const wsConfig = config.webServer;
-          if (wsConfig?.enabled) {
+          // Never START the web server for a pure headless backend that has not
+          // been windowed — the port is a GUI-app feature, and a config:set over
+          // the local bridge must not be able to expose it before promotion.
+          // Promotion (promoteHeadlessToWindowed) starts it per config instead.
+          if (wsConfig?.enabled && !hasEverBeenWindowed) {
+            console.info(`[${__BRAND_PRODUCT_NAME}] Ignoring web-server enable for a non-windowed headless backend.`);
+          } else if (wsConfig?.enabled) {
             restartWebServer(wsConfig)
               .then(() =>
                 console.info(
@@ -1340,6 +1354,7 @@ if (gotSingleInstanceLock) {
       }
       console.info(`[${__BRAND_PRODUCT_NAME}] Promoting headless backend to windowed (GUI launched).`);
       headlessWindowBlockActive = false; // allow windows to show again
+      hasEverBeenWindowed = true; // GUI now present — web-server hot-reload may apply
       disableIdleShutdown(); // a GUI now holds this backend; don't idle-exit
       if (process.platform === 'darwin') {
         // Return to a normal foreground app: regular activation policy lets an
