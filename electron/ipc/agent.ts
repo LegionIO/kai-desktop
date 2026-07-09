@@ -109,21 +109,32 @@ function extractLastUserText(messages: unknown[]): string | null {
   return null;
 }
 
+/** The last user message object from a flat message list, or null. */
+function lastUserMessage(messages: unknown[]): { role?: unknown; content?: unknown } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: unknown; content?: unknown } | null;
+    if (m && typeof m === 'object' && m.role === 'user') return m;
+  }
+  return null;
+}
+
 /**
- * Persist a UserPromptSubmit modify-hook redaction back to the stored
- * conversation. The renderer appended + persisted the ORIGINAL user turn before
- * agent:stream ran, so a DLP redaction that only altered the model-facing
- * `messages` would otherwise leave the raw prompt visible/exportable in local
- * history. Rewrite the text of the last user turn on the active branch.
+ * Persist a UserPromptSubmit redaction/denial back to the stored conversation.
+ * The renderer appended + persisted the ORIGINAL user turn before agent:stream
+ * ran, so a DLP change that only altered the model-facing `messages` (or a deny
+ * that never reached the model) would otherwise leave the raw prompt visible/
+ * exportable in local history. Replace the last user turn's content WHOLESALE
+ * with `sanitizedContent` (covering removed attachments/non-text parts, not just
+ * text) and flag it so conversations:put preserves it against a stale raw
+ * same-id rewrite from the stream-done handler.
  */
-function persistRedactedUserTurn(appHome: string, conversationId: string, sanitizedText: string): void {
+function persistRedactedUserTurn(appHome: string, conversationId: string, sanitizedContent: unknown): void {
   try {
     const store = readConversationStore(appHome);
     const conv = store.conversations?.[conversationId];
     if (!conv) return;
     const { tree, headId } = ensureConversationTree(conv);
     const branch = getConversationBranch(tree, headId);
-    // Find the last user node on the active branch.
     let target: (typeof branch)[number] | undefined;
     for (let i = branch.length - 1; i >= 0; i--) {
       if (branch[i].role === 'user') {
@@ -132,38 +143,19 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
       }
     }
     if (!target) return;
-    // Rewrite the node's text content to the sanitized text, preserving any
-    // non-text parts (e.g. images) so a text-only redaction doesn't drop them.
     const node = tree.find((m) => m.id === target!.id);
     if (!node) return;
-    const content = node.content as unknown;
-    if (Array.isArray(content)) {
-      const parts = content as Array<{ type?: string; text?: string }>;
-      let replaced = false;
-      const nextParts = parts.map((p) => {
-        if (p && typeof p === 'object' && (p.type === 'text' || typeof p.text === 'string')) {
-          if (!replaced) {
-            replaced = true;
-            return { ...p, text: sanitizedText };
-          }
-          // Drop any further text parts — their content was folded into the
-          // single sanitized string.
-          return null;
-        }
-        return p;
-      });
-      node.content = (
-        replaced ? nextParts.filter((p) => p !== null) : [{ type: 'text', text: sanitizedText }]
-      ) as never;
-    } else {
-      node.content = sanitizedText as never;
-    }
-    // Mark the node server-authoritative so conversations:put preserves this
-    // redacted content when the renderer's stream-done write arrives with the
-    // same id but the RAW user text (the merge otherwise takes incoming's
-    // version of shared ids, re-persisting the unredacted prompt).
+    // Replace the whole content with the sanitized payload so removed non-text
+    // parts (attachments/files) are dropped too. Normalize a string to a text
+    // part for consistency with the renderer's content-part shape.
+    node.content = (
+      typeof sanitizedContent === 'string' ? [{ type: 'text', text: sanitizedContent }] : sanitizedContent
+    ) as never;
     (node as unknown as { redactedByHook?: boolean }).redactedByHook = true;
     conv.messageTree = tree as never;
+    // Recompute the flat `messages` mirror of the active branch so exports/list
+    // reflect the redaction immediately.
+    conv.messages = getConversationBranch(tree, headId) as never;
     writeConversationStore(appHome, store);
     broadcastConversationChange(store);
   } catch (err) {
@@ -543,6 +535,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (promptDispatch.denied) {
           // Guard against a stale denial after cancel/restart (see plugin branch).
           if (activeStreams.get(conversationId)?.token === streamToken) {
+            // The renderer already persisted the raw user turn — a deny stops the
+            // model call but must ALSO scrub the sensitive prompt from local
+            // history/exports. Replace it with a policy placeholder.
+            persistRedactedUserTurn(appHome, conversationId, '[blocked by a policy hook]');
             broadcastStreamEvent({
               conversationId,
               type: 'error',
@@ -559,16 +555,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           systemPrompt?: string;
         };
         if (Array.isArray(next?.messages)) {
-          // Capture the last user message BEFORE and AFTER the modify hook so we
-          // can persist a redaction back to the stored conversation (the renderer
-          // already persisted the ORIGINAL user turn before agent:stream ran, so
-          // without this a DLP-redacted prompt would stay visible/exportable in
-          // local history).
-          const lastUserBefore = extractLastUserText(messages);
+          // A modify hook may rewrite/remove the last user turn's content. The
+          // renderer already persisted the ORIGINAL turn before agent:stream ran,
+          // so persist the FULL sanitized content (not just text — this also drops
+          // removed attachments/non-text parts) back to the store when it changed.
+          const beforeText = extractLastUserText(messages);
           messages = stripDisplayOnlyParts(next.messages);
-          const lastUserAfter = extractLastUserText(messages);
-          if (lastUserAfter !== null && lastUserAfter !== lastUserBefore) {
-            persistRedactedUserTurn(appHome, conversationId, lastUserAfter);
+          const afterMsg = lastUserMessage(messages);
+          const afterText = extractLastUserText(messages);
+          if (afterMsg && afterText !== beforeText) {
+            persistRedactedUserTurn(appHome, conversationId, afterMsg.content);
           }
         }
         if (typeof next?.systemPrompt === 'string') {
