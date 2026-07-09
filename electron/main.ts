@@ -95,6 +95,8 @@ import { initPluginBrowser } from './plugins/browser-window/index.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
+import { startLocalServer, stopLocalServer } from './local-bridge/local-server.js';
+import { webClients } from './web-server/web-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -117,6 +119,14 @@ function resolveUserDataDir(): string {
 }
 
 const APP_HOME = resolveUserDataDir();
+
+/**
+ * Headless mode: run the full main-process backend (IPC handlers, tools, local
+ * CLI bridge) with NO window. Used when the `kai` CLI boots the leader itself
+ * because no GUI is running. Detected from argv or env so the packaged app can
+ * be relaunched into headless mode.
+ */
+const IS_HEADLESS = process.argv.includes('--kai-headless') || process.env.KAI_HEADLESS === '1';
 
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
 
@@ -242,6 +252,15 @@ function saveWindowState(win: BrowserWindow): void {
 // Set app name early so macOS menu bar and dock show the product name instead of "Electron"
 app.setName(__BRAND_PRODUCT_NAME);
 
+// A headless backend is a macOS "accessory" process: no Dock icon, no menu
+// bar, no window. Set at launch (per-process) — the value is never set by the
+// GUI/CLI front-end clients, so nothing else is affected. This is the correct
+// mechanism (vs. a runtime app.dock.hide() toggle) for keeping a CLI-only /
+// backend run from rendering as a foreground GUI app in Finder or the Dock.
+if (IS_HEADLESS && process.platform === 'darwin' && app.setActivationPolicy) {
+  app.setActivationPolicy('accessory');
+}
+
 // Register the media protocol as a privileged scheme (must happen before app.whenReady)
 protocol.registerSchemesAsPrivileged([
   {
@@ -264,6 +283,21 @@ protocol.registerSchemesAsPrivileged([
     },
   },
 ]);
+
+// When APP_HOME is overridden (dev/headless isolation via KAI_USER_DATA), also
+// remap Electron's own userData dir so the single-instance lock namespace
+// tracks the app home. Without this, two instances pointed at DIFFERENT homes
+// would still collide on one shared lock (the default userData), and the loser
+// would quit without ever serving its socket. With it: distinct homes ⇒
+// distinct locks (isolation works); same home ⇒ shared lock (the intended
+// "one backend per install" contract still holds).
+if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
+  try {
+    app.setPath('userData', join(APP_HOME, 'electron-user-data'));
+  } catch (err) {
+    console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to remap userData for isolated home:`, err);
+  }
+}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -1488,7 +1522,7 @@ if (gotSingleInstanceLock) {
       });
     });
 
-    const mainWindow = createWindow();
+    const mainWindow = IS_HEADLESS ? null : createWindow();
 
     // Initialize marketplace and plugins immediately. We avoid putting this
     // inside `ready-to-show` because createWindow() calls loadURL(), which may
@@ -1530,12 +1564,18 @@ if (gotSingleInstanceLock) {
       }
     })();
 
-    mainWindow.once('ready-to-show', () => {
+    mainWindow?.once('ready-to-show', () => {
       mainWindow.show();
 
       // Signal OTA rollback system that the app is running stably
       signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
     });
+
+    // Headless leader has no window to become "ready to show" — signal stable
+    // once the backend is up so OTA rollback doesn't count it as a crash.
+    if (IS_HEADLESS) {
+      signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
+    }
 
     // Initialize tools asynchronously
     const toolsReady = shellPathReady
@@ -1560,6 +1600,22 @@ if (gotSingleInstanceLock) {
             )
             .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start:`, err));
         }
+
+        // Start the local IPC socket unconditionally — this process is the
+        // leader (it holds the single-instance lock), so it always serves the
+        // `kai` CLI bridge, independent of the user-facing web server toggle.
+        // A headless (CLI-spawned) backend enables idle shutdown so it doesn't
+        // outlive its clients; a windowed GUI leader persists.
+        startLocalServer({
+          idleShutdown: IS_HEADLESS,
+          hasOtherClients: () => BrowserWindow.getAllWindows().length > 0 || webClients.size > 0,
+          onIdleExit: () => {
+            console.info(`[${__BRAND_PRODUCT_NAME}] Headless backend idle with no clients — shutting down.`);
+            app.quit();
+          },
+        })
+          .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
+          .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err));
 
         // Initialize subagent cleanup cron job
         const dbPath = join(APP_HOME, 'data', 'memory.db');
@@ -1608,6 +1664,8 @@ app.on('before-quit', () => {
   cleanupOta();
   // Stop web UI server
   stopWebServer().catch(() => {});
+  // Stop the local CLI bridge (Phase 5 will add graceful leader handoff here)
+  stopLocalServer().catch(() => {});
   // Best-effort plugin cleanup (don't block quit on failures)
   pluginManagerRef?.unloadAll().catch((err) => {
     console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);

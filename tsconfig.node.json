@@ -12,7 +12,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "jsx": "react-jsx",
     "types": ["node"]
   },
-  "include": ["branding.d.ts", "electron/**/*.ts", "electron.vite.config.ts"]
+  "include": ["branding.d.ts", "electron/**/*.ts", "electron/**/*.tsx", "electron.vite.config.ts"]
 }

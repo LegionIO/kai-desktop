@@ -102,6 +102,7 @@ export default defineConfig({
         ],
         input: {
           index: resolve(__dirname, 'electron/main.ts'),
+          cli: resolve(__dirname, 'electron/cli/main.ts'),
         },
       },
     },
