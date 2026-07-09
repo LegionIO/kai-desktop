@@ -1,0 +1,53 @@
+#!/bin/sh
+# kai — terminal client for the Kai desktop app.
+#
+# Runs the CLI inside the app's OWN signed Electron binary (via `--kai-cli`), so
+# no separate Node runtime is needed and the security fuses stay locked. The
+# binary is exec'd DIRECTLY (not via `open`) so it inherits this terminal's
+# stdin/stdout/tty and the Ink TUI can render.
+#
+# Installed on PATH by electron-builder's afterPack (macOS). Resolves the app
+# binary from a few known locations; override with KAI_APP_BINARY.
+
+set -eu
+
+find_binary() {
+  # 1. Explicit override.
+  if [ -n "${KAI_APP_BINARY:-}" ] && [ -x "${KAI_APP_BINARY}" ]; then
+    printf '%s\n' "${KAI_APP_BINARY}"
+    return 0
+  fi
+
+  case "$(uname -s)" in
+    Darwin)
+      for app in \
+        "/Applications/Kai.app" \
+        "$HOME/Applications/Kai.app"; do
+        if [ -x "$app/Contents/MacOS/Kai" ]; then
+          printf '%s\n' "$app/Contents/MacOS/Kai"
+          return 0
+        fi
+      done
+      # Fall back to Spotlight if not in the usual spots.
+      mdfind_path=$(mdfind "kMDItemCFBundleIdentifier == 'com.kai.desktop'" 2>/dev/null | head -n1 || true)
+      if [ -n "$mdfind_path" ] && [ -x "$mdfind_path/Contents/MacOS/Kai" ]; then
+        printf '%s\n' "$mdfind_path/Contents/MacOS/Kai"
+        return 0
+      fi
+      ;;
+    Linux)
+      for cand in /opt/Kai/kai /usr/lib/kai/kai "$HOME/.local/lib/kai/kai"; do
+        if [ -x "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
+      done
+      ;;
+  esac
+  return 1
+}
+
+BIN=$(find_binary) || {
+  echo "kai: could not locate the Kai app binary." >&2
+  echo "     Install Kai, or set KAI_APP_BINARY to its executable path." >&2
+  exit 127
+}
+
+exec "$BIN" --kai-cli "$@"

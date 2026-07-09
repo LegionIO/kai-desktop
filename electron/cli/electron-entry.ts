@@ -5,17 +5,21 @@ import { runHeadlessOnce } from './headless-run.js';
 import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
 
 /**
- * Standalone (dev) `kai` entry: run with system node against the built bundle
- * (`node out/main/cli.js`). Spawns the DEV electron binary for the backend. The
- * packaged CLI uses `cli/electron-entry.ts` instead (re-execs the app binary).
+ * Run the `kai` CLI client from inside the packaged Electron main process
+ * (launched via `--kai-cli`). Connects to the backend over the local socket,
+ * spawning a headless backend (this same signed binary, re-exec'd with
+ * `--kai-headless`) if none is running, then runs the Ink REPL against the
+ * inherited terminal TTY. On exit it terminates the Electron process.
  */
-async function main(): Promise<void> {
+export async function runCliClient(): Promise<void> {
   const socketPath = getSocketPath();
 
   let client = await tryConnect(socketPath);
   if (!client) {
     cliLog('no running Kai backend found — starting a headless one…');
-    if (!spawnHeadlessBackend(false)) process.exit(1);
+    if (!spawnHeadlessBackend(true)) {
+      process.exit(1);
+    }
     client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS);
     if (!client) {
       cliLog('timed out waiting for the headless backend to come up');
@@ -26,11 +30,12 @@ async function main(): Promise<void> {
     cliLog('attached to running Kai backend');
   }
 
+  // On any exit, close the socket so the backend can reap itself promptly.
   const activeClient = client;
   process.on('exit', () => activeClient.close());
 
   if (process.stdin.isTTY && process.stdout.isTTY) {
-    await startRepl(activeClient, () => recoverBackend(activeClient, false));
+    await startRepl(activeClient, () => recoverBackend(activeClient, true));
     process.exit(0);
   } else {
     await runHeadlessOnce(activeClient);
@@ -39,8 +44,3 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 }
-
-main().catch((err) => {
-  cliLog(`fatal: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});

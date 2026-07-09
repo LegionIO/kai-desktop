@@ -77,6 +77,11 @@ mac:
   extraResources:
     - from: build/bin/LocalMacosHelper
       to: bin/LocalMacosHelper
+    # `kai` terminal-client launcher — execs this app's binary with --kai-cli.
+    # Shipped in Contents/Resources/bin; the app offers to symlink it onto PATH
+    # (e.g. /usr/local/bin/kai) from settings, à la VS Code's `code` command.
+    - from: bin/kai
+      to: bin/kai
   extendInfo:
     CFBundleDisplayName: "{{productName}}"
     CFBundleName: "{{productName}}"

@@ -4,6 +4,9 @@
   "version": "1.0.130",
   "description": "Kai - Local AI Assistant",
   "main": "./out/main/index.js",
+  "bin": {
+    "kai": "./bin/kai"
+  },
   "desktopName": "com.kai.desktop.desktop",
   "type": "module",
   "license": "MIT",

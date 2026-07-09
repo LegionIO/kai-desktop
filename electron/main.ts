@@ -133,6 +133,17 @@ const APP_HOME = resolveUserDataDir();
  */
 const IS_HEADLESS = process.argv.includes('--kai-headless') || process.env.KAI_HEADLESS === '1';
 
+/**
+ * CLI mode: this Electron process is the `kai` terminal client, not the app.
+ * It runs the Ink REPL in the main process (using Electron's built-in Node +
+ * the inherited terminal TTY) and connects to the backend over the local
+ * socket — it must NOT take the singleton lock or bootstrap the backend, so a
+ * real backend/GUI keeps ownership. The packaged `kai` shim execs the app
+ * binary with `--cli` so no separate Node runtime is needed and the security
+ * fuses stay locked (this is normal main-process Node, not RunAsNode).
+ */
+const IS_CLI = process.argv.includes('--kai-cli') || process.env.KAI_CLI === '1';
+
 // In headless mode there is no user and no Dock presence, so NOTHING may open a
 // window — not the app, not a plugin (e.g. skynet's bridge-auth window). A
 // stray window would flash on screen AND, by counting in getAllWindows(), keep
@@ -359,8 +370,10 @@ if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
   }
 }
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
+// CLI mode never requests the singleton lock — the backend (GUI or headless)
+// owns it. A `false` here also disables the whole backend bootstrap block below.
+const gotSingleInstanceLock = IS_CLI ? false : app.requestSingleInstanceLock();
+if (!IS_CLI && !gotSingleInstanceLock) {
   app.quit();
 }
 
@@ -1799,6 +1812,22 @@ if (gotSingleInstanceLock) {
 
       focusPrimaryWindow();
     });
+  });
+} else if (IS_CLI) {
+  // CLI client mode: no backend, no window, no lock. Run the Ink REPL in this
+  // main process against the inherited terminal TTY, connecting to the backend
+  // over the local socket (spawning a headless backend if none is running).
+  app.whenReady().then(async () => {
+    if (process.platform === 'darwin' && app.setActivationPolicy) {
+      app.setActivationPolicy('prohibited'); // never dock / foreground the CLI process
+    }
+    try {
+      const { runCliClient } = await import('./cli/electron-entry.js');
+      await runCliClient();
+    } catch (err) {
+      process.stderr.write(`[kai] fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+      app.exit(1);
+    }
   });
 }
 
