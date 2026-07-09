@@ -492,9 +492,20 @@ export class HookDispatcher {
       // doesn't have the first action consume the budget and skip the rest.
       // Evaluate the rule's conditions FIRST so a non-matching rule doesn't
       // consume its throttle budget (matches the engine's ordering).
+      //
+      // suppressObserve marks an ENFORCEMENT-ONLY auxiliary dispatch (e.g. title
+      // generation, sub-agent gating). Such calls must still apply block/modify
+      // enforcement, but must NOT consume the shell hook's throttle budget —
+      // otherwise an auxiliary dispatch could exhaust a UserPromptSubmit rule's
+      // rate-limit and cause the real chat prompt to be throttled past the DLP
+      // hook (raw prompt leaks). So we skip the throttle check (no bucket
+      // advancement) for suppressObserve dispatches and let enforcement proceed.
       if (reg.source === 'user' && reg.ruleId) {
         if (reg.conditionGate && !reg.conditionGate(current)) continue;
-        if (this.isRuleThrottled(reg.ruleId, reg.debounceMs ?? 0, reg.rateLimitPerMinute, dispatchId)) {
+        if (
+          !opts?.suppressObserve &&
+          this.isRuleThrottled(reg.ruleId, reg.debounceMs ?? 0, reg.rateLimitPerMinute, dispatchId)
+        ) {
           continue;
         }
       }

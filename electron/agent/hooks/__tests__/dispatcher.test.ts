@@ -161,4 +161,35 @@ describe('HookDispatcher rule throttling', () => {
     expect(ok.denied).toBe(false);
     expect((ok.payload as { messages: { content: string }[] }).messages[0].content).toBe('redacted');
   });
+
+  it('suppressObserve dispatch does NOT consume a shell rule throttle budget', async () => {
+    // A rate-limited (1/min) UserPromptSubmit shell hook. An enforcement-only
+    // (suppressObserve) auxiliary dispatch must not consume the budget, so a
+    // later real dispatch still fires the hook.
+    const rule: AutomationRule = {
+      id: 'r-aux',
+      name: 'rate-limited prompt hook',
+      enabled: true,
+      trigger: { source: 'hook', event: 'UserPromptSubmit' },
+      conditions: [],
+      conditionMode: 'all',
+      actions: [{ type: 'runHookCommand', command: 'ups-cmd', mode: 'observe', matcher: '*' }],
+      debounceMs: 0,
+      rateLimitPerMinute: 1,
+    } as AutomationRule;
+
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => makeConfig(rule) });
+
+    // Auxiliary (suppressObserve) dispatch: enforcement-only, must not fire the
+    // observe hook nor consume the budget.
+    await d.dispatch('UserPromptSubmit', { conversationId: 'c', messages: [] }, { suppressObserve: true });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawnCalls.length).toBe(0);
+
+    // The real dispatch still has its full 1/min budget → the hook fires.
+    await d.dispatch('UserPromptSubmit', { conversationId: 'c', messages: [] });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawnCalls.length).toBe(1);
+  });
 });
