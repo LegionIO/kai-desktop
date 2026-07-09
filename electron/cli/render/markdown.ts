@@ -1,9 +1,31 @@
 import { highlight } from 'cli-highlight';
 
-/** Wrap text in an OSC-8 hyperlink escape so terminals that support it make it clickable. */
+/**
+ * Strip raw control characters (ESC, CSI, OSC, C0 except \n\t) from
+ * model-controlled text BEFORE we add our own ANSI. Without this, a model could
+ * emit escape sequences that move the cursor, recolor the terminal, spoof UI,
+ * or inject its own OSC-8 links / clipboard writes. We add formatting ourselves
+ * afterward, so the incoming text must be inert.
+ */
+export function stripControl(s: string): string {
+  // Remove ESC (0x1b) and all other C0 control chars except tab (0x09) and
+  // newline (0x0a). This kills CSI/OSC/SGR/etc. at the source.
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+}
+
+/** Protocols allowed in clickable links — never file:, javascript:, data:, etc. */
+const SAFE_URL = /^https?:\/\//i;
+
+/** Wrap text in an OSC-8 hyperlink escape so terminals that support it make it
+ *  clickable. Only http(s) URLs become links; anything else renders as plain
+ *  (already-stripped) text so a malicious URL can't inject escapes or point at
+ *  a dangerous scheme. */
 export function osc8Link(label: string, url: string): string {
+  const safeLabel = stripControl(label);
+  if (!SAFE_URL.test(url)) return safeLabel;
+  const safeUrl = stripControl(url);
   const ESC = '\x1b';
-  return `${ESC}]8;;${url}${ESC}\\${label}${ESC}]8;;${ESC}\\`;
+  return `${ESC}]8;;${safeUrl}${ESC}\\${safeLabel}${ESC}]8;;${ESC}\\`;
 }
 
 const BOLD = '\x1b[1m';
@@ -29,7 +51,7 @@ function highlightCode(code: string, lang?: string): string {
  * goal is a pleasant assistant transcript, not a full CommonMark engine.
  */
 export function renderMarkdown(md: string): string {
-  const lines = md.split('\n');
+  const lines = stripControl(md).split('\n');
   const outLines: string[] = [];
   let inFence = false;
   let fenceLang = '';

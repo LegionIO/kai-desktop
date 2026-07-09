@@ -268,6 +268,17 @@ export function restartIdleShutdown(): void {
   maybeScheduleIdleShutdown();
 }
 
+/**
+ * Re-evaluate idle shutdown after a NON-local client surface changed (e.g. a
+ * web-UI client connected/disconnected). The idle scheduler otherwise only runs
+ * on local-socket close, so without this a demoted backend serving only web
+ * clients would never reap after the last browser disconnects. No-op unless
+ * idle-shutdown is enabled.
+ */
+export function notifyClientCountChanged(): void {
+  if (idleShutdownEnabled) maybeScheduleIdleShutdown();
+}
+
 export async function stopLocalServer(): Promise<void> {
   // Cancel any pending idle-shutdown and reset lifecycle state FIRST, so a
   // stale timer can't fire an old onIdleExit after stop (or after a restart

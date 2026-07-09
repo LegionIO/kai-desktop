@@ -1,4 +1,5 @@
 import { appendConversationMessages } from '../ipc/conversations.js';
+import { readConversation, writeConversation } from '../ipc/conversation-store.js';
 import type { StreamEvent } from './mastra-agent.js';
 
 /**
@@ -103,6 +104,45 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent): v
         part.durationMs = event.durationMs ?? part.durationMs;
       }
       acc.sawContent = true;
+      break;
+    }
+    case 'enrichment': {
+      // Persist runtime session IDs into conversation metadata so multi-turn
+      // resume works for Claude/Codex runtimes (mirrors RuntimeProvider). Done
+      // immediately (not batched to `done`) since a turn may not reach `done`.
+      const data = event.data as { claudeSdkSessionId?: string; codexSdkThreadId?: string } | undefined;
+      const claudeSdkSessionId = data?.claudeSdkSessionId;
+      const codexSdkThreadId = data?.codexSdkThreadId;
+      if (claudeSdkSessionId || codexSdkThreadId) {
+        try {
+          const conv = readConversation(appHome, conversationId);
+          if (conv) {
+            conv.metadata = {
+              ...(conv.metadata ?? {}),
+              ...(claudeSdkSessionId ? { claudeSdkSessionId } : {}),
+              ...(codexSdkThreadId ? { codexSdkThreadId } : {}),
+            };
+            writeConversation(appHome, conv);
+          }
+        } catch {
+          // best-effort
+        }
+      }
+      break;
+    }
+    case 'model-fallback': {
+      // If the runtime discarded the partial assistant output before failing
+      // over, drop what we've accumulated so we don't persist/replay a partial
+      // that the fresh attempt supersedes.
+      const data = event.data as { discardPartialAssistant?: boolean } | undefined;
+      if (data?.discardPartialAssistant) {
+        const acc = accumulators.get(conversationId);
+        if (acc) {
+          acc.parts = [];
+          acc.toolIndex.clear();
+          acc.sawContent = false;
+        }
+      }
       break;
     }
     case 'error': {

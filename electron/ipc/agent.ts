@@ -468,8 +468,22 @@ function logToolCompactionDebug(stage: string, details: Record<string, unknown>)
 // Tool registry - will be populated by Phase 4
 let registeredTools: ToolDefinition[] = [];
 
+// Resolves once the initial tool registry (built-in + MCP + skills + plugins +
+// CLI tools) has been registered. The local CLI bridge starts serving EARLY
+// (before this, for fast connect), so a CLI turn arriving in that window would
+// otherwise run with an empty tool set. agent:submit awaits this.
+let resolveToolsReady: () => void;
+const toolsReady: Promise<void> = new Promise((r) => {
+  resolveToolsReady = r;
+});
+let toolsRegistered = false;
+
 export function registerTools(tools: ToolDefinition[]): void {
   registeredTools = ensureSafeToolDefinitions(tools);
+  if (!toolsRegistered) {
+    toolsRegistered = true;
+    resolveToolsReady();
+  }
 }
 
 export function getRegisteredTools(): ToolDefinition[] {
@@ -2182,6 +2196,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     ) => {
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+      // The CLI bridge serves before the tool registry finishes building, so a
+      // turn arriving in that window would run tool-less. Wait for tools first.
+      await toolsReady;
 
       appendConversationMessages(appHome, conversationId, [
         { role: 'user', content: [{ type: 'text', text: userText }] },

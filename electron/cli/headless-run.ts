@@ -6,6 +6,7 @@ type StreamEvent = {
   type?: string;
   text?: string;
   toolName?: string;
+  toolCallId?: string;
   error?: string;
 };
 
@@ -62,7 +63,12 @@ export async function runHeadlessOnce(client: LocalBridgeClient): Promise<void> 
       if (e.conversationId !== id) return;
       if (e.type === 'text-delta' && e.text) process.stdout.write(e.text);
       else if (e.type === 'tool-call') process.stderr.write(`\n[tool: ${e.toolName ?? 'tool'}]\n`);
-      else if (e.type === 'error') process.stderr.write(`\n[error: ${e.error ?? 'unknown'}]\n`);
+      else if (e.type === 'tool-approval-required' && e.toolCallId) {
+        // Non-interactive: can't prompt. Auto-reject so the run doesn't hang
+        // forever waiting on an approval no one can give.
+        process.stderr.write(`\n[auto-denied ${e.toolName ?? 'tool'} — approval needs an interactive terminal]\n`);
+        void client.invoke('agent:reject-tool', e.toolCallId).catch(() => {});
+      } else if (e.type === 'error') process.stderr.write(`\n[error: ${e.error ?? 'unknown'}]\n`);
       else if (e.type === 'done') {
         process.stdout.write('\n');
         finish();

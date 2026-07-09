@@ -15,9 +15,18 @@ type StreamEvent = {
   text?: string;
   toolCallId?: string;
   toolName?: string;
+  args?: unknown;
   error?: string;
   durationMs?: number;
   data?: unknown;
+};
+
+// ask_user tool args: questions rendered as sequential pickers in the REPL.
+type AskUserQuestion = {
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
 };
 
 type ConversationRecord = {
@@ -239,6 +248,34 @@ export function App({
     void createNew();
   }, []);
 
+  // Render an ask_user tool call as sequential REPL pickers, then send the
+  // collected answers back via agent:answer-tool-question (keyed by question
+  // text, matching the GUI's contract). Falls back to approve on empty.
+  const promptAskUser = useCallback(
+    (toolCallId: string, questions: AskUserQuestion[]) => {
+      const answers: Record<string, string> = {};
+      const askNext = (i: number): void => {
+        if (i >= questions.length) {
+          void client.invoke('agent:answer-tool-question', toolCallId, answers).catch(() => {});
+          setStatus('running');
+          return;
+        }
+        const q = questions[i];
+        setPicker({
+          title: q.question,
+          items: q.options.map((o) => ({ label: o.label, value: o.label })),
+          onSelect: (v) => {
+            setPicker(null);
+            answers[q.question] = v;
+            askNext(i + 1);
+          },
+        });
+      };
+      askNext(0);
+    },
+    [client],
+  );
+
   // ── live stream subscription ────────────────────────────────────────
   useEffect(() => {
     const finalizeAssistant = (): void => {
@@ -276,6 +313,13 @@ export function App({
           if (e.toolCallId) {
             setTools((prev) => prev.map((t) => (t.id === e.toolCallId ? { ...t, status: 'awaiting' } : t)));
             const id = e.toolCallId;
+            // ask_user isn't a yes/no approval — it's a question set. Render the
+            // questions as pickers and send the chosen answers back.
+            const askArgs = e.args as { questions?: AskUserQuestion[] } | undefined;
+            if (e.toolName === 'ask_user' && Array.isArray(askArgs?.questions) && askArgs.questions.length > 0) {
+              promptAskUser(id, askArgs.questions);
+              break;
+            }
             setPicker({
               title: `Approve tool: ${e.toolName ?? 'tool'}?`,
               items: [
@@ -293,8 +337,14 @@ export function App({
         case 'model-fallback': {
           // Runtime fallback to a different model — reflect the model actually
           // serving the turn in the banner.
-          const to = (e.data as { toModel?: string } | undefined)?.toModel;
-          if (to) setFallbackModelLabel(to);
+          const fb = e.data as { toModel?: string; discardPartialAssistant?: boolean } | undefined;
+          if (fb?.toModel) setFallbackModelLabel(fb.toModel);
+          // If the runtime discarded the partial output before failing over,
+          // drop what we've streamed so we don't show a superseded fragment.
+          if (fb?.discardPartialAssistant) {
+            streamingRef.current = '';
+            setTurns((prev) => [...prev]);
+          }
           break;
         }
         case 'error':
@@ -343,7 +393,7 @@ export function App({
       off();
       offDisc();
     };
-  }, [client, recover, exit, resolveNote]);
+  }, [client, recover, exit, resolveNote, promptAskUser]);
 
   // ── command + input handling ────────────────────────────────────────
   // Single-round-trip selection change. The backend patches only the selection
