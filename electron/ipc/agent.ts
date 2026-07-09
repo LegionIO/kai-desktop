@@ -553,12 +553,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Compare the whole content STRUCTURALLY, not just extracted text, so a
           // hook that strips an attachment while leaving the text intact still
           // triggers persistence.
-          const beforeContent = jsonStableString(lastUserMessage(messages)?.content);
+          const beforeMsg = lastUserMessage(messages);
+          const beforeContent = jsonStableString(beforeMsg?.content);
           messages = stripDisplayOnlyParts(next.messages);
           const afterMsg = lastUserMessage(messages);
           const afterContent = jsonStableString(afterMsg?.content);
-          if (afterMsg && afterContent !== beforeContent) {
-            persistRedactedUserTurn(appHome, conversationId, afterMsg.content);
+          if (beforeMsg && afterContent !== beforeContent) {
+            // Persist the sanitized content. If the hook removed the submitted
+            // user turn entirely (no user message remains, or the last one no
+            // longer matches), scrub the stored turn with a placeholder rather
+            // than leaving the raw prompt or overwriting an earlier turn.
+            persistRedactedUserTurn(
+              appHome,
+              conversationId,
+              afterMsg ? afterMsg.content : '[removed by a policy hook]',
+            );
           }
         }
         if (typeof next?.systemPrompt === 'string') {

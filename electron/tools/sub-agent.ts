@@ -567,19 +567,21 @@ export function createSubAgentTool(
 
         // Persist state for resumption. Prefer the runner's GATED message
         // history (which reflects any UserPromptSubmit DLP redaction) so a later
-        // resume — possibly after the hook is disabled — never sends the raw
-        // original task/context to the model. Fall back to a reconstruction only
-        // if the runner didn't surface its messages (e.g. early error).
+        // resume never sends the raw original task/context to the model. Only
+        // fall back to a reconstruction when the runner NEVER surfaced messages
+        // (null) — an intentionally EMPTY gated history ([]) is a valid
+        // redaction result and must NOT be replaced with the raw task/context.
         const gatedHistory = finalGatedMessages as Array<{ role: string; content: unknown }> | null;
         const persistedMessages: Array<{ role: string; content: unknown }> =
-          gatedHistory && gatedHistory.length > 0
+          gatedHistory !== null
             ? [...gatedHistory]
             : [{ role: 'user', content: buildSubAgentTaskMessage(task, context) }];
-        // Ensure the final assistant response is captured (the runner appends it
-        // to its messages on each turn, but guard the fallback path too).
+        // Ensure the final assistant response is captured. Only in the raw
+        // FALLBACK path (gatedHistory === null) — a surfaced gated history (incl.
+        // empty) already reflects what the runner accumulated + any redaction.
         const lastMsg = persistedMessages[persistedMessages.length - 1];
         if (fullResponse && !(lastMsg?.role === 'assistant' && lastMsg.content === fullResponse)) {
-          if (!gatedHistory) persistedMessages.push({ role: 'assistant', content: fullResponse });
+          if (gatedHistory === null) persistedMessages.push({ role: 'assistant', content: fullResponse });
         }
 
         // Don't create resumable state for a denied/failed run. A
