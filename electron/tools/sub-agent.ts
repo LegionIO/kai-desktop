@@ -10,7 +10,12 @@ import { z } from 'zod';
 import { join } from 'path';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { runSubAgent, getActiveSubAgentCount, buildSubAgentTaskMessage } from '../agent/sub-agent-runner.js';
+import {
+  runSubAgent,
+  getActiveSubAgentCount,
+  buildSubAgentTaskMessage,
+  sanitizedMessageDisplayText,
+} from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
 import { streamAgentResponse, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
@@ -133,10 +138,9 @@ async function resumeSubAgent(
     }
 
     // Now broadcast the (possibly sanitized) resume message + running status.
-    const gatedResumeText =
-      typeof messages[messages.length - 1]?.content === 'string'
-        ? (messages[messages.length - 1].content as string)
-        : message;
+    // Derive from the gated last message (never the raw `message`), covering
+    // content-part arrays; empty when the hook removed/redacted all text.
+    const gatedResumeText = sanitizedMessageDisplayText(messages[messages.length - 1]?.content);
     broadcastEvent({
       subAgentConversationId,
       parentConversationId,

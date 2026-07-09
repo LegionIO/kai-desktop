@@ -184,10 +184,10 @@ export const SettingsPanel: FC<{ onClose: () => void }> = ({ onClose }) => {
                   key={entry.id}
                   type="button"
                   onClick={() => handleResultClick(entry)}
-                  className="flex w-full shrink-0 flex-col items-start gap-0.5 rounded-2xl px-3 py-2 text-left text-xs font-medium text-muted-foreground transition-all hover:bg-muted/80 hover:text-foreground"
+                  className="flex w-full min-w-0 shrink-0 flex-col items-start gap-0.5 rounded-2xl px-3 py-2 text-left text-xs font-medium text-muted-foreground transition-all hover:bg-muted/80 hover:text-foreground"
                 >
-                  <span className="truncate text-foreground">{entry.label}</span>
-                  <span className="truncate text-[10px] text-muted-foreground/70">{breadcrumb(entry)}</span>
+                  <span className="w-full truncate text-foreground">{entry.label}</span>
+                  <span className="w-full truncate text-[10px] text-muted-foreground/70">{breadcrumb(entry)}</span>
                 </button>
               ))
             ) : (

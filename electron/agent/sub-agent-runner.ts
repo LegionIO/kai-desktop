@@ -138,6 +138,26 @@ export function buildSubAgentTaskMessage(task: string, context?: string): string
   return parts.join('\n');
 }
 
+/**
+ * Derive the display text to broadcast for a sub-agent user message from the
+ * GATED message content. A UserPromptSubmit modify hook may return a string, an
+ * app-native content-part array (e.g. `[{type:'text',text:'[redacted]'}]`), or
+ * remove the message entirely. We must NOT fall back to the raw pre-gate text —
+ * that would leak content the hook redacted. Returns '' (fail closed) when no
+ * sanitized text can be derived, so the broadcast shows nothing rather than raw.
+ */
+export function sanitizedMessageDisplayText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p): p is { type?: string; text?: unknown } => !!p && typeof p === 'object')
+      .filter((p) => p.type === 'text' || typeof p.text === 'string')
+      .map((p) => (typeof p.text === 'string' ? p.text : ''))
+      .join('\n');
+  }
+  return '';
+}
+
 export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<SubAgentEvent> {
   const {
     subAgentConversationId,
@@ -260,7 +280,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // Broadcast the (possibly sanitized) task text — read from the gated first
     // user message so a DLP redaction is reflected in what clients see, rather
     // than the raw `task`.
-    const gatedTaskText = typeof messages[0]?.content === 'string' ? (messages[0].content as string) : task;
+    const gatedTaskText = sanitizedMessageDisplayText(messages[0]?.content);
 
     // Emit initial task as user message
     const taskMsgEvent: SubAgentEvent = {
@@ -324,7 +344,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       }
       // Broadcast the (possibly sanitized) text from the gated last message.
       const last = messages[messages.length - 1];
-      const gatedText = typeof last?.content === 'string' ? (last.content as string) : text;
+      const gatedText = sanitizedMessageDisplayText(last?.content);
       const evt: SubAgentEvent = {
         subAgentConversationId,
         parentConversationId,
