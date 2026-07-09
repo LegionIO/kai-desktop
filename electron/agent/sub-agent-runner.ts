@@ -336,10 +336,14 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       text: string,
       source: 'user' | 'parent' | 'task' = 'parent',
     ): Promise<SubAgentEvent | null> => {
+      const beforeFollowUp = [...messages];
       messages.push({ role: 'user', content: text });
       const gate = await gateUserPrompt();
       if (!gate.ok) {
-        // Broadcast nothing raw; surface a failed status instead.
+        // Roll the raw denied follow-up back out so it isn't surfaced via
+        // onFinalMessages / persisted for resume. Broadcast nothing raw.
+        messages.length = 0;
+        messages.push(...beforeFollowUp);
         broadcastSubAgentEvent({
           subAgentConversationId,
           parentConversationId,

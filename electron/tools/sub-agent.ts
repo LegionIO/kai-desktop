@@ -91,7 +91,9 @@ async function resumeSubAgent(
 
   // Add the resume message, but DON'T broadcast it yet — gate it through
   // UserPromptSubmit first so a DLP block/modify hook can redact/deny before the
-  // raw message reaches renderer/web clients.
+  // raw message reaches renderer/web clients. Snapshot the prior history so a
+  // denial can roll the raw message back out of the persisted state.
+  const messagesBeforeResume = [...messages];
   messages.push({ role: 'user', content: message });
 
   const localController = new AbortController();
@@ -117,6 +119,10 @@ async function resumeSubAgent(
         { suppressObserve: true },
       );
       if (gate.denied) {
+        // Roll the raw denied message back out of the shared/persisted history so
+        // a later resume can't replay it.
+        messages.length = 0;
+        messages.push(...messagesBeforeResume);
         broadcastEvent({
           subAgentConversationId,
           parentConversationId,
@@ -576,17 +582,24 @@ export function createSubAgentTool(
           if (!gatedHistory) persistedMessages.push({ role: 'assistant', content: fullResponse });
         }
 
-        subAgentState.set(subAgentConversationId, {
-          messages: persistedMessages,
-          config,
-          modelConfig: modelEntry.modelConfig,
-          tools: subAgentTools,
-          dbPath,
-          parentConversationId: ctx.toolCallId,
-          parentToolCallId: ctx.toolCallId,
-          depth: currentDepth + 1,
-          task,
-        });
+        // Don't create resumable state for a denied/failed run. A
+        // UserPromptSubmit DLP denial returns from runSubAgent before it surfaces
+        // gated messages, so the fallback would persist the RAW task/context and
+        // a later resume (after the hook is disabled) could replay it. Only
+        // completed runs become resumable.
+        if (!lastFailureSummary) {
+          subAgentState.set(subAgentConversationId, {
+            messages: persistedMessages,
+            config,
+            modelConfig: modelEntry.modelConfig,
+            tools: subAgentTools,
+            dbPath,
+            parentConversationId: ctx.toolCallId,
+            parentToolCallId: ctx.toolCallId,
+            depth: currentDepth + 1,
+            task,
+          });
+        }
 
         // Persist completion status to database
         try {
