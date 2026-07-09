@@ -214,7 +214,53 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       return evt;
     };
 
-    yield emitStatus(undefined as never, 'running', `Starting task: ${task.slice(0, 100)}`);
+    // Note: don't echo the raw task in this pre-gate status — a DLP hook may
+    // redact it below. A generic message here; the sanitized task is broadcast
+    // as the user-message after the gate.
+    yield emitStatus(undefined as never, 'running', 'Starting task');
+
+    // Gate the sub-agent prompt through UserPromptSubmit BEFORE broadcasting the
+    // task to clients, so a DLP block/modify hook can deny/redact it and the raw
+    // task never reaches the renderer/web. Enforcement-only (suppressObserve) so
+    // a sub-agent turn doesn't re-fire the parent's UserPromptSubmit automations.
+    // Returns false when the run should stop (denied). On modify, `messages` and
+    // subAgentConfig.systemPrompt are rewritten in place.
+    const gateUserPrompt = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      if (!hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) return { ok: true };
+      const gate = await hookDispatcher.dispatch(
+        'UserPromptSubmit',
+        {
+          conversationId: subAgentConversationId,
+          parentConversationId,
+          messages,
+          systemPrompt: subAgentConfig.systemPrompt,
+          modelKey: modelConfig.modelName,
+          purpose: 'sub-agent',
+        },
+        { suppressObserve: true },
+      );
+      if (gate.denied) return { ok: false, reason: gate.reason ?? 'Blocked by a UserPromptSubmit hook.' };
+      const gated = gate.payload as { messages?: unknown[]; systemPrompt?: string };
+      if (Array.isArray(gated?.messages)) {
+        messages.length = 0;
+        messages.push(...(gated.messages as Array<{ role: string; content: unknown }>));
+      }
+      if (typeof gated?.systemPrompt === 'string') {
+        subAgentConfig = { ...subAgentConfig, systemPrompt: gated.systemPrompt };
+      }
+      return { ok: true };
+    };
+
+    const initialGate = await gateUserPrompt();
+    if (!initialGate.ok) {
+      yield emitStatus(undefined as never, 'failed', initialGate.reason);
+      return;
+    }
+
+    // Broadcast the (possibly sanitized) task text — read from the gated first
+    // user message so a DLP redaction is reflected in what clients see, rather
+    // than the raw `task`.
+    const gatedTaskText = typeof messages[0]?.content === 'string' ? (messages[0].content as string) : task;
 
     // Emit initial task as user message
     const taskMsgEvent: SubAgentEvent = {
@@ -223,7 +269,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'sub-agent-user-message',
-      text: task,
+      text: gatedTaskText,
       source: 'task',
     };
     yield taskMsgEvent;
@@ -275,35 +321,14 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       turnCount++;
       controlSignal.current = null; // reset for this turn
 
-      // Gate each sub-agent model call through UserPromptSubmit, so a DLP
-      // block/modify hook covers sub-agent prompts too (they call the model
-      // directly and would otherwise bypass it). Enforcement-only (suppressObserve)
-      // so a sub-agent turn doesn't re-fire the parent's UserPromptSubmit
-      // automations. Only when an enforcing hook exists (no fan-out otherwise).
-      if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
-        const gate = await hookDispatcher.dispatch(
-          'UserPromptSubmit',
-          {
-            conversationId: subAgentConversationId,
-            parentConversationId,
-            messages,
-            systemPrompt: subAgentConfig.systemPrompt,
-            modelKey: modelConfig.modelName,
-            purpose: 'sub-agent',
-          },
-          { suppressObserve: true },
-        );
-        if (gate.denied) {
-          yield emitStatus(undefined as never, 'failed', gate.reason ?? 'Blocked by a UserPromptSubmit hook.');
+      // The first turn's prompt was already gated up front (before the task
+      // broadcast). Re-gate on FOLLOW-UP turns, whose new user messages were
+      // appended after the last gate, so a DLP block/modify hook covers them too.
+      if (turnCount > 1) {
+        const followUpGate = await gateUserPrompt();
+        if (!followUpGate.ok) {
+          yield emitStatus(undefined as never, 'failed', followUpGate.reason);
           break;
-        }
-        const gated = gate.payload as { messages?: unknown[]; systemPrompt?: string };
-        if (Array.isArray(gated?.messages)) {
-          messages.length = 0;
-          messages.push(...(gated.messages as Array<{ role: string; content: unknown }>));
-        }
-        if (typeof gated?.systemPrompt === 'string') {
-          subAgentConfig = { ...subAgentConfig, systemPrompt: gated.systemPrompt };
         }
       }
 
