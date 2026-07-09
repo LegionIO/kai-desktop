@@ -90,25 +90,6 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
 
-/** Extract the plain text of the LAST user message from a flat message list. */
-function extractLastUserText(messages: unknown[]): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as { role?: unknown; content?: unknown } | null;
-    if (!m || typeof m !== 'object' || m.role !== 'user') continue;
-    const c = m.content;
-    if (typeof c === 'string') return c;
-    if (Array.isArray(c)) {
-      return c
-        .filter((p): p is { type?: string; text?: unknown } => !!p && typeof p === 'object')
-        .filter((p) => p.type === 'text' || typeof p.text === 'string')
-        .map((p) => (typeof p.text === 'string' ? p.text : ''))
-        .join('\n');
-    }
-    return '';
-  }
-  return null;
-}
-
 /** The last user message object from a flat message list, or null. */
 function lastUserMessage(messages: unknown[]): { role?: unknown; content?: unknown } | null {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -116,6 +97,16 @@ function lastUserMessage(messages: unknown[]): { role?: unknown; content?: unkno
     if (m && typeof m === 'object' && m.role === 'user') return m;
   }
   return null;
+}
+
+/** Structural JSON of a value for change detection (undefined → ''). */
+function jsonStableString(value: unknown): string {
+  if (value === undefined) return '';
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return String(value);
+  }
 }
 
 /**
@@ -559,11 +550,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // renderer already persisted the ORIGINAL turn before agent:stream ran,
           // so persist the FULL sanitized content (not just text — this also drops
           // removed attachments/non-text parts) back to the store when it changed.
-          const beforeText = extractLastUserText(messages);
+          // Compare the whole content STRUCTURALLY, not just extracted text, so a
+          // hook that strips an attachment while leaving the text intact still
+          // triggers persistence.
+          const beforeContent = jsonStableString(lastUserMessage(messages)?.content);
           messages = stripDisplayOnlyParts(next.messages);
           const afterMsg = lastUserMessage(messages);
-          const afterText = extractLastUserText(messages);
-          if (afterMsg && afterText !== beforeText) {
+          const afterContent = jsonStableString(afterMsg?.content);
+          if (afterMsg && afterContent !== beforeContent) {
             persistRedactedUserTurn(appHome, conversationId, afterMsg.content);
           }
         }
