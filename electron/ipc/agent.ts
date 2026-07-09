@@ -199,7 +199,15 @@ function isServerPersistOwner(conversationId: string, activeToken: string | unde
   return owner !== undefined && owner === activeToken;
 }
 
-function broadcastStreamEvent(event: StreamEvent): void {
+/**
+ * @param emittingToken  The stream token of the run that produced this event.
+ *   Persistence/accumulation is only applied when it matches BOTH the persist
+ *   owner AND the conversation's current active stream — so a superseded run's
+ *   late in-flight events can't pollute the replacement run's accumulator or
+ *   clear its ownership on a stale `done`. Omitted for external producers
+ *   (automation / redaction), which are never server-persist owners.
+ */
+function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void {
   let eventToBroadcast = event;
   // Debug: log every event broadcast
   const eventSummary =
@@ -244,7 +252,13 @@ function broadcastStreamEvent(event: StreamEvent): void {
   // live but skips its own persistence (main owns the write here).
   if (event.conversationId) {
     const activeToken = activeStreams.get(event.conversationId)?.token;
-    if (isServerPersistOwner(event.conversationId, activeToken)) {
+    // Only the run that currently owns the active stream may drive persistence,
+    // and only when the event actually came from THAT run (emittingToken). A
+    // superseded run's late event carries its own (now-stale) token, so it fails
+    // the emittingToken check and can neither pollute the accumulator nor delete
+    // the replacement run's ownership on a stray `done`.
+    const fromCurrentRun = emittingToken === undefined || emittingToken === activeToken;
+    if (fromCurrentRun && isServerPersistOwner(event.conversationId, activeToken)) {
       eventToBroadcast = { ...eventToBroadcast, serverPersisted: true };
       if (serverPersistAppHome) {
         accumulateForPersistence(serverPersistAppHome, event);
@@ -578,16 +592,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
     activeObserverSessions.set(conversationId, observerSessionId);
 
+    // All broadcasts from THIS run carry its stream token so broadcastStreamEvent
+    // can reject persistence-side effects from a superseded run's late events.
+    const emit = (e: StreamEvent): void => broadcastStreamEvent(e, streamToken);
+
     let config: AppConfig;
     try {
       config = readEffectiveConfig(appHome);
     } catch (error) {
-      broadcastStreamEvent({
+      emit({
         conversationId,
         type: 'error',
         error: 'Failed to load config: ' + (error instanceof Error ? error.message : String(error)),
       });
-      broadcastStreamEvent({ conversationId, type: 'done' });
+      emit({ conversationId, type: 'done' });
       void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
       return { conversationId };
     }
@@ -625,12 +643,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // slow pre-send hook may resolve after the user cancelled/restarted,
         // and finalizing here would corrupt the replacement run.
         if (activeStreams.get(conversationId)?.token === streamToken) {
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'error',
             error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
           });
-          broadcastStreamEvent({ conversationId, type: 'done' });
+          emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         }
         cleanupStreamIfOwned(conversationId, streamToken);
@@ -665,12 +683,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // model call but must ALSO scrub the sensitive prompt from local
           // history/exports. Replace it with a policy placeholder.
           persistRedactedUserTurn(appHome, conversationId, '[blocked by a policy hook]');
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'error',
             error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
           });
-          broadcastStreamEvent({ conversationId, type: 'done' });
+          emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         }
         cleanupStreamIfOwned(conversationId, streamToken);
@@ -743,13 +761,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const warningMeta = resolution.inferenceProviderRuntimeId
         ? { runtimeId: resolution.inferenceProviderRuntimeId }
         : undefined;
-      broadcastStreamEvent({
+      emit({
         conversationId,
         type: 'text-delta',
         text: `⚠️ ${resolution.warning}`,
         ...(warningMeta ? { messageMeta: warningMeta } : {}),
       });
-      broadcastStreamEvent({
+      emit({
         conversationId,
         type: 'done',
         ...(warningMeta ? { messageMeta: warningMeta } : {}),
@@ -762,7 +780,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Non-blocking fallback notice: the preferred runtime is unavailable but we
     // can still route through the standard pipeline. Show a visible notice.
     if (resolution.fallbackNotice) {
-      broadcastStreamEvent({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
+      emit({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
     }
 
     // Lifecycle tool hooks are only enforced by the Mastra runtime. If the
@@ -771,7 +789,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // those hooks will NOT be applied — a silently-bypassed DLP/deny policy
     // is worse than none.
     if (runtime.id !== 'mastra' && hookDispatcher.hasEnforcingToolHooks()) {
-      broadcastStreamEvent({
+      emit({
         conversationId,
         type: 'text-delta',
         text:
@@ -789,7 +807,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const chainForProviderTools = [modelEntry, ...(fallbackEnabled ? (streamConfig?.fallbackModels ?? []) : [])];
     const hasProviderTools = chainForProviderTools.some((m) => (m?.modelConfig.providerTools?.length ?? 0) > 0);
     if (runtime.id === 'mastra' && hasProviderTools && hookDispatcher.hasEnforcingToolHooks()) {
-      broadcastStreamEvent({
+      emit({
         conversationId,
         type: 'text-delta',
         text:
@@ -892,13 +910,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }) ?? null;
       if (!inferenceProvider && pluginRuntimeId) {
         const meta = { runtimeId: pluginRuntimeId };
-        broadcastStreamEvent({
+        emit({
           conversationId,
           type: 'error',
           error: `Runtime "${pluginRuntimeId}" is selected, but no inference provider is available. Start or re-enable the plugin before sending messages.`,
           messageMeta: meta,
         });
-        broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+        emit({ conversationId, type: 'done', messageMeta: meta });
         void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         cleanupStreamIfOwned(conversationId, streamToken);
         return;
@@ -912,7 +930,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // block/modify hooks can't be enforced there. Warn (same posture as
         // non-Mastra runtimes) since the runtime.id check below won't fire.
         if (hookDispatcher.hasEnforcingToolHooks()) {
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'text-delta',
             text:
@@ -962,11 +980,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             })();
 
             if (event.type === 'done') {
-              broadcastStreamEvent(eventWithMeta as typeof event);
+              emit(eventWithMeta as typeof event);
               break;
             }
 
-            broadcastStreamEvent(eventWithMeta as typeof event);
+            emit(eventWithMeta as typeof event);
           }
 
           // Run post-receive hooks for plugin inference provider path.
@@ -1009,13 +1027,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               providerError,
             );
             const meta = { runtimeId: inferenceProvider.name };
-            broadcastStreamEvent({
+            emit({
               conversationId,
               type: 'error',
               error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
               messageMeta: meta,
             });
-            broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+            emit({ conversationId, type: 'done', messageMeta: meta });
             void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
             cleanupStreamIfOwned(conversationId, streamToken);
             return;
@@ -1025,13 +1043,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             providerError,
           );
           const meta = { runtimeId: inferenceProvider.name };
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'error',
             error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
             messageMeta: meta,
           });
-          broadcastStreamEvent({ conversationId, type: 'done', messageMeta: meta });
+          emit({ conversationId, type: 'done', messageMeta: meta });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
           cleanupStreamIfOwned(conversationId, streamToken);
           return;
@@ -1157,7 +1175,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             hasOriginalContent: typeof data.originalContent === 'string' && data.originalContent.length > 0,
             extractionDurationMs: data.extractionDurationMs ?? null,
           });
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'tool-compaction',
             toolCallId: executeToolCallId,
@@ -1179,7 +1197,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             hasOriginalContent: typeof data.originalContent === 'string' && data.originalContent.length > 0,
             extractionDurationMs: data.extractionDurationMs ?? null,
           });
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'tool-compaction',
             toolCallId: streamToolCallId,
@@ -1221,7 +1239,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             hasOriginalContent: typeof event.data.originalContent === 'string' && event.data.originalContent.length > 0,
             extractionDurationMs: event.data.extractionDurationMs ?? null,
           });
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'tool-compaction',
             toolCallId: streamToolCallId,
@@ -1446,7 +1464,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           observerInitiated: true,
         });
 
-        broadcastStreamEvent({
+        emit({
           conversationId,
           type: 'tool-call',
           toolCallId,
@@ -1471,7 +1489,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   data: progress,
                 });
                 if (!controller.signal.aborted) {
-                  broadcastStreamEvent({
+                  emit({
                     conversationId,
                     type: 'tool-progress',
                     toolCallId,
@@ -1506,7 +1524,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
-              broadcastStreamEvent({
+              emit({
                 conversationId,
                 type: 'tool-result',
                 toolCallId,
@@ -1544,7 +1562,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
-              broadcastStreamEvent({
+              emit({
                 conversationId,
                 type: 'tool-result',
                 toolCallId,
@@ -1579,7 +1597,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
       try {
         if (controller.signal.aborted) {
-          broadcastStreamEvent({ conversationId, type: 'done' });
+          emit({ conversationId, type: 'done' });
           return;
         }
         // Check if compaction is needed (only if runtime supports it)
@@ -1593,7 +1611,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           );
 
           if (check.shouldCompact) {
-            broadcastStreamEvent({
+            emit({
               conversationId,
               type: 'context-usage',
               data: {
@@ -1609,12 +1627,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               config.compaction.conversation,
             );
             if (controller.signal.aborted) {
-              broadcastStreamEvent({ conversationId, type: 'done' });
+              emit({ conversationId, type: 'done' });
               return;
             }
 
             if (compactionResult.compactedMessages) {
-              broadcastStreamEvent({
+              emit({
                 conversationId,
                 type: 'compaction',
                 data: {
@@ -1638,7 +1656,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             emitMidToolMessage: (text) => {
               if (activeObserverSessions.get(conversationId) !== observerSessionId) return;
               if (!controller.signal.aborted) {
-                broadcastStreamEvent({
+                emit({
                   conversationId,
                   type: 'observer-message',
                   text,
@@ -1686,7 +1704,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             // Side-channel events (tool progress) should stop immediately on abort.
             if (!controller.signal.aborted) {
-              broadcastStreamEvent(event);
+              emit(event);
             }
           },
           onToolExecutionStart: async (state: {
@@ -1720,7 +1738,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // stream `tool-call` handler will apply the stored args when it
               // fires (avoids emitting a duplicate card under the exec id).
               if (denyStreamId) {
-                broadcastStreamEvent({
+                emit({
                   conversationId,
                   type: 'tool-call',
                   toolCallId: denyStreamId,
@@ -1758,7 +1776,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 const failStreamId = streamToolCallIdByExecId.get(state.toolCallId);
                 if (failStreamId) {
                   hookRewrittenArgs.set(failStreamId, preTool.args);
-                  broadcastStreamEvent({
+                  emit({
                     conversationId,
                     type: 'tool-call',
                     toolCallId: failStreamId,
@@ -1780,7 +1798,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Only rebroadcast when the stream id is known; otherwise the
               // stream handler applies the stored args on arrival (no dup card).
               if (modStreamId) {
-                broadcastStreamEvent({
+                emit({
                   conversationId,
                   type: 'tool-call',
                   toolCallId: modStreamId,
@@ -1796,7 +1814,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate exit_plan_mode behind user approval regardless of execution mode
             if (state.toolName === 'exit_plan_mode') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-              broadcastStreamEvent({
+              emit({
                 conversationId,
                 type: 'tool-approval-required',
                 toolCallId: streamId,
@@ -1814,7 +1832,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
                   broadcastExecutionMode('auto');
                   planDoneSent = true;
-                  broadcastStreamEvent({ conversationId, type: 'done', data: { planDismissed: true } });
+                  emit({ conversationId, type: 'done', data: { planDismissed: true } });
                   controller.abort();
                   return;
                 }
@@ -1826,7 +1844,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // mode so the agent can continue planning with the user.
                 console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
                 planDoneSent = true;
-                broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
+                emit({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
                 controller.abort();
                 return;
               }
@@ -1835,7 +1853,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-              broadcastStreamEvent({
+              emit({
                 conversationId,
                 type: 'tool-approval-required',
                 toolCallId: streamId,
@@ -1936,7 +1954,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const previousRuntimeId = detectRuntimeSwitch(messages, runtime.id);
           if (previousRuntimeId && modelEntry) {
             const switchToolCallId = `switch-${Date.now()}`;
-            broadcastStreamEvent({
+            emit({
               conversationId,
               type: 'tool-call',
               toolCallId: switchToolCallId,
@@ -1949,7 +1967,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               abortSignal: controller.signal,
             });
 
-            broadcastStreamEvent({
+            emit({
               conversationId,
               type: 'tool-result',
               toolCallId: switchToolCallId,
@@ -2044,9 +2062,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             console.info(
               `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
             );
-            broadcastStreamEvent(event);
+            emit(event);
             planDoneSent = true;
-            broadcastStreamEvent({ conversationId, type: 'done', data: { planModeRestart: true } });
+            emit({ conversationId, type: 'done', data: { planModeRestart: true } });
             controller.abort();
             return { conversationId };
           }
@@ -2134,19 +2152,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           ipcDebugLog(
             `[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`,
           );
-          broadcastStreamEvent(event);
+          emit(event);
         }
       } catch (error) {
         ipcDebugLog(
           `[LOOP-ERROR] conv=${conversationId} aborted=${controller.signal.aborted} error=${error instanceof Error ? error.message : String(error)}`,
         );
         if (!controller.signal.aborted) {
-          broadcastStreamEvent({
+          emit({
             conversationId,
             type: 'error',
             error: error instanceof Error ? error.message : String(error),
           });
-          broadcastStreamEvent({ conversationId, type: 'done' });
+          emit({ conversationId, type: 'done' });
         }
       } finally {
         ipcDebugLog(`[LOOP-FINALLY] conv=${conversationId} cleaning up`);

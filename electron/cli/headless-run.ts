@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { LocalBridgeClient } from './client.js';
+import { stripControl } from './render/markdown.js';
 
 type StreamEvent = {
   conversationId?: string;
@@ -61,14 +62,16 @@ export async function runHeadlessOnce(client: LocalBridgeClient): Promise<void> 
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
       if (e.conversationId !== id) return;
-      if (e.type === 'text-delta' && e.text) process.stdout.write(e.text);
-      else if (e.type === 'tool-call') process.stderr.write(`\n[tool: ${e.toolName ?? 'tool'}]\n`);
+      if (e.type === 'text-delta' && e.text) process.stdout.write(stripControl(e.text));
+      else if (e.type === 'tool-call') process.stderr.write(`\n[tool: ${stripControl(e.toolName ?? 'tool')}]\n`);
       else if (e.type === 'tool-approval-required' && e.toolCallId) {
         // Non-interactive: can't prompt. Auto-reject so the run doesn't hang
         // forever waiting on an approval no one can give.
-        process.stderr.write(`\n[auto-denied ${e.toolName ?? 'tool'} — approval needs an interactive terminal]\n`);
+        process.stderr.write(
+          `\n[auto-denied ${stripControl(e.toolName ?? 'tool')} — approval needs an interactive terminal]\n`,
+        );
         void client.invoke('agent:reject-tool', e.toolCallId).catch(() => {});
-      } else if (e.type === 'error') process.stderr.write(`\n[error: ${e.error ?? 'unknown'}]\n`);
+      } else if (e.type === 'error') process.stderr.write(`\n[error: ${stripControl(e.error ?? 'unknown')}]\n`);
       else if (e.type === 'done') {
         process.stdout.write('\n');
         finish();
