@@ -1,79 +1,56 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { writeFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { getComputerUseManager } from '../computer-use/service.js';
+import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
+import {
+  readIndex,
+  readConversation,
+  writeConversation,
+  deleteConversation,
+  clearAllConversations,
+  getActiveConversationId,
+  setActiveConversationId,
+} from './conversation-store.js';
 
-type ConversationRecord = {
-  id: string;
-  title: string | null;
-  fallbackTitle: string | null;
-  messages: unknown[];
-  messageTree?: unknown[];
-  headId?: string | null;
-  conversationCompaction: unknown | null;
-  lastContextUsage: unknown | null;
-  createdAt: string;
-  updatedAt: string;
-  lastMessageAt: string | null;
-  titleStatus: 'idle' | 'generating' | 'ready' | 'error';
-  titleUpdatedAt: string | null;
-  messageCount: number;
-  userMessageCount: number;
-  runStatus: 'idle' | 'running' | 'awaiting-approval' | 'error';
-  hasUnread: boolean;
-  lastAssistantUpdateAt: string | null;
-  selectedModelKey: string | null;
-  selectedProfileKey?: string | null;
-  fallbackEnabled?: boolean;
-  profilePrimaryModelKey?: string | null;
-  currentWorkingDirectory?: string | null;
-  workspaceId?: string;
-  metadata?: Record<string, unknown>;
-};
+export type { ConversationRecord } from './conversation-store.js';
 
-type ConversationsStore = {
-  conversations: Record<string, ConversationRecord>;
-  activeConversationId: string | null;
-  settings: Record<string, unknown>;
-};
+// ── incremental broadcast ──────────────────────────────────────────────────
+// The store no longer ships the whole conversation set on every change. Each
+// mutation broadcasts only what changed so IPC + renderer cost is O(1 change),
+// not O(total history).
 
-function getStorePath(appHome: string): string {
-  return join(appHome, 'data', 'conversations.json');
-}
+/** Tagged `conversations:changed` payloads consumed by the renderer. */
+export type ConversationChange =
+  | { kind: 'upsert'; conversation: ConversationRecord; activeConversationId: string | null }
+  | { kind: 'delete'; id: string; activeConversationId: string | null }
+  | { kind: 'reset'; activeConversationId: string | null }
+  | { kind: 'active'; activeConversationId: string | null };
 
-export function readConversationStore(appHome: string): ConversationsStore {
-  const storePath = getStorePath(appHome);
-  if (!existsSync(storePath)) {
-    return { conversations: {}, activeConversationId: null, settings: {} };
-  }
-  try {
-    return JSON.parse(readFileSync(storePath, 'utf-8'));
-  } catch {
-    return { conversations: {}, activeConversationId: null, settings: {} };
-  }
-}
-
-export function writeConversationStore(appHome: string, store: ConversationsStore): void {
-  const storePath = getStorePath(appHome);
-  const dir = join(appHome, 'data');
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-  writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf-8');
-}
-
-export function broadcastConversationChange(store: ConversationsStore): void {
+function broadcastChange(change: ConversationChange): void {
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('conversations:changed', store);
+    win.webContents.send('conversations:changed', change);
   }
-  broadcastToWebClients('conversations:changed', store);
+  broadcastToWebClients('conversations:changed', change);
+}
+
+export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {
+  broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
+}
+function broadcastDelete(appHome: string, id: string): void {
+  broadcastChange({ kind: 'delete', id, activeConversationId: getActiveConversationId(appHome) });
+}
+function broadcastReset(appHome: string): void {
+  broadcastChange({ kind: 'reset', activeConversationId: getActiveConversationId(appHome) });
+}
+export function broadcastActive(appHome: string): void {
+  broadcastChange({ kind: 'active', activeConversationId: getActiveConversationId(appHome) });
 }
 
 // ── messageTree helpers (main-process append) ──────────────────────────────
@@ -149,8 +126,7 @@ export function appendConversationMessages(
   messages: Array<{ role: StoredTreeMessage['role']; content: unknown; createdAt?: string }>,
   options: { skipIfBusy?: boolean; parentId?: string | null; runStatus?: ConversationRecord['runStatus'] } = {},
 ): ConversationRecord | null {
-  const store = readConversationStore(appHome);
-  const conv = store.conversations[conversationId];
+  const conv = readConversation(appHome, conversationId);
   if (!conv) return null;
   if (options.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) {
     return null;
@@ -190,9 +166,8 @@ export function appendConversationMessages(
     ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
   };
 
-  store.conversations[conversationId] = next;
-  writeConversationStore(appHome, store);
-  broadcastConversationChange(store);
+  writeConversation(appHome, next);
+  broadcastUpsert(appHome, next);
   return next;
 }
 
@@ -315,38 +290,24 @@ export function preserveTerminalRunFields(prev: ConversationRecord, next: Conver
 
 export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, getConfig?: () => AppConfig): void {
   ipcMain.handle('conversations:list', () => {
-    const store = readConversationStore(appHome);
-    const conversations = Object.values(store.conversations);
-    // Sort by most recent activity
-    conversations.sort((a, b) => {
+    // Reads only the lightweight index — no message bodies loaded.
+    const index = readIndex(appHome);
+    const entries: ConversationIndexEntry[] = Object.values(index.conversations);
+    entries.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
       return bAt.localeCompare(aAt);
     });
-    // Add computed metadata for client-side filtering
-    return conversations.map((conv) => ({
-      ...conv,
-      hasToolCalls:
-        Array.isArray(conv.messages) &&
-        conv.messages.some((msg: unknown) => {
-          const m = msg as Record<string, unknown>;
-          return (
-            Array.isArray(m.content) &&
-            (m.content as Array<Record<string, unknown>>).some((part) => part?.type === 'tool-call')
-          );
-        }),
-    }));
+    return entries;
   });
 
   ipcMain.handle('conversations:get', (_event, id: string) => {
-    const store = readConversationStore(appHome);
-    return store.conversations[id] ?? null;
+    return readConversation(appHome, id) ?? null;
   });
 
   ipcMain.handle('conversations:put', (_event, conversation: ConversationRecord) => {
-    const store = readConversationStore(appHome);
     const tree = Array.isArray(conversation.messageTree) ? conversation.messageTree : [];
-    const prev = store.conversations[conversation.id];
+    const prev = readConversation(appHome, conversation.id);
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
     // Guard: never allow a write that would lose messages compared to what's on disk.
@@ -413,9 +374,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       nextConversation = reconcileConversationActivity(undefined, nextConversation);
     }
 
-    store.conversations[conversation.id] = nextConversation;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(appHome, nextConversation);
+    broadcastUpsert(appHome, nextConversation);
     if (!prev) {
       eventBus.emit('conversation', 'created', { id: conversation.id, title: nextConversation.title });
       void hookDispatcher.dispatch('ConversationStart', {
@@ -427,13 +387,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   });
 
   ipcMain.handle('conversations:delete', (_event, id: string) => {
-    const store = readConversationStore(appHome);
-    delete store.conversations[id];
-    if (store.activeConversationId === id) {
-      store.activeConversationId = null;
-    }
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    deleteConversation(appHome, id);
+    broadcastDelete(appHome, id);
     clearConversationDiffs(id);
 
     // Clean up associated computer-use sessions
@@ -450,13 +405,11 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   });
 
   ipcMain.handle('conversations:clear', () => {
-    const store = readConversationStore(appHome);
-
     // Clean up all computer-use sessions
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
-        for (const conversationId of Object.keys(store.conversations)) {
+        for (const conversationId of Object.keys(readIndex(appHome).conversations)) {
           manager.removeSessionsByConversation(conversationId);
         }
       } catch {
@@ -464,11 +417,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       }
     }
 
-    store.conversations = {};
-    store.activeConversationId = null;
+    clearAllConversations(appHome);
     clearAllDiffs();
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    broadcastReset(appHome);
     return { ok: true };
   });
 
@@ -478,7 +429,6 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   // perform the same operations without duplicating tree logic.
 
   const commitTreeUpdate = (
-    store: ConversationsStore,
     conv: ConversationRecord,
     tree: StoredTreeMessage[],
     headId: string | null,
@@ -496,17 +446,15 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       userMessageCount: branch.filter((m) => m.role === 'user').length,
       ...extra,
     };
-    store.conversations[conv.id] = next;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(appHome, next);
+    broadcastUpsert(appHome, next);
     return next;
   };
 
   ipcMain.handle(
     'conversations:edit-message',
     (_event, conversationId: string, messageId: string, newContent: unknown) => {
-      const store = readConversationStore(appHome);
-      const conv = store.conversations[conversationId];
+      const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 
       const { tree } = ensureConversationTree(conv);
@@ -527,13 +475,12 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
         createdAt: new Date().toISOString(),
       };
       const nextTree = [...tree, edited];
-      return { ok: true, conversation: commitTreeUpdate(store, conv, nextTree, edited.id) };
+      return { ok: true, conversation: commitTreeUpdate(conv, nextTree, edited.id) };
     },
   );
 
   ipcMain.handle('conversations:regenerate', (_event, conversationId: string, assistantMessageId: string) => {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations[conversationId];
+    const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
 
     const { tree, headId } = ensureConversationTree(conv);
@@ -543,31 +490,27 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     // Move head to the preceding user turn; the old assistant tail remains in
     // the tree as a sibling variant the user can flip back to.
     const nextHead = target.role === 'assistant' ? target.parentId : (target.id ?? headId);
-    return { ok: true, conversation: commitTreeUpdate(store, conv, tree, nextHead) };
+    return { ok: true, conversation: commitTreeUpdate(conv, tree, nextHead) };
   });
 
   ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations[conversationId];
+    const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
 
     const { tree } = ensureConversationTree(conv);
     if (!tree.some((m) => m.id === variantId)) return { ok: false, error: 'variant-not-found' };
 
     const nextHead = findDeepestDescendant(tree, variantId);
-    return { ok: true, conversation: commitTreeUpdate(store, conv, tree, nextHead) };
+    return { ok: true, conversation: commitTreeUpdate(conv, tree, nextHead) };
   });
 
   ipcMain.handle('conversations:get-active-id', () => {
-    const store = readConversationStore(appHome);
-    return store.activeConversationId;
+    return getActiveConversationId(appHome);
   });
 
   ipcMain.handle('conversations:set-active-id', (_event, id: string) => {
-    const store = readConversationStore(appHome);
-    store.activeConversationId = id;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    setActiveConversationId(appHome, id);
+    broadcastActive(appHome);
     return { ok: true };
   });
 
@@ -578,15 +521,14 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   ipcMain.handle(
     'conversations:set-selection',
     (_event, id: string, kind: 'model' | 'profile', value: string | null) => {
-      const store = readConversationStore(appHome);
-      const conv = store.conversations[id];
+      const conv = readConversation(appHome, id);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 
       if (kind === 'model') conv.selectedModelKey = value;
       else conv.selectedProfileKey = value;
       conv.updatedAt = new Date().toISOString();
-      writeConversationStore(appHome, store);
-      broadcastConversationChange(store);
+      writeConversation(appHome, conv);
+      broadcastUpsert(appHome, conv);
 
       // Resolve the effective model display name for the banner.
       let modelLabel: string | null = null;
@@ -612,8 +554,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   );
 
   ipcMain.handle('conversations:fork', (_event, id: string, upToMessageIndex?: number) => {
-    const store = readConversationStore(appHome);
-    const source = store.conversations[id];
+    const source = readConversation(appHome, id);
     if (!source) return { ok: false, error: 'Conversation not found' };
 
     // Deep-clone via JSON round-trip — the store is JSON-persisted so this is lossless.
@@ -665,17 +606,15 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       })(),
     };
 
-    store.conversations[forked.id] = forked;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(appHome, forked);
+    broadcastUpsert(appHome, forked);
     eventBus.emit('conversation', 'created', { id: forked.id, title: forked.title });
     void hookDispatcher.dispatch('ConversationStart', { conversationId: forked.id, title: forked.title });
     return { ok: true, conversation: forked };
   });
 
   ipcMain.handle('conversations:export', async (_event, id: string, format: 'markdown' | 'json') => {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations[id];
+    const conv = readConversation(appHome, id);
     if (!conv) return { ok: false, error: 'Conversation not found' };
 
     const ext = format === 'json' ? 'json' : 'md';

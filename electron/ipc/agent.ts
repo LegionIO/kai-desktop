@@ -8,13 +8,12 @@ import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
 import { readEffectiveConfig } from './config.js';
 import {
-  readConversationStore,
-  writeConversationStore,
-  broadcastConversationChange,
+  broadcastUpsert,
   ensureConversationTree,
   getConversationBranch,
   appendConversationMessages,
 } from './conversations.js';
+import { readConversation, writeConversation } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import { accumulateForPersistence, discardPersistenceAccumulator } from '../agent/stream-persistence.js';
@@ -123,8 +122,7 @@ function jsonStableString(value: unknown): string {
  */
 function persistRedactedUserTurn(appHome: string, conversationId: string, sanitizedContent: unknown): void {
   try {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations?.[conversationId];
+    const conv = readConversation(appHome, conversationId);
     if (!conv) return;
     const { tree, headId } = ensureConversationTree(conv);
     const branch = getConversationBranch(tree, headId);
@@ -149,8 +147,8 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
     // Recompute the flat `messages` mirror of the active branch so exports/list
     // reflect the redaction immediately.
     conv.messages = getConversationBranch(tree, headId) as never;
-    writeConversationStore(appHome, store);
-    broadcastConversationChange(store);
+    writeConversation(appHome, conv);
+    broadcastUpsert(appHome, conv);
     // The renderer ignores conversations:changed while a stream accumulator is
     // active (and then renders/persists its raw in-memory copy), so also emit a
     // stream event carrying the sanitized content + target node id so the live
@@ -238,15 +236,14 @@ function broadcastStreamEvent(event: StreamEvent): void {
 }
 
 /**
-/**
  * Auto-title a client-driven (CLI) conversation after its first completed turn,
  * mirroring what the GUI does client-side. No-op if the chat already has a
  * title or has no user turn yet. Best-effort: title failures are swallowed.
+ * Uses the per-conversation store (readConversation/writeConversation).
  */
 async function maybeAutoTitle(appHome: string, conversationId: string): Promise<void> {
   try {
-    const store = readConversationStore(appHome);
-    const conv = store.conversations[conversationId];
+    const conv = readConversation(appHome, conversationId);
     if (!conv || conv.title) return;
 
     const { tree, headId } = ensureConversationTree(conv);
@@ -267,14 +264,13 @@ async function maybeAutoTitle(appHome: string, conversationId: string): Promise<
     if (!title) return;
 
     // Re-read so we don't clobber a concurrent write, then persist the title.
-    const latest = readConversationStore(appHome);
-    const target = latest.conversations[conversationId];
-    if (!target || target.title) return;
-    target.title = title;
-    target.titleStatus = 'ready';
-    target.titleUpdatedAt = new Date().toISOString();
-    writeConversationStore(appHome, latest);
-    broadcastConversationChange(latest);
+    const latest = readConversation(appHome, conversationId);
+    if (!latest || latest.title) return;
+    latest.title = title;
+    latest.titleStatus = 'ready';
+    latest.titleUpdatedAt = new Date().toISOString();
+    writeConversation(appHome, latest);
+    broadcastUpsert(appHome, latest);
   } catch {
     // Best-effort — never let titling break the turn.
   }
@@ -1875,8 +1871,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
         // Load persisted conversation metadata so runtimes can resume sessions.
         // Claude Code SDK uses `claudeSdkSessionId`; Codex SDK uses `codexSdkThreadId`.
-        const convStore = readConversationStore(appHome);
-        const convMetadata = (convStore.conversations[conversationId]?.metadata ?? {}) as Record<string, unknown>;
+        const convMetadata = (readConversation(appHome, conversationId)?.metadata ?? {}) as Record<string, unknown>;
 
         // -----------------------------------------------------------------------
         // Cross-runtime switch: detect runtime change and inject prior context
@@ -2126,11 +2121,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
   ipcMain.handle('agent:stream', streamHandler);
 
-  // Thin server-side entry point for clients that don't manage the message
-  // tree themselves (the `kai` CLI). Appends the user turn to the conversation
-  // (server-authoritative persistence), then delegates to the same stream path
-  // the GUI uses. The GUI keeps calling `agent:stream` directly with its own
-  // in-memory branch; both funnel through `streamHandler`.
+  // Thin server-side entry point for clients that don't manage the message tree
+  // themselves (the `kai` CLI). Appends the user turn (server-authoritative
+  // persistence), creating the conversation if the client hasn't yet, then
+  // delegates to the same stream path the GUI uses.
   ipcMain.handle(
     'agent:submit',
     async (
@@ -2146,22 +2140,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         executionMode?: ExecutionMode;
       },
     ) => {
-      const store = readConversationStore(appHome);
-      const conv = store.conversations[conversationId];
+      const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 
       appendConversationMessages(appHome, conversationId, [
         { role: 'user', content: [{ type: 'text', text: userText }] },
       ]);
 
-      // Re-read to get the freshly appended branch to send to the model.
-      const updated = readConversationStore(appHome).conversations[conversationId];
+      const updated = readConversation(appHome, conversationId);
+      if (!updated) return { ok: false, error: 'conversation-not-found' };
       const { tree, headId } = ensureConversationTree(updated);
       const branch = getConversationBranch(tree, headId);
 
-      // Flag this turn for server-side assistant persistence: the CLI/headless
-      // client won't write the reply back itself, so broadcastStreamEvent will
-      // accumulate the stream and persist the assistant turn on `done`.
+      // Flag this turn for server-side assistant persistence — the CLI/headless
+      // client won't write the reply itself.
       serverPersistConversations.add(conversationId);
 
       await streamHandler(
@@ -2189,8 +2181,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       activeStreamModelKeys.delete(conversationId);
     }
     activeObserverSessions.delete(conversationId);
-    // Drop any server-side persistence accumulation for a cancelled turn so a
-    // partial assistant reply isn't written and the next turn starts clean.
+    // Drop any server-side persistence accumulation for a cancelled turn.
     if (serverPersistConversations.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }

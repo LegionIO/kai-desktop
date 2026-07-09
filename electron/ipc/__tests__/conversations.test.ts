@@ -8,7 +8,7 @@
  *     renderer side talks to via `window.app.conversations.*`.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -36,9 +36,48 @@ import {
   ensureConversationTree,
   getConversationBranch,
   registerConversationHandlers,
-  readConversationStore,
-  writeConversationStore,
 } from '../conversations.js';
+import {
+  readIndex,
+  readConversation,
+  writeConversation,
+  writeIndex,
+  setActiveConversationId,
+  __resetMigrationGuardForTests,
+  type ConversationRecord,
+} from '../conversation-store.js';
+
+// Test shims mapping the old whole-store helpers onto the per-file store, so the
+// existing assertions (`readConversationStore(appHome).conversations.c`) and
+// seed calls (`writeConversationStore(appHome, { conversations, ... })`) keep
+// working against the new layout.
+function readConversationStore(home: string): {
+  conversations: Record<string, ConversationRecord>;
+  activeConversationId: string | null;
+  settings: Record<string, unknown>;
+} {
+  const index = readIndex(home);
+  const conversations: Record<string, ConversationRecord> = {};
+  for (const id of Object.keys(index.conversations)) {
+    const c = readConversation(home, id);
+    if (c) conversations[id] = c;
+  }
+  return { conversations, activeConversationId: index.activeConversationId, settings: index.settings };
+}
+
+function writeConversationStore(
+  home: string,
+  store: {
+    conversations: Record<string, ConversationRecord>;
+    activeConversationId?: string | null;
+    settings?: Record<string, unknown>;
+  },
+): void {
+  // Reset to exactly the provided set (mirrors the old whole-file overwrite).
+  writeIndex(home, { conversations: {}, activeConversationId: store.activeConversationId ?? null, settings: {} });
+  for (const conv of Object.values(store.conversations)) writeConversation(home, conv);
+  if (store.activeConversationId !== undefined) setActiveConversationId(home, store.activeConversationId);
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -81,6 +120,9 @@ beforeEach(() => {
   tempRoot = mkdtempSync(join(tmpdir(), 'kai-conv-ipc-'));
   appHome = join(tempRoot, 'app-home');
   mkdirSync(join(appHome, 'data'), { recursive: true });
+  // The per-file store guards migration with a module-level flag; reset it so
+  // each fresh temp appHome is evaluated independently.
+  __resetMigrationGuardForTests();
 });
 
 afterEach(() => {
@@ -131,9 +173,9 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ id: 'conv-1', hasToolCalls: false });
 
-    // The on-disk store should contain the entry as well.
-    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'));
-    expect(onDisk.conversations['conv-1']).toBeDefined();
+    // The on-disk per-file store should contain the entry as well.
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations', 'conv-1.json'), 'utf-8'));
+    expect(onDisk.id).toBe('conv-1');
   });
 
   it('conversations:put unions on-disk messages the incoming write is missing', async () => {
@@ -319,24 +361,20 @@ describe('conversations IPC: error paths', () => {
 
     const result = await harness.invoke<{ ok: boolean }>('conversations:delete', FAKE_EVENT, 'ghost');
     expect(result).toEqual({ ok: true });
-    // No conversation existed, so the store file is created on write but the
-    // conversation map stays empty.
-    expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
-    const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations.json'), 'utf-8'));
-    expect(onDisk.conversations).toEqual({});
+    // No conversation existed, so the per-file store stays empty.
+    const store = readConversationStore(appHome);
+    expect(store.conversations).toEqual({});
   });
 
-  it('tolerates a corrupted conversations.json by returning an empty store', async () => {
-    // Seed the store file with junk so the read path falls into its catch.
+  it('tolerates a corrupted index.json by returning an empty store', async () => {
+    // Seed then overwrite index.json with junk to exercise the parse-failure branch.
     writeConversationStore(appHome, {
       conversations: {},
       activeConversationId: null,
       settings: {},
     });
-    const storePath = join(appHome, 'data', 'conversations.json');
-    // Overwrite with invalid JSON to exercise the parse failure branch.
     mkdirSync(join(appHome, 'data'), { recursive: true });
-    writeFileSync(storePath, '{not valid json', 'utf-8');
+    writeFileSync(join(appHome, 'data', 'index.json'), '{not valid json', 'utf-8');
 
     const store = readConversationStore(appHome);
     expect(store).toEqual({

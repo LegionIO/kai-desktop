@@ -1554,12 +1554,15 @@ export function RuntimeProvider({
   // automation targeting this thread). Our own persists never grow the tree past
   // treeRef.current, so a longer incoming tree reliably signals an external append.
   useEffect(() => {
-    return app.conversations.onChanged((raw: unknown) => {
+    return app.conversations.onChanged((change) => {
       const activeId = activeIdRef.current;
       if (!activeId || streamAccumulators.has(activeId)) return;
-      const store = raw as { conversations?: Record<string, { messageTree?: unknown[]; messages?: unknown[] }> };
-      const conv = store.conversations?.[activeId];
-      if (!conv) return;
+      // Only an upsert of the ACTIVE conversation can require a reload (an
+      // external append, e.g. an automation targeting this thread). Our own
+      // persists never grow the tree past treeRef.current, so a longer incoming
+      // tree reliably signals an external write.
+      if (change.kind !== 'upsert' || change.conversation.id !== activeId) return;
+      const conv = change.conversation as { messageTree?: unknown[]; messages?: unknown[] };
       const incomingLen = (conv.messageTree ?? conv.messages ?? []).length;
       if (incomingLen > treeRef.current.length) {
         void loadConversationState(activeId);
@@ -1847,21 +1850,35 @@ export function RuntimeProvider({
           // the live view. Kick off an async disk fetch to backfill the persisted
           // prefix (e.g. the user prompt turn) without discarding any deltas; the
           // trailing automation `done` reloads the authoritative tree from disk.
-          streamAccumulators.set(convId, { messages: [], headId: null });
+          const seededAcc: MessageAccumulator = { messages: [], headId: null };
+          streamAccumulators.set(convId, seededAcc);
           if (!automationSeedInProgress.has(convId)) {
             automationSeedInProgress.add(convId);
             void app.conversations
               .get(convId)
               .then((conv) => {
                 const rec = conv as ConversationRecord | null;
-                const existingAcc = streamAccumulators.get(convId);
-                // Only backfill if the accumulator hasn't started collecting the
-                // assistant response yet (avoid clobbering live deltas).
-                if (rec && existingAcc && existingAcc.messages.length === 0) {
-                  const { tree, headId } = ensureTree(rec);
-                  existingAcc.messages = [...tree];
-                  existingAcc.headId = headId;
-                }
+                // Bail unless the SAME accumulator we seeded is still current and
+                // this conversation is still an automation stream. Otherwise the
+                // original run ended (accumulator deleted) and a new interactive/
+                // retry run may own convId now — mutating it or reparenting to a
+                // stale head would corrupt that unrelated run.
+                if (streamAccumulators.get(convId) !== seededAcc) return;
+                if (!automationStreams.has(convId)) return;
+                if (!rec) return;
+                const { tree, headId } = ensureTree(rec);
+                if (tree.length === 0) return;
+                // Merge the persisted prefix (user prompt / prior history) in
+                // FRONT of whatever live deltas we've already collected, without
+                // dropping them. Skip nodes we already hold, and reparent the
+                // first live (root) node onto the persisted head so the branch
+                // stays connected.
+                const haveIds = new Set(seededAcc.messages.map((m) => m.id));
+                const prefix = tree.filter((m) => !haveIds.has(m.id));
+                if (prefix.length === 0) return;
+                const live = seededAcc.messages.map((m) => (m.parentId === null ? { ...m, parentId: headId } : m));
+                seededAcc.messages = [...prefix, ...live];
+                if (seededAcc.headId === null) seededAcc.headId = headId;
               })
               .catch(() => {})
               .finally(() => automationSeedInProgress.delete(convId));
@@ -2477,6 +2494,14 @@ export function RuntimeProvider({
       if (isActiveConv) {
         setTree([...acc.messages]);
         setHeadId(acc.headId);
+      }
+      // Automation-owned stream: render live but NEVER persist from the renderer.
+      // The main process writes the authoritative [user, assistant] turns; a
+      // debounced renderer persist here could write a partial assistant-only
+      // branch before the main write lands, creating duplicate/orphaned nodes.
+      if (e.automation || automationStreams.has(convId)) {
+        if (isActiveConv && !acc.awaitingApproval) setIsRunning(true);
+        return;
       }
       const persistStatus =
         e.type === 'tool-approval-required'

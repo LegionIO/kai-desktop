@@ -33,9 +33,7 @@ const resetMockStore = (convs: MockStore['conversations'] = {}) => {
   mockStore.activeConversationId = null;
 };
 vi.mock('../../ipc/conversations.js', () => ({
-  readConversationStore: vi.fn(() => mockStore),
-  writeConversationStore: vi.fn(),
-  broadcastConversationChange: vi.fn(),
+  broadcastUpsert: vi.fn(),
   appendConversationMessages: vi.fn(
     (
       _home: string,
@@ -62,12 +60,26 @@ vi.mock('../../ipc/conversations.js', () => ({
   })),
   getConversationBranch: vi.fn((tree: unknown[]) => tree),
 }));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
+vi.mock('../../ipc/conversation-store.js', () => ({
+  readIndex: vi.fn(() => ({
+    conversations: mockStore.conversations,
+    activeConversationId: mockStore.activeConversationId,
+    settings: mockStore.settings,
+  })),
+  readConversation: vi.fn((_home: string, id: string) => mockStore.conversations[id] ?? null),
+  // createAutomationConversation writes the new shell conversation through this.
+  writeConversation: vi.fn((_home: string, conv: { id: string }) => {
+    mockStore.conversations[conv.id] = conv as Record<string, unknown>;
+  }),
+}));
 
 import type { AutomationConversationTarget, AutomationRule } from '../../config/schema.js';
 import { executeActions, interpolateString, type ActionDeps } from '../actions.js';
 import { AutomationEventBus } from '../event-bus.js';
 import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
-import { appendConversationMessages, writeConversationStore } from '../../ipc/conversations.js';
+import { appendConversationMessages } from '../../ipc/conversations.js';
+import { writeConversation } from '../../ipc/conversation-store.js';
 
 function rule(actions: AutomationRule['actions']): AutomationRule {
   return {
@@ -251,7 +263,7 @@ describe('agent conversationTarget', () => {
 
   beforeEach(() => {
     resetMockStore();
-    vi.mocked(writeConversationStore).mockClear();
+    vi.mocked(writeConversation).mockClear();
     vi.mocked(appendConversationMessages).mockClear();
     vi.mocked(generateForPlugin).mockClear();
     vi.mocked(streamForPlugin).mockClear();
@@ -259,8 +271,7 @@ describe('agent conversationTarget', () => {
 
   it('per-invocation creates a shell (automationSingleton=false) then writes prompt + assistant', async () => {
     await executeActions(agentAction({ type: 'per-invocation' }), evt, deps());
-    const [, store] = vi.mocked(writeConversationStore).mock.calls[0] as [string, MockStore];
-    const conv = Object.values(store.conversations)[0] as Record<string, unknown>;
+    const conv = vi.mocked(writeConversation).mock.calls[0][1] as unknown as Record<string, unknown>;
     expect((conv.metadata as Record<string, unknown>).automationSingleton).toBe(false);
     // User prompt is written first (running), assistant second (idle).
     expect(appendConversationMessages).toHaveBeenNthCalledWith(
@@ -312,8 +323,7 @@ describe('agent conversationTarget', () => {
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {
     await executeActions(agentAction({ type: 'singleton' }), evt, deps());
-    const [, store1] = vi.mocked(writeConversationStore).mock.calls[0] as [string, MockStore];
-    const created = Object.values(store1.conversations)[0] as {
+    const created = vi.mocked(writeConversation).mock.calls[0][1] as unknown as {
       id: string;
       metadata: Record<string, unknown>;
       messageTree?: unknown[];
@@ -354,10 +364,10 @@ describe('agent conversationTarget', () => {
       expect.objectContaining({ runStatus: 'idle' }),
     );
 
-    vi.mocked(writeConversationStore).mockClear();
+    vi.mocked(writeConversation).mockClear();
     resetMockStore();
     await executeActions(agentAction({ type: 'existing', conversationId: 'gone' }), evt, deps());
-    expect(writeConversationStore).toHaveBeenCalled();
+    expect(writeConversation).toHaveBeenCalled();
   });
 
   it('includeHistory=true prepends the target branch to the agent input', async () => {

@@ -66,7 +66,7 @@ import { SplashBackground } from '@/components/SplashBackground';
 import { TooltipProvider } from '@/components/ui/Tooltip';
 import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelector';
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
-import { app } from '@/lib/ipc-client';
+import { app, type ConversationChange } from '@/lib/ipc-client';
 import { cn, generateId } from '@/lib/utils';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
@@ -424,11 +424,6 @@ function getComputerSessionForConversation(
   return sessionsByConversation.get(conversationId)?.[0];
 }
 
-type ConversationsStore = {
-  conversations?: Record<string, ConversationRecord>;
-  activeConversationId?: string | null;
-};
-
 type AppView = string;
 
 const CHAT_VIEW = 'chat';
@@ -716,23 +711,16 @@ function AppShell() {
   useEffect(() => {
     let cancelled = false;
 
-    const applyStore = (store: ConversationsStore | null) => {
+    const applyStore = (activeId: string | null, activeConversation: ConversationRecord | null) => {
       if (cancelled) return;
       if (suppressStoreSync.current) return;
-      const resolvedActiveId = store?.activeConversationId ?? null;
-      const conversation =
-        resolvedActiveId && store?.conversations ? (store.conversations[resolvedActiveId] ?? null) : null;
-
-      setActiveConversationId(resolvedActiveId);
+      setActiveConversationId(activeId);
       setActiveConversationTitle(
-        getConversationDisplayTitle(
-          conversation,
-          resolvedActiveId ? cuSessionsByConversation.get(resolvedActiveId) : undefined,
-        ),
+        getConversationDisplayTitle(activeConversation, activeId ? cuSessionsByConversation.get(activeId) : undefined),
       );
       setActiveConversationHasMessages(
-        (conversation as { messageCount?: number } | null)?.messageCount
-          ? (conversation as { messageCount: number }).messageCount > 0
+        (activeConversation as { messageCount?: number } | null)?.messageCount
+          ? (activeConversation as { messageCount: number }).messageCount > 0
           : false,
       );
     };
@@ -741,11 +729,10 @@ function AppShell() {
       try {
         const [id, list] = await Promise.all([app.conversations.getActiveId(), app.conversations.list()]);
         if (cancelled) return;
-
-        const conversations = Object.fromEntries(
-          (list as ConversationRecord[]).map((conversation) => [conversation.id, conversation]),
-        );
-        applyStore({ activeConversationId: id, conversations });
+        const resolvedId = (id as string | null) ?? null;
+        const active =
+          resolvedId != null ? ((list as ConversationRecord[]).find((c) => c.id === resolvedId) ?? null) : null;
+        applyStore(resolvedId, active);
       } catch {
         if (!cancelled) {
           setActiveConversationId(null);
@@ -755,8 +742,21 @@ function AppShell() {
     };
 
     void loadActiveConversation();
-    const unsubscribe = app.conversations.onChanged((store) => {
-      applyStore(store as ConversationsStore);
+    const unsubscribe = app.conversations.onChanged((raw) => {
+      const change = raw as ConversationChange;
+      const activeId = change.activeConversationId ?? null;
+      // We only need the active conversation's summary here. If the changed
+      // record IS the active one, use it directly; otherwise re-fetch just that
+      // one (cheap, single-file) so the title/hasMessages stay correct.
+      if (change.kind === 'upsert' && change.conversation.id === activeId) {
+        applyStore(activeId, change.conversation as unknown as ConversationRecord);
+      } else if (activeId == null) {
+        applyStore(null, null);
+      } else {
+        void app.conversations.get(activeId).then((conv) => {
+          applyStore(activeId, (conv as ConversationRecord | null) ?? null);
+        });
+      }
     });
 
     return () => {

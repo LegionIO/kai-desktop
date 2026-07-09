@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { dialog } from 'electron';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { readConversationStore } from './conversations.js';
+import { readAllConversations } from './conversation-store.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -135,10 +135,10 @@ type ConvRecord = {
 };
 
 function getConversationMeta(appHome: string): Map<string, ConversationMeta> {
-  const store = readConversationStore(appHome);
+  const conversations = readAllConversations(appHome);
   const meta = new Map<string, ConversationMeta>();
 
-  for (const conv of Object.values(store.conversations) as ConvRecord[]) {
+  for (const conv of conversations as ConvRecord[]) {
     const msgs = conv.messageTree ?? conv.messages ?? [];
     meta.set(conv.id, {
       id: conv.id,
@@ -160,7 +160,17 @@ function aggregateByConversation(appHome: string): ConversationUsageSummary[] {
   const meta = getConversationMeta(appHome);
 
   // Aggregate LLM events per conversation
-  const byConv = new Map<string, { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number; llmRequests: number }>();
+  const byConv = new Map<
+    string,
+    {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      totalTokens: number;
+      llmRequests: number;
+    }
+  >();
 
   for (const evt of events.events) {
     if (evt.modality !== 'llm' || !evt.conversationId) continue;
@@ -314,43 +324,49 @@ export function registerUsageHandlers(ipcMain: IpcMain, appHome: string): void {
   });
 
   // 2. Per-conversation breakdown (paginated + sortable + searchable)
-  ipcMain.handle('usage:by-conversation', (_event, params?: {
-    offset?: number;
-    limit?: number;
-    search?: string;
-    sortBy?: string;
-    sortDir?: string;
-  }) => {
-    summaryCache = null;
+  ipcMain.handle(
+    'usage:by-conversation',
+    (
+      _event,
+      params?: {
+        offset?: number;
+        limit?: number;
+        search?: string;
+        sortBy?: string;
+        sortDir?: string;
+      },
+    ) => {
+      summaryCache = null;
 
-    let conversations = aggregateByConversation(appHome);
+      let conversations = aggregateByConversation(appHome);
 
-    // Search filter
-    if (params?.search) {
-      const q = params.search.toLowerCase();
-      conversations = conversations.filter(
-        (c) => (c.title ?? '').toLowerCase().includes(q) || c.id.toLowerCase().includes(q),
-      );
-    }
+      // Search filter
+      if (params?.search) {
+        const q = params.search.toLowerCase();
+        conversations = conversations.filter(
+          (c) => (c.title ?? '').toLowerCase().includes(q) || c.id.toLowerCase().includes(q),
+        );
+      }
 
-    // Sort
-    const sortBy = params?.sortBy ?? 'totalTokens';
-    const sortDir = params?.sortDir === 'asc' ? 1 : -1;
-    conversations.sort((a, b) => {
-      const av = (a as Record<string, unknown>)[sortBy];
-      const bv = (b as Record<string, unknown>)[sortBy];
-      if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * sortDir;
-      if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * sortDir;
-      return 0;
-    });
+      // Sort
+      const sortBy = params?.sortBy ?? 'totalTokens';
+      const sortDir = params?.sortDir === 'asc' ? 1 : -1;
+      conversations.sort((a, b) => {
+        const av = (a as Record<string, unknown>)[sortBy];
+        const bv = (b as Record<string, unknown>)[sortBy];
+        if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * sortDir;
+        if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * sortDir;
+        return 0;
+      });
 
-    const total = conversations.length;
-    const offset = params?.offset ?? 0;
-    const limit = params?.limit ?? 25;
-    const page = conversations.slice(offset, offset + limit);
+      const total = conversations.length;
+      const offset = params?.offset ?? 0;
+      const limit = params?.limit ?? 25;
+      const page = conversations.slice(offset, offset + limit);
 
-    return { conversations: page, total, offset, limit };
-  });
+      return { conversations: page, total, offset, limit };
+    },
+  );
 
   // 3. Usage grouped by model
   ipcMain.handle('usage:by-model', () => {
@@ -392,7 +408,10 @@ export function registerUsageHandlers(ipcMain: IpcMain, appHome: string): void {
       if (evt.modality !== 'llm' || !evt.conversationId) continue;
       const model = evt.modelKey ?? 'unknown';
       let set = modelConvSets.get(model);
-      if (!set) { set = new Set(); modelConvSets.set(model, set); }
+      if (!set) {
+        set = new Set();
+        modelConvSets.set(model, set);
+      }
       set.add(evt.conversationId);
     }
     for (const [model, set] of modelConvSets) {
@@ -465,23 +484,25 @@ export function registerUsageHandlers(ipcMain: IpcMain, appHome: string): void {
 
     for (const e of events.events) {
       const convTitle = e.conversationId ? (meta.get(e.conversationId)?.title ?? '') : '';
-      lines.push([
-        e.timestamp,
-        e.modality,
-        csvEscape(e.conversationId ?? ''),
-        csvEscape(convTitle),
-        csvEscape(e.modelKey ?? ''),
-        e.inputTokens ?? '',
-        e.outputTokens ?? '',
-        e.cacheReadTokens ?? '',
-        e.cacheWriteTokens ?? '',
-        e.totalTokens ?? '',
-        e.durationSec ?? '',
-        e.imageCount ?? '',
-        e.videoCount ?? '',
-        e.size ?? '',
-        e.quality ?? '',
-      ].join(','));
+      lines.push(
+        [
+          e.timestamp,
+          e.modality,
+          csvEscape(e.conversationId ?? ''),
+          csvEscape(convTitle),
+          csvEscape(e.modelKey ?? ''),
+          e.inputTokens ?? '',
+          e.outputTokens ?? '',
+          e.cacheReadTokens ?? '',
+          e.cacheWriteTokens ?? '',
+          e.totalTokens ?? '',
+          e.durationSec ?? '',
+          e.imageCount ?? '',
+          e.videoCount ?? '',
+          e.size ?? '',
+          e.quality ?? '',
+        ].join(','),
+      );
     }
 
     const csv = lines.join('\n');

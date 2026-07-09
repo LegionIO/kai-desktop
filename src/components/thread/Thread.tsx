@@ -313,10 +313,9 @@ function useActiveConversationId(): string | null {
         if (!cancelled) setActiveConversationId(null);
       });
 
-    const unsubscribe = app.conversations.onChanged((store) => {
-      const payload = store as { activeConversationId?: string | null } | null;
+    const unsubscribe = app.conversations.onChanged((change) => {
       if (!cancelled) {
-        setActiveConversationId(payload?.activeConversationId ?? null);
+        setActiveConversationId(change.activeConversationId ?? null);
       }
     });
 
@@ -1266,8 +1265,7 @@ const AssistantMessage: FC = () => {
 
   // Extract pipeline enrichments stored as a content part
   const enrichmentsPart = content.find((p: { type: string }) => p.type === 'enrichments') as
-    | { type: 'enrichments'; enrichments: PipelineEnrichments }
-    | undefined;
+    { type: 'enrichments'; enrichments: PipelineEnrichments } | undefined;
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
 
   // Extract max-turns-reached content parts for interactive continue card

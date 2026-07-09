@@ -7,12 +7,12 @@ import { broadcastAgentStreamEvent } from '../ipc/agent.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
-  broadcastConversationChange,
+  broadcastUpsert,
   ensureConversationTree,
   getConversationBranch,
-  readConversationStore,
-  writeConversationStore,
 } from '../ipc/conversations.js';
+import { readIndex, readConversation, writeConversation } from '../ipc/conversation-store.js';
+import type { ConversationRecord } from '../ipc/conversation-store.js';
 import type { PluginActionPayload } from '../plugins/types.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { getPath } from './conditions.js';
@@ -79,8 +79,7 @@ function createAutomationConversation(
 ): string {
   const now = new Date().toISOString();
   const id = `auto-${randomUUID()}`;
-  const store = readConversationStore(appHome);
-  store.conversations[id] = {
+  const conv: ConversationRecord = {
     id,
     title,
     fallbackTitle: title,
@@ -103,8 +102,8 @@ function createAutomationConversation(
     selectedProfileKey: action.profileKey ?? null,
     metadata: { automationRuleId: rule.id, automationSingleton: singleton },
   };
-  writeConversationStore(appHome, store);
-  broadcastConversationChange(store);
+  writeConversation(appHome, conv);
+  broadcastUpsert(appHome, conv);
   return id;
 }
 
@@ -117,12 +116,11 @@ function resolveConversationTarget(
   const target = action.conversationTarget;
   if (target.type === 'per-invocation') return null;
 
-  const store = readConversationStore(appHome);
   const isBusy = (c: { id: string; runStatus?: string }) =>
     c.runStatus === 'running' || c.runStatus === 'awaiting-approval' || inFlightAutomationTargets.has(c.id);
 
   if (target.type === 'existing') {
-    const conv = store.conversations[target.conversationId];
+    const conv = readConversation(appHome, target.conversationId);
     if (!conv) {
       console.warn(
         `[automations] rule "${rule.name}" targets missing conversation ${target.conversationId}; creating a new one`,
@@ -138,7 +136,9 @@ function resolveConversationTarget(
     return { targetId: target.conversationId, created: false };
   }
 
-  for (const conv of Object.values(store.conversations)) {
+  // Singleton lookup uses the lightweight index (metadata + runStatus + id are all
+  // in the index entry — no need to load message bodies).
+  for (const conv of Object.values(readIndex(appHome).conversations)) {
     const meta = conv.metadata as { automationRuleId?: unknown; automationSingleton?: unknown } | undefined;
     if (meta?.automationRuleId === rule.id && meta?.automationSingleton === true) {
       if (isBusy(conv)) {
@@ -194,7 +194,7 @@ async function runAgentAction(
     // user prompt turn immediately with runStatus:'running' so the conversation
     // shows the prompt + a working indicator during generation.
     let messages: Array<{ role: string; content: unknown }> = [{ role: 'user', content: prompt }];
-    const existing = readConversationStore(deps.appHome).conversations[conversationId];
+    const existing = readConversation(deps.appHome, conversationId);
     let parentId: string | null | undefined;
     if (existing) {
       const { tree, headId } = ensureConversationTree(existing);
@@ -242,8 +242,7 @@ async function runAgentAction(
         { parentId: null, runStatus: 'running' },
       );
     }
-    const userTurnHeadId =
-      readConversationStore(deps.appHome).conversations[conversationId]?.headId ?? parentId ?? null;
+    const userTurnHeadId = readConversation(deps.appHome, conversationId)?.headId ?? parentId ?? null;
 
     // Stream the model response, broadcasting each event tagged `automation` so
     // the renderer renders it live in this conversation but defers persistence
@@ -267,6 +266,7 @@ async function runAgentAction(
     const toolPartById = new Map<string, ToolCallPart>();
     let text = '';
     let error: string | null = null;
+    let caughtStreamError = false;
     let modelKey = '';
     let lastEventWasToolResult = false;
     const toolCalls: PluginGenerateToolCall[] = [];
@@ -278,79 +278,97 @@ async function runAgentAction(
       else contentParts.push({ type: 'text', text: delta });
     };
 
-    for await (const ev of streamForPlugin({
-      messages,
-      config,
-      appHome: deps.appHome,
-      conversationId,
-      modelKey: action.modelKey,
-      profileKey: action.profileKey,
-      fallbackEnabled: Boolean(action.profileKey),
-      tools,
-      abortSignal: abortController.signal,
-    })) {
-      broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
+    // The stream (and its setup, e.g. resolving a model) can throw. If it does
+    // AFTER we've written the prompt turn, we must still finalize: write an
+    // assistant (error) turn, flip runStatus back to idle, and broadcast a
+    // terminal `done` — otherwise the conversation is stuck `running` forever
+    // with no reply. Catch here and fall through to the shared finalize path.
+    try {
+      for await (const ev of streamForPlugin({
+        messages,
+        config,
+        appHome: deps.appHome,
+        conversationId,
+        modelKey: action.modelKey,
+        profileKey: action.profileKey,
+        fallbackEnabled: Boolean(action.profileKey),
+        tools,
+        abortSignal: abortController.signal,
+      })) {
+        // Don't forward the inner stream's `done` — the renderer treats an
+        // automation `done` as terminal (clears + reloads). We broadcast exactly
+        // one terminal `done` AFTER the authoritative append below. Consume the
+        // inner done only for its modelKey.
+        if (ev.type === 'done') {
+          modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
+          continue;
+        }
+        broadcastAgentStreamEvent({ ...(ev as StreamEvent), conversationId, automation: true });
 
-      if (ev.type === 'done' && (ev as { modelKey?: string }).modelKey) {
-        modelKey = (ev as { modelKey?: string }).modelKey ?? modelKey;
-      } else if (ev.type === 'text-delta' && ev.text) {
-        if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
-          text += '\n\n';
-          appendTextPart('\n\n');
+        if (ev.type === 'text-delta' && ev.text) {
+          if (lastEventWasToolResult && text.length > 0 && !text.endsWith('\n')) {
+            text += '\n\n';
+            appendTextPart('\n\n');
+          }
+          text += ev.text;
+          appendTextPart(ev.text);
+          lastEventWasToolResult = false;
+        } else if (ev.type === 'tool-call' && ev.toolCallId) {
+          pendingToolCalls.set(ev.toolCallId, {
+            toolName: ev.toolName ?? 'unknown',
+            args: ev.args,
+            startedAt: Date.now(),
+          });
+          const part: ToolCallPart = {
+            type: 'tool-call',
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName ?? 'unknown',
+            args: ev.args ?? {},
+            argsText: JSON.stringify(ev.args ?? {}, null, 2),
+            startedAt: new Date().toISOString(),
+          };
+          toolPartById.set(ev.toolCallId, part);
+          contentParts.push(part);
+        } else if (ev.type === 'tool-result' && ev.toolCallId) {
+          lastEventWasToolResult = true;
+          const pending = pendingToolCalls.get(ev.toolCallId);
+          toolCalls.push({
+            toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+            args: pending?.args ?? {},
+            result: ev.result,
+            durationMs: pending ? Date.now() - pending.startedAt : undefined,
+          });
+          const part = toolPartById.get(ev.toolCallId);
+          if (part) {
+            part.result = ev.result;
+            part.finishedAt = new Date().toISOString();
+          }
+          pendingToolCalls.delete(ev.toolCallId);
+        } else if (ev.type === 'tool-error' && ev.toolCallId) {
+          const pending = pendingToolCalls.get(ev.toolCallId);
+          toolCalls.push({
+            toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
+            args: pending?.args ?? {},
+            result: null,
+            error: ev.error ?? 'Tool execution failed',
+            durationMs: pending ? Date.now() - pending.startedAt : undefined,
+          });
+          const part = toolPartById.get(ev.toolCallId);
+          if (part) {
+            part.error = ev.error ?? 'Tool execution failed';
+            part.result = { isError: true, error: ev.error ?? 'Tool execution failed' };
+            part.finishedAt = new Date().toISOString();
+          }
+          pendingToolCalls.delete(ev.toolCallId);
+        } else if (ev.type === 'error') {
+          error = ev.error ?? 'Unknown error';
         }
-        text += ev.text;
-        appendTextPart(ev.text);
-        lastEventWasToolResult = false;
-      } else if (ev.type === 'tool-call' && ev.toolCallId) {
-        pendingToolCalls.set(ev.toolCallId, {
-          toolName: ev.toolName ?? 'unknown',
-          args: ev.args,
-          startedAt: Date.now(),
-        });
-        const part: ToolCallPart = {
-          type: 'tool-call',
-          toolCallId: ev.toolCallId,
-          toolName: ev.toolName ?? 'unknown',
-          args: ev.args ?? {},
-          argsText: JSON.stringify(ev.args ?? {}, null, 2),
-          startedAt: new Date().toISOString(),
-        };
-        toolPartById.set(ev.toolCallId, part);
-        contentParts.push(part);
-      } else if (ev.type === 'tool-result' && ev.toolCallId) {
-        lastEventWasToolResult = true;
-        const pending = pendingToolCalls.get(ev.toolCallId);
-        toolCalls.push({
-          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
-          args: pending?.args ?? {},
-          result: ev.result,
-          durationMs: pending ? Date.now() - pending.startedAt : undefined,
-        });
-        const part = toolPartById.get(ev.toolCallId);
-        if (part) {
-          part.result = ev.result;
-          part.finishedAt = new Date().toISOString();
-        }
-        pendingToolCalls.delete(ev.toolCallId);
-      } else if (ev.type === 'tool-error' && ev.toolCallId) {
-        const pending = pendingToolCalls.get(ev.toolCallId);
-        toolCalls.push({
-          toolName: pending?.toolName ?? ev.toolName ?? 'unknown',
-          args: pending?.args ?? {},
-          result: null,
-          error: ev.error ?? 'Tool execution failed',
-          durationMs: pending ? Date.now() - pending.startedAt : undefined,
-        });
-        const part = toolPartById.get(ev.toolCallId);
-        if (part) {
-          part.error = ev.error ?? 'Tool execution failed';
-          part.result = { isError: true, error: ev.error ?? 'Tool execution failed' };
-          part.finishedAt = new Date().toISOString();
-        }
-        pendingToolCalls.delete(ev.toolCallId);
-      } else if (ev.type === 'error') {
-        error = ev.error ?? 'Unknown error';
       }
+    } catch (streamErr) {
+      // Setup or mid-stream failure after the prompt was written. Record it and
+      // fall through to finalize (assistant turn + idle + terminal done).
+      error = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      caughtStreamError = true;
     }
 
     const aborted = abortController.signal.aborted;
@@ -358,6 +376,10 @@ async function runAgentAction(
       // No text was produced — surface a status line so the message isn't empty.
       const fallbackText = aborted ? '_(stopped)_' : error ? `⚠️ ${error}` : '';
       if (fallbackText) appendTextPart(fallbackText);
+    } else if (caughtStreamError && error) {
+      // Partial text was produced before the throw — append the error so the
+      // failure is visible instead of being silently swallowed.
+      appendTextPart(`\n\n⚠️ ${error}`);
     }
     const assistantContent = contentParts.length > 0 ? contentParts : [{ type: 'text', text: '' }];
 
@@ -383,8 +405,11 @@ async function runAgentAction(
       event.depth + 1,
     );
 
-    if (error && !text && !aborted) {
-      throw new Error(error);
+    // Surface a real failure to the engine's run record — but only AFTER the
+    // conversation has been finalized above. A thrown stream error (or an
+    // `error` event with no output) is a genuine failure; an abort is not.
+    if (!aborted && (caughtStreamError || (error && !text))) {
+      throw new Error(error ?? 'Automation agent run failed');
     }
     return { text, modelKey, toolCalls, conversationId };
   } finally {
