@@ -39,6 +39,7 @@ export type ConversationRecord = {
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
   workspaceId?: string;
+  archived?: boolean;
   metadata?: Record<string, unknown>;
 };
 
@@ -64,6 +65,7 @@ export type ConversationIndexEntry = {
   profilePrimaryModelKey?: string | null;
   currentWorkingDirectory?: string | null;
   workspaceId?: string;
+  archived?: boolean;
   /** Precomputed so `list` never has to scan message bodies. */
   hasToolCalls: boolean;
   metadata?: Record<string, unknown>;
@@ -141,6 +143,7 @@ export function toIndexEntry(conv: ConversationRecord): ConversationIndexEntry {
     profilePrimaryModelKey: conv.profilePrimaryModelKey,
     currentWorkingDirectory: conv.currentWorkingDirectory,
     workspaceId: conv.workspaceId,
+    archived: conv.archived,
     hasToolCalls: computeHasToolCalls(conv),
     metadata: conv.metadata,
   };
@@ -209,6 +212,9 @@ export function readAllConversations(appHome: string): ConversationRecord[] {
 
 /** Write one conversation file and update its index entry (single-file cost). */
 export function writeConversation(appHome: string, conv: ConversationRecord): void {
+  // Migrate BEFORE touching per-file state: otherwise a later readIndex() could
+  // run migration and overwrite the file we just wrote from the stale monolith.
+  migrateMonolithIfNeeded(appHome);
   ensureDirs(appHome);
   writeFileSync(conversationPath(appHome, conv.id), JSON.stringify(conv, null, 2), 'utf-8');
   const index = readIndex(appHome);
@@ -217,6 +223,8 @@ export function writeConversation(appHome: string, conv: ConversationRecord): vo
 }
 
 export function deleteConversation(appHome: string, id: string): void {
+  // Migrate first so a subsequent readIndex() can't recreate the file we delete.
+  migrateMonolithIfNeeded(appHome);
   try {
     const p = conversationPath(appHome, id);
     if (existsSync(p)) rmSync(p);
@@ -232,6 +240,8 @@ export function deleteConversation(appHome: string, id: string): void {
 }
 
 export function clearAllConversations(appHome: string): void {
+  // Migrate first so the monolith can't be re-split into files after we clear.
+  migrateMonolithIfNeeded(appHome);
   const dir = conversationsDir(appHome);
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
@@ -281,26 +291,46 @@ export function migrateMonolithIfNeeded(appHome: string): void {
       settings?: Record<string, unknown>;
     };
     const conversations = parsed.conversations ?? {};
-    ensureDirs(appHome);
     const index: ConversationIndex = {
       conversations: {},
       activeConversationId: parsed.activeConversationId ?? null,
       settings: parsed.settings ?? {},
     };
-    for (const [id, conv] of Object.entries(conversations)) {
-      try {
-        writeFileSync(conversationPath(appHome, id), JSON.stringify(conv, null, 2), 'utf-8');
+    // Write every conversation into a TEMP dir first. Only if ALL succeed do we
+    // move them into place, write the index, and rename the monolith. A single
+    // per-record failure aborts the whole migration with the monolith intact —
+    // a partial migration that silently drops conversations is worse than none.
+    const finalDir = conversationsDir(appHome);
+    const stagingDir = `${finalDir}.migrating-${Date.now()}`;
+    mkdirSync(stagingDir, { recursive: true });
+    try {
+      for (const [id, conv] of Object.entries(conversations)) {
+        // sanitizeId throws on a bad id — treat as a failed migration, not a drop.
+        writeFileSync(join(stagingDir, `${sanitizeId(id)}.json`), JSON.stringify(conv, null, 2), 'utf-8');
         index.conversations[id] = toIndexEntry(conv);
-      } catch (err) {
-        console.error(`[conversation-store] migration: failed to write conversation ${id}:`, err);
       }
+      // All records staged successfully — commit atomically-ish: move files into
+      // the real dir, write the index, then rename the monolith last.
+      mkdirSync(finalDir, { recursive: true });
+      for (const name of readdirSync(stagingDir)) {
+        renameSync(join(stagingDir, name), join(finalDir, name));
+      }
+      rmSync(stagingDir, { recursive: true, force: true });
+      writeIndex(appHome, index);
+      // Keep the monolith as a safety copy — never delete migrated data.
+      renameSync(mono, `${mono}.migrated`);
+      console.info(
+        `[conversation-store] migrated ${Object.keys(index.conversations).length} conversations to per-file storage`,
+      );
+    } catch (recordErr) {
+      // Abort: discard the partial staging dir, leave the monolith untouched.
+      try {
+        rmSync(stagingDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      throw recordErr;
     }
-    writeIndex(appHome, index);
-    // Keep the monolith as a safety copy — never delete migrated data.
-    renameSync(mono, `${mono}.migrated`);
-    console.info(
-      `[conversation-store] migrated ${Object.keys(index.conversations).length} conversations to per-file storage`,
-    );
   } catch (err) {
     // Leave the monolith in place; a later read falls back to empty rather than
     // corrupting data. Reset the flag so a transient error can be retried.

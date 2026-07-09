@@ -54,9 +54,7 @@ function extractTextFromContent(content: unknown): string {
     .trim();
 }
 
-function formatMessagesAsConversation(
-  messages: Array<{ role?: string; content?: unknown }>,
-): string {
+function formatMessagesAsConversation(messages: Array<{ role?: string; content?: unknown }>): string {
   return messages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map((m) => {
@@ -101,13 +99,17 @@ export async function buildRealtimeMemoryContext(
   }
 
   console.info(`[RealtimeContext] Building context for conversation=${conversationId}, dbPath=${dbPath}`);
-  console.info(`[RealtimeContext] Config: maxTokens=${memoryConfig.maxTokens}, convoHistory=${memoryConfig.conversationHistory.enabled}, workingMem=${memoryConfig.workingMemory.enabled}, obs=${memoryConfig.observationalMemory.enabled}, semantic=${memoryConfig.semanticRecall.enabled}`);
+  console.info(
+    `[RealtimeContext] Config: maxTokens=${memoryConfig.maxTokens}, convoHistory=${memoryConfig.conversationHistory.enabled}, workingMem=${memoryConfig.workingMemory.enabled}, obs=${memoryConfig.observationalMemory.enabled}, semantic=${memoryConfig.semanticRecall.enabled}`,
+  );
 
   const maxTokens = memoryConfig.maxTokens || 8000;
   const memory = getSharedMemory(config, dbPath);
 
   if (!memory) {
-    console.info('[RealtimeContext] Memory not initialized (getSharedMemory returned null) — using call instructions only');
+    console.info(
+      '[RealtimeContext] Memory not initialized (getSharedMemory returned null) — using call instructions only',
+    );
     return CALL_INSTRUCTIONS;
   }
 
@@ -124,7 +126,9 @@ export async function buildRealtimeMemoryContext(
         threadId: conversationId,
         resourceId,
       });
-      console.info(`[RealtimeContext] Working memory result: ${workingMemory ? workingMemory.length + ' chars' : 'null/empty'}`);
+      console.info(
+        `[RealtimeContext] Working memory result: ${workingMemory ? workingMemory.length + ' chars' : 'null/empty'}`,
+      );
       if (workingMemory && workingMemory.trim()) {
         sections.push({
           label: '## Working Memory',
@@ -154,25 +158,28 @@ export async function buildRealtimeMemoryContext(
           perPage: maxMessages,
         });
 
-        console.info(`[RealtimeContext] Recall returned ${result.messages?.length ?? 0} messages (total=${result.total})`);
+        console.info(
+          `[RealtimeContext] Recall returned ${result.messages?.length ?? 0} messages (total=${result.total})`,
+        );
 
         if (result.messages && result.messages.length > 0) {
           // Log first few message roles for debugging
-          const preview = result.messages
-            .slice(0, 5)
-            .map((message) => {
-              const typedMessage = message as ConversationMessage;
-              const contentPreview = typeof typedMessage.content === 'string'
+          const preview = result.messages.slice(0, 5).map((message) => {
+            const typedMessage = message as ConversationMessage;
+            const contentPreview =
+              typeof typedMessage.content === 'string'
                 ? typedMessage.content.slice(0, 50)
                 : JSON.stringify(typedMessage.content).slice(0, 50);
-              return `${typedMessage.role}:${contentPreview}`;
-            });
+            return `${typedMessage.role}:${contentPreview}`;
+          });
           console.info(`[RealtimeContext] Message preview: ${JSON.stringify(preview)}`);
 
           const formatted = formatMessagesAsConversation(
             result.messages as Array<{ role?: string; content?: unknown }>,
           );
-          console.info(`[RealtimeContext] Formatted conversation: ${formatted ? formatted.length + ' chars' : 'empty'}`);
+          console.info(
+            `[RealtimeContext] Formatted conversation: ${formatted ? formatted.length + ' chars' : 'empty'}`,
+          );
           if (formatted) {
             sections.push({
               label: '## Recent Conversation',
@@ -182,34 +189,32 @@ export async function buildRealtimeMemoryContext(
           }
         }
       } else {
-        // Thread not in Mastra storage — try reading from conversations.json directly
+        // Thread not in Mastra storage — fall back to the per-file conversation
+        // store. dbPath is `<appHome>/data/memory.db`, so appHome is two dirs up.
         console.info('[RealtimeContext] Thread not found in Mastra storage — falling back to conversations store');
         try {
-          const { readFileSync, existsSync } = await import('fs');
-          const { join, dirname } = await import('path');
-          const convStorePath = join(dirname(dbPath), 'conversations.json');
-          if (existsSync(convStorePath)) {
-            const store = JSON.parse(readFileSync(convStorePath, 'utf-8')) as {
-              conversations?: Record<string, { messages?: Array<{ role?: string; content?: unknown }> }>;
-            };
-            const convo = store.conversations?.[conversationId];
-            if (convo?.messages && convo.messages.length > 0) {
-              console.info(`[RealtimeContext] Found ${convo.messages.length} messages in conversations.json`);
-              const recentMessages = convo.messages.slice(-maxMessages);
-              const formatted = formatMessagesAsConversation(recentMessages);
-              console.info(`[RealtimeContext] Formatted from conversations.json: ${formatted ? formatted.length + ' chars' : 'empty'}`);
-              if (formatted) {
-                sections.push({
-                  label: '## Recent Conversation',
-                  content: formatted,
-                  priority: 2,
-                });
-              }
-            } else {
-              console.info(`[RealtimeContext] Conversation "${conversationId}" not found or empty in conversations.json`);
+          const { dirname } = await import('path');
+          const { readConversation } = await import('../ipc/conversation-store.js');
+          const appHome = dirname(dirname(dbPath));
+          const convo = readConversation(appHome, conversationId) as {
+            messages?: Array<{ role?: string; content?: unknown }>;
+          } | null;
+          if (convo?.messages && convo.messages.length > 0) {
+            console.info(`[RealtimeContext] Found ${convo.messages.length} messages in conversation store`);
+            const recentMessages = convo.messages.slice(-maxMessages);
+            const formatted = formatMessagesAsConversation(recentMessages);
+            console.info(
+              `[RealtimeContext] Formatted from conversation store: ${formatted ? formatted.length + ' chars' : 'empty'}`,
+            );
+            if (formatted) {
+              sections.push({
+                label: '## Recent Conversation',
+                content: formatted,
+                priority: 2,
+              });
             }
           } else {
-            console.info(`[RealtimeContext] conversations.json not found at ${convStorePath}`);
+            console.info(`[RealtimeContext] Conversation "${conversationId}" not found or empty in conversation store`);
           }
         } catch (fallbackErr) {
           console.warn('[RealtimeContext] Fallback conversation read failed:', fallbackErr);
@@ -240,7 +245,9 @@ export async function buildRealtimeMemoryContext(
         const store = await storageAccess.storage.getStore('memory');
         console.info(`[RealtimeContext] Got memory store, calling getObservationalMemory(null, "${resourceId}")...`);
         const obsRecord = await store.getObservationalMemory(null, resourceId);
-        console.info(`[RealtimeContext] Observational memory: ${obsRecord?.activeObservations ? obsRecord.activeObservations.length + ' chars' : 'null/empty'}`);
+        console.info(
+          `[RealtimeContext] Observational memory: ${obsRecord?.activeObservations ? obsRecord.activeObservations.length + ' chars' : 'null/empty'}`,
+        );
         if (obsRecord?.activeObservations?.trim()) {
           sections.push({
             label: '## Long-term Memory (Observations)',
@@ -324,7 +331,8 @@ export async function buildRealtimeMemoryContext(
     if (sectionTokens > remainingTokens) {
       // Truncate this section to fit remaining budget
       const truncated = truncateToTokenBudget(section.content, remainingTokens - estimateTokens(section.label) - 5);
-      if (truncated.length > 20) { // Only include if there's meaningful content
+      if (truncated.length > 20) {
+        // Only include if there's meaningful content
         assembledParts.push(section.label);
         assembledParts.push(truncated);
         assembledParts.push('');
@@ -341,7 +349,9 @@ export async function buildRealtimeMemoryContext(
   assembledParts.push(CALL_INSTRUCTIONS);
 
   const result = assembledParts.join('\n');
-  console.info(`[RealtimeContext] Built context: ${result.length} chars (~${estimateTokens(result)} tokens), ${sections.length} section(s)`);
+  console.info(
+    `[RealtimeContext] Built context: ${result.length} chars (~${estimateTokens(result)} tokens), ${sections.length} section(s)`,
+  );
 
   return result;
 }

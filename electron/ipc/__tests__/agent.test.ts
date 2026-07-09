@@ -107,11 +107,16 @@ vi.mock('../config.js', () => ({
 }));
 
 vi.mock('../conversations.js', () => ({
-  readConversationStore: vi.fn(() => ({
-    conversations: {},
-    activeConversationId: null,
-    settings: {},
+  broadcastUpsert: vi.fn(),
+  ensureConversationTree: vi.fn((c: { messageTree?: unknown[]; headId?: string | null }) => ({
+    tree: c.messageTree ?? [],
+    headId: c.headId ?? null,
   })),
+  getConversationBranch: vi.fn((tree: unknown[]) => tree),
+}));
+vi.mock('../conversation-store.js', () => ({
+  readConversation: vi.fn(() => null),
+  writeConversation: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------

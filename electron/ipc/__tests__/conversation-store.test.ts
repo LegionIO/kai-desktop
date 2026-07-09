@@ -152,4 +152,45 @@ describe('migration from the monolith', () => {
     expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
     expect(existsSync(join(appHome, 'data', 'conversations.json.migrated'))).toBe(false);
   });
+
+  it('aborts atomically if any record fails — monolith intact, no partial files', () => {
+    // A bad (path-traversal) id makes sanitizeId throw mid-migration. The whole
+    // migration must abort: monolith kept, index NOT written, no per-file leftovers.
+    writeFileSync(
+      join(appHome, 'data', 'conversations.json'),
+      JSON.stringify({
+        conversations: { good: makeConv('good'), '../evil': makeConv('../evil') },
+        activeConversationId: null,
+        settings: {},
+      }),
+      'utf-8',
+    );
+    migrateMonolithIfNeeded(appHome);
+    expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
+    expect(existsSync(join(appHome, 'data', 'conversations.json.migrated'))).toBe(false);
+    expect(existsSync(join(appHome, 'data', 'index.json'))).toBe(false);
+    // The valid "good" record must NOT have been left behind as a partial write.
+    expect(existsSync(join(appHome, 'data', 'conversations', 'good.json'))).toBe(false);
+  });
+
+  it('a write to an existing id after upgrade is not clobbered by lazy migration', () => {
+    // Simulate a freshly-upgraded install: monolith on disk, no index yet, and
+    // the migration guard not yet tripped this "session".
+    writeFileSync(
+      join(appHome, 'data', 'conversations.json'),
+      JSON.stringify({
+        conversations: { c1: makeConv('c1', { title: 'OLD' }) },
+        activeConversationId: 'c1',
+        settings: {},
+      }),
+      'utf-8',
+    );
+    __resetMigrationGuardForTests();
+    // First post-upgrade action is a WRITE to that same id (e.g. a new message).
+    writeConversation(appHome, makeConv('c1', { title: 'NEW' }));
+    // The write must win — migration (which runs first inside writeConversation)
+    // must not overwrite it with the stale monolith copy.
+    expect(readConversation(appHome, 'c1')?.title).toBe('NEW');
+    expect(readIndex(appHome).conversations.c1.title).toBe('NEW');
+  });
 });

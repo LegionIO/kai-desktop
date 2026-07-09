@@ -12,10 +12,20 @@ vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: '', modelKey: 'test', toolCalls: [] })),
 }));
 vi.mock('../../ipc/conversations.js', () => ({
-  readConversationStore: () => ({ conversations: {}, activeConversationId: null, settings: {} }),
-  writeConversationStore: () => {},
-  broadcastConversationChange: () => {},
+  broadcastUpsert: () => {},
+  appendConversationMessages: () => null,
+  ensureConversationTree: (c: { messageTree?: unknown[]; headId?: string | null }) => ({
+    tree: c.messageTree ?? [],
+    headId: c.headId ?? null,
+  }),
+  getConversationBranch: (tree: unknown[]) => tree,
 }));
+vi.mock('../../ipc/conversation-store.js', () => ({
+  readIndex: () => ({ conversations: {}, activeConversationId: null, settings: {} }),
+  readConversation: () => null,
+  writeConversation: () => {},
+}));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: () => {} }));
 
 import type { AutomationRule, AutomationsConfig } from '../../config/schema.js';
 import { AutomationEngine, type EngineDeps } from '../engine.js';

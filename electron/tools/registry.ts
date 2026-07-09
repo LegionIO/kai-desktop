@@ -29,8 +29,7 @@ import { createVideoGenTool } from './video-gen.js';
 import { buildCliTools } from './cli-tools.js';
 import { createPluginInfoTool } from './plugin-info.js';
 import { z } from 'zod';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readConversation } from '../ipc/conversation-store.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
@@ -151,17 +150,7 @@ function buildConversationContextSummary(conversation: ConversationRecordLike | 
 }
 
 function readConversationRecord(appHome: string, conversationId: string): ConversationRecordLike | null {
-  const storePath = join(appHome, 'data', 'conversations.json');
-  if (!existsSync(storePath)) return null;
-
-  try {
-    const store = JSON.parse(readFileSync(storePath, 'utf-8')) as {
-      conversations?: Record<string, ConversationRecordLike>;
-    };
-    return store.conversations?.[conversationId] ?? null;
-  } catch {
-    return null;
-  }
+  return readConversation(appHome, conversationId) as ConversationRecordLike | null;
 }
 
 export async function buildToolRegistry(

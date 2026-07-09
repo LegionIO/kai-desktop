@@ -30,9 +30,15 @@ vi.mock('../renderer-build.js', () => ({ buildPluginRendererBundle: async () => 
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => {} }));
 vi.mock('../../tools/skill-loader.js', () => ({ convertJsonSchemaToZod: () => null }));
 vi.mock('../../ipc/conversations.js', () => ({
-  readConversationStore: () => ({}),
-  writeConversationStore: () => {},
-  broadcastConversationChange: () => {},
+  broadcastUpsert: () => {},
+  broadcastActive: () => {},
+}));
+vi.mock('../../ipc/conversation-store.js', () => ({
+  readConversation: () => null,
+  readAllConversations: () => [],
+  writeConversation: () => {},
+  getActiveConversationId: () => null,
+  setActiveConversationId: () => {},
 }));
 
 /**

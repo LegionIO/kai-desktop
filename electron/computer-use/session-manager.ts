@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { getActiveConversationId } from '../ipc/conversation-store.js';
 import { app, BrowserWindow, Notification, screen } from 'electron';
 import type {
   ComputerOverlayState,
@@ -44,18 +45,8 @@ const SESSION_ALERT_SOUND_BY_KIND: Record<SessionAlertKind, string> = {
 };
 
 function readActiveConversationId(appHome: string): string | null {
-  const storePath = join(appHome, 'data', 'conversations.json');
-  if (!existsSync(storePath)) return null;
-  try {
-    const store = JSON.parse(readFileSync(storePath, 'utf-8')) as {
-      activeConversationId?: string | null;
-    };
-    return typeof store.activeConversationId === 'string' && store.activeConversationId.trim()
-      ? store.activeConversationId
-      : null;
-  } catch {
-    return null;
-  }
+  const id = getActiveConversationId(appHome);
+  return typeof id === 'string' && id.trim() ? id : null;
 }
 
 function normalizeHydratedSession(session: ComputerSession): ComputerSession {
