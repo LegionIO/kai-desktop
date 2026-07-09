@@ -1185,6 +1185,7 @@ export function RuntimeProvider({
   };
   onModelFallback?: (toModelKey: string) => void;
   onConversationSettingsLoaded?: (settings: {
+    conversationId: string;
     selectedModelKey: string | null;
     selectedProfileKey: string | null;
     fallbackEnabled: boolean;
@@ -1426,6 +1427,7 @@ export function RuntimeProvider({
 
     // Restore per-conversation settings (model, profile, fallback, thread overrides)
     onConversationSettingsLoadedRef.current?.({
+      conversationId: id,
       selectedModelKey: conv.selectedModelKey ?? null,
       selectedProfileKey: conv.selectedProfileKey ?? null,
       fallbackEnabled: conv.fallbackEnabled ?? false,

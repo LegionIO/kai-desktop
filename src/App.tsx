@@ -231,6 +231,9 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
   const [fallbackEnabled, setFallbackEnabled] = useState(false);
   const [profilePrimaryModelKey, setProfilePrimaryModelKey] = useState<string | null>(null);
+  // See AppShell: gate persistence until this conversation's settings hydrate,
+  // or the persist effect clobbers saved values with initial null state.
+  const hydratedSettingsConvIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!conversationId) {
@@ -256,6 +259,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
         setSelectedProfileKey(record?.selectedProfileKey ?? null);
         setFallbackEnabled(record?.fallbackEnabled ?? false);
         setProfilePrimaryModelKey(record?.profilePrimaryModelKey ?? null);
+        hydratedSettingsConvIdRef.current = conversationId;
       })
       .catch(() => {
         if (cancelled) return;
@@ -272,6 +276,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
 
   useEffect(() => {
     if (!conversationId) return;
+    if (hydratedSettingsConvIdRef.current !== conversationId) return;
     app.conversations
       .get(conversationId)
       .then((conv: unknown) => {
@@ -527,6 +532,11 @@ function AppShell() {
   const [activeConversationHasMessages, setActiveConversationHasMessages] = useState(false);
   const [activeView, setActiveView] = useState<AppView>('chat');
   const [threadMode, setThreadMode] = useState<ThreadMode>('chat');
+  // Tracks the conversation id whose per-conversation settings (model, profile,
+  // overrides) have been hydrated into state. The persist effect must not write
+  // until this matches the active conversation, or it clobbers the saved values
+  // with the previous conversation's stale state on switch.
+  const hydratedSettingsConvIdRef = useRef<string | null>(null);
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
@@ -1112,6 +1122,7 @@ function AppShell() {
   // Restore per-conversation settings when switching conversations
   const handleConversationSettingsLoaded = useCallback(
     (settings: {
+      conversationId: string;
       selectedModelKey: string | null;
       selectedProfileKey: string | null;
       fallbackEnabled: boolean;
@@ -1124,6 +1135,7 @@ function AppShell() {
       maxRetries?: number | null;
       runtimeOverride?: string | null;
     }) => {
+      hydratedSettingsConvIdRef.current = settings.conversationId;
       setSelectedModelKey(settings.selectedModelKey);
       setSelectedProfileKey(settings.selectedProfileKey);
       setFallbackEnabled(settings.fallbackEnabled);
@@ -1146,6 +1158,11 @@ function AppShell() {
   // Persist per-conversation settings whenever they change
   useEffect(() => {
     if (!activeConversationId) return;
+    // Don't persist until the settings for THIS conversation have been hydrated
+    // into state. On a conversation switch, activeConversationId updates before
+    // the loaded model/profile/overrides are applied; writing here would clobber
+    // the saved values with the previous conversation's stale state.
+    if (hydratedSettingsConvIdRef.current !== activeConversationId) return;
     app.conversations
       .get(activeConversationId)
       .then((conv: unknown) => {
