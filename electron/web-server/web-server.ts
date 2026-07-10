@@ -74,6 +74,11 @@ const LOGIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
  *  JSON.parsed on the main process; an unbounded frame is a DoS vector. */
 const MAX_WS_MESSAGE_BYTES = 4 * 1024 * 1024; // 4 MiB
 
+/** How long the TLS/plain pre-read may wait for the first byte before the raw
+ *  socket is destroyed (slowloris guard). A real client sends its ClientHello /
+ *  request line immediately. */
+const PRE_READ_TIMEOUT_MS = 10_000;
+
 /* ── File-backed session store ─────────────────────────────────────── */
 
 const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
@@ -1190,7 +1195,20 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     ]);
 
     netServer = net.createServer((socket) => {
+      // Slowloris guard: this pre-read waits for the first byte to sniff TLS vs
+      // plain HTTP, but socket.once('readable') alone waits forever — an unauth
+      // client could hold many idle sockets before Node's HTTP timeouts apply.
+      // Bound the wait; a real client sends its ClientHello / request line at once.
+      const preReadTimer = setTimeout(() => {
+        socket.destroy();
+      }, PRE_READ_TIMEOUT_MS);
+      preReadTimer.unref?.();
+      socket.once('error', () => {
+        clearTimeout(preReadTimer);
+        socket.destroy();
+      });
       socket.once('readable', () => {
+        clearTimeout(preReadTimer);
         const buf: Buffer | null = socket.read(1);
         if (!buf || buf.length === 0) {
           socket.destroy();
