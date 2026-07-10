@@ -1128,6 +1128,7 @@ export async function startAgentRun(
   const scrubbedProcessEnv = filterAgentEnv(process.env as Record<string, string>, envDenylist, envAllowlist);
   const safeEnv = { ...scrubbedProcessEnv, ...filterAgentEnv(agent.config?.env, envDenylist, envAllowlist) };
 
+  let createdSessionId: string | null = null;
   try {
     const sessionId = await terminalManager.create(agent.currentTaskId, {
       runtime: effectiveRuntime,
@@ -1139,6 +1140,7 @@ export async function startAgentRun(
       envIsComplete: true,
       dangerousMode,
     });
+    createdSessionId = sessionId;
 
     agent.status = 'running';
     agent.terminalSessionId = sessionId;
@@ -1284,6 +1286,16 @@ export async function startAgentRun(
 
     return { sessionId };
   } catch (err) {
+    // If the PTY was created but a later step (persistence, task write) threw,
+    // kill it so we don't orphan a spawned process the agent record no longer
+    // tracks.
+    if (createdSessionId) {
+      try {
+        terminalManager.kill(createdSessionId);
+      } catch {
+        /* best-effort */
+      }
+    }
     return { error: String(err) };
   }
 }

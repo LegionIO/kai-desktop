@@ -15,6 +15,10 @@ import { join } from 'path';
 
 const buffers = new Map<string, string[]>();
 const MAX_LINES = 5000;
+/** Cap on how many sessions' buffers are held IN MEMORY. Disk logs are the
+ *  source of truth (getBuffer reloads on demand), so evicting the oldest
+ *  in-memory entry when over the cap bounds memory without losing data. */
+const MAX_IN_MEMORY_SESSIONS = 64;
 
 /** Directory where terminal logs are persisted. Set via initOutputBuffer(). */
 let logDir: string | null = null;
@@ -44,6 +48,16 @@ export function initOutputBuffer(appHome: string): void {
 export function appendOutput(sessionId: string, data: string): void {
   let buf = buffers.get(sessionId);
   if (!buf) {
+    // Evict the oldest in-memory buffer(s) if we're at the cap. Flush the
+    // evicted one to disk first so its output isn't lost (getBuffer reloads it).
+    // Map iteration order is insertion order, so the first key is the oldest.
+    while (buffers.size >= MAX_IN_MEMORY_SESSIONS) {
+      const oldest = buffers.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      flushToDisk(oldest);
+      cancelFlush(oldest);
+      buffers.delete(oldest);
+    }
     buf = [];
     buffers.set(sessionId, buf);
   }
