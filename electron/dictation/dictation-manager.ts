@@ -176,6 +176,9 @@ const MAX_SAFE_BACKSPACES = 120;
 const HOTKEY_SUSPEND_TTL_MS = 20_000;
 const STOP_SESSION_OVERALL_TIMEOUT_MS = 8_000;
 const NATIVE_SESSION_END_TIMEOUT_MS = 3_000;
+/** Bound mic startup so a hung getUserMedia / recorder-window eval can't strand
+ *  the session in 'starting' (which blocks stop/toggle recovery). */
+const MIC_START_TIMEOUT_MS = 10_000;
 const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
 const DICTATION_SOUND_BY_KIND: Record<DictationSoundKind, string> = {
   start: 'Blow',
@@ -276,6 +279,12 @@ export function updateDictationConfig(appConfig: AppConfig): void {
   if (newConfig?.enabled) {
     createDictationOverlay();
   } else {
+    // Disabling the feature must also STOP any in-flight session — otherwise
+    // mic capture / STT / native typing keep running with the hotkey + overlay
+    // already gone, leaving no way to stop it.
+    if (oldEnabled && state !== 'idle') {
+      void stopDictation();
+    }
     destroyDictationOverlay();
   }
 }
@@ -689,7 +698,10 @@ async function startDictationInner(): Promise<void> {
 
     // 3. Start mic capture
     phaseStartedAt = Date.now();
-    await startMicCapture(config.inputDeviceId ?? undefined);
+    // Bound mic startup: getUserMedia / the recorder-window executeJavaScript can
+    // hang, which would strand state='starting' and block stop/toggle recovery.
+    // On timeout this throws → the start catch runs the normal idle/cleanup path.
+    await withTimeout(startMicCapture(config.inputDeviceId ?? undefined), MIC_START_TIMEOUT_MS, 'Mic start');
     dictationDebugLog('START_PHASE', {
       generation,
       phase: 'mic-start',
