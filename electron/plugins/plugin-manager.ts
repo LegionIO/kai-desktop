@@ -57,6 +57,15 @@ import { checkPluginCompatibility } from './plugin-compat.js';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
+/** A plugin name is used as an on-disk path segment (plugin-settings/<name>/…)
+ *  and as an identity key, so it must be a strict slug — no separators, no
+ *  traversal, no leading dot. Mirrors the skills-loader name rule. */
+const PLUGIN_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+
+export function isValidPluginName(name: unknown): name is string {
+  return typeof name === 'string' && name !== '.' && name !== '..' && PLUGIN_NAME_RE.test(name);
+}
+
 function setNestedValue(target: Record<string, unknown>, path: string, value: unknown): void {
   const keys = path.split('.').filter(Boolean);
   if (keys.some((k) => DANGEROUS_KEYS.has(k))) return;
@@ -160,6 +169,22 @@ export class PluginManager {
 
       try {
         const manifest = readPluginManifest(pluginDir, entry);
+        // The plugin name is used as an on-disk path segment (plugin-settings/
+        // <name>/) and as an identity key. Reject a name that isn't a strict slug
+        // or that doesn't match its directory — a crafted name like "../../x"
+        // would otherwise escape the plugin-settings namespace (reachable via
+        // renderer IPC get/set), and a name != dir lets a plugin impersonate
+        // another.
+        if (!isValidPluginName(manifest.name)) {
+          console.warn(`[PluginManager] Skipping plugin in "${entry}": invalid manifest name "${manifest.name}"`);
+          continue;
+        }
+        if (manifest.name !== entry) {
+          console.warn(
+            `[PluginManager] Skipping plugin in "${entry}": manifest name "${manifest.name}" does not match its directory`,
+          );
+          continue;
+        }
         results.push({ manifest, dir: pluginDir });
       } catch (err) {
         console.warn(`[PluginManager] Failed to read plugin manifest at ${manifestPath}:`, err);
@@ -706,6 +731,19 @@ export class PluginManager {
       instance.declaredEvents = [];
       instance.declaredActions = [];
       eventBus.unregisterSource(`plugin.${manifest.name}`);
+      // Activation may have already started API-managed resources (e.g. an HTTP
+      // server) before throwing. Clearing subscriptions alone leaves those live
+      // until app exit — run the same API cleanup unloadPlugin() uses so a failed
+      // activation can't leak resources.
+      try {
+        const api = this.pluginAPIs.get(manifest.name);
+        if (api) await cleanupPluginAPI(api);
+      } catch (cleanupErr) {
+        console.error(
+          `[PluginManager] Error cleaning up API after failed activation of "${manifest.name}":`,
+          cleanupErr,
+        );
+      }
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.error(`[PluginManager] Failed to load plugin "${manifest.name}":`, err);
@@ -1011,7 +1049,18 @@ export class PluginManager {
   }
 
   private pluginSettingsPath(pluginName: string): string {
-    return join(this.appHome, 'plugin-settings', pluginName, 'settings.json');
+    // Defense-in-depth: discovery already rejects non-slug names, but this path
+    // is derived from a name that also flows in via IPC — refuse anything that
+    // isn't a strict slug so it can never escape the plugin-settings namespace.
+    if (!isValidPluginName(pluginName)) {
+      throw new Error(`Invalid plugin name: ${JSON.stringify(pluginName)}`);
+    }
+    const base = join(this.appHome, 'plugin-settings');
+    const full = join(base, pluginName, 'settings.json');
+    if (!resolve(full).startsWith(resolve(base) + sep)) {
+      throw new Error(`Invalid plugin name: ${JSON.stringify(pluginName)}`);
+    }
+    return full;
   }
 
   getPluginConfig(pluginName: string): Record<string, unknown> {
