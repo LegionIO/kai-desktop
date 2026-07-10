@@ -1438,19 +1438,24 @@ export function RuntimeProvider({
     if (hasActiveStream) {
       setIsRunning(!accAwait);
     } else if (conv.runStatus === 'running') {
-      // Persisted as running but we have no local accumulator. This is either a
-      // stale flag OR an automation is streaming into it right now (opened
-      // mid-run). Ask the main process; if a run is in flight, seed an
-      // accumulator from the persisted tree so subsequent automation events
-      // render live. Otherwise clear the stale flag.
-      const inFlight = await app.automations.inFlight(id).catch(() => false);
-      if (inFlight) {
+      // Persisted as running but we have no local accumulator. Either a run is
+      // streaming into it right now (automation OR a CLI/server-persisted submit
+      // on the headless backend) and we opened mid-run, or it's a genuinely stale
+      // flag. Ask the main process (both owners). If in-flight, seed an accumulator
+      // so subsequent events render live. If NOT in-flight, just show not-running
+      // locally — do NOT write runStatus:idle here: the main process owns stale
+      // reset (resetStaleRunStatus at startup), and a racy renderer write could
+      // clobber a run whose first event simply hasn't reached us yet.
+      const [autoInFlight, agentInFlight] = await Promise.all([
+        app.automations.inFlight(id).catch(() => false),
+        app.agent.inFlight(id).catch(() => false),
+      ]);
+      if (autoInFlight || agentInFlight) {
         automationStreams.add(id);
         streamAccumulators.set(id, { messages: [...t], headId: h });
         setIsRunning(true);
       } else {
         setIsRunning(false);
-        void persistConversation(id, t, h, { runStatus: 'idle' });
       }
     } else {
       setIsRunning(false);
@@ -1559,16 +1564,12 @@ export function RuntimeProvider({
     });
   }, [loadConversationState]);
 
-  useEffect(() => {
-    if (!activeConversationId || isRunning || streamAccumulators.has(activeConversationId)) return;
-
-    void (async () => {
-      const conv = (await app.conversations.get(activeConversationId)) as ConversationRecord | null;
-      if (conv?.runStatus === 'running') {
-        await patchConversation(activeConversationId, { runStatus: 'idle' });
-      }
-    })();
-  }, [activeConversationId, isRunning, tree, headId]);
+  // (Removed per codex r3 M3.) A prior effect here cleared the active
+  // conversation's runStatus:'running' → 'idle' whenever !isRunning + no local
+  // accumulator. That raced with live CLI/server-persisted runs (it didn't check
+  // agent/automation in-flight) and duplicated logic loadConversationState now
+  // owns (it seeds + sets isRunning correctly, and the MAIN process sweeps
+  // genuinely-stale flags at startup). The renderer no longer writes runStatus.
 
   const schedulePersist = useCallback(
     (conversationId: string, t: StoredMessage[], h: string | null, extra: Partial<ConversationRecord> = {}) => {

@@ -2393,6 +2393,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     },
   );
 
+  // Whether a live agent run (interactive stream, CLI/server-persisted submit, or
+  // a pending pre-toolsReady submit) currently owns this conversation. The GUI
+  // uses this to avoid clearing a `running` conversation it doesn't have a local
+  // accumulator for (a headless CLI run it just connected to). Complements
+  // automations.inFlight (automation runs). Does NOT cover automation runs — the
+  // renderer checks both.
+  ipcMain.handle('agent:in-flight', (_event, conversationId: string): boolean => {
+    return activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
+  });
+
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
     // Cancel a submit still waiting on toolsReady (no activeStreams entry yet)
     // so it bails after the await instead of starting a run for a gone client.

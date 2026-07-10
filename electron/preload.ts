@@ -49,6 +49,7 @@ const appAPI = {
         threadOverrides,
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
+    inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<boolean>,
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),

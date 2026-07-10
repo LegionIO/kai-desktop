@@ -1,5 +1,5 @@
 import { app } from 'electron';
-import { existsSync, mkdirSync, lstatSync, rmSync, chmodSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, lstatSync, rmSync, chmodSync, readFileSync, writeFileSync, readlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
@@ -68,13 +68,24 @@ function installTarget(): { dir: string; path: string } {
   return { dir, path: join(dir, 'kai') };
 }
 
+/** POSIX single-quote a string: wrap in '...' and escape embedded ' as '\''.
+ *  Single quotes disable ALL shell expansion, so a path with $, backticks, etc.
+ *  is safe. */
+function shSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 /** The wrapper script contents — bakes in the app binary + the managed marker. */
 function wrapperContents(appBin: string): string {
   if (process.platform === 'win32') {
-    return ['@echo off', `rem ${MANAGED_MARKER}`, `"${appBin}" --kai-cli %*`, ''].join('\r\n');
+    // In a batch file a literal % must be escaped as %% or it triggers env-var
+    // expansion. Then wrap in double-quotes for spaces.
+    const cmdSafe = appBin.replace(/%/g, '%%');
+    return ['@echo off', `rem ${MANAGED_MARKER}`, `"${cmdSafe}" --kai-cli %*`, ''].join('\r\n');
   }
-  // POSIX: exec so signals/tty pass straight through. Quote the path.
-  return [`#!/bin/sh`, `# ${MANAGED_MARKER}`, `exec "${appBin}" --kai-cli "$@"`, ''].join('\n');
+  // POSIX: exec so signals/tty pass straight through. Single-quote the path so
+  // no shell expansion occurs when `kai` runs.
+  return [`#!/bin/sh`, `# ${MANAGED_MARKER}`, `exec ${shSingleQuote(appBin)} --kai-cli "$@"`, ''].join('\n');
 }
 
 function isOnPath(dir: string): boolean {
@@ -84,13 +95,43 @@ function isOnPath(dir: string): boolean {
   return pathVar.split(sep).map(norm).includes(norm(dir));
 }
 
-/** Is the file at `path` a wrapper WE wrote (carries the marker)? */
+/** Path to the shipped launcher shim inside the packaged app (Resources/bin),
+ *  used to recognize LEGACY installs (pre-marker) that symlinked/copied it. */
+function shippedShimPath(): string | null {
+  const name = process.platform === 'win32' ? 'kai.cmd' : 'kai';
+  const base = app.isPackaged ? process.resourcesPath : app.getAppPath();
+  if (!base) return null; // process.resourcesPath is undefined outside Electron (tests)
+  const p = join(base, 'bin', name);
+  return existsSync(p) ? p : null;
+}
+
+/** Is the file at `path` a Kai-managed CLI entry? Recognizes the current marker
+ *  wrapper AND legacy installs (pre-marker) so an upgrade/uninstall can still
+ *  manage them instead of reporting a false conflict:
+ *   - POSIX: a symlink whose target is the shipped shim (old symlink install),
+ *   - any platform: a regular file carrying KAI_MANAGED_CLI_WRAPPER, or whose
+ *     content is byte-identical to the shipped shim (old copy install). */
 function isManaged(path: string): boolean {
   try {
     if (!existsSync(path)) return false;
     const st = lstatSync(path);
+    const shim = shippedShimPath();
+    if (st.isSymbolicLink()) {
+      // Legacy POSIX install symlinked to the shipped shim.
+      return shim ? readlinkSync(path) === shim : false;
+    }
     if (!st.isFile()) return false;
-    return readFileSync(path, 'utf-8').includes(MANAGED_MARKER);
+    const body = readFileSync(path, 'utf-8');
+    if (body.includes(MANAGED_MARKER)) return true;
+    // Legacy copy install: identical to the shipped shim.
+    if (shim) {
+      try {
+        return readFileSync(shim, 'utf-8') === body;
+      } catch {
+        return false;
+      }
+    }
+    return false;
   } catch {
     return false;
   }

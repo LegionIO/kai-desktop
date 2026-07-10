@@ -61,6 +61,7 @@ type AppAPI = {
       },
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
+    inFlight: (conversationId: string) => Promise<boolean>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
