@@ -553,6 +553,41 @@ export function getBridgeScript(): string {
       synthesizePrompt: function(agentId, userDescription) { return invoke('agents:synthesize-prompt', agentId, userDescription); },
       onChanged: function(cb) { return on('agents:changed', cb); }
     },
+    shell: {
+      openPath: function(filePath) { return invoke('shell:open-path', filePath); }
+    },
+    partitions: {
+      list: function() { return invoke('partitions:list'); },
+      delete: function(names) { return invoke('partitions:delete', names); }
+    },
+    cli: {
+      installStatus: function() { return invoke('cli:install-status'); },
+      install: function() { return invoke('cli:install'); },
+      uninstall: function() { return invoke('cli:uninstall'); }
+    },
+    autoUpdate: {
+      check: function() { return invoke('auto-update:check'); },
+      install: function() { return invoke('auto-update:install'); },
+      onStatus: function(cb) { return on('auto-update:status', cb); }
+    },
+    dictation: {
+      toggle: function() { return invoke('dictation:toggle'); },
+      stop: function() { return invoke('dictation:stop'); },
+      getState: function() { return invoke('dictation:get-state'); },
+      getTypingMode: function() { return invoke('dictation:get-typing-mode'); },
+      setDevice: function(deviceId) { return invoke('dictation:set-device', deviceId); },
+      suspendHotkey: function() { return invoke('dictation:suspend-hotkey'); },
+      resumeHotkey: function() { return invoke('dictation:resume-hotkey'); },
+      setOverlayInteractive: function(interactive) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'send', channel: 'dictation:overlay-set-interactive', data: interactive })); },
+      resizeOverlay: function(height) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'send', channel: 'dictation:overlay-resize', data: height })); },
+      restoreOverlayFocus: function() { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'send', channel: 'dictation:overlay-restore-focus' })); },
+      onStateChange: function(cb) { return on('dictation:state', cb); },
+      onLevel: function(cb) { return on('dictation:level', cb); },
+      onPartial: function(cb) { return on('dictation:partial', cb); },
+      onFinal: function(cb) { return on('dictation:final', cb); },
+      onError: function(cb) { return on('dictation:error', cb); },
+      onTypingMode: function(cb) { return on('dictation:typing-mode', cb); }
+    },
     onMenuOpenSettings: function(cb) { return on('menu:open-settings', cb); },
     onFind: function(cb) { return on('menu:find', cb); },
     onModelSwitched: function(cb) { return on('agent:model-switched', cb); },
