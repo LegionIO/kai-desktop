@@ -162,6 +162,12 @@ export function listAllTasks(appHome: string): TaskFile[] {
 export interface TaskHandlerOptions {
   /** Called when a task is kicked back to in_progress. Auto-restarts the assigned agent. */
   onTaskKickedBack?: (taskId: string, assignedAgentId: string | undefined) => void;
+  /**
+   * Called just before a task file is unlinked. Lets the agent lifecycle stop
+   * the assigned running agent (abort its Mastra stream / kill its PTY + reset
+   * to idle) so a deleted running task can't keep executing invisibly.
+   */
+  onTaskDeleted?: (taskId: string, assignedAgentId: string | undefined) => void;
 }
 
 export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?: TaskHandlerOptions): void {
@@ -312,6 +318,15 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       if (existsSync(filePath)) {
         try {
           const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+          // Stop the assigned running agent BEFORE removing the file, so it
+          // can't keep executing against a task that no longer exists.
+          if (options?.onTaskDeleted) {
+            try {
+              options.onTaskDeleted(id, task.assignedAgentId);
+            } catch (err) {
+              console.warn(`[tasks] onTaskDeleted hook threw for task ${id}:`, err);
+            }
+          }
           const sessionIds = new Set<string>();
           if (task.terminalSessionId) sessionIds.add(task.terminalSessionId);
           for (const run of task.runs ?? []) if (run.terminalSessionId) sessionIds.add(run.terminalSessionId);

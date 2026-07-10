@@ -66,6 +66,7 @@ import {
   listAllAgents,
   assignTaskToAgent,
   startAgentRun,
+  stopAgentForDeletedTask,
 } from './ipc/agents.js';
 import { listAllTasks } from './ipc/tasks.js';
 import { TaskDispatcher } from './agent/task-dispatcher.js';
@@ -1162,6 +1163,11 @@ if (gotSingleInstanceLock) {
         setTimeout(() => {
           void startAgentRun(APP_HOME, taskTerminalManager, assignedAgentId);
         }, 500);
+      },
+      onTaskDeleted: (taskId, assignedAgentId) => {
+        if (!assignedAgentId) return;
+        console.info(`[Agent:task] Stopping agent ${assignedAgentId} — its task ${taskId} was deleted`);
+        stopAgentForDeletedTask(APP_HOME, taskTerminalManager, assignedAgentId, taskId);
       },
     });
     registerWorkspaceHandlers(ipcMain, APP_HOME, getConfig, setConfig);

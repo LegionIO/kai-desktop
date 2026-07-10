@@ -30,6 +30,18 @@ const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 /** AbortControllers for running Mastra virtual sessions (keyed by sessionId). */
 const mastraAbortControllers = new Map<string, AbortController>();
 
+/**
+ * Synchronous in-memory start lock (keyed by agentId). startAgentRun's
+ * `status === 'running'` gate is not enough on its own: the mutation to
+ * 'running' only lands AFTER an await (dynamic import for Mastra, or
+ * terminalManager.create() for a PTY), so two near-simultaneous starts (e.g. a
+ * manual start racing a dispatcher tick) both pass the file-read gate and each
+ * spawn a session — the second overwrites terminalSessionId and orphans the
+ * first. Claiming this set synchronously before any await makes the start
+ * single-flight per agent; it's released in a finally.
+ */
+const startingAgents = new Set<string>();
+
 /** Module-level ref to terminal manager — set during registration, used by autoRestartAgent. */
 let _terminalManager: TaskTerminalManager | null = null;
 let _appHome: string | null = null;
@@ -73,6 +85,44 @@ function stopAgentExecution(terminalManager: TaskTerminalManager, sessionId: str
   } catch {
     /* best-effort */
   }
+}
+
+/**
+ * True if the agent still exists, is running, and its terminalSessionId matches
+ * the given session. Used to detect that a start was superseded (task deleted /
+ * agent stopped / a newer run took over) across a startup await before we commit
+ * to streaming or spawning against a dead task.
+ */
+function agentStillOwnsSession(appHome: string, agentId: string, sessionId: string): boolean {
+  const agent = readAgent(appHome, agentId);
+  return !!agent && agent.status === 'running' && agent.terminalSessionId === sessionId;
+}
+
+/**
+ * Stop and reset the agent that owns a task being deleted. Called from the
+ * tasks:delete seam (tasks.ts has no terminalManager/agent access). Aborts the
+ * agent's Mastra stream / kills its PTY and resets it to idle so a deleted
+ * running task can't keep executing invisibly against a task file that no longer
+ * exists. Only acts if the agent still points at THIS task (guards against a
+ * stale assignment where the agent already moved on).
+ */
+export function stopAgentForDeletedTask(
+  appHome: string,
+  terminalManager: TaskTerminalManager,
+  agentId: string,
+  deletedTaskId: string,
+): void {
+  if (!isValidId(agentId)) return;
+  const agent = readAgent(appHome, agentId);
+  if (!agent) return;
+  if (agent.currentTaskId && agent.currentTaskId !== deletedTaskId) return;
+  stopAgentExecution(terminalManager, agent.terminalSessionId);
+  agent.status = 'idle';
+  agent.currentTaskId = undefined;
+  agent.terminalSessionId = undefined;
+  agent.updatedAt = new Date().toISOString();
+  writeAgent(appHome, agent);
+  broadcastAgentChange(appHome);
 }
 
 // ── Runtime / env / arg validation ──────────────────────────────────────
@@ -727,6 +777,24 @@ export async function startAgentRun(
   if (!agent) return { error: `Agent ${agentId} not found` };
   if (agent.status === 'running') return { error: 'Agent is already running' };
 
+  // Single-flight per agent: claim the start lock synchronously (before any
+  // await) so a concurrent start can't slip past the status gate above while
+  // this one is between the file read and writing status='running'.
+  if (startingAgents.has(agentId)) return { error: 'Agent is already starting' };
+  startingAgents.add(agentId);
+  try {
+    return await startAgentRunLocked(appHome, terminalManager, agentId, agent);
+  } finally {
+    startingAgents.delete(agentId);
+  }
+}
+
+async function startAgentRunLocked(
+  appHome: string,
+  terminalManager: TaskTerminalManager,
+  agentId: string,
+  agent: AgentFile,
+): Promise<{ sessionId?: string; error?: string }> {
   // If agent has no currentTaskId, try to find the task that's assigned to this agent.
   // This happens after kick-back: task.assignedAgentId still points here but
   // agent.currentTaskId was cleared on the previous run's completion.
@@ -806,6 +874,15 @@ export async function startAgentRun(
 
     // Run the Mastra agent asynchronously
     const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    // The task may have been DELETED during the dynamic import above (which
+    // resets this agent to idle via the onTaskDeleted seam). If so, abort the
+    // start instead of streaming against a task that no longer exists.
+    if (!agentStillOwnsSession(appHome, agentId, virtualSessionId)) {
+      console.info(
+        `[Agent:task] Mastra start aborted — agent no longer owns session ${virtualSessionId} (task deleted/stopped)`,
+      );
+      return { error: 'Start superseded (task deleted or agent stopped)' };
+    }
     const config = readEffectiveConfig(appHome);
 
     // Build task-aware system prompt that ensures the agent completes the full task
@@ -1081,9 +1158,14 @@ export async function startAgentRun(
           broadcast(`\r\n\x1b[33mThe task remains in progress. Check your model/provider configuration.\x1b[0m\r\n`);
         }
       } finally {
-        // Mark agent idle (if promote_task/block_task didn't already do it)
+        // Mark agent idle (if promote_task/block_task didn't already do it) —
+        // but ONLY if this virtual session still owns the agent. promote/block
+        // set status=idle + clear currentTaskId while leaving terminalSessionId,
+        // so a dispatcher tick can start a NEW run (reassigning terminalSessionId
+        // + status='running') before this old stream's finally runs. Without the
+        // ownership guard we'd clobber that new run's currentTaskId/session.
         const freshAgent = readAgent(appHome, agentId);
-        if (freshAgent && freshAgent.status === 'running') {
+        if (freshAgent && freshAgent.status === 'running' && freshAgent.terminalSessionId === virtualSessionId) {
           console.info(
             `[Agent:task] Mastra stream ended, marking agent "${freshAgent.name}" idle (promote/block not called)`,
           );
@@ -1093,7 +1175,9 @@ export async function startAgentRun(
           freshAgent.updatedAt = new Date().toISOString();
           writeAgent(appHome, freshAgent);
         } else {
-          console.info(`[Agent:task] Mastra stream ended, agent already idle/stopped (status=${freshAgent?.status})`);
+          console.info(
+            `[Agent:task] Mastra stream ended, agent already idle/stopped or superseded (status=${freshAgent?.status}, owns=${freshAgent?.terminalSessionId})`,
+          );
         }
 
         // Don't touch task status — promote_task/block_task handle that.
@@ -1144,6 +1228,27 @@ export async function startAgentRun(
       dangerousMode,
     });
     createdSessionId = sessionId;
+
+    // The task may have been DELETED during terminalManager.create() (which
+    // resets this agent to idle + clears currentTaskId via the onTaskDeleted
+    // seam), or the agent stopped. If so, kill the just-spawned PTY and abort
+    // instead of persisting a running session for a task that no longer exists.
+    const postCreateAgent = readAgent(appHome, agentId);
+    if (
+      !postCreateAgent ||
+      postCreateAgent.currentTaskId !== agent.currentTaskId ||
+      !readTask(appHome, agent.currentTaskId)
+    ) {
+      console.info(
+        `[Agent:task] PTY start aborted — task deleted/agent stopped during create; killing session ${sessionId}`,
+      );
+      try {
+        terminalManager.kill(sessionId);
+      } catch {
+        /* best-effort */
+      }
+      return { error: 'Start superseded (task deleted or agent stopped)' };
+    }
 
     agent.status = 'running';
     agent.terminalSessionId = sessionId;
@@ -1197,7 +1302,29 @@ export async function startAgentRun(
     terminalManager.onSessionExit(sessionId, (exitCode: number) => {
       console.info(`[Agent:task] PTY exit code=${exitCode} session=${sessionId} agent=${agentId}`);
       const freshAgent = readAgent(appHome, agentId);
-      if (!freshAgent || freshAgent.status !== 'running') return;
+      if (!freshAgent) return;
+      // If the agent is no longer 'running' (promote_task/block_task already
+      // reconciled) but this exiting session is still recorded on it, clear the
+      // stale terminalSessionId so it doesn't linger. Otherwise nothing to do.
+      if (freshAgent.status !== 'running') {
+        if (freshAgent.terminalSessionId === sessionId) {
+          freshAgent.terminalSessionId = undefined;
+          freshAgent.updatedAt = new Date().toISOString();
+          writeAgent(appHome, freshAgent);
+          broadcastAgentChange(appHome);
+        }
+        return;
+      }
+      // Ownership guard: only reconcile if this exiting session still owns the
+      // agent. A stale PTY from a superseded run can exit while a NEWER run is
+      // active — without this check we'd clear the new run's currentTaskId /
+      // terminalSessionId and mark it idle.
+      if (freshAgent.terminalSessionId !== sessionId) {
+        console.info(
+          `[Agent:task] Ignoring exit for stale session ${sessionId} (agent now owns ${freshAgent.terminalSessionId})`,
+        );
+        return;
+      }
 
       // Read task to get reviewerAgentIds and retryCount for the completion pipeline
       const completedTaskId = freshAgent.currentTaskId;
