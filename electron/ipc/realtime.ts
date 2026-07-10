@@ -14,6 +14,16 @@ import { recordUsageEvent } from './usage.js';
 let activeSession: RealtimeSession | null = null;
 let sessionStartTime: string | null = null;
 let sessionConversationId: string | null = null;
+/**
+ * Monotonic start generation. Bumped at the top of BOTH start-session and
+ * end-session. `start-session` awaits memory-context building BEFORE the session
+ * object exists, so an end-session (hangup) or a second start during that window
+ * can't cancel the in-flight start. Each start captures its generation and, after
+ * every async gap, bails (+ tears down anything it created) if a newer start or an
+ * end has since bumped the counter — so a pending start can't outlive a hangup or
+ * race an overlapping start.
+ */
+let startGeneration = 0;
 
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
   activeSession?.updateTools(tools);
@@ -28,6 +38,10 @@ export function registerRealtimeHandlers(
   const dbPath = join(appHome, 'data', 'memory.db');
 
   ipcMain.handle('realtime:start-session', async (_event, conversationId: string) => {
+    // Claim this start. Any older in-flight start is now stale; a later start or
+    // an end-session will bump this again and supersede US.
+    const myGeneration = ++startGeneration;
+    const isStale = () => myGeneration !== startGeneration;
     try {
       console.info(`[Realtime IPC] start-session called for conversationId="${conversationId}"`);
 
@@ -57,9 +71,30 @@ export function registerRealtimeHandlers(
         }
       }
 
+      // A hangup (end-session) or a newer start happened while we were building
+      // memory context — abort this stale start so it can't connect after the
+      // user already hung up / a newer call took over.
+      if (isStale()) {
+        console.info('[Realtime IPC] start superseded during memory-context build — aborting stale start');
+        return { error: 'Session start superseded' };
+      }
+
       const tools = getTools();
-      activeSession = new RealtimeSession(getConfig, tools);
-      await activeSession.start(conversationId, memoryContext);
+      const session = new RealtimeSession(getConfig, tools);
+      await session.start(conversationId, memoryContext);
+
+      // Re-check after the (async) connect: if superseded meanwhile, tear down
+      // the session we just built instead of installing it as active.
+      if (isStale()) {
+        console.info('[Realtime IPC] start superseded during session.start — closing stale session');
+        try {
+          session.close();
+        } catch {
+          /* best-effort */
+        }
+        return { error: 'Session start superseded' };
+      }
+      activeSession = session;
       return { ok: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -79,6 +114,9 @@ export function registerRealtimeHandlers(
   });
 
   ipcMain.handle('realtime:end-session', async () => {
+    // Supersede any in-flight start (a hangup during the "ringing"/memory-context
+    // phase) so it aborts instead of connecting after the user hung up.
+    startGeneration++;
     if (activeSession) {
       // Record usage event before closing
       if (sessionStartTime) {

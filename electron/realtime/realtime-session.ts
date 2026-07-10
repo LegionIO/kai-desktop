@@ -135,6 +135,13 @@ export class RealtimeSession {
   private tools: ToolDefinition[];
   private getFullConfig: () => AppConfig;
   private pendingToolCalls: Map<string, PendingToolCall> = new Map();
+  /** Aborted on close()/failAndClose() so an in-flight tool.execute() is
+   *  cancelled when the call ends, and finishToolCall becomes a no-op for a
+   *  result that arrives after teardown (it would otherwise broadcast a
+   *  tool-result for a dead session). */
+  private toolAbort: AbortController = new AbortController();
+  /** True once the session has been torn down (close/failAndClose). */
+  private torndown = false;
 
   /** Whether the AI has requested to end the call (deferred until response completes) */
   private _endCallRequested = false;
@@ -277,6 +284,8 @@ export class RealtimeSession {
   }
 
   close(): void {
+    this.torndown = true;
+    this.toolAbort.abort();
     this.teardownComputerUseTracking();
     if (this.ws) {
       try {
@@ -299,6 +308,8 @@ export class RealtimeSession {
    */
   private failAndClose(message: string): void {
     if (!this.ws && this._status === 'error') return; // already failed+closed
+    this.torndown = true;
+    this.toolAbort.abort();
     this.teardownComputerUseTracking();
     if (this.ws) {
       try {
@@ -1072,6 +1083,7 @@ export class RealtimeSession {
       const rawResult = await tool.execute(args, {
         toolCallId: callId,
         conversationId: this.conversationId,
+        abortSignal: this.toolAbort.signal,
       });
       const compacted = await this.maybeCompactToolOutput(callId, toolName, rawResult);
       this.finishToolCall(callId, toolName, compacted.result, false, startedAt, compacted.compaction);
@@ -1096,6 +1108,13 @@ export class RealtimeSession {
   ): void {
     const finishedAt = new Date().toISOString();
     this.pendingToolCalls.delete(callId);
+
+    // If the session was torn down while this tool ran (hangup / fatal error),
+    // don't broadcast a tool-result or push it to the (now-closed) socket — the
+    // result is for a dead session. Dropping the pending entry above is enough.
+    if (this.torndown) {
+      return;
+    }
 
     // Broadcast result to renderer
     this.broadcastRealtimeEvent({
