@@ -19,6 +19,37 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
       | undefined) ?? {};
   const titleGenEnabled = titleGen.enabled ?? true;
 
+  // "Install `kai` command in PATH" — VS Code `code`-style toggle backed by the
+  // cli:install IPC (symlinks/copies the shipped launcher onto a per-user PATH dir).
+  const [cliStatus, setCliStatus] = useState<{ installed: boolean; target?: string; onPath?: boolean } | null>(null);
+  const [cliBusy, setCliBusy] = useState(false);
+  const [cliError, setCliError] = useState<string | null>(null);
+
+  const refreshCliStatus = useCallback(() => {
+    void app.cli
+      .installStatus()
+      .then((s) => setCliStatus(s))
+      .catch(() => setCliStatus(null));
+  }, []);
+
+  useEffect(() => {
+    refreshCliStatus();
+  }, [refreshCliStatus]);
+
+  const toggleCli = useCallback(async () => {
+    setCliBusy(true);
+    setCliError(null);
+    try {
+      const s = cliStatus?.installed ? await app.cli.uninstall() : await app.cli.install();
+      setCliStatus(s);
+      if (s.error) setCliError(s.error);
+    } catch (err) {
+      setCliError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCliBusy(false);
+    }
+  }, [cliStatus?.installed]);
+
   return (
     <div className="space-y-6">
       {!hideTitle && (
@@ -36,6 +67,47 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
           checked={!!config.launchAtLogin}
           onChange={(v) => updateConfig('launchAtLogin', v)}
         />
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Terminal CLI</legend>
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs">
+              Install the <code className="rounded bg-muted px-1">kai</code> command in your PATH
+            </p>
+            <p className="mt-0.5 text-[10px] text-muted-foreground">
+              Adds a <code className="rounded bg-muted px-1">kai</code> launcher so you can start the terminal client
+              from any shell.
+              {cliStatus?.installed ? (
+                <>
+                  {' '}
+                  Installed{cliStatus.target ? ` at ${cliStatus.target}` : ''}
+                  {cliStatus.onPath === false ? ' (restart your shell to pick it up on PATH)' : ''}.
+                </>
+              ) : null}
+            </p>
+            {cliError ? (
+              <p className="mt-0.5 text-[10px] text-red-500 flex items-center gap-1">
+                <AlertTriangleIcon className="h-3 w-3 shrink-0" />
+                {cliError}
+              </p>
+            ) : null}
+          </div>
+          <button
+            type="button"
+            disabled={cliBusy}
+            onClick={() => void toggleCli()}
+            className="shrink-0 rounded-md border px-2.5 py-1 text-[11px] hover:bg-muted disabled:opacity-50 flex items-center gap-1"
+          >
+            {cliBusy ? (
+              <LoaderIcon className="h-3 w-3 animate-spin" />
+            ) : cliStatus?.installed ? (
+              <CheckCircle2Icon className="h-3 w-3 text-green-500" />
+            ) : null}
+            {cliStatus?.installed ? 'Uninstall' : 'Install'}
+          </button>
+        </div>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
