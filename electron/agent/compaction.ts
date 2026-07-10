@@ -1,9 +1,5 @@
 import { randomUUID } from 'crypto';
-import {
-  countSerializedTokens,
-  resolveConversationTokenization,
-  serializeForTokenCounting,
-} from './tokenization.js';
+import { countSerializedTokens, resolveConversationTokenization, serializeForTokenCounting } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
@@ -53,7 +49,11 @@ export function selectProtectedTail(
   }
 
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].role === 'tool' && messages[i].tool_call_id && protectedToolCallIds.has(messages[i].tool_call_id!)) {
+    if (
+      messages[i].role === 'tool' &&
+      messages[i].tool_call_id &&
+      protectedToolCallIds.has(messages[i].tool_call_id!)
+    ) {
       protectedIds.add(i);
     }
   }
@@ -124,9 +124,7 @@ export async function compactConversationPrefix(
   // Budget the compaction prompt input to avoid exceeding the context window.
   // Mirrors maelstrom-agent: contextWindow - outputMaxTokens - promptReserveTokens
   const promptInputBudget = Math.floor(
-    tokenization.contextWindowTokens
-      - Math.max(0, config.outputMaxTokens)
-      - Math.max(0, config.promptReserveTokens),
+    tokenization.contextWindowTokens - Math.max(0, config.outputMaxTokens) - Math.max(0, config.promptReserveTokens),
   );
   if (promptInputBudget <= 0) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
@@ -177,9 +175,11 @@ export async function compactConversationPrefix(
     content: summaryText,
   };
 
-  const compactedMessageIds = prefix
-    .map((m) => m.id)
-    .filter((id): id is string => typeof id === 'string');
+  // Only the messages actually included in the summary (fittedPrefix) are
+  // represented in it. Messages shifted out to fit the budget are NOT summarized,
+  // so don't report them as compacted — mislabeling them as preserved hides
+  // real context loss from callers/telemetry.
+  const compactedMessageIds = fittedPrefix.map((m) => m.id).filter((id): id is string => typeof id === 'string');
 
   return {
     compactedMessages: [summaryMessage, ...suffix],
@@ -265,7 +265,8 @@ async function aiExtractRelevantInfo(
     const agent = new Agent({
       id: `tool-compact-${Date.now()}`,
       name: 'tool-compaction-agent',
-      instructions: 'Summarize only the information needed to answer the user request. Keep important IDs, names, and values. Omit boilerplate and repeated metadata. If output is JSON-like, preserve key fields in compact form.',
+      instructions:
+        'Summarize only the information needed to answer the user request. Keep important IDs, names, and values. Omit boilerplate and repeated metadata. If output is JSON-like, preserve key fields in compact form.',
       model: model as AgentConfig['model'],
     });
 
@@ -318,13 +319,7 @@ export async function compactToolResult(
 
   // Try AI extraction first
   if (settings.useAI && modelConfig) {
-    const extracted = await aiExtractRelevantInfo(
-      content,
-      toolName,
-      userQuery,
-      settings.outputMaxTokens,
-      modelConfig,
-    );
+    const extracted = await aiExtractRelevantInfo(content, toolName, userQuery, settings.outputMaxTokens, modelConfig);
     if (extracted) {
       // Bound AI output to outputMaxTokens in case the model went over
       const bounded = truncateToTokenBudget(extracted, settings.outputMaxTokens, truncateOpts, modelName);

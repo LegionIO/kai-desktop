@@ -75,7 +75,7 @@ const conversationMessageSchema = z.object({
 });
 
 /** Active plan generation streams, keyed by taskId. */
-const activeTaskStreams = new Map<string, { abort: () => void }>();
+const activeTaskStreams = new Map<string, { token: symbol; abort: () => void }>();
 
 // ── Async Mutex ─────────────────────────────────────────────────────────
 
@@ -408,7 +408,16 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       if (existing) existing.abort();
 
       const controller = new AbortController();
-      activeTaskStreams.set(taskId, { abort: () => controller.abort() });
+      // Token identifies THIS stream so a later stream replacing it under the
+      // same taskId isn't torn down by this one's finally (which would make the
+      // new stream uncancellable and race plan writes).
+      const streamToken = Symbol(taskId);
+      activeTaskStreams.set(taskId, { token: streamToken, abort: () => controller.abort() });
+      const clearIfCurrent = () => {
+        if (activeTaskStreams.get(taskId)?.token === streamToken) {
+          activeTaskStreams.delete(taskId);
+        }
+      };
 
       // Resolve config and model
       let config: AppConfig;
@@ -496,7 +505,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
             broadcastTaskStreamEvent({ taskId, type: 'done' });
           }
         } finally {
-          activeTaskStreams.delete(taskId);
+          clearIfCurrent();
         }
       })();
 
