@@ -86,8 +86,14 @@ export interface CodePaths {
   renderer: string;
   /** Whether we're running from an OTA overlay (true) or bundled code (false) */
   isOverlay: boolean;
-  /** The active code version (from overlay manifest or app version) */
+  /** The active code version (from overlay manifest or app version) — reflects
+   *  the preload/renderer layers, which ARE OTA-updatable. */
   codeVersion: string;
+  /** The active MAIN-process code version. Always the shell/bundled version:
+   *  OTA cannot swap main (it's already loaded from asar before bootstrap runs),
+   *  so a newer overlay's main-process fixes are NOT live until a full app
+   *  update. Optional for back-compat with callers that predate the split. */
+  mainCodeVersion?: string;
 }
 
 /** Status of the OTA updater, broadcast to the renderer */

@@ -54,6 +54,7 @@ export function resolveCodePaths(appSlug: string, shellVersion: string, bundledO
     renderer: join(bundledOutDir, '..', 'renderer'),
     isOverlay: false,
     codeVersion: shellVersion,
+    mainCodeVersion: shellVersion,
   };
 
   try {
@@ -187,12 +188,22 @@ export function resolveCodePaths(appSlug: string, shellVersion: string, bundledO
 
     console.info(`[ota-bootstrap] Using OTA overlay: code v${manifest.codeVersion} (shell v${shellVersion})`);
 
+    // OTA overlays ONLY supply preload + renderer. The main-process code was
+    // already loaded from the bundled asar before this bootstrap ran (Node can't
+    // re-require the running main), so `main` MUST point at the bundled dir — the
+    // overlay's own out/main is never executed. Returning it here previously
+    // implied main was OTA-updatable when it is not; keep it honest.
     return {
-      main: overlayMain,
+      main: bundledOutDir,
       preload: overlayPreload,
       renderer: overlayRenderer,
       isOverlay: true,
       codeVersion: manifest.codeVersion,
+      // The active MAIN-process code is the shell's version, regardless of the
+      // overlay's codeVersion (which reflects preload/renderer only). Surfaced
+      // so callers/telemetry can tell that a main-process fix in a newer overlay
+      // is NOT yet live — a full app update is required for main changes.
+      mainCodeVersion: shellVersion,
     };
   } catch (err) {
     console.warn('[ota-bootstrap] Error resolving overlay, falling back to bundled:', err);
