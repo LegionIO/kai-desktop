@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, existsSync, readdirSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
-import { getSkillToolName, loadSkillsFromDisk, type SkillManifest } from './skill-loader.js';
+import { getSkillToolName, loadSkillsFromDisk, computeNextEnabledSkills, type SkillManifest } from './skill-loader.js';
 import {
   readContainedFileSync,
   writeContainedFileSync,
@@ -282,10 +282,8 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
           if (!isContained(skillDir, skillsDir)) return { error: 'Invalid skill name' };
           if (!existsSync(join(skillDir, 'skill.json'))) return { error: `Skill "${safeName}" not found.` };
 
-          const enabled = [...(config.skills?.enabled ?? [])];
-          if (!enabled.includes(safeName)) {
-            enabled.push(safeName);
-          }
+          const discovered = loadSkillsFromDisk(skillsDir).map((s) => s.manifest.name);
+          const enabled = computeNextEnabledSkills(config.skills?.enabled ?? [], 'enable', safeName, discovered);
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 
@@ -295,7 +293,8 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         case 'disable': {
           const safeName = validateSkillName(name);
           if (!safeName) return { error: 'Invalid skill name' };
-          const enabled = (config.skills?.enabled ?? []).filter((s: string) => s !== safeName);
+          const discovered = loadSkillsFromDisk(skillsDir).map((s) => s.manifest.name);
+          const enabled = computeNextEnabledSkills(config.skills?.enabled ?? [], 'disable', safeName, discovered);
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 

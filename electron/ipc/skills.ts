@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { existsSync, readdirSync, rmSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { AppConfig } from '../config/schema.js';
-import { loadSkillsFromDisk } from '../tools/skill-loader.js';
+import { loadSkillsFromDisk, computeNextEnabledSkills } from '../tools/skill-loader.js';
 import { readContainedFileSync, SKILL_MANIFEST_MAX_BYTES, SKILL_FILE_MAX_BYTES } from '../tools/skill-fs.js';
 import { readEffectiveConfig, writeDesktopConfig } from './config.js';
 
@@ -94,13 +94,17 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
   ipcMain.handle('skills:toggle', async (_event, name: string, enable: boolean) => {
     const config = readConfig(appHome);
-    let enabled = [...(config.skills?.enabled ?? [])];
-
-    if (enable && !enabled.includes(name)) {
-      enabled.push(name);
-    } else if (!enable) {
-      enabled = enabled.filter((s: string) => s !== name);
-    }
+    const skillsDir = config.skills?.directory || join(appHome, 'skills');
+    const discovered = loadSkillsFromDisk(skillsDir).map((s) => s.manifest.name);
+    // Use the shared helper so the "empty list = all enabled" sentinel is handled
+    // correctly (disable-from-empty materializes the full set; enable-from-empty
+    // stays all-enabled) instead of the naive push/filter that mis-toggled.
+    const enabled = computeNextEnabledSkills(
+      config.skills?.enabled ?? [],
+      enable ? 'enable' : 'disable',
+      name,
+      discovered,
+    );
 
     config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
     writeDesktopConfig(appHome, config);

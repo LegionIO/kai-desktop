@@ -574,6 +574,48 @@ export function workflowToToolDefinition(manifest: SkillManifest, workflow: AnyW
 
 /* ── Load all enabled skills as Mastra Workflows ── */
 
+/**
+ * Compute the next `skills.enabled` list for an enable/disable toggle, correctly
+ * handling the "empty list means ALL enabled" sentinel.
+ *
+ * The sentinel makes naive mutation wrong in two ways:
+ *  - disabling from `[]` (all-enabled) via `filter(≠name)` stays `[]` → a no-op,
+ *    so the skill is NOT actually disabled;
+ *  - enabling one skill from `[]` produces `[name]`, which silently DISABLES
+ *    every other discovered skill.
+ *
+ * Fix: when disabling out of the all-enabled state, materialize the full set of
+ * discovered names minus the target so the remaining skills stay enabled.
+ * Enabling from the all-enabled state is a genuine no-op (stays `[]`).
+ */
+export function computeNextEnabledSkills(
+  current: string[],
+  action: 'enable' | 'disable',
+  target: string,
+  discoveredNames: string[],
+): string[] {
+  const isAllEnabled = current.length === 0;
+
+  if (action === 'enable') {
+    if (isAllEnabled) return current; // already all-enabled — no-op
+    return current.includes(target) ? current : [...current, target];
+  }
+
+  // disable
+  if (isAllEnabled) {
+    // Materialize every discovered skill EXCEPT the one being disabled. Edge
+    // case: if this skill is the ONLY discovered one, the result is [] — which
+    // the sentinel reads back as "all enabled", so we can't represent "disable
+    // the last skill" without a schema change. In that case fall back to a
+    // marker that matches no real skill name (skill names are validated against
+    // /^[a-z0-9].../, so a leading "!" can never collide) so the disable sticks.
+    const materialized = discoveredNames.filter((n) => n !== target);
+    return materialized.length > 0 ? materialized : ['!none'];
+  }
+  const next = current.filter((n) => n !== target);
+  return next.length > 0 ? next : ['!none'];
+}
+
 export function loadSkillsAsWorkflows(
   skillsDir: string,
   enabledSkills: string[],

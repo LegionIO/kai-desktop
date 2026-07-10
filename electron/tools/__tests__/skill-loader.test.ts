@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadSkillsFromDisk, interpolateTemplateShellSafe } from '../skill-loader';
+import { loadSkillsFromDisk, interpolateTemplateShellSafe, computeNextEnabledSkills } from '../skill-loader';
 
 function writeSkill(root: string, dirName: string, manifest: Record<string, unknown>): string {
   const dir = join(root, dirName);
@@ -103,5 +103,43 @@ describe('interpolateTemplateShellSafe', () => {
   it('consumes surrounding quotes in the template to avoid double-quoting', () => {
     const out = interpolateTemplateShellSafe("x '{{input.v}}'", { v: 'val' });
     expect(out).toBe("x 'val'");
+  });
+});
+
+describe('computeNextEnabledSkills', () => {
+  const discovered = ['a', 'b', 'c'];
+
+  it('enable from all-enabled ([]) stays all-enabled (no-op)', () => {
+    expect(computeNextEnabledSkills([], 'enable', 'a', discovered)).toEqual([]);
+  });
+
+  it('disable from all-enabled ([]) materializes the full set minus the target', () => {
+    expect(computeNextEnabledSkills([], 'disable', 'b', discovered).sort()).toEqual(['a', 'c']);
+  });
+
+  it('enable adds a skill to an explicit list', () => {
+    expect(computeNextEnabledSkills(['a'], 'enable', 'b', discovered).sort()).toEqual(['a', 'b']);
+  });
+
+  it('enable is idempotent when already present', () => {
+    expect(computeNextEnabledSkills(['a', 'b'], 'enable', 'a', discovered).sort()).toEqual(['a', 'b']);
+  });
+
+  it('disable removes a skill from an explicit list', () => {
+    expect(computeNextEnabledSkills(['a', 'b'], 'disable', 'a', discovered)).toEqual(['b']);
+  });
+
+  it('disabling the only enabled skill does not collapse back to all-enabled', () => {
+    // ['a'] disable 'a' → [] would mean "all enabled" (re-enabling a). Guard with
+    // a non-matching marker so the disable actually sticks.
+    const next = computeNextEnabledSkills(['a'], 'disable', 'a', discovered);
+    expect(next).not.toEqual([]);
+    expect(next.includes('a')).toBe(false);
+  });
+
+  it('disabling the only discovered skill from all-enabled does not re-enable it', () => {
+    const next = computeNextEnabledSkills([], 'disable', 'solo', ['solo']);
+    expect(next).not.toEqual([]);
+    expect(next.includes('solo')).toBe(false);
   });
 });
