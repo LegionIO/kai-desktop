@@ -17,7 +17,7 @@
  *     snapshots, so failures point straight at the regression.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type * as NodeOs from 'node:os';
@@ -299,5 +299,38 @@ describe('config: removedBuiltins suppresses built-in provider reconstruction', 
     expect(after.models.providers.anthropic).toBeUndefined();
     expect((after.models.catalog ?? []).some((m) => m.provider === 'anthropic')).toBe(false);
     expect((after.models as { removedBuiltins?: string[] }).removedBuiltins).toContain('anthropic');
+  });
+});
+
+// POSIX-only: the secret-bearing config file (MCP env, web password, media keys)
+// must be written owner-only, and the settings dir tightened even if it
+// pre-existed with looser perms. Skipped on win32 (no POSIX mode bits).
+describe.skipIf(process.platform === 'win32')('config IPC: secret file permissions', () => {
+  it('writes desktop.json 0600 and tightens the settings dir to 0700', () => {
+    const settingsDir = join(appHome, 'settings');
+    // Simulate a pre-existing settings dir created with loose perms (the case
+    // the chmod-after-mkdir hardening must fix, since mkdir mode is create-only).
+    chmodSync(settingsDir, 0o755);
+
+    const initial = readEffectiveConfig(appHome);
+    writeDesktopConfig(appHome, initial);
+
+    const filePath = join(settingsDir, 'desktop.json');
+    expect(statSync(filePath).mode & 0o777).toBe(0o600);
+    expect(statSync(settingsDir).mode & 0o777).toBe(0o700);
+  });
+
+  it('re-tightens a pre-existing world-readable desktop.json on the next write', () => {
+    const initial = readEffectiveConfig(appHome);
+    const filePath = join(appHome, 'settings', 'desktop.json');
+    // First write creates it; then loosen it as if an older build wrote it 0644.
+    writeDesktopConfig(appHome, initial);
+    chmodSync(filePath, 0o644);
+    expect(statSync(filePath).mode & 0o777).toBe(0o644);
+
+    // A subsequent write must restore 0600 (chmod runs after writeFileSync,
+    // whose mode only applies on create).
+    writeDesktopConfig(appHome, initial);
+    expect(statSync(filePath).mode & 0o777).toBe(0o600);
   });
 });
