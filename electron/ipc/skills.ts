@@ -1,8 +1,9 @@
 import type { IpcMain } from 'electron';
-import { readFileSync, existsSync, readdirSync, rmSync } from 'fs';
+import { existsSync, readdirSync, rmSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import { loadSkillsFromDisk } from '../tools/skill-loader.js';
+import { readContainedFileSync, SKILL_MANIFEST_MAX_BYTES, SKILL_FILE_MAX_BYTES } from '../tools/skill-fs.js';
 import { readEffectiveConfig, writeDesktopConfig } from './config.js';
 
 function readConfig(appHome: string): AppConfig {
@@ -52,18 +53,23 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
     if (!existsSync(manifestPath)) return { error: `Skill "${name}" not found.` };
 
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    const manifestRaw = readContainedFileSync(skillDir, manifestPath, SKILL_MANIFEST_MAX_BYTES);
+    if (manifestRaw == null) return { error: `Skill "${name}" manifest is missing, too large, or not a regular file.` };
+    const manifest = JSON.parse(manifestRaw);
     const files: Record<string, string> = {};
 
     try {
       const entries = readdirSync(skillDir);
       for (const entry of entries) {
         if (entry === 'skill.json') continue;
-        try {
-          files[entry] = readFileSync(join(skillDir, entry), 'utf-8');
-        } catch { /* skip binary files */ }
+        // Symlink-safe + size-capped: a symlinked file inside a skill dir must
+        // not expose an arbitrary local file through the get IPC.
+        const contents = readContainedFileSync(skillDir, join(skillDir, entry), SKILL_FILE_MAX_BYTES);
+        if (contents != null) files[entry] = contents;
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
 
     return { manifest, files, dir: skillDir };
   });

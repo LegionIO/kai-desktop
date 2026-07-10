@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { readdirSync, readFileSync, existsSync, statSync, realpathSync } from 'fs';
+import { readdirSync, existsSync, statSync, realpathSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import { execPath } from 'process';
 import { createWorkflow, createStep } from '@mastra/core/workflows';
@@ -11,6 +11,7 @@ import type { AppConfig } from '../config/schema.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { isCommandAllowed } from './shell.js';
 import { runToolExecution } from './execution.js';
+import { readContainedFileSync, SKILL_MANIFEST_MAX_BYTES } from './skill-fs.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
 
 /* ── Manifest types ── */
@@ -146,7 +147,14 @@ export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillMa
     if (!existsSync(manifestPath)) continue;
 
     try {
-      const raw = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+      // Symlink-safe, size-capped read: skill.json must be a regular file inside
+      // the skill dir — a symlinked manifest could expose an arbitrary local file.
+      const manifestRaw = readContainedFileSync(skillDir, manifestPath, SKILL_MANIFEST_MAX_BYTES);
+      if (manifestRaw == null) {
+        console.warn(`[SkillLoader] Skipping skill "${entry}": manifest missing, too large, or not a regular file`);
+        continue;
+      }
+      const raw = JSON.parse(manifestRaw);
       const name = raw.name ?? entry;
       // The manifest name is the tool's identity + the enablement key, so it
       // must be a valid slug AND match the directory name — otherwise a skill
@@ -191,7 +199,23 @@ async function runShellExecution(
   getConfig: () => AppConfig,
 ): Promise<Record<string, unknown>> {
   const command = manifest.execution.command ?? './run.sh';
-  const resolvedCommand = interpolateTemplateShellSafe(command, input);
+
+  // SECURITY: never interpolate agent-supplied input into the shell command.
+  // Single-quoting is not enough — a placeholder that sits inside pre-existing
+  // DOUBLE quotes in the template (e.g. `echo "x {{input.v}}"`) still allows
+  // $(...) / backtick command substitution to execute. Input is passed to the
+  // skill exclusively via the SKILL_INPUT env var (JSON). A command template
+  // that still references {{input.…}} is rejected so the skill author migrates
+  // to reading SKILL_INPUT instead of silently running an unsafe command.
+  if (/\{\{\s*input\./.test(command)) {
+    return {
+      isError: true,
+      error:
+        'Skill shell commands may not interpolate {{input.*}} (shell-injection risk). ' +
+        'Read the JSON input from the SKILL_INPUT environment variable instead.',
+    };
+  }
+  const resolvedCommand = command;
   const config = getConfig();
 
   const check = isCommandAllowed(resolvedCommand, config);

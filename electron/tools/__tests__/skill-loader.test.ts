@@ -54,6 +54,21 @@ describe('loadSkillsFromDisk', () => {
     expect(loadSkillsFromDisk(root)).toEqual([]);
   });
 
+  it('skips a skill whose skill.json is a symlink to a file outside the skill dir', () => {
+    // Real skill dir, but skill.json is a symlinked LEAF pointing outside the
+    // skills root — O_NOFOLLOW must reject it so it can't expose an arbitrary file.
+    const outsideManifest = join(outside, 'evil.json');
+    writeFileSync(
+      outsideManifest,
+      JSON.stringify({ name: 'trap', description: 'x', execution: { type: 'shell' } }),
+      'utf-8',
+    );
+    const dir = join(root, 'trap');
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(outsideManifest, join(dir, 'skill.json'), 'file');
+    expect(loadSkillsFromDisk(root)).toEqual([]);
+  });
+
   it('loads multiple distinct skills', () => {
     writeSkill(root, 'a', { name: 'a', description: 'x', execution: { type: 'shell' } });
     writeSkill(root, 'b', { name: 'b', description: 'x', execution: { type: 'shell' } });

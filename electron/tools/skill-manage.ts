@@ -1,9 +1,15 @@
 import { z } from 'zod';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync, chmodSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, readdirSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import { getSkillToolName, loadSkillsFromDisk, type SkillManifest } from './skill-loader.js';
+import {
+  readContainedFileSync,
+  writeContainedFileSync,
+  SKILL_MANIFEST_MAX_BYTES,
+  SKILL_FILE_MAX_BYTES,
+} from './skill-fs.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
 
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
@@ -36,32 +42,52 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
   return {
     name: 'skills',
     description: [
-      'Manage ' + __BRAND_PRODUCT_NAME + ' skills. Skills are reusable tools stored on disk that persist across sessions.',
+      'Manage ' +
+        __BRAND_PRODUCT_NAME +
+        ' skills. Skills are reusable tools stored on disk that persist across sessions.',
       'Actions: "list" shows all skills. "get" reads a skill\'s manifest and files. "create" makes a new skill. "edit" updates one. "delete" removes one. "enable"/"disable" toggles availability.',
       'Skill types: "shell" (runs a command), "script" (runs Node.js), "prompt" (template), "http" (calls an endpoint), "composite" (chains tools).',
       `Created skills are immediately available as tools named like "${getSkillToolName('deploy-status')}".`,
     ].join(' '),
     inputSchema: z.object({
-      action: z.enum(['list', 'get', 'create', 'edit', 'delete', 'enable', 'disable']).describe('The action to perform'),
+      action: z
+        .enum(['list', 'get', 'create', 'edit', 'delete', 'enable', 'disable'])
+        .describe('The action to perform'),
       name: z.string().optional().describe('Skill name (required for get/create/edit/delete/enable/disable)'),
       description: z.string().optional().describe('Skill description (for create/edit)'),
       version: z.string().optional().describe('Skill version string (for create/edit)'),
       inputSchema: z.any().optional().describe('JSON Schema for the skill input (for create/edit)'),
-      execution: z.object({
-        type: z.enum(['shell', 'script', 'prompt', 'http', 'composite']).describe('Execution type'),
-        command: z.string().optional().describe('Shell command (for shell type)'),
-        scriptFile: z.string().optional().describe('Script filename (for script type, default: index.mjs)'),
-        promptTemplate: z.string().optional().describe('Prompt template with {{input.field}} placeholders (for prompt type)'),
-        url: z.string().optional().describe('HTTP endpoint URL (for http type)'),
-        method: z.string().optional().describe('HTTP method (for http type, default: POST)'),
-        headers: z.record(z.string(), z.string()).optional().describe('HTTP headers (for http type)'),
-        bodyTemplate: z.string().optional().describe('HTTP body template (for http type)'),
-        steps: z.array(z.object({
-          tool: z.string().describe('Tool name to call'),
-          args: z.record(z.string(), z.any()).describe('Arguments to pass'),
-        })).optional().describe('Steps for composite type'),
-      }).optional().describe('Execution configuration (required for create)'),
-      files: z.record(z.string(), z.string()).optional().describe('Additional files to write in the skill directory, keyed by filename (e.g., {"run.sh": "#!/bin/bash\\necho hello", "index.mjs": "..."})'),
+      execution: z
+        .object({
+          type: z.enum(['shell', 'script', 'prompt', 'http', 'composite']).describe('Execution type'),
+          command: z.string().optional().describe('Shell command (for shell type)'),
+          scriptFile: z.string().optional().describe('Script filename (for script type, default: index.mjs)'),
+          promptTemplate: z
+            .string()
+            .optional()
+            .describe('Prompt template with {{input.field}} placeholders (for prompt type)'),
+          url: z.string().optional().describe('HTTP endpoint URL (for http type)'),
+          method: z.string().optional().describe('HTTP method (for http type, default: POST)'),
+          headers: z.record(z.string(), z.string()).optional().describe('HTTP headers (for http type)'),
+          bodyTemplate: z.string().optional().describe('HTTP body template (for http type)'),
+          steps: z
+            .array(
+              z.object({
+                tool: z.string().describe('Tool name to call'),
+                args: z.record(z.string(), z.any()).describe('Arguments to pass'),
+              }),
+            )
+            .optional()
+            .describe('Steps for composite type'),
+        })
+        .optional()
+        .describe('Execution configuration (required for create)'),
+      files: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe(
+          'Additional files to write in the skill directory, keyed by filename (e.g., {"run.sh": "#!/bin/bash\\necho hello", "index.mjs": "..."})',
+        ),
     }),
     execute: async (input) => {
       const { action, name, description, version, inputSchema, execution, files } = input as {
@@ -101,20 +127,24 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
           const manifestPath = join(skillDir, 'skill.json');
           if (!existsSync(manifestPath)) return { error: `Skill "${safeName}" not found.` };
 
-          const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+          const manifestRaw = readContainedFileSync(skillDir, manifestPath, SKILL_MANIFEST_MAX_BYTES);
+          if (manifestRaw == null)
+            return { error: `Skill "${safeName}" manifest is missing, too large, or not a regular file.` };
+          const manifest = JSON.parse(manifestRaw);
 
-          // Read additional files in the skill directory
+          // Read additional files in the skill directory (symlink-safe + size-capped:
+          // a symlinked file inside a skill dir must not expose arbitrary local files).
           const skillFiles: Record<string, string> = {};
           try {
             const entries = readdirSync(skillDir);
             for (const entry of entries) {
               if (entry === 'skill.json') continue;
-              const filePath = join(skillDir, entry);
-              try {
-                skillFiles[entry] = readFileSync(filePath, 'utf-8');
-              } catch { /* skip binary files */ }
+              const contents = readContainedFileSync(skillDir, join(skillDir, entry), SKILL_FILE_MAX_BYTES);
+              if (contents != null) skillFiles[entry] = contents;
             }
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
 
           return { manifest, files: skillFiles, dir: skillDir };
         }
@@ -122,7 +152,10 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
         case 'create': {
           const safeName = validateSkillName(name);
           if (!safeName) {
-            return { error: 'Skill name must start with a letter/digit and contain only lowercase letters, digits, hyphens, and underscores.' };
+            return {
+              error:
+                'Skill name must start with a letter/digit and contain only lowercase letters, digits, hyphens, and underscores.',
+            };
           }
           if (!execution) return { error: 'Execution configuration is required.' };
           if (!description) return { error: 'Description is required.' };
@@ -151,17 +184,13 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             ...(inputSchema ? { inputSchema } : {}),
             execution,
           };
-          writeFileSync(join(skillDir, 'skill.json'), JSON.stringify(manifest, null, 2));
+          writeContainedFileSync(skillDir, join(skillDir, 'skill.json'), JSON.stringify(manifest, null, 2));
 
           // Write additional files (already validated above)
           if (files) {
             for (const [filename, content] of Object.entries(files)) {
               const filePath = join(skillDir, filename);
-              writeFileSync(filePath, content);
-              // Make shell scripts executable
-              if (filename.endsWith('.sh')) {
-                try { chmodSync(filePath, 0o755); } catch { /* ignore */ }
-              }
+              writeContainedFileSync(skillDir, filePath, content, filename.endsWith('.sh') ? 0o755 : 0o644);
             }
           }
 
@@ -199,7 +228,10 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             }
           }
 
-          const existing = JSON.parse(readFileSync(manifestPath, 'utf-8')) as SkillManifest;
+          const existingRaw = readContainedFileSync(skillDir, manifestPath, SKILL_MANIFEST_MAX_BYTES);
+          if (existingRaw == null)
+            return { error: `Skill "${safeName}" manifest is missing, too large, or not a regular file.` };
+          const existing = JSON.parse(existingRaw) as SkillManifest;
           const updated: SkillManifest = {
             ...existing,
             ...(description !== undefined ? { description } : {}),
@@ -207,16 +239,15 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             ...(inputSchema !== undefined ? { inputSchema } : {}),
             ...(execution !== undefined ? { execution } : {}),
           };
-          writeFileSync(manifestPath, JSON.stringify(updated, null, 2));
+          // Symlink-safe write: a planted symlink at skill.json (or any target
+          // file) must not redirect the write outside the skill root.
+          writeContainedFileSync(skillDir, manifestPath, JSON.stringify(updated, null, 2));
 
           // Write additional files if provided (already validated above)
           if (files) {
             for (const [filename, content] of Object.entries(files)) {
               const filePath = join(skillDir, filename);
-              writeFileSync(filePath, content);
-              if (filename.endsWith('.sh')) {
-                try { chmodSync(filePath, 0o755); } catch { /* ignore */ }
-              }
+              writeContainedFileSync(skillDir, filePath, content, filename.endsWith('.sh') ? 0o755 : 0o644);
             }
           }
 
