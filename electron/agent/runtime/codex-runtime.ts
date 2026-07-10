@@ -291,6 +291,25 @@ export class CodexRuntime implements AgentRuntime {
     let codex: InstanceType<CodexClass>;
     let threadOptions: Parameters<InstanceType<CodexClass>['startThread']>[0];
 
+    // Build the Codex input for a turn. Shared by the initial run and the
+    // resume-failure retry so both apply the same MCP tool hints AND the
+    // switchContext prefix — otherwise a runtime-switch turn that hits a stale
+    // thread would silently drop its prior context on the retry.
+    const buildCodexInput = (): CodexInput => {
+      let effectiveText =
+        bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
+      // Inject prior context on runtime switch (Codex has no system prompt API)
+      if (options.switchContext) {
+        effectiveText = `${options.switchContext}\n\n${effectiveText}`;
+      }
+      return imagePaths.length > 0
+        ? [
+            ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
+            ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
+          ]
+        : effectiveText;
+    };
+
     // -----------------------------------------------------------------------
     // 5. Create Codex instance and thread, then stream + translate events
     // -----------------------------------------------------------------------
@@ -345,23 +364,7 @@ export class CodexRuntime implements AgentRuntime {
       // -----------------------------------------------------------------------
       // 6. Stream and translate events
       // -----------------------------------------------------------------------
-      // Build the effective text (with MCP tool hints if needed)
-      let effectiveText =
-        bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
-
-      // Inject prior context on runtime switch (Codex has no system prompt API)
-      if (options.switchContext) {
-        effectiveText = `${options.switchContext}\n\n${effectiveText}`;
-      }
-
-      // If there are images, use structured input; otherwise plain string
-      const codexInput: CodexInput =
-        imagePaths.length > 0
-          ? [
-              ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
-              ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
-            ]
-          : effectiveText;
+      const codexInput = buildCodexInput();
 
       const { events } = await thread.runStreamed(codexInput, {
         signal: abortSignal,
@@ -397,16 +400,7 @@ export class CodexRuntime implements AgentRuntime {
         try {
           const freshThread = codex!.startThread(threadOptions);
 
-          const effectiveText =
-            bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
-
-          const codexInput: CodexInput =
-            imagePaths.length > 0
-              ? [
-                  ...(effectiveText ? [{ type: 'text' as const, text: effectiveText }] : []),
-                  ...imagePaths.map((p) => ({ type: 'local_image' as const, path: p })),
-                ]
-              : effectiveText;
+          const codexInput = buildCodexInput();
 
           const { events: retryEvents } = await freshThread.runStreamed(codexInput, {
             signal: abortSignal,
