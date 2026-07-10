@@ -36,11 +36,7 @@ export function registerOtaHandlers(
   // Manual check for OTA updates
   ipcMain.handle('ota:check', async () => {
     try {
-      const available = await checkForOtaUpdate(
-        appSlug,
-        codePaths.codeVersion,
-        shellVersion,
-      );
+      const available = await checkForOtaUpdate(appSlug, codePaths.codeVersion, shellVersion);
       return { ok: true, available };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'OTA check failed';
@@ -51,11 +47,7 @@ export function registerOtaHandlers(
   // Download (and verify) an available OTA update
   ipcMain.handle('ota:download', async () => {
     try {
-      const result = await downloadOtaUpdate(
-        appSlug,
-        codePaths.codeVersion,
-        shellVersion,
-      );
+      const result = await downloadOtaUpdate(appSlug, codePaths.codeVersion, shellVersion);
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'OTA download failed';
@@ -65,13 +57,13 @@ export function registerOtaHandlers(
 
   // Apply a staged OTA update (swap staging → current)
   ipcMain.handle('ota:apply', () => {
-    const result = applyOtaUpdate(appSlug);
+    const result = applyOtaUpdate(appSlug, codePaths.codeVersion);
     return result;
   });
 
   // Apply and restart the app
   ipcMain.handle('ota:apply-and-restart', () => {
-    const result = applyOtaUpdate(appSlug);
+    const result = applyOtaUpdate(appSlug, codePaths.codeVersion);
     if (result.success) {
       // Relaunch the app to load the new code
       setTimeout(() => {

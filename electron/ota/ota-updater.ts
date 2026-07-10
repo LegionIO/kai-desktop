@@ -25,7 +25,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { net, app } from 'electron';
-import { gte as semverGte } from 'semver';
+import { gte as semverGte, gt as semverGt } from 'semver';
 import type { OtaFeed, OtaFeedEntry, OtaManifest, OtaStatus } from './types.js';
 import { OTA_DIR_NAME, OTA_CURRENT_DIR, OTA_STAGING_DIR, OTA_ROLLBACK_DIR, OTA_MANIFEST_FILE } from './types.js';
 import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
@@ -490,7 +490,10 @@ export async function downloadOtaUpdate(
  * 2. staging/ → current/ (atomic rename)
  * 3. Signal restart needed
  */
-export function applyOtaUpdate(appSlug: string): { success: boolean; error?: string; version?: string } {
+export function applyOtaUpdate(
+  appSlug: string,
+  currentCodeVersion?: string,
+): { success: boolean; error?: string; version?: string } {
   const otaRoot = getOtaRoot(appSlug);
   const stagingDir = join(otaRoot, OTA_STAGING_DIR);
   const currentDir = join(otaRoot, OTA_CURRENT_DIR);
@@ -503,6 +506,17 @@ export function applyOtaUpdate(appSlug: string): { success: boolean; error?: str
   try {
     // Read version from staging manifest
     const manifest: OtaManifest = JSON.parse(readFileSync(join(stagingDir, OTA_MANIFEST_FILE), 'utf-8'));
+
+    // Apply-time downgrade guard: a stale-but-signed staged overlay must not be
+    // applied over an equal/newer running version (mirrors the load-layer check
+    // in bootstrap.ts). Only enforced when the caller supplies the current
+    // version; skipped otherwise for back-compat.
+    if (currentCodeVersion && !semverGt(manifest.codeVersion, currentCodeVersion)) {
+      rmSync(stagingDir, { recursive: true, force: true });
+      const error = `Refusing to apply OTA ${manifest.codeVersion} over current ${currentCodeVersion} (not newer)`;
+      broadcast({ state: 'error', message: error });
+      return { success: false, error };
+    }
 
     broadcast({ state: 'applying', version: manifest.codeVersion });
 
