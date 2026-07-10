@@ -93,21 +93,11 @@ export function buildSignedArchive(opts: BuildArchiveOptions): BuiltArchive {
   const tarArgs = ['-czf'];
   const archivePath = join(dir, 'ota-archive.tar.gz');
   if (opts.tamper?.zipSlip) {
+    // Place an escape file as a SIBLING of src, then tar from inside src and
+    // reference it via `../escape.txt` so the archive contains a real traversal
+    // member (portable across GNU tar + macOS bsdtar; --transform is GNU-only).
     writeFileSync(join(dir, 'escape.txt'), 'pwned', 'utf-8');
-    // Build the tar from `dir` so we can reference ../ escape members.
-    execFileSync('/usr/bin/tar', [
-      '-czf',
-      archivePath,
-      '-C',
-      src,
-      '.',
-      '-C',
-      dir,
-      // add an entry that extracts to ../escape.txt relative to extract root
-      '--transform',
-      's,^escape.txt,../escape.txt,',
-      'escape.txt',
-    ]);
+    execFileSync('/usr/bin/tar', ['-czf', archivePath, '-C', src, '.', '../escape.txt']);
   } else {
     execFileSync('/usr/bin/tar', [...tarArgs, archivePath, '-C', src, '.']);
   }

@@ -17,11 +17,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'fs';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { net, app } from 'electron';
@@ -237,6 +238,75 @@ async function hashFile(filePath: string): Promise<string> {
 }
 
 /**
+ * Extract an OTA archive into `destDir` with zip-slip / link-escape defenses.
+ *
+ * Defense-in-depth: the archive sha512 is already checked against the signed
+ * feed value BEFORE this runs, so a tampered archive can't reach here without a
+ * signature break. This adds a second barrier for the key-compromise case:
+ *   1. Pre-list members (`tar -tvzf`) and REJECT any that are absolute, contain
+ *      a `..` segment, or are symlink/hardlink/device entries (the verbose
+ *      listing's type char catches links `l`/`h`, devices `c`/`b`, etc).
+ *   2. Extract only after the listing is clean.
+ *   3. Realpath-verify every extracted entry still resolves under destDir.
+ * Throws on any violation (caller wipes staging + fails the update).
+ */
+function safeExtractArchive(archivePath: string, destDir: string): void {
+  // 1. Pre-list with type info. bsdtar + GNU tar both print a verbose table
+  //    whose first column starts with the entry type char (`-` file, `d` dir,
+  //    `l` symlink, `h` hardlink, `c`/`b` device, `p` fifo).
+  const listing = execFileSync('/usr/bin/tar', ['-tvzf', archivePath], { encoding: 'utf-8' });
+  for (const rawLine of listing.split('\n')) {
+    const line = rawLine.trimEnd();
+    if (!line) continue;
+    const typeChar = line[0];
+    // The member path is the last whitespace-run field; links render as
+    // "name -> target" so split on " -> " first to isolate the member name.
+    const afterArrow = line.split(' -> ')[0];
+    const name = afterArrow.slice(afterArrow.lastIndexOf(' ') + 1);
+    if (!name || name === './') continue;
+
+    if (typeChar === 'l' || typeChar === 'h') {
+      throw new Error(`OTA archive contains a link member (rejected): ${line}`);
+    }
+    if (typeChar === 'c' || typeChar === 'b' || typeChar === 'p' || typeChar === 's') {
+      throw new Error(`OTA archive contains a special/device member (rejected): ${line}`);
+    }
+    if (name.startsWith('/') || name.startsWith('~')) {
+      throw new Error(`OTA archive contains an absolute path member (rejected): ${name}`);
+    }
+    const segments = name.split(/[/\\]/);
+    if (segments.some((s) => s === '..')) {
+      throw new Error(`OTA archive contains a traversal ('..') member (rejected): ${name}`);
+    }
+  }
+
+  // 2. Extract into a fresh dir. -P is NOT passed, so tar also strips leading
+  //    slashes / rejects `..` on its own — this is belt-and-suspenders.
+  mkdirSync(destDir, { recursive: true });
+  execFileSync('/usr/bin/tar', ['-xzf', archivePath, '-C', destDir]);
+
+  // 3. Realpath-verify every extracted entry stays under destDir (guards a
+  //    symlink that slipped the listing heuristic, or a tar quirk).
+  const root = realpathSync(destDir);
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      let real: string;
+      try {
+        real = realpathSync(full);
+      } catch {
+        throw new Error(`OTA extracted entry could not be resolved (rejected): ${full}`);
+      }
+      if (real !== root && !real.startsWith(root + sep)) {
+        throw new Error(`OTA extracted entry escapes the extract root (rejected): ${full} -> ${real}`);
+      }
+      if (entry.isDirectory()) walk(full);
+    }
+  };
+  walk(root);
+}
+
+/**
  * Verify the extracted OTA archive against its manifest hashes.
  */
 async function verifyExtracted(stagingDir: string): Promise<{ valid: boolean; error?: string }> {
@@ -437,10 +507,9 @@ export async function downloadOtaUpdate(
       return { success: false, error };
     }
 
-    // Extract archive using system tar (always available on macOS)
+    // Extract archive with zip-slip / link-escape defenses (see safeExtractArchive).
     const extractDir = join(stagingDir, 'extracted');
-    mkdirSync(extractDir, { recursive: true });
-    execFileSync('/usr/bin/tar', ['-xzf', archivePath, '-C', extractDir]);
+    safeExtractArchive(archivePath, extractDir);
 
     // Verify extracted files against manifest
     const verification = await verifyExtracted(extractDir);
