@@ -25,7 +25,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { net, app } from 'electron';
-import { gte as semverGte, gt as semverGt } from 'semver';
+import { gte as semverGte, gt as semverGt, valid as semverValid } from 'semver';
 import type { OtaFeed, OtaFeedEntry, OtaManifest, OtaStatus } from './types.js';
 import { OTA_DIR_NAME, OTA_CURRENT_DIR, OTA_STAGING_DIR, OTA_ROLLBACK_DIR, OTA_MANIFEST_FILE } from './types.js';
 import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
@@ -531,12 +531,20 @@ export function applyOtaUpdate(
     // Apply-time downgrade guard: a stale-but-signed staged overlay must not be
     // applied over an equal/newer running version (mirrors the load-layer check
     // in bootstrap.ts). Only enforced when the caller supplies the current
-    // version; skipped otherwise for back-compat.
-    if (currentCodeVersion && !semverGt(manifest.codeVersion, currentCodeVersion)) {
-      rmSync(stagingDir, { recursive: true, force: true });
-      const error = `Refusing to apply OTA ${manifest.codeVersion} over current ${currentCodeVersion} (not newer)`;
-      broadcast({ state: 'error', message: error });
-      return { success: false, error };
+    // version; skipped otherwise for back-compat. A malformed staged version is
+    // treated as a rejection (semverGt would otherwise throw).
+    if (currentCodeVersion) {
+      const staged = manifest.codeVersion;
+      const isNewer =
+        semverValid(staged) != null && semverValid(currentCodeVersion) != null && semverGt(staged, currentCodeVersion);
+      if (!isNewer) {
+        rmSync(stagingDir, { recursive: true, force: true });
+        otaReady = false;
+        readyVersion = undefined;
+        const error = `Refusing to apply OTA ${staged} over current ${currentCodeVersion} (not newer or invalid)`;
+        broadcast({ state: 'error', message: error });
+        return { success: false, error };
+      }
     }
 
     broadcast({ state: 'applying', version: manifest.codeVersion });

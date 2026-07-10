@@ -78,6 +78,15 @@ describe('applyOtaUpdate downgrade guard', () => {
     expect(existsSync(join(otaRoot, OTA_STAGING_DIR))).toBe(false);
   });
 
+  it('refuses (does not throw) a staged manifest with an invalid version, and wipes staging', () => {
+    const otaRoot = stageOverlay('not-a-semver');
+    // semverGt would throw on an invalid version — the guard must treat it as a
+    // rejection instead of crashing.
+    const res = applyOtaUpdate(APP_SLUG, '1.0.0');
+    expect(res.success).toBe(false);
+    expect(existsSync(join(otaRoot, OTA_STAGING_DIR))).toBe(false);
+  });
+
   it('applies a strictly-newer staged overlay (staging → current)', () => {
     const otaRoot = stageOverlay('1.1.0');
     const res = applyOtaUpdate(APP_SLUG, '1.0.9');
