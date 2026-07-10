@@ -243,12 +243,25 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       try {
         const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
 
-        // Validate state machine transition
-        if (updates.status && existing.status !== updates.status) {
-          if (!isValidTransition(existing.status, updates.status)) {
-            return { error: `Invalid transition: ${existing.status} → ${updates.status}` };
+        // Validate the status transition whenever the status key is PRESENT.
+        // A truthiness-only check let status: undefined/null/'' slip past the
+        // state machine and then get spread into the persisted task, wiping the
+        // status and dropping the task off the board / out of listAllTasks.
+        if ('status' in updates) {
+          const parsed = kaiTaskStatusSchema.safeParse(updates.status);
+          if (!parsed.success) {
+            return { error: `Invalid task status: ${JSON.stringify(updates.status)}` };
+          }
+          if (existing.status !== parsed.data && !isValidTransition(existing.status, parsed.data)) {
+            return { error: `Invalid transition: ${existing.status} → ${parsed.data}` };
           }
         }
+
+        // Strip keys explicitly set to undefined so a `{ field: undefined }`
+        // update can't blank out an existing value on merge.
+        const cleanUpdates = Object.fromEntries(
+          Object.entries(updates).filter(([, v]) => v !== undefined),
+        ) as Partial<TaskFile>;
 
         // Don't bump updatedAt for operational/bookkeeping-only fields.
         // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
@@ -258,10 +271,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           'completedAt',
           'archivedAt',
         ];
-        const isMeaningful = Object.keys(updates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
+        const isMeaningful = Object.keys(cleanUpdates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
         const updated: TaskFile = {
           ...existing,
-          ...updates,
+          ...cleanUpdates,
           id, // prevent ID mutation
           ...(isMeaningful && { updatedAt: new Date().toISOString() }),
         };
