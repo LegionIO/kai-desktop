@@ -106,6 +106,25 @@ function ensureDirs(appHome: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
+/** Write a file atomically: write to a sibling temp file, then rename into place.
+ *  rename(2) is atomic on the same filesystem, so a crash mid-write can never
+ *  leave a torn/truncated destination — readers see either the old file or the
+ *  fully-written new one. */
+function atomicWriteFileSync(destPath: string, data: string): void {
+  const tmp = `${destPath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, data, 'utf-8');
+    renameSync(tmp, destPath);
+  } catch (err) {
+    try {
+      if (existsSync(tmp)) rmSync(tmp, { force: true });
+    } catch {
+      /* ignore cleanup failure */
+    }
+    throw err;
+  }
+}
+
 // ── index derivation ───────────────────────────────────────────────────────
 
 function computeHasToolCalls(conv: ConversationRecord): boolean {
@@ -156,7 +175,12 @@ const EMPTY_INDEX: ConversationIndex = { conversations: {}, activeConversationId
 export function readIndex(appHome: string): ConversationIndex {
   migrateMonolithIfNeeded(appHome);
   const p = indexPath(appHome);
-  if (!existsSync(p)) return { ...EMPTY_INDEX, conversations: {}, settings: {} };
+  if (!existsSync(p)) {
+    // No index but conversation files may exist (e.g. index write never landed
+    // after a crash) — rebuild from the per-file records rather than hiding them.
+    const rebuilt = rebuildIndexFromConversationFiles(appHome);
+    return rebuilt ?? { ...EMPTY_INDEX, conversations: {}, settings: {} };
+  }
   try {
     const parsed = JSON.parse(readFileSync(p, 'utf-8')) as Partial<ConversationIndex>;
     return {
@@ -165,13 +189,45 @@ export function readIndex(appHome: string): ConversationIndex {
       settings: parsed.settings ?? {},
     };
   } catch {
-    return { conversations: {}, activeConversationId: null, settings: {} };
+    // Corrupt/truncated index — the per-file conversation records are the source
+    // of truth, so rebuild the summaries from them instead of returning empty
+    // (which would make every chat vanish from the list). activeConversationId +
+    // settings are best-effort lost, but no message data is.
+    const rebuilt = rebuildIndexFromConversationFiles(appHome);
+    return rebuilt ?? { conversations: {}, activeConversationId: null, settings: {} };
   }
+}
+
+/** Reconstruct the index by scanning the per-conversation files and deriving each
+ *  summary via toIndexEntry. Returns null if the conversations dir is absent (so
+ *  callers can fall back to an empty index). Best-effort — corrupt individual
+ *  files are skipped. Does NOT recover activeConversationId/settings (index-only
+ *  state); those reset, but no message data is lost. */
+function rebuildIndexFromConversationFiles(appHome: string): ConversationIndex | null {
+  const dir = conversationsDir(appHome);
+  if (!existsSync(dir)) return null;
+  const index: ConversationIndex = { conversations: {}, activeConversationId: null, settings: {} };
+  let recovered = 0;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const conv = JSON.parse(readFileSync(join(dir, name), 'utf-8')) as ConversationRecord;
+      if (conv && typeof conv.id === 'string') {
+        index.conversations[conv.id] = toIndexEntry(conv);
+        recovered += 1;
+      }
+    } catch {
+      /* skip corrupt file */
+    }
+  }
+  if (recovered === 0) return null;
+  console.warn(`[conversation-store] rebuilt index from ${recovered} conversation file(s) (index was missing/corrupt)`);
+  return index;
 }
 
 export function writeIndex(appHome: string, index: ConversationIndex): void {
   ensureDirs(appHome);
-  writeFileSync(indexPath(appHome), JSON.stringify(index, null, 2), 'utf-8');
+  atomicWriteFileSync(indexPath(appHome), JSON.stringify(index, null, 2));
 }
 
 // ── conversation read/write ───────────────────────────────────────────────────
@@ -216,7 +272,7 @@ export function writeConversation(appHome: string, conv: ConversationRecord): vo
   // monolith is still un-migrated — a partial index would strand old chats.
   assertMigratedBeforeWrite(appHome);
   ensureDirs(appHome);
-  writeFileSync(conversationPath(appHome, conv.id), JSON.stringify(conv, null, 2), 'utf-8');
+  atomicWriteFileSync(conversationPath(appHome, conv.id), JSON.stringify(conv, null, 2));
   const index = readIndex(appHome);
   index.conversations[conv.id] = toIndexEntry(conv);
   writeIndex(appHome, index);

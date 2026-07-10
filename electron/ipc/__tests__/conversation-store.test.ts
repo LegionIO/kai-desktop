@@ -205,4 +205,28 @@ describe('migration from the monolith', () => {
     // The monolith remains, so migration can be retried once corruption is fixed.
     expect(existsSync(join(appHome, 'data', 'conversations.json'))).toBe(true);
   });
+
+  it('rebuilds the index from conversation files when index.json is corrupt', () => {
+    // Write two conversations normally so their per-file records exist.
+    writeConversation(appHome, makeConv('a', { title: 'Alpha' }));
+    writeConversation(appHome, makeConv('b', { title: 'Beta' }));
+    // Corrupt the index on disk (simulates a torn write / disk corruption).
+    writeFileSync(join(appHome, 'data', 'index.json'), '{ this is not json', 'utf-8');
+    // readIndex must NOT return empty (which would hide both chats) — it rebuilds
+    // the summaries from the intact per-file records.
+    const index = readIndex(appHome);
+    expect(Object.keys(index.conversations).sort()).toEqual(['a', 'b']);
+    expect(index.conversations.a.title).toBe('Alpha');
+    expect(index.conversations.b.title).toBe('Beta');
+  });
+
+  it('rebuilds the index from conversation files when index.json is missing but files exist', () => {
+    writeConversation(appHome, makeConv('a', { title: 'Alpha' }));
+    // Delete only the index, leaving the per-file record (crash between file
+    // write and index write).
+    rmSync(join(appHome, 'data', 'index.json'), { force: true });
+    const index = readIndex(appHome);
+    expect(Object.keys(index.conversations)).toEqual(['a']);
+    expect(index.conversations.a.title).toBe('Alpha');
+  });
 });

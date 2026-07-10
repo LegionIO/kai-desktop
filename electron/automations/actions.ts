@@ -386,15 +386,52 @@ async function runAgentAction(
     // Persist the assistant turn (authoritative on-disk write) and return to idle.
     // Persisting the full content parts (text + tool calls) keeps the tool calls
     // visible after the conversation is reloaded from disk.
-    const appended = appendConversationMessages(
-      deps.appHome,
-      conversationId,
-      [{ role: 'assistant', content: assistantContent, createdAt: new Date().toISOString() }],
-      { parentId: userTurnHeadId, runStatus: 'idle' },
-    );
+    //
+    // This write MUST NOT be able to leave the conversation stuck at
+    // runStatus:'running'. If it throws (disk/index error, or a tool result that
+    // won't JSON-serialize), fall back to a minimal idle write, and always
+    // broadcast the terminal `done` so the renderer clears its running indicator.
+    let appended: ReturnType<typeof appendConversationMessages> = null;
+    let finalizeError: unknown = null;
+    try {
+      appended = appendConversationMessages(
+        deps.appHome,
+        conversationId,
+        [{ role: 'assistant', content: assistantContent, createdAt: new Date().toISOString() }],
+        { parentId: userTurnHeadId, runStatus: 'idle' },
+      );
+    } catch (persistErr) {
+      finalizeError = persistErr;
+      console.error(`[automations] failed to persist assistant turn for ${conversationId}; forcing idle:`, persistErr);
+      // Best-effort: at minimum flip runStatus back to idle so the conversation
+      // isn't wedged. Try a plain-text fallback message (drops unserializable
+      // tool-call parts), then a status-only write if even that fails.
+      try {
+        appended = appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: text || '⚠️ Automation result could not be saved.' }],
+              createdAt: new Date().toISOString(),
+            },
+          ],
+          { parentId: userTurnHeadId, runStatus: 'idle' },
+        );
+      } catch (fallbackErr) {
+        console.error(`[automations] fallback persist also failed for ${conversationId}:`, fallbackErr);
+        try {
+          appendConversationMessages(deps.appHome, conversationId, [], { runStatus: 'idle' });
+        } catch {
+          /* give up on disk; the terminal `done` below still unwedges the UI */
+        }
+      }
+    }
 
     // Tell the renderer the automation stream is finished so it clears the
-    // running indicator and reloads the authoritative tree from disk.
+    // running indicator and reloads the authoritative tree from disk. Emitted
+    // even if persistence failed above — otherwise the UI spins forever.
     broadcastAgentStreamEvent({ conversationId, type: 'done', automation: true });
 
     const emittedTitle = appended?.title ?? appended?.fallbackTitle ?? title;
@@ -407,9 +444,11 @@ async function runAgentAction(
 
     // Surface a real failure to the engine's run record — but only AFTER the
     // conversation has been finalized above. A thrown stream error (or an
-    // `error` event with no output) is a genuine failure; an abort is not.
-    if (!aborted && (caughtStreamError || (error && !text))) {
-      throw new Error(error ?? 'Automation agent run failed');
+    // `error` event with no output) is a genuine failure; an abort is not. A
+    // persistence failure during finalize is also a genuine failure.
+    if (!aborted && (caughtStreamError || finalizeError || (error && !text))) {
+      const failMsg = error ?? (finalizeError instanceof Error ? finalizeError.message : null);
+      throw new Error(failMsg ?? 'Automation agent run failed');
     }
     return { text, modelKey, toolCalls, conversationId };
   } finally {
