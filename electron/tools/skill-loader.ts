@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import { readdirSync, readFileSync, existsSync, statSync } from 'fs';
-import { join } from 'path';
+import { readdirSync, readFileSync, existsSync, statSync, realpathSync } from 'fs';
+import { join, resolve, sep } from 'path';
+import { execPath } from 'process';
 import { createWorkflow, createStep } from '@mastra/core/workflows';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 import { registerSkillWorkflow } from '../agent/mastra-instance.js';
@@ -96,6 +97,8 @@ import { convertJsonSchemaToZod } from './json-schema-zod.js';
 
 export { convertJsonSchemaToZod } from './json-schema-zod.js';
 
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
 /* ── Skill loading from disk ── */
 
 export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillManifest; dir: string }> {
@@ -110,11 +113,28 @@ export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillMa
     return [];
   }
 
+  let skillsRoot: string;
+  try {
+    skillsRoot = realpathSync(skillsDir);
+  } catch {
+    return [];
+  }
+
+  const seenNames = new Set<string>();
+
   for (const entry of entries) {
     const skillDir = join(skillsDir, entry);
+    // Reject a skill dir that isn't a real directory contained in the skills
+    // root — a symlink could point outside it and load arbitrary code/manifests.
+    let realSkillDir: string;
     try {
       if (!statSync(skillDir).isDirectory()) continue;
+      realSkillDir = realpathSync(skillDir);
     } catch {
+      continue;
+    }
+    if (realSkillDir !== skillsRoot && !realSkillDir.startsWith(skillsRoot + sep)) {
+      console.warn(`[SkillLoader] Skipping skill "${entry}": resolves outside the skills directory`);
       continue;
     }
 
@@ -123,8 +143,27 @@ export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillMa
 
     try {
       const raw = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+      const name = raw.name ?? entry;
+      // The manifest name is the tool's identity + the enablement key, so it
+      // must be a valid slug AND match the directory name — otherwise a skill
+      // could impersonate another (enabled) skill's name.
+      if (!SKILL_NAME_RE.test(name)) {
+        console.warn(`[SkillLoader] Skipping skill "${entry}": invalid manifest name "${name}"`);
+        continue;
+      }
+      if (name !== entry) {
+        console.warn(
+          `[SkillLoader] Skipping skill in "${entry}": manifest name "${name}" does not match its directory`,
+        );
+        continue;
+      }
+      if (seenNames.has(name)) {
+        console.warn(`[SkillLoader] Skipping duplicate skill name "${name}"`);
+        continue;
+      }
+      seenNames.add(name);
       const manifest: SkillManifest = {
-        name: raw.name ?? entry,
+        name,
         description: raw.description ?? `Skill: ${entry}`,
         version: raw.version,
         inputSchema: raw.inputSchema,
@@ -190,8 +229,26 @@ async function runScriptExecution(
   const streaming = resolveProcessStreamingConfig(config);
   const context: ToolExecutionContext = { toolCallId: `wf-${Date.now()}` };
 
+  // Resolve the script path and require it to stay inside the skill directory,
+  // then run it with argv (shell:false). Passing it through a shell as
+  // `node ${JSON.stringify(scriptFile)}` is injectable — JSON.stringify's double
+  // quotes do NOT stop $(...) / backtick command substitution, so a crafted
+  // manifest scriptFile could execute arbitrary shell.
+  const skillRoot = realpathSync(skillDir);
+  const scriptPath = resolve(skillRoot, scriptFile);
+  let realScriptPath: string;
+  try {
+    realScriptPath = realpathSync(scriptPath);
+  } catch {
+    throw new Error(`Skill script not found: ${scriptFile}`);
+  }
+  if (realScriptPath !== skillRoot && !realScriptPath.startsWith(skillRoot + sep)) {
+    throw new Error(`Skill script "${scriptFile}" escapes the skill directory`);
+  }
+
   const result = await runCommandWithStreaming({
     command: `node ${JSON.stringify(scriptFile)}`,
+    argv: [execPath, realScriptPath],
     cwd: skillDir,
     timeoutMs: config.tools.shell.timeout,
     env: { ...process.env, SKILL_INPUT: JSON.stringify(input) },
@@ -338,7 +395,6 @@ function buildCompositeWorkflow(
       description: manifest.description,
       inputSchema,
       outputSchema,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     })
       .then(noOp as any)
       .commit();
