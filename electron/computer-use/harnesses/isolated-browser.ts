@@ -1,4 +1,4 @@
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, session } from 'electron';
 import type {
   ComputerActionProposal,
   ComputerEnvironmentMetadata,
@@ -48,10 +48,41 @@ type ResolvedBrowserTarget = {
 
 const interactiveSelector = 'a, button, input, textarea, select, [role="button"], [contenteditable="true"]';
 const actionSearchStopWords = new Set([
-  'about', 'above', 'after', 'again', 'button', 'center', 'clear', 'click', 'clearly', 'control',
-  'direct', 'entry', 'flow', 'from', 'header', 'icon', 'into', 'initiate', 'just', 'link', 'menu',
-  'most', 'next', 'open', 'page', 'right', 'should', 'that', 'then', 'there', 'this', 'top',
-  'visible', 'with', 'within',
+  'about',
+  'above',
+  'after',
+  'again',
+  'button',
+  'center',
+  'clear',
+  'click',
+  'clearly',
+  'control',
+  'direct',
+  'entry',
+  'flow',
+  'from',
+  'header',
+  'icon',
+  'into',
+  'initiate',
+  'just',
+  'link',
+  'menu',
+  'most',
+  'next',
+  'open',
+  'page',
+  'right',
+  'should',
+  'that',
+  'then',
+  'there',
+  'this',
+  'top',
+  'visible',
+  'with',
+  'within',
 ]);
 
 function clampCoordinate(value: number, max: number): number {
@@ -71,6 +102,10 @@ function ensureWindow(sessionId: string): BrowserWindow {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      // Per-session, in-memory partition (NOT `persist:`) so each automation
+      // session gets isolated cookies/storage/cache that vanish with the window
+      // — no state bleed between targets or into the app's default session.
+      partition: `kai-cu-${sessionId}`,
     },
   });
   applyBrandUserAgent(win.webContents);
@@ -126,14 +161,18 @@ function extractSearchTerms(action: ComputerActionProposal): string[] {
     .join(' ');
   if (!source) return [];
 
-  return Array.from(new Set(source
-    .split(' ')
-    .map((term) => term.trim())
-    .filter((term) => term.length >= 2 && !actionSearchStopWords.has(term))));
+  return Array.from(
+    new Set(
+      source
+        .split(' ')
+        .map((term) => term.trim())
+        .filter((term) => term.length >= 2 && !actionSearchStopWords.has(term)),
+    ),
+  );
 }
 
 function centerPointForElement(element: BrowserInteractiveElement): BrowserPoint {
-  return point(element.x + (element.width / 2), element.y + (element.height / 2));
+  return point(element.x + element.width / 2, element.y + element.height / 2);
 }
 
 function distanceToRect(target: BrowserPoint, element: BrowserInteractiveElement): number {
@@ -145,10 +184,12 @@ function distanceToRect(target: BrowserPoint, element: BrowserInteractiveElement
 }
 
 function pointInsideElement(target: BrowserPoint, element: BrowserInteractiveElement): boolean {
-  return target.x >= element.x
-    && target.x <= element.x + Math.max(element.width, 1)
-    && target.y >= element.y
-    && target.y <= element.y + Math.max(element.height, 1);
+  return (
+    target.x >= element.x &&
+    target.x <= element.x + Math.max(element.width, 1) &&
+    target.y >= element.y &&
+    target.y <= element.y + Math.max(element.height, 1)
+  );
 }
 
 function resolveMovementPath(action: ComputerActionProposal): ComputerUseMovementPath {
@@ -171,13 +212,16 @@ async function resolveCoordinateSpace(win: BrowserWindow, session: ComputerSessi
     viewportWidth?: number;
     viewportHeight?: number;
     devicePixelRatio?: number;
-  }>(win, `
+  }>(
+    win,
+    `
     (() => ({
       viewportWidth: Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0, visualViewport?.width || 0),
       viewportHeight: Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0, visualViewport?.height || 0),
       devicePixelRatio: window.devicePixelRatio || 1,
     }))();
-  `);
+  `,
+  );
 
   const contentBounds = win.getContentBounds();
   const frameWidth = Math.max(1, Math.round(session.latestFrame?.width ?? Math.max(contentBounds.width, 1)));
@@ -372,7 +416,9 @@ function escapeJson(value: unknown): string {
 }
 
 async function readInteractiveElements(win: BrowserWindow): Promise<BrowserInteractiveElement[]> {
-  return evalInPage<BrowserInteractiveElement[]>(win, `
+  return evalInPage<BrowserInteractiveElement[]>(
+    win,
+    `
     (() => {
       const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0, visualViewport?.width || 0);
       const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0, visualViewport?.height || 0);
@@ -411,7 +457,8 @@ async function readInteractiveElements(win: BrowserWindow): Promise<BrowserInter
         };
       });
     })();
-  `);
+  `,
+  );
 }
 
 function describeElement(element: BrowserInteractiveElement): string | undefined {
@@ -439,7 +486,13 @@ function scoreElementMatch(
   if (action.elementId && action.elementId === element.id) {
     score += 2000;
   }
-  if (actionSelector && normalizedSelector && (actionSelector === normalizedSelector || actionSelector.includes(normalizedSelector) || normalizedSelector.includes(actionSelector))) {
+  if (
+    actionSelector &&
+    normalizedSelector &&
+    (actionSelector === normalizedSelector ||
+      actionSelector.includes(normalizedSelector) ||
+      normalizedSelector.includes(actionSelector))
+  ) {
     score += 900;
   }
 
@@ -484,14 +537,12 @@ async function resolveBrowserTarget(
   }
 
   const shouldUseMatched = Boolean(
-    matched
-      && (action.elementId === matched.id
-        || (action.selector && normalizeSearchText(action.selector) && bestScore >= 200)
-        || bestScore >= 260),
+    matched &&
+    (action.elementId === matched.id ||
+      (action.selector && normalizeSearchText(action.selector) && bestScore >= 200) ||
+      bestScore >= 260),
   );
-  const appliedViewport = shouldUseMatched && matched
-    ? centerPointForElement(matched)
-    : requestedViewport;
+  const appliedViewport = shouldUseMatched && matched ? centerPointForElement(matched) : requestedViewport;
   const appliedFrame = toFramePoint(appliedViewport, space);
 
   return {
@@ -499,10 +550,12 @@ async function resolveBrowserTarget(
     requestedViewport,
     appliedFrame,
     appliedViewport,
-    ...(shouldUseMatched && matched ? {
-      elementId: matched.id,
-      elementLabel: describeElement(matched),
-    } : {}),
+    ...(shouldUseMatched && matched
+      ? {
+          elementId: matched.id,
+          elementLabel: describeElement(matched),
+        }
+      : {}),
   };
 }
 
@@ -512,7 +565,8 @@ function formatResolvedPointerSummary(
   movementPath: ComputerUseMovementPath,
 ): string {
   const applied = `${target.appliedFrame.x}, ${target.appliedFrame.y}`;
-  const requestedChanged = target.appliedFrame.x !== target.requestedFrame.x || target.appliedFrame.y !== target.requestedFrame.y;
+  const requestedChanged =
+    target.appliedFrame.x !== target.requestedFrame.x || target.appliedFrame.y !== target.requestedFrame.y;
   const pathSuffix = movementPathSuffix(movementPath);
   if (!requestedChanged) {
     return `${verb} ${applied}${pathSuffix}.`;
@@ -657,6 +711,14 @@ export class IsolatedBrowserHarness implements ComputerHarness {
       }
       win.destroy();
     }
+    // Explicitly clear the per-session partition's storage. In-memory partitions
+    // drop on window close, but this guarantees cookies/cache/localStorage/SW
+    // are gone even if a stray reference kept the session alive.
+    try {
+      await session.fromPartition(`kai-cu-${sessionId}`).clearStorageData();
+    } catch {
+      // Best-effort teardown.
+    }
   }
 
   async captureFrame(session: ComputerSession): Promise<ComputerFrame> {
@@ -675,7 +737,11 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     };
   }
 
-  async movePointer(session: ComputerSession, action: ComputerActionProposal, _context?: ComputerHarnessActionContext): Promise<ComputerHarnessActionResult> {
+  async movePointer(
+    session: ComputerSession,
+    action: ComputerActionProposal,
+    _context?: ComputerHarnessActionContext,
+  ): Promise<ComputerHarnessActionResult> {
     const win = ensureWindow(session.id);
     const space = await resolveCoordinateSpace(win, session);
     const requested = point(action.x, action.y);
@@ -704,7 +770,10 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     } catch {
       await evalInPage(win, buildPointerScript(route, 1));
     }
-    return result(formatResolvedPointerSummary('Clicked browser viewport at', target, movementPath), target.appliedFrame);
+    return result(
+      formatResolvedPointerSummary('Clicked browser viewport at', target, movementPath),
+      target.appliedFrame,
+    );
   }
 
   async doubleClick(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
@@ -720,7 +789,10 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     } catch {
       await evalInPage(win, buildPointerScript(route, 2));
     }
-    return result(formatResolvedPointerSummary('Double-clicked browser viewport at', target, movementPath), target.appliedFrame);
+    return result(
+      formatResolvedPointerSummary('Double-clicked browser viewport at', target, movementPath),
+      target.appliedFrame,
+    );
   }
 
   async drag(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
@@ -740,7 +812,10 @@ export class IsolatedBrowserHarness implements ComputerHarness {
       await evalInPage(win, buildDragScript(moveToStartRoute, dragRoute));
     }
     const actual = toFramePoint(dragEnd, space);
-    return result(`Dragged browser viewport pointer from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${movementPathSuffix(movementPath)}.`, actual);
+    return result(
+      `Dragged browser viewport pointer from ${requestedStart.x}, ${requestedStart.y} to ${requestedEnd.x}, ${requestedEnd.y}${movementPathSuffix(movementPath)}.`,
+      actual,
+    );
   }
 
   async scroll(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
@@ -754,7 +829,9 @@ export class IsolatedBrowserHarness implements ComputerHarness {
   async typeText(session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
     const win = ensureWindow(session.id);
     const text = action.text ?? '';
-    await evalInPage(win, `
+    await evalInPage(
+      win,
+      `
       (() => {
         const el = document.activeElement;
         if (!el) return 'No active element';
@@ -787,7 +864,8 @@ export class IsolatedBrowserHarness implements ComputerHarness {
         }
         return 'Active element is not editable';
       })();
-    `);
+    `,
+    );
     return result(`Typed ${JSON.stringify(action.text ?? '')} into browser.`);
   }
 
@@ -796,7 +874,9 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     const keys = action.keys ?? [];
     const primary = keys[keys.length - 1] ?? 'Enter';
     const modifiers = keys.slice(0, -1);
-    await evalInPage(win, `
+    await evalInPage(
+      win,
+      `
       (() => {
         const el = document.activeElement || document.body;
         if (el instanceof HTMLElement) {
@@ -912,7 +992,8 @@ export class IsolatedBrowserHarness implements ComputerHarness {
         dispatchKeyboard('keyup');
         return key;
       })();
-    `);
+    `,
+    );
     return result(`Pressed keys: ${keys.join(' + ') || primary}.`);
   }
 
@@ -947,11 +1028,15 @@ export class IsolatedBrowserHarness implements ComputerHarness {
   async getEnvironmentMetadata(session: ComputerSession): Promise<ComputerEnvironmentMetadata> {
     const win = ensureWindow(session.id);
     const space = await resolveCoordinateSpace(win, session);
-    const metadata = await evalInPage<ComputerEnvironmentMetadata & {
-      viewportWidth?: number;
-      viewportHeight?: number;
-      devicePixelRatio?: number;
-    }>(win, `
+    const metadata = await evalInPage<
+      ComputerEnvironmentMetadata & {
+        viewportWidth?: number;
+        viewportHeight?: number;
+        devicePixelRatio?: number;
+      }
+    >(
+      win,
+      `
       (() => {
         const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0, visualViewport?.width || 0);
         const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0, visualViewport?.height || 0);
@@ -1001,16 +1086,14 @@ export class IsolatedBrowserHarness implements ComputerHarness {
           interactiveElements: elements,
         };
       })();
-    `);
+    `,
+    );
 
     return {
       ...metadata,
       interactiveElements: metadata.interactiveElements?.map((element) => {
         const topLeft = toFramePoint({ x: element.x, y: element.y }, space);
-        const bottomRight = toFramePoint(
-          { x: element.x + element.width, y: element.y + element.height },
-          space,
-        );
+        const bottomRight = toFramePoint({ x: element.x + element.width, y: element.y + element.height }, space);
         return {
           ...element,
           x: topLeft.x,
