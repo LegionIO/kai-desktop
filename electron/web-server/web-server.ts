@@ -4,7 +4,18 @@ import https from 'https';
 import net from 'net';
 import { join, extname, sep } from 'path';
 import { homedir } from 'os';
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathSync } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  statSync,
+  mkdirSync,
+  realpathSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+} from 'fs';
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
@@ -795,9 +806,42 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         return;
       }
 
+      // Open + validate + read through a single fd to close the TOCTOU gap:
+      // the fd is bound to the inode at open time, so a symlink/file swap after
+      // the realpath check above cannot redirect the read to another target.
       const ext = extname(realMediaPath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      const data = readFileSync(realMediaPath);
+      let data: Buffer;
+      let fd: number | null = null;
+      try {
+        fd = openSync(realMediaPath, 'r');
+        const st = fstatSync(fd);
+        if (!st.isFile()) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found');
+          return;
+        }
+        data = Buffer.allocUnsafe(st.size);
+        let offset = 0;
+        while (offset < st.size) {
+          const bytesRead = readSync(fd, data, offset, st.size - offset, offset);
+          if (bytesRead <= 0) break;
+          offset += bytesRead;
+        }
+        if (offset !== st.size) data = data.subarray(0, offset);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      } finally {
+        if (fd !== null) {
+          try {
+            closeSync(fd);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       res.writeHead(200, {
         'Content-Type': contentType,
         'Content-Length': data.byteLength,
