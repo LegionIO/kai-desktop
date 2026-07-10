@@ -42,6 +42,10 @@ const INITIAL_DELAY_MS = 8_000; // 8 seconds after launch (after full updater's 
  *  the cap only rejects pathological/malicious sizes. */
 const MAX_OTA_ARCHIVE_BYTES = 512 * 1024 * 1024; // 512 MiB
 
+/** Cap redirect chains for OTA fetches/downloads so a circular or runaway
+ *  `Location` (malicious feed or misconfigured CDN) can't recurse unbounded. */
+const MAX_OTA_REDIRECTS = 5;
+
 // Env overrides for testing (mirrors auto-update.ts pattern)
 const DEV_TEST_VERSION = process.env.KAI_UPDATE_TEST_VERSION;
 const isTestMode = !!DEV_TEST_VERSION;
@@ -87,7 +91,7 @@ function getOtaFeedUrl(): string {
 /**
  * Fetch JSON from a URL using Electron's net module.
  */
-async function fetchJson<T>(url: string): Promise<T> {
+async function fetchJson<T>(url: string, redirectsLeft = MAX_OTA_REDIRECTS): Promise<T> {
   return new Promise((resolve, reject) => {
     const request = net.request(url);
     let data = '';
@@ -95,10 +99,16 @@ async function fetchJson<T>(url: string): Promise<T> {
     request.on('response', (response) => {
       // Follow redirects (GitHub uses 302 for release assets)
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        if (redirectsLeft <= 0) {
+          reject(new Error(`Too many redirects fetching ${url}`));
+          return;
+        }
         const redirectUrl = Array.isArray(response.headers.location)
           ? response.headers.location[0]
           : response.headers.location;
-        fetchJson<T>(redirectUrl).then(resolve).catch(reject);
+        fetchJson<T>(redirectUrl, redirectsLeft - 1)
+          .then(resolve)
+          .catch(reject);
         return;
       }
 
@@ -128,17 +138,28 @@ async function fetchJson<T>(url: string): Promise<T> {
 /**
  * Download a file with progress reporting.
  */
-async function downloadFile(url: string, destPath: string, version: string): Promise<void> {
+async function downloadFile(
+  url: string,
+  destPath: string,
+  version: string,
+  redirectsLeft = MAX_OTA_REDIRECTS,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = net.request(url);
 
     request.on('response', (response) => {
       // Follow redirects
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        if (redirectsLeft <= 0) {
+          reject(new Error(`Too many redirects downloading ${url}`));
+          return;
+        }
         const redirectUrl = Array.isArray(response.headers.location)
           ? response.headers.location[0]
           : response.headers.location;
-        downloadFile(redirectUrl, destPath, version).then(resolve).catch(reject);
+        downloadFile(redirectUrl, destPath, version, redirectsLeft - 1)
+          .then(resolve)
+          .catch(reject);
         return;
       }
 
