@@ -101,6 +101,32 @@ type PendingToolCall = {
 
 const WS_OPEN = 1; // WS_OPEN constant
 
+/**
+ * Redact a WebSocket/HTTP URL for logging: strips userinfo and masks any
+ * query param whose name looks credential-bearing (token/key/secret/password).
+ * A custom realtime baseUrl can legitimately carry `?token=…` or userinfo, which
+ * must not land in logs. Falls back to a scheme-only string if the URL is
+ * unparseable (never log the raw value on failure).
+ */
+function redactUrlForLog(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    for (const key of [...u.searchParams.keys()]) {
+      if (/token|key|secret|password|auth|sig/i.test(key)) {
+        u.searchParams.set(key, '***');
+      }
+    }
+    return u.toString();
+  } catch {
+    const scheme = raw.split('://')[0];
+    return scheme && scheme !== raw ? `${scheme}://[unparseable-url-redacted]` : '[redacted-url]';
+  }
+}
+
 export class RealtimeSession {
   private ws: WebSocket | null = null;
   private _status: RealtimeSessionStatus = 'idle';
@@ -180,7 +206,7 @@ export class RealtimeSession {
 
       try {
         const { url, headers } = this.buildConnection();
-        console.info(`[RealtimeSession] Connecting to: ${url}`);
+        console.info(`[RealtimeSession] Connecting to: ${redactUrlForLog(url)}`);
         console.info(`[RealtimeSession] Headers: ${Object.keys(headers).join(', ')}`);
         this.ws = new WebSocket(url, { headers });
 
@@ -261,6 +287,29 @@ export class RealtimeSession {
       this.ws = null;
     }
     this.setStatus('disconnected');
+    this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
+  }
+
+  /**
+   * Terminal failure path for a fatal server/connection error: tear the session
+   * down (close the socket + computer-use tracking) so the main process can't be
+   * left half-open when the renderer doesn't call endSession, and surface the
+   * error status once. Idempotent — a second call after the socket is gone is a
+   * cheap no-op.
+   */
+  private failAndClose(message: string): void {
+    if (!this.ws && this._status === 'error') return; // already failed+closed
+    this.teardownComputerUseTracking();
+    if (this.ws) {
+      try {
+        this.ws.close(1011, 'Fatal error');
+      } catch {
+        // Ignore close errors
+      }
+      this.ws = null;
+    }
+    // setStatus already broadcasts the status event (both realtime + stream).
+    this.setStatus('error', message);
     this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
   }
 
@@ -464,7 +513,7 @@ export class RealtimeSession {
         headers['Authorization'] = `Bearer ${customCfg.apiKey}`;
       }
       const url = `${wsUrl}${separator}model=${encodeURIComponent(model)}`;
-      console.info(`[RealtimeSession] Custom WebSocket URL: ${url}`);
+      console.info(`[RealtimeSession] Custom WebSocket URL: ${redactUrlForLog(url)}`);
       console.info(`[RealtimeSession] Custom headers: ${JSON.stringify(Object.keys(headers))}`);
       return { url, headers };
     }
@@ -594,8 +643,10 @@ export class RealtimeSession {
         if (benignCodes.includes(code)) {
           console.info('[RealtimeSession] Benign server error (ignored):', msg, code);
         } else {
-          console.error('[RealtimeSession] Server error:', msg, code);
-          this.broadcastRealtimeEvent({ type: 'status', status: 'error', error: msg });
+          // Fatal server/session error: tear the session down so the main
+          // process isn't left half-open (the renderer may not call endSession).
+          console.error('[RealtimeSession] Fatal server error — closing session:', msg, code);
+          this.failAndClose(msg);
         }
         break;
       }

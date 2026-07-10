@@ -487,6 +487,15 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         cleanup();
+        // A failure AFTER startSession succeeded (e.g. mic setup threw) leaves the
+        // main-process realtime session open — cleanup() only tears down renderer
+        // audio. End the main session too. The handler is a safe no-op if no
+        // session was created (start failed before one existed).
+        try {
+          await app.realtime.endSession();
+        } catch {
+          // Ignore — best-effort teardown.
+        }
         setCallState({
           isInCall: false,
           status: 'error',
