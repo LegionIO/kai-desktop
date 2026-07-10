@@ -55,7 +55,9 @@ function playDisconnectTone(outputDeviceId?: string): void {
     osc2.stop(ctx.currentTime + 0.52);
 
     // Auto-close context after tones finish
-    setTimeout(() => { void ctx.close(); }, 700);
+    setTimeout(() => {
+      void ctx.close();
+    }, 700);
   } catch {
     // Audio context may fail in some environments — ignore silently
   }
@@ -68,10 +70,10 @@ export type RealtimeCallStatus = 'idle' | 'preparing' | 'connecting' | 'connecte
 export type RealtimeCallState = {
   isInCall: boolean;
   status: RealtimeCallStatus;
-  isSpeaking: boolean;       // User is speaking (VAD)
-  isProcessing: boolean;     // AI is processing user input (between speech end and response start)
-  isResponding: boolean;     // AI is generating/playing a response
-  duration: number;          // Seconds since call started
+  isSpeaking: boolean; // User is speaking (VAD)
+  isProcessing: boolean; // AI is processing user input (between speech end and response start)
+  isResponding: boolean; // AI is generating/playing a response
+  duration: number; // Seconds since call started
   error?: string;
   silenceCountdown?: number; // Seconds until auto-end (shown when >75% of timeout elapsed)
 };
@@ -82,8 +84,8 @@ type RealtimeContextValue = {
   endCall: () => Promise<void>;
   toggleMute: () => void;
   isMuted: boolean;
-  inputLevel: number;        // 0-1, current mic input level
-  outputLevel: number;       // 0-1, current playback audio level
+  inputLevel: number; // 0-1, current mic input level
+  outputLevel: number; // 0-1, current playback audio level
 };
 
 const defaultState: RealtimeCallState = {
@@ -130,14 +132,22 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   const responseDonePendingRef = useRef(false); // response-done received but audio still playing
   const muteSilenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const browserMicRef = useRef<{ stream: MediaStream; ctx: AudioContext; processor: ScriptProcessorNode } | null>(null);
-  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  // Timers created by the end-call-pending flow (poll/safety/cleanup). Tracked so
+  // cleanup() can clear them — otherwise a stale 60s safety timeout can fire
+  // during a LATER call and end it.
+  const endCallTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
+  );
 
-  const realtimeConfig = (config as Record<string, unknown> | null)?.realtime as {
-    enabled?: boolean;
-    inputDeviceId?: string;
-    outputDeviceId?: string;
-    autoEndCall?: { enabled?: boolean; silenceTimeoutSec?: number };
-  } | undefined;
+  const realtimeConfig = (config as Record<string, unknown> | null)?.realtime as
+    | {
+        enabled?: boolean;
+        inputDeviceId?: string;
+        outputDeviceId?: string;
+        autoEndCall?: { enabled?: boolean; silenceTimeoutSec?: number };
+      }
+    | undefined;
 
   // Cleanup function for ending a call
   const cleanup = useCallback(() => {
@@ -185,6 +195,13 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
       clearInterval(muteSilenceTimerRef.current);
       muteSilenceTimerRef.current = null;
     }
+
+    // Clear any pending end-call-flow timers so they can't fire into a later call.
+    for (const t of endCallTimersRef.current) {
+      clearTimeout(t);
+      clearInterval(t as unknown as ReturnType<typeof setInterval>);
+    }
+    endCallTimersRef.current = [];
 
     // Stop mic
     if (browserMicRef.current) {
@@ -244,234 +261,245 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
       }
       // Mute/unmute browser mic tracks directly
       if (browserMicRef.current) {
-        browserMicRef.current.stream.getAudioTracks().forEach((t) => { t.enabled = !next; });
+        browserMicRef.current.stream.getAudioTracks().forEach((t) => {
+          t.enabled = !next;
+        });
       }
       return next;
     });
   }, []);
 
-  const startCall = useCallback(async (conversationId: string) => {
-    if (callActiveRef.current) return;
+  const startCall = useCallback(
+    async (conversationId: string) => {
+      if (callActiveRef.current) return;
 
-    // Start in "preparing" (ringing) state — memory is being gathered
-    setCallState({
-      isInCall: true,
-      status: 'preparing',
-      isSpeaking: false,
-      isProcessing: false,
-      isResponding: false,
-      duration: 0,
-    });
-
-    try {
-      // Initialize audio player
-      // On web/mobile, desktop-specific device IDs are invalid — validate before using
-      let outputDeviceId = realtimeConfig?.outputDeviceId;
-      if (isWebBridge && outputDeviceId) {
-        try {
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          const outputExists = devices.some((d) => d.kind === 'audiooutput' && d.deviceId === outputDeviceId);
-          if (!outputExists) {
-            console.info('[RealtimeProvider] Configured output device not found on this browser, falling back to default');
-            outputDeviceId = undefined;
-          }
-        } catch {
-          outputDeviceId = undefined;
-        }
-      }
-      const player = new RealtimeAudioPlayer();
-      await player.init(outputDeviceId);
-      playerRef.current = player;
-
-      // Start ringtone after 1 second if still preparing
-      ringDelayTimerRef.current = setTimeout(() => {
-        const tone = new Ringtone();
-        ringtoneRef.current = tone;
-        void tone.start(outputDeviceId);
-      }, 1000);
-
-      // Start the realtime session (includes memory gathering — the "ringing" phase)
-      const result = await app.realtime.startSession(conversationId);
-
-      // Stop the ringtone
-      if (ringDelayTimerRef.current) {
-        clearTimeout(ringDelayTimerRef.current);
-        ringDelayTimerRef.current = null;
-      }
-      if (ringtoneRef.current) {
-        ringtoneRef.current.destroy();
-        ringtoneRef.current = null;
-      }
-
-      if (result.error) {
-        throw new Error(result.error);
-      }
-
-      callActiveRef.current = true;
-      startTimeRef.current = Date.now();
-      lastUserSpeechRef.current = Date.now();
-
-      // Start mic capture
-      let inputDeviceId = realtimeConfig?.inputDeviceId;
-      if (isWebBridge) {
-        // Browser audio capture: getUserMedia → ScriptProcessorNode → PCM16 base64
-        if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error('Microphone access requires HTTPS. Enable TLS in Web UI settings.');
-        }
-        // Validate input device exists on this browser before using exact constraint
-        if (inputDeviceId) {
-          try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const inputExists = devices.some((d) => d.kind === 'audioinput' && d.deviceId === inputDeviceId);
-            if (!inputExists) {
-              console.info('[RealtimeProvider] Configured input device not found on this browser, falling back to default');
-              inputDeviceId = undefined;
-            }
-          } catch {
-            inputDeviceId = undefined;
-          }
-        }
-        const constraints: MediaStreamConstraints = {
-          audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            sampleRate: 16000,
-            ...(inputDeviceId ? { deviceId: { exact: inputDeviceId } } : {}),
-          },
-        };
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        const ctx = new AudioContext({ sampleRate: 16000 });
-        const source = ctx.createMediaStreamSource(stream);
-        const processor = ctx.createScriptProcessor(4096, 1, 1);
-        processor.onaudioprocess = (e) => {
-          if (!callActiveRef.current) return;
-          if (mutedRef.current) {
-            setInputLevel(0);
-            return;
-          }
-          const float32 = e.inputBuffer.getChannelData(0);
-          const pcm = new Int16Array(float32.length);
-          for (let i = 0; i < float32.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32[i]));
-            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-          // Compute level
-          let maxA = 0;
-          for (let i = 0; i < float32.length; i++) {
-            const a = Math.abs(float32[i]);
-            if (a > maxA) maxA = a;
-          }
-          setInputLevel(Math.min(1, maxA * 3));
-          // Base64 encode and send
-          const bytes = new Uint8Array(pcm.buffer);
-          let bin = '';
-          for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
-          app.realtime.sendAudio(btoa(bin));
-        };
-        source.connect(processor);
-        processor.connect(ctx.destination);
-        browserMicRef.current = { stream, ctx, processor };
-      } else {
-        await app.mic.liveMicStart(inputDeviceId);
-
-        // Poll mic for PCM chunks and send to realtime session
-        let totalChunksSent = 0;
-        let lastLogTime = Date.now();
-        micDrainTimerRef.current = setInterval(async () => {
-          if (!callActiveRef.current) return;
-          try {
-            const chunks = await app.mic.liveMicDrain();
-            if (mutedRef.current) {
-              // Drain chunks but don't send them — keeps the mic buffer from growing
-              setInputLevel(0);
-              return;
-            }
-            if (chunks.length > 0) {
-              const lastChunk = chunks[chunks.length - 1];
-              setInputLevel(computePcmLevel(lastChunk));
-              for (const chunk of chunks) {
-                app.realtime.sendAudio(chunk);
-                totalChunksSent++;
-              }
-              const now = Date.now();
-              if (now - lastLogTime > 2000) {
-                console.log(`[RealtimeProvider] Audio: ${chunks.length} chunks drained, total sent: ${totalChunksSent}, latest chunk size: ${chunks[0]?.length ?? 0} chars`);
-                lastLogTime = now;
-              }
-            } else {
-              setInputLevel(0);
-            }
-          } catch (err) {
-            console.warn('[RealtimeProvider] Mic drain error:', err);
-          }
-        }, 50);
-      }
-
-      // Duration timer
-      durationTimerRef.current = setInterval(() => {
-        const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
-        setCallState((prev) => ({ ...prev, duration: elapsed }));
-      }, 1000);
-
-      // Output level polling + deferred response-done handling
-      levelTimerRef.current = setInterval(() => {
-        if (playerRef.current) {
-          setOutputLevel(playerRef.current.getLevel());
-          // If response-done fired while audio was still playing, clear isResponding now
-          if (responseDonePendingRef.current && !playerRef.current.playing) {
-            responseDonePendingRef.current = false;
-            setCallState((prev) => prev.isResponding ? { ...prev, isResponding: false } : prev);
-          }
-        }
-      }, 66); // ~15fps
-
-      // Auto-end-call silence detection
-      const autoEndEnabled = realtimeConfig?.autoEndCall?.enabled !== false;
-      const silenceTimeoutSec = realtimeConfig?.autoEndCall?.silenceTimeoutSec ?? 60;
-
-      if (autoEndEnabled) {
-        silenceTimerRef.current = setInterval(() => {
-          if (!callActiveRef.current) return;
-
-          // Don't count silence while the AI is actively speaking or generating
-          const isPlaying = playerRef.current?.playing ?? false;
-          if (isPlaying) {
-            // Reset the speech timer — there's active audio, not silence
-            lastUserSpeechRef.current = Date.now();
-            setCallState((prev) => prev.silenceCountdown ? { ...prev, silenceCountdown: undefined } : prev);
-            return;
-          }
-
-          const silenceSec = (Date.now() - lastUserSpeechRef.current) / 1000;
-          const threshold75 = silenceTimeoutSec * 0.75;
-
-          if (silenceSec >= silenceTimeoutSec) {
-            // Auto-end the call
-            void endCallInner();
-          } else if (silenceSec >= threshold75) {
-            // Show countdown
-            const remaining = Math.ceil(silenceTimeoutSec - silenceSec);
-            setCallState((prev) => ({ ...prev, silenceCountdown: remaining }));
-          } else {
-            setCallState((prev) => prev.silenceCountdown ? { ...prev, silenceCountdown: undefined } : prev);
-          }
-        }, 1000);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      cleanup();
+      // Start in "preparing" (ringing) state — memory is being gathered
       setCallState({
-        isInCall: false,
-        status: 'error',
+        isInCall: true,
+        status: 'preparing',
         isSpeaking: false,
         isProcessing: false,
         isResponding: false,
         duration: 0,
-        error: msg,
       });
-    }
-  }, [realtimeConfig, cleanup]);
+
+      try {
+        // Initialize audio player
+        // On web/mobile, desktop-specific device IDs are invalid — validate before using
+        let outputDeviceId = realtimeConfig?.outputDeviceId;
+        if (isWebBridge && outputDeviceId) {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const outputExists = devices.some((d) => d.kind === 'audiooutput' && d.deviceId === outputDeviceId);
+            if (!outputExists) {
+              console.info(
+                '[RealtimeProvider] Configured output device not found on this browser, falling back to default',
+              );
+              outputDeviceId = undefined;
+            }
+          } catch {
+            outputDeviceId = undefined;
+          }
+        }
+        const player = new RealtimeAudioPlayer();
+        await player.init(outputDeviceId);
+        playerRef.current = player;
+
+        // Start ringtone after 1 second if still preparing
+        ringDelayTimerRef.current = setTimeout(() => {
+          const tone = new Ringtone();
+          ringtoneRef.current = tone;
+          void tone.start(outputDeviceId);
+        }, 1000);
+
+        // Start the realtime session (includes memory gathering — the "ringing" phase)
+        const result = await app.realtime.startSession(conversationId);
+
+        // Stop the ringtone
+        if (ringDelayTimerRef.current) {
+          clearTimeout(ringDelayTimerRef.current);
+          ringDelayTimerRef.current = null;
+        }
+        if (ringtoneRef.current) {
+          ringtoneRef.current.destroy();
+          ringtoneRef.current = null;
+        }
+
+        if (result.error) {
+          throw new Error(result.error);
+        }
+
+        callActiveRef.current = true;
+        startTimeRef.current = Date.now();
+        lastUserSpeechRef.current = Date.now();
+
+        // Start mic capture
+        let inputDeviceId = realtimeConfig?.inputDeviceId;
+        if (isWebBridge) {
+          // Browser audio capture: getUserMedia → ScriptProcessorNode → PCM16 base64
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('Microphone access requires HTTPS. Enable TLS in Web UI settings.');
+          }
+          // Validate input device exists on this browser before using exact constraint
+          if (inputDeviceId) {
+            try {
+              const devices = await navigator.mediaDevices.enumerateDevices();
+              const inputExists = devices.some((d) => d.kind === 'audioinput' && d.deviceId === inputDeviceId);
+              if (!inputExists) {
+                console.info(
+                  '[RealtimeProvider] Configured input device not found on this browser, falling back to default',
+                );
+                inputDeviceId = undefined;
+              }
+            } catch {
+              inputDeviceId = undefined;
+            }
+          }
+          const constraints: MediaStreamConstraints = {
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              sampleRate: 16000,
+              ...(inputDeviceId ? { deviceId: { exact: inputDeviceId } } : {}),
+            },
+          };
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          const ctx = new AudioContext({ sampleRate: 16000 });
+          const source = ctx.createMediaStreamSource(stream);
+          const processor = ctx.createScriptProcessor(4096, 1, 1);
+          processor.onaudioprocess = (e) => {
+            if (!callActiveRef.current) return;
+            if (mutedRef.current) {
+              setInputLevel(0);
+              return;
+            }
+            const float32 = e.inputBuffer.getChannelData(0);
+            const pcm = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+              const s = Math.max(-1, Math.min(1, float32[i]));
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            // Compute level
+            let maxA = 0;
+            for (let i = 0; i < float32.length; i++) {
+              const a = Math.abs(float32[i]);
+              if (a > maxA) maxA = a;
+            }
+            setInputLevel(Math.min(1, maxA * 3));
+            // Base64 encode and send
+            const bytes = new Uint8Array(pcm.buffer);
+            let bin = '';
+            for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+            app.realtime.sendAudio(btoa(bin));
+          };
+          source.connect(processor);
+          processor.connect(ctx.destination);
+          browserMicRef.current = { stream, ctx, processor };
+        } else {
+          await app.mic.liveMicStart(inputDeviceId);
+
+          // Poll mic for PCM chunks and send to realtime session
+          let totalChunksSent = 0;
+          let lastLogTime = Date.now();
+          micDrainTimerRef.current = setInterval(async () => {
+            if (!callActiveRef.current) return;
+            try {
+              const chunks = await app.mic.liveMicDrain();
+              if (mutedRef.current) {
+                // Drain chunks but don't send them — keeps the mic buffer from growing
+                setInputLevel(0);
+                return;
+              }
+              if (chunks.length > 0) {
+                const lastChunk = chunks[chunks.length - 1];
+                setInputLevel(computePcmLevel(lastChunk));
+                for (const chunk of chunks) {
+                  app.realtime.sendAudio(chunk);
+                  totalChunksSent++;
+                }
+                const now = Date.now();
+                if (now - lastLogTime > 2000) {
+                  console.log(
+                    `[RealtimeProvider] Audio: ${chunks.length} chunks drained, total sent: ${totalChunksSent}, latest chunk size: ${chunks[0]?.length ?? 0} chars`,
+                  );
+                  lastLogTime = now;
+                }
+              } else {
+                setInputLevel(0);
+              }
+            } catch (err) {
+              console.warn('[RealtimeProvider] Mic drain error:', err);
+            }
+          }, 50);
+        }
+
+        // Duration timer
+        durationTimerRef.current = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
+          setCallState((prev) => ({ ...prev, duration: elapsed }));
+        }, 1000);
+
+        // Output level polling + deferred response-done handling
+        levelTimerRef.current = setInterval(() => {
+          if (playerRef.current) {
+            setOutputLevel(playerRef.current.getLevel());
+            // If response-done fired while audio was still playing, clear isResponding now
+            if (responseDonePendingRef.current && !playerRef.current.playing) {
+              responseDonePendingRef.current = false;
+              setCallState((prev) => (prev.isResponding ? { ...prev, isResponding: false } : prev));
+            }
+          }
+        }, 66); // ~15fps
+
+        // Auto-end-call silence detection
+        const autoEndEnabled = realtimeConfig?.autoEndCall?.enabled !== false;
+        const silenceTimeoutSec = realtimeConfig?.autoEndCall?.silenceTimeoutSec ?? 60;
+
+        if (autoEndEnabled) {
+          silenceTimerRef.current = setInterval(() => {
+            if (!callActiveRef.current) return;
+
+            // Don't count silence while the AI is actively speaking or generating
+            const isPlaying = playerRef.current?.playing ?? false;
+            if (isPlaying) {
+              // Reset the speech timer — there's active audio, not silence
+              lastUserSpeechRef.current = Date.now();
+              setCallState((prev) => (prev.silenceCountdown ? { ...prev, silenceCountdown: undefined } : prev));
+              return;
+            }
+
+            const silenceSec = (Date.now() - lastUserSpeechRef.current) / 1000;
+            const threshold75 = silenceTimeoutSec * 0.75;
+
+            if (silenceSec >= silenceTimeoutSec) {
+              // Auto-end the call
+              void endCallInner();
+            } else if (silenceSec >= threshold75) {
+              // Show countdown
+              const remaining = Math.ceil(silenceTimeoutSec - silenceSec);
+              setCallState((prev) => ({ ...prev, silenceCountdown: remaining }));
+            } else {
+              setCallState((prev) => (prev.silenceCountdown ? { ...prev, silenceCountdown: undefined } : prev));
+            }
+          }, 1000);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        cleanup();
+        setCallState({
+          isInCall: false,
+          status: 'error',
+          isSpeaking: false,
+          isProcessing: false,
+          isResponding: false,
+          duration: 0,
+          error: msg,
+        });
+      }
+    },
+    [realtimeConfig, cleanup],
+  );
 
   const endCallInner = useCallback(async () => {
     cleanup();
@@ -557,7 +585,7 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
             const pcm = new Int16Array(float32.length);
             for (let i = 0; i < float32.length; i++) {
               const s = Math.max(-1, Math.min(1, float32[i]));
-              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
             }
             // Compute level
             let maxA = 0;
@@ -683,21 +711,25 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
               if (!player || player.isFinished(2000)) {
                 clearInterval(pollEndCall);
                 console.info('[RealtimeProvider] All audio finished playing — ending call');
-                setTimeout(() => {
+                const finishTimer = setTimeout(() => {
                   void endCallInner();
                 }, 300);
+                endCallTimersRef.current.push(finishTimer);
               }
             }, 200);
+            endCallTimersRef.current.push(pollEndCall as unknown as ReturnType<typeof setTimeout>);
 
             // Safety timeout: end after 60s max
-            setTimeout(() => {
+            const safetyTimer = setTimeout(() => {
               clearInterval(pollEndCall);
               if (callActiveRef.current) {
                 console.info('[RealtimeProvider] end-call safety timeout — forcing end');
                 void endCallInner();
               }
             }, 60000);
+            endCallTimersRef.current.push(safetyTimer);
           }, 2000);
+          endCallTimersRef.current.push(startCheckDelay);
 
           // If the call ends externally before the delay, clean up
           const checkCleanup = setInterval(() => {
@@ -706,6 +738,7 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
               clearInterval(checkCleanup);
             }
           }, 500);
+          endCallTimersRef.current.push(checkCleanup as unknown as ReturnType<typeof setTimeout>);
           break;
         }
       }
@@ -719,6 +752,13 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      // Always clear pending end-call timers, even outside an active call — they
+      // can be scheduled during the connecting/preparing window.
+      for (const t of endCallTimersRef.current) {
+        clearTimeout(t);
+        clearInterval(t as unknown as ReturnType<typeof setInterval>);
+      }
+      endCallTimersRef.current = [];
       if (callActiveRef.current) {
         cleanup();
         void app.realtime?.endSession?.();
@@ -736,11 +776,7 @@ export const RealtimeProvider: FC<PropsWithChildren> = ({ children }) => {
     outputLevel,
   };
 
-  return (
-    <RealtimeContext.Provider value={value}>
-      {children}
-    </RealtimeContext.Provider>
-  );
+  return <RealtimeContext.Provider value={value}>{children}</RealtimeContext.Provider>;
 };
 
 /**
