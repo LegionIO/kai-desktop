@@ -50,6 +50,10 @@ try {
 const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const SESSION_MAX_AGE_SECS = SESSION_LIFETIME_MS / 1000;
 
+/** Hard cap on the /api/login request body (bytes). Login is a tiny JSON blob;
+ *  this stops an unauthenticated client from exhausting memory pre-rate-limit. */
+const MAX_LOGIN_BODY_BYTES = 64 * 1024;
+
 /** One-time login-token lifetime (QR codes): 5 minutes. */
 const LOGIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 
@@ -639,8 +643,24 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         return;
       }
       const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      let received = 0;
+      let aborted = false;
+      req.on('data', (chunk: Buffer) => {
+        if (aborted) return;
+        received += chunk.length;
+        // Login bodies are tiny JSON; cap hard so an unauthenticated client
+        // cannot exhaust memory before rate limiting kicks in.
+        if (received > MAX_LOGIN_BODY_BYTES) {
+          aborted = true;
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Request too large' }));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
       req.on('end', () => {
+        if (aborted) return;
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
           const userOk = safeEqual(String(body.username ?? '').toLowerCase(), config.auth.username.toLowerCase());
@@ -755,9 +775,26 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         return;
       }
 
-      const ext = extname(filePath).toLowerCase();
+      // Re-check containment on the canonical path so a symlink inside
+      // MEDIA_DIR cannot escape the directory (lexical check above only
+      // guards the request path, not the on-disk link target).
+      let realMediaPath: string;
+      try {
+        realMediaPath = realpathSync(filePath);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+      if (!realMediaPath.startsWith(MEDIA_DIR + sep) && realMediaPath !== MEDIA_DIR) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return;
+      }
+
+      const ext = extname(realMediaPath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      const data = readFileSync(filePath);
+      const data = readFileSync(realMediaPath);
       res.writeHead(200, {
         'Content-Type': contentType,
         'Content-Length': data.byteLength,
