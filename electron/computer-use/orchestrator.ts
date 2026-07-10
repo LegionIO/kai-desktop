@@ -530,7 +530,15 @@ export class ComputerUseOrchestrator {
     const harness = getHarness(this.getConfig(), session, this.getConfig);
     try {
       await harness.initialize(session);
-      await this.executeAction(harness, { ...action, status: 'running' }, undefined, sessionId);
+      // Thread the session's active-run abort signal (if any) so a stop/pause
+      // during an approved-action execution can propagate + the post-await fence
+      // in executeAction discards a resurrecting write.
+      await this.executeAction(
+        harness,
+        { ...action, status: 'running' },
+        this.activeRuns.get(sessionId)?.signal,
+        sessionId,
+      );
       this.resume(sessionId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -654,6 +662,29 @@ export class ComputerUseOrchestrator {
               displayIndex: actionDisplayIndex,
             }
           : this.readSession(sessionId)?.cursor;
+
+    // Fence stale results: the harness await above can outlast a stop/pause/
+    // takeover that aborted this run's signal (or moved the session to a
+    // terminal/paused state). Writing status:'running' + marking the action
+    // completed here would RESURRECT a stopped/paused session and apply a result
+    // the user cancelled. Re-check the signal + the CURRENT session status and
+    // discard the write if the session is no longer running under this run.
+    const currentBeforeWrite = this.readSession(sessionId);
+    const sessionCancelledOrGone =
+      signal?.aborted === true ||
+      !currentBeforeWrite ||
+      currentBeforeWrite.status === 'stopped' ||
+      currentBeforeWrite.status === 'paused' ||
+      currentBeforeWrite.status === 'failed' ||
+      currentBeforeWrite.status === 'completed';
+    if (sessionCancelledOrGone) {
+      // Still surface a frame if we got one (harmless, read-only) but do NOT
+      // change session/action status — the cancellation stands.
+      if (result.frame) {
+        this.emitEvent({ type: 'frame', sessionId, frame: result.frame });
+      }
+      return;
+    }
 
     const updated = this.mutateSession(sessionId, (existing) => ({
       ...existing,

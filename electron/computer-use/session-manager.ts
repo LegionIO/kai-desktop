@@ -931,6 +931,19 @@ export class ComputerUseSessionManager extends EventEmitter {
       // Re-read inside the lock — the session may have changed while queued.
       const current = this.sessions.get(sessionId);
       if (!current) return null;
+      // Atomicity: only consume an approval that is STILL pending for an action
+      // STILL awaiting approval. A stale/double approve (arriving after a reject,
+      // stop, or a prior approve already ran) must be a no-op — otherwise it
+      // would resurrect the session to 'running' and re-run/undo a decision.
+      const pendingApproval = current.approvals.find((a) => a.actionId === actionId && a.status === 'pending');
+      const awaitingAction = current.actions.find((a) => a.id === actionId && a.status === 'awaiting-approval');
+      if (!pendingApproval || !awaitingAction) {
+        console.warn(
+          `[Computer Use] Ignoring stale approve for ${actionId} in session ${sessionId} ` +
+            `(approval or action no longer pending) — likely a double-approve or approve-after-reject/stop.`,
+        );
+        return current;
+      }
       // Approving resumes the session to 'running'; don't do that for
       // local-macos while another local session is active.
       if (current.target === 'local-macos') {
