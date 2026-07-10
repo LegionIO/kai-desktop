@@ -1100,7 +1100,12 @@ export async function startAgentRun(
   const envAllowlist = config?.autopilot?.agentEnvAllowlist;
 
   const safeArgs = filterAgentArgs(agent.config?.customArgs, argsDenylist, argsAllowlist);
-  const safeEnv = filterAgentEnv(agent.config?.env, envDenylist, envAllowlist);
+  // Build the COMPLETE child env: scrub the inherited process.env through the
+  // same deny/allow policy (so the app's own secrets like *_API_KEY / *_BASE_URL
+  // don't leak into the spawned CLI), then overlay the agent's declared env.
+  // Passed with envIsComplete so the terminal manager doesn't re-add process.env.
+  const scrubbedProcessEnv = filterAgentEnv(process.env as Record<string, string>, envDenylist, envAllowlist);
+  const safeEnv = { ...scrubbedProcessEnv, ...filterAgentEnv(agent.config?.env, envDenylist, envAllowlist) };
 
   try {
     const sessionId = await terminalManager.create(agent.currentTaskId, {
@@ -1110,6 +1115,7 @@ export async function startAgentRun(
       rows: 30,
       customArgs: safeArgs,
       env: safeEnv,
+      envIsComplete: true,
       dangerousMode,
     });
 

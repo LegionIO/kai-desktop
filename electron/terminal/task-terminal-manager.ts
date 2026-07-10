@@ -50,6 +50,10 @@ export class TaskTerminalManager {
       rows?: number;
       customArgs?: string[];
       env?: Record<string, string>;
+      /** When true, `env` is the COMPLETE child environment — do NOT spread the
+       *  inherited process.env underneath (which would leak the app's own
+       *  secrets past the caller's env deny/allow filtering). */
+      envIsComplete?: boolean;
       /** When true, pass --dangerously-* flags to CLI agents. Defaults to false. */
       dangerousMode?: boolean;
     },
@@ -69,7 +73,9 @@ export class TaskTerminalManager {
       cols: options.cols ?? 80,
       rows: options.rows ?? 24,
       cwd: options.cwd ?? homedir(),
-      env: { ...process.env, ...options.env, TERM: 'xterm-256color' } as Record<string, string>,
+      env: options.envIsComplete
+        ? ({ ...options.env, TERM: 'xterm-256color' } as Record<string, string>)
+        : ({ ...process.env, ...options.env, TERM: 'xterm-256color' } as Record<string, string>),
     });
 
     proc.onData((data: string) => {
