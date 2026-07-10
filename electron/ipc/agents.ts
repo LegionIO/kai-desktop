@@ -242,8 +242,29 @@ async function runSingleReviewer(
   reviewerAgentId: string,
   executorOutput: string,
 ): Promise<TaskReviewResult> {
+  // Validate the reviewer id before it reaches readAgent() (which joins it into
+  // a file path) — a non-UUID id could path-traverse. Fail the review rather
+  // than run with a missing agent's "Unknown Reviewer" fallback instructions.
+  if (!isValidId(reviewerAgentId)) {
+    return {
+      agentId: String(reviewerAgentId),
+      agentName: 'Invalid Reviewer',
+      status: 'rejected',
+      feedback: 'Reviewer agent id is not a valid identifier.',
+      terminalSessionId: `review-invalid-${randomUUID()}`,
+    };
+  }
   const agent = readAgent(appHome, reviewerAgentId);
-  const agentName = agent?.name ?? 'Unknown Reviewer';
+  if (!agent) {
+    return {
+      agentId: reviewerAgentId,
+      agentName: 'Missing Reviewer',
+      status: 'rejected',
+      feedback: 'Reviewer agent no longer exists.',
+      terminalSessionId: `review-missing-${randomUUID()}`,
+    };
+  }
+  const agentName = agent.name;
   const virtualSessionId = `review-${task.id}-${reviewerAgentId}-${randomUUID()}`;
 
   // Initialize result
@@ -1155,8 +1176,15 @@ export async function startAgentRun(
     const promptableRuntimes = ['claude-code', 'codex'];
     if (task.description && promptableRuntimes.includes(effectiveRuntime)) {
       setTimeout(() => {
-        const prompt = task.description.trim() + '\n';
-        terminalManager.write(sessionId, prompt);
+        // The PTY may have been stopped/killed during the delay — guard the
+        // write so a throw here (in an unhandled timer) can't crash main.
+        try {
+          if (!terminalManager.isAlive(sessionId)) return;
+          const prompt = task.description.trim() + '\n';
+          terminalManager.write(sessionId, prompt);
+        } catch (err) {
+          console.warn(`[Agent:task] Deferred prompt write failed for session ${sessionId}:`, err);
+        }
       }, 1500);
     }
 
