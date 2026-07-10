@@ -15,6 +15,7 @@ import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
+import { clearBuffer } from '../terminal/output-buffer.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -307,7 +308,21 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     try {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
+      // Clear the terminal output buffers (memory + disk) for this task's
+      // execution + review sessions before removing it, so deleted tasks don't
+      // leak orphaned logs in data/terminal-logs. (Stopping a still-running
+      // agent on delete is handled separately in the agent lifecycle.)
       if (existsSync(filePath)) {
+        try {
+          const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+          const sessionIds = new Set<string>();
+          if (task.terminalSessionId) sessionIds.add(task.terminalSessionId);
+          for (const run of task.runs ?? []) if (run.terminalSessionId) sessionIds.add(run.terminalSessionId);
+          for (const rr of task.reviewResults ?? []) if (rr.terminalSessionId) sessionIds.add(rr.terminalSessionId);
+          for (const sid of sessionIds) clearBuffer(sid);
+        } catch {
+          /* best-effort — still delete the task file below */
+        }
         unlinkSync(filePath);
       }
       broadcastTaskChange(appHome);
