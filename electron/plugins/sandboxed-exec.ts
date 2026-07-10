@@ -13,7 +13,7 @@
  * @source Plan: docs/plans/native-plugin-auto-install.md — Phase 2
  */
 
-import { spawn, execSync } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { resolve, normalize, join } from 'path';
 import { homedir } from 'os';
 import { existsSync, realpathSync } from 'fs';
@@ -31,8 +31,16 @@ import type {
 
 /** The complete set of binaries any plugin may ever execute. */
 export const SYSTEM_ALLOWED_BINARIES = new Set<AllowedBinary>([
-  'claude', 'codex', 'node', 'npm', 'pip', 'pip3',
-  'python', 'python3', 'git', 'bash',
+  'claude',
+  'codex',
+  'node',
+  'npm',
+  'pip',
+  'pip3',
+  'python',
+  'python3',
+  'git',
+  'bash',
 ]);
 
 /** Maximum stdout/stderr captured per command (1 MB). */
@@ -46,21 +54,28 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 
 /** Patterns that indicate shell metacharacters — always blocked in args. */
 const BLOCKED_ARG_PATTERNS = [
-  /;/,             // command chaining
-  /\|/,            // piping
-  /`/,             // backtick execution
-  /\$\(/,          // subshell
-  /\$\{/,          // variable expansion
-  /\.\.\//,        // path traversal
-  />\s*/,          // output redirection
-  /<\s*/,          // input redirection
-  /&/,             // background execution
+  /;/, // command chaining
+  /\|/, // piping
+  /`/, // backtick execution
+  /\$\(/, // subshell
+  /\$\{/, // variable expansion
+  /\.\.\//, // path traversal
+  />\s*/, // output redirection
+  /<\s*/, // input redirection
+  /&/, // background execution
 ];
 
 /** Environment variables safe for plugins to read. */
 export const SAFE_ENV_VARS = new Set([
-  'PATH', 'HOME', 'SHELL', 'USER', 'LANG', 'TERM',
-  'TMPDIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
+  'PATH',
+  'HOME',
+  'SHELL',
+  'USER',
+  'LANG',
+  'TERM',
+  'TMPDIR',
+  'XDG_DATA_HOME',
+  'XDG_CONFIG_HOME',
 ]);
 
 // ─── Scope Resolution ───────────────────────────────────────────────────────
@@ -71,9 +86,12 @@ export const SAFE_ENV_VARS = new Set([
 export function resolveScopeDirectory(scope: ScopedDirectory): string {
   const home = homedir();
   switch (scope) {
-    case 'claude-home': return join(home, '.claude');
-    case 'codex-home':  return join(home, '.codex');
-    default:            throw new Error(`Unknown scope: ${scope}`);
+    case 'claude-home':
+      return join(home, '.claude');
+    case 'codex-home':
+      return join(home, '.codex');
+    default:
+      throw new Error(`Unknown scope: ${scope}`);
   }
 }
 
@@ -81,16 +99,11 @@ export function resolveScopeDirectory(scope: ScopedDirectory): string {
  * Check if a path is within one of the declared scoped directories.
  * Resolves symlinks and normalizes before comparison.
  */
-export function isPathWithinScope(
-  targetPath: string,
-  directories: ScopedDirectory[],
-): boolean {
+export function isPathWithinScope(targetPath: string, directories: ScopedDirectory[]): boolean {
   let resolvedTarget: string;
   try {
     // If the path exists, resolve symlinks. Otherwise just normalize.
-    resolvedTarget = existsSync(targetPath)
-      ? realpathSync(targetPath)
-      : normalize(resolve(targetPath));
+    resolvedTarget = existsSync(targetPath) ? realpathSync(targetPath) : normalize(resolve(targetPath));
   } catch {
     resolvedTarget = normalize(resolve(targetPath));
   }
@@ -99,9 +112,7 @@ export function isPathWithinScope(
     const scopeRoot = resolveScopeDirectory(scope);
     let resolvedRoot: string;
     try {
-      resolvedRoot = existsSync(scopeRoot)
-        ? realpathSync(scopeRoot)
-        : normalize(resolve(scopeRoot));
+      resolvedRoot = existsSync(scopeRoot) ? realpathSync(scopeRoot) : normalize(resolve(scopeRoot));
     } catch {
       resolvedRoot = normalize(resolve(scopeRoot));
     }
@@ -297,8 +308,21 @@ export async function executeCommand(
  * Returns null if not found.
  */
 export async function findBinary(name: string): Promise<string | null> {
+  // Runtime allowlist check: the AllowedBinary TS type is compile-time only, so
+  // a plugin (runtime JS) could pass an arbitrary string. Reject anything not in
+  // SYSTEM_ALLOWED_BINARIES before it reaches the shell-free lookup.
+  if (!SYSTEM_ALLOWED_BINARIES.has(name as AllowedBinary)) {
+    return null;
+  }
   try {
-    const result = execSync(`which ${name}`, { encoding: 'utf-8', timeout: 5000 }).trim();
+    // execFile with shell:false — `name` is passed as a literal argv entry and
+    // is never interpreted by a shell. `which` is resolved from PATH by exec.
+    const result = execFileSync('which', [name], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
+      .trim()
+      .split('\n')[0];
     return result || null;
   } catch {
     return null;
@@ -315,10 +339,14 @@ export async function detectTool(binary: AllowedBinary): Promise<ToolDetectionRe
   }
 
   try {
-    const version = execSync(`${path} --version`, {
+    // Invoke the resolved absolute path directly (shell:false) — no string
+    // interpolation into a shell.
+    const version = execFileSync(path, ['--version'], {
       encoding: 'utf-8',
       timeout: 10_000,
-    }).trim().split('\n')[0];
+    })
+      .trim()
+      .split('\n')[0];
     return { name: binary, installed: true, path, version };
   } catch (err) {
     return { name: binary, installed: true, path, error: String(err) };

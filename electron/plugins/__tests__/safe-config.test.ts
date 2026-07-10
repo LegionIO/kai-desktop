@@ -68,6 +68,8 @@ const SECRETS = {
   videoOpenaiKey: 'sk-test-video-openai-redact-tttttttttt',
   videoAzureKey: 'test-video-azure-redact-uuuuuuuuuuuuu',
   videoCustomKey: 'sk-test-video-custom-redact-vvvvvvvvvv',
+  sttOpenaiKey: 'sk-test-stt-openai-redact-wwwwwwwwwwww',
+  dictationOpenaiKey: 'sk-test-dictation-openai-redact-xxxxxxxx',
 } as const;
 
 function buildPopulatedConfig(): AppConfig {
@@ -216,6 +218,10 @@ function buildPopulatedConfig(): AppConfig {
         subscriptionKey: SECRETS.azureSubscriptionKey,
         ttsVoice: 'en-US-JennyNeural',
       },
+      stt: {
+        provider: 'openai' as const,
+        openai: { apiKey: SECRETS.sttOpenaiKey },
+      },
       tts: { enabled: true, rate: 1 },
       recording: { enabled: false, continuous: false },
     },
@@ -260,6 +266,13 @@ function buildPopulatedConfig(): AppConfig {
       overlay: { enabled: false, position: 'top' as const, heightPx: 80, opacity: 0.6 },
     },
     advanced: { temperature: 0.7, maxSteps: 25, maxRetries: 2, useResponsesApi: false },
+    dictation: {
+      enabled: true,
+      provider: 'openai' as const,
+      openai: { apiKey: SECRETS.dictationOpenaiKey },
+      hotkey: 'cmd+shift+d',
+      mode: 'toggle' as const,
+    },
     imageGeneration: {
       enabled: true,
       provider: 'openai' as const,
@@ -389,6 +402,12 @@ describe('toPluginSafeConfig', () => {
     expect(safe.videoGeneration?.openai?.hasApiKey).toBe(true);
     expect(safe.videoGeneration?.azure?.hasApiKey).toBe(true);
     expect(safe.videoGeneration?.custom?.hasApiKey).toBe(true);
+
+    // STT (composer) + dictation OpenAI Realtime keys must be redacted too.
+    expect(safe.audio.stt?.openai?.hasApiKey).toBe(true);
+    expect(safe.audio.stt?.openai && 'apiKey' in safe.audio.stt.openai).toBe(false);
+    expect(safe.dictation?.openai?.hasApiKey).toBe(true);
+    expect(safe.dictation?.openai && 'apiKey' in safe.dictation.openai).toBe(false);
   });
 
   it('returns a deep clone — mutating the result does not affect the source', () => {

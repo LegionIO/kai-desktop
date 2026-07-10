@@ -1,7 +1,7 @@
 import type { IpcMain } from 'electron';
 import { readFileSync, writeFileSync, existsSync, watch, mkdirSync } from 'fs';
 import { randomBytes } from 'crypto';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
@@ -679,7 +679,10 @@ function readAppLlmConfig(): AppLlmFile {
 }
 
 function writeAppLlmConfig(config: AppLlmFile): void {
-  writeFileSync(getAppLlmConfigPath(), JSON.stringify(config, null, 2), 'utf-8');
+  const p = getAppLlmConfigPath();
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  // Secret-bearing (provider API keys) — restrict to the owner.
+  writeFileSync(p, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
 }
 
 function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Record<string, unknown> {
@@ -1087,8 +1090,12 @@ function normalizeResponsesApiConfig(config: AppConfig): AppConfig {
 
 export function writeDesktopConfig(appHome: string, config: AppConfig): void {
   const configPath = getDesktopSettingsPath(appHome);
-  mkdirSync(join(appHome, 'settings'), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), 'utf-8');
+  mkdirSync(join(appHome, 'settings'), { recursive: true, mode: 0o700 });
+  // Secret-bearing (MCP env vars, web password, media/realtime keys) — owner-only.
+  writeFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }
 
 function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {

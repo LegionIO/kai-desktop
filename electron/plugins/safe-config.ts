@@ -8,11 +8,7 @@ import type { AppConfig } from '../config/schema.js';
  */
 export type PluginSafeProviderConfig = Omit<
   AppConfig['models']['providers'][string],
-  | 'apiKey'
-  | 'accessKeyId'
-  | 'secretAccessKey'
-  | 'sessionToken'
-  | 'extraHeaders'
+  'apiKey' | 'accessKeyId' | 'secretAccessKey' | 'sessionToken' | 'extraHeaders'
 > & {
   hasApiKey: boolean;
   hasAccessKeyId: boolean;
@@ -56,9 +52,7 @@ type PluginSafeVideoGenerationConfig = Omit<VideoGenerationConfig, 'openai' | 'a
   custom?: PluginSafeProviderCredentialBlock<NonNullable<VideoGenerationConfig['custom']>>;
 };
 
-type EmbeddingProviderConfig = NonNullable<
-  AppConfig['memory']['semanticRecall']['embeddingProvider']
->;
+type EmbeddingProviderConfig = NonNullable<AppConfig['memory']['semanticRecall']['embeddingProvider']>;
 type PluginSafeEmbeddingProviderConfig = Omit<EmbeddingProviderConfig, 'openai' | 'azure' | 'custom'> & {
   openai?: PluginSafeProviderCredentialBlock<NonNullable<EmbeddingProviderConfig['openai']>>;
   azure?: PluginSafeProviderCredentialBlock<NonNullable<EmbeddingProviderConfig['azure']>>;
@@ -77,8 +71,19 @@ type PluginSafeMcpServer = Omit<McpServer, 'env'> & {
   hasEnv: boolean;
 };
 
-type PluginSafeAudioConfig = Omit<AppConfig['audio'], 'azure'> & {
+type PluginSafeAudioConfig = Omit<AppConfig['audio'], 'azure' | 'stt'> & {
   azure?: PluginSafeAzureAudioConfig;
+  stt?: PluginSafeSttConfig;
+};
+
+/** STT sub-config with the OpenAI Realtime apiKey redacted. */
+type PluginSafeSttConfig = Omit<NonNullable<AppConfig['audio']['stt']>, 'openai'> & {
+  openai?: PluginSafeProviderCredentialBlock<NonNullable<NonNullable<AppConfig['audio']['stt']>['openai']>>;
+};
+
+/** Dictation config with the OpenAI Realtime apiKey redacted. */
+type PluginSafeDictationConfig = Omit<NonNullable<AppConfig['dictation']>, 'openai'> & {
+  openai?: PluginSafeProviderCredentialBlock<NonNullable<NonNullable<AppConfig['dictation']>['openai']>>;
 };
 
 type PluginSafeWebServerConfig = Omit<AppConfig['webServer'], 'tls' | 'auth'> & {
@@ -110,6 +115,7 @@ export type PluginSafeConfig = Omit<
   | 'realtime'
   | 'imageGeneration'
   | 'videoGeneration'
+  | 'dictation'
 > & {
   models: Omit<AppConfig['models'], 'providers'> & {
     providers: Record<string, PluginSafeProviderConfig>;
@@ -121,6 +127,7 @@ export type PluginSafeConfig = Omit<
   realtime: PluginSafeRealtimeConfig;
   imageGeneration?: PluginSafeImageGenerationConfig;
   videoGeneration?: PluginSafeVideoGenerationConfig;
+  dictation?: PluginSafeDictationConfig;
 };
 
 function hasNonEmptyString(value: unknown): boolean {
@@ -138,17 +145,8 @@ function redactProviderCredentialBlock<T extends { apiKey?: string }>(
   };
 }
 
-function redactProvider(
-  provider: AppConfig['models']['providers'][string],
-): PluginSafeProviderConfig {
-  const {
-    apiKey,
-    accessKeyId,
-    secretAccessKey,
-    sessionToken,
-    extraHeaders,
-    ...rest
-  } = provider;
+function redactProvider(provider: AppConfig['models']['providers'][string]): PluginSafeProviderConfig {
+  const { apiKey, accessKeyId, secretAccessKey, sessionToken, extraHeaders, ...rest } = provider;
   return {
     ...rest,
     hasApiKey: hasNonEmptyString(apiKey),
@@ -219,7 +217,14 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
           };
         })()
       : undefined,
+    stt: cloned.audio.stt
+      ? { ...cloned.audio.stt, openai: redactProviderCredentialBlock(cloned.audio.stt.openai) }
+      : undefined,
   };
+
+  const safeDictation: PluginSafeDictationConfig | undefined = cloned.dictation
+    ? { ...cloned.dictation, openai: redactProviderCredentialBlock(cloned.dictation.openai) }
+    : undefined;
 
   const safeRealtime: PluginSafeRealtimeConfig = {
     ...cloned.realtime,
@@ -271,6 +276,7 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
     realtime: _realtime,
     imageGeneration: _imageGeneration,
     videoGeneration: _videoGeneration,
+    dictation: _dictation,
     ...remaining
   } = cloned;
 
@@ -287,6 +293,7 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
     realtime: safeRealtime,
     imageGeneration: safeImageGeneration,
     videoGeneration: safeVideoGeneration,
+    dictation: safeDictation,
   };
 }
 
