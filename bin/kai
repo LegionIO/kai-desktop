@@ -75,6 +75,24 @@ find_binary() {
       fi
       ;;
     Linux)
+      # PRIMARY: derive the app binary from this script's own real path, so a
+      # symlinked shim (e.g. ~/.local/bin/kai → .../resources/bin/kai) or an
+      # AppImage mount at a random path still finds its app. The launcher is
+      # shipped at <appRoot>/resources/bin/kai; the ELF binary is <appRoot>/kai.
+      _self=$(resolve_real_path "$0" 2>/dev/null || true)
+      if [ -n "$_self" ]; then
+        _selfdir=$(cd -P "$(dirname "$_self")" 2>/dev/null && pwd || true)
+        if [ -n "$_selfdir" ]; then
+          for rel in "../../kai" "../kai"; do
+            _cand=$(cd -P "$_selfdir" 2>/dev/null && cd -P "$(dirname "$rel")" 2>/dev/null && pwd || true)
+            if [ -n "$_cand" ] && [ -x "$_cand/$(basename "$rel")" ]; then
+              printf '%s\n' "$_cand/$(basename "$rel")"
+              return 0
+            fi
+          done
+        fi
+      fi
+      # Fixed install locations (deb / manual).
       for cand in /opt/Kai/kai /usr/lib/kai/kai "$HOME/.local/lib/kai/kai"; do
         if [ -x "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
       done
