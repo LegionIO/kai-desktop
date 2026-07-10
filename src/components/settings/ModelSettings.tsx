@@ -433,14 +433,16 @@ const CatalogContent: FC<SettingsProps> = ({ config, updateConfig }) => {
   };
 
   return (
-    <ModelCatalog
-      catalog={models.catalog}
-      providerKeys={providerKeys}
-      providers={models.providers}
-      onAdd={addModel}
-      onUpdate={updateModel}
-      onDelete={deleteModel}
-    />
+    <div data-setting-id="models.catalog">
+      <ModelCatalog
+        catalog={models.catalog}
+        providerKeys={providerKeys}
+        providers={models.providers}
+        onAdd={addModel}
+        onUpdate={updateModel}
+        onDelete={deleteModel}
+      />
+    </div>
   );
 };
 
@@ -516,7 +518,7 @@ const PromptsContent: FC<SettingsProps> = ({ config, updateConfig }) => {
     ((config as Record<string, unknown>).realtime as { instructions?: string } | undefined)?.instructions ?? '';
 
   return (
-    <div className="space-y-4">
+    <div data-setting-id="systemPrompts" className="space-y-4">
       {promptFields.map((field) => {
         let value: string;
         if (field.key === 'chat') {

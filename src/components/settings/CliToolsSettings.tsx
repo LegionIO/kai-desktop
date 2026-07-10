@@ -38,7 +38,10 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   useEffect(() => {
     const allBinaries = [...new Set(tools.flatMap((t) => [t.binary, ...(t.extraBinaries ?? [])]))];
     if (allBinaries.length > 0 && app.cliTools?.checkBinaries) {
-      app.cliTools.checkBinaries(allBinaries).then(setBinaryStatus).catch(() => {});
+      app.cliTools
+        .checkBinaries(allBinaries)
+        .then(setBinaryStatus)
+        .catch(() => {});
     }
   }, [tools]);
 
@@ -46,7 +49,10 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
     if (contributedTools.length === 0) return;
     const allBinaries = [...new Set(contributedTools.flatMap((t) => [t.binary, ...(t.extraBinaries ?? [])]))];
     if (allBinaries.length > 0 && app.cliTools?.checkBinaries) {
-      app.cliTools.checkBinaries(allBinaries).then(setPluginBinaryStatus).catch(() => {});
+      app.cliTools
+        .checkBinaries(allBinaries)
+        .then(setPluginBinaryStatus)
+        .catch(() => {});
     }
   }, [contributedTools]);
 
@@ -79,7 +85,7 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   const totalCount = tools.length;
 
   return (
-    <div className="space-y-4">
+    <div data-setting-id="cliTools" className="space-y-4">
       {!hideTitle && (
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold">CLI Tools</h3>
@@ -89,12 +95,11 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         </div>
       )}
       <p className="text-xs text-muted-foreground">
-        CLI tools give the AI access to command-line programs. Tools are only available if their binary is found on the system.
+        CLI tools give the AI access to command-line programs. Tools are only available if their binary is found on the
+        system.
       </p>
 
-      {tools.length === 0 && !showAdd && (
-        <p className="text-xs text-muted-foreground">No CLI tools configured.</p>
-      )}
+      {tools.length === 0 && !showAdd && <p className="text-xs text-muted-foreground">No CLI tools configured.</p>}
 
       <div className="space-y-2">
         {tools.map((tool, i) =>
@@ -142,7 +147,9 @@ export const CliToolsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <div className="space-y-2 pt-2">
           <div className="flex items-center gap-1.5">
             <PackageIcon className="h-3 w-3 text-muted-foreground" />
-            <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">Plugin Tools</span>
+            <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
+              Plugin Tools
+            </span>
           </div>
           {contributedTools.map((tool) => (
             <PluginToolCard
@@ -179,14 +186,10 @@ const PluginToolCard: FC<{
           </span>
         )}
 
-        <span className="text-[10px] text-muted-foreground/60 bg-muted/50 rounded px-1.5 py-0.5 ml-auto">
-          plugin
-        </span>
+        <span className="text-[10px] text-muted-foreground/60 bg-muted/50 rounded px-1.5 py-0.5 ml-auto">plugin</span>
       </div>
 
-      <div className="text-[10px] text-muted-foreground line-clamp-2">
-        {tool.description.split('\n')[0]}
-      </div>
+      <div className="text-[10px] text-muted-foreground line-clamp-2">{tool.description.split('\n')[0]}</div>
 
       {!binaryFound && (
         <div className="flex items-center gap-1.5 text-[10px] text-red-500 dark:text-red-400">
@@ -226,9 +229,7 @@ const ToolCard: FC<{
         )}
 
         {tool.builtIn && (
-          <span className="text-[10px] text-muted-foreground/60 bg-muted/50 rounded px-1.5 py-0.5">
-            built-in
-          </span>
+          <span className="text-[10px] text-muted-foreground/60 bg-muted/50 rounded px-1.5 py-0.5">built-in</span>
         )}
 
         <div className="ml-auto flex items-center gap-1">
@@ -236,7 +237,12 @@ const ToolCard: FC<{
             <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
           {!tool.builtIn && (
-            <button type="button" onClick={onDelete} className="p-1 rounded hover:bg-destructive/10 transition-colors" title="Delete">
+            <button
+              type="button"
+              onClick={onDelete}
+              className="p-1 rounded hover:bg-destructive/10 transition-colors"
+              title="Delete"
+            >
               <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
             </button>
           )}
@@ -250,9 +256,7 @@ const ToolCard: FC<{
         </div>
       </div>
 
-      <div className="text-[10px] text-muted-foreground line-clamp-2">
-        {tool.description.split('\n')[0]}
-      </div>
+      <div className="text-[10px] text-muted-foreground line-clamp-2">{tool.description.split('\n')[0]}</div>
 
       {!binaryFound && isEnabled && (
         <div className="flex items-center gap-1.5 text-[10px] text-red-500 dark:text-red-400">
@@ -295,7 +299,10 @@ const ToolForm: FC<{
 
   const handleSave = () => {
     if (!canSave) return;
-    const extras = extraBinaries.split(',').map((s) => s.trim()).filter(Boolean);
+    const extras = extraBinaries
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
     const tool: CliTool = {
       name: name.trim(),
       binary: binary.trim(),
@@ -326,7 +333,10 @@ const ToolForm: FC<{
             <EditableInput
               className="flex-1 rounded border bg-background px-2 py-1 text-xs font-mono"
               value={binary}
-              onChange={(v) => { setBinary(v); setCheckResult(null); }}
+              onChange={(v) => {
+                setBinary(v);
+                setCheckResult(null);
+              }}
               placeholder="htop"
             />
             <button
@@ -338,11 +348,12 @@ const ToolForm: FC<{
             >
               <SearchIcon className="h-3.5 w-3.5 text-muted-foreground" />
             </button>
-            {checkResult !== null && (
-              checkResult
-                ? <CheckCircle2Icon className="h-3.5 w-3.5 text-green-500" />
-                : <AlertCircleIcon className="h-3.5 w-3.5 text-red-500" />
-            )}
+            {checkResult !== null &&
+              (checkResult ? (
+                <CheckCircle2Icon className="h-3.5 w-3.5 text-green-500" />
+              ) : (
+                <AlertCircleIcon className="h-3.5 w-3.5 text-red-500" />
+              ))}
           </div>
         </div>
       </div>

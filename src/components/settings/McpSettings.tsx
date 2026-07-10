@@ -69,12 +69,10 @@ export const McpSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ confi
   };
 
   return (
-    <div className="space-y-4">
+    <div data-setting-id="mcpServers" className="space-y-4">
       {!hideTitle && <h3 className="text-sm font-semibold">MCP Servers</h3>}
 
-      {servers.length === 0 && !showAdd && (
-        <p className="text-xs text-muted-foreground">No MCP servers configured.</p>
-      )}
+      {servers.length === 0 && !showAdd && <p className="text-xs text-muted-foreground">No MCP servers configured.</p>}
 
       <div className="space-y-2">
         {servers.map((server, i) =>
@@ -166,13 +164,23 @@ const ServerCard: FC<{
         )}
 
         <div className="ml-auto flex items-center gap-1">
-          <button type="button" onClick={handleTest} className="p-1 rounded hover:bg-muted transition-colors" title="Test connection">
+          <button
+            type="button"
+            onClick={handleTest}
+            className="p-1 rounded hover:bg-muted transition-colors"
+            title="Test connection"
+          >
             <ZapIcon className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
           <button type="button" onClick={onEdit} className="p-1 rounded hover:bg-muted transition-colors" title="Edit">
             <PencilIcon className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
-          <button type="button" onClick={onDelete} className="p-1 rounded hover:bg-destructive/10 transition-colors" title="Delete">
+          <button
+            type="button"
+            onClick={onDelete}
+            className="p-1 rounded hover:bg-destructive/10 transition-colors"
+            title="Delete"
+          >
             <Trash2Icon className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
           <input
@@ -190,9 +198,7 @@ const ServerCard: FC<{
       </div>
 
       {server.env && Object.keys(server.env).length > 0 && (
-        <div className="text-[10px] text-muted-foreground">
-          Env: {Object.keys(server.env).join(', ')}
-        </div>
+        <div className="text-[10px] text-muted-foreground">Env: {Object.keys(server.env).join(', ')}</div>
       )}
 
       {testResult && <TestResultBadge result={testResult} />}
@@ -240,9 +246,7 @@ const ServerForm: FC<{
   const [url, setUrl] = useState(initial.url ?? '');
   const [command, setCommand] = useState(initial.command ?? '');
   const [args, setArgs] = useState((initial.args ?? []).join(' '));
-  const [env, setEnv] = useState<Array<[string, string]>>(
-    Object.entries(initial.env ?? {}),
-  );
+  const [env, setEnv] = useState<Array<[string, string]>>(Object.entries(initial.env ?? {}));
   const [enabled, setEnabled] = useState(initial.enabled !== false);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
 
@@ -375,17 +379,29 @@ const ServerForm: FC<{
               <EditableInput
                 className="w-1/3 rounded border bg-background px-2 py-1 text-xs font-mono"
                 value={key}
-                onChange={(k) => { const next = [...env]; next[i] = [k, value]; setEnv(next); }}
+                onChange={(k) => {
+                  const next = [...env];
+                  next[i] = [k, value];
+                  setEnv(next);
+                }}
                 placeholder="KEY"
               />
               <span className="text-[10px] text-muted-foreground">=</span>
               <EditableInput
                 className="flex-1 rounded border bg-background px-2 py-1 text-xs font-mono"
                 value={value}
-                onChange={(v) => { const next = [...env]; next[i] = [key, v]; setEnv(next); }}
+                onChange={(v) => {
+                  const next = [...env];
+                  next[i] = [key, v];
+                  setEnv(next);
+                }}
                 placeholder="value"
               />
-              <button type="button" onClick={() => setEnv(env.filter((_, j) => j !== i))} className="p-0.5 rounded hover:bg-destructive/10">
+              <button
+                type="button"
+                onClick={() => setEnv(env.filter((_, j) => j !== i))}
+                className="p-0.5 rounded hover:bg-destructive/10"
+              >
                 <XIcon className="h-3 w-3 text-muted-foreground" />
               </button>
             </div>
