@@ -301,6 +301,13 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
 
   // ─── Application › General ───
   {
+    id: 'cli.install',
+    label: 'Install the kai terminal command',
+    section: 'general',
+    tab: 'general',
+    keywords: ['cli', 'command line', 'terminal', 'kai command', 'path', 'shell', 'install kai', 'code command'],
+  },
+  {
     id: 'launchAtLogin',
     label: 'Launch at login',
     section: 'general',

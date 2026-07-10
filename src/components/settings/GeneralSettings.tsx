@@ -74,7 +74,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
         />
       </fieldset>
 
-      <fieldset className="rounded-lg border p-3 space-y-3">
+      <fieldset data-setting-id="cli.install" className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Terminal CLI</legend>
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
