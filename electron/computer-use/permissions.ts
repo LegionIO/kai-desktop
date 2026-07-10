@@ -413,8 +413,14 @@ export async function getComputerUsePermissions(options?: {
 
   return {
     target: 'local-macos',
-    accessibilityTrusted: getAccessibilityStatus(),
-    screenRecordingGranted: getScreenRecordingStatus(helperResult),
+    // Fail CLOSED on disagreement: the Swift helper is what actually performs
+    // capture + input, so a permission it reports as denied must not be masked
+    // by Electron's own API reporting granted (an Electron-granted/helper-denied
+    // state would otherwise pass preflight and then run blind / silently no-op).
+    // Require BOTH the Electron check AND the helper (when the helper returned a
+    // value) to agree the permission is granted.
+    accessibilityTrusted: getAccessibilityStatus() && helperResult.accessibilityTrusted !== false,
+    screenRecordingGranted: getScreenRecordingStatus(helperResult) && helperResult.screenRecordingGranted !== false,
     automationGranted,
     // When the probe was skipped, default to true — the caller opted out of
     // checking, so we shouldn't block on an unknown value.
