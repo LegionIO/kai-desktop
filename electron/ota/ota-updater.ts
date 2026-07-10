@@ -362,6 +362,8 @@ function checkFeedSignature(latest: OtaFeedEntry): string | null {
     minBaseVersion: latest.minBaseVersion,
     filesHash: latest.filesHash,
     signature: latest.signature,
+    url: latest.url,
+    size: latest.size,
   });
   if (!ok) {
     console.error('[ota-updater] OTA signature verification failed — refusing update');
@@ -541,6 +543,10 @@ export async function downloadOtaUpdate(
       extractedManifest.sha512 = latest.sha512;
       extractedManifest.filesHash = latest.filesHash;
       extractedManifest.signature = latest.signature;
+      // Persist v2 url+size so the apply-time re-verify + bootstrap can rebuild
+      // the v2 signed payload (a v2 signature only verifies with url/size).
+      extractedManifest.url = latest.url;
+      extractedManifest.size = latest.size;
       writeFileSync(extractedManifestPath, JSON.stringify(extractedManifest, null, 2));
     } catch (err) {
       rmSync(stagingDir, { recursive: true, force: true });
@@ -599,6 +605,8 @@ function verifyStagedOverlaySync(stagingDir: string, manifest: OtaManifest): { v
       minBaseVersion: manifest.minBaseVersion,
       filesHash: manifest.filesHash,
       signature: manifest.signature,
+      url: manifest.url,
+      size: manifest.size,
     });
     if (!ok) return { valid: false, error: 'staged overlay signature verification failed' };
   }

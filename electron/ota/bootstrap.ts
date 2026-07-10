@@ -20,11 +20,7 @@ import { OTA_DIR_NAME, OTA_CURRENT_DIR, OTA_MANIFEST_FILE } from './types.js';
 import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
 
 /** Entrypoint files whose on-disk hash is re-checked against the signed manifest at boot. */
-const OTA_ENTRYPOINT_FILES = [
-  'out/main/index.js',
-  'out/preload/index.mjs',
-  'out/renderer/index.html',
-] as const;
+const OTA_ENTRYPOINT_FILES = ['out/main/index.js', 'out/preload/index.mjs', 'out/renderer/index.html'] as const;
 
 function hashFileSync(filePath: string): string {
   return createHash('sha512').update(readFileSync(filePath)).digest('hex');
@@ -51,11 +47,7 @@ function wipeOverlay(dir: string, reason: string): void {
  * @param bundledOutDir - The bundled out/ directory (import.meta.dirname for main process)
  * @returns Resolved code paths
  */
-export function resolveCodePaths(
-  appSlug: string,
-  shellVersion: string,
-  bundledOutDir: string,
-): CodePaths {
+export function resolveCodePaths(appSlug: string, shellVersion: string, bundledOutDir: string): CodePaths {
   const bundledPaths: CodePaths = {
     main: bundledOutDir,
     preload: join(bundledOutDir, '..', 'preload'),
@@ -111,9 +103,7 @@ export function resolveCodePaths(
     // payload signed by the release pipeline. This defeats local tampering of
     // ~/.kai/ota/current/ and feed-bypass attacks.
     if (shouldSkipOtaSignature(app.isPackaged)) {
-      console.warn(
-        '[ota-bootstrap] KAI_OTA_SKIP_SIGNATURE or dev mode — skipping overlay signature verification',
-      );
+      console.warn('[ota-bootstrap] KAI_OTA_SKIP_SIGNATURE or dev mode — skipping overlay signature verification');
     } else {
       if (!manifest.signature || !manifest.sha512 || !manifest.filesHash) {
         console.warn('[ota-bootstrap] Overlay manifest is unsigned — refusing overlay');
@@ -126,6 +116,8 @@ export function resolveCodePaths(
         minBaseVersion: manifest.minBaseVersion,
         filesHash: manifest.filesHash,
         signature: manifest.signature,
+        url: manifest.url,
+        size: manifest.size,
       });
       if (!sigOk) {
         console.warn('[ota-bootstrap] Overlay signature verification failed — refusing overlay');
@@ -193,9 +185,7 @@ export function resolveCodePaths(
       return bundledPaths;
     }
 
-    console.info(
-      `[ota-bootstrap] Using OTA overlay: code v${manifest.codeVersion} (shell v${shellVersion})`,
-    );
+    console.info(`[ota-bootstrap] Using OTA overlay: code v${manifest.codeVersion} (shell v${shellVersion})`);
 
     return {
       main: overlayMain,

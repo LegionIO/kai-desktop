@@ -43,11 +43,22 @@ export interface OtaManifest {
   filesHash?: string;
   /**
    * Base64 Ed25519 signature over
-   * `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`.
+   * `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}` (v1) or, when
+   * url+size are present, the v2 payload with `\n${url}\n${size}` appended.
    * Persisted by the updater after a verified download. Absent in legacy
    * overlays; new clients refuse to boot an overlay without it.
    */
   signature?: string;
+  /**
+   * v2: the archive download URL, bound into the signature. Persisted so the
+   * apply-time re-verify + bootstrap can rebuild the v2 signed payload. Absent
+   * in v1 overlays (verification falls back to the 4-field payload).
+   */
+  url?: string;
+  /**
+   * v2: the archive byte size, bound into the signature. Persisted alongside url.
+   */
+  size?: number;
 }
 
 /**

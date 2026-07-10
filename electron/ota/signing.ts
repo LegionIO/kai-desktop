@@ -44,14 +44,25 @@ export const OTA_PUBLIC_KEY_IS_PLACEHOLDER = !OTA_PUBLIC_KEY || !OTA_PUBLIC_KEY.
 /**
  * Build the canonical byte string that is signed / verified.
  * MUST match scripts/build-ota-archive.ts exactly.
+ *
+ * v1 (legacy): `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`
+ * v2: appends `\n${url}\n${size}` so the download TARGET (archive url + byte
+ * size) is authenticated, not just its post-download hash. When url/size are
+ * omitted this produces the v1 string, so old signers/verifiers interoperate.
  */
 export function buildSignedPayload(
   sha512: string,
   codeVersion: string,
   minBaseVersion: string,
   filesHash: string,
+  url?: string,
+  size?: number,
 ): Buffer {
-  return Buffer.from(`${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`, 'utf8');
+  const base = `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`;
+  if (url != null && size != null) {
+    return Buffer.from(`${base}\n${url}\n${size}`, 'utf8');
+  }
+  return Buffer.from(base, 'utf8');
 }
 
 /**
@@ -79,27 +90,46 @@ export interface OtaSignedFields {
   minBaseVersion: string;
   filesHash: string;
   signature: string;
+  /** v2: archive download URL, bound into the signature. Optional for v1 feeds. */
+  url?: string;
+  /** v2: archive byte size, bound into the signature. Optional for v1 feeds. */
+  size?: number;
 }
 
 /**
  * Verify an Ed25519 signature over the canonical OTA payload.
  *
- * @param fields - the signed fields (sha512/codeVersion/minBaseVersion/filesHash/signature)
- * @param publicKey - the PEM SPKI public key to verify against. Defaults to the
- *   build-time-baked `OTA_PUBLIC_KEY`; production callers never pass this. The
- *   parameter exists so the OTA test harness can verify against an ephemeral
- *   test keypair without touching the shipped key.
- * @returns true if the signature is valid for the given fields
+ * Backward-compatible: when url+size are present it tries the v2 payload first
+ * (url/size bound); on failure — or when url/size are absent (legacy feed) — it
+ * falls back to the v1 4-field payload. An old field install (v1 verifier)
+ * accepts a v1 archive; a new install accepts both a v2 archive AND a still-in-
+ * flight v1 archive → NO signer/verifier skew window. Drop the v1 fallback only
+ * once all field installs are v2-aware.
+ *
+ * @param publicKey - PEM SPKI key to verify against. Defaults to the build-baked
+ *   OTA_PUBLIC_KEY; production callers never pass this (the OTA test harness does).
  */
 export function verifyOtaSignature(fields: OtaSignedFields, publicKey: string = OTA_PUBLIC_KEY): boolean {
   if (!fields.signature || !fields.sha512 || !fields.codeVersion || !fields.minBaseVersion || !fields.filesHash) {
     return false;
   }
   try {
-    const payload = buildSignedPayload(fields.sha512, fields.codeVersion, fields.minBaseVersion, fields.filesHash);
     const sigBuf = Buffer.from(fields.signature, 'base64');
-    // Ed25519 → algorithm must be null
-    return cryptoVerify(null, payload, publicKey, sigBuf);
+    // v2 first when url/size are available (Ed25519 → algorithm must be null).
+    if (fields.url != null && fields.size != null) {
+      const v2 = buildSignedPayload(
+        fields.sha512,
+        fields.codeVersion,
+        fields.minBaseVersion,
+        fields.filesHash,
+        fields.url,
+        fields.size,
+      );
+      if (cryptoVerify(null, v2, publicKey, sigBuf)) return true;
+    }
+    // v1 fallback (legacy 4-field payload).
+    const v1 = buildSignedPayload(fields.sha512, fields.codeVersion, fields.minBaseVersion, fields.filesHash);
+    return cryptoVerify(null, v1, publicKey, sigBuf);
   } catch (err) {
     console.error('[ota-signing] Signature verification threw:', err);
     return false;

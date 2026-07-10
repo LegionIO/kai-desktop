@@ -20,6 +20,8 @@ function signedFields(latest: OtaFeedEntry): OtaSignedFields {
     minBaseVersion: latest.minBaseVersion,
     filesHash: latest.filesHash!,
     signature: latest.signature!,
+    url: latest.url,
+    size: latest.size,
   };
 }
 
@@ -60,5 +62,25 @@ describe('OTA harness signature round-trip', () => {
     // Recompute over a DIFFERENT files map → mismatch (proves filesHash binds the set).
     const tampered = computeFilesHash({ 'out/main/index.js': { sha512: 'deadbeef' } });
     expect(tampered).not.toBe(feed.latest.filesHash);
+  });
+
+  it('v2 signature binds url+size (a url/size swap breaks verification)', () => {
+    const keys = generateOtaKeys();
+    const { feed } = buildSignedArchive({ keys, codeVersion: '1.1.0', url: 'ota.tar.gz' });
+    // Correct url/size verifies…
+    expect(verifyOtaSignature(signedFields(feed.latest), keys.publicKeyPem)).toBe(true);
+    // …but tampering the url breaks it (v2 fails, and v1 fallback doesn't cover url).
+    const swapped = { ...signedFields(feed.latest), url: 'evil.tar.gz' };
+    expect(verifyOtaSignature(swapped, keys.publicKeyPem)).toBe(false);
+    const resized = { ...signedFields(feed.latest), size: (feed.latest.size ?? 0) + 1 };
+    expect(verifyOtaSignature(resized, keys.publicKeyPem)).toBe(false);
+  });
+
+  it('BACK-COMPAT: a legacy v1-signed archive still verifies (no brick window)', () => {
+    const keys = generateOtaKeys();
+    // Sign the old 4-field payload — an archive from a signer that predates v2.
+    const { feed } = buildSignedArchive({ keys, codeVersion: '1.1.0', url: 'ota.tar.gz', signV1: true });
+    // The new verifier (which prefers v2) must fall back to v1 and accept it.
+    expect(verifyOtaSignature(signedFields(feed.latest), keys.publicKeyPem)).toBe(true);
   });
 });

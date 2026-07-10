@@ -38,6 +38,8 @@ export interface BuildArchiveOptions {
   files?: Record<string, string>;
   /** URL the feed will advertise (default filled in by the server helper). */
   url: string;
+  /** Sign the legacy v1 (4-field) payload instead of v2 — for back-compat tests. */
+  signV1?: boolean;
   /** Tamper hooks for adversarial cases. */
   tamper?: {
     /** Corrupt one file's on-disk bytes AFTER hashing (filesHash mismatch on extract). */
@@ -113,8 +115,12 @@ export function buildSignedArchive(opts: BuildArchiveOptions): BuiltArchive {
   const archiveSha512 = sha512File(archivePath);
   const size = opts.tamper?.wrongSize ?? readFileSync(archivePath).byteLength;
 
-  // Sign the (v1) payload with the ephemeral private key.
-  const payload = buildSignedPayload(archiveSha512, opts.codeVersion, manifest.minBaseVersion, filesHash);
+  // Sign the v2 payload (url+size bound) with the ephemeral private key, unless
+  // signV1 is requested (back-compat test: prove a legacy 4-field signature
+  // still verifies through verifyOtaSignature's v1 fallback).
+  const payload = opts.signV1
+    ? buildSignedPayload(archiveSha512, opts.codeVersion, manifest.minBaseVersion, filesHash)
+    : buildSignedPayload(archiveSha512, opts.codeVersion, manifest.minBaseVersion, filesHash, opts.url, size);
   let signature = cryptoSign(null, payload, opts.keys.privateKey).toString('base64');
   if (opts.tamper?.badSignature) {
     signature = Buffer.from('not-a-valid-signature').toString('base64');

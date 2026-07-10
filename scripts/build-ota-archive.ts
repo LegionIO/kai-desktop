@@ -51,7 +51,9 @@ const preloadIndex = resolve(outDir, 'preload', 'index.mjs');
 const rendererIndex = resolve(outDir, 'renderer', 'index.html');
 
 if (!existsSync(mainIndex) || !existsSync(preloadIndex) || !existsSync(rendererIndex)) {
-  console.error('Error: out/ directory is missing expected files (main/index.js, preload/index.mjs, renderer/index.html).');
+  console.error(
+    'Error: out/ directory is missing expected files (main/index.js, preload/index.mjs, renderer/index.html).',
+  );
   console.error('Run `pnpm build` first.');
   process.exit(1);
 }
@@ -159,11 +161,7 @@ execFileSync('cp', ['-R', outDir, resolve(stagingDir, 'out')]);
 execFileSync('/usr/bin/find', [resolve(stagingDir, 'out'), '-name', '*.map', '-delete']);
 
 // Create the tar.gz
-execFileSync('/usr/bin/tar', [
-  '-czf', archivePath,
-  '-C', stagingDir,
-  '.',
-]);
+execFileSync('/usr/bin/tar', ['-czf', archivePath, '-C', stagingDir, '.']);
 
 // Clean up staging
 execFileSync('rm', ['-rf', stagingDir]);
@@ -180,7 +178,16 @@ console.info(`[build-ota] SHA-512: ${archiveHash.slice(0, 16)}...`);
 // ── Sign the archive (Ed25519) ───────────────────────────────────────────────
 //
 // Canonical signed payload — MUST match electron/ota/signing.ts#buildSignedPayload:
-//   `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`
+//   v1: `${sha512}\n${codeVersion}\n${minBaseVersion}\n${filesHash}`
+//   v2: v1 + `\n${url}\n${size}`  (binds the download target into the signature)
+//
+// ROLLOUT SAFETY: we sign v1 BY DEFAULT and only sign v2 when KAI_OTA_SIGN_V2=1.
+// The in-app verifier is v2-capable (tries v2, falls back to v1) as of this
+// release, but an ALREADY-INSTALLED field client is v1-only — it verifies a
+// signature against the 4-field payload and would REJECT a v2 signature,
+// bricking its OTA channel. So the format ships now (verifier + signer support),
+// but the signer stays on v1 until telemetry confirms all field installs are
+// v2-capable; then flip KAI_OTA_SIGN_V2=1 in the release workflow (one env change).
 //
 // The private key is supplied via KAI_OTA_SIGNING_KEY (PEM-encoded Ed25519
 // private key) by the kai-builder CI pipeline. Local/dev builds without the
@@ -189,16 +196,23 @@ console.info(`[build-ota] SHA-512: ${archiveHash.slice(0, 16)}...`);
 
 let signature: string | undefined;
 const signingKeyPem = process.env.KAI_OTA_SIGNING_KEY;
+const signV2 = process.env.KAI_OTA_SIGN_V2 === '1';
 if (signingKeyPem) {
   try {
     const privateKey = createPrivateKey(signingKeyPem);
-    const payload = Buffer.from(
-      `${archiveHash}\n${version}\n${minBaseVersion}\n${filesHash}`,
-      'utf8',
-    );
+    // v1 by default; v2 (url+size bound) only when explicitly enabled. Keep
+    // byte-identical to electron/ota/signing.ts#buildSignedPayload.
+    const payload = signV2
+      ? Buffer.from(
+          `${archiveHash}\n${version}\n${minBaseVersion}\n${filesHash}\n${archiveName}\n${archiveStat.size}`,
+          'utf8',
+        )
+      : Buffer.from(`${archiveHash}\n${version}\n${minBaseVersion}\n${filesHash}`, 'utf8');
     // Ed25519 → algorithm must be null
     signature = cryptoSign(null, payload, privateKey).toString('base64');
-    console.info(`[build-ota] Signed archive (Ed25519): ${signature.slice(0, 16)}...`);
+    console.info(
+      `[build-ota] Signed archive (Ed25519, ${signV2 ? 'v2 url+size bound' : 'v1'}): ${signature.slice(0, 16)}...`,
+    );
   } catch (err) {
     console.error('[build-ota] FATAL: KAI_OTA_SIGNING_KEY was set but signing failed:', err);
     process.exit(1);
