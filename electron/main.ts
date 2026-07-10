@@ -30,6 +30,7 @@ import {
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { resetStaleRunStatus } from './ipc/conversation-store.js';
+import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
@@ -1085,6 +1086,11 @@ if (gotSingleInstanceLock) {
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerDiffHandlers(ipcMain, getConfig);
+    // "Install `kai` command in PATH" (VS Code `code`-style). Symlinks/copies the
+    // shipped launcher onto a per-user PATH dir; no elevation required.
+    ipcMain.handle('cli:install-status', () => getCliInstallStatus());
+    ipcMain.handle('cli:install', () => installCliCommand());
+    ipcMain.handle('cli:uninstall', () => uninstallCliCommand());
     registerArtifactBundleHandlers(ipcMain);
     registerMicRecorderHandlers(ipcMain);
     registerLiveSttHandlers(ipcMain);

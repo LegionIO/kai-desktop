@@ -11,9 +11,11 @@ import type { AppShotPayload } from '../../shared/app-shots';
 import type { DiffEvent, FileDiff } from '../../shared/diff-types';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
 import type { ConversationChange } from '../../electron/ipc/conversations';
+import type { CliInstallStatus } from '../../electron/ipc/cli-install';
 
 export type { ConversationChange } from '../../electron/ipc/conversations';
 export type { ConversationRecord } from '../../electron/ipc/conversation-store';
+export type { CliInstallStatus } from '../../electron/ipc/cli-install';
 
 export type AutomationSourceCatalogEntry = {
   source: string;
@@ -135,6 +137,11 @@ type AppAPI = {
   };
   cliTools: {
     checkBinaries: (binaryNames: string[]) => Promise<Record<string, boolean>>;
+  };
+  cli: {
+    installStatus: () => Promise<CliInstallStatus>;
+    install: () => Promise<CliInstallStatus>;
+    uninstall: () => Promise<CliInstallStatus>;
   };
   skills: {
     list: () => Promise<

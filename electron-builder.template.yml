@@ -124,6 +124,9 @@ win:
   extraResources:
     - from: build/bin/LocalWindowsHelper.ps1
       to: bin/LocalWindowsHelper.ps1
+    # `kai` terminal-client launcher (Windows). The app offers to add it to PATH.
+    - from: bin/kai.cmd
+      to: bin/kai.cmd
   target:
     - target: nsis
       arch:
@@ -144,6 +147,9 @@ linux:
       to: bin/LocalLinuxHelper.sh
     - from: build/bin/atspi_helper.py
       to: bin/atspi_helper.py
+    # `kai` terminal-client launcher (Linux). The app offers to add it to PATH.
+    - from: bin/kai
+      to: bin/kai
   target:
     - target: AppImage
       arch:

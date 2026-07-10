@@ -3,6 +3,7 @@ import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface
 import type { AppShotPayload } from '../shared/app-shots.js';
 import type { DiffEvent, FileDiff } from '../shared/diff-types.js';
 import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
+import type { CliInstallStatus as CliInstallStatusIpc } from './ipc/cli-install.js';
 
 export type AppAPI = typeof appAPI;
 
@@ -144,6 +145,12 @@ const appAPI = {
   cliTools: {
     checkBinaries: (binaryNames: string[]) =>
       ipcRenderer.invoke('cli-tools:check-binaries', binaryNames) as Promise<Record<string, boolean>>,
+  },
+
+  cli: {
+    installStatus: () => ipcRenderer.invoke('cli:install-status') as Promise<CliInstallStatusIpc>,
+    install: () => ipcRenderer.invoke('cli:install') as Promise<CliInstallStatusIpc>,
+    uninstall: () => ipcRenderer.invoke('cli:uninstall') as Promise<CliInstallStatusIpc>,
   },
 
   skills: {
