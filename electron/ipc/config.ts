@@ -1,5 +1,5 @@
 import type { IpcMain } from 'electron';
-import { readFileSync, writeFileSync, existsSync, watch, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, watch, mkdirSync, chmodSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
@@ -681,8 +681,15 @@ function readAppLlmConfig(): AppLlmFile {
 function writeAppLlmConfig(config: AppLlmFile): void {
   const p = getAppLlmConfigPath();
   mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  // Secret-bearing (provider API keys) — restrict to the owner.
+  // Secret-bearing (provider API keys) — restrict to the owner. writeFileSync's
+  // mode only applies on create, so chmod after to also tighten a pre-existing
+  // file that was written with looser perms before this hardening.
   writeFileSync(p, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort on platforms without POSIX perms */
+  }
 }
 
 function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Record<string, unknown> {
@@ -1092,10 +1099,16 @@ export function writeDesktopConfig(appHome: string, config: AppConfig): void {
   const configPath = getDesktopSettingsPath(appHome);
   mkdirSync(join(appHome, 'settings'), { recursive: true, mode: 0o700 });
   // Secret-bearing (MCP env vars, web password, media/realtime keys) — owner-only.
+  // chmod after write since mode only applies when the file is first created.
   writeFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), {
     encoding: 'utf-8',
     mode: 0o600,
   });
+  try {
+    chmodSync(configPath, 0o600);
+  } catch {
+    /* best-effort on platforms without POSIX perms */
+  }
 }
 
 function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
