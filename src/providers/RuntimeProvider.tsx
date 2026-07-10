@@ -1634,6 +1634,7 @@ export function RuntimeProvider({
     selectedProfileKey,
     fallbackEnabled,
     threadOverrides,
+    executionMode,
   });
   useEffect(() => {
     streamHandlerRef.current = {
@@ -1645,6 +1646,7 @@ export function RuntimeProvider({
       selectedProfileKey,
       fallbackEnabled,
       threadOverrides,
+      executionMode,
     };
   }, [
     tree,
@@ -1655,6 +1657,7 @@ export function RuntimeProvider({
     selectedProfileKey,
     fallbackEnabled,
     threadOverrides,
+    executionMode,
   ]);
 
   // Stream event listener — subscribes ONCE, reads mutable values via refs/globals
@@ -2300,7 +2303,7 @@ export function RuntimeProvider({
             cfg.selectedProfileKey ?? undefined,
             cfg.fallbackEnabled ?? false,
             currentWorkingDirectoryRef.current ?? undefined,
-            executionMode ?? 'auto',
+            cfg.executionMode ?? 'auto',
             cfg.threadOverrides ?? undefined,
           );
           return;
