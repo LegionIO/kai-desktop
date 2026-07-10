@@ -1224,6 +1224,9 @@ export function RuntimeProvider({
   const treeRef = useRef<StoredMessage[]>([]);
   const headIdRef = useRef<string | null>(null);
   const currentWorkingDirectoryRef = useRef<string | null>(null);
+  // Monotonic token for loadConversationState so a stale async load can't clobber
+  // a newer conversation selection.
+  const loadSeqRef = useRef(0);
   const persistTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const onModelFallbackRef = useRef(onModelFallback);
   onModelFallbackRef.current = onModelFallback;
@@ -1379,8 +1382,19 @@ export function RuntimeProvider({
   }, [branchPoints, tree, headId, isRunning]);
 
   const loadConversationState = useCallback(async (id: string) => {
+    // Monotonic guard: if the user switches conversations while an earlier load
+    // is still awaiting IPC, the earlier (now-stale) load must not apply its
+    // results over the newer selection. Capture a token; only commit state when
+    // this call is still the most recent one.
+    const seq = ++loadSeqRef.current;
+    const isCurrent = () => seq === loadSeqRef.current;
+
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return false;
+    // Superseded by a newer load — return true so callers (e.g. the mount
+    // effect) treat it as handled and DON'T fall through to create a new
+    // conversation; the newer load owns the resulting state.
+    if (!isCurrent()) return true;
 
     const { tree: t, headId: h } = ensureTree(conv);
 
@@ -1450,6 +1464,9 @@ export function RuntimeProvider({
         app.automations.inFlight(id).catch(() => false),
         app.agent.inFlight(id).catch(() => false),
       ]);
+      // A switch may have happened during the in-flight probe — don't seed an
+      // accumulator or flip isRunning for a conversation that's no longer active.
+      if (!isCurrent()) return true;
       if (autoInFlight || agentInFlight) {
         automationStreams.add(id);
         streamAccumulators.set(id, { messages: [...t], headId: h });
