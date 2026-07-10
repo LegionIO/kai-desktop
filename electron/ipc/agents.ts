@@ -56,6 +56,25 @@ function isValidId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
 }
 
+/**
+ * Fully stop an agent's execution: abort a Mastra virtual-session stream (for
+ * which terminalManager.kill is a no-op) AND kill a real PTY. Used by stop,
+ * unassign, and delete so a Mastra run can't keep streaming after any of them.
+ */
+function stopAgentExecution(terminalManager: TaskTerminalManager, sessionId: string | undefined): void {
+  if (!sessionId) return;
+  const abortCtrl = mastraAbortControllers.get(sessionId);
+  if (abortCtrl) {
+    abortCtrl.abort();
+    mastraAbortControllers.delete(sessionId);
+  }
+  try {
+    terminalManager.kill(sessionId);
+  } catch {
+    /* best-effort */
+  }
+}
+
 // ── Runtime / env / arg validation ──────────────────────────────────────
 //
 // Persisted agents carry caller-supplied `runtime`, `config.env`, and
@@ -1389,10 +1408,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
   ipcMain.handle('agents:delete', (_e, id: string) => {
     if (!isValidId(id)) return { error: 'Invalid agent ID' };
     try {
-      // Kill any running terminal first
+      // Kill any running terminal first (aborts a Mastra stream too)
       const agent = readAgent(appHome, id);
       if (agent?.terminalSessionId) {
-        terminalManager.kill(agent.terminalSessionId);
+        stopAgentExecution(terminalManager, agent.terminalSessionId);
       }
       // Unassign from any task
       if (agent?.currentTaskId) {
@@ -1428,9 +1447,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
 
-    // If agent is running, stop it first
+    // If agent is running, stop it first (aborts a Mastra stream too)
     if (agent.status === 'running' && agent.terminalSessionId) {
-      terminalManager.kill(agent.terminalSessionId);
+      stopAgentExecution(terminalManager, agent.terminalSessionId);
       agent.terminalSessionId = undefined;
       agent.status = 'idle';
     } else if (agent.status === 'running') {
@@ -1470,16 +1489,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     const agent = readAgent(appHome, agentId);
     if (!agent) return { error: `Agent ${agentId} not found` };
 
-    // Kill terminal if one exists (regardless of agent.status)
+    // Kill terminal if one exists (regardless of agent.status) — aborts a
+    // Mastra virtual-session stream as well as killing a real PTY.
     if (agent.terminalSessionId) {
-      // For Mastra virtual sessions, abort the streaming generator
-      const abortCtrl = mastraAbortControllers.get(agent.terminalSessionId);
-      if (abortCtrl) {
-        abortCtrl.abort();
-        mastraAbortControllers.delete(agent.terminalSessionId);
-      }
-      // For PTY sessions, kill the process
-      terminalManager.kill(agent.terminalSessionId);
+      stopAgentExecution(terminalManager, agent.terminalSessionId);
     }
 
     // Capture currentTaskId before clearing — we need it for task cleanup below
