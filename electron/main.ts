@@ -86,6 +86,7 @@ import {
   consumePostUpdateMarker,
 } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
+import { safeFetch, readCappedArrayBuffer } from './utils/ssrf-guard.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import {
   bootstrapBundledPlugins,
@@ -1667,6 +1668,9 @@ if (gotSingleInstanceLock) {
     });
 
     // Fetch image bytes from main process (bypasses CORS)
+    // Cap on a media fetch/save so a huge/endless remote response can't OOM the
+    // main process (the fetched bytes are also base64'd for IPC on the fetch path).
+    const MAX_MEDIA_FETCH_BYTES = 256 * 1024 * 1024; // 256 MiB
     ipcMain.handle('image:fetch', async (_event, url: string) => {
       let parsed;
       try {
@@ -1682,11 +1686,18 @@ if (gotSingleInstanceLock) {
         return { error: 'Only http(s) and media URLs are allowed' };
       }
       try {
-        const resp = await net.fetch(url, {
-          headers: withBrandUserAgent(),
-        });
+        const isMedia = parsed.protocol === __BRAND_MEDIA_PROTOCOL + ':';
+        // http(s) URLs go through the SSRF-guarded fetch (blocks private/loopback
+        // targets + redirect bypass + caps the body). The media: protocol resolves
+        // to a LOCAL file via the app's own protocol handler — not a network
+        // request — so it uses net.fetch directly and needs no SSRF guard.
+        const resp = isMedia
+          ? await net.fetch(url, { headers: withBrandUserAgent() })
+          : await safeFetch(url, { headers: withBrandUserAgent() as Record<string, string> });
         if (!resp.ok) return { error: `HTTP ${resp.status}` };
-        const buffer = Buffer.from(await resp.arrayBuffer());
+        const buffer = isMedia
+          ? Buffer.from(await resp.arrayBuffer())
+          : await readCappedArrayBuffer(resp, MAX_MEDIA_FETCH_BYTES);
         const mime = resp.headers.get('content-type') || 'image/png';
         return { data: buffer.toString('base64'), mime };
       } catch (err) {
@@ -1749,11 +1760,14 @@ if (gotSingleInstanceLock) {
       if (result.canceled || !result.filePath) return { canceled: true };
 
       try {
-        const resp = await net.fetch(url, {
-          headers: withBrandUserAgent(),
-        });
+        const isMedia = parsed.protocol === __BRAND_MEDIA_PROTOCOL + ':';
+        const resp = isMedia
+          ? await net.fetch(url, { headers: withBrandUserAgent() })
+          : await safeFetch(url, { headers: withBrandUserAgent() as Record<string, string> });
         if (!resp.ok) return { error: `HTTP ${resp.status}` };
-        const buffer = Buffer.from(await resp.arrayBuffer());
+        const buffer = isMedia
+          ? Buffer.from(await resp.arrayBuffer())
+          : await readCappedArrayBuffer(resp, MAX_MEDIA_FETCH_BYTES);
         writeFileSync(result.filePath, buffer);
         return { canceled: false, filePath: result.filePath };
       } catch (err) {
