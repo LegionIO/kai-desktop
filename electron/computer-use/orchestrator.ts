@@ -485,6 +485,25 @@ export class ComputerUseOrchestrator {
           await new Promise((resolve) => setTimeout(resolve, postActionDelayMs));
         }
       }
+
+      // Loop fell through the step cap without reaching a terminal/paused state.
+      // Without this, the session stays 'running' with no active run — a zombie
+      // whose browser window / takeover monitor lingers and which the finally's
+      // terminal-only cleanup never disposes. Pause it explicitly so the user
+      // can resume/continue and cleanup can settle.
+      if (!controller.signal.aborted) {
+        const afterLoop = this.readSession(sessionId);
+        if (afterLoop && afterLoop.status === 'running') {
+          this.mutateSession(sessionId, (current) => ({
+            ...current,
+            status: 'paused',
+            pauseReason: 'system',
+            statusMessage: 'Reached the step limit for this run. Continue to keep going.',
+            humanInControl: false,
+            updatedAt: nowIso(),
+          }));
+        }
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.mutateSession(sessionId, (current) => ({
