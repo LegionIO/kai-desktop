@@ -168,6 +168,15 @@ export async function performQuitAndInstall(): Promise<void> {
     return;
   }
 
+  // Re-entrancy guard: multiple install calls could otherwise pass the guard
+  // above and run elevation hooks / quitAndInstall more than once (accumulating
+  // native Squirrel listeners on macOS). Only the first attempt proceeds.
+  if (installInProgress) {
+    console.warn('[auto-update] install already in progress — ignoring duplicate performQuitAndInstall');
+    return;
+  }
+  installInProgress = true;
+
   // Run pre-update hooks (e.g., elevate to admin)
   if (hookRunner) {
     broadcast({ state: 'preparing', version: downloadedVersion });
@@ -179,11 +188,13 @@ export async function performQuitAndInstall(): Promise<void> {
       if (result.abort) {
         console.info('[auto-update] Pre-update hook aborted install:', result.abortReason ?? '(no reason)');
         broadcast({ state: 'downloaded', version: downloadedVersion });
+        installInProgress = false; // aborted before install — allow a later retry
         return;
       }
     } catch (err) {
       console.error('[auto-update] Pre-update hooks threw, aborting install:', err);
       broadcast({ state: 'downloaded', version: downloadedVersion });
+      installInProgress = false; // failed before install — allow a later retry
       return;
     }
   }
@@ -233,42 +244,62 @@ export function checkForUpdatesInteractive(): void {
     return;
   }
 
+  // Serialize interactive checks — a repeat click while one is in flight would
+  // attach more one-shot listeners + promise catches to the same operation.
+  if (interactiveCheckInFlight) return;
+  interactiveCheckInFlight = true;
+
   const cleanup = () => {
     autoUpdater.removeListener('update-available', onAvailable);
     autoUpdater.removeListener('update-not-available', onNotAvailable);
     autoUpdater.removeListener('error', onError);
+    interactiveCheckInFlight = false;
+  };
+
+  // checkForUpdates() emits `error` AND rejects on failure, so both onError
+  // (via the once listener) and .catch(onError) can fire — guard so only the
+  // first settles (one dialog, one cleanup).
+  let settled = false;
+  const settleOnce = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    fn();
   };
 
   const onAvailable = (info: { version: string }) => {
-    cleanup();
-    dialog.showMessageBox({
-      type: 'info',
-      title: 'Update Available',
-      message: `${__BRAND_PRODUCT_NAME} ${info.version} is available.`,
-      detail: `The update is downloading in the background. You'll be notified when it's ready to install.`,
-      buttons: ['OK'],
+    settleOnce(() => {
+      dialog.showMessageBox({
+        type: 'info',
+        title: 'Update Available',
+        message: `${__BRAND_PRODUCT_NAME} ${info.version} is available.`,
+        detail: `The update is downloading in the background. You'll be notified when it's ready to install.`,
+        buttons: ['OK'],
+      });
     });
   };
 
   const onNotAvailable = () => {
-    cleanup();
-    dialog.showMessageBox({
-      type: 'info',
-      title: 'No Updates',
-      message: `${__BRAND_PRODUCT_NAME} is up to date.`,
-      detail: `You are running the latest version (${__APP_VERSION}).`,
-      buttons: ['OK'],
+    settleOnce(() => {
+      dialog.showMessageBox({
+        type: 'info',
+        title: 'No Updates',
+        message: `${__BRAND_PRODUCT_NAME} is up to date.`,
+        detail: `You are running the latest version (${__APP_VERSION}).`,
+        buttons: ['OK'],
+      });
     });
   };
 
   const onError = (err: Error) => {
-    cleanup();
-    dialog.showMessageBox({
-      type: 'warning',
-      title: 'Update Error',
-      message: 'Could not check for updates.',
-      detail: err.message,
-      buttons: ['OK'],
+    settleOnce(() => {
+      dialog.showMessageBox({
+        type: 'warning',
+        title: 'Update Error',
+        message: 'Could not check for updates.',
+        detail: err.message,
+        buttons: ['OK'],
+      });
     });
   };
 
@@ -283,6 +314,10 @@ let downloaded = false;
 let downloadedVersion: string | undefined;
 let downloadedFilePath: string | undefined;
 let pendingVersion: string | undefined;
+/** Guards checkForUpdatesInteractive against overlapping runs. */
+let interactiveCheckInFlight = false;
+/** Guards performQuitAndInstall against re-entrant install attempts. */
+let installInProgress = false;
 let pendingFullSize: number | undefined;
 
 export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?: () => void): void {
