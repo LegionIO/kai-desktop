@@ -61,6 +61,11 @@ import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js
 import { openPluginBrowserWindow } from './browser-window/index.js';
 import { hookDispatcher, HOOK_EVENTS } from '../agent/hooks/dispatcher.js';
 
+/** Max buffered body for a plugin HTTP server request (1 MB). */
+const PLUGIN_HTTP_MAX_BODY_BYTES = 1_048_576;
+/** Max time a plugin HTTP request/headers may take before the socket is closed. */
+const PLUGIN_HTTP_REQUEST_TIMEOUT_MS = 30_000;
+
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
 // last BrowserWindow using that partition's session closes.  For auth windows
@@ -1175,10 +1180,22 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
               let body = '';
               if (req.method !== 'GET' && req.method !== 'HEAD') {
-                body = await new Promise<string>((resolveBody) => {
+                body = await new Promise<string>((resolveBody, rejectBody) => {
                   const chunks: Buffer[] = [];
-                  req.on('data', (chunk: Buffer) => chunks.push(chunk));
+                  let received = 0;
+                  req.on('data', (chunk: Buffer) => {
+                    received += chunk.length;
+                    // Cap the buffered body so a large/slow request can't be
+                    // used as a memory-exhaustion DoS against the host process.
+                    if (received > PLUGIN_HTTP_MAX_BODY_BYTES) {
+                      req.destroy();
+                      rejectBody(new Error('Request body too large'));
+                      return;
+                    }
+                    chunks.push(chunk);
+                  });
                   req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf-8')));
+                  req.on('error', (e) => rejectBody(e));
                 });
               }
 
@@ -1205,6 +1222,10 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           });
 
           const host = options?.host ?? '127.0.0.1';
+          // Bound how long a client can hold a request/socket open, so a slow-
+          // loris style connection can't tie up the plugin's server.
+          httpServer.requestTimeout = PLUGIN_HTTP_REQUEST_TIMEOUT_MS;
+          httpServer.headersTimeout = PLUGIN_HTTP_REQUEST_TIMEOUT_MS;
           httpServer.listen(port, host, () => {
             console.info(`[Plugin:${manifest.name}] HTTP server listening on ${host}:${port}`);
             resolve();

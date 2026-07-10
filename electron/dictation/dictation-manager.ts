@@ -643,11 +643,18 @@ async function startDictationInner(): Promise<void> {
         hardErrorCodes.has(beginResponse.errorCode) &&
         !canAllowBlindKeyboardFullPatchConfig()
       ) {
+        // Hard failure: reset to idle through the SAME cleanup sequence as the
+        // catch path, or the manager stays wedged in 'starting' (blocking the
+        // next start) with the overlay + native session still around.
+        state = 'idle';
+        sessionGeneration += 1;
+        broadcastState();
+        await cleanupSession();
+        hideDictationOverlay();
         broadcastError(
           beginResponse.error ??
             `Dictation could not verify the target text field (${beginResponse.errorCode}). Enable blind keyboard mode to dictate here anyway.`,
         );
-        await nativeSession?.endSession().catch(() => {});
         return;
       }
     }
