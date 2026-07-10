@@ -96,9 +96,12 @@ function contentToText(content: unknown): string {
 export function App({
   client,
   recover,
+  runtimeRef,
 }: {
   client: LocalBridgeClient;
   recover?: () => Promise<boolean>;
+  // Shared with startRepl so quit-time cleanup can cancel an in-flight turn.
+  runtimeRef?: { activeConversationId: string | null; busy: boolean };
 }): React.ReactElement {
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -135,6 +138,12 @@ export function App({
   // every status change (runCommand). Kept in sync below.
   const statusRef = useRef<'idle' | 'running' | 'awaiting-approval'>('idle');
   statusRef.current = status;
+  // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
+  // an in-flight turn on the right conversation.
+  if (runtimeRef) {
+    runtimeRef.activeConversationId = conversationId || convIdRef.current || null;
+    runtimeRef.busy = status === 'running' || status === 'awaiting-approval';
+  }
 
   const pushTurn = useCallback((t: Turn) => setTurns((prev) => [...prev, t]), []);
 
@@ -596,6 +605,14 @@ export function App({
           break;
         case 'rewind':
         case 'revert': {
+          // Rewinding mid-turn would fight the in-flight stream: its terminal
+          // server-persist appends the assistant under the captured submit-time
+          // parent and moves headId back, effectively undoing the rewind. Refuse
+          // while busy.
+          if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+            pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
+            break;
+          }
           if (unsavedRecordRef.current) {
             pushTurn({ kind: 'note', text: 'nothing to rewind yet' });
             break;

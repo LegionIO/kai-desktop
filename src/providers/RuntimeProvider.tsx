@@ -2015,7 +2015,11 @@ export function RuntimeProvider({
         if (data && data.content !== undefined) {
           const targetId = typeof data.messageId === 'string' ? data.messageId : undefined;
           let idx = targetId ? acc.messages.findIndex((m) => m.id === targetId) : -1;
-          if (idx < 0) {
+          // Only fall back to "last user message" when NO messageId was given.
+          // If a messageId WAS provided but isn't in this accumulator yet (e.g. a
+          // CLI-appended node the renderer hasn't loaded), do NOT redact a
+          // different turn — skip and let the store's own scrub + reload apply.
+          if (idx < 0 && !targetId) {
             for (let i = acc.messages.length - 1; i >= 0; i--) {
               if (acc.messages[i].role === 'user') {
                 idx = i;

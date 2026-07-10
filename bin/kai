@@ -46,9 +46,11 @@ find_binary() {
       # moved/malicious same-bundle-id app can't hijack the CLI.
       _self=$(resolve_real_path "$0" 2>/dev/null || true)
       if [ -n "$_self" ]; then
-        _self_bin=$(cd "$(dirname "$_self")/../../MacOS" 2>/dev/null && pwd)/Kai
-        if [ -x "$_self_bin" ]; then
-          printf '%s\n' "$_self_bin"
+        # `|| true` so a failed cd (not inside a bundle) doesn't abort under
+        # `set -e` and skip the fixed-location/Spotlight fallbacks below.
+        _macos_dir=$(cd "$(dirname "$_self")/../../MacOS" 2>/dev/null && pwd || true)
+        if [ -n "$_macos_dir" ] && [ -x "$_macos_dir/Kai" ]; then
+          printf '%s\n' "$_macos_dir/Kai"
           return 0
         fi
       fi

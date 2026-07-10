@@ -14,7 +14,16 @@ import { App } from './app.js';
  * the process exits (Ink's default Ctrl-C would kill us mid-handshake).
  */
 export async function startRepl(client: LocalBridgeClient, recover?: () => Promise<boolean>): Promise<void> {
-  const instance = render(<App client={client} recover={recover} />, { exitOnCtrlC: false });
+  // App writes the active conversation id + busy flag here so cleanup can cancel
+  // an in-flight turn on quit. Requesting backend shutdown is NOT enough when a
+  // GUI leader is attached (idleShutdown is false there, so the request is a
+  // no-op) — the model/tool run would otherwise continue after the CLI is gone,
+  // including a permanently stuck approval prompt.
+  const runtimeRef: { activeConversationId: string | null; busy: boolean } = {
+    activeConversationId: null,
+    busy: false,
+  };
+  const instance = render(<App client={client} recover={recover} runtimeRef={runtimeRef} />, { exitOnCtrlC: false });
 
   let cleaningUp = false;
   const cleanup = async (): Promise<void> => {
@@ -26,6 +35,15 @@ export async function startRepl(client: LocalBridgeClient, recover?: () => Promi
       /* already unmounted */
     }
     process.stdout.write('\x1b[2m Cleaning up…\x1b[0m\n');
+    // Cancel the in-flight turn (if any) so it doesn't keep running on a shared
+    // backend after we detach. Best-effort — don't let it block the exit.
+    if (runtimeRef.busy && runtimeRef.activeConversationId) {
+      try {
+        await client.invoke('agent:cancel-stream', runtimeRef.activeConversationId);
+      } catch {
+        /* ignore */
+      }
+    }
     await client.requestShutdown();
     client.close();
     process.exit(0);
