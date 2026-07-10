@@ -1,36 +1,19 @@
 /**
  * Unit tests for the in-app "Install `kai` command" logic (POSIX path).
- * Mocks electron `app` + os.homedir into a tmpdir so no real ~/.local/bin or
- * app bundle is touched. Windows-specific behavior (copy + PATH edit) isn't
- * exercised here — it's validated manually on Windows.
+ * Mocks electron `app` (packaged) + os.homedir into a tmpdir so no real
+ * ~/.local/bin is touched. Windows copy+PATH is validated manually, not here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import {
-  mkdtempSync,
-  rmSync,
-  mkdirSync,
-  writeFileSync,
-  existsSync,
-  lstatSync,
-  readlinkSync,
-  readFileSync,
-} from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, lstatSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type * as NodeOs from 'node:os';
 import { join } from 'node:path';
 
 let tmpHome: string;
-let appRoot: string;
 
-// electron `app`: unpackaged (dev), getAppPath → our fake repo root with bin/kai.
-vi.mock('electron', () => ({
-  app: {
-    isPackaged: false,
-    getAppPath: () => appRoot,
-  },
-}));
+// electron `app`: packaged so appBinaryPath() resolves to process.execPath.
+vi.mock('electron', () => ({ app: { isPackaged: true, getAppPath: () => '/unused' } }));
 
-// Redirect homedir → tmp so the install target (~/.local/bin) is sandboxed.
 vi.mock('os', async () => {
   const actual = await vi.importActual<typeof NodeOs>('os');
   return { ...actual, homedir: () => tmpHome };
@@ -42,14 +25,12 @@ vi.mock('node:os', async () => {
 
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from '../cli-install.js';
 
+const DEST = () => join(tmpHome, '.local', 'bin', 'kai');
+
 beforeEach(() => {
   const base = mkdtempSync(join(tmpdir(), 'kai-cli-install-'));
   tmpHome = join(base, 'home');
-  appRoot = join(base, 'app');
   mkdirSync(tmpHome, { recursive: true });
-  mkdirSync(join(appRoot, 'bin'), { recursive: true });
-  // Fake shipped launcher in the (dev) repo bin/.
-  writeFileSync(join(appRoot, 'bin', 'kai'), '#!/bin/sh\necho kai\n', { mode: 0o755 });
 });
 
 afterEach(() => {
@@ -61,49 +42,67 @@ afterEach(() => {
 });
 
 describe('cli-install (POSIX)', () => {
-  it('reports not-installed before install, with a resolvable source', () => {
+  it('reports not-installed before install', () => {
     const status = getCliInstallStatus();
     expect(status.installed).toBe(false);
-    expect(status.source).toBe(join(appRoot, 'bin', 'kai'));
+    expect(status.conflict).toBeUndefined();
   });
 
-  it('install creates a symlink to the shipped shim and reports installed', () => {
+  it('install writes a managed wrapper that bakes in the app binary path', () => {
     const status = installCliCommand();
     expect(status.installed).toBe(true);
-    const dest = join(tmpHome, '.local', 'bin', 'kai');
-    expect(existsSync(dest)).toBe(true);
-    expect(lstatSync(dest).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(dest)).toBe(join(appRoot, 'bin', 'kai'));
+    expect(existsSync(DEST())).toBe(true);
+    // It's a regular file (wrapper), executable, carrying the managed marker +
+    // the app binary path (process.execPath under the test runner).
+    expect(lstatSync(DEST()).isFile()).toBe(true);
+    const body = readFileSync(DEST(), 'utf-8');
+    expect(body).toContain('KAI_MANAGED_CLI_WRAPPER');
+    expect(body).toContain(process.execPath);
+    expect(body).toContain('--kai-cli');
     expect(getCliInstallStatus().installed).toBe(true);
   });
 
-  it('install is idempotent (re-install replaces the link)', () => {
+  it('refuses to overwrite / claim an unrelated non-Kai file (conflict)', () => {
+    mkdirSync(join(tmpHome, '.local', 'bin'), { recursive: true });
+    writeFileSync(DEST(), '#!/bin/sh\necho not kai\n');
+    expect(getCliInstallStatus().conflict).toBe(true);
+    expect(getCliInstallStatus().installed).toBe(false);
+    const res = installCliCommand();
+    expect(res.installed).toBe(false);
+    expect(res.conflict).toBe(true);
+    // The foreign file must be untouched.
+    expect(readFileSync(DEST(), 'utf-8')).toContain('not kai');
+  });
+
+  it('install is idempotent (rewrites the managed wrapper)', () => {
     installCliCommand();
     const second = installCliCommand();
     expect(second.installed).toBe(true);
   });
 
-  it('appends a PATH line to a shell rc exactly once', () => {
-    // Provide a .bashrc so ensurePosixPath has a target.
-    writeFileSync(join(tmpHome, '.bashrc'), '# existing\n');
+  it('appends a managed PATH block to a shell rc exactly once, removed on uninstall', () => {
+    process.env.SHELL = '/bin/zsh';
     installCliCommand();
-    installCliCommand(); // second run must not double-append
-    const rc = readFileSync(join(tmpHome, '.bashrc'), 'utf-8');
-    const markerCount = (rc.match(/added by Kai/g) ?? []).length;
-    expect(markerCount).toBe(1);
+    installCliCommand();
+    const rc = join(tmpHome, '.zshrc');
+    const body = readFileSync(rc, 'utf-8');
+    expect((body.match(/added by Kai/g) ?? []).length).toBe(1);
+    uninstallCliCommand();
+    expect(readFileSync(rc, 'utf-8')).not.toContain('added by Kai');
   });
 
-  it('uninstall removes the command', () => {
+  it('uninstall removes only a managed wrapper', () => {
     installCliCommand();
     const status = uninstallCliCommand();
     expect(status.installed).toBe(false);
-    expect(existsSync(join(tmpHome, '.local', 'bin', 'kai'))).toBe(false);
+    expect(existsSync(DEST())).toBe(false);
   });
 
-  it('install fails cleanly when the shim source is missing', () => {
-    rmSync(join(appRoot, 'bin', 'kai'));
-    const status = installCliCommand();
-    expect(status.installed).toBe(false);
-    expect(status.error).toMatch(/not found/i);
+  it('uninstall refuses to remove an unrelated file', () => {
+    mkdirSync(join(tmpHome, '.local', 'bin'), { recursive: true });
+    writeFileSync(DEST(), 'foreign\n');
+    const res = uninstallCliCommand();
+    expect(res.conflict).toBe(true);
+    expect(existsSync(DEST())).toBe(true);
   });
 });

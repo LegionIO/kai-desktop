@@ -21,7 +21,12 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
 
   // "Install `kai` command in PATH" — VS Code `code`-style toggle backed by the
   // cli:install IPC (symlinks/copies the shipped launcher onto a per-user PATH dir).
-  const [cliStatus, setCliStatus] = useState<{ installed: boolean; target?: string; onPath?: boolean } | null>(null);
+  const [cliStatus, setCliStatus] = useState<{
+    installed: boolean;
+    target?: string;
+    onPath?: boolean;
+    conflict?: boolean;
+  } | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
   const [cliError, setCliError] = useState<string | null>(null);
 
@@ -92,11 +97,16 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
                 <AlertTriangleIcon className="h-3 w-3 shrink-0" />
                 {cliError}
               </p>
+            ) : cliStatus?.conflict ? (
+              <p className="mt-0.5 text-[10px] text-amber-500 flex items-center gap-1">
+                <AlertTriangleIcon className="h-3 w-3 shrink-0" />A different `kai` command already exists in PATH — not
+                managed by Kai.
+              </p>
             ) : null}
           </div>
           <button
             type="button"
-            disabled={cliBusy}
+            disabled={cliBusy || cliStatus?.conflict}
             onClick={() => void toggleCli()}
             className="shrink-0 rounded-md border px-2.5 py-1 text-[11px] hover:bg-muted disabled:opacity-50 flex items-center gap-1"
           >
