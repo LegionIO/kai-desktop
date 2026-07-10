@@ -130,16 +130,22 @@ export async function compactConversationPrefix(
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
-  // Fit prefix to the input budget by dropping oldest messages until it fits
+  // Fit prefix to the input budget by dropping oldest messages until it fits.
+  // If we would have to DROP any prefix message to fit, fail safe: a dropped
+  // message is neither summarized nor kept, so it would be silently lost from
+  // the conversation. Returning a null result leaves the history uncompacted
+  // (the turn proceeds on the full context) rather than losing content.
   const fittedPrefix = [...prefix];
+  let droppedForBudget = false;
   while (fittedPrefix.length > 0) {
     const candidatePromptText = serializeForTokenCounting(fittedPrefix);
     const candidateTokens = tokenization.encoding.encode(candidatePromptText).length;
     if (candidateTokens <= promptInputBudget) break;
     fittedPrefix.shift();
+    droppedForBudget = true;
   }
 
-  if (fittedPrefix.length === 0) {
+  if (fittedPrefix.length === 0 || droppedForBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
@@ -162,8 +168,18 @@ export async function compactConversationPrefix(
     serializeForTokenCounting(fittedPrefix),
   ].join('\n');
 
-  const result = await agent.generate(prompt, { maxSteps: 1 });
-  const summaryText = typeof result.text === 'string' ? result.text.trim() : null;
+  // Fail safe if the summarizer LLM call throws (network/API error): compaction
+  // is best-effort and runs mid-turn, so an uncaught throw here would fail the
+  // whole user turn. Return a null result to keep the uncompacted history and
+  // let the turn proceed (mirrors aiExtractRelevantInfo's try/catch contract).
+  let summaryText: string | null = null;
+  try {
+    const result = await agent.generate(prompt, { maxSteps: 1 });
+    summaryText = typeof result.text === 'string' ? result.text.trim() || null : null;
+  } catch (err) {
+    console.warn('[compaction] Summarizer generate failed — skipping compaction for this turn:', err);
+    return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+  }
   if (!summaryText) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
@@ -241,11 +257,26 @@ function truncateToTokenBudget(
   const headChars = Math.floor(keepChars * options.headRatio);
   const tailChars = Math.max(options.minTailChars, keepChars - headChars);
 
-  return [
-    content.slice(0, headChars),
-    '\n\n...[tool output truncated for size]...\n\n',
-    content.slice(-tailChars),
-  ].join('');
+  const marker = '\n\n...[tool output truncated for size]...\n\n';
+  let head = headChars;
+  let tail = tailChars;
+  let out = content.slice(0, head) + marker + content.slice(-tail);
+
+  // The minChars / minTailChars floors above can push the result BACK over
+  // maxTokens (a floor is a lower bound on chars, not tokens). Re-tokenize and
+  // shrink head+tail proportionally until the output actually fits, ignoring the
+  // floors on this pass — a slightly-too-small slice is correct behavior when
+  // the budget genuinely can't hold the floors.
+  for (let i = 0; i < 12 && estimateToolTokens(out, modelName) > maxTokens; i++) {
+    head = Math.floor(head * 0.7);
+    tail = Math.floor(tail * 0.7);
+    if (head <= 0 && tail <= 0) {
+      out = marker;
+      break;
+    }
+    out = content.slice(0, Math.max(0, head)) + marker + (tail > 0 ? content.slice(-tail) : '');
+  }
+  return out;
 }
 
 /**
