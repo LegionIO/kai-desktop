@@ -22,6 +22,7 @@ import {
   compactConversationPrefix,
   compactToolResult,
   estimateToolTokens,
+  isStrictPrefix,
 } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1695,12 +1696,69 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // Check if compaction is needed (only if runtime supports it)
         if (compactionSupported && config.compaction.conversation.enabled && modelEntry) {
           const chatMessages = messages as Array<{ role: string; content: unknown; id?: string }>;
-          const check = shouldCompact(
-            chatMessages as Parameters<typeof shouldCompact>[0],
-            modelEntry.modelConfig.modelName,
-            config.compaction.conversation.triggerPercent,
-            modelEntry.modelConfig.maxInputTokens,
-          );
+
+          // Reuse a previously-persisted compaction when it still applies to this
+          // branch, instead of re-summarizing the same prefix every turn. The
+          // stored record's compactedMessageIds must be an ordered prefix of the
+          // current branch (a fork/rewind/variant/edit changes the leading ids and
+          // fails this check → we recompute). Fail-safe: any mismatch or over-window
+          // reuse falls through to the normal shouldCompact/recompute path; we never
+          // drop a message. Substitution stays LOCAL to this turn's `messages`.
+          const storedCompaction = readConversation(appHome, conversationId)?.conversationCompaction as
+            | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[] }
+            | null
+            | undefined;
+          let reusedCompaction = false;
+          if (
+            storedCompaction &&
+            typeof storedCompaction.compactionId === 'string' &&
+            typeof storedCompaction.summaryText === 'string' &&
+            Array.isArray(storedCompaction.compactedMessageIds) &&
+            storedCompaction.compactedMessageIds.length > 0
+          ) {
+            // The summary covers the first N branch messages (N = stored id
+            // count). Reuse is only safe if EACH of those N messages carries a
+            // real (non-empty string) id we can match against the stored ids — an
+            // id-less covered message can't be verified and must not be silently
+            // folded into the summary (that would drop it). Restrict matching to
+            // the covered span so no sentinel/collision reasoning is needed.
+            const coveredCount = storedCompaction.compactedMessageIds.length;
+            const coveredBranchIds = chatMessages
+              .slice(0, coveredCount)
+              .map((m) => (typeof m.id === 'string' && m.id.length > 0 ? m.id : null));
+            const coveredAllIded =
+              coveredBranchIds.length === coveredCount && coveredBranchIds.every((id) => id !== null);
+            if (coveredAllIded && isStrictPrefix(storedCompaction.compactedMessageIds, coveredBranchIds as string[])) {
+              const summaryMsg = {
+                id: `compaction-summary-${storedCompaction.compactionId}`,
+                role: 'assistant' as const,
+                content: storedCompaction.summaryText,
+              };
+              const candidate = [summaryMsg, ...chatMessages.slice(coveredCount)];
+              // Only adopt the reuse if the candidate still fits under the trigger;
+              // if the branch has grown enough to need a NEW compaction, fall through
+              // to recompute (which will overwrite the record + emit a new event).
+              const reuseCheck = shouldCompact(
+                candidate as Parameters<typeof shouldCompact>[0],
+                modelEntry.modelConfig.modelName,
+                config.compaction.conversation.triggerPercent,
+                modelEntry.modelConfig.maxInputTokens,
+              );
+              if (!reuseCheck.shouldCompact) {
+                messages = candidate as typeof messages;
+                reusedCompaction = true;
+              }
+            }
+          }
+
+          const check = reusedCompaction
+            ? { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 }
+            : shouldCompact(
+                chatMessages as Parameters<typeof shouldCompact>[0],
+                modelEntry.modelConfig.modelName,
+                config.compaction.conversation.triggerPercent,
+                modelEntry.modelConfig.maxInputTokens,
+              );
 
           if (check.shouldCompact) {
             emit({

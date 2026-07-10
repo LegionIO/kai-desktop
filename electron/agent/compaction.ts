@@ -88,6 +88,21 @@ export type CompactionResult = {
   compactedMessageIds: string[];
 };
 
+/**
+ * True if `ids` is an ordered prefix of `branchIds` (same values, same order,
+ * starting at index 0). Used to decide whether a stored compaction record still
+ * applies to the current active branch: after a fork/rewind/variant/edit the
+ * leading message ids change, the prefix check fails, and the caller recomputes
+ * instead of reusing a stale summary. Fail-safe: any mismatch ⇒ false ⇒ recompute.
+ */
+export function isStrictPrefix(ids: readonly string[], branchIds: readonly string[]): boolean {
+  if (ids.length === 0 || ids.length > branchIds.length) return false;
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i] !== branchIds[i]) return false;
+  }
+  return true;
+}
+
 export async function compactConversationPrefix(
   messages: ChatMessage[],
   modelConfig: LLMModelConfig,
@@ -184,6 +199,21 @@ export async function compactConversationPrefix(
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
+  // Enforce outputMaxTokens on the generated summary. The prompt budget reserves
+  // outputMaxTokens for the summary but nothing constrained the model's actual
+  // output, so a runaway summary could push the compacted request back over the
+  // context window. Bound it with the same head/tail truncator used for tool
+  // results (a summary is prose, so headRatio favors the front where the durable
+  // constraints/decisions live).
+  if (config.outputMaxTokens > 0) {
+    summaryText = truncateToTokenBudget(
+      summaryText,
+      config.outputMaxTokens,
+      { minChars: 200, headRatio: 0.7, minTailChars: 200 },
+      modelConfig.modelName,
+    );
+  }
+
   const compactionId = randomUUID();
   const summaryMessage: ChatMessage = {
     id: `compaction-summary-${compactionId}`,
@@ -195,10 +225,35 @@ export async function compactConversationPrefix(
   // represented in it. Messages shifted out to fit the budget are NOT summarized,
   // so don't report them as compacted — mislabeling them as preserved hides
   // real context loss from callers/telemetry.
-  const compactedMessageIds = fittedPrefix.map((m) => m.id).filter((id): id is string => typeof id === 'string');
+  //
+  // For REUSE, compactedMessageIds.length is used as the count of prefix messages
+  // the summary replaces (messages.slice(length)). That's only correct if EVERY
+  // fittedPrefix message has a stable id — otherwise a filtered-out id-less message
+  // would make the count too short and a later reuse would reintroduce an
+  // already-summarized message. So require a complete 1:1 id mapping; if any
+  // prefix message lacks an id, emit an EMPTY compactedMessageIds (the record is
+  // then non-reusable — isStrictPrefix([]) is false — and the turn still gets the
+  // in-memory compaction, just no persisted reuse).
+  const fittedPrefixIds = fittedPrefix
+    .map((m) => m.id)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  const compactedMessageIds = fittedPrefixIds.length === fittedPrefix.length ? fittedPrefixIds : [];
+
+  const compactedMessages: ChatMessage[] = [summaryMessage, ...suffix];
+
+  // Final safety: verify the compacted request actually fits the input budget.
+  // Even a bounded summary plus the suffix could exceed promptInputBudget if the
+  // suffix is large; shipping an over-budget request would defeat the point (and
+  // risk a provider hard-limit error). If it still doesn't fit, return the null
+  // no-op — the turn proceeds on the full (uncompacted) context, preserving the
+  // "null ⇒ no message loss" contract.
+  const compactedTokens = tokenization.encoding.encode(serializeForTokenCounting(compactedMessages)).length;
+  if (compactedTokens > promptInputBudget) {
+    return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+  }
 
   return {
-    compactedMessages: [summaryMessage, ...suffix],
+    compactedMessages,
     summaryText,
     compactionId,
     compactedMessageIds,

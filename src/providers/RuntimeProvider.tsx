@@ -107,7 +107,7 @@ export type ConversationRecord = {
   messageTree?: StoredMessage[];
   /** ID of the current head message in the tree */
   headId?: string | null;
-  conversationCompaction: unknown | null;
+  conversationCompaction: ConversationCompaction;
   lastContextUsage: unknown | null;
   createdAt: string;
   updatedAt: string;
@@ -168,7 +168,19 @@ type MessageAccumulator = {
   deferredApprovals?: Map<string, { toolCallId: string; args?: unknown }>;
   /** True while a tool is awaiting user approval — suppresses the running indicator */
   awaitingApproval?: boolean;
+  /** Compaction record captured from the `compaction` stream event this turn.
+   *  The event precedes the assistant reply, so we stash it here and fold it into
+   *  the terminal (done/error/awaiting) persist rather than writing mid-turn. */
+  pendingCompaction?: ConversationCompaction;
 };
+
+type ConversationCompaction = {
+  compactionId: string;
+  summaryText: string;
+  compactedMessageIds: string[];
+  boundaryHeadId: string | null;
+  createdAt: string;
+} | null;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -2195,6 +2207,32 @@ export function RuntimeProvider({
             });
           })();
         }
+      } else if (e.type === 'compaction') {
+        // A conversation compaction happened this turn (main summarized a prefix
+        // to fit the context window). The event precedes the assistant reply, so
+        // stash the record and fold it into the terminal persist — a mid-turn
+        // write would race the done path.
+        const cd = e.data as
+          | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[] }
+          | undefined;
+        if (
+          cd &&
+          typeof cd.compactionId === 'string' &&
+          typeof cd.summaryText === 'string' &&
+          Array.isArray(cd.compactedMessageIds) &&
+          cd.compactedMessageIds.every((id) => typeof id === 'string' && id.length > 0)
+        ) {
+          acc.pendingCompaction = {
+            compactionId: cd.compactionId,
+            summaryText: cd.summaryText,
+            // Store verbatim — main already guarantees a complete id mapping (or an
+            // empty array for a non-reusable record). Re-filtering here could
+            // shorten the array and desync it from the count main used for reuse.
+            compactedMessageIds: cd.compactedMessageIds,
+            boundaryHeadId: acc.headId,
+            createdAt: nowIso(),
+          };
+        }
       } else if (e.type === 'context-usage') {
         const usageData = normalizeTokenUsage(e.data);
         if (usageData) applyTokenUsage(acc, usageData);
@@ -2329,6 +2367,7 @@ export function RuntimeProvider({
           runStatus: 'idle',
           lastAssistantUpdateAt: nowIso(),
           hasUnread: !isActiveConv,
+          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
         });
         if (isActiveConv) {
           setIsRunning(false);
@@ -2374,6 +2413,7 @@ export function RuntimeProvider({
           runStatus: 'idle',
           lastAssistantUpdateAt: nowIso(),
           hasUnread: !isActiveConv,
+          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
         });
         if (isActiveConv) {
           setIsRunning(false);
@@ -2432,6 +2472,7 @@ export function RuntimeProvider({
           persistConversation(convId, acc.messages, acc.headId, {
             runStatus: 'awaiting-approval',
             hasUnread: true,
+            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
           });
           return;
         }
@@ -2456,6 +2497,7 @@ export function RuntimeProvider({
           runStatus: 'idle',
           lastAssistantUpdateAt: nowIso(),
           hasUnread: !isActiveConv,
+          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
         });
         if (isActiveConv) {
           setTree([...acc.messages]);

@@ -73,6 +73,23 @@ describe('per-file read/write', () => {
     expect('messageTree' in index.conversations.c1).toBe(false);
   });
 
+  it('round-trips a conversationCompaction record (persist → read deep-equal)', () => {
+    const compaction = {
+      compactionId: 'comp-1',
+      summaryText: 'summary of the first N messages',
+      compactedMessageIds: ['m1', 'm2', 'm3'],
+      boundaryHeadId: 'm5',
+      createdAt: '2026-07-10T00:00:00.000Z',
+    };
+    writeConversation(appHome, makeConv('cc1', { conversationCompaction: compaction }));
+    expect(readConversation(appHome, 'cc1')?.conversationCompaction).toEqual(compaction);
+  });
+
+  it('defaults conversationCompaction to null when unset', () => {
+    writeConversation(appHome, makeConv('cc2'));
+    expect(readConversation(appHome, 'cc2')?.conversationCompaction).toBeNull();
+  });
+
   it('derives hasToolCalls into the index entry', () => {
     const withTool = makeConv('c2', {
       messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1' }] }],

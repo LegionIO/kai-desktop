@@ -13,6 +13,21 @@ import { join } from 'path';
 // set-selection touch a single small file.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Persisted conversation-compaction record (single "latest valid"). Documents
+ * that the messages whose ids are in `compactedMessageIds` were summarized into
+ * `summaryText`. Non-destructive: the full messageTree is never mutated, so this
+ * is metadata a later turn reuses when the ids still form a prefix of the active
+ * branch (see agent.ts + compaction.ts isStrictPrefix).
+ */
+export type ConversationCompaction = {
+  compactionId: string;
+  summaryText: string;
+  compactedMessageIds: string[];
+  boundaryHeadId: string | null;
+  createdAt: string;
+} | null;
+
 /** Full persisted conversation, including heavy message data. */
 export type ConversationRecord = {
   id: string;
@@ -21,7 +36,7 @@ export type ConversationRecord = {
   messages: unknown[];
   messageTree?: unknown[];
   headId?: string | null;
-  conversationCompaction: unknown | null;
+  conversationCompaction: ConversationCompaction;
   lastContextUsage: unknown | null;
   createdAt: string;
   updatedAt: string;
