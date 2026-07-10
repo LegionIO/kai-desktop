@@ -680,7 +680,14 @@ function readAppLlmConfig(): AppLlmFile {
 
 function writeAppLlmConfig(config: AppLlmFile): void {
   const p = getAppLlmConfigPath();
-  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  const dir = dirname(p);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdir mode is create-only; tighten a pre-existing dir too (best-effort).
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort on platforms without POSIX perms */
+  }
   // Secret-bearing (provider API keys) — restrict to the owner. writeFileSync's
   // mode only applies on create, so chmod after to also tighten a pre-existing
   // file that was written with looser perms before this hardening.
@@ -1097,7 +1104,15 @@ function normalizeResponsesApiConfig(config: AppConfig): AppConfig {
 
 export function writeDesktopConfig(appHome: string, config: AppConfig): void {
   const configPath = getDesktopSettingsPath(appHome);
-  mkdirSync(join(appHome, 'settings'), { recursive: true, mode: 0o700 });
+  const settingsDir = join(appHome, 'settings');
+  mkdirSync(settingsDir, { recursive: true, mode: 0o700 });
+  // mkdir mode is create-only and ensureAppHome() may have made this dir with
+  // default perms — tighten it too (best-effort).
+  try {
+    chmodSync(settingsDir, 0o700);
+  } catch {
+    /* best-effort on platforms without POSIX perms */
+  }
   // Secret-bearing (MCP env vars, web password, media/realtime keys) — owner-only.
   // chmod after write since mode only applies when the file is first created.
   writeFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), {

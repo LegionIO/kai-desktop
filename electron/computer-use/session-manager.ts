@@ -903,24 +903,37 @@ export class ComputerUseSessionManager extends EventEmitter {
   async approveAction(sessionId: string, actionId: string): Promise<ComputerSession | null> {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
-    this.suppressTakeoverMonitor();
-    const next: ComputerSession = {
-      ...session,
-      approvals: session.approvals.map((approval) =>
-        approval.actionId === actionId ? { ...approval, status: 'approved' as const } : approval,
-      ),
-      actions: session.actions.map((action) =>
-        action.id === actionId ? { ...action, status: 'approved' as const } : action,
-      ),
-      status: 'running',
-      humanInControl: false,
-      pauseReason: undefined,
-      statusMessage: undefined,
-      updatedAt: nowIso(),
+
+    const approve = async (): Promise<ComputerSession | null> => {
+      // Re-read inside the lock — the session may have changed while queued.
+      const current = this.sessions.get(sessionId);
+      if (!current) return null;
+      // Approving resumes the session to 'running'; don't do that for
+      // local-macos while another local session is active.
+      if (current.target === 'local-macos') {
+        this.assertNoActiveLocalMacos(current.id);
+      }
+      this.suppressTakeoverMonitor();
+      const next: ComputerSession = {
+        ...current,
+        approvals: current.approvals.map((approval) =>
+          approval.actionId === actionId ? { ...approval, status: 'approved' as const } : approval,
+        ),
+        actions: current.actions.map((action) =>
+          action.id === actionId ? { ...action, status: 'approved' as const } : action,
+        ),
+        status: 'running',
+        humanInControl: false,
+        pauseReason: undefined,
+        statusMessage: undefined,
+        updatedAt: nowIso(),
+      };
+      this.upsertSession(next);
+      await this.orchestrator.executeApprovedAction(sessionId, actionId);
+      return this.sessions.get(sessionId) ?? null;
     };
-    this.upsertSession(next);
-    await this.orchestrator.executeApprovedAction(sessionId, actionId);
-    return this.sessions.get(sessionId) ?? null;
+
+    return session.target === 'local-macos' ? this.runExclusiveLocalMacos(approve) : approve();
   }
 
   rejectAction(sessionId: string, actionId: string, reason?: string): ComputerSession | null {

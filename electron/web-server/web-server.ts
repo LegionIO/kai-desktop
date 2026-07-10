@@ -777,16 +777,19 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
       // Re-check containment on the canonical path so a symlink inside
       // MEDIA_DIR cannot escape the directory (lexical check above only
-      // guards the request path, not the on-disk link target).
+      // guards the request path, not the on-disk link target). Resolve
+      // MEDIA_DIR too, so a legitimately symlinked media root still matches.
       let realMediaPath: string;
+      let realMediaRoot: string;
       try {
         realMediaPath = realpathSync(filePath);
+        realMediaRoot = realpathSync(MEDIA_DIR);
       } catch {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
         return;
       }
-      if (!realMediaPath.startsWith(MEDIA_DIR + sep) && realMediaPath !== MEDIA_DIR) {
+      if (!realMediaPath.startsWith(realMediaRoot + sep) && realMediaPath !== realMediaRoot) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
         return;
