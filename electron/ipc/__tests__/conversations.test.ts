@@ -338,6 +338,64 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(stored.headId).toBe('b');
     expect(stored.messageTree).toHaveLength(2);
   });
+
+  it('conversations:put does not let a stale running write clobber final content with an older partial', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    // On-disk: stream finished — assistant 'a' has FINAL content, runStatus idle,
+    // with a recent lastAssistantUpdateAt.
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: '2026-01-02T00:00:02.000Z' },
+          { id: 'a', parentId: 'u', role: 'assistant', content: 'FINAL', createdAt: '2026-01-02T00:00:03.000Z' },
+        ],
+        headId: 'a',
+        messageCount: 2,
+        userMessageCount: 1,
+        runStatus: 'idle',
+        lastMessageAt: '2026-01-02T00:00:03.000Z',
+        lastAssistantUpdateAt: '2026-01-02T00:00:03.000Z',
+        updatedAt: '2026-01-02T00:00:03.000Z',
+      }),
+    );
+
+    // A stale debounced write races in: SAME node ids (nothing "missing", so the
+    // id-union merge is a no-op), but assistant 'a' still carries the older
+    // PARTIAL content, runStatus:'running', and older timestamps.
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('c', {
+        messageTree: [
+          { id: 'u', parentId: null, role: 'user', content: 'q', createdAt: '2026-01-02T00:00:02.000Z' },
+          { id: 'a', parentId: 'u', role: 'assistant', content: 'partial', createdAt: '2026-01-02T00:00:02.500Z' },
+        ],
+        headId: 'a',
+        messageCount: 2,
+        userMessageCount: 1,
+        runStatus: 'running',
+        lastMessageAt: '2026-01-02T00:00:02.500Z',
+        lastAssistantUpdateAt: '2026-01-02T00:00:02.500Z',
+        updatedAt: '2026-01-02T00:00:02.500Z',
+      }),
+    );
+
+    const stored = readConversationStore(appHome).conversations.c as {
+      runStatus: string;
+      messageTree: Array<{ id: string; content: unknown }>;
+    };
+    // The final content must survive — the stale running write must NOT replace
+    // it with the older partial, and runStatus must stay idle.
+    expect(stored.messageTree.find((m) => m.id === 'a')?.content).toBe('FINAL');
+    expect(stored.runStatus).toBe('idle');
+  });
 });
 
 describe('conversations IPC: error paths', () => {

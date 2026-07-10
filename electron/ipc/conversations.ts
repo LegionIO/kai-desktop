@@ -207,6 +207,27 @@ function latestTimestamp(...values: Array<string | null | undefined>): string | 
   return latestValue;
 }
 
+/** Derive lastMessageAt / lastAssistantUpdateAt purely from a committed branch.
+ *  Used by tree mutations (edit / regenerate / rewind / switch-variant / fork)
+ *  so the activity timestamps reflect the ACTIVE branch, not stale values
+ *  inherited from a source conversation or a pre-edit head. */
+function deriveBranchActivity(branch: ConversationMessageLike[]): {
+  lastMessageAt: string | null;
+  lastAssistantUpdateAt: string | null;
+} {
+  let lastMessageAt: string | null = null;
+  let lastAssistantUpdateAt: string | null = null;
+  for (const message of branch) {
+    const createdAt = toIsoTimestamp(message.createdAt);
+    if (!createdAt) continue;
+    lastMessageAt = latestTimestamp(lastMessageAt, createdAt);
+    if (message.role === 'assistant') {
+      lastAssistantUpdateAt = latestTimestamp(lastAssistantUpdateAt, createdAt);
+    }
+  }
+  return { lastMessageAt, lastAssistantUpdateAt };
+}
+
 export function reconcileConversationActivity(
   prev: ConversationRecord | undefined,
   next: ConversationRecord,
@@ -278,8 +299,19 @@ export function isStaleRunningWrite(prev: ConversationRecord, next: Conversation
 export function preserveTerminalRunFields(prev: ConversationRecord, next: ConversationRecord): ConversationRecord {
   if (!isStaleRunningWrite(prev, next)) return next;
 
+  // A write detected as stale-running must not be allowed to mutate the message
+  // tree at all: it may carry the SAME node ids as disk but with older partial
+  // content (e.g. an assistant node captured mid-stream), which the id-union
+  // merge above does NOT catch (nothing is "missing"), so the final assistant
+  // body would be replaced by the stale partial. Restore the stored tree/branch/
+  // head/counts and keep only the benign non-tree metadata from `next`.
   return {
     ...next,
+    messageTree: prev.messageTree,
+    messages: prev.messages,
+    headId: prev.headId,
+    messageCount: prev.messageCount,
+    userMessageCount: prev.userMessageCount,
     runStatus: prev.runStatus,
     hasUnread: prev.hasUnread,
     lastAssistantUpdateAt: prev.lastAssistantUpdateAt,
@@ -436,6 +468,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   ): ConversationRecord => {
     const branch = getConversationBranch(tree, headId);
     const now = new Date().toISOString();
+    const activity = deriveBranchActivity(branch as ConversationMessageLike[]);
     const next: ConversationRecord = {
       ...conv,
       messageTree: tree,
@@ -444,6 +477,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       updatedAt: now,
       messageCount: branch.length,
       userMessageCount: branch.filter((m) => m.role === 'user').length,
+      lastMessageAt: activity.lastMessageAt,
+      lastAssistantUpdateAt: activity.lastAssistantUpdateAt,
       ...extra,
     };
     writeConversation(appHome, next);
@@ -605,6 +640,10 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       sliced.length > 0 ? ((sliced[sliced.length - 1] as { id?: unknown }).id as string | undefined) : undefined;
 
     const baseTitle = clone.title ?? clone.fallbackTitle ?? 'Chat';
+    // Derive activity timestamps from the SLICED branch, not the source — when
+    // upToMessageIndex drops the tail, the source's lastMessageAt /
+    // lastAssistantUpdateAt may point at messages not present in the fork.
+    const forkActivity = deriveBranchActivity(sliced as ConversationMessageLike[]);
     const forked: ConversationRecord = {
       ...clone,
       id: randomUUID(),
@@ -614,6 +653,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       headId: lastId ?? null,
       messageCount: sliced.length,
       userMessageCount: sliced.filter((m) => (m as { role?: unknown }).role === 'user').length,
+      lastMessageAt: forkActivity.lastMessageAt,
+      lastAssistantUpdateAt: forkActivity.lastAssistantUpdateAt,
       // Drop compaction state when forking a partial prefix — the summary may
       // reference messages past the cut point.
       conversationCompaction: sliced.length === allMessages.length ? clone.conversationCompaction : null,
