@@ -12,7 +12,7 @@ const PROVIDER_META_KEYS = ['providerMetadata', 'providerOptions', 'experimental
 function stripProviderMeta(part: PartLike): PartLike {
   let needsClone = false;
   for (const key of PROVIDER_META_KEYS) {
-    if (part[key] != null) {
+    if (Object.hasOwn(part, key)) {
       needsClone = true;
       break;
     }
@@ -38,6 +38,24 @@ function sanitizeContentParts(content: unknown): unknown {
   return changed ? result : content;
 }
 
+/** True if the message carries provider metadata at the MESSAGE level (not just
+ *  inside content parts). These fields survive a model switch and can carry a
+ *  provider-specific shape the next provider rejects. */
+function hasMessageLevelProviderMeta(msg: MessageLike): boolean {
+  return PROVIDER_META_KEYS.some((k) => Object.hasOwn(msg, k));
+}
+
+/** Strip content-part metadata AND message-level provider metadata. Returns the
+ *  same object reference when nothing changed (so callers can detect no-ops). */
+function sanitizeMessage(msg: MessageLike): MessageLike {
+  const cleanedContent = sanitizeContentParts(msg.content);
+  const msgLevel = hasMessageLevelProviderMeta(msg);
+  if (cleanedContent === msg.content && !msgLevel) return msg;
+  const next: MessageLike = { ...msg, content: cleanedContent };
+  for (const k of PROVIDER_META_KEYS) delete (next as Record<string, unknown>)[k];
+  return next;
+}
+
 /**
  * Model-scoped sanitization: strip provider-specific metadata from assistant
  * messages that were produced by a different model than the current target.
@@ -55,11 +73,11 @@ export function sanitizeMessagesForModel(messages: unknown[], targetModelId: str
     const sourceModel = msg.messageMeta?.sourceModel as string | undefined;
     if (sourceModel === targetModelId) return rawMsg;
 
-    const cleaned = sanitizeContentParts(msg.content);
-    if (cleaned === msg.content) return rawMsg;
+    const cleaned = sanitizeMessage(msg);
+    if (cleaned === msg) return rawMsg;
 
     changed = true;
-    return { ...msg, content: cleaned };
+    return cleaned;
   });
 
   return changed ? result : messages;
@@ -97,11 +115,11 @@ export function deepSanitizeMessages(messages: unknown[]): unknown[] {
   let changed = false;
   const result = messages.map((rawMsg) => {
     const msg = rawMsg as MessageLike;
-    const cleaned = sanitizeContentParts(msg.content);
-    if (cleaned === msg.content) return rawMsg;
+    const cleaned = sanitizeMessage(msg);
+    if (cleaned === msg) return rawMsg;
 
     changed = true;
-    return { ...msg, content: cleaned };
+    return cleaned;
   });
 
   return changed ? result : messages;

@@ -42,14 +42,20 @@ export function classifyError(error: unknown): RetryableErrorInfo {
     return { statusCode, retryAfterMs, isTransient: false, category: 'auth', message };
   }
 
-  // Client errors (4xx except rate limits) — not transient
-  if (statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 429) {
-    return { statusCode, retryAfterMs, isTransient: false, category: 'client-error', message };
-  }
-
-  // Rate limit (429)
+  // Rate limit (429) — transient. Checked before the generic 4xx branch.
   if (statusCode === 429) {
     return { statusCode, retryAfterMs, isTransient: true, category: 'rate-limit', message };
+  }
+
+  // Timeout (408) — transient. Checked before the generic 4xx branch (a 408 is a
+  // request timeout the server invites you to retry, not a permanent client error).
+  if (statusCode === 408) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'timeout', message };
+  }
+
+  // Client errors (4xx except the retryable 408/429 handled above) — not transient
+  if (statusCode !== undefined && statusCode >= 400 && statusCode < 500) {
+    return { statusCode, retryAfterMs, isTransient: false, category: 'client-error', message };
   }
 
   // Overload (529 — Anthropic-specific)
@@ -62,17 +68,16 @@ export function classifyError(error: unknown): RetryableErrorInfo {
     return { statusCode, retryAfterMs, isTransient: true, category: 'server-error', message };
   }
 
-  // Timeout (408)
-  if (statusCode === 408) {
-    return { statusCode, retryAfterMs, isTransient: true, category: 'timeout', message };
-  }
-
-  // Network errors (no status code, but connection-related keywords)
+  // Network / statusless-timeout errors (no status code, connection-related or
+  // timeout keywords). Bedrock/other SDKs sometimes surface a timeout as a bare
+  // "Request timed out" with no status — treat those as transient too.
   const lowerMessage = message.toLowerCase();
   if (
     lowerMessage.includes('econnreset') ||
     lowerMessage.includes('econnrefused') ||
     lowerMessage.includes('etimedout') ||
+    lowerMessage.includes('timed out') ||
+    lowerMessage.includes('timeout') ||
     lowerMessage.includes('epipe') ||
     lowerMessage.includes('socket hang up') ||
     lowerMessage.includes('network') ||
@@ -119,17 +124,25 @@ export function calculateDelay(
  * Only retries on transient errors (rate limits, server errors, network issues).
  * Non-transient errors (auth, client errors) are thrown immediately.
  */
-export async function withRetry<T>(
-  fn: () => Promise<T>,
-  options?: RetryOptions,
-): Promise<T> {
-  const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
-  const baseDelayMs = options?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
-  const maxDelayMs = options?.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+export async function withRetry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T> {
+  const maxRetriesRaw = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const baseDelayRaw = options?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const maxDelayRaw = options?.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+  // Guard against NaN / negative option values: a NaN maxRetries would make the
+  // loop never run (and throw undefined); a NaN delay would produce a broken timer.
+  const maxRetries =
+    Number.isFinite(maxRetriesRaw) && maxRetriesRaw >= 0 ? Math.floor(maxRetriesRaw) : DEFAULT_MAX_RETRIES;
+  const baseDelayMs = Number.isFinite(baseDelayRaw) && baseDelayRaw >= 0 ? baseDelayRaw : DEFAULT_BASE_DELAY_MS;
+  const maxDelayMs = Number.isFinite(maxDelayRaw) && maxDelayRaw >= 0 ? maxDelayRaw : DEFAULT_MAX_DELAY_MS;
 
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Abort BEFORE each attempt: if abort fired during the previous sleep (or
+    // between the timer resolving and here), don't fire another fn() call.
+    if (options?.abortSignal?.aborted) {
+      throw lastError ?? new Error('Aborted');
+    }
     try {
       return await fn();
     } catch (error) {
@@ -201,9 +214,17 @@ function extractRetryAfterMs(error: unknown): number | undefined {
   if (!error || typeof error !== 'object') return undefined;
   const e = error as Record<string, unknown>;
 
-  // Check headers for Retry-After
-  const headers = (e.headers ?? e.responseHeaders) as Record<string, string | undefined> | undefined;
-  const retryAfter = headers?.['retry-after'] ?? headers?.['Retry-After'];
+  // Headers may be a plain object OR a Fetch `Headers` instance (which the AI
+  // SDK / undici expose). Read via .get() when available, else index the object.
+  const rawHeaders = (e.headers ?? e.responseHeaders) as unknown;
+  let retryAfter: string | undefined;
+  if (rawHeaders && typeof (rawHeaders as { get?: unknown }).get === 'function') {
+    const h = rawHeaders as { get: (name: string) => string | null };
+    retryAfter = h.get('retry-after') ?? undefined;
+  } else if (rawHeaders && typeof rawHeaders === 'object') {
+    const h = rawHeaders as Record<string, string | undefined>;
+    retryAfter = h['retry-after'] ?? h['Retry-After'];
+  }
 
   if (!retryAfter) return undefined;
 
@@ -229,9 +250,13 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
       return;
     }
 
-    const timer = setTimeout(resolve, ms);
+    let onAbort: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
 
-    const onAbort = (): void => {
+    onAbort = (): void => {
       clearTimeout(timer);
       reject(new Error('Aborted'));
     };

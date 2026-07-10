@@ -110,19 +110,29 @@ export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: stri
         }
 
         if (part.type === 'tool-call') {
+          // A tool-call MUST have a string toolCallId + toolName, or the emitted
+          // assistant tool-call / tool-result pair is ambiguous and the provider
+          // rejects it (400). Skip a malformed part rather than emit `undefined`
+          // ids — dropping the pair entirely keeps the request well-formed.
+          const toolCallId = typeof part.toolCallId === 'string' ? part.toolCallId : null;
+          const toolName = typeof part.toolName === 'string' ? part.toolName : null;
+          if (!toolCallId || !toolName) {
+            continue;
+          }
+
           // Emit clean tool-call in the assistant message
           assistantParts.push({
             type: 'tool-call',
-            toolCallId: part.toolCallId as string,
-            toolName: part.toolName as string,
+            toolCallId,
+            toolName,
             args: part.args ?? {},
           });
 
           // Collect matching tool-result for the follow-up tool message
           toolResults.push({
             type: 'tool-result',
-            toolCallId: part.toolCallId as string,
-            toolName: part.toolName as string,
+            toolCallId,
+            toolName,
             result: part.result !== undefined ? part.result : 'Tool execution did not complete.',
           });
           continue;
