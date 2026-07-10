@@ -5,11 +5,15 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { z as Z } from 'zod';
-import type { ToolDefinition } from './types.js';
+import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { buildScopedToolName } from './naming.js';
 import type { AppConfig } from '../config/schema.js';
 
 type McpServerConfig = AppConfig['mcpServers'][number];
+
+/** Cap on a single MCP tool call so a hung server can't keep the agent turn
+ *  alive forever. The timer resets on progress notifications. */
+const MCP_CALL_TIMEOUT_MS = 120_000;
 
 type McpConnection = {
   name: string;
@@ -72,7 +76,7 @@ async function createTransport(server: McpServerConfig): Promise<Transport> {
     return new StdioClientTransport({
       command: server.command,
       args: server.args,
-      env: server.env ? { ...process.env, ...server.env } as Record<string, string> : undefined,
+      env: server.env ? ({ ...process.env, ...server.env } as Record<string, string>) : undefined,
     });
   }
 
@@ -109,8 +113,14 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       sourceId: server.name,
       originalName: t.name,
       aliases: [`${server.name}:${t.name}`],
-      execute: async (input: unknown) => {
-        const result = await client.callTool({ name: t.name, arguments: input as Record<string, unknown> });
+      execute: async (input: unknown, context?: ToolExecutionContext) => {
+        // Propagate chat/user cancellation and cap the call so a hung MCP server
+        // can't keep the tool promise (and the agent turn) alive forever.
+        const result = await client.callTool({ name: t.name, arguments: input as Record<string, unknown> }, undefined, {
+          ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
+          timeout: MCP_CALL_TIMEOUT_MS,
+          resetTimeoutOnProgress: true,
+        });
         if (result.isError) throw new Error(JSON.stringify(result.content));
         // Extract text from content array
         const content = result.content as Array<{ type: string; text?: string }>;
@@ -160,7 +170,11 @@ export async function connectAllMcpServers(config: AppConfig): Promise<ToolDefin
 export async function disconnectMcpServer(name: string): Promise<void> {
   const conn = connections.get(name);
   if (conn?.client) {
-    try { await conn.client.close(); } catch { /* ignore */ }
+    try {
+      await conn.client.close();
+    } catch {
+      /* ignore */
+    }
   }
   connections.delete(name);
 }
@@ -168,7 +182,11 @@ export async function disconnectMcpServer(name: string): Promise<void> {
 /** Fingerprint a server config for change detection */
 function serverFingerprint(s: McpServerConfig): string {
   return JSON.stringify({
-    url: s.url, command: s.command, args: s.args, env: s.env, enabled: s.enabled,
+    url: s.url,
+    command: s.command,
+    args: s.args,
+    env: s.env,
+    enabled: s.enabled,
   });
 }
 
