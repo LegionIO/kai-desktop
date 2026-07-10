@@ -40,7 +40,7 @@ module.exports = async function afterPack(context) {
   if (context.electronPlatformName === 'linux') {
     const { chmodSync } = require('node:fs');
     const resourcesBin = join(context.appOutDir, 'resources', 'bin');
-    for (const helper of ['LocalLinuxHelper.sh', 'atspi_helper.py']) {
+    for (const helper of ['LocalLinuxHelper.sh', 'atspi_helper.py', 'kai']) {
       const p = join(resourcesBin, helper);
       if (existsSync(p)) chmodSync(p, 0o755);
     }
@@ -52,6 +52,15 @@ module.exports = async function afterPack(context) {
   const appPath = join(context.appOutDir, appName);
   const appInfoPlist = join(appPath, 'Contents', 'Info.plist');
   if (!existsSync(appInfoPlist)) return;
+
+  // The shipped `kai` launcher shim must stay executable so a legacy symlink
+  // install (or a user running it directly) works; extraResources copy does not
+  // reliably preserve the repo's exec bit.
+  {
+    const { chmodSync } = require('node:fs');
+    const shim = join(appPath, 'Contents', 'Resources', 'bin', 'kai');
+    if (existsSync(shim)) chmodSync(shim, 0o755);
+  }
 
   const localNetworkUsageDescription = plistBuddy(
     appInfoPlist,
