@@ -16,6 +16,7 @@ import {
   readSync,
   closeSync,
   constants,
+  chmodSync,
 } from 'fs';
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -69,6 +70,10 @@ const MAX_LOGIN_BODY_BYTES = 64 * 1024;
 /** One-time login-token lifetime (QR codes): 5 minutes. */
 const LOGIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 
+/** Cap on a single inbound WebSocket message. Each frame is UTF-8 decoded +
+ *  JSON.parsed on the main process; an unbounded frame is a DoS vector. */
+const MAX_WS_MESSAGE_BYTES = 4 * 1024 * 1024; // 4 MiB
+
 /* ── File-backed session store ─────────────────────────────────────── */
 
 const SESSIONS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'data');
@@ -94,6 +99,13 @@ function saveSessions(store: SessionStore): void {
       encoding: 'utf-8',
       mode: 0o600,
     });
+    // writeFileSync's mode only applies on create; tighten a pre-existing file
+    // that an older build may have written with looser perms (session tokens).
+    try {
+      chmodSync(SESSIONS_PATH, 0o600);
+    } catch {
+      /* best-effort */
+    }
   } catch {
     // Non-fatal — sessions degrade to in-memory-only.
   }
@@ -151,6 +163,13 @@ function isRateLimited(ip: string): boolean {
 
 function recordFailedLogin(ip: string): void {
   const now = Date.now();
+  // Prune expired entries so the map can't grow unbounded across many distinct
+  // source IPs (each failed login from a new IP would otherwise leak an entry).
+  if (loginAttempts.size > 256) {
+    for (const [k, v] of loginAttempts) {
+      if (now > v.resetAt) loginAttempts.delete(k);
+    }
+  }
   const entry = loginAttempts.get(ip);
   if (!entry || now > entry.resetAt) {
     loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_RATE_WINDOW_MS });
@@ -708,8 +727,17 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     // Token-based auto-login (for QR code scanning)
     if (urlPath === '/api/token-login') {
-      const fullUrl = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
-      const loginToken = fullUrl.searchParams.get('token');
+      // Parse against a FIXED base (not the client Host header, which can be
+      // malformed and make `new URL` throw on this auth-exempt route). We only
+      // need the query string, so the base host is irrelevant.
+      let loginToken: string | null = null;
+      try {
+        loginToken = new URL(req.url ?? '/', 'http://localhost').searchParams.get('token');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Bad request' }));
+        return;
+      }
       const loginTokenExpiry = loginToken ? loginTokens.get(loginToken) : undefined;
       if (loginToken && typeof loginTokenExpiry === 'number' && Date.now() <= loginTokenExpiry) {
         // Consume the token (one-time use)
@@ -895,26 +923,62 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         return;
       }
 
-      // Symlink defence: resolve the canonical path and re-check containment
-      // so a symlink inside the plugin dir cannot escape it. (statSync follows
-      // links, so the isFile() check above doesn't catch this.)
+      // Symlink defence: resolve the canonical path AND the plugin root, then
+      // re-check containment so a symlink inside the plugin dir (or a symlinked
+      // plugin root) cannot escape it. (statSync follows links, so isFile()
+      // above doesn't catch this.)
       let realPath: string;
+      let realPluginDir: string;
       try {
         realPath = realpathSync(filePath);
+        realPluginDir = realpathSync(pluginDir);
       } catch {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
         return;
       }
-      if (!realPath.startsWith(pluginDir + sep) && realPath !== pluginDir) {
+      if (!realPath.startsWith(realPluginDir + sep) && realPath !== realPluginDir) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
         return;
       }
 
+      // Read through a validated fd (O_NOFOLLOW) so a symlink swap after the
+      // realpath check can't redirect the read outside the plugin dir (mirrors
+      // the /media route).
       const ext = extname(realPath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      const data = readFileSync(realPath);
+      let data: Buffer;
+      let fd: number | null = null;
+      try {
+        fd = openSync(realPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const st = fstatSync(fd);
+        if (!st.isFile()) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found');
+          return;
+        }
+        data = Buffer.allocUnsafe(st.size);
+        let offset = 0;
+        while (offset < st.size) {
+          const bytesRead = readSync(fd, data, offset, st.size - offset, offset);
+          if (bytesRead <= 0) break;
+          offset += bytesRead;
+        }
+        if (offset !== st.size) data = data.subarray(0, offset);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      } finally {
+        if (fd !== null) {
+          try {
+            closeSync(fd);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       res.writeHead(200, {
         'Content-Type': contentType,
         'Content-Length': data.byteLength,
@@ -957,8 +1021,10 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     ? https.createServer({ cert: tlsOptions.cert, key: tlsOptions.key }, requestHandler)
     : http.createServer(requestHandler);
 
-  // WebSocket server
-  wss = new WebSocketServer({ noServer: true });
+  // WebSocket server. Cap frame size — every message is UTF-8 decoded and
+  // JSON.parsed on the main process, so an unbounded frame is a DoS vector
+  // (especially in anonymous mode). `ws` closes oversized frames with 1009.
+  wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_MESSAGE_BYTES });
 
   const handleUpgrade = (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
     const upgradePath = (req.url ?? '/').split('?')[0];

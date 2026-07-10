@@ -88,8 +88,11 @@ function generateSelfSignedCert(addresses: string[]): { cert: string; key: strin
   }
 
   cert.setExtensions([
-    { name: 'basicConstraints', cA: true },
-    { name: 'keyUsage', keyCertSign: true, digitalSignature: true, keyEncipherment: true },
+    // Server leaf, NOT a CA — if a user trusts this cert as a root and the key
+    // later leaks, a CA cert could sign other certs. A TLS server needs neither
+    // cA nor keyCertSign.
+    { name: 'basicConstraints', cA: false },
+    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
     { name: 'extKeyUsage', serverAuth: true },
     { name: 'subjectAltName', altNames },
   ]);
@@ -110,13 +113,21 @@ export function ensureSelfSignedCert(): { cert: string; key: string } {
   mkdirSync(CERT_DIR, { recursive: true, mode: 0o700 });
   // `mode` is only applied when mkdirSync actually creates the directory;
   // tighten perms on a pre-existing directory (e.g. upgraded installs).
-  try { chmodSync(CERT_DIR, 0o700); } catch { /* best-effort */ }
+  try {
+    chmodSync(CERT_DIR, 0o700);
+  } catch {
+    /* best-effort */
+  }
   const addresses = getLocalAddresses();
   const meta = readMeta();
 
   if (meta && isCertValid(meta, addresses)) {
     // Tighten perms on an existing key written before the 0o600 mode was added.
-    try { chmodSync(KEY_PATH, 0o600); } catch { /* best-effort */ }
+    try {
+      chmodSync(KEY_PATH, 0o600);
+    } catch {
+      /* best-effort */
+    }
     return {
       cert: readFileSync(CERT_PATH, 'utf-8'),
       key: readFileSync(KEY_PATH, 'utf-8'),
@@ -130,11 +141,19 @@ export function ensureSelfSignedCert(): { cert: string; key: string } {
   writeFileSync(CERT_PATH, cert, 'utf-8');
   writeFileSync(KEY_PATH, key, { encoding: 'utf-8', mode: 0o600 });
   // `mode` only applies on file creation; enforce 0o600 if the file already existed.
-  try { chmodSync(KEY_PATH, 0o600); } catch { /* best-effort */ }
-  writeFileSync(META_PATH, JSON.stringify({
-    addresses,
-    notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
-  } satisfies CertMeta), 'utf-8');
+  try {
+    chmodSync(KEY_PATH, 0o600);
+  } catch {
+    /* best-effort */
+  }
+  writeFileSync(
+    META_PATH,
+    JSON.stringify({
+      addresses,
+      notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+    } satisfies CertMeta),
+    'utf-8',
+  );
 
   return { cert, key };
 }
