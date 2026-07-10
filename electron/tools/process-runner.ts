@@ -138,9 +138,7 @@ function appendChunk(state: StreamState, chunk: string, cfg: ProcessStreamingCon
     return;
   }
 
-  const tailBytes = state.tailBytes > 0
-    ? state.tailBytes
-    : buildHeadTailOutput('', cfg).tailBytes;
+  const tailBytes = state.tailBytes > 0 ? state.tailBytes : buildHeadTailOutput('', cfg).tailBytes;
   state.tailBytes = tailBytes;
   state.tail = lastBytes(state.tail + chunk, tailBytes);
   state.output = state.head + TRUNCATION_MARKER + state.tail;
@@ -222,22 +220,24 @@ export async function runCommandWithStreaming(options: RunProcessOptions): Promi
   let timedOut = false;
   let cancelled = false;
   let terminationRequested = false;
+  let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const child = argv && argv.length > 0
-    ? spawn(argv[0], argv.slice(1), {
-        cwd,
-        env: effectiveEnv,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: process.platform !== 'win32',
-      })
-    : spawn(command, {
-        cwd,
-        env: effectiveEnv,
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: process.platform !== 'win32',
-      });
+  const child =
+    argv && argv.length > 0
+      ? spawn(argv[0], argv.slice(1), {
+          cwd,
+          env: effectiveEnv,
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: process.platform !== 'win32',
+        })
+      : spawn(command, {
+          cwd,
+          env: effectiveEnv,
+          shell: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: process.platform !== 'win32',
+        });
 
   child.stdout?.setEncoding('utf-8');
   child.stderr?.setEncoding('utf-8');
@@ -313,12 +313,18 @@ export async function runCommandWithStreaming(options: RunProcessOptions): Promi
     if (reason === 'cancel') cancelled = true;
 
     killProcess('SIGTERM');
-    setTimeout(() => killProcess('SIGKILL'), 750);
+    // Escalate to SIGKILL if the process doesn't exit. Retain the timer so it can
+    // be cleared on close — otherwise it fires ~750ms after a clean shutdown and,
+    // under PID/process-group reuse, could signal an unrelated group.
+    sigkillTimer = setTimeout(() => killProcess('SIGKILL'), 750);
   };
 
-  const timeoutId = setTimeout(() => {
-    requestTerminate('timeout');
-  }, Math.max(1, timeoutMs));
+  const timeoutId = setTimeout(
+    () => {
+      requestTerminate('timeout');
+    },
+    Math.max(1, timeoutMs),
+  );
 
   const intervalId = setInterval(flushPending, Math.max(50, streaming.updateIntervalMs));
 
@@ -373,6 +379,7 @@ export async function runCommandWithStreaming(options: RunProcessOptions): Promi
 
   clearTimeout(timeoutId);
   clearInterval(intervalId);
+  if (sigkillTimer) clearTimeout(sigkillTimer);
   flushPending();
 
   if (context.abortSignal) {
