@@ -10,20 +10,24 @@
  */
 
 import { createHash } from 'crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs';
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import { net, app } from 'electron';
 import { gte as semverGte } from 'semver';
 import type { OtaFeed, OtaFeedEntry, OtaManifest, OtaStatus } from './types.js';
-import {
-  OTA_DIR_NAME,
-  OTA_CURRENT_DIR,
-  OTA_STAGING_DIR,
-  OTA_ROLLBACK_DIR,
-  OTA_MANIFEST_FILE,
-} from './types.js';
+import { OTA_DIR_NAME, OTA_CURRENT_DIR, OTA_STAGING_DIR, OTA_ROLLBACK_DIR, OTA_MANIFEST_FILE } from './types.js';
 import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 
@@ -31,6 +35,12 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours (same as full updater)
 const INITIAL_DELAY_MS = 8_000; // 8 seconds after launch (after full updater's 5s check)
+
+/** Hard ceiling on an OTA archive download. The archive is hash-verified after
+ *  download, but that runs too late to stop a tampered feed from filling disk
+ *  with a huge response first. A legitimate overlay is a small fraction of this;
+ *  the cap only rejects pathological/malicious sizes. */
+const MAX_OTA_ARCHIVE_BYTES = 512 * 1024 * 1024; // 512 MiB
 
 // Env overrides for testing (mirrors auto-update.ts pattern)
 const DEV_TEST_VERSION = process.env.KAI_UPDATE_TEST_VERSION;
@@ -97,7 +107,9 @@ async function fetchJson<T>(url: string): Promise<T> {
         return;
       }
 
-      response.on('data', (chunk) => { data += chunk.toString(); });
+      response.on('data', (chunk) => {
+        data += chunk.toString();
+      });
       response.on('end', () => {
         try {
           resolve(JSON.parse(data));
@@ -116,11 +128,7 @@ async function fetchJson<T>(url: string): Promise<T> {
 /**
  * Download a file with progress reporting.
  */
-async function downloadFile(
-  url: string,
-  destPath: string,
-  version: string,
-): Promise<void> {
+async function downloadFile(url: string, destPath: string, version: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = net.request(url);
 
@@ -141,15 +149,37 @@ async function downloadFile(
 
       const totalStr = response.headers['content-length'];
       const total = totalStr ? parseInt(Array.isArray(totalStr) ? totalStr[0] : totalStr, 10) : 0;
+      // Reject an oversized advertised length before streaming a single byte.
+      if (total > MAX_OTA_ARCHIVE_BYTES) {
+        request.abort();
+        reject(new Error(`OTA archive too large: Content-Length ${total} exceeds ${MAX_OTA_ARCHIVE_BYTES}`));
+        return;
+      }
       let transferred = 0;
+      let aborted = false;
 
       const writeStream = createWriteStream(destPath);
       writeStream.on('error', reject);
       writeStream.on('finish', resolve);
 
       response.on('data', (chunk) => {
-        writeStream.write(chunk);
+        if (aborted) return;
         transferred += chunk.length;
+        // Abort mid-stream if a lying/absent Content-Length lets the body run
+        // past the ceiling — don't keep filling disk until the hash check.
+        if (transferred > MAX_OTA_ARCHIVE_BYTES) {
+          aborted = true;
+          request.abort();
+          writeStream.destroy();
+          try {
+            rmSync(destPath, { force: true });
+          } catch {
+            /* best-effort cleanup */
+          }
+          reject(new Error(`OTA archive exceeded ${MAX_OTA_ARCHIVE_BYTES} bytes mid-download`));
+          return;
+        }
+        writeStream.write(chunk);
         if (total > 0) {
           broadcast({
             state: 'downloading',
@@ -161,7 +191,9 @@ async function downloadFile(
         }
       });
 
-      response.on('end', () => { writeStream.end(); });
+      response.on('end', () => {
+        if (!aborted) writeStream.end();
+      });
       response.on('error', reject);
     });
 
@@ -226,9 +258,7 @@ async function verifyExtracted(stagingDir: string): Promise<{ valid: boolean; er
  */
 function checkFeedSignature(latest: OtaFeedEntry): string | null {
   if (shouldSkipOtaSignature(app.isPackaged)) {
-    console.warn(
-      '[ota-updater] KAI_OTA_SKIP_SIGNATURE or dev mode — skipping OTA signature verification',
-    );
+    console.warn('[ota-updater] KAI_OTA_SKIP_SIGNATURE or dev mode — skipping OTA signature verification');
     return null;
   }
   if (!latest.signature || !latest.filesHash) {
@@ -405,9 +435,7 @@ export async function downloadOtaUpdate(
     // needing the (now-deleted) archive or a network round-trip.
     try {
       const extractedManifestPath = join(extractDir, OTA_MANIFEST_FILE);
-      const extractedManifest: OtaManifest = JSON.parse(
-        readFileSync(extractedManifestPath, 'utf-8'),
-      );
+      const extractedManifest: OtaManifest = JSON.parse(readFileSync(extractedManifestPath, 'utf-8'));
       // Verify the archive's manifest.files actually hashes to the signed
       // filesHash before persisting it. Catching the mismatch here fails the
       // update cleanly instead of letting bootstrap wipe a bad overlay on
@@ -474,9 +502,7 @@ export function applyOtaUpdate(appSlug: string): { success: boolean; error?: str
 
   try {
     // Read version from staging manifest
-    const manifest: OtaManifest = JSON.parse(
-      readFileSync(join(stagingDir, OTA_MANIFEST_FILE), 'utf-8'),
-    );
+    const manifest: OtaManifest = JSON.parse(readFileSync(join(stagingDir, OTA_MANIFEST_FILE), 'utf-8'));
 
     broadcast({ state: 'applying', version: manifest.codeVersion });
 
@@ -559,11 +585,7 @@ export function getReadyVersion(): string | undefined {
  * @param getCodeVersion - Function to get current code version (may change after apply)
  * @param getShellVersion - Function to get shell version
  */
-export function startOtaChecks(
-  appSlug: string,
-  getCodeVersion: () => string,
-  getShellVersion: () => string,
-): void {
+export function startOtaChecks(appSlug: string, getCodeVersion: () => string, getShellVersion: () => string): void {
   if (!app.isPackaged && !isTestMode) return;
 
   // Initial check (delayed to avoid competing with full updater)
