@@ -164,7 +164,12 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
 }
 
 // Pending tool approval promises — shared with the Claude Agent SDK MCP bridge
-import { pendingToolApprovals, setServerPersistTagger } from './tool-approval.js';
+import {
+  pendingToolApprovals,
+  setServerPersistTagger,
+  registerPendingApproval,
+  broadcastStreamEventRaw,
+} from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
 import { pendingQuestionAnswers } from '../tools/ask-user.js';
@@ -191,6 +196,14 @@ const activeStreamModelKeys = new Map<string, string>();
 // the conversation's CURRENT active stream token matches the persist owner.
 const pendingServerPersist = new Set<string>();
 const serverPersistTokens = new Map<string, string>();
+// A submit that is still awaiting toolsReady (before any activeStreams entry
+// exists) is otherwise uncancellable. Each submit mints a unique id and records
+// it as the conversation's current pending submit; agent:cancel-stream marks it
+// cancelled so the submit bails after the await instead of starting a run for a
+// client that already detached.
+let submitIdSeq = 0;
+const currentPendingSubmit = new Map<string, number>();
+const cancelledSubmits = new Set<number>();
 // The conversation head captured at submit time (the just-appended user turn),
 // keyed by conversationId. streamHandler binds it to the run's token so the
 // assistant reply is persisted as a child of the turn it actually answered —
@@ -1893,9 +1906,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 args: state.args,
               });
               observer?.onToolAwaitingApproval(state.toolCallId);
-              const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
-                pendingToolApprovals.set(streamId, { resolve });
-              });
+              // Abort-aware: a cancel-stream aborts controller.signal, which
+              // resolves this with 'dismiss' and deletes the pending entry, so a
+              // later GUI approval can't resume a cancelled run (and no leak).
+              const approved = await registerPendingApproval(streamId, controller.signal);
               if (approved !== true) {
                 state.cancel();
                 if (approved === 'dismiss') {
@@ -1932,9 +1946,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 args: state.args,
               });
               observer?.onToolAwaitingApproval(state.toolCallId);
-              const approved = await new Promise<boolean | 'dismiss'>((resolve) => {
-                pendingToolApprovals.set(streamId, { resolve });
-              });
+              // Abort-aware (see exit_plan_mode above): cancel resolves this as
+              // 'dismiss' and cleans up, instead of leaking a pending approval.
+              const approved = await registerPendingApproval(streamId, controller.signal);
               if (approved !== true) {
                 state.cancel();
               } else {
@@ -2286,9 +2300,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 
+      // Mint a cancellable id for the pre-stream window (waiting on toolsReady):
+      // no activeStreams entry exists yet, so agent:cancel-stream can only reach
+      // us via cancelledSubmits.
+      const submitId = ++submitIdSeq;
+      currentPendingSubmit.set(conversationId, submitId);
+
       // The CLI bridge serves before the tool registry finishes building, so a
       // turn arriving in that window would run tool-less. Wait for tools first.
       await toolsReady;
+
+      // If the client detached (or cancelled) while we awaited toolsReady, bail
+      // before appending the user turn / starting a model run.
+      if (cancelledSubmits.delete(submitId)) {
+        if (currentPendingSubmit.get(conversationId) === submitId) currentPendingSubmit.delete(conversationId);
+        return { ok: false, error: 'cancelled' };
+      }
+      if (currentPendingSubmit.get(conversationId) === submitId) currentPendingSubmit.delete(conversationId);
 
       // Mark the conversation running so automation busy-checks and the GUI
       // index see a live CLI turn and don't target it with a concurrent write.
@@ -2329,6 +2357,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   );
 
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
+    // Cancel a submit still waiting on toolsReady (no activeStreams entry yet)
+    // so it bails after the await instead of starting a run for a gone client.
+    const pendingSubmitId = currentPendingSubmit.get(conversationId);
+    if (pendingSubmitId !== undefined) {
+      cancelledSubmits.add(pendingSubmitId);
+      currentPendingSubmit.delete(conversationId);
+    }
     const controller = activeStreams.get(conversationId);
     if (controller) {
       controller.abort();
@@ -2356,6 +2391,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       } catch {
         // best-effort
       }
+      // Tell any GUI watching this CLI-owned turn that the stream ended, so it
+      // drops its live accumulator + running indicator (it only clears on a
+      // terminal event, and ignores conversation upserts while accumulating).
+      // Tag serverPersisted explicitly so the renderer takes its render-only
+      // path (the token is already cleared, so the auto-tagger wouldn't).
+      broadcastStreamEventRaw({ conversationId, type: 'done', serverPersisted: true, data: { cancelled: true } });
     }
     return { ok: true };
   });

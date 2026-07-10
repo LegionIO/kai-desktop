@@ -804,8 +804,13 @@ function createWindow(): BrowserWindow {
     // backend, demote to headless NOW rather than waiting on window-all-closed
     // — which may never fire, because dictation keeps a hidden overlay window
     // alive that counts in getAllWindows(). demoteWindowedToHeadless tears those
-    // GUI-only windows/services down.
-    if ((localClients.size > 0 || webClients.size > 0) && !headlessWindowBlockActive) {
+    // GUI-only windows/services down. But do NOT demote while OTHER visible
+    // windows remain (plugin browser, computer-use operator) — hiding the dock
+    // and re-arming idle shutdown under a visible window would be wrong.
+    const otherVisible = BrowserWindow.getAllWindows().some(
+      (w) => w !== mainWindow && !w.isDestroyed() && w.isVisible(),
+    );
+    if ((localClients.size > 0 || webClients.size > 0) && !headlessWindowBlockActive && !otherVisible) {
       demoteWindowedToHeadlessRef();
     }
   });
