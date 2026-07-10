@@ -280,57 +280,71 @@ export class CodexRuntime implements AgentRuntime {
     const bridgeAuthToken = bridge.getAuthToken();
     const bridgeAuthTokenEnvVar = bridge.getAuthTokenEnvVar();
     const codexPathOverride = resolveCodexExecutable();
-    const codex = new CodexCtor({
-      ...(codexPathOverride ? { codexPathOverride } : {}),
-      ...(apiKey ? { apiKey } : {}),
-      ...(baseUrl ? { baseUrl } : {}),
-      ...(bridgeAuthToken && bridgeAuthTokenEnvVar
-        ? {
-            // The SDK's `env` option replaces the child environment entirely,
-            // so spread process.env and overlay only the bridge token —
-            // otherwise the Codex CLI loses HOME/PATH/cert vars.
-            env: {
-              ...(process.env as Record<string, string>),
-              [bridgeAuthTokenEnvVar]: bridgeAuthToken,
-            },
-          }
-        : {}),
-      ...(bridgeUrl
-        ? {
-            config: {
-              features: {
-                tool_search_always_defer_mcp_tools: false,
-              },
-              mcp_servers: {
-                kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
-              },
-            },
-          }
-        : {}),
-    });
 
-    const threadOptions = {
-      ...(modelAuth?.modelName ? { model: modelAuth.modelName } : {}),
-      workingDirectory: cwd ?? process.cwd(),
-      modelReasoningEffort: modelEffort,
-      approvalPolicy,
-      skipGitRepoCheck: true,
-    };
-
-    // Resume or start new thread.
-    // `codexSdkThreadId` is written to conversation.metadata when the `thread.started`
-    // enrichment event is persisted by the renderer — see RuntimeProvider applyEnrichments.
-    // This makes context persist across both turns within a session and app restarts.
-    const resumeId =
-      (options.conversationMetadata?.codexSdkThreadId as string | undefined) ??
-      (sdkConfig.resumeThreadId as string | undefined) ??
-      undefined;
-    const thread = resumeId ? codex.resumeThread(resumeId, threadOptions) : codex.startThread(threadOptions);
+    // Declared before the try so the catch/retry handler below can still see
+    // them; assigned inside the try so a throw during construction / thread
+    // creation is caught and converted to an error+done event with cleanup,
+    // rather than leaking the temp image dir + MCP bridge and throwing out of
+    // the generator.
+    let resumeId: string | undefined;
+    let thread: ThreadInstance;
+    let codex: InstanceType<CodexClass>;
+    let threadOptions: Parameters<InstanceType<CodexClass>['startThread']>[0];
 
     // -----------------------------------------------------------------------
-    // 6. Stream and translate events
+    // 5. Create Codex instance and thread, then stream + translate events
     // -----------------------------------------------------------------------
     try {
+      codex = new CodexCtor({
+        ...(codexPathOverride ? { codexPathOverride } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(bridgeAuthToken && bridgeAuthTokenEnvVar
+          ? {
+              // The SDK's `env` option replaces the child environment entirely,
+              // so spread process.env and overlay only the bridge token —
+              // otherwise the Codex CLI loses HOME/PATH/cert vars.
+              env: {
+                ...(process.env as Record<string, string>),
+                [bridgeAuthTokenEnvVar]: bridgeAuthToken,
+              },
+            }
+          : {}),
+        ...(bridgeUrl
+          ? {
+              config: {
+                features: {
+                  tool_search_always_defer_mcp_tools: false,
+                },
+                mcp_servers: {
+                  kai: buildCodexMcpServerConfig(bridgeUrl, customTools ?? [], bridgeAuthToken, bridgeAuthTokenEnvVar),
+                },
+              },
+            }
+          : {}),
+      });
+
+      threadOptions = {
+        ...(modelAuth?.modelName ? { model: modelAuth.modelName } : {}),
+        workingDirectory: cwd ?? process.cwd(),
+        modelReasoningEffort: modelEffort,
+        approvalPolicy,
+        skipGitRepoCheck: true,
+      };
+
+      // Resume or start new thread.
+      // `codexSdkThreadId` is written to conversation.metadata when the `thread.started`
+      // enrichment event is persisted by the renderer — see RuntimeProvider applyEnrichments.
+      // This makes context persist across both turns within a session and app restarts.
+      resumeId =
+        (options.conversationMetadata?.codexSdkThreadId as string | undefined) ??
+        (sdkConfig.resumeThreadId as string | undefined) ??
+        undefined;
+      thread = resumeId ? codex.resumeThread(resumeId, threadOptions) : codex.startThread(threadOptions);
+
+      // -----------------------------------------------------------------------
+      // 6. Stream and translate events
+      // -----------------------------------------------------------------------
       // Build the effective text (with MCP tool hints if needed)
       let effectiveText =
         bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
@@ -381,7 +395,7 @@ export class CodexRuntime implements AgentRuntime {
       if (isThreadNotFound) {
         console.warn(`[codex-runtime] Thread resume failed (id=${resumeId}), retrying with fresh thread`);
         try {
-          const freshThread = codex.startThread(threadOptions);
+          const freshThread = codex!.startThread(threadOptions);
 
           const effectiveText =
             bridgeUrl && customTools ? buildCodexMcpPrompt(textPrompt ?? '', customTools) : (textPrompt ?? '');
