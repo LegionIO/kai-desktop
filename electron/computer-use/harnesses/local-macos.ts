@@ -21,6 +21,7 @@ import {
   runLocalMacMouseCommand,
 } from '../permissions.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
+import { safeNavigateUrl } from '../../platform/safe-url.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -668,8 +669,14 @@ export class LocalMacosHarness implements ComputerHarness {
   async navigate(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
     const url = action.url?.trim();
     if (!url) throw new Error('Navigation requires a URL.');
-    await execFileAsync('open', [url], { timeout: 15000 });
-    return buildResult(`Opened ${url}.`);
+    // Model-supplied URL — restrict to http/https/about so a `navigate` action
+    // can't hand `file:`, `x-apple.systempreferences:`, `mailto:`, custom app
+    // schemes, etc. to `open` and launch arbitrary OS protocol handlers.
+    // (App launching stays behind the separate, approval-gated openApp action.)
+    const safe = safeNavigateUrl(url);
+    if (!safe) throw new Error(`Refusing to navigate to disallowed URL scheme: ${url}`);
+    await execFileAsync('open', [safe], { timeout: 15000 });
+    return buildResult(`Opened ${safe}.`);
   }
 
   async waitForIdle(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {

@@ -138,7 +138,19 @@ async function withAbortTimeout<T>(
 }
 
 export class VmHttpClient {
-  constructor(private readonly baseUrl: string) {}
+  constructor(private readonly baseUrl: string) {
+    // Validate the VM base URL scheme up front so a misconfigured/hostile
+    // baseUrl can't turn harness requests into file:/other-scheme fetches.
+    let parsed: URL;
+    try {
+      parsed = new URL(baseUrl);
+    } catch {
+      throw new Error(`Invalid VM harness baseUrl: ${baseUrl}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`VM harness baseUrl must be http(s): ${baseUrl}`);
+    }
+  }
 
   async createSession(input: {
     clientSessionId: string;
@@ -155,10 +167,11 @@ export class VmHttpClient {
     };
     const data = await this.requestJson('POST', '/v1/computer-use/sessions', payload, input.signal, 30000);
     const obj = toRecord(data);
-    const sessionId = readString(obj, 'sessionId')
-      ?? readString(toRecord(obj.data), 'sessionId')
-      ?? readString(toRecord(obj.session), 'id')
-      ?? readString(obj, 'id');
+    const sessionId =
+      readString(obj, 'sessionId') ??
+      readString(toRecord(obj.data), 'sessionId') ??
+      readString(toRecord(obj.session), 'id') ??
+      readString(obj, 'id');
 
     if (!sessionId) {
       throw new Error(`Remote VM did not return a sessionId from ${this.baseUrl}`);
@@ -167,16 +180,34 @@ export class VmHttpClient {
   }
 
   async deleteSession(sessionId: string, signal?: AbortSignal): Promise<void> {
-    await this.requestJson('DELETE', `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}`, undefined, signal, 20000);
+    await this.requestJson(
+      'DELETE',
+      `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}`,
+      undefined,
+      signal,
+      20000,
+    );
   }
 
   async getState(sessionId: string, signal?: AbortSignal): Promise<VmStateSnapshot> {
-    const data = await this.requestJson('GET', `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}/state`, undefined, signal, 25000);
+    const data = await this.requestJson(
+      'GET',
+      `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}/state`,
+      undefined,
+      signal,
+      25000,
+    );
     return this.parseState(data);
   }
 
   async getFrame(sessionId: string, signal?: AbortSignal): Promise<VmRemoteFrame | null> {
-    const data = await this.requestJson('GET', `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}/frame`, undefined, signal, 25000);
+    const data = await this.requestJson(
+      'GET',
+      `/v1/computer-use/sessions/${encodeURIComponent(sessionId)}/frame`,
+      undefined,
+      signal,
+      25000,
+    );
     const obj = toRecord(data);
     const frame = toRecord(obj.frame ?? data);
 
@@ -197,7 +228,11 @@ export class VmHttpClient {
     };
   }
 
-  async performAction(sessionId: string, action: ComputerActionProposal, signal?: AbortSignal): Promise<VmActionOutcome> {
+  async performAction(
+    sessionId: string,
+    action: ComputerActionProposal,
+    signal?: AbortSignal,
+  ): Promise<VmActionOutcome> {
     const actionBody = {
       action: {
         actionId: action.id,
@@ -258,7 +293,11 @@ export class VmHttpClient {
     };
   }
 
-  private async pollOperation(operationId: string, initialDelayMs: number, signal?: AbortSignal): Promise<VmActionOutcome> {
+  private async pollOperation(
+    operationId: string,
+    initialDelayMs: number,
+    signal?: AbortSignal,
+  ): Promise<VmActionOutcome> {
     const startedAt = Date.now();
     let delayMs = Math.max(150, Math.min(initialDelayMs, 5000));
 
@@ -310,14 +349,15 @@ export class VmHttpClient {
     const obj = toRecord(data);
     const resultObj = toRecord(obj.result);
 
-    const result: VmActionResult | undefined = Object.keys(resultObj).length > 0
-      ? {
-          summary: readString(resultObj, 'summary'),
-          frame: this.parseFrameObject(resultObj.frame),
-          environment: toRecord(resultObj.environment) as ComputerEnvironmentMetadata,
-          cursor: toRecord(resultObj.cursor) as Partial<ComputerUseCursorState>,
-        }
-      : undefined;
+    const result: VmActionResult | undefined =
+      Object.keys(resultObj).length > 0
+        ? {
+            summary: readString(resultObj, 'summary'),
+            frame: this.parseFrameObject(resultObj.frame),
+            environment: toRecord(resultObj.environment) as ComputerEnvironmentMetadata,
+            cursor: toRecord(resultObj.cursor) as Partial<ComputerUseCursorState>,
+          }
+        : undefined;
 
     return {
       status: readString(obj, 'status'),
