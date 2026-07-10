@@ -116,6 +116,7 @@ export type PluginSafeConfig = Omit<
   | 'imageGeneration'
   | 'videoGeneration'
   | 'dictation'
+  | 'plugins'
 > & {
   models: Omit<AppConfig['models'], 'providers'> & {
     providers: Record<string, PluginSafeProviderConfig>;
@@ -266,7 +267,10 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
   };
 
   // Destructure to drop the original credential-bearing branches before
-  // spreading the rest; this keeps the returned type honest.
+  // spreading the rest; this keeps the returned type honest. `plugins` is also
+  // dropped: it's the per-plugin private namespace map (config.plugins[name]),
+  // so spreading it would let one plugin read every OTHER plugin's private
+  // data. A plugin reads its OWN data via getPluginData(), not this shared view.
   const {
     models: _models,
     memory: _memory,
@@ -277,6 +281,7 @@ export function toPluginSafeConfig(config: AppConfig): PluginSafeConfig {
     imageGeneration: _imageGeneration,
     videoGeneration: _videoGeneration,
     dictation: _dictation,
+    plugins: _plugins,
     ...remaining
   } = cloned;
 

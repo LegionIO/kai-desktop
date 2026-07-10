@@ -1224,9 +1224,24 @@ export function registerConfigHandlers(
       return;
     }
 
+    // Snapshot so an invalid mutation can be rolled back instead of writing a
+    // malformed config to disk (which would make readEffectiveConfig fall back
+    // to all-defaults and let a later write clobber valid settings with them).
+    const snapshot = structuredClone(currentConfig);
+    const validateOrRollback = () => {
+      const parsed = appConfigSchema.safeParse(currentConfig);
+      if (!parsed.success) {
+        currentConfig = snapshot;
+        throw new Error(`Rejected config write at "${path}": ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+      }
+      // Persist the schema-normalized result so defaults/coercions are on disk.
+      currentConfig = parsed.data as AppConfig;
+    };
+
     if (path.startsWith('models.')) {
       // Always persist to desktop.json (covers plugin-contributed providers/catalog)
       setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
+      validateOrRollback();
       writeDesktopConfig(appHome, currentConfig);
 
       // Also persist to llm.json for built-in provider paths
@@ -1263,6 +1278,7 @@ export function registerConfigHandlers(
         randomBytes(12).toString('base64url'),
       );
     }
+    validateOrRollback();
     writeDesktopConfig(appHome, currentConfig);
     currentConfig = readEffectiveConfig(appHome);
     scheduleConfigBroadcast();

@@ -198,6 +198,28 @@ describe('config IPC: registered channels', () => {
     expect(onDisk.launchAtLogin).toBe(true);
   });
 
+  it('rejects a schema-invalid config:set and leaves prior valid state intact', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(ipc as Parameters<typeof registerConfigHandlers>[0], appHome);
+      },
+    });
+
+    // Establish a known-good value.
+    await harness.invoke('config:set', FAKE_EVENT, 'launchAtLogin', true);
+
+    // An invalid value for a typed scalar must be rejected (validate-before-write),
+    // not written to disk where it would corrupt the config and force an
+    // all-defaults fallback on the next read.
+    await expect(harness.invoke('config:set', FAKE_EVENT, 'launchAtLogin', { not: 'a boolean' })).rejects.toThrow();
+
+    // The prior valid value survives — in memory and on disk.
+    const reread = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+    expect(reread.launchAtLogin).toBe(true);
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
+    expect(onDisk.launchAtLogin).toBe(true);
+  });
+
   it('reports homedir via platform:homedir', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

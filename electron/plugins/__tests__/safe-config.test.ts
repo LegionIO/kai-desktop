@@ -418,6 +418,21 @@ describe('toPluginSafeConfig', () => {
     expect(fixture.models.providers.openai.endpoint).toBe('https://api.openai.com/v1');
   });
 
+  it('omits the per-plugin namespace map so one plugin cannot read another plugin’s private data', () => {
+    const fixture = buildPopulatedConfig();
+    fixture.plugins = {
+      'plugin-a': { apiToken: 'a-secret-value', setting: 1 },
+      'plugin-b': { privateKey: 'b-secret-value' },
+    };
+    const safe = toPluginSafeConfig(fixture);
+    // The whole `plugins` map must be absent from the shared safe view — a
+    // plugin reads its OWN data via getPluginData(), never through this view.
+    expect('plugins' in safe).toBe(false);
+    const serialized = JSON.stringify(safe);
+    expect(serialized.includes('a-secret-value')).toBe(false);
+    expect(serialized.includes('b-secret-value')).toBe(false);
+  });
+
   it('schema-walk regression guard: no surviving keys whose name suggests a credential', () => {
     // This is the future-proofing net. If a new field whose name matches
     // /api[_-]?key|password|secret|token|access[_-]?key|subscription[_-]?key/i
