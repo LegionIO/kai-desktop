@@ -99,6 +99,10 @@ export { convertJsonSchemaToZod } from './json-schema-zod.js';
 
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
+/** HTTP-skill request timeout + response body cap. */
+const HTTP_SKILL_TIMEOUT_MS = 30_000;
+const HTTP_SKILL_MAX_BODY_BYTES = 10 * 1024 * 1024;
+
 /* ── Skill loading from disk ── */
 
 export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillManifest; dir: string }> {
@@ -303,13 +307,29 @@ async function runHttpExecution(
     }
   }
 
-  const resp = await fetch(url, fetchOptions);
+  // Bound the request: a slow/huge endpoint shouldn't hang the tool call or
+  // buffer unbounded memory. Abort after HTTP_SKILL_TIMEOUT_MS and cap the body.
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), HTTP_SKILL_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(url, { ...fetchOptions, signal: abort.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+
   const contentType = resp.headers.get('content-type') ?? '';
+  // Read the body stream with a byte cap instead of unbounded json()/text().
+  const raw = await readCappedBody(resp, HTTP_SKILL_MAX_BODY_BYTES);
   let body: unknown;
   if (contentType.includes('json')) {
-    body = await resp.json();
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      body = raw;
+    }
   } else {
-    body = await resp.text();
+    body = raw;
   }
 
   return {
@@ -318,6 +338,31 @@ async function runHttpExecution(
     body,
     ...(resp.ok ? {} : { error: `HTTP ${resp.status}` }),
   };
+}
+
+/** Read a response body up to `maxBytes`, aborting the stream once exceeded. */
+async function readCappedBody(resp: Response, maxBytes: number): Promise<string> {
+  if (!resp.body) return await resp.text();
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.byteLength;
+        if (received > maxBytes) {
+          void reader.cancel();
+          throw new Error(`HTTP skill response exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf-8');
 }
 
 /* ── Build a Mastra Workflow from a skill manifest ── */
