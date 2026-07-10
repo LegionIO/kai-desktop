@@ -173,6 +173,10 @@ export class ComputerUseSessionManager extends EventEmitter {
   private readonly orchestrator: ComputerUseOrchestrator;
   private takeoverMonitorActive = false;
   private takeoverSuppressedUntil = 0;
+  /** Serializes local-macos start/resume/continue so their check-then-act
+   *  (guard → await preflight → transition to running) can't interleave and
+   *  let two local-macos sessions run at once. */
+  private localMacosLock: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly appHome: string,
@@ -582,6 +586,36 @@ export class ComputerUseSessionManager extends EventEmitter {
     openComputerSetupWindow(conversationId);
   }
 
+  /** Run `fn` serialized against other local-macos start/resume/continue calls.
+   *  The main process is single-threaded, so a promise-chain mutex is enough to
+   *  make each critical section's check-then-act atomic across its awaits. */
+  private runExclusiveLocalMacos<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.localMacosLock.then(fn, fn);
+    // Keep the chain alive regardless of this call's outcome.
+    this.localMacosLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Throw if another local-macos session is already active (not paused/terminal).
+   *  Call inside the lock, immediately before transitioning to starting/running. */
+  private assertNoActiveLocalMacos(exceptSessionId?: string): void {
+    for (const existing of this.sessions.values()) {
+      if (existing.id === exceptSessionId) continue;
+      if (
+        existing.target === 'local-macos' &&
+        existing.status !== 'completed' &&
+        existing.status !== 'stopped' &&
+        existing.status !== 'failed' &&
+        existing.status !== 'paused'
+      ) {
+        throw new Error(`A local Mac session is already active (${existing.id}). Stop it before starting a new one.`);
+      }
+    }
+  }
+
   async startSession(goal: string, options: StartComputerSessionOptions): Promise<ComputerSession> {
     const config = this.getConfig();
     const sessionId = makeComputerUseId('cs');
@@ -593,67 +627,69 @@ export class ComputerUseSessionManager extends EventEmitter {
     const surface = options.surface ?? config.computerUse.defaultSurface;
     const approvalMode = options.approvalMode ?? config.computerUse.approvalModeDefault;
 
-    // Singleton guard: only one local-macos session can run at a time
-    // Paused sessions don't block new ones — user may want to start fresh
-    if (target === 'local-macos') {
-      for (const existing of this.sessions.values()) {
-        if (
-          existing.target === 'local-macos' &&
-          existing.status !== 'completed' &&
-          existing.status !== 'stopped' &&
-          existing.status !== 'failed' &&
-          existing.status !== 'paused'
-        ) {
-          throw new Error(`A local Mac session is already active (${existing.id}). Stop it before starting a new one.`);
-        }
+    const buildAndStart = async (): Promise<ComputerSession> => {
+      // Singleton guard: only one local-macos session can run at a time.
+      // Paused/terminal sessions don't block new ones. Re-checked here inside
+      // the lock so two concurrent starts can't both pass before either is in
+      // the map (the guard + preflight await was previously a check-then-act race).
+      if (target === 'local-macos') {
+        this.assertNoActiveLocalMacos();
       }
-    }
 
-    const { permissions, blocker } = await this.evaluatePreflight(target, { requestMissing: true });
+      const { permissions, blocker } = await this.evaluatePreflight(target, { requestMissing: true });
 
-    const session: ComputerSession = {
-      id: sessionId,
-      conversationId,
-      goal,
-      conversationContext: options.contextSummary?.trim() || undefined,
-      target,
-      surface,
-      approvalMode,
-      selectedModelKey: options.modelKey ?? null,
-      selectedProfileKey: options.profileKey ?? null,
-      fallbackEnabled: options.fallbackEnabled ?? false,
-      reasoningEffort: options.reasoningEffort ?? undefined,
-      status: blocker ? 'failed' : 'starting',
-      providerAdapter: 'hybrid',
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      actions: [],
-      approvals: [],
-      checkpoints: [],
-      guidanceMessages: [],
-      permissionState: blocker ? { ...permissions, message: blocker } : permissions,
-      cursor: { x: 0, y: 0, visible: false, clickedAt: null },
-      operatorWindowOpen: !blocker && surface === 'window',
-      humanInControl: false,
-      pauseReason: blocker ? 'permissions' : undefined,
-      statusMessage: blocker ?? undefined,
-      lastError: blocker ?? undefined,
+      // Re-check after the preflight await — another start may have won the race
+      // while we were awaiting permission prompts.
+      if (target === 'local-macos' && !blocker) {
+        this.assertNoActiveLocalMacos();
+      }
+
+      const session: ComputerSession = {
+        id: sessionId,
+        conversationId,
+        goal,
+        conversationContext: options.contextSummary?.trim() || undefined,
+        target,
+        surface,
+        approvalMode,
+        selectedModelKey: options.modelKey ?? null,
+        selectedProfileKey: options.profileKey ?? null,
+        fallbackEnabled: options.fallbackEnabled ?? false,
+        reasoningEffort: options.reasoningEffort ?? undefined,
+        status: blocker ? 'failed' : 'starting',
+        providerAdapter: 'hybrid',
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        actions: [],
+        approvals: [],
+        checkpoints: [],
+        guidanceMessages: [],
+        permissionState: blocker ? { ...permissions, message: blocker } : permissions,
+        cursor: { x: 0, y: 0, visible: false, clickedAt: null },
+        operatorWindowOpen: !blocker && surface === 'window',
+        humanInControl: false,
+        pauseReason: blocker ? 'permissions' : undefined,
+        statusMessage: blocker ?? undefined,
+        lastError: blocker ?? undefined,
+      };
+
+      if (!blocker) {
+        this.suppressTakeoverMonitor();
+      }
+      this.upsertSession(session);
+      if (!blocker && surface === 'window') {
+        openOperatorWindow(session.id, () => this.handleOperatorWindowClosed(session.id), {
+          conversationId: session.conversationId,
+        });
+      }
+      if (!blocker) {
+        this.openOverlayIfEnabled(session);
+        this.orchestrator.resume(session.id);
+      }
+      return session;
     };
 
-    if (!blocker) {
-      this.suppressTakeoverMonitor();
-    }
-    this.upsertSession(session);
-    if (!blocker && surface === 'window') {
-      openOperatorWindow(session.id, () => this.handleOperatorWindowClosed(session.id), {
-        conversationId: session.conversationId,
-      });
-    }
-    if (!blocker) {
-      this.openOverlayIfEnabled(session);
-      this.orchestrator.resume(session.id);
-    }
-    return session;
+    return target === 'local-macos' ? this.runExclusiveLocalMacos(buildAndStart) : buildAndStart();
   }
 
   pauseSession(sessionId: string): ComputerSession | null {
@@ -675,34 +711,48 @@ export class ComputerUseSessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
 
-    const { permissions, blocker } = await this.evaluatePreflight(session.target, { requestMissing: true });
-    if (blocker) {
-      return this.upsertSession({
+    const resume = async (): Promise<ComputerSession | null> => {
+      // Don't resume a local-macos session while another is active.
+      if (session.target === 'local-macos') {
+        this.assertNoActiveLocalMacos(session.id);
+      }
+
+      const { permissions, blocker } = await this.evaluatePreflight(session.target, { requestMissing: true });
+      if (blocker) {
+        return this.upsertSession({
+          ...session,
+          status: 'failed',
+          permissionState: { ...permissions, message: blocker },
+          humanInControl: false,
+          pauseReason: 'permissions',
+          statusMessage: blocker,
+          lastError: blocker,
+          updatedAt: nowIso(),
+        });
+      }
+
+      // Re-check after the preflight await.
+      if (session.target === 'local-macos') {
+        this.assertNoActiveLocalMacos(session.id);
+      }
+
+      this.suppressTakeoverMonitor();
+      const next = this.upsertSession({
         ...session,
-        status: 'failed',
-        permissionState: { ...permissions, message: blocker },
+        status: 'running',
+        permissionState: permissions,
         humanInControl: false,
-        pauseReason: 'permissions',
-        statusMessage: blocker,
-        lastError: blocker,
+        pauseReason: undefined,
+        statusMessage: undefined,
+        lastError: undefined,
         updatedAt: nowIso(),
       });
-    }
+      this.openOverlayIfEnabled(next);
+      this.orchestrator.resume(sessionId);
+      return next;
+    };
 
-    this.suppressTakeoverMonitor();
-    const next = this.upsertSession({
-      ...session,
-      status: 'running',
-      permissionState: permissions,
-      humanInControl: false,
-      pauseReason: undefined,
-      statusMessage: undefined,
-      lastError: undefined,
-      updatedAt: nowIso(),
-    });
-    this.openOverlayIfEnabled(next);
-    this.orchestrator.resume(sessionId);
-    return next;
+    return session.target === 'local-macos' ? this.runExclusiveLocalMacos(resume) : resume();
   }
 
   stopSession(sessionId: string): ComputerSession | null {
@@ -790,50 +840,64 @@ export class ComputerUseSessionManager extends EventEmitter {
 
     const target = session.target;
 
-    // Re-check permissions for local-macos
-    const { permissions, blocker } =
-      target === 'local-macos'
-        ? await this.evaluatePreflight(target, { requestMissing: true })
-        : { permissions: session.permissionState, blocker: null as string | null };
+    const doContinue = async (): Promise<ComputerSession | null> => {
+      // Don't continue a local-macos session while another is active.
+      if (target === 'local-macos') {
+        this.assertNoActiveLocalMacos(session.id);
+      }
 
-    if (blocker) {
-      return this.upsertSession({
+      // Re-check permissions for local-macos
+      const { permissions, blocker } =
+        target === 'local-macos'
+          ? await this.evaluatePreflight(target, { requestMissing: true })
+          : { permissions: session.permissionState, blocker: null as string | null };
+
+      if (blocker) {
+        return this.upsertSession({
+          ...session,
+          status: 'failed',
+          permissionState: permissions ? { ...permissions, message: blocker } : session.permissionState,
+          lastError: blocker,
+          statusMessage: blocker,
+          updatedAt: nowIso(),
+        });
+      }
+
+      // Re-check after the preflight await.
+      if (target === 'local-macos') {
+        this.assertNoActiveLocalMacos(session.id);
+      }
+
+      // Append the new goal to the original
+      const continuedGoal = `${session.goal}\n\nFollow-up: ${newGoal.trim()}`;
+
+      // Add a guidance message so the orchestrator sees the new instruction
+      const guidanceMessage = {
+        id: makeComputerUseId('guide'),
+        text: newGoal.trim(),
+        createdAt: nowIso(),
+      };
+
+      this.suppressTakeoverMonitor();
+      const next = this.upsertSession({
         ...session,
-        status: 'failed',
-        permissionState: permissions ? { ...permissions, message: blocker } : session.permissionState,
-        lastError: blocker,
-        statusMessage: blocker,
+        goal: continuedGoal,
+        status: 'running',
+        lastError: undefined,
+        statusMessage: undefined,
+        pauseReason: undefined,
+        humanInControl: false,
+        guidanceMessages: [...(session.guidanceMessages ?? []), guidanceMessage],
         updatedAt: nowIso(),
+        ...(permissions ? { permissionState: permissions } : {}),
       });
-    }
 
-    // Append the new goal to the original
-    const continuedGoal = `${session.goal}\n\nFollow-up: ${newGoal.trim()}`;
-
-    // Add a guidance message so the orchestrator sees the new instruction
-    const guidanceMessage = {
-      id: makeComputerUseId('guide'),
-      text: newGoal.trim(),
-      createdAt: nowIso(),
+      this.openOverlayIfEnabled(next);
+      this.orchestrator.resume(sessionId);
+      return next;
     };
 
-    this.suppressTakeoverMonitor();
-    const next = this.upsertSession({
-      ...session,
-      goal: continuedGoal,
-      status: 'running',
-      lastError: undefined,
-      statusMessage: undefined,
-      pauseReason: undefined,
-      humanInControl: false,
-      guidanceMessages: [...(session.guidanceMessages ?? []), guidanceMessage],
-      updatedAt: nowIso(),
-      ...(permissions ? { permissionState: permissions } : {}),
-    });
-
-    this.openOverlayIfEnabled(next);
-    this.orchestrator.resume(sessionId);
-    return next;
+    return target === 'local-macos' ? this.runExclusiveLocalMacos(doContinue) : doContinue();
   }
 
   async approveAction(sessionId: string, actionId: string): Promise<ComputerSession | null> {
