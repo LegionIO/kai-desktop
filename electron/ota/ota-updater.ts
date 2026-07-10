@@ -573,6 +573,76 @@ export async function downloadOtaUpdate(
 }
 
 /**
+ * Synchronously re-verify a staged overlay just before it's applied: the signed
+ * filesHash must match a recompute over manifest.files, the Ed25519 signature
+ * must verify (when signed fields are present), and every listed file must hash
+ * to its manifest entry. Catches on-disk tampering of the staging dir between
+ * download and apply. Sync so applyOtaUpdate stays synchronous.
+ */
+function verifyStagedOverlaySync(stagingDir: string, manifest: OtaManifest): { valid: boolean; error?: string } {
+  const files = manifest.files ?? {};
+  // 1. filesHash binds the whole file set — recompute + compare.
+  if (manifest.filesHash) {
+    const recomputed = computeFilesHash(files);
+    if (recomputed !== manifest.filesHash) {
+      return { valid: false, error: 'manifest.filesHash mismatch' };
+    }
+  }
+  // 2. Signature (skip only in dev/unsigned per the shared policy).
+  if (!shouldSkipOtaSignature(app.isPackaged)) {
+    if (!manifest.signature || !manifest.filesHash || !manifest.sha512) {
+      return { valid: false, error: 'staged overlay is missing signature fields' };
+    }
+    const ok = verifyOtaSignature({
+      sha512: manifest.sha512,
+      codeVersion: manifest.codeVersion,
+      minBaseVersion: manifest.minBaseVersion,
+      filesHash: manifest.filesHash,
+      signature: manifest.signature,
+    });
+    if (!ok) return { valid: false, error: 'staged overlay signature verification failed' };
+  }
+  // 3. Every file present + hashes to its manifest entry.
+  for (const [rel, entry] of Object.entries(files)) {
+    const full = join(stagingDir, rel);
+    if (!existsSync(full)) return { valid: false, error: `missing file: ${rel}` };
+    const actual = createHash('sha512').update(readFileSync(full)).digest('hex');
+    if (actual !== entry.sha512) return { valid: false, error: `hash mismatch: ${rel}` };
+  }
+  return { valid: true };
+}
+
+/** Path of the persisted highest-applied-version floor file. */
+function appliedFloorPath(otaRoot: string): string {
+  return join(otaRoot, 'applied-version-floor');
+}
+
+/** Read the highest version ever applied (null if none / unreadable). */
+function readAppliedVersionFloor(otaRoot: string): string | null {
+  try {
+    const p = appliedFloorPath(otaRoot);
+    if (!existsSync(p)) return null;
+    const v = readFileSync(p, 'utf-8').trim();
+    return semverValid(v) != null ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Bump the floor to `version` if it's higher than the stored value. */
+function writeAppliedVersionFloor(otaRoot: string, version: string): void {
+  try {
+    if (semverValid(version) == null) return;
+    const current = readAppliedVersionFloor(otaRoot);
+    if (current && !semverGt(version, current)) return;
+    mkdirSync(otaRoot, { recursive: true });
+    writeFileSync(appliedFloorPath(otaRoot), version, 'utf-8');
+  } catch (err) {
+    console.error('[ota-updater] Failed to persist applied-version floor:', err);
+  }
+}
+
+/**
  * Apply a staged OTA update by atomically swapping directories.
  *
  * Flow:
@@ -616,6 +686,36 @@ export function applyOtaUpdate(
       }
     }
 
+    // Highest-applied-version floor: refuse to apply anything ≤ the highest
+    // version we've EVER applied, even across reinstalls where currentCodeVersion
+    // may regress (e.g. a downgraded shell). Persisted under the OTA root.
+    const floor = readAppliedVersionFloor(otaRoot);
+    if (floor && semverValid(manifest.codeVersion) != null && semverValid(floor) != null) {
+      if (!semverGt(manifest.codeVersion, floor)) {
+        rmSync(stagingDir, { recursive: true, force: true });
+        otaReady = false;
+        readyVersion = undefined;
+        const error = `Refusing to apply OTA ${manifest.codeVersion} — not above the applied-version floor ${floor}`;
+        broadcast({ state: 'error', message: error });
+        return { success: false, error };
+      }
+    }
+
+    // Re-verify the staged overlay IMMEDIATELY before the rename. Download-time
+    // verification can be defeated by an attacker who tampers the staging dir on
+    // disk between stage and apply; re-checking the signed filesHash + Ed25519
+    // signature + per-file hashes here closes that window (bootstrap.ts also
+    // re-verifies at load, so this is defense-in-depth on the apply path).
+    const reverify = verifyStagedOverlaySync(stagingDir, manifest);
+    if (!reverify.valid) {
+      rmSync(stagingDir, { recursive: true, force: true });
+      otaReady = false;
+      readyVersion = undefined;
+      const error = `Staged OTA failed re-verification before apply: ${reverify.error}`;
+      broadcast({ state: 'error', message: error });
+      return { success: false, error };
+    }
+
     broadcast({ state: 'applying', version: manifest.codeVersion });
 
     // Step 1: Remove old rollback
@@ -630,6 +730,10 @@ export function applyOtaUpdate(
 
     // Step 3: Move staging → current (atomic on same filesystem)
     renameSync(stagingDir, currentDir);
+
+    // Record the applied version as the new floor so a later stale-but-signed
+    // overlay can't be applied as a downgrade even across reinstalls.
+    writeAppliedVersionFloor(otaRoot, manifest.codeVersion);
 
     otaReady = false;
     readyVersion = undefined;

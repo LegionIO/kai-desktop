@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { createReadStream, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import type * as NodeOs from 'node:os';
@@ -46,7 +46,7 @@ vi.mock('../signing.js', async (orig) => {
   };
 });
 
-import { downloadOtaUpdate } from '../ota-updater.js';
+import { downloadOtaUpdate, applyOtaUpdate } from '../ota-updater.js';
 import { OTA_DIR_NAME, OTA_STAGING_DIR, OTA_MANIFEST_FILE } from '../types.js';
 import { generateOtaKeys, buildSignedArchive, type BuildArchiveOptions } from './ota-harness.js';
 
@@ -126,5 +126,23 @@ describe('downloadOtaUpdate end-to-end (local server + harness archive)', () => 
     // unchanged — the archive hash check still catches the tamper at minimum.
     const { result } = await runDownload({ corruptFileAfterHash: 'out/main/index.js' });
     expect(result.success).toBe(false);
+  });
+
+  it('re-verifies the staged overlay before apply: a post-stage tamper is rejected', async () => {
+    // Download + stage a clean archive.
+    const { result, stagingExists } = await runDownload();
+    expect(result.success).toBe(true);
+    expect(stagingExists).toBe(true);
+
+    // Tamper a staged file on disk AFTER download-time verification passed.
+    const stagingDir = join(fakeHome, '.' + APP_SLUG, OTA_DIR_NAME, OTA_STAGING_DIR);
+    writeFileSync(join(stagingDir, 'out/main/index.js'), 'TAMPERED-AFTER-STAGE\n', 'utf-8');
+
+    // applyOtaUpdate must re-verify + reject (current version below staged).
+    const applied = applyOtaUpdate(APP_SLUG, '1.0.0');
+    expect(applied.success).toBe(false);
+    expect(applied.error).toMatch(/re-verification|hash mismatch/i);
+    // Staging wiped — no half-applied overlay.
+    expect(existsSync(join(stagingDir, OTA_MANIFEST_FILE))).toBe(false);
   });
 });

@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type * as NodeOs from 'node:os';
+import type * as SigningModule from '../signing';
 import type { OtaManifest } from '../types';
 import { OTA_DIR_NAME, OTA_STAGING_DIR, OTA_CURRENT_DIR, OTA_MANIFEST_FILE } from '../types';
 
@@ -15,6 +16,15 @@ import { OTA_DIR_NAME, OTA_STAGING_DIR, OTA_CURRENT_DIR, OTA_MANIFEST_FILE } fro
 // import must resolve — stub electron + the window broadcast + redirect homedir.
 vi.mock('electron', () => ({ app: { isPackaged: true }, net: {} }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => {} }));
+
+// These tests exercise the VERSION guards (downgrade + floor), not signature
+// verification. Skip the signed-overlay re-verify so minimal unsigned fixtures
+// still apply — the re-verify path itself is covered by ota-download.test.ts
+// against real harness-signed archives.
+vi.mock('../signing.js', async (orig) => {
+  const actual = (await orig()) as typeof SigningModule;
+  return { ...actual, shouldSkipOtaSignature: () => true };
+});
 
 let fakeHome: string;
 vi.mock('node:os', async (orig) => {
@@ -98,6 +108,29 @@ describe('applyOtaUpdate downgrade guard', () => {
   it('applies without a version floor when currentCodeVersion is omitted (back-compat)', () => {
     const otaRoot = stageOverlay('0.0.1');
     const res = applyOtaUpdate(APP_SLUG);
+    expect(res.success).toBe(true);
+    expect(existsSync(join(otaRoot, OTA_CURRENT_DIR, OTA_MANIFEST_FILE))).toBe(true);
+  });
+
+  it('persists an applied-version floor and refuses a later stale overlay below it', () => {
+    // Apply 1.5.0 → floor becomes 1.5.0.
+    stageOverlay('1.5.0');
+    expect(applyOtaUpdate(APP_SLUG, '1.0.0').success).toBe(true);
+
+    // A later staged 1.4.0 — even though currentCodeVersion regressed to 1.0.0
+    // (e.g. a downgraded shell) — must be refused by the floor.
+    const otaRoot = stageOverlay('1.4.0');
+    const res = applyOtaUpdate(APP_SLUG, '1.0.0');
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/floor/i);
+    expect(existsSync(join(otaRoot, OTA_STAGING_DIR))).toBe(false);
+  });
+
+  it('allows an overlay strictly above the applied-version floor', () => {
+    stageOverlay('1.5.0');
+    expect(applyOtaUpdate(APP_SLUG, '1.0.0').success).toBe(true);
+    const otaRoot = stageOverlay('1.6.0');
+    const res = applyOtaUpdate(APP_SLUG, '1.0.0');
     expect(res.success).toBe(true);
     expect(existsSync(join(otaRoot, OTA_CURRENT_DIR, OTA_MANIFEST_FILE))).toBe(true);
   });
