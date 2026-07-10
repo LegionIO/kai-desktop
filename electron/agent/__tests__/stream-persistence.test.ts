@@ -57,6 +57,26 @@ describe('stream persistence accumulator', () => {
     ]);
   });
 
+  it('preserves compaction metadata on a compacted tool result', () => {
+    feed({ conversationId: 'cc', type: 'tool-call', toolCallId: 't1', toolName: 'read_file', args: { path: 'big' } });
+    feed({
+      conversationId: 'cc',
+      type: 'tool-result',
+      toolCallId: 't1',
+      result: 'SUMMARY',
+      durationMs: 10,
+      compaction: { originalContent: 'FULL ORIGINAL OUTPUT', wasCompacted: true, extractionDurationMs: 5 },
+    });
+    feed({ conversationId: 'cc', type: 'done' });
+
+    const [, , msgs] = appendMock.mock.calls[0];
+    const part = msgs[0].content[0];
+    expect(part.result).toBe('SUMMARY');
+    expect(part.originalResult).toBe('FULL ORIGINAL OUTPUT');
+    expect(part.compactionMeta).toEqual({ wasCompacted: true, extractionDurationMs: 5 });
+    expect(part.compactionPhase).toBe('complete');
+  });
+
   it('flags tool errors with isError and preserves the error payload', () => {
     feed({ conversationId: 'c3', type: 'tool-call', toolCallId: 't1', toolName: 'run', args: {} });
     feed({ conversationId: 'c3', type: 'tool-error', toolCallId: 't1', error: 'boom' });

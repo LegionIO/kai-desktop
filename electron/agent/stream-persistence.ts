@@ -25,6 +25,12 @@ type ToolPart = {
   result?: unknown;
   isError?: boolean;
   durationMs?: number;
+  // Compaction metadata — mirrors what RuntimeProvider persists for interactive
+  // streams, so a compacted large tool result stays recoverable after reload on
+  // server-persisted (CLI/headless) streams too.
+  originalResult?: unknown;
+  compactionMeta?: { wasCompacted: boolean; extractionDurationMs: number };
+  compactionPhase?: 'start' | 'complete' | null;
 };
 type ContentPart = TextPart | ToolPart;
 
@@ -108,6 +114,16 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
           event.type === 'tool-error' ? { isError: true, error: event.error ?? 'Tool execution failed' } : event.result;
         part.isError = event.type === 'tool-error' || undefined;
         part.durationMs = event.durationMs ?? part.durationMs;
+        // Preserve compaction metadata so a compacted large tool result stays
+        // recoverable after reload (mirrors RuntimeProvider.applyToolResult).
+        if (event.compaction) {
+          part.originalResult = part.originalResult ?? event.compaction.originalContent;
+          part.compactionMeta = {
+            wasCompacted: event.compaction.wasCompacted,
+            extractionDurationMs: event.compaction.extractionDurationMs,
+          };
+          part.compactionPhase = 'complete';
+        }
       }
       acc.sawContent = true;
       break;
