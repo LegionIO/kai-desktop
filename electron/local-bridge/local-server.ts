@@ -82,10 +82,24 @@ function maybeScheduleIdleShutdown(): void {
  * A single client connection's inbound buffer. The bridge speaks
  * newline-delimited JSON: each line is one `{id,type,channel,args}` request.
  */
+/** Auth handshake deadline: a socket that doesn't authenticate within this is
+ *  destroyed. Prevents an unauthenticated socket from holding a slot / keeping a
+ *  headless backend alive with pre-auth pings. */
+const AUTH_TIMEOUT_MS = 5000;
+
 function attachClient(socket: Socket): void {
-  localClients.add(socket);
+  // Do NOT add to localClients yet — an unauthenticated socket must not receive
+  // broadcasts (info leak) or count toward keeping the backend alive. It joins
+  // the client set only after a successful auth handshake (see handleMessage).
   socket.setNoDelay(true);
-  cancelIdleTimer(); // a client is present — cancel any pending idle shutdown
+
+  // Destroy the socket if it doesn't complete the auth handshake in time.
+  const authTimer = setTimeout(() => {
+    if (!authedClients.has(socket)) {
+      writeLine(socket, { type: 'error', message: 'auth timeout' });
+      socket.destroy();
+    }
+  }, AUTH_TIMEOUT_MS);
 
   // Heartbeat: the client is expected to send {type:'ping'} periodically. If we
   // see no traffic for HEARTBEAT_TIMEOUT_MS we consider the client dead and
@@ -123,6 +137,8 @@ function attachClient(socket: Socket): void {
 
   const onGone = (): void => {
     clearInterval(beat);
+    clearTimeout(authTimer);
+    authedClients.delete(socket);
     localClients.delete(socket);
     maybeScheduleIdleShutdown();
   };
@@ -153,6 +169,9 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
     const ok = provided.length === expected.length && timingSafeEqualStr(provided, expected);
     if (ok) {
       authedClients.add(socket);
+      // Now (and only now) join the broadcast set + count toward liveness.
+      localClients.add(socket);
+      cancelIdleTimer();
       writeLine(socket, { id: msg.id, type: 'result', data: { ok: true } });
     } else {
       writeLine(socket, { id: msg.id, type: 'error', message: 'auth failed' });
