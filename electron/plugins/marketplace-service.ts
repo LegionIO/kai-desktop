@@ -40,6 +40,36 @@ function assertSecureMarketplaceUrl(rawUrl: string): void {
   throw new Error(`Refusing insecure marketplace URL (must be https): ${rawUrl}`);
 }
 
+/** Hard cap on a downloaded plugin archive (before extraction). Real plugins are
+ *  a small fraction of this; the cap only stops a malicious/broken host from
+ *  exhausting memory/disk before the integrity check. */
+const MAX_PLUGIN_ARCHIVE_BYTES = 128 * 1024 * 1024; // 128 MiB
+
+/** Read a fetch Response body into a Buffer, aborting once it exceeds maxBytes. */
+async function readCappedResponse(response: Response, maxBytes: number, pluginName: string): Promise<Buffer> {
+  if (!response.body) return Buffer.from(await response.arrayBuffer());
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.byteLength;
+        if (received > maxBytes) {
+          void reader.cancel();
+          throw new Error(`Plugin "${pluginName}" archive exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c)));
+}
+
 /* ── Marketplace JSON types ── */
 
 export type MarketplacePluginEntry = {
@@ -271,8 +301,14 @@ export class MarketplaceService {
         throw new Error(`Failed to download plugin "${entry.name}": HTTP ${response.status}`);
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const archiveBuffer = Buffer.from(arrayBuffer);
+      // Reject an oversized advertised length up front, then read the body with
+      // a hard byte cap so a malicious/broken host can't exhaust memory before
+      // the integrity check runs.
+      const advertised = Number(response.headers.get('content-length') ?? 0);
+      if (advertised > MAX_PLUGIN_ARCHIVE_BYTES) {
+        throw new Error(`Plugin "${entry.name}" archive too large: ${advertised} > ${MAX_PLUGIN_ARCHIVE_BYTES}`);
+      }
+      const archiveBuffer = await readCappedResponse(response, MAX_PLUGIN_ARCHIVE_BYTES, entry.name);
 
       // Verify the tarball integrity BEFORE writing it to disk or feeding it
       // to tar — a malicious archive could otherwise exploit the extractor.
