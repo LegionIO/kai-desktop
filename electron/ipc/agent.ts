@@ -690,6 +690,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         error: 'Failed to load config: ' + (error instanceof Error ? error.message : String(error)),
       });
       emit({ conversationId, type: 'done' });
+      // Clean up the activeStreams entry set above — otherwise this conversation
+      // stays "busy" forever and later agent:submit calls return conversation-busy.
+      cleanupStreamIfOwned(conversationId, streamToken);
+      pendingServerPersist.delete(conversationId);
+      pendingServerPersistParent.delete(conversationId);
+      serverPersistTokens.delete(conversationId);
+      serverPersistParents.delete(conversationId);
+      activeObserverSessions.delete(conversationId);
       void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
       return { conversationId };
     }

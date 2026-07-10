@@ -880,9 +880,11 @@ function formatStreamError(raw: string, category?: string, statusCode?: number):
 function applyEnrichments(acc: MessageAccumulator, data: Record<string, unknown>): void {
   // Normalize enrichment payload from multiple event shapes — supports both flat keys and nested
   const debate = (data['debate:result'] ?? data['debate'] ?? data['debate_result']) as
-    Record<string, unknown> | undefined;
+    | Record<string, unknown>
+    | undefined;
   const curation = (data['curation:stats'] ?? data['curation'] ?? data['curation_stats']) as
-    Record<string, unknown> | undefined;
+    | Record<string, unknown>
+    | undefined;
 
   if (!debate && !curation) return;
 
@@ -1473,31 +1475,13 @@ export function RuntimeProvider({
     return true;
   }, []);
 
-  // On mount, clear stale runStatus for ALL conversations.
-  // If the app was closed while a stream was in progress, the persisted
-  // runStatus may still be 'running' even though no stream is active.
-  useEffect(() => {
-    (async () => {
-      try {
-        const allConvs = (await app.conversations.list()) as ConversationRecord[];
-        for (const conv of allConvs) {
-          if (
-            (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') &&
-            !streamAccumulators.has(conv.id)
-          ) {
-            // Don't clear a conversation that a main-process automation run is
-            // actively streaming into — its `running` status is real even though
-            // the renderer has no local accumulator yet (the stream may not have
-            // reached us before this mount-time cleanup).
-            if (await app.automations.inFlight(conv.id).catch(() => false)) continue;
-            await patchConversation(conv.id, { runStatus: 'idle' });
-          }
-        }
-      } catch {
-        /* best-effort cleanup */
-      }
-    })();
-  }, []);
+  // Stale `running` runStatus is now swept authoritatively by the MAIN process at
+  // backend startup (resetStaleRunStatus in electron/main.ts), before any client
+  // is served — so a fresh backend can't have a live run yet, and the sweep is
+  // race-free. A renderer-side sweep here would additionally have to know about
+  // CLI/server-persisted runs (activeStreams/serverPersistTokens/currentPendingSubmit),
+  // which it can't see, and could wrongly clear a live headless run the GUI just
+  // connected to. So the renderer no longer sweeps. (Removed per codex r2 M2.)
 
   // Load active conversation on mount
   useEffect(() => {
@@ -1769,7 +1753,8 @@ export function RuntimeProvider({
           const lastIsUser = lastMsg?.role === 'user';
           const lastContent = lastIsUser && Array.isArray(lastMsg.content) ? lastMsg.content : [];
           const lastText = lastContent.find((p: unknown) => (p as { type: string }).type === 'text') as
-            { text?: string } | undefined;
+            | { text?: string }
+            | undefined;
           const isDuplicate = lastIsUser && lastText?.text === msgText;
 
           if (!isDuplicate) {
@@ -1806,7 +1791,8 @@ export function RuntimeProvider({
             toolCallId: e.toolCallId,
             toolName: e.toolName,
             data: e.data as
-              { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean } | undefined,
+              | { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean }
+              | undefined,
           });
         } else if (e.type === 'error') {
           applyError(saAcc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
@@ -2222,7 +2208,8 @@ export function RuntimeProvider({
       } else if (e.type === 'retry') {
         // Retry events are informational — show as observer message
         const retryData = e.data as
-          { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string } | undefined;
+          | { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string }
+          | undefined;
         if (retryData) {
           const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
           const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
