@@ -118,6 +118,32 @@ async function evalInPage<T>(win: BrowserWindow, source: string): Promise<T> {
   return win.webContents.executeJavaScript(source, true) as Promise<T>;
 }
 
+/** Max time a single page navigation may take. A legit load finishes well under
+ *  this; a hung/nonresponsive URL would otherwise pin the orchestrator forever
+ *  (loadURL never rejects on its own for a stalled load). */
+const NAVIGATE_TIMEOUT_MS = 45_000;
+
+/** loadURL bounded by a timeout; stops the in-flight load and rejects on expiry. */
+async function loadURLWithTimeout(win: BrowserWindow, url: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try {
+        if (!win.isDestroyed()) win.webContents.stop();
+      } catch {
+        /* ignore */
+      }
+      reject(new Error(`Navigation to ${url} timed out after ${NAVIGATE_TIMEOUT_MS}ms`));
+    }, NAVIGATE_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([win.loadURL(url), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function result(summary: string, cursor?: { x: number; y: number }): ComputerHarnessActionResult {
   return {
     summary,
@@ -695,7 +721,7 @@ export class IsolatedBrowserHarness implements ComputerHarness {
       // Fall back to synthetic DOM events if the debugger is unavailable.
     }
     if (win.webContents.getURL()) return;
-    await win.loadURL('https://example.com');
+    await loadURLWithTimeout(win, 'https://example.com');
   }
 
   async dispose(sessionId: string): Promise<void> {
@@ -1015,7 +1041,7 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     const url = action.url?.trim();
     if (!url) throw new Error('Navigation requires a URL.');
     const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    await win.loadURL(normalized);
+    await loadURLWithTimeout(win, normalized);
     return result(`Navigated to ${normalized}.`);
   }
 
