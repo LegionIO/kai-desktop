@@ -1,4 +1,4 @@
-import { appendConversationMessages } from '../ipc/conversations.js';
+import { appendConversationMessages, broadcastUpsert } from '../ipc/conversations.js';
 import { readConversation, writeConversation } from '../ipc/conversation-store.js';
 import type { StreamEvent } from './mastra-agent.js';
 
@@ -161,12 +161,14 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
       accumulators.delete(conversationId);
       if (!acc || !acc.sawContent || acc.parts.length === 0) {
         // Nothing to persist, but agent:submit marked the conversation
-        // 'running' for this turn — reset it so it doesn't look stuck busy.
+        // 'running' for this turn — reset it so it doesn't look stuck busy, and
+        // broadcast so non-active GUI/web clients drop the running indicator too.
         try {
           const conv = readConversation(appHome, conversationId);
           if (conv && conv.runStatus === 'running') {
             conv.runStatus = 'idle';
             writeConversation(appHome, conv);
+            broadcastUpsert(appHome, conv);
           }
         } catch {
           // best-effort

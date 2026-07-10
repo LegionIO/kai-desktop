@@ -675,6 +675,20 @@ export function App({
     ],
   );
 
+  // Terminal handler for a turn that failed BEFORE any stream event (submit
+  // threw or resolved { ok:false }). Mirrors the effect's settleTurn: drain one
+  // queued message or go idle, guarded so it runs once per turn.
+  const failTurnAndDrain = useCallback(() => {
+    if (turnSettledRef.current) return;
+    turnSettledRef.current = true;
+    if (queueRef.current.length > 0) {
+      const next = queueRef.current.shift() as string;
+      setTimeout(() => sendMessageRef.current(next), 0);
+    } else {
+      setStatus('idle');
+    }
+  }, []);
+
   const sendMessage = useCallback(
     (trimmed: string) => {
       pushTurn({ kind: 'user', text: trimmed });
@@ -684,23 +698,39 @@ export function App({
       void (async () => {
         try {
           // Persist a lazily-created chat on its first message (see createNew).
+          // Clear the draft only AFTER a successful put, so a failed save doesn't
+          // lose it — the catch below leaves unsavedRecordRef intact for a retry.
           const unsaved = unsavedRecordRef.current;
           if (unsaved) {
-            unsavedRecordRef.current = null;
             await client.invoke('conversations:put', unsaved);
             await client.invoke('conversations:set-active-id', unsaved.id);
+            unsavedRecordRef.current = null;
           }
-          await client.invoke('agent:submit', convIdRef.current, trimmed, { cwd: CWD });
+          // agent:submit RESOLVES with { ok:false } (doesn't throw) when the
+          // conversation is gone — treat that as a terminal error so the turn
+          // doesn't sit 'running' forever with no stream event to settle it.
+          const res = await client.invoke<{ ok?: boolean; error?: string }>(
+            'agent:submit',
+            convIdRef.current,
+            trimmed,
+            {
+              cwd: CWD,
+            },
+          );
+          if (res && res.ok === false) {
+            setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${res.error ?? 'unknown'}` }]);
+            failTurnAndDrain();
+          }
         } catch (err) {
           setTurns((prev) => [
             ...prev,
             { kind: 'error', text: `submit failed: ${(err as { message?: string })?.message ?? err}` },
           ]);
-          setStatus('idle');
+          failTurnAndDrain();
         }
       })();
     },
-    [client, pushTurn],
+    [client, pushTurn, failTurnAndDrain],
   );
   // Keep a ref so the stream-event effect (which doesn't depend on sendMessage)
   // can flush the queue on `done` without re-subscribing.

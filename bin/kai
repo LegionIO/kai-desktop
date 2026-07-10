@@ -6,10 +6,30 @@
 # binary is exec'd DIRECTLY (not via `open`) so it inherits this terminal's
 # stdin/stdout/tty and the Ink TUI can render.
 #
-# Installed on PATH by electron-builder's afterPack (macOS). Resolves the app
-# binary from a few known locations; override with KAI_APP_BINARY.
+# Installed on PATH by electron-builder's afterPack (macOS) — typically as a
+# symlink from /usr/local/bin/kai to Kai.app/Contents/Resources/bin/kai. The
+# PRIMARY resolution derives the app binary from THIS script's own real path
+# (../../MacOS/Kai), so the CLI always runs the exact bundle it shipped in — no
+# trusting a same-bundle-id app that Spotlight happens to find first.
 
 set -eu
+
+# Resolve the real path of a file, following symlinks, without readlink -f
+# (absent on stock macOS). Pure-sh loop.
+resolve_real_path() {
+  _p=$1
+  # cd into the dir + basename loop to canonicalize through symlinks.
+  while [ -L "$_p" ]; do
+    _dir=$(cd -P "$(dirname "$_p")" 2>/dev/null && pwd) || return 1
+    _link=$(ls -ld "$_p" | sed -e 's/^.* -> //')
+    case "$_link" in
+      /*) _p=$_link ;;
+      *) _p=$_dir/$_link ;;
+    esac
+  done
+  _dir=$(cd -P "$(dirname "$_p")" 2>/dev/null && pwd) || return 1
+  printf '%s\n' "$_dir/$(basename "$_p")"
+}
 
 find_binary() {
   # 1. Explicit override.
@@ -20,6 +40,19 @@ find_binary() {
 
   case "$(uname -s)" in
     Darwin)
+      # 2. PRIMARY: derive the app binary from this script's own location.
+      # Shipped at Kai.app/Contents/Resources/bin/kai → ../../MacOS/Kai. This is
+      # the signed binary of the very bundle this shim belongs to, so a stale/
+      # moved/malicious same-bundle-id app can't hijack the CLI.
+      _self=$(resolve_real_path "$0" 2>/dev/null || true)
+      if [ -n "$_self" ]; then
+        _self_bin=$(cd "$(dirname "$_self")/../../MacOS" 2>/dev/null && pwd)/Kai
+        if [ -x "$_self_bin" ]; then
+          printf '%s\n' "$_self_bin"
+          return 0
+        fi
+      fi
+      # 3. Fixed install locations.
       for app in \
         "/Applications/Kai.app" \
         "$HOME/Applications/Kai.app"; do
@@ -28,11 +61,15 @@ find_binary() {
           return 0
         fi
       done
-      # Fall back to Spotlight if not in the usual spots.
+      # 4. Spotlight, last resort. Only trust a hit whose code signature is
+      # valid AND whose bundle id matches — a same-bundle-id app that fails
+      # signature verification (moved/tampered/mounted) is NOT run.
       mdfind_path=$(mdfind "kMDItemCFBundleIdentifier == 'com.kai.desktop'" 2>/dev/null | head -n1 || true)
       if [ -n "$mdfind_path" ] && [ -x "$mdfind_path/Contents/MacOS/Kai" ]; then
-        printf '%s\n' "$mdfind_path/Contents/MacOS/Kai"
-        return 0
+        if codesign --verify --deep --strict "$mdfind_path" >/dev/null 2>&1; then
+          printf '%s\n' "$mdfind_path/Contents/MacOS/Kai"
+          return 0
+        fi
       fi
       ;;
     Linux)
