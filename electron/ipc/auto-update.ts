@@ -113,7 +113,7 @@ export function setUpdateHookRunner(runner: UpdateHookRunner): void {
 
 const POST_UPDATE_MARKER = join(app.getPath('userData'), '.update-completed');
 
-function writePostUpdateMarker(version: string): void {
+function writePostUpdateMarker(version: string): boolean {
   try {
     writeFileSync(
       POST_UPDATE_MARKER,
@@ -123,8 +123,13 @@ function writePostUpdateMarker(version: string): void {
         timestamp: Date.now(),
       }),
     );
-  } catch {
-    /* non-fatal */
+    return true;
+  } catch (err) {
+    // Non-fatal: the update itself still proceeds. But post-update hooks (e.g.
+    // revoking admin granted by a pre-update hook) won't fire after relaunch,
+    // which is a degraded state worth surfacing rather than silently swallowing.
+    console.error('[auto-update] Failed to write post-update marker — post-update hooks will not run:', err);
+    return false;
   }
 }
 

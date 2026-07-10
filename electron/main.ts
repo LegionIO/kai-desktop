@@ -1865,11 +1865,19 @@ if (gotSingleInstanceLock) {
         // (e.g., revoke admin privileges granted by pre-update hook).
         const updateMarker = consumePostUpdateMarker();
         if (updateMarker) {
-          console.info(`[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version}`);
+          // Only report success if the app actually relaunched into the marker's
+          // target version. A failed/rolled-back Squirrel install can leave a
+          // stale marker; firing success post-hooks (e.g. revoking admin) for a
+          // version we're not running would be wrong.
+          const updateSucceeded = updateMarker.version === app.getVersion();
+          console.info(
+            `[${__BRAND_PRODUCT_NAME}] Post-update: ${updateMarker.fromVersion} → ${updateMarker.version} ` +
+              `(running ${app.getVersion()}, success=${updateSucceeded})`,
+          );
           pluginManager
             .runPostUpdateHooks({
               version: updateMarker.version,
-              success: true,
+              success: updateSucceeded,
             })
             .catch((err) => {
               console.error(`[${__BRAND_PRODUCT_NAME}] Post-update hooks after relaunch threw:`, err);
