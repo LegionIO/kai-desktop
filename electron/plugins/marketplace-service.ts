@@ -23,6 +23,23 @@ export type InstallResult = PluginIntegrity & {
 import { checkPluginCompatibility } from './plugin-compat.js';
 import type { CompatCheckResult } from './plugin-compat.js';
 
+/** Reject a marketplace/package URL that isn't HTTPS (localhost allowed for
+ *  dev). A plaintext catalog/download lets a MITM swap the published integrity
+ *  hashes AND the archive, making the integrity check attacker-controlled. */
+function assertSecureMarketplaceUrl(rawUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`Invalid marketplace URL: ${rawUrl}`);
+  }
+  if (parsed.protocol === 'https:') return;
+  const host = parsed.hostname;
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  if (parsed.protocol === 'http:' && isLocal) return;
+  throw new Error(`Refusing insecure marketplace URL (must be https): ${rawUrl}`);
+}
+
 /* ── Marketplace JSON types ── */
 
 export type MarketplacePluginEntry = {
@@ -125,6 +142,7 @@ export class MarketplaceService {
   }
 
   private async fetchSingleCatalog(url: string, bustCache = false): Promise<MarketplaceCatalog> {
+    assertSecureMarketplaceUrl(url);
     const fetchUrl = bustCache ? `${url}?_=${Date.now()}` : url;
     const response = await net.fetch(fetchUrl, {
       headers: {
@@ -244,6 +262,10 @@ export class MarketplaceService {
         tarballUrl = `${baseUrl}/${entry.name}/${tag}/${assetName}`;
       }
 
+      // The resolved package URL must be HTTPS (or localhost) — a plaintext
+      // download lets a MITM swap the archive before the hash check.
+      assertSecureMarketplaceUrl(tarballUrl);
+
       const response = await net.fetch(tarballUrl, { headers });
       if (!response.ok) {
         throw new Error(`Failed to download plugin "${entry.name}": HTTP ${response.status}`);
@@ -254,8 +276,13 @@ export class MarketplaceService {
 
       // Verify the tarball integrity BEFORE writing it to disk or feeding it
       // to tar — a malicious archive could otherwise exploit the extractor.
+      // archiveHash is REQUIRED: without it, tar would run on unverified bytes
+      // (a MITM'd/compromised origin could ship a traversal/symlink archive).
+      if (!entry.archiveHash) {
+        throw new Error(`Plugin "${entry.name}" has no archiveHash — refusing to install unverified package`);
+      }
       const archiveHash = createHash('sha256').update(archiveBuffer).digest('hex');
-      if (entry.archiveHash && archiveHash !== entry.archiveHash) {
+      if (archiveHash !== entry.archiveHash) {
         throw new Error(
           `Plugin "${entry.name}" archive integrity check failed: expected ${entry.archiveHash}, got ${archiveHash}`,
         );
