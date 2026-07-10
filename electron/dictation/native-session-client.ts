@@ -1,5 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { buildSwiftFallbackEnv, resolveCompiledHelperBinary, resolveMaterializedHelperPath } from '../computer-use/permissions.js';
+import {
+  buildSwiftFallbackEnv,
+  resolveCompiledHelperBinary,
+  resolveMaterializedHelperPath,
+} from '../computer-use/permissions.js';
 import type { PartialTypingConfig, PartialTypingStrategy } from './partial-typing.js';
 
 export type DictationNativeTypingMode = 'ax' | 'kb' | 'idle';
@@ -88,6 +92,7 @@ export class DictationNativeSessionClient {
   private resolveReady: (() => void) | null = null;
   private rejectReady: ((error: Error) => void) | null = null;
   private intentionallyClosing = false;
+  private closed = false;
   private ready = false;
 
   constructor(private readonly options: DictationNativeSessionClientOptions = {}) {}
@@ -98,9 +103,7 @@ export class DictationNativeSessionClient {
 
     const binaryPath = resolveCompiledHelperBinary();
     const command = binaryPath ?? 'xcrun';
-    const args = binaryPath
-      ? ['dictationSession']
-      : ['swift', resolveMaterializedHelperPath(), 'dictationSession'];
+    const args = binaryPath ? ['dictationSession'] : ['swift', resolveMaterializedHelperPath(), 'dictationSession'];
 
     this.child = spawn(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -120,7 +123,9 @@ export class DictationNativeSessionClient {
 
     this.readyPromise = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new DictationNativeSessionError('Dictation native helper did not become ready in time.', 'ready_timeout'));
+        reject(
+          new DictationNativeSessionError('Dictation native helper did not become ready in time.', 'ready_timeout'),
+        );
       }, READY_TIMEOUT_MS);
       this.resolveReady = () => {
         clearTimeout(timer);
@@ -186,7 +191,18 @@ export class DictationNativeSessionClient {
 
   close(): void {
     this.intentionallyClosing = true;
+    this.closed = true;
     if (this.child && !this.child.killed) {
+      // Detach stdout/stderr/lifecycle listeners so a late chunk buffered after
+      // SIGTERM can't dispatch a targetDirty/response event for a dead session.
+      try {
+        this.child.stdout.removeAllListeners('data');
+        this.child.stderr.removeAllListeners('data');
+        this.child.removeAllListeners('exit');
+        this.child.removeAllListeners('error');
+      } catch {
+        // Ignore listener-teardown failures.
+      }
       try {
         this.child.stdin.end();
       } catch {
@@ -212,15 +228,19 @@ export class DictationNativeSessionClient {
     if (!appName || targetPid == null) return null;
     return {
       appName,
-      bundleId: typeof response.targetBundleId === 'string' && response.targetBundleId.trim()
-        ? response.targetBundleId.trim()
-        : null,
+      bundleId:
+        typeof response.targetBundleId === 'string' && response.targetBundleId.trim()
+          ? response.targetBundleId.trim()
+          : null,
       pid: targetPid,
       capturedAt: normalizeTimestamp(response.capturedAt),
     };
   }
 
-  private async checkedRequest(method: string, params: Record<string, unknown>): Promise<DictationNativeSessionResponse> {
+  private async checkedRequest(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<DictationNativeSessionResponse> {
     const response = await this.request(method, params);
     if (response.ok === false) {
       throw new DictationNativeSessionError(response.error ?? `${method} failed`, response.errorCode);
@@ -257,6 +277,7 @@ export class DictationNativeSessionClient {
   }
 
   private handleStdout(text: string): void {
+    if (this.closed) return;
     this.stdoutBuffer += text;
     while (true) {
       const newline = this.stdoutBuffer.indexOf('\n');
@@ -307,9 +328,10 @@ export class DictationNativeSessionClient {
     }
 
     if (event.event === 'targetDirty') {
-      const reason = event.reason
-        ?? [event.kind, event.eventType, event.keyCode].filter(value => value != null).join(':')
-        ?? 'native-event';
+      const reason =
+        event.reason ??
+        [event.kind, event.eventType, event.keyCode].filter((value) => value != null).join(':') ??
+        'native-event';
       this.options.onTargetDirty?.(reason || 'native-event');
       return;
     }

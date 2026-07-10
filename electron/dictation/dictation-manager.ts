@@ -586,7 +586,13 @@ async function startDictationInner(): Promise<void> {
     let beginResponse: DictationNativeSessionResponse;
     if (process.platform === 'darwin') {
       nativeSession = new DictationNativeSessionClient({
-        onTargetDirty: (reason) => scheduleTypingTargetRefresh(`native:${reason}`),
+        onTargetDirty: (reason) => {
+          // Drop a targetDirty from an old helper: after stop/start the native
+          // client's listeners can still fire a late event that would schedule a
+          // refresh against a newer session's target.
+          if (generation !== sessionGeneration) return;
+          scheduleTypingTargetRefresh(`native:${reason}`);
+        },
         onProtocolError: (message) => dictationDebugLog('NATIVE_SESSION_PROTOCOL', { message }),
         onExit: (message) => handleNativeSessionExit(generation, message),
       });
@@ -942,15 +948,29 @@ async function refreshTypingTargetSnapshot(reason: string): Promise<void> {
 }
 
 async function finishSession(): Promise<void> {
+  // Scope this finish to the session that owns it. If the overall stop timeout
+  // (STOP_SESSION_OVERALL_TIMEOUT_MS) fires, stopDictationInner rejects, falls
+  // through to cleanupSession() + bumps sessionGeneration, and a new session may
+  // start — but this finishSession keeps running. Every step below either awaits
+  // or mutates a module global (recognizer / openaiSttSession / nativeSession /
+  // recorder window / session state) that the NEW session now owns, so we re-check
+  // the captured generation after each await and bail before touching anything if
+  // superseded. cleanupSession() (the timeout fallback) already owns teardown.
+  const generation = sessionGeneration;
   stopAudioPolling();
   stopHoldMonitor();
   stopTypingTargetTracking();
   await drainRemainingAudioToStt();
+  if (generation !== sessionGeneration) return;
   const finalChunks = await stopMicCapture();
+  if (generation !== sessionGeneration) return;
   writeAudioChunksToStt(finalChunks);
   await stopStt();
+  if (generation !== sessionGeneration) return;
   await waitForTypingQueueToSettle();
+  if (generation !== sessionGeneration) return;
   await endNativeSession();
+  if (generation !== sessionGeneration) return;
   destroyRecorderWindow();
   resetSessionState();
 }
@@ -1263,16 +1283,23 @@ async function startOpenAIStt(): Promise<void> {
     sampleRateHz,
   );
 
+  // Capture the generation this STT session belongs to. A late SDK/WS callback
+  // that arrives after this session was stopped (and possibly a new one started)
+  // must not type its stale transcript into the newer target.
+  const sttGeneration = sessionGeneration;
   openaiSttSession = new OpenAIRealtimeSttSession(
     { ...sttConfig, sampleRate: sampleRateHz, language },
     {
       onPartial: (text) => {
+        if (sttGeneration !== sessionGeneration) return;
         handlePartial(text);
       },
       onFinal: (text) => {
+        if (sttGeneration !== sessionGeneration) return;
         handleFinal(text);
       },
       onError: (error) => {
+        if (sttGeneration !== sessionGeneration) return;
         console.error('[Dictation] OpenAI STT error: %s', error);
         handleSttCancellationError();
       },
@@ -1347,19 +1374,27 @@ async function startAzureStt(): Promise<void> {
   // Create recognizer
   recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
 
+  // Capture the generation this recognizer belongs to. Azure fires callbacks on
+  // its own threads; a `recognized`/`recognizing` that lands after stop (during
+  // the async stopContinuousRecognitionAsync) must not type into a newer session.
+  const sttGeneration = sessionGeneration;
+
   recognizer.recognizing = (_sender, e) => {
+    if (sttGeneration !== sessionGeneration) return;
     if (e.result.text) {
       handlePartial(e.result.text);
     }
   };
 
   recognizer.recognized = (_sender, e) => {
+    if (sttGeneration !== sessionGeneration) return;
     if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
       handleFinal(e.result.text);
     }
   };
 
   recognizer.canceled = (_sender, e) => {
+    if (sttGeneration !== sessionGeneration) return;
     if (e.reason === sdk.CancellationReason.Error) {
       console.error(
         '[Dictation] STT canceled: reason=%s errorCode=%s hasDetails=%s',
