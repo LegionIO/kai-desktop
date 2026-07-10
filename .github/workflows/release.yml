@@ -100,12 +100,12 @@ jobs:
           git tag "$TAG"
           git push origin "$TAG"
 
-  publish-release:
+  build-mac:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: prepare-release
     runs-on: macos-26
     permissions:
-      contents: write
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
       # Code signing — electron-builder reads these automatically
@@ -218,30 +218,17 @@ jobs:
           echo "path=$stable_path" >> "$GITHUB_OUTPUT"
           echo "name=$stable_name" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub release
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-        run: |
-          gh release create "$TAG" "${{ steps.artifact.outputs.path }}" \
-            --generate-notes \
-            --title "$TAG" \
-            --verify-tag
-
-      - name: Upload auto-update artifacts
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-        run: |
-          # Upload the ZIP archive (used by electron-updater for macOS auto-updates)
-          zip_path="$(find dist -maxdepth 1 -type f -name '*.zip' | head -n 1)"
-          if [ -n "$zip_path" ]; then
-            gh release upload "$TAG" "$zip_path" --clobber
-          fi
-
-          # Upload the latest-mac.yml manifest (tells electron-updater where to find the update)
-          manifest_path="$(find dist -maxdepth 1 -type f -name 'latest-mac.yml' | head -n 1)"
-          if [ -n "$manifest_path" ]; then
-            gh release upload "$TAG" "$manifest_path" --clobber
-          fi
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kai-mac
+          # DMG (stable-named) + the auto-update zip + latest-mac.yml manifest.
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Classify release for OTA eligibility
         id: ota-classify
@@ -268,30 +255,21 @@ jobs:
 
       - name: Upload OTA artifacts
         if: steps.ota-classify.outputs.eligible == 'true'
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-        run: |
-          # Upload the OTA archive
-          ota_path="$(find dist -maxdepth 1 -type f -name '*-ota-*.tar.gz' | head -n 1)"
-          if [ -n "$ota_path" ]; then
-            gh release upload "$TAG" "$ota_path" --clobber
-            echo "Uploaded OTA archive: $(basename "$ota_path") ($(du -h "$ota_path" | cut -f1))"
-          fi
+        uses: actions/upload-artifact@v4
+        with:
+          name: kai-ota
+          path: |
+            dist/*-ota-*.tar.gz
+            dist/latest-ota.json
+          if-no-files-found: error
+          retention-days: 1
 
-          # Upload the OTA feed manifest
-          if [ -f "dist/latest-ota.json" ]; then
-            gh release upload "$TAG" "dist/latest-ota.json" --clobber
-            echo "Uploaded OTA feed manifest"
-          fi
-
-  publish-release-win:
+  build-windows:
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    needs: [prepare-release, publish-release]
+    needs: prepare-release
     runs-on: windows-latest
     permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
+      contents: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -310,35 +288,37 @@ jobs:
 
       - run: pnpm build:win
 
-      - name: Upload Windows artifacts to release
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
+      - name: Verify Windows artifacts present
         shell: bash
         run: |
-          # Upload the NSIS installer
+          # Fail fast in the build job (not the finalize job) if outputs are missing.
           exe_path="$(find dist -maxdepth 1 -type f -name '*.exe' | head -n 1)"
           if [ -z "$exe_path" ]; then
             echo "ERROR: No .exe installer found in dist/" >&2
             exit 1
           fi
-          gh release upload "$TAG" "$exe_path" --clobber
-
-          # Upload the latest.yml manifest (tells electron-updater where to find the Windows update)
           manifest_path="$(find dist -maxdepth 1 -type f -name 'latest.yml' | head -n 1)"
           if [ -z "$manifest_path" ]; then
             echo "ERROR: No latest.yml manifest found in dist/" >&2
             exit 1
           fi
-          gh release upload "$TAG" "$manifest_path" --clobber
 
-  publish-release-linux:
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kai-windows
+          path: |
+            dist/*.exe
+            dist/latest.yml
+          if-no-files-found: error
+          retention-days: 1
+
+  build-linux:
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    needs: [prepare-release, publish-release]
+    needs: prepare-release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
+      contents: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -357,39 +337,112 @@ jobs:
 
       - run: pnpm build:linux
 
-      - name: Upload Linux artifacts to release
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
+      - name: Verify Linux artifacts present
         run: |
-          # AppImage (primary installer + auto-update payload)
+          # Fail fast in the build job (not the finalize job) if outputs are missing.
           appimage_path="$(find dist -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
           if [ -z "$appimage_path" ]; then
             echo "ERROR: No .AppImage found in dist/" >&2
             exit 1
           fi
-          gh release upload "$TAG" "$appimage_path" --clobber
-
-          # .deb package
           deb_path="$(find dist -maxdepth 1 -type f -name '*.deb' | head -n 1)"
           if [ -z "$deb_path" ]; then
             echo "ERROR: No .deb package found in dist/" >&2
             exit 1
           fi
-          gh release upload "$TAG" "$deb_path" --clobber
-
-          # latest-linux.yml manifest (electron-updater)
           manifest_path="$(find dist -maxdepth 1 -type f -name 'latest-linux.yml' | head -n 1)"
           if [ -z "$manifest_path" ]; then
             echo "ERROR: No latest-linux.yml manifest found in dist/" >&2
             exit 1
           fi
-          gh release upload "$TAG" "$manifest_path" --clobber
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kai-linux
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/latest-linux.yml
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [prepare-release, build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kai-mac
+          path: ./dist/
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kai-windows
+          path: ./dist/
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kai-linux
+          path: ./dist/
+
+      - name: Download OTA artifacts
+        # OTA archive is only built when classify-release marks the release
+        # OTA-eligible (JS-only changes); non-eligible releases ship a full app
+        # update only, so this artifact may not exist.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: kai-ota
+          path: ./dist/
+
+      - name: Create GitHub release with all platform assets
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          # Collect every asset the platform build jobs produced. Each is
+          # required except the OTA files (only present for eligible releases).
+          assets=()
+          for pat in '*.dmg' '*.zip' 'latest-mac.yml' '*.exe' 'latest.yml' '*.AppImage' '*.deb' 'latest-linux.yml'; do
+            f="$(find dist -maxdepth 1 -type f -name "$pat" | head -n 1)"
+            if [ -z "$f" ]; then
+              echo "ERROR: expected release asset missing: $pat" >&2
+              exit 1
+            fi
+            assets+=("$f")
+          done
+          # OTA (optional)
+          for pat in '*-ota-*.tar.gz' 'latest-ota.json'; do
+            f="$(find dist -maxdepth 1 -type f -name "$pat" | head -n 1)"
+            if [ -n "$f" ]; then
+              assets+=("$f")
+              echo "Including OTA asset: $(basename "$f")"
+            fi
+          done
+
+          gh release create "$TAG" "${assets[@]}" \
+            --generate-notes \
+            --title "$TAG" \
+            --verify-tag
 
   update-cask:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs:
       - prepare-release
-      - publish-release
+      - build-mac
+      - release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -399,7 +452,7 @@ jobs:
       - name: Download DMG and compute SHA256
         id: sha
         env:
-          ASSET_NAME: ${{ needs.publish-release.outputs.asset_name }}
+          ASSET_NAME: ${{ needs.build-mac.outputs.asset_name }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
           gh release download "$TAG" \
