@@ -173,6 +173,13 @@ export class ComputerUseSessionManager extends EventEmitter {
   private readonly orchestrator: ComputerUseOrchestrator;
   private takeoverMonitorActive = false;
   private takeoverSuppressedUntil = 0;
+  /** Last observed Input Monitoring grant state (from preflight). Input
+   *  Monitoring is needed ONLY for takeover detection, not core automation, so
+   *  a session may run without it — the takeover monitor is simply skipped. */
+  private inputMonitoringGranted = false;
+  /** True once we've warned that takeover monitoring is unavailable, so we don't
+   *  spam the log each refresh. */
+  private takeoverUnavailableWarned = false;
   /** Serializes local-macos start/resume/continue so their check-then-act
    *  (guard → await preflight → transition to running) can't interleave and
    *  let two local-macos sessions run at once. */
@@ -397,13 +404,12 @@ export class ComputerUseSessionManager extends EventEmitter {
             ' so it can drive System Events and read focused window metadata.',
         );
       }
-      if (!permissions.inputMonitoringGranted) {
-        missing.push(
-          'Enable Input Monitoring for ' +
-            __BRAND_PRODUCT_NAME +
-            ' in System Settings > Privacy & Security > Input Monitoring so it can detect when you take over control.',
-        );
-      }
+      // Input Monitoring is NOT a session-start blocker: it's only needed for
+      // manual-takeover DETECTION, not core screenshot/input automation. Record
+      // the grant state so the takeover monitor can degrade gracefully (skip
+      // monitoring + warn) instead of blocking the whole session — especially
+      // since the functional probe false-negatives when the user is idle.
+      this.inputMonitoringGranted = permissions.inputMonitoringGranted === true;
       return missing.length > 0 ? missing.join(' ') : null;
     }
 
@@ -509,12 +515,29 @@ export class ComputerUseSessionManager extends EventEmitter {
 
   private shouldRunTakeoverMonitor(): boolean {
     if (!this.getConfig().computerUse.safety.manualTakeoverPauses) return false;
+    let hasRunningLocalMacos = false;
     for (const session of this.sessions.values()) {
       if (session.target !== 'local-macos') continue;
       if (session.status !== 'running') continue;
-      return true;
+      hasRunningLocalMacos = true;
+      break;
     }
-    return false;
+    if (!hasRunningLocalMacos) return false;
+    // Takeover detection requires Input Monitoring. If it isn't granted, the
+    // session still runs (core automation doesn't need it) — we just can't watch
+    // for a manual takeover. Warn once so the user knows the safety feature is
+    // off, then degrade gracefully rather than blocking the session.
+    if (!this.inputMonitoringGranted) {
+      if (!this.takeoverUnavailableWarned) {
+        console.warn(
+          '[Computer Use] Manual-takeover monitoring is unavailable (Input Monitoring not granted) — ' +
+            'the session will run without takeover detection. Enable Input Monitoring in System Settings to restore it.',
+        );
+        this.takeoverUnavailableWarned = true;
+      }
+      return false;
+    }
+    return true;
   }
 
   private suppressTakeoverMonitor(durationMs = 1000): void {

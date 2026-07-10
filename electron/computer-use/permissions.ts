@@ -375,7 +375,12 @@ async function getNonDarwinPermissions(): Promise<ComputerUsePermissions> {
     // `automationGranted` is a hard preflight gate; on non-darwin it reflects
     // the ability to launch/control apps, not optional text introspection.
     automationGranted: helperReady,
-    inputMonitoringGranted: true,
+    // Input Monitoring is a macOS-only concept used solely for takeover
+    // detection (via the Swift helper). On non-darwin / fallback adapters there
+    // is no such permission and no takeover monitor, so report false honestly.
+    // This is no longer a session-start blocker (takeover monitoring degrades
+    // gracefully when absent), so reporting false doesn't block core automation.
+    inputMonitoringGranted: false,
     helperReady,
     message: helperReady ? undefined : (platform.message ?? fallback?.message),
   };
