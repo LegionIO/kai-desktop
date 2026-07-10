@@ -273,6 +273,7 @@ export function getBridgeScript(): string {
     agent: {
       stream: function(cId, msgs, mk, re, pk, fb, cwd, em) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd, em); },
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
+      inFlight: function(cId) { return invoke('agent:in-flight', cId); },
       approveToolCall: function(id) { return invoke('agent:approve-tool', id); },
       rejectToolCall: function(id) { return invoke('agent:reject-tool', id); },
       dismissToolCall: function(id) { return invoke('agent:dismiss-tool', id); },
