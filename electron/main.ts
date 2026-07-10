@@ -192,6 +192,26 @@ let headlessWindowBlockActive = IS_HEADLESS;
   };
 }
 
+// The prototype patch above catches explicit .show()/.showInactive() calls, but
+// a window created with the DEFAULT `{ show: true }` becomes visible during
+// construction without ever calling .show(). Catch those at the source: while
+// the headless block is active, hide + destroy any newly-created window
+// immediately. A no-op when headlessWindowBlockActive is false (normal GUI, and
+// after promoteHeadlessToWindowed lifts the flag so the real window survives).
+app.on('browser-window-created', (_event, win) => {
+  if (!headlessWindowBlockActive) return;
+  try {
+    win.hide();
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (!win.isDestroyed()) win.destroy();
+  } catch {
+    /* ignore */
+  }
+});
+
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
 
 /**
