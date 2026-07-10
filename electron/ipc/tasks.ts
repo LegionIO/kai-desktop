@@ -1,5 +1,4 @@
 import type { IpcMain } from 'electron';
-import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -14,6 +13,7 @@ import type {
 import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 import { clearBuffer } from '../terminal/output-buffer.js';
 
@@ -118,20 +118,17 @@ function isValidTaskId(id: unknown): id is string {
 function broadcastTaskChange(appHome: string): void {
   try {
     const tasks = listAllTasks(appHome);
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      win.webContents.send('tasks:changed', tasks);
-    }
+    // broadcastToAllWindows fans out to every desktop window AND web-bridge
+    // clients (via broadcastToWebClients), so the web Tasks view gets live
+    // updates too — a plain webContents.send loop would skip web clients.
+    broadcastToAllWindows('tasks:changed', tasks);
   } catch (err) {
     console.error('[tasks] Failed to broadcast task change:', err);
   }
 }
 
 function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue;
-    win.webContents.send('tasks:stream-event', event);
-  }
+  broadcastToAllWindows('tasks:stream-event', event);
 }
 
 export function listAllTasks(appHome: string): TaskFile[] {

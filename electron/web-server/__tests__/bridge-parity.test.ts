@@ -76,7 +76,7 @@ function evalBridgeScript(): Record<string, unknown> {
 describe('web bridge ↔ preload parity', () => {
   // Namespaces required to be a full method-level mirror of preload. Other
   // namespaces (dialog, mic, image…) are intentionally degraded in web mode.
-  const fullMirrorNamespaces = ['plugins'] as const;
+  const fullMirrorNamespaces = ['plugins', 'tasks', 'agents', 'workspaces'] as const;
 
   it.each(fullMirrorNamespaces)('web shim `app.%s` exposes every method preload does', (ns) => {
     expect(preloadAPI).toBeDefined();

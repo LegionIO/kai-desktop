@@ -9,10 +9,10 @@
  */
 
 import type { IpcMain } from 'electron';
-import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { appendOutput, getBuffer } from './output-buffer.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 
 // node-pty is a native addon — imported dynamically to gracefully handle
 // missing builds (e.g. in CI or unsupported platforms).
@@ -209,10 +209,10 @@ export class TaskTerminalManager {
   }
 
   private broadcast(channel: string, data: unknown): void {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      win.webContents.send(channel, data);
-    }
+    // Fan out to all desktop windows AND web-bridge clients so a web task
+    // terminal receives live PTY output/exit (a plain webContents.send loop
+    // would skip web clients).
+    broadcastToAllWindows(channel, data);
   }
 }
 

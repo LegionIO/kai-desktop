@@ -6,7 +6,6 @@
  */
 
 import type { IpcMain } from 'electron';
-import { BrowserWindow } from 'electron';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -14,6 +13,7 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js'
 import type { TaskFile, TaskReviewResult, TaskRun } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
 import { analyzeCompletion as analyzeCompletionCore } from '../agent/task-completion.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { z } from 'zod';
 import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
 import { listAllTasks } from './tasks.js';
@@ -228,10 +228,9 @@ function writeTask(appHome: string, task: TaskFile): void {
 function broadcastAgentChange(appHome: string): void {
   try {
     const agents = listAllAgents(appHome);
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      win.webContents.send('agents:changed', agents);
-    }
+    // Fan out to desktop windows AND web-bridge clients so the web Agents view
+    // updates live (a plain webContents.send loop would skip web clients).
+    broadcastToAllWindows('agents:changed', agents);
   } catch (err) {
     console.error('[agents] Failed to broadcast agent change:', err);
   }
@@ -240,10 +239,7 @@ function broadcastAgentChange(appHome: string): void {
 function broadcastTaskChange(appHome: string): void {
   try {
     const tasks = listAllTasks(appHome);
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      win.webContents.send('tasks:changed', tasks);
-    }
+    broadcastToAllWindows('tasks:changed', tasks);
   } catch (err) {
     console.error('[agents] Failed to broadcast task change:', err);
   }
@@ -323,10 +319,7 @@ async function runSingleReviewer(
 
   const broadcast = (text: string) => {
     appendOutput(virtualSessionId, text);
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (win.isDestroyed()) continue;
-      win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
-    }
+    broadcastToAllWindows('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
   };
 
   broadcast(`\x1b[1;35m[Reviewer: ${agentName}]\x1b[0m Starting review of task: ${task.title}\r\n`);
@@ -506,10 +499,7 @@ async function runSingleReviewer(
   }
 
   // Broadcast terminal exit for this reviewer's session
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue;
-    win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
-  }
+  broadcastToAllWindows('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
 
   return result;
 }
@@ -811,10 +801,7 @@ export async function startAgentRun(
     // Broadcast formatted output to the terminal viewer via the standard channel
     const broadcast = (text: string) => {
       appendOutput(virtualSessionId, text);
-      for (const win of BrowserWindow.getAllWindows()) {
-        if (win.isDestroyed()) continue;
-        win.webContents.send('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
-      }
+      broadcastToAllWindows('tasks:terminal-data', { sessionId: virtualSessionId, data: text });
     };
 
     // Run the Mastra agent asynchronously
@@ -1115,10 +1102,7 @@ export async function startAgentRun(
         broadcastTaskChange(appHome);
 
         // Broadcast terminal exit so the UI knows it's done
-        for (const win of BrowserWindow.getAllWindows()) {
-          if (win.isDestroyed()) continue;
-          win.webContents.send('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
-        }
+        broadcastToAllWindows('tasks:terminal-exit', { sessionId: virtualSessionId, exitCode: 0 });
 
         // Clean up abort controller
         mastraAbortControllers.delete(virtualSessionId);
