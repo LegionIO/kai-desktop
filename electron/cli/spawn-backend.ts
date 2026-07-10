@@ -28,6 +28,9 @@ export function spawnHeadlessBackend(fromElectron: boolean): boolean {
       stdio: 'ignore',
       env: { ...process.env, KAI_HEADLESS: '1', KAI_CLI: '' },
     });
+    child.on('error', (err) => {
+      cliLog(`failed to spawn headless backend: ${err instanceof Error ? err.message : String(err)}`);
+    });
     child.unref();
     return true;
   }
@@ -39,18 +42,28 @@ export function spawnHeadlessBackend(fromElectron: boolean): boolean {
   const entryDir = dirname(process.argv[1] ?? ''); // .../out/main
   const mainBundle = join(entryDir, 'index.js'); // sibling of cli.js
   const root = join(entryDir, '..', '..'); // repo root (out/main → up 2)
+  // On Windows, node_modules/.bin/electron is a .cmd shim that CreateProcess
+  // cannot exec directly (spawn without a shell → ENOENT/EINVAL). Spawn the real
+  // electron.exe from the package's dist dir instead; fall back to the POSIX bin.
   const electron =
     process.platform === 'win32'
-      ? join(root, 'node_modules', '.bin', 'electron.cmd')
+      ? join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
       : join(root, 'node_modules', '.bin', 'electron');
   if (!existsSync(mainBundle)) {
     cliLog('cannot locate the Electron main bundle (out/main/index.js) — run `pnpm build` first');
+    return false;
+  }
+  if (!existsSync(electron)) {
+    cliLog(`cannot locate the dev Electron binary at ${electron} — run \`pnpm install\` first`);
     return false;
   }
   const child = spawn(electron, [mainBundle, '--kai-headless'], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, KAI_HEADLESS: '1', KAI_CLI: '' },
+  });
+  child.on('error', (err) => {
+    cliLog(`failed to spawn dev backend: ${err instanceof Error ? err.message : String(err)}`);
   });
   child.unref();
   return true;
