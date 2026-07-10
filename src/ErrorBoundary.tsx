@@ -20,10 +20,49 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.error) {
       return (
-        <div style={{ padding: 40, fontFamily: 'system-ui, monospace', backgroundColor: '#120f29', color: '#f4efff', height: '100vh', overflow: 'auto' }}>
-          <h2 style={{ marginBottom: 16 }}>
-            {__BRAND_ERROR_BOUNDARY_TEXT}
-          </h2>
+        <div
+          style={{
+            padding: 40,
+            fontFamily: 'system-ui, monospace',
+            backgroundColor: '#120f29',
+            color: '#f4efff',
+            height: '100vh',
+            overflow: 'auto',
+          }}
+        >
+          <h2 style={{ marginBottom: 16 }}>{__BRAND_ERROR_BOUNDARY_TEXT}</h2>
+          <div style={{ display: 'flex', gap: 12, marginBottom: 20 }}>
+            <button
+              type="button"
+              onClick={() => this.setState({ error: null })}
+              style={{
+                padding: '6px 14px',
+                borderRadius: 8,
+                border: '1px solid #6d5bd0',
+                background: '#2a2350',
+                color: '#f4efff',
+                cursor: 'pointer',
+                fontSize: 13,
+              }}
+            >
+              Try again
+            </button>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              style={{
+                padding: '6px 14px',
+                borderRadius: 8,
+                border: '1px solid #3a3560',
+                background: 'transparent',
+                color: '#d9d0ff',
+                cursor: 'pointer',
+                fontSize: 13,
+              }}
+            >
+              Reload
+            </button>
+          </div>
           <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5, color: '#d9d0ff' }}>
             {this.state.error.message}
             {'\n\n'}
