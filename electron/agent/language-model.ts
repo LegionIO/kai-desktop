@@ -29,7 +29,10 @@ function normalizeOpenAIBaseUrl(endpoint?: string): string | undefined {
   try {
     parsed = new URL(trimmed);
   } catch {
-    return undefined;
+    // A non-empty but unparseable endpoint must NOT silently fall back to the
+    // default OpenAI host — that would route a custom/compatible provider's
+    // request (and its key) to the wrong provider. Surface it as a config error.
+    throw new Error(`Invalid provider endpoint URL: ${endpoint}`);
   }
   if (hasOpenAIV1Path(parsed.pathname)) return trimmed;
   if (!isAzureOpenAIHost(parsed.hostname)) return trimmed;

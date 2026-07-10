@@ -100,10 +100,7 @@ export function resolveModelCatalog(config: AppConfig): {
   return { entries, defaultEntry, byKey };
 }
 
-export function resolveModelForThread(
-  config: AppConfig,
-  threadModelKey: string | null,
-): ModelCatalogEntry | null {
+export function resolveModelForThread(config: AppConfig, threadModelKey: string | null): ModelCatalogEntry | null {
   const catalog = resolveModelCatalog(config);
   if (threadModelKey && catalog.byKey.has(threadModelKey)) {
     return catalog.byKey.get(threadModelKey)!;
@@ -148,9 +145,7 @@ export function resolveStreamConfig(
   //    Special sentinel '__none__' means explicitly skip all profiles.
   const skipProfile = opts.threadProfileKey === '__none__';
   const profileKey = skipProfile ? null : (opts.threadProfileKey ?? config.defaultProfileKey ?? null);
-  let profile = profileKey
-    ? (config.profiles ?? []).find((p) => p.key === profileKey)
-    : undefined;
+  let profile = profileKey ? (config.profiles ?? []).find((p) => p.key === profileKey) : undefined;
 
   // If no profile resolved, synthesize an implicit one from the global defaultModelKey
   // so the resolution always flows through a profile path.
@@ -164,17 +159,19 @@ export function resolveStreamConfig(
   }
 
   // 2. Resolve primary model: manual override → profile's primary model
-  const primaryModelKey = opts.threadModelKey
-    ?? profile.primaryModelKey;
+  const primaryModelKey = opts.threadModelKey ?? profile.primaryModelKey;
   const primaryModel = catalog.byKey.get(primaryModelKey) ?? catalog.defaultEntry;
   if (!primaryModel) return null;
 
-  // 3. Resolve fallback chain from profile
+  // 3. Resolve fallback chain from profile. Filter against the RESOLVED primary
+  // key (primaryModel.key), not the requested key — when the requested key is
+  // stale and we fell back to defaultEntry, filtering by the stale key could
+  // leave the resolved primary sitting in its own fallback list.
   const fallbackKeys = profile.fallbackModelKeys;
   const fallbackModels = fallbackKeys
-    .filter((k) => k !== primaryModelKey)
     .map((k) => catalog.byKey.get(k))
-    .filter((e): e is ModelCatalogEntry => e != null);
+    .filter((e): e is ModelCatalogEntry => e != null)
+    .filter((e) => e.key !== primaryModel.key);
 
   // 4. Merge parameters: thread overrides → profile overrides → global
   const threadOvr = opts.threadOverrides;
@@ -182,10 +179,11 @@ export function resolveStreamConfig(
   const maxSteps = threadOvr?.maxSteps ?? profile.maxSteps ?? config.advanced.maxSteps;
   const maxRetries = threadOvr?.maxRetries ?? profile.maxRetries ?? config.advanced.maxRetries;
   const profileUseResponsesApi = profile.useResponsesApi;
-  const useResponsesApi = profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
+  const useResponsesApi =
+    profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
   const globalSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
   const systemPrompt = threadOvr?.systemPromptOverride?.trim() || profile.systemPrompt?.trim() || globalSystemPrompt;
-  const reasoningEffort = opts.reasoningEffort ?? profile.reasoningEffort as ReasoningEffort | undefined;
+  const reasoningEffort = opts.reasoningEffort ?? (profile.reasoningEffort as ReasoningEffort | undefined);
 
   // 5. Apply merged parameters to model configs (cloned so we don't mutate catalog)
   // For useResponsesApi, precedence is: profile explicit > model/provider default > global default.
