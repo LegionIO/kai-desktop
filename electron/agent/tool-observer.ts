@@ -297,10 +297,12 @@ export class ToolObserverManager {
     this.baseThreadContext = options.baseThreadContext;
     this.emitMidToolMessage = options.emitMidToolMessage;
     this.cancelToolCall = options.cancelToolCall;
-    this.launchToolCall = options.launchToolCall ?? (async () => ({
-      ok: false,
-      details: 'Observer-initiated tool launch is not enabled in this runtime path.',
-    }));
+    this.launchToolCall =
+      options.launchToolCall ??
+      (async () => ({
+        ok: false,
+        details: 'Observer-initiated tool launch is not enabled in this runtime path.',
+      }));
     this.messageSubAgent = options.messageSubAgent;
   }
 
@@ -403,9 +405,12 @@ export class ToolObserverManager {
         resolve();
       };
 
-      const timer = setTimeout(() => {
-        done();
-      }, Math.max(1, timeoutMs));
+      const timer = setTimeout(
+        () => {
+          done();
+        },
+        Math.max(1, timeoutMs),
+      );
 
       const wrappedDone = (): void => {
         clearTimeout(timer);
@@ -457,6 +462,11 @@ export class ToolObserverManager {
     if (this.evaluationTimer) {
       clearTimeout(this.evaluationTimer);
       this.evaluationTimer = null;
+    }
+    // Resolve any in-flight waitForLinkedLaunchedTools promises now instead of
+    // leaving them to hang until their own timeout — the session is gone.
+    for (const waiters of this.parentWaiters.values()) {
+      for (const waiter of waiters) waiter();
     }
     this.tools.clear();
     this.perToolAugmentation.clear();
@@ -561,11 +571,11 @@ export class ToolObserverManager {
       this.baseThreadContext ? `BASE THREAD CONTEXT\n${this.baseThreadContext}` : '',
       observerLines.length > 0 ? `OBSERVER JOURNAL\n${observerLines.join('\n')}` : '',
       runningLines.length > 0 ? `RUNNING TOOLS SNAPSHOT\n${runningLines.join('\n\n')}` : '',
-    ].filter(Boolean).join('\n\n');
+    ]
+      .filter(Boolean)
+      .join('\n\n');
 
-    return joined.length > MAX_DYNAMIC_CONTEXT_CHARS
-      ? joined.slice(joined.length - MAX_DYNAMIC_CONTEXT_CHARS)
-      : joined;
+    return joined.length > MAX_DYNAMIC_CONTEXT_CHARS ? joined.slice(joined.length - MAX_DYNAMIC_CONTEXT_CHARS) : joined;
   }
 
   private buildPromptPayload(runningTools: ObservedToolState[]): string {
@@ -585,23 +595,23 @@ export class ToolObserverManager {
       },
     }));
 
-    return JSON.stringify({
-      userRequest: this.userRequestSummary,
-      threadContext: this.buildDynamicThreadContext(runningTools),
-      runningTools: toolsPayload,
-      limits: {
-        maxActionsPerTick: MAX_ACTIONS_PER_TICK,
-        maxTotalLaunchedTools: this.config.maxTotalLaunchedTools,
-        launchedSoFar: this.totalLaunchedTools,
+    return JSON.stringify(
+      {
+        userRequest: this.userRequestSummary,
+        threadContext: this.buildDynamicThreadContext(runningTools),
+        runningTools: toolsPayload,
+        limits: {
+          maxActionsPerTick: MAX_ACTIONS_PER_TICK,
+          maxTotalLaunchedTools: this.config.maxTotalLaunchedTools,
+          launchedSoFar: this.totalLaunchedTools,
+        },
       },
-    }, null, 2);
+      null,
+      2,
+    );
   }
 
-  private recordEvent(
-    targetToolCallIds: string[],
-    event: ObserverEventRecord,
-    messageForJournal?: string,
-  ): void {
+  private recordEvent(targetToolCallIds: string[], event: ObserverEventRecord, messageForJournal?: string): void {
     for (const toolCallId of targetToolCallIds) {
       const aug = this.ensureToolAugmentation(toolCallId);
       aug.events.push(event);
@@ -790,10 +800,17 @@ export class ToolObserverManager {
     }
   }
 
-  private async applyMessageSubAgent(action: { type: 'message_sub_agent'; toolCallId: string; message: string; rationale?: string }): Promise<void> {
+  private async applyMessageSubAgent(action: {
+    type: 'message_sub_agent';
+    toolCallId: string;
+    message: string;
+    rationale?: string;
+  }): Promise<void> {
     const tool = this.tools.get(action.toolCallId);
     if (!tool || tool.toolName !== 'sub_agent') {
-      this.appendJournal(`[observer-action] message_sub_agent skipped: ${action.toolCallId} is not a running sub_agent`);
+      this.appendJournal(
+        `[observer-action] message_sub_agent skipped: ${action.toolCallId} is not a running sub_agent`,
+      );
       return;
     }
 
@@ -838,7 +855,12 @@ export class ToolObserverManager {
 
       const decision = (result.object as ObserverDecision | undefined) ?? { actions: [] };
       const actions = Array.isArray(decision.actions) ? decision.actions.slice(0, MAX_ACTIONS_PER_TICK) : [];
+      // The observer LLM call is async; the session may have been disposed while
+      // it ran (tool finished, conversation stopped). Don't apply actions —
+      // send_message / cancel_tool / launch_tool — against a dead session.
+      if (this.disposed) return;
       for (const action of actions) {
+        if (this.disposed) return;
         await this.applyAction(action, this.getRunningTools());
       }
     } catch (error) {
