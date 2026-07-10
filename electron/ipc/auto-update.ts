@@ -159,6 +159,15 @@ export function consumePostUpdateMarker(): { version: string; fromVersion: strin
  *    extract + replace + relaunch atomically)
  */
 export async function performQuitAndInstall(): Promise<void> {
+  // Guard: never run pre-update hooks, write the post-update marker, or call
+  // quitAndInstall unless an update actually finished downloading. Invoking this
+  // prematurely (e.g. a stray auto-update:install IPC) would write a spurious
+  // marker and hand a non-existent artifact to the installer.
+  if (!downloaded || !downloadedVersion || !downloadedFilePath) {
+    console.warn('[auto-update] performQuitAndInstall called with no downloaded update — ignoring');
+    return;
+  }
+
   // Run pre-update hooks (e.g., elevate to admin)
   if (hookRunner) {
     broadcast({ state: 'preparing', version: downloadedVersion });
@@ -365,7 +374,11 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   });
 
   ipcMain.handle('auto-update:install', async () => {
+    if (!downloaded || !downloadedVersion || !downloadedFilePath) {
+      return { ok: false, error: 'No update has been downloaded yet' };
+    }
     await performQuitAndInstall();
+    return { ok: true };
   });
 
   // Automatic update checks (only in packaged builds or test mode)
