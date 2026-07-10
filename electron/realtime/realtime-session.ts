@@ -32,7 +32,13 @@ export type RealtimeEvent =
   | { type: 'status'; status: RealtimeSessionStatus; error?: string }
   | { type: 'transcript'; role: 'user' | 'assistant'; text: string; isFinal: boolean; itemId: string }
   | { type: 'audio'; audioBase64: string }
-  | { type: 'tool-call'; toolCallId: string; toolName: string; args: string; status: 'pending' | 'running' | 'done' | 'error' }
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      args: string;
+      status: 'pending' | 'running' | 'done' | 'error';
+    }
   | { type: 'tool-result'; toolCallId: string; result: unknown; isError?: boolean }
   | { type: 'input-speech'; speaking: boolean }
   | { type: 'response-started' }
@@ -45,36 +51,44 @@ export type RealtimeStreamEvent =
   | { type: 'realtime-user-transcript'; conversationId: string; text: string; isFinal: boolean; itemId: string }
   | { type: 'text-delta'; conversationId: string; text: string; source: 'realtime' }
   | { type: 'realtime-interrupt'; conversationId: string; spokenText: string; unspokenText: string }
-  | { type: 'tool-call'; conversationId: string; toolCallId: string; toolName: string; args: unknown; startedAt: string; source: 'realtime' }
   | {
-    type: 'tool-result';
-    conversationId: string;
-    toolCallId: string;
-    toolName: string;
-    result: unknown;
-    isError?: boolean;
-    startedAt: string;
-    finishedAt: string;
-    source: 'realtime';
-    compaction?: {
-      originalContent: string;
-      wasCompacted: boolean;
-      extractionDurationMs: number;
-    };
-  }
+      type: 'tool-call';
+      conversationId: string;
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      startedAt: string;
+      source: 'realtime';
+    }
   | {
-    type: 'tool-compaction';
-    conversationId: string;
-    toolCallId: string;
-    toolName: string;
-    source: 'realtime';
-    data: {
-      phase: 'start' | 'complete';
-      originalContent?: string;
-      extractionDurationMs?: number;
-      timestamp: string;
-    };
-  }
+      type: 'tool-result';
+      conversationId: string;
+      toolCallId: string;
+      toolName: string;
+      result: unknown;
+      isError?: boolean;
+      startedAt: string;
+      finishedAt: string;
+      source: 'realtime';
+      compaction?: {
+        originalContent: string;
+        wasCompacted: boolean;
+        extractionDurationMs: number;
+      };
+    }
+  | {
+      type: 'tool-compaction';
+      conversationId: string;
+      toolCallId: string;
+      toolName: string;
+      source: 'realtime';
+      data: {
+        phase: 'start' | 'complete';
+        originalContent?: string;
+        extractionDurationMs?: number;
+        timestamp: string;
+      };
+    }
   | { type: 'realtime-status'; conversationId: string; status: RealtimeSessionStatus; error?: string }
   | { type: 'done'; conversationId: string; source: 'realtime' };
 
@@ -123,10 +137,7 @@ export class RealtimeSession {
   private userTranscriptBuffers: Map<string, string> = new Map();
   private assistantTranscriptBuffers: Map<string, string> = new Map();
 
-  constructor(
-    getConfig: () => AppConfig,
-    tools: ToolDefinition[],
-  ) {
+  constructor(getConfig: () => AppConfig, tools: ToolDefinition[]) {
     this.getFullConfig = getConfig;
     this.config = getConfig().realtime;
     this.tools = tools;
@@ -160,7 +171,12 @@ export class RealtimeSession {
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
-      const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+      const settle = (fn: () => void) => {
+        if (!settled) {
+          settled = true;
+          fn();
+        }
+      };
 
       try {
         const { url, headers } = this.buildConnection();
@@ -188,6 +204,9 @@ export class RealtimeSession {
           if (this._status !== 'error') {
             this.setStatus('disconnected');
           }
+          // Remote close: tear down computer-use tracking so its listener does
+          // not outlive the socket (setupComputerUseTracking ran before connect).
+          this.teardownComputerUseTracking();
           this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
           this.ws = null;
         });
@@ -200,6 +219,7 @@ export class RealtimeSession {
           }
           console.error('[RealtimeSession] WebSocket error:', err.message);
           this.setStatus('error', err.message);
+          this.teardownComputerUseTracking();
           this.ws = null;
           settle(() => reject(err));
         });
@@ -207,12 +227,15 @@ export class RealtimeSession {
         // Capture the actual HTTP response body on upgrade failure (400, 401, etc.)
         this.ws.on('unexpected-response', (_req: unknown, res: IncomingMessage) => {
           let body = '';
-          res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+          res.on('data', (chunk: Buffer) => {
+            body += chunk.toString();
+          });
           res.on('end', () => {
             const msg = `HTTP ${res.statusCode}: ${body || res.statusMessage || 'Unknown error'}`;
             console.error(`[RealtimeSession] WebSocket upgrade rejected: ${msg}`);
             console.error(`[RealtimeSession] Response headers:`, JSON.stringify(res.headers, null, 2));
             this.setStatus('error', msg);
+            this.teardownComputerUseTracking();
             this.ws = null;
             settle(() => reject(new Error(msg)));
           });
@@ -221,6 +244,7 @@ export class RealtimeSession {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('[RealtimeSession] Failed to connect:', msg);
         this.setStatus('error', msg);
+        this.teardownComputerUseTracking();
         settle(() => reject(err instanceof Error ? err : new Error(msg)));
       }
     });
@@ -249,15 +273,19 @@ export class RealtimeSession {
     // Resample 16kHz → 24kHz (mic captures at 16kHz, Realtime API expects 24kHz PCM16)
     const resampled = resample16to24(pcmBase64);
 
-    this.ws.send(JSON.stringify({
-      type: 'input_audio_buffer.append',
-      audio: resampled,
-    }));
+    this.ws.send(
+      JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: resampled,
+      }),
+    );
 
     this._audioChunkCount++;
     const now = Date.now();
     if (now - this._lastAudioLogTime > 3000) {
-      console.info(`[RealtimeSession] Audio sent: ${this._audioChunkCount} chunks total, latest input=${pcmBase64.length} chars → resampled=${resampled.length} chars`);
+      console.info(
+        `[RealtimeSession] Audio sent: ${this._audioChunkCount} chunks total, latest input=${pcmBase64.length} chars → resampled=${resampled.length} chars`,
+      );
       this._lastAudioLogTime = now;
     }
   }
@@ -324,8 +352,7 @@ export class RealtimeSession {
           return `Computer session completed successfully. Goal was: "${s.goal}". Final subgoal: ${s.currentSubgoal ?? 'done'}.`;
         if (s.status === 'failed' && (cfg?.onSessionFailed ?? true))
           return `Computer session failed: ${s.lastError ?? 'unknown error'}. Goal was: "${s.goal}".`;
-        if (s.status === 'stopped')
-          return 'Computer session was stopped by the user.';
+        if (s.status === 'stopped') return 'Computer session was stopped by the user.';
         if (s.status === 'awaiting-approval' && (cfg?.onApprovalNeeded ?? true))
           return `Computer session needs your approval: ${s.statusMessage ?? 'an action requires confirmation before proceeding'}.`;
         return null;
@@ -361,14 +388,16 @@ export class RealtimeSession {
   private injectComputerUpdate(text: string): void {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return;
 
-    this.ws.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: `[Computer Session Update] ${text}` }],
-      },
-    }));
+    this.ws.send(
+      JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `[Computer Session Update] ${text}` }],
+        },
+      }),
+    );
 
     // Trigger a response so the model can react — but only if not already responding
     if (!this._inResponse) {
@@ -388,7 +417,7 @@ export class RealtimeSession {
       return {
         url: `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
         headers: withBrandUserAgent({
-          'Authorization': `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
           'OpenAI-Beta': 'realtime=v1',
         }),
       };
@@ -404,7 +433,9 @@ export class RealtimeSession {
       // Derive WebSocket URL from the endpoint, preserving http vs https
       const wsBase = azureCfg.endpoint.replace(/\/+$/, '').replace(/^http/, 'ws');
       const url = `${wsBase}/openai/realtime?api-version=${apiVersion}&deployment=${encodeURIComponent(deployment)}`;
-      console.info(`[RealtimeSession] Azure config: endpoint="${azureCfg.endpoint}" deploymentName="${azureCfg.deploymentName}" model="${model}" → resolved deployment="${deployment}"`);
+      console.info(
+        `[RealtimeSession] Azure config: endpoint="${azureCfg.endpoint}" deploymentName="${azureCfg.deploymentName}" model="${model}" → resolved deployment="${deployment}"`,
+      );
       console.info(`[RealtimeSession] Azure WebSocket URL: ${url}`);
       return {
         url,
@@ -473,20 +504,18 @@ export class RealtimeSession {
     toolDefinitions.push({
       type: 'function' as const,
       name: 'end_call',
-      description: 'End the current voice call. Use this when the user says goodbye, asks to hang up, or the conversation has naturally concluded. The call will end after your current response finishes.',
+      description:
+        'End the current voice call. Use this when the user says goodbye, asks to hang up, or the conversation has naturally concluded. The call will end after your current response finishes.',
       parameters: { type: 'object', properties: {} } as Record<string, unknown>,
     });
 
     // Compose instructions from config + memory context
-    const instructionParts = [
-      this.config.instructions || '',
-      this.memoryContext || '',
-    ].filter(Boolean);
-    const composedInstructions = instructionParts.length > 0
-      ? instructionParts.join('\n\n')
-      : undefined;
+    const instructionParts = [this.config.instructions || '', this.memoryContext || ''].filter(Boolean);
+    const composedInstructions = instructionParts.length > 0 ? instructionParts.join('\n\n') : undefined;
 
-    console.info(`[RealtimeSession] Instructions composition: configInstructions=${(this.config.instructions || '').length} chars, memoryContext=${this.memoryContext.length} chars, composed=${composedInstructions?.length ?? 0} chars`);
+    console.info(
+      `[RealtimeSession] Instructions composition: configInstructions=${(this.config.instructions || '').length} chars, memoryContext=${this.memoryContext.length} chars, composed=${composedInstructions?.length ?? 0} chars`,
+    );
 
     const sessionConfig: Record<string, unknown> = {
       type: 'session.update',
@@ -496,17 +525,16 @@ export class RealtimeSession {
         voice: this.config.voice || 'alloy',
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
-        input_audio_transcription: this.config.inputAudioTranscription !== false
-          ? { model: 'whisper-1' }
-          : null,
-        turn_detection: this.config.turnDetection?.type === 'none'
-          ? null
-          : {
-              type: 'server_vad',
-              threshold: this.config.turnDetection?.threshold ?? 0.5,
-              silence_duration_ms: this.config.turnDetection?.silenceDurationMs ?? 500,
-              prefix_padding_ms: 300,
-            },
+        input_audio_transcription: this.config.inputAudioTranscription !== false ? { model: 'whisper-1' } : null,
+        turn_detection:
+          this.config.turnDetection?.type === 'none'
+            ? null
+            : {
+                type: 'server_vad',
+                threshold: this.config.turnDetection?.threshold ?? 0.5,
+                silence_duration_ms: this.config.turnDetection?.silenceDurationMs ?? 500,
+                prefix_padding_ms: 300,
+              },
         tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
       },
     };
@@ -538,14 +566,16 @@ export class RealtimeSession {
         console.info('[RealtimeSession] Session updated');
         // Inject a synthetic message to prompt the assistant to greet the user
         if (this.ws?.readyState === WS_OPEN) {
-          this.ws.send(JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'message',
-              role: 'user',
-              content: [{ type: 'input_text', text: '[Call has been answered]' }],
-            },
-          }));
+          this.ws.send(
+            JSON.stringify({
+              type: 'conversation.item.create',
+              item: {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: '[Call has been answered]' }],
+              },
+            }),
+          );
           this.ws.send(JSON.stringify({ type: 'response.create' }));
         }
         break;
@@ -589,15 +619,19 @@ export class RealtimeSession {
 
           // Truncate the model's audio to what the user actually heard
           if (this._currentAudioItemId) {
-            const totalAudioMs = Math.round((this._audioBytesSent / 2) / 24000 * 1000);
+            const totalAudioMs = Math.round((this._audioBytesSent / 2 / 24000) * 1000);
             const playedMs = Math.max(0, totalAudioMs - 500);
-            console.info(`[RealtimeSession] Truncating audio item ${this._currentAudioItemId} at ${playedMs}ms (total sent: ${totalAudioMs}ms)`);
-            this.ws.send(JSON.stringify({
-              type: 'conversation.item.truncate',
-              item_id: this._currentAudioItemId,
-              content_index: this._currentAudioContentIndex,
-              audio_end_ms: playedMs,
-            }));
+            console.info(
+              `[RealtimeSession] Truncating audio item ${this._currentAudioItemId} at ${playedMs}ms (total sent: ${totalAudioMs}ms)`,
+            );
+            this.ws.send(
+              JSON.stringify({
+                type: 'conversation.item.truncate',
+                item_id: this._currentAudioItemId,
+                content_index: this._currentAudioContentIndex,
+                audio_end_ms: playedMs,
+              }),
+            );
           }
         }
         break;
@@ -618,7 +652,11 @@ export class RealtimeSession {
         if (transcript) {
           this.userTranscriptBuffers.set(itemId, transcript);
           this.broadcastRealtimeEvent({
-            type: 'transcript', role: 'user', text: transcript, isFinal: true, itemId,
+            type: 'transcript',
+            role: 'user',
+            text: transcript,
+            isFinal: true,
+            itemId,
           });
           this.broadcastStreamEvent({
             type: 'realtime-user-transcript',
@@ -653,12 +691,12 @@ export class RealtimeSession {
           // Get the full accumulated text (includes deltas that arrived after the interrupt)
           const fullText = (this.assistantTranscriptBuffers.get(this._interruptedItemId) ?? '').trim();
           const spokenText = this._interruptedSpokenText;
-          const unspokenText = fullText.length > spokenText.length
-            ? fullText.slice(spokenText.length).trim()
-            : '';
+          const unspokenText = fullText.length > spokenText.length ? fullText.slice(spokenText.length).trim() : '';
 
           if (spokenText && unspokenText) {
-            console.info(`[RealtimeSession] Interrupt resolved: spoken=${spokenText.length} chars, unspoken=${unspokenText.length} chars`);
+            console.info(
+              `[RealtimeSession] Interrupt resolved: spoken=${spokenText.length} chars, unspoken=${unspokenText.length} chars`,
+            );
             this.broadcastRealtimeEvent({
               type: 'interrupt',
               itemId: this._interruptedItemId,
@@ -695,7 +733,7 @@ export class RealtimeSession {
             this._currentAudioContentIndex = contentIndex;
           }
           // base64 → raw bytes: each base64 char = 6 bits, so length * 3/4 = bytes
-          this._audioBytesSent += Math.floor(audioBase64.length * 3 / 4);
+          this._audioBytesSent += Math.floor((audioBase64.length * 3) / 4);
 
           this.broadcastRealtimeEvent({ type: 'audio', audioBase64 });
         }
@@ -711,7 +749,11 @@ export class RealtimeSession {
           const existing = this.assistantTranscriptBuffers.get(itemId) ?? '';
           this.assistantTranscriptBuffers.set(itemId, existing + delta);
           this.broadcastRealtimeEvent({
-            type: 'transcript', role: 'assistant', text: delta, isFinal: false, itemId,
+            type: 'transcript',
+            role: 'assistant',
+            text: delta,
+            isFinal: false,
+            itemId,
           });
           this.broadcastStreamEvent({
             type: 'text-delta',
@@ -729,7 +771,11 @@ export class RealtimeSession {
         if (fullText) {
           this.assistantTranscriptBuffers.set(itemId, fullText);
           this.broadcastRealtimeEvent({
-            type: 'transcript', role: 'assistant', text: fullText, isFinal: true, itemId,
+            type: 'transcript',
+            role: 'assistant',
+            text: fullText,
+            isFinal: true,
+            itemId,
           });
         }
         break;
@@ -767,7 +813,11 @@ export class RealtimeSession {
         // Broadcast tool-call event
         const startedAt = new Date().toISOString();
         this.broadcastRealtimeEvent({
-          type: 'tool-call', toolCallId: callId, toolName, args: argsJson, status: 'running',
+          type: 'tool-call',
+          toolCallId: callId,
+          toolName,
+          args: argsJson,
+          status: 'running',
         });
         this.broadcastStreamEvent({
           type: 'tool-call',
@@ -810,7 +860,11 @@ export class RealtimeSession {
         if (finalTranscript && itemId) {
           this.assistantTranscriptBuffers.set(itemId, finalTranscript);
           this.broadcastRealtimeEvent({
-            type: 'transcript', role: 'assistant', text: finalTranscript, isFinal: true, itemId,
+            type: 'transcript',
+            role: 'assistant',
+            text: finalTranscript,
+            isFinal: true,
+            itemId,
           });
         }
         break;
@@ -875,8 +929,8 @@ export class RealtimeSession {
     const originalText = this.stringifyToolResult(result);
     const modelEntry = resolveModelForThread(fullConfig, null);
     const modelName = modelEntry?.modelConfig.modelName;
-    const shouldAttemptCompaction = originalText.length > 0
-      && estimateToolTokens(originalText, modelName) > toolCompaction.triggerTokens;
+    const shouldAttemptCompaction =
+      originalText.length > 0 && estimateToolTokens(originalText, modelName) > toolCompaction.triggerTokens;
 
     if (!shouldAttemptCompaction) {
       return { result };
@@ -942,7 +996,13 @@ export class RealtimeSession {
     // Handle the built-in end_call tool
     if (toolName === 'end_call') {
       console.info('[RealtimeSession] AI requested end_call — notifying renderer');
-      this.finishToolCall(callId, toolName, { success: true, message: 'Call will end after your response completes.' }, false, startedAt);
+      this.finishToolCall(
+        callId,
+        toolName,
+        { success: true, message: 'Call will end after your response completes.' },
+        false,
+        startedAt,
+      );
       // Notify renderer — it will wait for all audio to finish playing before closing
       this.broadcastRealtimeEvent({ type: 'end-call-pending' });
       return;
@@ -988,7 +1048,10 @@ export class RealtimeSession {
 
     // Broadcast result to renderer
     this.broadcastRealtimeEvent({
-      type: 'tool-result', toolCallId: callId, result, isError,
+      type: 'tool-result',
+      toolCallId: callId,
+      result,
+      isError,
     });
     this.broadcastStreamEvent({
       type: 'tool-result',
@@ -1006,19 +1069,23 @@ export class RealtimeSession {
     // Send result back to the Realtime API
     if (this.ws && this.ws.readyState === WS_OPEN) {
       // Create a conversation item with the tool output
-      this.ws.send(JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'function_call_output',
-          call_id: callId,
-          output: JSON.stringify(result),
-        },
-      }));
+      this.ws.send(
+        JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(result),
+          },
+        }),
+      );
 
       // Request the model to continue generating
-      this.ws.send(JSON.stringify({
-        type: 'response.create',
-      }));
+      this.ws.send(
+        JSON.stringify({
+          type: 'response.create',
+        }),
+      );
 
       // Auto-track computer-use sessions started via tool calls
       if (toolName === 'computer_use_session' && !isError) {

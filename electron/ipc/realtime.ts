@@ -49,7 +49,9 @@ export function registerRealtimeHandlers(
         try {
           const startTime = Date.now();
           memoryContext = await buildRealtimeMemoryContext(conversationId, config, dbPath);
-          console.info(`[Realtime IPC] Memory context built in ${Date.now() - startTime}ms: ${memoryContext.length} chars`);
+          console.info(
+            `[Realtime IPC] Memory context built in ${Date.now() - startTime}ms: ${memoryContext.length} chars`,
+          );
         } catch (err) {
           console.warn('[Realtime IPC] Memory context build failed (continuing without):', err);
         }
@@ -62,6 +64,16 @@ export function registerRealtimeHandlers(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Realtime IPC] Failed to start session:', msg);
+      // Start failed — don't leave a half-initialized session as the active one
+      // (its computer-use tracking + socket would leak and block the next start).
+      if (activeSession) {
+        try {
+          activeSession.close();
+        } catch {
+          /* best-effort */
+        }
+        activeSession = null;
+      }
       return { error: msg };
     }
   });
