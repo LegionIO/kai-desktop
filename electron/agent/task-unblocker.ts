@@ -71,10 +71,13 @@ export async function attemptUnblock(task: TaskFile): Promise<UnblockResult> {
     const raw = (text ?? '').trim();
 
     if (raw.startsWith('RESOLVABLE:')) {
-      return {
-        resolved: true,
-        resolution: raw.replace('RESOLVABLE:', '').trim(),
-      };
+      const resolution = raw.replace('RESOLVABLE:', '').trim();
+      // An empty RESOLVABLE (no actual guidance) is not a real resolution —
+      // treat it as needing a human rather than silently "unblocking" with nothing.
+      if (!resolution) {
+        return { resolved: false, requiresHuman: true, reason: 'AI returned RESOLVABLE with no guidance' };
+      }
+      return { resolved: true, resolution };
     }
 
     return {
@@ -124,7 +127,12 @@ export async function assessComplexity(task: TaskFile): Promise<boolean> {
     });
 
     const answer = (text ?? '').trim().toUpperCase();
-    return answer.startsWith('YES');
+    // Fail-safe: only a STANDALONE "NO" skips human review. Require the whole
+    // answer to be exactly NO (optionally with trailing punctuation), so
+    // "NONE", "NOT SURE", "NO123", empty, and malformed output all still require
+    // review.
+    const isStandaloneNo = /^NO[.!]?$/.test(answer);
+    return !isStandaloneNo;
   } catch (err) {
     console.warn('[task-unblocker] Complexity assessment failed:', err);
     return true; // Conservative fallback

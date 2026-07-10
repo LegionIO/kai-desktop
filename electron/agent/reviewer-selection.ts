@@ -22,12 +22,14 @@ export async function selectReviewers(
     return availableReviewers.map((a) => a.id);
   }
 
+  // Sort a COPY — never mutate the caller-owned array (aliasing bug).
+  const byName = () => [...availableReviewers].sort((a, b) => a.name.localeCompare(b.name));
+
   // Try AI-powered selection
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     // Fallback: pick first N reviewers (sorted by name for stability)
-    return availableReviewers
-      .sort((a, b) => a.name.localeCompare(b.name))
+    return byName()
       .slice(0, count)
       .map((a) => a.id);
   }
@@ -66,8 +68,10 @@ export async function selectReviewers(
     const match = raw.match(/\[[\s\S]*\]/);
     if (match) {
       const ids = JSON.parse(match[0]) as string[];
-      // Validate IDs exist in available reviewers
-      const validIds = ids.filter((id) => availableReviewers.some((a) => a.id === id));
+      // Validate + DEDUPE: a repeated valid id must not satisfy the quorum
+      // (that would silently shrink the reviewer set below `count`).
+      const availableIds = new Set(availableReviewers.map((a) => a.id));
+      const validIds = [...new Set(ids)].filter((id) => availableIds.has(id));
       if (validIds.length >= count) return validIds.slice(0, count);
       // If AI returned fewer valid IDs, supplement with remaining reviewers
       const remaining = availableReviewers.filter((a) => !validIds.includes(a.id)).slice(0, count - validIds.length);
@@ -78,8 +82,7 @@ export async function selectReviewers(
   }
 
   // Fallback: first N by name
-  return availableReviewers
-    .sort((a, b) => a.name.localeCompare(b.name))
+  return byName()
     .slice(0, count)
     .map((a) => a.id);
 }

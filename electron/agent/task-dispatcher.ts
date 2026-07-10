@@ -265,9 +265,13 @@ async function scoreAi(task: TaskFile, agent: AgentFile): Promise<ScoreResult> {
 
     const raw = (text ?? '').trim();
     const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? '';
-    const numMatch = firstLine.match(/[01](?:\.\d+)?|0?\.\d+/);
+    // The first line must BE a bare number in [0,1] — not merely contain a digit.
+    // Accepting a substring let prose ("1 concern found") or an out-of-range value
+    // (10, -1) become a perfect score. Require the whole first line to parse and
+    // fall inside the valid range; otherwise treat as an unusable score (0).
+    const numMatch = firstLine.match(/^(\d(?:\.\d+)?|0?\.\d+)$/);
     const parsed = numMatch ? Number.parseFloat(numMatch[0]) : NaN;
-    const score = Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : 0;
+    const score = Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0;
     const reasonLine = raw.split(/\r?\n/).slice(1).join(' ').trim() || `ai-scored (${firstLine})`;
     return { score, reason: `[ai] ${reasonLine.slice(0, 160)}` };
   } catch (err) {
@@ -388,21 +392,36 @@ export class TaskDispatcher {
     this.tickInFlight = true;
     const decisions: DispatchDecision[] = [];
     let aborted = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const deadline = new Promise<never>((_, reject) =>
-      setTimeout(() => {
+    const deadline = new Promise<never>((_, reject) => {
+      deadlineTimer = setTimeout(() => {
         aborted = true;
         reject(new Error('tick timeout'));
-      }, TICK_TIMEOUT_MS),
-    );
+      }, TICK_TIMEOUT_MS);
+    });
+
+    // Hold the body promise so we can keep tickInFlight true until the body
+    // ACTUALLY settles — even if the deadline fired and we stopped awaiting it.
+    // Otherwise a timed-out body keeps mutating state (assign/start) while a new
+    // tick starts, causing duplicate assignments.
+    const bodyPromise = this.tickBody(decisions, () => aborted);
 
     try {
-      await Promise.race([this.tickBody(decisions, () => aborted), deadline]);
+      await Promise.race([bodyPromise, deadline]);
     } catch (err) {
       if (!aborted) console.error('[task-dispatcher] Tick failed:', err);
     } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
       this.lastTickAt = new Date().toISOString();
-      this.tickInFlight = false;
+      // Only release the in-flight guard once the body settles. If the deadline
+      // won the race, wait for the body to unwind (its isAborted() checks stop it
+      // at the next await) before allowing the next tick to start.
+      void bodyPromise
+        .catch(() => {})
+        .finally(() => {
+          this.tickInFlight = false;
+        });
       this.broadcast();
     }
 
@@ -517,31 +536,29 @@ export class TaskDispatcher {
           const startResult = await this.deps.startAgent(pair.agent.id);
           if (startResult && 'error' in startResult && startResult.error) {
             decision.error = `start failed: ${startResult.error}`;
-            // Rollback: unassign so dispatcher can retry next tick
-            if (this.deps.unassignTask) {
-              try {
-                await this.deps.unassignTask(pair.agent.id, pair.task.id);
-              } catch {}
+            // Rollback ONLY if we can actually undo the persisted assignment.
+            // If unassignTask is absent or throws, the task is still assigned on
+            // disk — releasing the used-sets/slot here would let us re-assign the
+            // same task/agent this tick (a double-assignment). Keep them consumed.
+            const rolledBack = await this.tryUnassign(pair.agent.id, pair.task.id);
+            if (rolledBack) {
+              usedTasks.delete(pair.task.id);
+              usedAgents.delete(pair.agent.id);
+              remainingSlots += 1;
+              decision.assigned = false;
             }
-            usedTasks.delete(pair.task.id);
-            usedAgents.delete(pair.agent.id);
-            remainingSlots += 1;
-            decision.assigned = false;
           } else if (startResult && 'sessionId' in startResult && startResult.sessionId) {
             decision.started = true;
           }
         } catch (err) {
           decision.error = `start threw: ${String(err)}`;
-          // Rollback: unassign so dispatcher can retry next tick
-          if (this.deps.unassignTask) {
-            try {
-              await this.deps.unassignTask(pair.agent.id, pair.task.id);
-            } catch {}
+          const rolledBack = await this.tryUnassign(pair.agent.id, pair.task.id);
+          if (rolledBack) {
+            usedTasks.delete(pair.task.id);
+            usedAgents.delete(pair.agent.id);
+            remainingSlots += 1;
+            decision.assigned = false;
           }
-          usedTasks.delete(pair.task.id);
-          usedAgents.delete(pair.agent.id);
-          remainingSlots += 1;
-          decision.assigned = false;
         }
       }
 
@@ -591,6 +608,24 @@ export class TaskDispatcher {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Attempt to undo a persisted assignment after a start failure. Returns true
+   * only if the assignment was actually rolled back (so the caller can safely
+   * free the task/agent for reuse this tick). Returns false when no unassign dep
+   * exists or it throws — the task is still assigned on disk, so the caller must
+   * keep it consumed to avoid a double-assignment.
+   */
+  private async tryUnassign(agentId: string, taskId: string): Promise<boolean> {
+    if (!this.deps.unassignTask) return false;
+    try {
+      await this.deps.unassignTask(agentId, taskId);
+      return true;
+    } catch (err) {
+      console.warn('[task-dispatcher] unassignTask threw during rollback:', err);
+      return false;
     }
   }
 
