@@ -612,6 +612,9 @@ function AppShell() {
   const isMobile = useIsMobile();
   const [dragState, setDragState] = useState<{ startX: number; startWidth: number } | null>(null);
   const suppressStoreSync = useRef(false);
+  // Monotonic token guarding async active-conversation reads (onChanged fetch +
+  // switch title load) so out-of-order resolutions can't apply stale state.
+  const activeSyncSeqRef = useRef(0);
   const { config, updateConfig } = useConfig();
   const fullWidth = useFullWidthContent();
   const { title: themeTitle, Icon: ThemeIcon, toggle: toggleTheme } = useThemeToggleControl();
@@ -753,7 +756,11 @@ function AppShell() {
       } else if (activeId == null) {
         applyStore(null, null);
       } else {
+        // Sequence-guard the async fetch: rapid onChanged events can resolve out
+        // of order, letting an older active-id's record overwrite a newer one.
+        const seq = ++activeSyncSeqRef.current;
         void app.conversations.get(activeId).then((conv) => {
+          if (seq !== activeSyncSeqRef.current) return;
           applyStore(activeId, (conv as ConversationRecord | null) ?? null);
         });
       }
@@ -943,11 +950,15 @@ function AppShell() {
     async (id: string) => {
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
+      const seq = ++activeSyncSeqRef.current;
       await app.conversations.setActiveId(id);
       setActiveView(CHAT_VIEW);
       setActiveConversationId(id);
-      // Load the title for the switched-to conversation
+      // Load the title for the switched-to conversation. Guard the async title
+      // write so a rapid re-switch (A→B→A) doesn't let B's late-resolving title
+      // overwrite the now-active A.
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
+      if (seq !== activeSyncSeqRef.current) return;
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
     },
     [cuSessionsByConversation, isMobile],
@@ -1708,7 +1719,8 @@ function AppShell() {
 
   // ── Dock ordering + plugin bubble state (persisted in config.ui) ─────────
   const dockUi = config?.ui as
-    { dockOrder?: { units?: string[]; plugins?: string[] }; pluginBubbleExpanded?: boolean } | undefined;
+    | { dockOrder?: { units?: string[]; plugins?: string[] }; pluginBubbleExpanded?: boolean }
+    | undefined;
   const dockUnitOrder = dockUi?.dockOrder?.units ?? [];
   const dockPluginOrder = dockUi?.dockOrder?.plugins ?? [];
   const pluginBubbleExpanded = dockUi?.pluginBubbleExpanded !== false;
