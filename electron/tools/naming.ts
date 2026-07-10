@@ -86,3 +86,46 @@ export function ensureSafeToolDefinition(tool: ToolDefinition): ToolDefinition {
 export function ensureSafeToolDefinitions(tools: ToolDefinition[]): ToolDefinition[] {
   return tools.map((tool) => ensureSafeToolDefinition(tool));
 }
+
+/**
+ * Ensure every tool has a UNIQUE registered name. Two distinct sources can
+ * sanitize to the same scoped name (e.g. MCP servers `foo bar` and `foo@bar`
+ * both → `mcp__foo_bar__…`, or a skill name colliding with a built-in). The
+ * agent tool map is keyed by name, so the later tool would silently SHADOW the
+ * earlier one and calls would dispatch to the wrong tool.
+ *
+ * The FIRST occurrence of a name keeps it (stable for existing configs/aliases);
+ * each subsequent collision gets a short deterministic hash suffix derived from
+ * its sourceId+originalName, with the colliding name preserved as an alias.
+ * A warning is logged so the collision is visible.
+ */
+export function dedupeToolNames(tools: ToolDefinition[]): ToolDefinition[] {
+  const seen = new Set<string>();
+  return tools.map((tool) => {
+    if (!seen.has(tool.name)) {
+      seen.add(tool.name);
+      return tool;
+    }
+    const basis = `${tool.source ?? ''}:${tool.sourceId ?? ''}:${tool.originalName ?? tool.name}`;
+    const suffix = '_' + createHash('sha1').update(basis).digest('hex').slice(0, 6);
+    // Fit the suffix within the length limit by trimming the base name if needed.
+    const base =
+      tool.name.length + suffix.length > MAX_TOOL_NAME_LENGTH
+        ? tool.name.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length).replace(/[_-]+$/, '')
+        : tool.name;
+    let disambiguated = base + suffix;
+    // Extremely unlikely, but guarantee uniqueness even if the hash collides.
+    while (seen.has(disambiguated)) disambiguated += 'x';
+    seen.add(disambiguated);
+    console.warn(
+      `[naming] Duplicate tool name "${tool.name}" (source=${tool.source ?? '?'} id=${tool.sourceId ?? '?'}) ` +
+        `disambiguated to "${disambiguated}" to avoid silently shadowing an earlier tool.`,
+    );
+    return {
+      ...tool,
+      name: disambiguated,
+      originalName: tool.originalName ?? tool.name,
+      aliases: Array.from(new Set([...(tool.aliases ?? []), tool.name])),
+    };
+  });
+}

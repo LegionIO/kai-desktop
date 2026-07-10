@@ -3,6 +3,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { ComputerSession } from '../../shared/computer-use.js';
 import { connectAllMcpServers } from './mcp-client.js';
 import { createMcpManageTool } from './mcp-manage.js';
+import { dedupeToolNames } from './naming.js';
 import {
   createMemorySettingsTool,
   createCompactionSettingsTool,
@@ -566,5 +567,8 @@ export async function buildToolRegistry(
     }
   }
 
-  return tools;
+  // Guarantee unique registered names across built-ins + skills + MCP: two
+  // sources can sanitize to the same scoped name and would otherwise silently
+  // shadow each other in the agent's name-keyed tool map.
+  return dedupeToolNames(tools);
 }
