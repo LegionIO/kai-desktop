@@ -140,7 +140,6 @@ nsis:
 linux:
   category: Development
   maintainer: "{{linuxMaintainer}}"
-  syncDesktopName: true
   icon: build/icon.png
   extraResources:
     - from: build/bin/LocalLinuxHelper.sh
