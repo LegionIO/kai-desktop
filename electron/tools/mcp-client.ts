@@ -12,8 +12,11 @@ import type { AppConfig } from '../config/schema.js';
 type McpServerConfig = AppConfig['mcpServers'][number];
 
 /** Cap on a single MCP tool call so a hung server can't keep the agent turn
- *  alive forever. The timer resets on progress notifications. */
+ *  alive forever. The idle timer resets on progress notifications, but the
+ *  ABSOLUTE cap does not — a server that streams progress forever is still
+ *  bounded so it can never keep the turn (and its tool promise) alive. */
 const MCP_CALL_TIMEOUT_MS = 120_000;
+const MCP_CALL_MAX_TOTAL_MS = 600_000;
 
 type McpConnection = {
   name: string;
@@ -97,9 +100,15 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
   const existing = connections.get(server.name);
   if (existing && existing.status === 'connected') return existing;
 
+  // Hoisted so the catch can tear down a client/transport that connected before
+  // a later step (listTools / tool conversion) threw — otherwise a stdio child
+  // or network handle leaks while the stored error connection holds null handles.
+  let client: Client | null = null;
+  let transport: Transport | null = null;
+
   try {
-    const transport = await createTransport(server);
-    const client = new Client({ name: __BRAND_MCP_CLIENT_NAME, version: '1.0.0' });
+    transport = await createTransport(server);
+    client = new Client({ name: __BRAND_MCP_CLIENT_NAME, version: '1.0.0' });
 
     await client.connect(transport);
 
@@ -116,11 +125,16 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       execute: async (input: unknown, context?: ToolExecutionContext) => {
         // Propagate chat/user cancellation and cap the call so a hung MCP server
         // can't keep the tool promise (and the agent turn) alive forever.
-        const result = await client.callTool({ name: t.name, arguments: input as Record<string, unknown> }, undefined, {
-          ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
-          timeout: MCP_CALL_TIMEOUT_MS,
-          resetTimeoutOnProgress: true,
-        });
+        const result = await client!.callTool(
+          { name: t.name, arguments: input as Record<string, unknown> },
+          undefined,
+          {
+            ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
+            timeout: MCP_CALL_TIMEOUT_MS,
+            resetTimeoutOnProgress: true,
+            maxTotalTimeout: MCP_CALL_MAX_TOTAL_MS,
+          },
+        );
         if (result.isError) throw new Error(JSON.stringify(result.content));
         // Extract text from content array
         const content = result.content as Array<{ type: string; text?: string }>;
@@ -138,9 +152,37 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
       fingerprint: serverFingerprint(server),
     };
 
+    // If the transport closes or errors AFTER a successful connect (server crash,
+    // stdio child exit, network drop), mark the connection disconnected so the
+    // pool stops reporting it as healthy. The dead tool closures remain until the
+    // next config rebuild, but the status reflects reality.
+    const markDisconnected = () => {
+      const current = connections.get(server.name);
+      if (current === connection && current.status === 'connected') {
+        current.status = 'disconnected';
+      }
+    };
+    transport.onclose = markDisconnected;
+    const priorOnError = transport.onerror?.bind(transport);
+    transport.onerror = (err: Error) => {
+      priorOnError?.(err);
+      markDisconnected();
+    };
+
     connections.set(server.name, connection);
     return connection;
   } catch (error) {
+    // Tear down a half-open client/transport before recording the error.
+    try {
+      await client?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await transport?.close();
+    } catch {
+      /* ignore */
+    }
     const conn: McpConnection = {
       name: server.name,
       client: null as unknown as Client,
@@ -179,6 +221,14 @@ export async function disconnectMcpServer(name: string): Promise<void> {
   connections.delete(name);
 }
 
+/** Close every MCP connection in the pool. Called from app-quit teardown so
+ *  stdio child processes + network handles don't survive as orphans (a child is
+ *  NOT killed automatically when its parent Electron process exits). */
+export async function disconnectAllMcpServers(): Promise<void> {
+  const names = Array.from(connections.keys());
+  await Promise.allSettled(names.map((name) => disconnectMcpServer(name)));
+}
+
 /** Fingerprint a server config for change detection */
 function serverFingerprint(s: McpServerConfig): string {
   return JSON.stringify({
@@ -194,8 +244,24 @@ function serverFingerprint(s: McpServerConfig): string {
  * Reconcile MCP connections with the current config.
  * Disconnects removed/changed/disabled servers, connects new/changed ones.
  * Returns the full set of MCP tools after reconciliation.
+ *
+ * Serialized: rapid config changes can fire overlapping rebuilds; running them
+ * concurrently lets two calls spawn the same server, overwrite the map entry,
+ * and leak the losing client. Each rebuild waits for the previous to finish so
+ * the connection pool is only ever mutated by one reconcile at a time, and the
+ * LAST caller's tool set is the one that reflects the final config.
  */
-export async function rebuildMcpTools(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
+let rebuildChain: Promise<ToolDefinition[]> = Promise.resolve([]);
+
+export function rebuildMcpTools(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
+  const run = rebuildChain.catch(() => []).then(() => rebuildMcpToolsInner(servers));
+  // Keep the chain alive even if this run rejects, so a failure doesn't wedge
+  // all future rebuilds.
+  rebuildChain = run.catch(() => []);
+  return run;
+}
+
+async function rebuildMcpToolsInner(servers: McpServerConfig[]): Promise<ToolDefinition[]> {
   const desired = new Map<string, McpServerConfig>();
   for (const s of servers) {
     if (s.enabled !== false) desired.set(s.name, s);

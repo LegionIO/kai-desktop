@@ -35,7 +35,7 @@ import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
-import { rebuildMcpTools } from './tools/mcp-client.js';
+import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
 import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerDiffHandlers } from './ipc/diffs.js';
@@ -2023,6 +2023,9 @@ app.on('before-quit', () => {
   pluginManagerRef?.unloadAll().catch((err) => {
     console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);
   });
+  // Close MCP connections so stdio child processes / network handles don't
+  // survive as orphans (a child is not killed automatically when Electron exits).
+  disconnectAllMcpServers().catch(() => {});
   cleanupMicRecorder();
   cleanupDictation();
   cleanupAppShots();
