@@ -28,6 +28,7 @@ vi.mock('../../web-server/ipc-bridge.js', () => ({
 }));
 
 import { startLocalServer, stopLocalServer, getSocketPath } from '../local-server.js';
+import { getBridgeToken } from '../paths.js';
 import { broadcastToLocalClients } from '../local-clients.js';
 import { LocalBridgeClient } from '../../cli/client.js';
 
@@ -47,7 +48,7 @@ describe('local bridge transport', () => {
 
   it('round-trips an invoke through invokeHandler', async () => {
     invokeHandlerMock.mockResolvedValue([{ id: 'c1', title: 'Hello' }]);
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
 
     const result = await client.invoke('conversations:list');
@@ -57,7 +58,7 @@ describe('local bridge transport', () => {
 
   it('forwards handler args and propagates errors', async () => {
     invokeHandlerMock.mockRejectedValue(new Error('conversation-not-found'));
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
 
     await expect(client.invoke('conversations:get', 'missing')).rejects.toThrow('conversation-not-found');
@@ -65,7 +66,7 @@ describe('local bridge transport', () => {
   });
 
   it('delivers server-pushed broadcasts to on(channel) subscribers', async () => {
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
 
     const received: unknown[] = [];
@@ -80,7 +81,7 @@ describe('local bridge transport', () => {
 
   it('rejects in-flight calls when the connection drops', async () => {
     invokeHandlerMock.mockImplementation(() => new Promise(() => {})); // never resolves
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
 
     const pending = client.invoke('agent:stream', 'c1');
@@ -90,7 +91,7 @@ describe('local bridge transport', () => {
   });
 
   it('reconnects to a backend that comes back, preserving event subscriptions', async () => {
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
 
     const received: unknown[] = [];
@@ -117,7 +118,7 @@ describe('local bridge transport', () => {
   });
 
   it('does not flag intentional close as recoverable', async () => {
-    client = new LocalBridgeClient(getSocketPath());
+    client = new LocalBridgeClient(getSocketPath(), getBridgeToken());
     await client.connect();
     client.close();
     expect(client.wasIntentionalClose()).toBe(true);

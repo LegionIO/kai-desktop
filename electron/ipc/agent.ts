@@ -2300,6 +2300,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 
+      // Reject a second concurrent submit into the same conversation while one is
+      // still pending (waiting on toolsReady). currentPendingSubmit holds one id
+      // per conversation; a second submit would overwrite it, so a later cancel
+      // could cancel the wrong one and let a detached run proceed. The post-
+      // toolsReady busy-check covers the already-streaming case; this covers the
+      // pre-toolsReady window.
+      if (currentPendingSubmit.has(conversationId) || activeStreams.has(conversationId)) {
+        return { ok: false, error: 'conversation-busy' };
+      }
+
       // Mint a cancellable id for the pre-stream window (waiting on toolsReady):
       // no activeStreams entry exists yet, so agent:cancel-stream can only reach
       // us via cancelledSubmits.
@@ -2318,15 +2328,34 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
       if (currentPendingSubmit.get(conversationId) === submitId) currentPendingSubmit.delete(conversationId);
 
+      // Re-read AFTER toolsReady: another stream (automation/GUI) may have started
+      // during the wait. Refuse to submit into a busy conversation — appending our
+      // user turn under a head a concurrent run will later move would corrupt/hide
+      // this branch. An in-flight automation run marks its target runStatus:'running',
+      // so the runStatus check + activeStreams entry together cover automation, GUI,
+      // and CLI concurrency without importing the automations module (avoids a cycle).
+      const busyCheck = readConversation(appHome, conversationId);
+      if (!busyCheck) return { ok: false, error: 'conversation-not-found' };
+      if (
+        busyCheck.runStatus === 'running' ||
+        busyCheck.runStatus === 'awaiting-approval' ||
+        activeStreams.has(conversationId)
+      ) {
+        return { ok: false, error: 'conversation-busy' };
+      }
+
       // Mark the conversation running so automation busy-checks and the GUI
       // index see a live CLI turn and don't target it with a concurrent write.
       // The terminal assistant/error persist (or cancel) resets it to idle.
-      appendConversationMessages(
+      // skipIfBusy guards against a run that started between the check above and
+      // this write; a null return means we lost the race and must abort.
+      const promptWrite = appendConversationMessages(
         appHome,
         conversationId,
         [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        { runStatus: 'running' },
+        { skipIfBusy: true, runStatus: 'running' },
       );
+      if (!promptWrite) return { ok: false, error: 'conversation-busy' };
 
       const updated = readConversation(appHome, conversationId);
       if (!updated) return { ok: false, error: 'conversation-not-found' };

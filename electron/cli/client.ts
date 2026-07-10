@@ -38,7 +38,10 @@ export class LocalBridgeClient {
   private pongMissed = 0;
   private intentionalClose = false; // set by close() so disconnect handlers can tell crash from quit
 
-  constructor(private readonly socketPath: string) {}
+  constructor(
+    private readonly socketPath: string,
+    private readonly authToken?: string,
+  ) {}
 
   /** Connect once. Rejects if the socket cannot be reached. */
   connect(): Promise<void> {
@@ -58,8 +61,44 @@ export class LocalBridgeClient {
         this.socket = socket;
         this.connected = true;
         this.wire(socket);
-        resolve();
+        // Authenticate before resolving: the backend refuses invoke/send until
+        // the per-install bridge token is presented. If no token is configured
+        // (older backend), skip the handshake and connect as before.
+        if (!this.authToken) {
+          resolve();
+          return;
+        }
+        this.authenticate()
+          .then(() => resolve())
+          .catch((err) => {
+            this.teardown(false);
+            reject(err instanceof Error ? err : new Error(String(err)));
+          });
       });
+    });
+  }
+
+  /** Send the auth handshake and await its result, reusing the pending-call map. */
+  private authenticate(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const socket = this.socket;
+      if (!socket) {
+        reject(new Error('not connected'));
+        return;
+      }
+      const id = String(++this.nextId);
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('timeout waiting for auth'));
+      }, INVOKE_TIMEOUT_MS);
+      this.pending.set(id, { resolve: () => resolve(), reject, timer });
+      try {
+        socket.write(JSON.stringify({ id, type: 'auth', token: this.authToken }) + '\n');
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -302,8 +341,8 @@ export class LocalBridgeClient {
 }
 
 /** Attempt a connection to the given socket path; resolves null if unreachable. */
-export async function tryConnect(socketPath: string): Promise<LocalBridgeClient | null> {
-  const client = new LocalBridgeClient(socketPath);
+export async function tryConnect(socketPath: string, authToken?: string): Promise<LocalBridgeClient | null> {
+  const client = new LocalBridgeClient(socketPath, authToken);
   try {
     await client.connect();
     return client;

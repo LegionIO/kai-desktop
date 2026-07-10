@@ -264,6 +264,33 @@ export function getActiveConversationId(appHome: string): string | null {
   return readIndex(appHome).activeConversationId;
 }
 
+/**
+ * Reset any conversation stuck in `running`/`awaiting-approval` to `idle` at
+ * backend startup. If the singleton backend died mid-run (crash/quit) while a
+ * server-persisted CLI turn or automation was in flight, its in-memory run
+ * state is gone but the on-disk runStatus is stale. The next leader has no
+ * active stream for these, so a fresh backend must sweep them idle — otherwise
+ * the GUI/CLI show a permanently-spinning conversation that also blocks new
+ * submits (the busy-check refuses to write into a `running` conversation).
+ * Rebuilds the index entries from the per-file records so counts stay accurate.
+ */
+export function resetStaleRunStatus(appHome: string): number {
+  const index = readIndex(appHome);
+  if (monolithMigrationPending(appHome)) return 0;
+  let reset = 0;
+  for (const id of Object.keys(index.conversations)) {
+    const entry = index.conversations[id];
+    if (entry.runStatus !== 'running' && entry.runStatus !== 'awaiting-approval') continue;
+    const conv = readConversation(appHome, id);
+    if (!conv) continue;
+    conv.runStatus = 'idle';
+    writeConversation(appHome, conv);
+    reset += 1;
+  }
+  if (reset > 0) console.info(`[conversation-store] reset ${reset} stale running conversation(s) to idle at startup`);
+  return reset;
+}
+
 export function setActiveConversationId(appHome: string, id: string | null): void {
   // Guard: writing the index before a pending migration would strand the monolith.
   assertMigratedBeforeWrite(appHome);

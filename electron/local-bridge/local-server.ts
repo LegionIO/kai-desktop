@@ -1,12 +1,17 @@
 import net from 'net';
 import { mkdirSync, existsSync, unlinkSync, chmodSync, statSync } from 'fs';
+import { timingSafeEqual } from 'crypto';
 import type { Socket, Server } from 'net';
 import { localClients, broadcastToLocalClients } from './local-clients.js';
 import { registerBroadcastSink } from '../web-server/web-clients.js';
 import { invokeHandler } from '../web-server/ipc-bridge.js';
-import { getRunDir, getSocketPath } from './paths.js';
+import { getRunDir, getSocketPath, getBridgeToken } from './paths.js';
 
 export { getRunDir, getSocketPath } from './paths.js';
+
+/** Sockets that have completed the auth handshake ({type:'auth', token}).
+ *  invoke/send are refused until a socket is in this set. */
+const authedClients = new WeakSet<Socket>();
 
 let server: Server | null = null;
 let unregisterSink: (() => void) | null = null;
@@ -34,6 +39,11 @@ const SHUTDOWN_SETTLE_MS = 400;
  *  Kept low so a half-open socket (Ctrl-C / crash where no FIN is delivered) is
  *  detected quickly and the backend can reap itself. The client pings ~5s. */
 const HEARTBEAT_TIMEOUT_MS = 12000;
+/** Hard cap on a single newline-delimited inbound frame (and on total buffered
+ *  bytes before a newline). A malformed/malicious same-user client must not be
+ *  able to grow the singleton backend's memory without bound. 8 MiB comfortably
+ *  covers legitimate payloads (image data URLs, large prompts) while bounding abuse. */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 let idleShutdownEnabled = false;
 let idleTimer: NodeJS.Timeout | null = null;
 let hasOtherClients: (() => boolean) | null = null;
@@ -96,6 +106,13 @@ function attachClient(socket: Socket): void {
   socket.on('data', (chunk: Buffer) => {
     alive = true; // any inbound traffic counts as liveness
     buffer += chunk.toString('utf-8');
+    // Bound the pre-newline buffer: a client that never sends a newline (or sends
+    // an oversized frame) must not grow backend memory without limit.
+    if (buffer.length > MAX_FRAME_BYTES) {
+      console.warn('[local-bridge] inbound frame exceeded MAX_FRAME_BYTES; destroying socket');
+      socket.destroy();
+      return;
+    }
     let newlineIndex: number;
     while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, newlineIndex);
@@ -114,7 +131,7 @@ function attachClient(socket: Socket): void {
 }
 
 async function handleMessage(socket: Socket, line: string): Promise<void> {
-  let msg: { id?: string; type?: string; channel?: string; args?: unknown[]; data?: unknown };
+  let msg: { id?: string; type?: string; channel?: string; args?: unknown[]; data?: unknown; token?: string };
   try {
     msg = JSON.parse(line);
   } catch {
@@ -123,6 +140,31 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
 
   if (msg.type === 'ping') {
     writeLine(socket, { type: 'pong' });
+    return;
+  }
+
+  // Auth handshake: a client must present the per-install bridge token before it
+  // can invoke handlers or send events. This gates the win32 named pipe (which
+  // has no owner-only ACL) and is defense-in-depth on POSIX. Compare in constant
+  // time to avoid a timing oracle on the token.
+  if (msg.type === 'auth') {
+    const expected = getBridgeToken();
+    const provided = typeof msg.token === 'string' ? msg.token : '';
+    const ok = provided.length === expected.length && timingSafeEqualStr(provided, expected);
+    if (ok) {
+      authedClients.add(socket);
+      writeLine(socket, { id: msg.id, type: 'result', data: { ok: true } });
+    } else {
+      writeLine(socket, { id: msg.id, type: 'error', message: 'auth failed' });
+      socket.destroy();
+    }
+    return;
+  }
+
+  // Everything below requires authentication.
+  if (!authedClients.has(socket)) {
+    if (msg.id) writeLine(socket, { id: msg.id, type: 'error', message: 'unauthenticated' });
+    socket.destroy();
     return;
   }
 
@@ -137,6 +179,11 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
   }
 
   if (msg.type === 'invoke' && msg.channel && msg.id) {
+    // Validate args is a bounded array before spreading into the handler.
+    if (msg.args !== undefined && (!Array.isArray(msg.args) || msg.args.length > 64)) {
+      writeLine(socket, { id: msg.id, type: 'error', message: 'invalid args' });
+      return;
+    }
     try {
       const result = await invokeHandler(msg.channel, ...(msg.args ?? []));
       writeLine(socket, { id: msg.id, type: 'result', data: result });
@@ -158,6 +205,14 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
       // Ignore errors on fire-and-forget
     }
   }
+}
+
+/** Constant-time string compare for the auth token (avoids a timing oracle). */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
 }
 
 function writeLine(socket: Socket, obj: unknown): void {

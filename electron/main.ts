@@ -29,6 +29,7 @@ import {
   getWorkspaceToolDefinitions,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
+import { resetStaleRunStatus } from './ipc/conversation-store.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
@@ -1293,6 +1294,16 @@ if (gotSingleInstanceLock) {
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+
+    // A fresh backend has no in-flight runs. If a previous leader died mid-run,
+    // stale `running`/`awaiting-approval` runStatus is left on disk — sweep it to
+    // idle before serving clients so nothing shows a stuck spinner or blocks new
+    // submits.
+    try {
+      resetStaleRunStatus(APP_HOME);
+    } catch (err) {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] stale runStatus sweep failed (non-fatal):`, err);
+    }
 
     // Start the local IPC socket EARLY — as soon as the conversation/agent IPC
     // handlers exist — so the `kai` CLI can connect in ~1s instead of waiting

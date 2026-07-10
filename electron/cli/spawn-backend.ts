@@ -57,10 +57,14 @@ export function spawnHeadlessBackend(fromElectron: boolean): boolean {
 }
 
 /** Poll the socket until a backend is listening, or the deadline passes. */
-export async function waitForSocket(socketPath: string, deadlineMs: number): Promise<LocalBridgeClient | null> {
+export async function waitForSocket(
+  socketPath: string,
+  deadlineMs: number,
+  authToken?: string,
+): Promise<LocalBridgeClient | null> {
   const start = Date.now();
   for (;;) {
-    const client = await tryConnect(socketPath);
+    const client = await tryConnect(socketPath, authToken);
     if (client) return client;
     if (Date.now() - start > deadlineMs) return null;
     await new Promise((r) => setTimeout(r, CONNECT_RETRY_MS));

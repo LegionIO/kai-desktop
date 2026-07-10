@@ -1,4 +1,4 @@
-import { getSocketPath } from '../local-bridge/paths.js';
+import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
 import { runHeadlessOnce } from './headless-run.js';
@@ -11,12 +11,13 @@ import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEO
  */
 async function main(): Promise<void> {
   const socketPath = getSocketPath();
+  const token = getBridgeToken();
 
-  let client = await tryConnect(socketPath);
+  let client = await tryConnect(socketPath, token);
   if (!client) {
     cliLog('no running Kai backend found — starting a headless one…');
     if (!spawnHeadlessBackend(false)) process.exit(1);
-    client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS);
+    client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS, token);
     if (!client) {
       cliLog('timed out waiting for the headless backend to come up');
       process.exit(1);
