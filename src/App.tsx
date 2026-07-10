@@ -1708,8 +1708,7 @@ function AppShell() {
 
   // ── Dock ordering + plugin bubble state (persisted in config.ui) ─────────
   const dockUi = config?.ui as
-    | { dockOrder?: { units?: string[]; plugins?: string[] }; pluginBubbleExpanded?: boolean }
-    | undefined;
+    { dockOrder?: { units?: string[]; plugins?: string[] }; pluginBubbleExpanded?: boolean } | undefined;
   const dockUnitOrder = dockUi?.dockOrder?.units ?? [];
   const dockPluginOrder = dockUi?.dockOrder?.plugins ?? [];
   const pluginBubbleExpanded = dockUi?.pluginBubbleExpanded !== false;

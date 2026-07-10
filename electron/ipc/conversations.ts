@@ -493,6 +493,33 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     return { ok: true, conversation: commitTreeUpdate(conv, tree, nextHead) };
   });
 
+  // Rewind the active branch back by N complete turns (default 1): move headId
+  // to the message before the Nth-from-last USER turn, undoing the most recent
+  // exchange(s). The shelved tail stays in the tree as a branch, so nothing is
+  // lost. Refused if the conversation has been compacted (summary nodes make
+  // "a turn" ambiguous and reviving pre-summary messages could double content).
+  ipcMain.handle('conversations:rewind', (_event, conversationId: string, steps = 1) => {
+    const conv = readConversation(appHome, conversationId);
+    if (!conv) return { ok: false, error: 'conversation-not-found' };
+    if (conv.conversationCompaction) return { ok: false, error: 'compacted' };
+
+    const { tree, headId } = ensureConversationTree(conv);
+    const branch = getConversationBranch(tree, headId);
+    // Indices of user turns along the active branch, oldest→newest.
+    const userIdx = branch.map((m, i) => (m.role === 'user' ? i : -1)).filter((i) => i >= 0);
+    if (userIdx.length === 0) return { ok: false, error: 'nothing-to-rewind' };
+
+    // Normalize steps to a finite positive integer — a NaN/negative/fractional
+    // value from the wire would make `target` NaN and null the head.
+    const n = Number(steps);
+    const safeSteps = Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
+    const target = Math.max(0, userIdx.length - safeSteps);
+    const cutIndex = userIdx[target]; // this user turn (and everything after) is removed from the active branch
+    const nextHead = cutIndex > 0 ? branch[cutIndex - 1].id : null;
+    const removed = branch.length - cutIndex;
+    return { ok: true, removed, conversation: commitTreeUpdate(conv, tree, nextHead) };
+  });
+
   ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
@@ -513,6 +540,45 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     broadcastActive(appHome);
     return { ok: true };
   });
+
+  // Fast single-round-trip selection change for the CLI: patch only the
+  // selected model or profile on one conversation (one read + one write; no
+  // full-record merge), and return the resolved effective-model display name so
+  // the client can update its banner without extra catalog/get round-trips.
+  ipcMain.handle(
+    'conversations:set-selection',
+    (_event, id: string, kind: 'model' | 'profile', value: string | null) => {
+      const conv = readConversation(appHome, id);
+      if (!conv) return { ok: false, error: 'conversation-not-found' };
+
+      if (kind === 'model') conv.selectedModelKey = value;
+      else conv.selectedProfileKey = value;
+      conv.updatedAt = new Date().toISOString();
+      writeConversation(appHome, conv);
+      broadcastUpsert(appHome, conv);
+
+      // Resolve the effective model display name for the banner.
+      let modelLabel: string | null = null;
+      let profileLabel: string | null = null;
+      try {
+        const config = getConfig?.();
+        if (config) {
+          const models = config.models?.catalog ?? [];
+          const profiles = config.profiles ?? [];
+          const profile = conv.selectedProfileKey ? profiles.find((p) => p.key === conv.selectedProfileKey) : undefined;
+          profileLabel = profile ? (profile.name ?? profile.key) : null;
+          const effectiveModelKey =
+            profile?.primaryModelKey ?? conv.selectedModelKey ?? config.models?.defaultModelKey ?? null;
+          const entry = models.find((m) => m.key === effectiveModelKey);
+          modelLabel = entry?.displayName ?? effectiveModelKey ?? null;
+        }
+      } catch {
+        // label resolution is best-effort
+      }
+
+      return { ok: true, modelLabel, profileLabel };
+    },
+  );
 
   ipcMain.handle('conversations:fork', (_event, id: string, upToMessageIndex?: number) => {
     const source = readConversation(appHome, id);

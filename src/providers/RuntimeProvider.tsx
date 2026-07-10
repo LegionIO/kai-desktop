@@ -880,11 +880,9 @@ function formatStreamError(raw: string, category?: string, statusCode?: number):
 function applyEnrichments(acc: MessageAccumulator, data: Record<string, unknown>): void {
   // Normalize enrichment payload from multiple event shapes — supports both flat keys and nested
   const debate = (data['debate:result'] ?? data['debate'] ?? data['debate_result']) as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   const curation = (data['curation:stats'] ?? data['curation'] ?? data['curation_stats']) as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
 
   if (!debate && !curation) return;
 
@@ -1696,6 +1694,9 @@ export function RuntimeProvider({
         };
         // Set when the event originates from an automation run (see StreamEvent).
         automation?: boolean;
+        // Set when a agent:submit (CLI) turn is persisted by the MAIN process;
+        // a GUI on the same conversation renders live but must not persist.
+        serverPersisted?: boolean;
       };
 
       // Debug: log every event received in renderer
@@ -1768,8 +1769,7 @@ export function RuntimeProvider({
           const lastIsUser = lastMsg?.role === 'user';
           const lastContent = lastIsUser && Array.isArray(lastMsg.content) ? lastMsg.content : [];
           const lastText = lastContent.find((p: unknown) => (p as { type: string }).type === 'text') as
-            | { text?: string }
-            | undefined;
+            { text?: string } | undefined;
           const isDuplicate = lastIsUser && lastText?.text === msgText;
 
           if (!isDuplicate) {
@@ -1806,8 +1806,7 @@ export function RuntimeProvider({
             toolCallId: e.toolCallId,
             toolName: e.toolName,
             data: e.data as
-              | { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean }
-              | undefined,
+              { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean } | undefined,
           });
         } else if (e.type === 'error') {
           applyError(saAcc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
@@ -1842,7 +1841,10 @@ export function RuntimeProvider({
       const convId = e.conversationId;
       const isActiveConv = convId === activeIdRef.current;
 
-      if (e.automation) automationStreams.add(convId);
+      // Both automation runs and CLI (agent:submit) turns are persisted by the
+      // MAIN process; track them in one set so the renderer renders live but
+      // never double-persists. `automationStreams` = "main-owned stream here".
+      if (e.automation || e.serverPersisted) automationStreams.add(convId);
 
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
@@ -1851,12 +1853,13 @@ export function RuntimeProvider({
             `[StreamEvent] Creating accumulator for active conv=${convId.slice(0, 8)} treeLen=${curTree.length} headId=${curHead?.slice(0, 8) ?? 'null'}`,
           );
           streamAccumulators.set(convId, { messages: [...curTree], headId: curHead });
-        } else if (e.automation) {
-          // Automation streaming into a NON-active conversation: keep a background
-          // accumulator so switching to it mid-run shows streamed-so-far content.
-          // Seed SYNCHRONOUSLY (empty base) and fall through to process this same
-          // event — dropping early events truncated the first thoughts/text from
-          // the live view. Kick off an async disk fetch to backfill the persisted
+        } else if (e.automation || e.serverPersisted) {
+          // Automation OR CLI (serverPersisted) streaming into a NON-active
+          // conversation: keep a background accumulator so switching to it
+          // mid-run shows streamed-so-far content. Seed SYNCHRONOUSLY (empty
+          // base) and fall through to process this same event — dropping early
+          // events truncated the first thoughts/text from the live view. Kick
+          // off an async disk fetch to backfill the persisted
           // prefix (e.g. the user prompt turn) without discarding any deltas; the
           // trailing automation `done` reloads the authoritative tree from disk.
           const seededAcc: MessageAccumulator = { messages: [], headId: null };
@@ -2017,7 +2020,11 @@ export function RuntimeProvider({
         if (data && data.content !== undefined) {
           const targetId = typeof data.messageId === 'string' ? data.messageId : undefined;
           let idx = targetId ? acc.messages.findIndex((m) => m.id === targetId) : -1;
-          if (idx < 0) {
+          // Only fall back to "last user message" when NO messageId was given.
+          // If a messageId WAS provided but isn't in this accumulator yet (e.g. a
+          // CLI-appended node the renderer hasn't loaded), do NOT redact a
+          // different turn — skip and let the store's own scrub + reload apply.
+          if (idx < 0 && !targetId) {
             for (let i = acc.messages.length - 1; i >= 0; i--) {
               if (acc.messages[i].role === 'user') {
                 idx = i;
@@ -2215,8 +2222,7 @@ export function RuntimeProvider({
       } else if (e.type === 'retry') {
         // Retry events are informational — show as observer message
         const retryData = e.data as
-          | { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string }
-          | undefined;
+          { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string } | undefined;
         if (retryData) {
           const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
           const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
@@ -2328,7 +2334,7 @@ export function RuntimeProvider({
         );
         // Automation-owned stream: main process persists the terminal state and
         // sends its own `done`. Don't persist from here; just reconcile from disk.
-        if (e.automation || automationStreams.has(convId)) {
+        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
           // Keep the accumulator alive so the trailing automation `done` (which
           // arrives right after) does the final cleanup + reload uniformly.
           if (isActiveConv) {
@@ -2374,7 +2380,7 @@ export function RuntimeProvider({
         // Automation-owned stream: the MAIN process persisted the authoritative
         // [user, assistant] exchange and set runStatus. Don't persist from here
         // (would duplicate). Drop the accumulator + reload from disk to reconcile.
-        if (e.automation || automationStreams.has(convId)) {
+        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
           automationStreams.delete(convId);
           const _ptAuto = persistTimersRef.current.get(convId);
           if (_ptAuto) {
@@ -2509,7 +2515,7 @@ export function RuntimeProvider({
       // The main process writes the authoritative [user, assistant] turns; a
       // debounced renderer persist here could write a partial assistant-only
       // branch before the main write lands, creating duplicate/orphaned nodes.
-      if (e.automation || automationStreams.has(convId)) {
+      if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
         if (isActiveConv && !acc.awaitingApproval) setIsRunning(true);
         return;
       }

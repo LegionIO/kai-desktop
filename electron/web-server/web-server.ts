@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathS
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { webClients } from './web-clients.js';
+import { notifyClientCountChanged } from '../local-bridge/local-server.js';
 import { invokeHandler } from './ipc-bridge.js';
 import { ensureSelfSignedCert } from './self-signed.js';
 import { getLoginPageHtml } from './login-page.js';
@@ -1004,11 +1005,13 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     ws.on('close', () => {
       clearInterval(heartbeat);
       webClients.delete(ws);
+      notifyClientCountChanged(); // a demoted headless backend may now be idle
     });
 
     ws.on('error', () => {
       clearInterval(heartbeat);
       webClients.delete(ws);
+      notifyClientCountChanged();
     });
   });
 

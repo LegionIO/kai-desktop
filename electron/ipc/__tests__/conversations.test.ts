@@ -546,3 +546,98 @@ describe('ensureConversationTree / getConversationBranch', () => {
     expect(getConversationBranch(tree, 'c').map((m) => m.id)).toEqual(['a', 'c']);
   });
 });
+
+describe('conversations IPC: rewind', () => {
+  const twoExchangeTree = [
+    { id: 'u1', parentId: null, role: 'user' as const, content: 'q1', createdAt: 'x' },
+    { id: 'a1', parentId: 'u1', role: 'assistant' as const, content: 'a1', createdAt: 'x' },
+    { id: 'u2', parentId: 'a1', role: 'user' as const, content: 'q2', createdAt: 'x' },
+    { id: 'a2', parentId: 'u2', role: 'assistant' as const, content: 'a2', createdAt: 'x' },
+  ];
+
+  it('rewinds one turn, shrinking the active branch and keeping the tail in the tree', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('rw', {
+        messages: twoExchangeTree,
+        messageTree: twoExchangeTree,
+        headId: 'a2',
+        messageCount: 4,
+        userMessageCount: 2,
+      }),
+    );
+
+    const res = await harness.invoke<{ ok: boolean; removed: number }>('conversations:rewind', FAKE_EVENT, 'rw', 1);
+    expect(res.ok).toBe(true);
+    expect(res.removed).toBe(2);
+
+    const after = await harness.invoke<{ messages: unknown[]; messageTree: unknown[] }>(
+      'conversations:get',
+      FAKE_EVENT,
+      'rw',
+    );
+    expect(after.messages).toHaveLength(2); // active branch back to first exchange
+    expect(after.messageTree).toHaveLength(4); // nothing lost — tail stays as a branch
+  });
+
+  it('refuses to rewind a compacted conversation', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('rwc', {
+        messages: twoExchangeTree,
+        messageTree: twoExchangeTree,
+        headId: 'a2',
+        messageCount: 4,
+        userMessageCount: 2,
+        conversationCompaction: { summaryText: 'summary' },
+      }),
+    );
+
+    const res = await harness.invoke<{ ok: boolean; error: string }>('conversations:rewind', FAKE_EVENT, 'rwc', 1);
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('compacted');
+  });
+
+  it('normalizes a NaN steps value to 1 instead of nulling the head', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('rwnan', {
+        messages: twoExchangeTree,
+        messageTree: twoExchangeTree,
+        headId: 'a2',
+        messageCount: 4,
+        userMessageCount: 2,
+      }),
+    );
+
+    // A non-numeric steps from the wire must not produce removed: NaN / head: null.
+    const res = await harness.invoke<{ ok: boolean; removed: number }>(
+      'conversations:rewind',
+      FAKE_EVENT,
+      'rwnan',
+      'garbage' as unknown as number,
+    );
+    expect(res.ok).toBe(true);
+    expect(res.removed).toBe(2); // treated as steps=1
+    const after = await harness.invoke<{ messages: unknown[] }>('conversations:get', FAKE_EVENT, 'rwnan');
+    expect(after.messages).toHaveLength(2);
+  });
+});

@@ -95,6 +95,14 @@ import { initPluginBrowser } from './plugins/browser-window/index.js';
 import { primeResolvedShellPath } from './utils/shell-env.js';
 import { installIpcCapture } from './web-server/ipc-bridge.js';
 import { startWebServer, stopWebServer, restartWebServer } from './web-server/web-server.js';
+import {
+  startLocalServer,
+  stopLocalServer,
+  disableIdleShutdown,
+  restartIdleShutdown,
+} from './local-bridge/local-server.js';
+import { localClients } from './local-bridge/local-clients.js';
+import { webClients } from './web-server/web-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -118,7 +126,100 @@ function resolveUserDataDir(): string {
 
 const APP_HOME = resolveUserDataDir();
 
+/**
+ * Headless mode: run the full main-process backend (IPC handlers, tools, local
+ * CLI bridge) with NO window. Used when the `kai` CLI boots the leader itself
+ * because no GUI is running. Detected from argv or env so the packaged app can
+ * be relaunched into headless mode.
+ */
+const IS_HEADLESS = process.argv.includes('--kai-headless') || process.env.KAI_HEADLESS === '1';
+
+/**
+ * CLI mode: this Electron process is the `kai` terminal client, not the app.
+ * It runs the Ink REPL in the main process (using Electron's built-in Node +
+ * the inherited terminal TTY) and connects to the backend over the local
+ * socket — it must NOT take the singleton lock or bootstrap the backend, so a
+ * real backend/GUI keeps ownership. The packaged `kai` shim execs the app
+ * binary with `--cli` so no separate Node runtime is needed and the security
+ * fuses stay locked (this is normal main-process Node, not RunAsNode).
+ */
+const IS_CLI = process.argv.includes('--kai-cli') || process.env.KAI_CLI === '1';
+
+// In headless mode there is no user and no Dock presence, so NOTHING may open a
+// window — not the app, not a plugin (e.g. skynet's bridge-auth window). A
+// stray window would flash on screen AND, by counting in getAllWindows(), keep
+// the idle-shutdown heuristic from ever firing. Neutralize window display at
+// the source: patch BrowserWindow so any instance created while the block is
+// active is forced hidden and destroyed. The block is LIFTED when a headless
+// backend is promoted to windowed (a GUI launched against it — see
+// `promoteHeadlessToWindowed`), so the real app window can then appear.
+let headlessWindowBlockActive = IS_HEADLESS;
+// Install the window-block guard UNCONDITIONALLY (not just when launched
+// headless). It's gated at runtime on `headlessWindowBlockActive`, which is
+// false for a normal GUI launch — so the patch is a no-op there. But a GUI that
+// later DEMOTES to a dockless background backend flips the flag true, and
+// without the guard installed at startup, plugins/GUI subsystems could still
+// open a visible window in the supposedly headless backend.
+{
+  const proto = BrowserWindow.prototype as unknown as {
+    show: () => void;
+    showInactive: () => void;
+    focus: () => void;
+  };
+  const origShow = proto.show;
+  const origShowInactive = proto.showInactive;
+  const origFocus = proto.focus;
+  const selfDestruct = function (this: BrowserWindow): void {
+    try {
+      if (!this.isDestroyed()) this.destroy();
+    } catch {
+      /* ignore */
+    }
+  };
+  proto.show = function (this: BrowserWindow): void {
+    if (headlessWindowBlockActive) selfDestruct.call(this);
+    else origShow.call(this);
+  };
+  proto.showInactive = function (this: BrowserWindow): void {
+    if (headlessWindowBlockActive) selfDestruct.call(this);
+    else origShowInactive.call(this);
+  };
+  proto.focus = function (this: BrowserWindow): void {
+    if (!headlessWindowBlockActive) origFocus.call(this);
+    // else no-op: never steal focus while headless
+  };
+}
+
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
+
+/**
+ * Promote a headless (CLI-spawned) backend to a windowed GUI. Assigned inside
+ * `whenReady` (it needs getConfig/setConfig + the started local server in
+ * scope); a no-op until then. Fired from `second-instance` when a GUI launches
+ * against a running headless backend — the backend gains a window instead of
+ * the GUI launch silently failing the singleton lock.
+ */
+let promoteHeadlessToWindowed: () => Promise<void> = async () => {};
+
+/** Set once `promoteHeadlessToWindowed` is wired in whenReady. */
+let promoteReady = false;
+/** A second-instance (GUI launch) that arrived before promotion was wired. */
+let pendingPromote = false;
+
+/**
+ * Revert a windowed backend to a dockless headless background backend when its
+ * last GUI window closes but socket clients (CLIs) remain. Assigned in
+ * `whenReady`; a no-op until then. Fired from `window-all-closed`.
+ */
+let demoteWindowedToHeadlessRef: () => void = () => {};
+
+// Monotonic: true once this process has ever presented a GUI window — set at
+// boot for a normal GUI launch, and on promotion for a CLI-spawned headless
+// backend. Gates the web-server config hot-reload so a PURE headless backend
+// (never windowed) can't be made to expose its network port via a config:set
+// over the local bridge. A demoted-after-GUI backend keeps this true (it was
+// already exposed as a GUI), so config-driven restarts still apply there.
+let hasEverBeenWindowed = !IS_HEADLESS;
 
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
 
@@ -242,6 +343,15 @@ function saveWindowState(win: BrowserWindow): void {
 // Set app name early so macOS menu bar and dock show the product name instead of "Electron"
 app.setName(__BRAND_PRODUCT_NAME);
 
+// A headless backend is a macOS "accessory" process: no Dock icon, no menu
+// bar, no window. Set at launch (per-process) — the value is never set by the
+// GUI/CLI front-end clients, so nothing else is affected. This is the correct
+// mechanism (vs. a runtime app.dock.hide() toggle) for keeping a CLI-only /
+// backend run from rendering as a foreground GUI app in Finder or the Dock.
+if (IS_HEADLESS && process.platform === 'darwin' && app.setActivationPolicy) {
+  app.setActivationPolicy('accessory');
+}
+
 // Register the media protocol as a privileged scheme (must happen before app.whenReady)
 protocol.registerSchemesAsPrivileged([
   {
@@ -265,8 +375,25 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
+// When APP_HOME is overridden (dev/headless isolation via KAI_USER_DATA), also
+// remap Electron's own userData dir so the single-instance lock namespace
+// tracks the app home. Without this, two instances pointed at DIFFERENT homes
+// would still collide on one shared lock (the default userData), and the loser
+// would quit without ever serving its socket. With it: distinct homes ⇒
+// distinct locks (isolation works); same home ⇒ shared lock (the intended
+// "one backend per install" contract still holds).
+if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
+  try {
+    app.setPath('userData', join(APP_HOME, 'electron-user-data'));
+  } catch (err) {
+    console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to remap userData for isolated home:`, err);
+  }
+}
+
+// CLI mode never requests the singleton lock — the backend (GUI or headless)
+// owns it. A `false` here also disables the whole backend bootstrap block below.
+const gotSingleInstanceLock = IS_CLI ? false : app.requestSingleInstanceLock();
+if (!IS_CLI && !gotSingleInstanceLock) {
   app.quit();
 }
 
@@ -673,6 +800,19 @@ function createWindow(): BrowserWindow {
     if (primaryWindowRef === mainWindow) {
       primaryWindowRef = null;
     }
+    // The primary window is gone. If CLI/web clients still depend on this
+    // backend, demote to headless NOW rather than waiting on window-all-closed
+    // — which may never fire, because dictation keeps a hidden overlay window
+    // alive that counts in getAllWindows(). demoteWindowedToHeadless tears those
+    // GUI-only windows/services down. But do NOT demote while OTHER visible
+    // windows remain (plugin browser, computer-use operator) — hiding the dock
+    // and re-arming idle shutdown under a visible window would be wrong.
+    const otherVisible = BrowserWindow.getAllWindows().some(
+      (w) => w !== mainWindow && !w.isDestroyed() && w.isVisible(),
+    );
+    if ((localClients.size > 0 || webClients.size > 0) && !headlessWindowBlockActive && !otherVisible) {
+      demoteWindowedToHeadlessRef();
+    }
   });
 
   return mainWindow;
@@ -702,8 +842,25 @@ app.commandLine.appendSwitch('enable-speech-api');
 app.commandLine.appendSwitch('enable-speech-dispatcher');
 
 if (gotSingleInstanceLock) {
-  app.on('second-instance', () => {
-    focusPrimaryWindow();
+  app.on('second-instance', (_event, argv) => {
+    // A second launch arrived. Ignore duplicate BACKEND/CLI launches (e.g. two
+    // CLIs racing to spawn a headless backend, or a CLI client attaching) —
+    // only a real GUI launch should promote a dockless backend to windowed.
+    if (argv.includes('--kai-headless') || argv.includes('--kai-cli')) {
+      return;
+    }
+    // If this process is currently a dockless (headless/demoted) backend, a GUI
+    // is trying to open against us — promote to windowed. Gate on the RUNTIME
+    // window-block state, not the immutable IS_HEADLESS, so a GUI leader that
+    // demoted after its windows closed still re-promotes. If promotion isn't
+    // wired yet (second-instance can arrive before whenReady assigns it),
+    // remember it and drain once ready.
+    if (headlessWindowBlockActive) {
+      if (promoteReady) void promoteHeadlessToWindowed();
+      else pendingPromote = true;
+    } else {
+      focusPrimaryWindow();
+    }
   });
 
   app.whenReady().then(() => {
@@ -715,8 +872,10 @@ if (gotSingleInstanceLock) {
       return process.env.PATH ?? '';
     });
 
-    // Request microphone permission on macOS (needed for voice recording / speech-to-text)
-    if (process.platform === 'darwin') {
+    // Request microphone permission on macOS (needed for voice recording /
+    // speech-to-text) — GUI only. A headless CLI backend has no mic UI and must
+    // not trigger a privacy-permission prompt on terminal startup.
+    if (process.platform === 'darwin' && !IS_HEADLESS) {
       systemPreferences
         .askForMediaAccess('microphone')
         .then((granted) => {
@@ -727,10 +886,13 @@ if (gotSingleInstanceLock) {
         });
     }
 
-    // Set dock icon (macOS) — needed for dev mode since packager config doesn't apply.
+    // Set dock icon (macOS) — GUI only; a headless/accessory backend has no Dock
+    // presence, and setting an icon would be a no-op at best.
     // The raw icon.png fills edge-to-edge; createPaddedDockIcon gives it the inset that
     // packaged .icns builds get automatically.
-    setMacDockIcon();
+    if (!IS_HEADLESS) {
+      setMacDockIcon();
+    }
 
     // Config reader (used by tools and OAuth)
     const getConfig = () => readEffectiveConfig(APP_HOME);
@@ -846,7 +1008,13 @@ if (gotSingleInstanceLock) {
         webServerDebounce = setTimeout(() => {
           webServerDebounce = null;
           const wsConfig = config.webServer;
-          if (wsConfig?.enabled) {
+          // Never START the web server for a pure headless backend that has not
+          // been windowed — the port is a GUI-app feature, and a config:set over
+          // the local bridge must not be able to expose it before promotion.
+          // Promotion (promoteHeadlessToWindowed) starts it per config instead.
+          if (wsConfig?.enabled && !hasEverBeenWindowed) {
+            console.info(`[${__BRAND_PRODUCT_NAME}] Ignoring web-server enable for a non-windowed headless backend.`);
+          } else if (wsConfig?.enabled) {
             restartWebServer(wsConfig)
               .then(() =>
                 console.info(
@@ -922,11 +1090,19 @@ if (gotSingleInstanceLock) {
     registerBatchTranscribeHandlers(ipcMain, getConfig);
     registerStreamingSttHandlers(ipcMain, getConfig, getRecorderWindow);
 
-    // Initialize dictation system (global hotkey + STT + text insertion)
-    initDictation(getConfig(), setConfig);
+    // Initialize dictation + App Shots (global hotkeys, hidden helper windows,
+    // screenshot capture) ONLY when we have a GUI. A headless CLI backend has
+    // no user to dictate/screenshot, and their hidden BrowserWindows would
+    // otherwise keep the process off the Dock AND suppress idle-shutdown
+    // (getAllWindows() > 0). Handlers above are just IPC — harmless to leave
+    // registered — but these init calls create windows/hotkeys, so skip them.
+    if (!IS_HEADLESS) {
+      // Initialize dictation system (global hotkey + STT + text insertion)
+      initDictation(getConfig(), setConfig);
 
-    // Initialize App Shots (global hotkey → screenshot + window metadata → composer)
-    initAppShots(getConfig());
+      // Initialize App Shots (global hotkey → screenshot + window metadata → composer)
+      initAppShots(getConfig());
+    }
     registerAppShotsHandlers(ipcMain);
 
     // Debug logging: renderer can write to debug-logs/ via IPC
@@ -1117,6 +1293,143 @@ if (gotSingleInstanceLock) {
 
     // Register agent handlers after pluginManager so inference providers are available
     registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+
+    // Start the local IPC socket EARLY — as soon as the conversation/agent IPC
+    // handlers exist — so the `kai` CLI can connect in ~1s instead of waiting
+    // for the slow tool-registry / plugin / marketplace init that follows. The
+    // leader always serves it (it holds the single-instance lock), independent
+    // of the user-facing web server toggle. A headless (CLI-spawned) backend
+    // enables idle shutdown so it doesn't outlive its clients; a windowed GUI
+    // leader persists.
+    startLocalServer({
+      idleShutdown: IS_HEADLESS,
+      // What keeps a headless/demoted backend alive besides local CLI sockets:
+      // connected web-UI clients. (Windows don't count — a headless backend
+      // blocks/destroys them; a windowed GUI leader doesn't enable idleShutdown
+      // at all so this predicate is moot there.) A demoted GUI leader that was
+      // serving the web UI must not idle-exit while a browser is still attached.
+      hasOtherClients: () => webClients.size > 0,
+      onIdleExit: () => {
+        console.info(`[${__BRAND_PRODUCT_NAME}] Headless backend idle with no clients — shutting down.`);
+        app.quit();
+        // Hard-exit fallback: if before-quit teardown stalls (async plugin
+        // cleanup, pending work), force the process down so a headless backend
+        // never lingers after its clients are gone.
+        setTimeout(() => {
+          app.exit(0);
+        }, 2000).unref();
+      },
+    })
+      .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
+      .catch((err) => {
+        console.error(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge failed to start:`, err);
+        // A headless backend with no reachable socket is useless AND would hold
+        // the singleton lock forever, blocking every future CLI/GUI launch. Exit
+        // so the next launch can take over. A windowed GUI leader keeps running
+        // (the socket is a bonus there, not its reason to exist).
+        if (IS_HEADLESS) {
+          app.quit();
+          setTimeout(() => app.exit(1), 2000).unref();
+        }
+      });
+
+    // ── Headless ⇄ windowed transitions ──────────────────────────────────
+    // A single leader process can start headless (spawned by the CLI) and later
+    // gain/lose a GUI window as GUIs open/close, without ever tearing down the
+    // backend the CLIs depend on.
+    let guiInitialized = !IS_HEADLESS; // GUI-only subsystems already set up at boot?
+
+    const ensureGuiSubsystems = (): void => {
+      if (guiInitialized) return;
+      guiInitialized = true;
+      try {
+        setMacDockIcon(); // headless boot skipped this; a promoted window needs the icon
+        initDictation(getConfig(), setConfig);
+        initAppShots(getConfig());
+      } catch (err) {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] GUI subsystem init on promotion failed (non-fatal):`, err);
+      }
+    };
+
+    promoteHeadlessToWindowed = async (): Promise<void> => {
+      if (!headlessWindowBlockActive) {
+        // Already windowed — just focus.
+        focusPrimaryWindow();
+        return;
+      }
+      console.info(`[${__BRAND_PRODUCT_NAME}] Promoting headless backend to windowed (GUI launched).`);
+      headlessWindowBlockActive = false; // allow windows to show again
+      hasEverBeenWindowed = true; // GUI now present — web-server hot-reload may apply
+      disableIdleShutdown(); // a GUI now holds this backend; don't idle-exit
+      if (process.platform === 'darwin') {
+        // Return to a normal foreground app: regular activation policy lets an
+        // interactive window paint + focus (accessory apps can't foreground a
+        // standard window), and re-show the Dock icon.
+        app.setActivationPolicy?.('regular');
+        app.dock?.show();
+      }
+      ensureGuiSubsystems();
+      // A headless backend skips the web server at boot (it's a GUI-app feature).
+      // On promotion to a real GUI, honor the config: start it if enabled and not
+      // already running. startWebServer is idempotent (stops any existing first).
+      const webServerConfig = getConfig().webServer;
+      if (webServerConfig?.enabled) {
+        startWebServer(webServerConfig)
+          .then(() =>
+            console.info(
+              `[${__BRAND_PRODUCT_NAME}] Web UI server started on promotion at ${webServerConfig.tls?.enabled ? 'https' : 'http'}://${webServerConfig.bindAddress || '0.0.0.0'}:${webServerConfig.port}`,
+            ),
+          )
+          .catch((err) => console.error(`[${__BRAND_PRODUCT_NAME}] Web server failed to start on promotion:`, err));
+      }
+      const win = createWindow();
+      win.once('ready-to-show', () => {
+        if (!win.isDestroyed()) {
+          win.show();
+          win.focus();
+        }
+      });
+    };
+
+    // Called when the primary GUI window closes (or from window-all-closed): if
+    // socket clients (CLIs) or web clients remain, revert to a dockless
+    // background backend that idle-exits once the last client leaves — instead
+    // of lingering as a dock app. Tearing down GUI-only services here is what
+    // actually makes it headless: dictation eagerly creates a HIDDEN overlay
+    // window, so without this a closed main window would leave that window alive
+    // (window-all-closed never fires) and hotkeys/overlays would keep running.
+    const demoteWindowedToHeadless = (): void => {
+      if (headlessWindowBlockActive) return; // already headless
+      console.info(`[${__BRAND_PRODUCT_NAME}] No primary window — reverting to headless background backend.`);
+      headlessWindowBlockActive = true;
+      // Suspend GUI-only subsystems (global hotkeys + hidden overlay/recorder
+      // windows). The web server stays up on purpose — it serves web clients and
+      // is counted by hasOtherClients() to keep the backend alive. Reset the
+      // init latch so a later promotion re-initializes these.
+      try {
+        cleanupDictation();
+        cleanupAppShots();
+        closeAllOverlayWindows();
+      } catch (err) {
+        console.warn(`[${__BRAND_PRODUCT_NAME}] GUI subsystem teardown on demote failed (non-fatal):`, err);
+      }
+      guiInitialized = false;
+      if (process.platform === 'darwin') {
+        app.dock?.hide();
+        app.setActivationPolicy?.('accessory');
+      }
+      // Re-arm idle self-shutdown so the backend reaps once its last CLI leaves.
+      restartIdleShutdown();
+    };
+    demoteWindowedToHeadlessRef = demoteWindowedToHeadless;
+
+    // Promotion is now wired. Drain a GUI launch that raced ahead of this
+    // assignment (second-instance arrived during startup).
+    promoteReady = true;
+    if (pendingPromote) {
+      pendingPromote = false;
+      if (headlessWindowBlockActive) void promoteHeadlessToWindowed();
+    }
 
     // Automation event bus + engine (needs pluginManager for plugin-action dispatch,
     // getRegisteredTools for tool actions, and getConfig for rule reload).
@@ -1488,7 +1801,7 @@ if (gotSingleInstanceLock) {
       });
     });
 
-    const mainWindow = createWindow();
+    const mainWindow = IS_HEADLESS ? null : createWindow();
 
     // Initialize marketplace and plugins immediately. We avoid putting this
     // inside `ready-to-show` because createWindow() calls loadURL(), which may
@@ -1530,12 +1843,18 @@ if (gotSingleInstanceLock) {
       }
     })();
 
-    mainWindow.once('ready-to-show', () => {
+    mainWindow?.once('ready-to-show', () => {
       mainWindow.show();
 
       // Signal OTA rollback system that the app is running stably
       signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
     });
+
+    // Headless leader has no window to become "ready to show" — signal stable
+    // once the backend is up so OTA rollback doesn't count it as a crash.
+    if (IS_HEADLESS) {
+      signalAppRunning(__BRAND_APP_SLUG, codePaths.codeVersion);
+    }
 
     // Initialize tools asynchronously
     const toolsReady = shellPathReady
@@ -1549,9 +1868,12 @@ if (gotSingleInstanceLock) {
         // Register realtime handlers (needs tool registry)
         registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);
 
-        // Start web UI server if enabled
+        // Start web UI server if enabled — but NOT in headless (CLI-spawned)
+        // mode. The web server is a GUI-app feature; a headless CLI backend
+        // shouldn't expose a network port, and plugin/web bridge connections to
+        // it would otherwise count as "clients" and suppress idle-shutdown.
         const webServerConfig = getConfig().webServer;
-        if (webServerConfig?.enabled) {
+        if (webServerConfig?.enabled && !IS_HEADLESS) {
           startWebServer(webServerConfig)
             .then(() =>
               console.info(
@@ -1567,6 +1889,10 @@ if (gotSingleInstanceLock) {
       })
       .catch((err) => {
         console.error(`[${__BRAND_PRODUCT_NAME}] Failed to build tool registry:`, err);
+        // Still resolve tools-ready (with whatever registered, possibly none) so
+        // CLI agent:submit calls don't hang forever awaiting a registry that
+        // will never arrive. registerTools() flips the ready latch.
+        registerTools(getRegisteredTools());
       });
 
     void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {
@@ -1576,6 +1902,14 @@ if (gotSingleInstanceLock) {
     app.on('activate', () => {
       const allWindows = BrowserWindow.getAllWindows();
       if (allWindows.length === 0) {
+        // If we're a dockless (headless/demoted) backend, go through the full
+        // promotion (lift window block, restore dock/activation, init GUI subsystems,
+        // disable idle-shutdown) — a raw createWindow() here would be destroyed by
+        // the window block.
+        if (headlessWindowBlockActive) {
+          void promoteHeadlessToWindowed();
+          return;
+        }
         const win = createWindow();
         win.once('ready-to-show', () => {
           win.show();
@@ -1594,10 +1928,40 @@ if (gotSingleInstanceLock) {
       focusPrimaryWindow();
     });
   });
+} else if (IS_CLI) {
+  // CLI client mode: no backend, no window, no lock. Run the Ink REPL in this
+  // main process against the inherited terminal TTY, connecting to the backend
+  // over the local socket (spawning a headless backend if none is running).
+  app.whenReady().then(async () => {
+    if (process.platform === 'darwin' && app.setActivationPolicy) {
+      app.setActivationPolicy('prohibited'); // never dock / foreground the CLI process
+    }
+    try {
+      const { runCliClient } = await import('./cli/electron-entry.js');
+      await runCliClient();
+    } catch (err) {
+      process.stderr.write(`[kai] fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+      app.exit(1);
+    }
+  });
 }
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  // If CLI/socket clients OR web-UI clients are still attached, don't quit —
+  // the backend they depend on lives here. Revert to a dockless headless
+  // background backend that idle-exits once the last client disconnects.
+  if (localClients.size > 0 || webClients.size > 0) {
+    demoteWindowedToHeadlessRef();
+    return;
+  }
+  // No clients. A backend that only ever existed to serve clients (a headless
+  // CLI-spawned leader, or a GUI that has since demoted) has no reason to
+  // linger, so quit on every platform. But a NORMAL GUI launch must keep the
+  // historical macOS behavior: stay resident (dock icon + main-process
+  // background services — dictation/App Shots global hotkeys, automation
+  // engine) and reopen on `activate`. Only non-darwin quits in that case.
+  const isBackendOnly = IS_HEADLESS || headlessWindowBlockActive;
+  if (isBackendOnly || process.platform !== 'darwin') {
     app.quit();
   }
 });
@@ -1608,6 +1972,8 @@ app.on('before-quit', () => {
   cleanupOta();
   // Stop web UI server
   stopWebServer().catch(() => {});
+  // Stop the local CLI bridge (Phase 5 will add graceful leader handoff here)
+  stopLocalServer().catch(() => {});
   // Best-effort plugin cleanup (don't block quit on failures)
   pluginManagerRef?.unloadAll().catch((err) => {
     console.error(`[${__BRAND_PRODUCT_NAME}] Plugin cleanup error:`, err);

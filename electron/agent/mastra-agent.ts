@@ -81,6 +81,11 @@ export type StreamEvent = {
    * chat). The renderer uses it to render live but defer persistence to the main
    * process (which owns the automation conversation's on-disk write). */
   automation?: boolean;
+  /** Set when this turn was started via agent:submit (the `kai` CLI) and the
+   * MAIN process is persisting the assistant reply. A GUI viewing the same
+   * conversation must render live but NOT persist (would duplicate). Same
+   * render-live-skip-persist-reload-on-done treatment as `automation`. */
+  serverPersisted?: boolean;
 };
 
 type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -1488,8 +1493,7 @@ async function* streamWithRealEvents(
             }
             // Extract Anthropic cache token info from providerMetadata or directly from usage
             const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
-              | Record<string, unknown>
-              | undefined;
+              Record<string, unknown> | undefined;
             const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;

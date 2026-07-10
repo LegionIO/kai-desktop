@@ -16,22 +16,12 @@ import { generateId } from '@/lib/utils';
 import { NumberField, settingsSelectClass, TextField, Toggle, type SettingsProps } from './shared';
 
 type ConditionOp =
-  | 'equals'
-  | 'notEquals'
-  | 'contains'
-  | 'startsWith'
-  | 'endsWith'
-  | 'matches'
-  | 'in'
-  | 'exists'
-  | 'expression';
+  'equals' | 'notEquals' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'in' | 'exists' | 'expression';
 
 type Condition = { path: string; op: ConditionOp; value?: unknown; caseSensitive: boolean };
 
 type ConversationTarget =
-  | { type: 'per-invocation' }
-  | { type: 'singleton' }
-  | { type: 'existing'; conversationId: string };
+  { type: 'per-invocation' } | { type: 'singleton' } | { type: 'existing'; conversationId: string };
 
 type Action =
   | {
