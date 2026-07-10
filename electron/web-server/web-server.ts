@@ -15,6 +15,7 @@ import {
   fstatSync,
   readSync,
   closeSync,
+  constants,
 } from 'fs';
 import type { Duplex } from 'stream';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -814,7 +815,11 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       let data: Buffer;
       let fd: number | null = null;
       try {
-        fd = openSync(realMediaPath, 'r');
+        // O_NOFOLLOW: after realpathSync every ancestor is already canonical, so
+        // this makes the open fail if the final node was swapped to a symlink
+        // between the check and the open — closing the TOCTOU window without a
+        // hand-rolled openat path walk. (constants.O_RDONLY | O_NOFOLLOW.)
+        fd = openSync(realMediaPath, constants.O_RDONLY | constants.O_NOFOLLOW);
         const st = fstatSync(fd);
         if (!st.isFile()) {
           res.writeHead(404, { 'Content-Type': 'text/plain' });
