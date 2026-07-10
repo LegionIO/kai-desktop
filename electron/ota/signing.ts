@@ -36,12 +36,10 @@ import { createHash, verify as cryptoVerify } from 'crypto';
  * the define is not substituted — those contexts see an empty string and
  * `OTA_PUBLIC_KEY_IS_PLACEHOLDER` is true.
  */
-export const OTA_PUBLIC_KEY: string =
-  typeof __BRAND_OTA_PUBLIC_KEY !== 'undefined' ? __BRAND_OTA_PUBLIC_KEY : '';
+export const OTA_PUBLIC_KEY: string = typeof __BRAND_OTA_PUBLIC_KEY !== 'undefined' ? __BRAND_OTA_PUBLIC_KEY : '';
 
 /** True when no real public key was injected at build time. */
-export const OTA_PUBLIC_KEY_IS_PLACEHOLDER =
-  !OTA_PUBLIC_KEY || !OTA_PUBLIC_KEY.includes('BEGIN PUBLIC KEY');
+export const OTA_PUBLIC_KEY_IS_PLACEHOLDER = !OTA_PUBLIC_KEY || !OTA_PUBLIC_KEY.includes('BEGIN PUBLIC KEY');
 
 /**
  * Build the canonical byte string that is signed / verified.
@@ -86,28 +84,22 @@ export interface OtaSignedFields {
 /**
  * Verify an Ed25519 signature over the canonical OTA payload.
  *
+ * @param fields - the signed fields (sha512/codeVersion/minBaseVersion/filesHash/signature)
+ * @param publicKey - the PEM SPKI public key to verify against. Defaults to the
+ *   build-time-baked `OTA_PUBLIC_KEY`; production callers never pass this. The
+ *   parameter exists so the OTA test harness can verify against an ephemeral
+ *   test keypair without touching the shipped key.
  * @returns true if the signature is valid for the given fields
  */
-export function verifyOtaSignature(fields: OtaSignedFields): boolean {
-  if (
-    !fields.signature ||
-    !fields.sha512 ||
-    !fields.codeVersion ||
-    !fields.minBaseVersion ||
-    !fields.filesHash
-  ) {
+export function verifyOtaSignature(fields: OtaSignedFields, publicKey: string = OTA_PUBLIC_KEY): boolean {
+  if (!fields.signature || !fields.sha512 || !fields.codeVersion || !fields.minBaseVersion || !fields.filesHash) {
     return false;
   }
   try {
-    const payload = buildSignedPayload(
-      fields.sha512,
-      fields.codeVersion,
-      fields.minBaseVersion,
-      fields.filesHash,
-    );
+    const payload = buildSignedPayload(fields.sha512, fields.codeVersion, fields.minBaseVersion, fields.filesHash);
     const sigBuf = Buffer.from(fields.signature, 'base64');
     // Ed25519 → algorithm must be null
-    return cryptoVerify(null, payload, OTA_PUBLIC_KEY, sigBuf);
+    return cryptoVerify(null, payload, publicKey, sigBuf);
   } catch (err) {
     console.error('[ota-signing] Signature verification threw:', err);
     return false;
