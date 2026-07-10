@@ -10,6 +10,12 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gpt-4o-mini': 128000,
   'gpt-4.1': 1048576,
   'gpt-4.1-mini': 1048576,
+  // OpenAI reasoning models (recognized in usage-pricing.ts). Without these,
+  // adding one without an explicit maxInputTokens leaves contextWindowTokens
+  // null and compaction never triggers.
+  o3: 200000,
+  'o3-mini': 200000,
+  'o4-mini': 200000,
 };
 
 const MODEL_ENCODING_ALIASES: Record<string, string> = {
@@ -25,6 +31,10 @@ const MODEL_NORMALIZATION_RULES: Array<{ pattern: RegExp; normalized: string }> 
   { pattern: /^gpt-4o(?:-.+)?$/, normalized: 'gpt-4o' },
   { pattern: /^gpt-4\.1-mini(?:-.+)?$/, normalized: 'gpt-4.1-mini' },
   { pattern: /^gpt-4\.1(?:-.+)?$/, normalized: 'gpt-4.1' },
+  // Reasoning models — most-specific first so o4-mini/o3-mini win over o3.
+  { pattern: /^o4-mini(?:-.+)?$/, normalized: 'o4-mini' },
+  { pattern: /^o3-mini(?:-.+)?$/, normalized: 'o3-mini' },
+  { pattern: /^o3(?:-.+)?$/, normalized: 'o3' },
 ];
 
 const encodingCache = new Map<string, ModelEncoding>();
@@ -90,7 +100,7 @@ export function resolveConversationTokenization(
   const contextWindowTokens =
     typeof contextWindowOverride === 'number' && Number.isFinite(contextWindowOverride) && contextWindowOverride > 0
       ? Math.floor(contextWindowOverride)
-      : MODEL_CONTEXT_WINDOWS[normalizedModelName] ?? null;
+      : (MODEL_CONTEXT_WINDOWS[normalizedModelName] ?? null);
 
   const encodingModelName = MODEL_ENCODING_ALIASES[normalizedModelName] ?? normalizedModelName;
   const encoding = resolveEncodingForModel(encodingModelName);
