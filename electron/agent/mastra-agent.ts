@@ -1212,7 +1212,16 @@ async function* generateWithSyntheticEvents(
       break;
     } catch (error) {
       const emittedAnyOutput = eventQueue.length > 0;
-      if (!compatibilityRetried && shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)) {
+      // If the caller aborted, do NOT retry — skip all retry branches and fall
+      // through to the terminal path (which suppresses the error event for an
+      // abort). Otherwise a cancel during the error/backoff window would still
+      // yield a `retry`, sleep, and call generate() again for a dead turn.
+      const aborted = options?.abortSignal?.aborted === true;
+      if (
+        !aborted &&
+        !compatibilityRetried &&
+        shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)
+      ) {
         compatibilityRetried = true;
         activeModelSettings = omitTemperature(activeModelSettings);
         activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
@@ -1222,7 +1231,7 @@ async function* generateWithSyntheticEvents(
         );
         continue;
       }
-      if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
+      if (!aborted && !sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
         sanitizationRetried = true;
         activeMessages = deepSanitizeMessages(activeMessages);
         console.warn(
@@ -1235,7 +1244,7 @@ async function* generateWithSyntheticEvents(
       // Classify error for retry decision
       const errorInfo = classifyError(error);
 
-      if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
+      if (!aborted && errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
         const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
         console.warn(
           `[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
