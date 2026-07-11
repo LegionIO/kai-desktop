@@ -6,7 +6,7 @@
  * (File named AppshotGallerySettings to avoid a case-insensitive-filesystem
  * collision with AppShotsSettings.tsx on macOS.)
  */
-import { useState, useEffect, useCallback, type FC } from 'react';
+import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { XIcon, TrashIcon, PinIcon, PaperclipIcon, ImageIcon } from 'lucide-react';
 import { NumberField, Toggle, type SettingsProps } from './shared';
@@ -27,6 +27,23 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Strip path separators / control chars / dot-components from a filename part
+ *  (appName comes from OS window titles / user-writable index — untrusted). */
+function sanitizeFilenamePart(raw: string, fallback = 'appshot'): string {
+  const cleaned = Array.from(raw)
+    .filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      if (code < 0x20 || code === 0x7f) return false; // control chars
+      return ch !== '/' && ch !== '\\';
+    })
+    .join('')
+    .replace(/\.{2,}/g, '.') // collapse runs of dots
+    .replace(/^[.\s]+|[.\s]+$/g, '') // trim leading/trailing dots + spaces
+    .slice(0, 80)
+    .trim();
+  return cleaned || fallback;
+}
+
 const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () => void }> = ({
   appshot,
   onClose,
@@ -34,12 +51,24 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
 }) => {
   const { addAttachments } = useAttachments();
   const [dataUrl, setDataUrl] = useState<string | null>(null);
+  // Track pin state locally so it updates immediately after toggle without the
+  // viewer holding a stale prop `appshot` (parent refreshes the list, not this).
+  const [pinned, setPinned] = useState(appshot.pinned);
+
+  useEffect(() => {
+    setPinned(appshot.pinned);
+  }, [appshot.pinned]);
 
   useEffect(() => {
     let cancelled = false;
-    void app.appshots.getImage(appshot.id).then((url) => {
-      if (!cancelled) setDataUrl(url);
-    });
+    void app.appshots
+      .getImage(appshot.id)
+      .then((url) => {
+        if (!cancelled) setDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setDataUrl(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -49,7 +78,7 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
     if (!dataUrl) return;
     addAttachments([
       {
-        name: `${appshot.metadata.appName ?? 'appshot'}-${appshot.id}.jpg`,
+        name: `${sanitizeFilenamePart(appshot.metadata.appName ?? 'appshot')}-${appshot.id}.jpg`,
         mime: 'image/jpeg',
         isImage: true,
         size: appshot.imageBytes,
@@ -60,15 +89,26 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
   }, [dataUrl, appshot, addAttachments, onClose]);
 
   const del = useCallback(async () => {
-    await app.appshots.delete(appshot.id);
+    try {
+      await app.appshots.delete(appshot.id);
+    } catch {
+      /* best-effort; broadcast/refresh keeps UI consistent */
+    }
     onChanged();
     onClose();
   }, [appshot.id, onChanged, onClose]);
 
   const togglePin = useCallback(async () => {
-    await app.appshots.update(appshot.id, { pinned: !appshot.pinned });
+    const next = !pinned;
+    setPinned(next); // optimistic
+    try {
+      await app.appshots.update(appshot.id, { pinned: next });
+    } catch {
+      setPinned(!next); // revert on failure
+      return;
+    }
     onChanged();
-  }, [appshot.id, appshot.pinned, onChanged]);
+  }, [appshot.id, pinned, onChanged]);
 
   const meta = appshot.metadata;
   const rows: Array<[string, string]> = [
@@ -136,7 +176,7 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
                   onClick={togglePin}
                   className="flex items-center justify-center gap-2 rounded-lg border border-border/60 px-3 py-2 text-xs"
                 >
-                  <PinIcon className="h-3.5 w-3.5" /> {appshot.pinned ? 'Unpin' : 'Pin'}
+                  <PinIcon className="h-3.5 w-3.5" /> {pinned ? 'Unpin' : 'Pin'}
                 </button>
                 <button
                   type="button"
@@ -158,9 +198,14 @@ const GalleryThumb: FC<{ appshot: Appshot; onOpen: () => void }> = ({ appshot, o
   const [thumb, setThumb] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    void app.appshots.getImage(appshot.id).then((url) => {
-      if (!cancelled) setThumb(url);
-    });
+    void app.appshots
+      .getImage(appshot.id)
+      .then((url) => {
+        if (!cancelled) setThumb(url);
+      })
+      .catch(() => {
+        if (!cancelled) setThumb(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -188,9 +233,19 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   const cfg = (config.appshots as AppshotsConfig | undefined) ?? {};
   const [appshots, setAppshots] = useState<Appshot[]>([]);
   const [viewing, setViewing] = useState<Appshot | null>(null);
+  // Monotonic guard: a slow older list() response must not overwrite a newer one.
+  const refreshSeqRef = useRef(0);
 
   const refresh = useCallback(() => {
-    void app.appshots.list().then((list) => setAppshots([...list].reverse())); // newest first
+    const seq = ++refreshSeqRef.current;
+    void app.appshots
+      .list()
+      .then((list) => {
+        if (seq === refreshSeqRef.current) setAppshots([...list].reverse()); // newest first
+      })
+      .catch(() => {
+        /* advisory; leave the current list in place on failure */
+      });
   }, []);
 
   useEffect(() => {
@@ -200,7 +255,11 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   }, [refresh]);
 
   const deleteAll = useCallback(async () => {
-    await app.appshots.deleteAll();
+    try {
+      await app.appshots.deleteAll();
+    } catch {
+      /* best-effort */
+    }
     refresh();
   }, [refresh]);
 
