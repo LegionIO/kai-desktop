@@ -204,7 +204,10 @@ function toMastraTools(
   } & ToolLifecycleHooks,
   executionContext?: Pick<ToolExecutionContext, 'cwd'>,
 ): Record<string, ReturnType<typeof createTool>> {
-  const result: Record<string, ReturnType<typeof createTool>> = {};
+  // Null-prototype map: tool names can originate from skills / MCP servers, so a
+  // tool named "__proto__"/"constructor" must create a plain entry, not invoke a
+  // prototype setter (prototype pollution).
+  const result: Record<string, ReturnType<typeof createTool>> = Object.create(null);
   for (const tool of tools) {
     result[tool.name] = createTool({
       id: tool.name,
@@ -512,7 +515,9 @@ function isAnthropicProviderModel(modelConfig: LLMModelConfig): boolean {
 }
 
 function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
+  // Null-prototype: provider-tool names are config-controlled; avoid a
+  // "__proto__" key mutating the prototype (prototype pollution).
+  const result: Record<string, unknown> = Object.create(null);
   for (const configuredTool of modelConfig.providerTools ?? []) {
     if (!configuredTool || typeof configuredTool !== 'object' || Array.isArray(configuredTool)) continue;
 
