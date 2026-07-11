@@ -16,7 +16,10 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
     inputSchema: z.object({
       prompt: z.string().describe('A detailed description of the video to generate.'),
       duration_seconds: z.number().optional().describe('Length of the video in seconds (4, 8, or 12). Defaults to 4.'),
-      size: z.string().optional().describe('Video resolution, e.g. "720x1280", "1280x720", "1024x1792", "1792x1024". Defaults to "1280x720".'),
+      size: z
+        .string()
+        .optional()
+        .describe('Video resolution, e.g. "720x1280", "1280x720", "1024x1792", "1792x1024". Defaults to "1280x720".'),
     }),
     execute: async (input, context: ToolExecutionContext) => {
       const { prompt, duration_seconds, size } = input as {
@@ -34,6 +37,41 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
         const model = config.model || 'sora-2';
         const deploymentName = config.azure?.deploymentName || model;
         const timeoutMs = config.timeout || 300000;
+
+        // One ABSOLUTE deadline for the whole operation. `timeoutMs` previously
+        // only gated the gaps between polls, so an attacker-controlled provider
+        // could hang any individual create/retrieve/download call forever. Race
+        // every provider call (and the poll sleep) against this deadline + the
+        // abort signal so the tool always terminates.
+        const deadline = Date.now() + timeoutMs;
+        const withDeadline = async <T>(p: Promise<T>, what: string): Promise<T> => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error(`Video generation timed out after ${Math.round(timeoutMs / 1000)}s.`);
+          let timer: NodeJS.Timeout | undefined;
+          let onAbort: (() => void) | undefined;
+          const signal = context.abortSignal;
+          try {
+            return await Promise.race([
+              p,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () =>
+                    reject(new Error(`Video generation timed out (${what}) after ${Math.round(timeoutMs / 1000)}s.`)),
+                  remaining,
+                );
+                timer.unref?.();
+                if (signal) {
+                  if (signal.aborted) reject(new Error('Video generation was cancelled.'));
+                  onAbort = () => reject(new Error('Video generation was cancelled.'));
+                  signal.addEventListener('abort', onAbort, { once: true });
+                }
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+            if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+          }
+        };
 
         // Create OpenAI client with video deployment header
         const client = createMediaGenClient(config, {
@@ -53,12 +91,15 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
           stopped: false,
         });
 
-        const createResponse = await client.videos.create({
-          model,
-          prompt,
-          seconds,
-          size: videoSize as '720x1280' | '1280x720' | '1024x1792' | '1792x1024',
-        });
+        const createResponse = await withDeadline(
+          client.videos.create({
+            model,
+            prompt,
+            seconds,
+            size: videoSize as '720x1280' | '1280x720' | '1024x1792' | '1792x1024',
+          }),
+          'create',
+        );
 
         const jobId = createResponse.id;
 
@@ -72,7 +113,7 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
         });
 
         // Poll for completion
-        let videoStatus = await client.videos.retrieve(jobId);
+        let videoStatus = await withDeadline(client.videos.retrieve(jobId), 'retrieve');
         let pollCount = 0;
         const pollStart = Date.now();
 
@@ -89,12 +130,12 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
           await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
           pollCount++;
 
-          videoStatus = await client.videos.retrieve(jobId);
+          videoStatus = await withDeadline(client.videos.retrieve(jobId), 'retrieve');
 
           context.onProgress?.({
             stream: 'stdout',
-            delta: `Status: ${videoStatus.status} (poll #${pollCount}, ${pollCount * POLL_INTERVAL_MS / 1000}s elapsed)\n`,
-            output: `Job ID: ${jobId}\nStatus: ${videoStatus.status}\nPoll #${pollCount} (${pollCount * POLL_INTERVAL_MS / 1000}s elapsed)\n`,
+            delta: `Status: ${videoStatus.status} (poll #${pollCount}, ${(pollCount * POLL_INTERVAL_MS) / 1000}s elapsed)\n`,
+            output: `Job ID: ${jobId}\nStatus: ${videoStatus.status}\nPoll #${pollCount} (${(pollCount * POLL_INTERVAL_MS) / 1000}s elapsed)\n`,
             bytesSeen: 0,
             truncated: false,
             stopped: false,
@@ -118,7 +159,7 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
           stopped: false,
         });
 
-        const videoResponse = await client.videos.downloadContent(videoStatus.id);
+        const videoResponse = await withDeadline(client.videos.downloadContent(videoStatus.id), 'download');
         if (!videoResponse.ok || !videoResponse.body) {
           return { error: 'Failed to download video content.', jobId };
         }
