@@ -523,7 +523,8 @@ export function App({
             kind: 'note',
             text:
               '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear\n' +
-              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents  /quit\n' +
+              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents\n' +
+              '/subagents  /subagent-stop [id]  /quit\n' +
               'keys: Esc cancel turn · Esc Esc rewind menu · Ctrl-O expand tool i/o · Ctrl-C quit',
           });
           break;
@@ -780,6 +781,56 @@ export function App({
           }
           const lines = agents.map((a) => `  ${a.name}${a.status ? `  (${a.status})` : ''}`);
           pushTurn({ kind: 'note', text: `agents:\n${lines.join('\n')}` });
+          break;
+        }
+        case 'subagents':
+        case 'sub-agents': {
+          const res = await client.invoke<{ ids?: string[] }>('agent:sub-agent-list');
+          const ids = res?.ids ?? [];
+          if (ids.length === 0) {
+            pushTurn({ kind: 'note', text: 'no active sub-agents' });
+            break;
+          }
+          const lines = ids.map((sid) => `  • ${sid}`);
+          pushTurn({
+            kind: 'note',
+            text: `active sub-agents (${ids.length}):\n${lines.join('\n')}\n(stop one with /subagent-stop <id>)`,
+          });
+          break;
+        }
+        case 'subagent-stop':
+        case 'sub-agent-stop': {
+          const res = await client.invoke<{ ids?: string[] }>('agent:sub-agent-list');
+          const ids = res?.ids ?? [];
+          if (ids.length === 0) {
+            pushTurn({ kind: 'note', text: 'no active sub-agents to stop' });
+            break;
+          }
+          const target = arg.trim();
+          if (target) {
+            const match = ids.find((sid) => sid === target || sid.startsWith(target));
+            if (!match) {
+              pushTurn({ kind: 'note', text: `no sub-agent matching "${target}"` });
+              break;
+            }
+            await client.invoke('agent:sub-agent-stop', match).catch(() => {});
+            pushTurn({ kind: 'note', text: `stopped sub-agent ${match}` });
+            break;
+          }
+          // No id given → pick from a menu.
+          setPicker({
+            title: 'Stop which sub-agent?',
+            items: ids.map((sid) => ({ label: sid, value: sid })),
+            onSelect: (sid) => {
+              setPicker(null);
+              void client
+                .invoke('agent:sub-agent-stop', sid)
+                .then(() => pushTurn({ kind: 'note', text: `stopped sub-agent ${sid}` }))
+                .catch((err) =>
+                  pushTurn({ kind: 'error', text: `stop failed: ${(err as { message?: string })?.message ?? err}` }),
+                );
+            },
+          });
           break;
         }
         case 'quit':
