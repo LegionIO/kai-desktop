@@ -194,6 +194,13 @@ jobs:
 
       - run: pnpm build
 
+      # Compiled-CLI smoke: run the freshly-built out/main/cli.js under a clean
+      # node:22-slim container (no Electron, no backend) and assert it loads +
+      # fails fast with guidance instead of crashing on a bad import or hanging.
+      # Runs AFTER `pnpm build` so out/ exists; ubuntu-latest ships Docker.
+      - name: Compiled CLI Linux smoke (no-backend fast-fail)
+        run: pnpm smoke:cli:linux
+
   ipc-seam-smoke:
     needs:
       - changes

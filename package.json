@@ -41,6 +41,7 @@
     "verify:fuses": "tsx scripts/verify-fuses.ts",
     "test:ipc-seam:linux": "playwright test --config playwright.config.ts",
     "validate:linux-cli": "docker run --rm -v \"$PWD/bin:/work/bin:ro\" -v \"$PWD/scripts/validate-linux-launcher.sh:/validate.sh:ro\" debian:stable-slim sh /validate.sh",
+    "smoke:cli:linux": "sh scripts/smoke-cli-linux.sh",
     "prepare": "husky"
   },
   "devDependencies": {
