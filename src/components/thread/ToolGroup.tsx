@@ -38,6 +38,8 @@ import {
 } from 'lucide-react';
 import ShikiHighlighter from 'react-shiki';
 import { app } from '@/lib/ipc-client';
+import { useConfig } from '@/providers/ConfigProvider';
+import { EditDiffSummary } from './EditDiffSummary';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { usePlanPanel } from '@/providers/PlanPanelContext';
@@ -89,7 +91,11 @@ export const ToolGroup: FC<{
     toolCallId: string;
   }) => Promise<{ id: string; title: string } | null>;
 }> = ({ parts, onSendFeedback, onPlanApproved }) => {
+  const { config } = useConfig();
   if (parts.length === 0) return null;
+
+  const editSummaryEnabled =
+    (config?.ui as { editDiffSummary?: { enabled?: boolean } } | undefined)?.editDiffSummary?.enabled ?? true;
 
   return (
     <div className="my-2 space-y-1.5">
@@ -101,6 +107,7 @@ export const ToolGroup: FC<{
           onPlanApproved={onPlanApproved}
         />
       ))}
+      <EditDiffSummary parts={parts} enabled={editSummaryEnabled} />
     </div>
   );
 };

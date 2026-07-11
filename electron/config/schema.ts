@@ -871,6 +871,9 @@ export const appConfigSchema = z.object({
       })
       .default({ units: [], plugins: [] }),
     pluginBubbleExpanded: z.boolean().default(true),
+    /** Show a per-turn "N files changed · +X −Y" edit-diff rollup under each
+     *  assistant tool group (issue #80). Default on. */
+    editDiffSummary: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
     /**
      * How dock notification badges render when their value is a word/string:
      * - 'dot': collapse to a corner dot; full text moves to the icon tooltip
