@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, statSync } from 'fs';
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  statSync,
+  symlinkSync,
+  lstatSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../atomic-write.js';
@@ -68,5 +78,22 @@ describe('atomicWriteFileSync', () => {
     // never a window where the secret sits at 0o644.
     expect(statSync(dest).mode & 0o777).toBe(0o600);
     expect(readFileSync(dest, 'utf-8')).toBe('new');
+  });
+
+  it('replaces a symlinked destination with a real file instead of following it (POSIX)', () => {
+    if (process.platform === 'win32') return;
+    const outside = join(dir, 'outside.txt');
+    writeFileSync(outside, 'original-outside');
+    const dest = join(dir, 'link.json');
+    symlinkSync(outside, dest);
+    expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+
+    atomicWriteFileSync(dest, 'payload');
+
+    // rename replaces the symlink itself with the real temp file; the symlink
+    // target must NOT be overwritten (no write-through-symlink).
+    expect(lstatSync(dest).isSymbolicLink()).toBe(false);
+    expect(readFileSync(dest, 'utf-8')).toBe('payload');
+    expect(readFileSync(outside, 'utf-8')).toBe('original-outside');
   });
 });
