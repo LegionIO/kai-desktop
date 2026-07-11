@@ -32,6 +32,8 @@ const followUpQueues = new Map<string, string[]>();
 const activeSubAgentControllers = new Map<string, AbortController>();
 /** Map parent toolCallId → subAgentConversationId for observer lookups */
 const toolCallToSubAgent = new Map<string, string>();
+/** Parent conversation id per ACTIVE sub-agent — used to enforce maxPerParent. */
+const activeSubAgentParents = new Map<string, string>();
 /** Persisted sub-agent conversation state for resumption */
 const subAgentState = new Map<
   string,
@@ -433,6 +435,23 @@ export function createSubAgentTool(
           error: `Maximum concurrent sub-agents (${subAgentConfig.maxConcurrent ?? 4}) reached.`,
         };
       }
+      // Enforce the per-parent cap: how many sub-agents THIS conversation already
+      // has running. Uses the synchronously-registered activeSubAgentParents map so
+      // the check is race-free with the registration below (no await between).
+      const maxPerParent = subAgentConfig.maxPerParent ?? 2;
+      const parentId = ctx.conversationId;
+      if (parentId) {
+        let activeForParent = 0;
+        for (const p of activeSubAgentParents.values()) {
+          if (p === parentId) activeForParent += 1;
+        }
+        if (activeForParent >= maxPerParent) {
+          return {
+            isError: true,
+            error: `Maximum sub-agents per parent (${maxPerParent}) reached.`,
+          };
+        }
+      }
 
       const modelKey = model ?? subAgentConfig.defaultModel ?? null;
       const modelEntry = resolveModelForThread(config, modelKey);
@@ -447,6 +466,7 @@ export function createSubAgentTool(
       const localController = new AbortController();
       activeSubAgentControllers.set(subAgentConversationId, localController);
       toolCallToSubAgent.set(ctx.toolCallId, subAgentConversationId);
+      if (parentId) activeSubAgentParents.set(subAgentConversationId, parentId);
 
       if (ctx.abortSignal?.aborted) {
         cleanupRuntime(subAgentConversationId);
@@ -584,12 +604,13 @@ export function createSubAgentTool(
           if (gatedHistory === null) persistedMessages.push({ role: 'assistant', content: fullResponse });
         }
 
-        // Don't create resumable state for a denied/failed run. A
+        // Don't create resumable state for a denied/failed/aborted run. A
         // UserPromptSubmit DLP denial returns from runSubAgent before it surfaces
         // gated messages, so the fallback would persist the RAW task/context and
-        // a later resume (after the hook is disabled) could replay it. Only
-        // completed runs become resumable.
-        if (!lastFailureSummary) {
+        // a later resume (after the hook is disabled) could replay it. An aborted
+        // run likewise has incomplete/ungated history. Only cleanly completed runs
+        // become resumable.
+        if (!lastFailureSummary && !localController.signal.aborted) {
           subAgentState.set(subAgentConversationId, {
             messages: persistedMessages,
             config,
@@ -640,12 +661,28 @@ export function createSubAgentTool(
           };
         }
 
+        // An aborted run returned partial/interrupted work — surface it as an
+        // error so the parent agent doesn't treat a cancelled sub-agent as a
+        // successful completion. (Any resumable state cached before the abort is
+        // dropped in the finally block.)
+        if (localController.signal.aborted) {
+          return {
+            isError: true,
+            subAgentConversationId,
+            error: 'Sub-agent was stopped before completing its task.',
+            response: fullResponse,
+            toolsUsed,
+            depth: currentDepth + 1,
+            status: 'stopped',
+          };
+        }
+
         return {
           subAgentConversationId,
           response: fullResponse,
           toolsUsed,
           depth: currentDepth + 1,
-          status: localController.signal.aborted ? 'stopped' : 'completed',
+          status: 'completed',
         };
       } catch (error) {
         // Persist failure status to database
@@ -672,14 +709,29 @@ export function createSubAgentTool(
       } finally {
         ctx.abortSignal?.removeEventListener('abort', parentAbortHandler);
         cleanupRuntime(subAgentConversationId);
-        // NOTE: Do NOT delete subAgentState — it's needed for resumption
+        // Preserve subAgentState for resumption of a CLEANLY completed run — but
+        // if this run was aborted, drop any resumable state that was cached before
+        // the abort landed (covers an abort during the final awaited status write
+        // AND the catch path). An aborted run has incomplete/ungated history and
+        // must never be resumable.
+        if (localController.signal.aborted) {
+          subAgentState.delete(subAgentConversationId);
+        }
       }
     },
   };
 }
 
-/** Clean up runtime state (queue + controller) but preserve conversation state */
+/** Clean up runtime state (queue + controller + toolCall mapping) but preserve
+ *  conversation state. Removes the toolCallToSubAgent entry(ies) pointing at this
+ *  sub-agent so the map doesn't grow unbounded (one entry per spawn). Follow-ups
+ *  by toolCallId only route while the sub-agent is active (they read followUpQueues,
+ *  also cleared here), so dropping the mapping on completion loses nothing. */
 function cleanupRuntime(subAgentConversationId: string): void {
   followUpQueues.delete(subAgentConversationId);
   activeSubAgentControllers.delete(subAgentConversationId);
+  activeSubAgentParents.delete(subAgentConversationId);
+  for (const [toolCallId, saId] of toolCallToSubAgent) {
+    if (saId === subAgentConversationId) toolCallToSubAgent.delete(toolCallId);
+  }
 }
