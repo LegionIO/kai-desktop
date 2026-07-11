@@ -24,6 +24,7 @@ Enables users to create autonomous agents that can work on tasks independently i
 **Location**: `~/.kai/data/agents/` and `~/.kai/data/tasks/`
 
 **Why JSON?**
+
 - Simple persistence without database complexity
 - Easy to inspect and debug
 - Fast reads/writes for file-based operations
@@ -74,21 +75,25 @@ Enables users to create autonomous agents that can work on tasks independently i
 ### Key Components
 
 **1. Agent Files** (`~/.kai/data/agents/{uuid}.json`)
+
 - Contains agent configuration, instructions, runtime settings
 - `currentTaskId` field links to assigned task
 - Status tracked: `"idle"` or `"running"`
 
 **2. Task Files** (`~/.kai/data/tasks/{uuid}.json`)
+
 - Contains task title, description, status
 - `assignedAgentId` field links to assigned agent
 - Status lifecycle: `todo → in_progress → done`
 
 **3. IPC Handlers** (`electron/ipc/agents.ts`, `electron/ipc/tasks.ts`)
+
 - `agents:create`, `agents:assign-task`, `agents:start`, `agents:stop`
 - `tasks:create`, `tasks:update`, `tasks:get`, `tasks:list`
 - No database queries - pure JSON I/O
 
 **4. Terminal Manager** (`electron/terminal/task-terminal-manager.ts`)
+
 - Spawns PTY sessions for agent runtimes
 - Injects task descriptions as initial prompts
 - Streams output back to UI
@@ -146,6 +151,7 @@ Powers the main Kai assistant that handles conversations, tool calls, and contex
 **Location**: `~/.kai/data/memory.db`
 
 **Tables**:
+
 - `mastra_agents` - Agent definitions
 - `mastra_agent_versions` - Agent version history
 - `mastra_conversations` - Conversation threads
@@ -153,6 +159,7 @@ Powers the main Kai assistant that handles conversations, tool calls, and contex
 - `mastra_tools` - Available tools
 
 **Why Database?**
+
 - Complex relational queries (messages, context, tools)
 - ACID transactions for consistency
 - Efficient full-text search
@@ -208,18 +215,21 @@ Powers the main Kai assistant that handles conversations, tool calls, and contex
 ### Key Components
 
 **1. Mastra SDK** (`@mastra/core`)
+
 - Framework for building conversational agents
 - Handles message history, context, tool calls
 - Manages agent versioning and updates
 - Provides database abstractions
 
 **2. Database Schema**
+
 - `mastra_agents`: High-level agent metadata (id, status, activeVersionId)
 - `mastra_agent_versions`: Version-specific config (name, instructions, tools, model)
 - `mastra_conversations`: Conversation threads with metadata
 - `mastra_messages`: Individual messages with role, content, tool calls
 
 **3. Agent Handler** (`electron/ipc/agent.ts`)
+
 - Streams LLM responses to UI
 - Handles tool approval workflow
 - Generates conversation titles
@@ -257,37 +267,41 @@ Kai Desktop evolved from a single conversational agent (Mastra-based) to support
 
 ### Design Rationale
 
-| Aspect                    | Conversational Agent (DB) | Task Agent (JSON)      |
-|---------------------------|---------------------------|------------------------|
-| **Interaction Pattern**   | Synchronous chat          | Async background work  |
-| **State Complexity**      | High (tools, context)     | Low (config, status)   |
-| **Query Patterns**        | Relational, full-text     | Simple key-value       |
-| **Persistence Needs**     | History, versions, tools  | Config, assignment     |
-| **Read Frequency**        | Constant (every message)  | Occasional (UI load)   |
-| **Write Frequency**       | High (every message)      | Low (status changes)   |
-| **Data Size**             | Grows unbounded           | Fixed per agent        |
+| Aspect                  | Conversational Agent (DB) | Task Agent (JSON)     |
+| ----------------------- | ------------------------- | --------------------- |
+| **Interaction Pattern** | Synchronous chat          | Async background work |
+| **State Complexity**    | High (tools, context)     | Low (config, status)  |
+| **Query Patterns**      | Relational, full-text     | Simple key-value      |
+| **Persistence Needs**   | History, versions, tools  | Config, assignment    |
+| **Read Frequency**      | Constant (every message)  | Occasional (UI load)  |
+| **Write Frequency**     | High (every message)      | Low (status changes)  |
+| **Data Size**           | Grows unbounded           | Fixed per agent       |
 
 ### Trade-offs
 
 **JSON System Advantages:**
+
 - ✅ Simple, no ORM overhead
 - ✅ Easy to backup/restore
 - ✅ Human-readable for debugging
 - ✅ Fast for small datasets
 
 **JSON System Disadvantages:**
+
 - ❌ No query optimization
 - ❌ No transactions
 - ❌ Manual consistency management
 - ❌ Race conditions on concurrent writes
 
 **Database System Advantages:**
+
 - ✅ Transactions and ACID
 - ✅ Efficient complex queries
 - ✅ Built-in full-text search
 - ✅ Scales to millions of messages
 
 **Database System Disadvantages:**
+
 - ❌ Migration complexity
 - ❌ Harder to inspect manually
 - ❌ Larger memory footprint
@@ -307,6 +321,7 @@ The `mastra_agents` table is for the **main conversational agent** that you chat
 **Answer**: The JSON-based system has no background polling mechanism.
 
 Unlike a traditional job queue system, Kai's autonomous agents require manual start via the UI. This is a design choice to:
+
 - Give users explicit control
 - Avoid surprise resource usage
 - Keep the implementation simple
@@ -316,6 +331,7 @@ Unlike a traditional job queue system, Kai's autonomous agents require manual st
 **Answer**: Technically possible but not currently supported.
 
 You could write a migration script to insert agent JSON data into `mastra_agents` and `mastra_agent_versions`, but:
+
 - The IPC handlers would need updates to query the database
 - The Mastra SDK would need to be integrated with task terminal management
 - Bidirectional sync between JSON and DB would be required
@@ -327,6 +343,7 @@ This is future work and not trivial.
 **Answer**: Pragmatic incremental development.
 
 Kai started with Mastra for conversational AI. Adding autonomous task agents was a new feature with different requirements. Building a separate JSON-based system was:
+
 - Faster to implement
 - Lower risk (didn't touch existing Mastra code)
 - Easier to iterate on
@@ -342,12 +359,14 @@ The downside is architectural confusion, which this document aims to clarify.
 **Approach**: Migrate agent/task system to use `mastra_agents` + new `kai_tasks` table
 
 **Pros**:
+
 - Single source of truth
 - Better query capabilities
 - Transactions for consistency
 - Easier to add features (filtering, search, history)
 
 **Cons**:
+
 - Migration complexity
 - Breaking changes for existing users
 - More code to maintain
@@ -357,11 +376,13 @@ The downside is architectural confusion, which this document aims to clarify.
 **Approach**: Remove `mastra_agents` and use JSON for everything
 
 **Pros**:
+
 - Simpler overall architecture
 - No database dependency
 - Easier backups
 
 **Cons**:
+
 - Conversation history would be very inefficient
 - No good solution for full-text search
 - Mastra SDK benefits lost
@@ -371,11 +392,13 @@ The downside is architectural confusion, which this document aims to clarify.
 **Approach**: Keep both systems but improve documentation and naming
 
 **Pros**:
+
 - No breaking changes
 - Both systems optimized for their use case
 - Clear separation of concerns
 
 **Cons**:
+
 - Conceptual overhead for users
 - Duplicate code (some logic in both)
 
@@ -388,12 +411,14 @@ The downside is architectural confusion, which this document aims to clarify.
 ### When Working on Autonomous Agents/Tasks
 
 ✅ **DO**:
+
 - Modify files in `electron/ipc/agents.ts` and `electron/ipc/tasks.ts`
 - Use `readAgent()`, `writeAgent()`, `readTask()`, `writeTask()` helpers
 - Update JSON files directly
 - Test with sample JSON files in `~/.kai/data/`
 
 ❌ **DON'T**:
+
 - Query the `mastra_agents` or `mastra_agent_versions` tables
 - Use the Mastra SDK for agent/task operations
 - Expect automatic polling or background execution
@@ -401,12 +426,14 @@ The downside is architectural confusion, which this document aims to clarify.
 ### When Working on Main Conversational Agent
 
 ✅ **DO**:
+
 - Modify files in `electron/ipc/agent.ts` (singular)
 - Use the Mastra SDK (`@mastra/core`, `@mastra/memory`)
 - Query `mastra_conversations`, `mastra_messages` tables
 - Use transactions for consistency
 
 ❌ **DON'T**:
+
 - Read/write JSON files in `~/.kai/data/agents/` or `~/.kai/data/tasks/`
 - Confuse this with the autonomous agent system
 
@@ -456,6 +483,45 @@ sqlite3 ~/.kai/data/memory.db "SELECT * FROM mastra_conversations LIMIT 10;"
 
 ---
 
+## Runtime Confinement (blast-radius containment)
+
+Runtimes that execute untrusted tool calls (Claude Code, Codex, pi — those with
+the `executesUntrustedTools` capability) can be _confined_: run with a scrubbed
+environment and refused a working directory in your home, root, or any
+credential-bearing folder. Confinement is **off by default** and changes no
+behavior until an operator opts in via **Settings › Models › Runtimes ›
+Confinement** (or `agent.confinement.enabled` in `config.json`).
+
+Config (`agent.confinement`, see `electron/config/schema.ts`):
+
+| Field              | Default | Effect                                                                                       |
+| ------------------ | ------- | -------------------------------------------------------------------------------------------- |
+| `enabled`          | `false` | Master gate for the enforcement wiring at the IPC chokepoint (`electron/ipc/agent.ts`).      |
+| `workspaceOnly`    | `true`  | Refuse a cwd outside the workspace root (home/root/`.aws`/`.ssh`/… are always refused).      |
+| `scrubCredentials` | `true`  | Build the child env from a fail-closed allowlist instead of inheriting the parent env.       |
+| `envAllowlist`     | `[]`    | Extra env-var names forwarded on top of the built-in safe set. Deliberate, auditable opt-in. |
+
+### Recommended: git push over SSH under the scrub
+
+The scrub keeps a small safe set (`electron/agent/runtime/confinement.ts` →
+`BASE_ALLOWLIST`), which **includes `SSH_AUTH_SOCK`**. So an agent in a repo can
+`git push` over SSH with **zero secret env** — the forwarded agent socket
+supplies the key. This (plus your OS git credential helper) is the recommended
+path and needs no `envAllowlist` entry.
+
+### Opt-ins (only if you need them)
+
+- `GH_TOKEN` / `GITHUB_TOKEN` (for `gh`-based push over HTTPS) and `AWS_*`
+  credentials are **stripped by default**. Add the specific name to
+  `envAllowlist` to forward it. The settings UI flags allowlisted names that
+  look like secrets, since forwarding one copies its value from your environment
+  into the agent — undoing the scrub for that variable.
+- Relaxing `workspaceOnly` or `scrubCredentials` while `enabled` is on is a
+  deliberate escape hatch; the UI shows a warning because it makes an "enabled"
+  confinement materially unconfining.
+
+---
+
 ## Related Documentation
 
 - [Data Directory Structure](./DATA_DIRECTORY.md)
@@ -467,6 +533,7 @@ sqlite3 ~/.kai/data/memory.db "SELECT * FROM mastra_conversations LIMIT 10;"
 ## Questions?
 
 If you have questions about the architecture or encounter issues:
+
 1. Check which system you're working with (JSON vs Database)
 2. Review the appropriate section of this document
 3. Open an issue on GitHub with architecture clarification tag
