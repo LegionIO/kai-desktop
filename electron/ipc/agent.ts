@@ -2429,21 +2429,35 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const MAX_ATTACHMENTS_TOTAL_BYTES = 7 * 1024 * 1024; // 7 MiB across all images (< 8 MiB frame)
       const userContent: Array<Record<string, unknown>> = [{ type: 'text', text: userText }];
       if (Array.isArray(opts?.attachments)) {
+        // Only accept a known set of image MIME types; anything else (including
+        // an oversized arbitrary string that would bypass the byte budget) is
+        // dropped to the bare {image} part with no mimeType.
+        const ALLOWED_IMAGE_MIME = new Set([
+          'image/png',
+          'image/jpeg',
+          'image/gif',
+          'image/webp',
+          'image/bmp',
+          'image/svg+xml',
+          'image/heic',
+          'image/heif',
+        ]);
         let imageCount = 0;
         let totalBytes = 0;
         for (const att of opts!.attachments) {
           if (imageCount >= MAX_ATTACHMENTS) break;
           const image = att?.image;
           if (typeof image !== 'string' || image.length === 0) continue;
-          if (image.length > MAX_ATTACHMENT_BYTES) continue; // single image too big — skip
-          if (totalBytes + image.length > MAX_ATTACHMENTS_TOTAL_BYTES) break; // budget exhausted
-          totalBytes += image.length;
+          // Byte-accurate accounting (a data URL is ASCII, but be exact so a
+          // multibyte string can't slip past the intended persisted/model cap).
+          const imageBytes = Buffer.byteLength(image, 'utf8');
+          if (imageBytes > MAX_ATTACHMENT_BYTES) continue; // single image too big — skip
+          if (totalBytes + imageBytes > MAX_ATTACHMENTS_TOTAL_BYTES) break; // budget exhausted
+          totalBytes += imageBytes;
           imageCount += 1;
-          userContent.push(
-            typeof att.mimeType === 'string'
-              ? { type: 'image', image, mimeType: att.mimeType }
-              : { type: 'image', image },
-          );
+          const mimeType =
+            typeof att.mimeType === 'string' && ALLOWED_IMAGE_MIME.has(att.mimeType) ? att.mimeType : undefined;
+          userContent.push(mimeType ? { type: 'image', image, mimeType } : { type: 'image', image });
         }
       }
 
