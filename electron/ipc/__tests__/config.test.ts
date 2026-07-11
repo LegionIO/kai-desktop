@@ -71,6 +71,7 @@ import {
   writeDesktopConfig,
   type AppConfig,
 } from '../config.js';
+import { appConfigSchema } from '../../config/schema.js';
 
 // ---------------------------------------------------------------------------
 // Per-test fixture: temp `appHome` directory that mirrors `~/.kai/`.
@@ -150,6 +151,69 @@ describe('config IPC: desktopConfigPayload round-trip', () => {
     // Allowlisted sections still present after the strip.
     expect(onDisk.agent).toBeDefined();
     expect(onDisk.tools).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 1b: agent.confinement schema (#70) — secure-by-default + round-trip.
+// ---------------------------------------------------------------------------
+
+describe('agent.confinement schema', () => {
+  it('is secure-by-default when confinement is omitted but present', () => {
+    const base = readEffectiveConfig(appHome);
+    const parsed = appConfigSchema.parse({
+      ...base,
+      agent: { ...(base.agent ?? { runtime: 'auto' }), confinement: {} },
+    });
+    expect(parsed.agent?.confinement).toEqual({
+      workspaceOnly: true,
+      scrubCredentials: true,
+      envAllowlist: [],
+    });
+  });
+
+  it('parses envAllowlist, root, and per-runtime overrides', () => {
+    const base = readEffectiveConfig(appHome);
+    const parsed = appConfigSchema.parse({
+      ...base,
+      agent: {
+        ...(base.agent ?? { runtime: 'auto' }),
+        confinement: {
+          workspaceOnly: false,
+          scrubCredentials: true,
+          envAllowlist: ['GH_TOKEN', 'MY_VAR'],
+          root: '/work/project',
+          overrides: { 'claude-agent-sdk': { workspaceOnly: true }, 'codex-sdk': { scrubCredentials: false } },
+        },
+      },
+    });
+    const c = parsed.agent!.confinement!;
+    expect(c.workspaceOnly).toBe(false);
+    expect(c.envAllowlist).toEqual(['GH_TOKEN', 'MY_VAR']);
+    expect(c.root).toBe('/work/project');
+    expect(c.overrides?.['claude-agent-sdk']).toEqual({ workspaceOnly: true });
+    expect(c.overrides?.['codex-sdk']).toEqual({ scrubCredentials: false });
+  });
+
+  it('round-trips through desktopConfigPayload write -> read', () => {
+    const base = readEffectiveConfig(appHome);
+    const withConfinement: AppConfig = {
+      ...base,
+      agent: {
+        ...(base.agent ?? { runtime: 'auto' }),
+        confinement: { workspaceOnly: true, scrubCredentials: true, envAllowlist: ['GH_TOKEN'], root: '/work' },
+      },
+    } as AppConfig;
+    writeDesktopConfig(appHome, withConfinement);
+    const reread = readEffectiveConfig(appHome);
+    expect(reread.agent?.confinement).toEqual({
+      workspaceOnly: true,
+      scrubCredentials: true,
+      envAllowlist: ['GH_TOKEN'],
+      root: '/work',
+    });
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
+    expect(onDisk.agent.confinement.envAllowlist).toEqual(['GH_TOKEN']);
   });
 });
 

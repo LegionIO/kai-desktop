@@ -618,12 +618,36 @@ const codexSdkConfigSchema = z.object({
   approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
 });
 
+/**
+ * Blast-radius containment for autonomous agent runtimes (#66/#70).
+ * Secure-by-default: workspaceOnly + scrubCredentials both default true, so an
+ * unset config confines the agent. `envAllowlist` opts specific vars back into
+ * the scrubbed child env; `root` pins the workspace; per-runtime `overrides`
+ * relax specific runtimes.
+ */
+const confinementConfigSchema = z.object({
+  workspaceOnly: z.boolean().default(true),
+  scrubCredentials: z.boolean().default(true),
+  envAllowlist: z.array(z.string()).default([]),
+  root: z.string().optional(),
+  overrides: z
+    .record(
+      z.string(),
+      z.object({
+        workspaceOnly: z.boolean().optional(),
+        scrubCredentials: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+});
+
 const agentConfigSchema = z.object({
   runtime: z.string().default('auto'), // 'auto' | 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | plugin runtime ids
   maxTurns: z.number().positive().optional(),
   autoContinueOnMaxTurns: z.boolean().optional(),
   claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
   codexSdk: codexSdkConfigSchema.optional(),
+  confinement: confinementConfigSchema.optional(),
 });
 
 const webServerConfigSchema = z.object({
