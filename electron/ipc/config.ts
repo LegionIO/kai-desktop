@@ -1,7 +1,7 @@
 import type { IpcMain } from 'electron';
 import { readFileSync, existsSync, watch, mkdirSync, chmodSync } from 'fs';
 import { randomBytes } from 'crypto';
-import { join, dirname } from 'path';
+import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
@@ -1230,12 +1230,35 @@ export function registerConfigHandlers(
     }, 200);
   };
 
-  if (existsSync(configPath)) {
-    watch(configPath, reloadConfig);
-  }
+  // Watch each settings file for external edits. `fs.watch` on the file itself
+  // only works if the file already exists at startup — a first-time provider
+  // import that CREATES llm.json (or desktop.json) later would then go
+  // unnoticed until restart. So we watch the containing DIRECTORY and filter by
+  // basename, which catches create/rename/replace as well as in-place writes.
+  // (desktop.json lives under appHome; llm.json under homedir — usually the
+  // same settings dir in production, but watched independently to be correct
+  // when they differ.)
   const appLlmPath = getAppLlmConfigPath();
-  if (existsSync(appLlmPath)) {
-    watch(appLlmPath, reloadConfig);
+  // Group the watched files by their containing directory, so a shared settings
+  // dir (the common production case where appHome === ~/.<slug>) is watched by a
+  // single fs.watch that reloads on either basename, rather than two watchers.
+  const watchedBasenamesByDir = new Map<string, Set<string>>();
+  for (const p of [configPath, appLlmPath]) {
+    const dir = dirname(p);
+    const set = watchedBasenamesByDir.get(dir) ?? new Set<string>();
+    set.add(basename(p));
+    watchedBasenamesByDir.set(dir, set);
+  }
+  for (const [dir, basenames] of watchedBasenamesByDir) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      watch(dir, (_event, changed) => {
+        // Some platforms report a null filename; fall back to reloading.
+        if (changed == null || basenames.has(changed)) reloadConfig();
+      });
+    } catch {
+      // Watching is best-effort; config still loads and persists without it.
+    }
   }
 
   // Unified setConfig that handles models.* persistence correctly.
