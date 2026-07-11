@@ -239,6 +239,11 @@ function listAllAgents(appHome: string): AgentFile[] {
 }
 
 function readAgent(appHome: string, id: string): AgentFile | null {
+  // Fail closed on a non-UUID id: `id` is joined into a file path, and not every
+  // caller validates first (e.g. reviewerAgentIds entries are only length-checked
+  // at tasks:create, so a crafted `../…` value could reach here). Restricting to
+  // the UUID shape here makes the read path traversal-safe regardless of caller.
+  if (!isValidId(id)) return null;
   const filePath = join(getAgentsDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
