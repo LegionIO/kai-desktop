@@ -2,6 +2,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { isAbsolute, resolve, extname } from 'path';
+import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
@@ -758,7 +759,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
   ipcMain.handle(
     'conversations:export',
-    async (_event, id: string, format: 'markdown' | 'json', opts?: { targetPath?: string }) => {
+    async (_event, id: string, format: 'markdown' | 'json', opts?: { targetPath?: string; overwrite?: boolean }) => {
       const conv = readConversation(appHome, id);
       if (!conv) return { ok: false, error: 'Conversation not found' };
 
@@ -774,6 +775,12 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
         if (typeof dest !== 'string' || dest.trim() === '') return { ok: false, error: 'Invalid target path' };
         dest = isAbsolute(dest) ? dest : resolve(process.cwd(), dest);
         if (!extname(dest)) dest = `${dest}.${ext}`;
+        // Don't silently clobber an existing file (e.g. a fat-fingered
+        // `/export md ~/.zshrc`). Require an explicit overwrite flag; otherwise
+        // return a clear error the CLI can surface.
+        if (!opts.overwrite && existsSync(dest)) {
+          return { ok: false, error: `file exists: ${dest} (pass overwrite to replace it)` };
+        }
         try {
           atomicWriteFileSync(dest, body);
           return { ok: true, filePath: dest };
