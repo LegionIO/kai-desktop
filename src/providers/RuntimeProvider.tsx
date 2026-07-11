@@ -297,16 +297,23 @@ function extractPromptHistoryText(message: ThreadMessageLike): string | null {
 // --- Message tree helpers ---
 
 /** Walk from a leaf message up to the root, returning the active branch (reversed to chronological order) */
-function getActiveBranch(tree: StoredMessage[], headId: string | null): StoredMessage[] {
+export function getActiveBranch(tree: StoredMessage[], headId: string | null): StoredMessage[] {
   if (!headId || tree.length === 0) return [];
   const byId = new Map(tree.map((m) => [m.id, m]));
   const branch: StoredMessage[] = [];
-  let current = headId;
+  const visited = new Set<string>();
+  let current: string | null = headId;
   while (current) {
+    // Cycle guard: a corrupt/malicious messageTree (from disk or the web
+    // bridge) with a parentId cycle would otherwise loop forever and hang the
+    // renderer, since this runs on every render/persist/stream event. Stop at
+    // the first repeated id.
+    if (visited.has(current)) break;
+    visited.add(current);
     const msg = byId.get(current);
     if (!msg) break;
     branch.unshift(msg);
-    current = msg.parentId!;
+    current = msg.parentId ?? null;
   }
   return branch;
 }
@@ -1116,14 +1123,20 @@ async function maybeGenerateTitle(conversationId: string, messages: ThreadMessag
 
 // --- Helpers to convert flat messages to tree ---
 
-function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: string | null } {
+export function ensureTree(conv: ConversationRecord): { tree: StoredMessage[]; headId: string | null } {
   if (conv.messageTree && conv.messageTree.length > 0) {
     // Rehydrate createdAt from ISO string to Date
     const tree = conv.messageTree.map((m) => ({
       ...m,
       createdAt: m.createdAt ? new Date(m.createdAt as unknown as string) : undefined,
     }));
-    const headId = conv.headId ?? tree[tree.length - 1]?.id ?? null;
+    // Guard against a DANGLING headId: if the persisted head isn't nullish but
+    // points to an id not present in the tree (corrupt data), getActiveBranch
+    // would return [] — the conversation renders empty and a later persist
+    // writes messages:[] / messageCount:0 back, logically losing all history.
+    // Fall back to the last node so the tree stays visible and recoverable.
+    const headExists = conv.headId != null && tree.some((m) => m.id === conv.headId);
+    const headId = headExists ? conv.headId! : (tree[tree.length - 1]?.id ?? null);
     return { tree, headId };
   }
   // Convert flat messages to tree
