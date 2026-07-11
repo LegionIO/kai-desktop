@@ -9,6 +9,7 @@ import {
   chmodSync,
   constants as fsConstants,
 } from 'fs';
+import { randomUUID } from 'crypto';
 
 export interface AtomicWriteOptions {
   /**
@@ -44,7 +45,11 @@ const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
  * of a default-umask temp, would expose).
  */
 export function atomicWriteFileSync(destPath: string, data: string | Uint8Array, opts: AtomicWriteOptions = {}): void {
-  const tmp = `${destPath}.tmp-${process.pid}-${Date.now()}`;
+  // Per-call-unique temp name: pid+time collide if two writes to the same dest
+  // land in the same millisecond in one process — with O_EXCL the loser would
+  // EEXIST and its cleanup could rmSync the winner's in-flight temp. randomUUID
+  // makes each call's temp unique so concurrent same-dest writes never clash.
+  const tmp = `${destPath}.tmp-${process.pid}-${randomUUID()}`;
   const mode = opts.mode ?? 0o666;
   try {
     if (O_NOFOLLOW === 0) {
