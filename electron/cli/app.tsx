@@ -508,7 +508,9 @@ export function App({
         case 'help':
           pushTurn({
             kind: 'note',
-            text: '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear  /quit',
+            text:
+              '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear\n' +
+              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents  /quit',
           });
           break;
         case 'new':
@@ -668,6 +670,102 @@ export function App({
               },
             });
           }
+          break;
+        }
+        case 'usage':
+        case 'cost': {
+          const s = await client.invoke<{
+            totalInputTokens?: number;
+            totalOutputTokens?: number;
+            totalTokens?: number;
+            totalCacheReadTokens?: number;
+            totalCacheWriteTokens?: number;
+            cacheHitRatio?: number;
+            llmRequests?: number;
+            totalConversations?: number;
+            imagesGenerated?: number;
+            videosGenerated?: number;
+          }>('usage:summary');
+          if (!s) {
+            pushTurn({ kind: 'note', text: 'no usage data yet' });
+            break;
+          }
+          const n = (v?: number) => (v ?? 0).toLocaleString();
+          const lines = [
+            `tokens: ${n(s.totalTokens)} total  (in ${n(s.totalInputTokens)} / out ${n(s.totalOutputTokens)})`,
+            `cache: read ${n(s.totalCacheReadTokens)} / write ${n(s.totalCacheWriteTokens)}` +
+              (s.cacheHitRatio != null ? `  (${Math.round(s.cacheHitRatio * 100)}% hit)` : ''),
+            `requests: ${n(s.llmRequests)}   chats: ${n(s.totalConversations)}` +
+              (s.imagesGenerated ? `   images: ${n(s.imagesGenerated)}` : '') +
+              (s.videosGenerated ? `   videos: ${n(s.videosGenerated)}` : ''),
+          ];
+          pushTurn({ kind: 'note', text: lines.join('\n') });
+          break;
+        }
+        case 'export': {
+          // Syntax: /export [json|markdown] [path]  — either arg optional, any order.
+          const parts = arg.trim().split(/\s+/).filter(Boolean);
+          let fmt: 'json' | 'markdown' = 'markdown';
+          let targetPath: string | undefined;
+          for (const p of parts) {
+            const low = p.toLowerCase();
+            if (low === 'json' || low === 'md' || low === 'markdown') fmt = low === 'json' ? 'json' : 'markdown';
+            else targetPath = p;
+          }
+          if (!targetPath) targetPath = `${convIdRef.current.slice(0, 8)}.${fmt === 'json' ? 'json' : 'md'}`;
+          const res = await client.invoke<{ ok?: boolean; filePath?: string; error?: string }>(
+            'conversations:export',
+            convIdRef.current,
+            fmt,
+            { targetPath },
+          );
+          if (res?.ok && res.filePath) {
+            pushTurn({ kind: 'note', text: `exported (${fmt}) → ${res.filePath}` });
+          } else {
+            pushTurn({ kind: 'note', text: `export failed: ${res?.error ?? 'unknown'}` });
+          }
+          break;
+        }
+        case 'mcp': {
+          const config = await client.invoke<{ mcpServers?: Array<{ name: string; enabled?: boolean }> }>('config:get');
+          const servers = config?.mcpServers ?? [];
+          if (servers.length === 0) {
+            pushTurn({ kind: 'note', text: 'no MCP servers configured' });
+            break;
+          }
+          const lines = servers.map((sv) => `  ${sv.enabled === false ? '○' : '●'} ${sv.name}`);
+          pushTurn({ kind: 'note', text: `MCP servers:\n${lines.join('\n')}` });
+          break;
+        }
+        case 'tools': {
+          const config = await client.invoke<{ cliTools?: Array<{ name: string; enabled?: boolean }> }>('config:get');
+          const cliTools = config?.cliTools ?? [];
+          if (cliTools.length === 0) {
+            pushTurn({ kind: 'note', text: 'no CLI tools configured' });
+            break;
+          }
+          const lines = cliTools.map((t) => `  ${t.enabled === false ? '○' : '●'} ${t.name}`);
+          pushTurn({ kind: 'note', text: `CLI tools:\n${lines.join('\n')}` });
+          break;
+        }
+        case 'skills': {
+          const skills = (await client.invoke<Array<{ name: string; enabled?: boolean }>>('skills:list')) ?? [];
+          if (skills.length === 0) {
+            pushTurn({ kind: 'note', text: 'no skills installed' });
+            break;
+          }
+          const lines = skills.map((sk) => `  ${sk.enabled === false ? '○' : '●'} ${sk.name}`);
+          pushTurn({ kind: 'note', text: `skills:\n${lines.join('\n')}` });
+          break;
+        }
+        case 'agents': {
+          const agents = (await client.invoke<Array<{ name: string; status?: string }>>('agents:list')) ?? [];
+          if (agents.length === 0) {
+            pushTurn({ kind: 'note', text: 'no agents configured' });
+            break;
+          }
+          const lines = agents.map((a) => `  ${a.name}${a.status ? `  (${a.status})` : ''}`);
+          pushTurn({ kind: 'note', text: `agents:\n${lines.join('\n')}` });
           break;
         }
         case 'quit':

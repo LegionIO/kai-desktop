@@ -1,7 +1,8 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { writeFileSync } from 'fs';
+import { isAbsolute, resolve, extname } from 'path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
@@ -681,32 +682,53 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     return { ok: true, conversation: forked };
   });
 
-  ipcMain.handle('conversations:export', async (_event, id: string, format: 'markdown' | 'json') => {
-    const conv = readConversation(appHome, id);
-    if (!conv) return { ok: false, error: 'Conversation not found' };
+  ipcMain.handle(
+    'conversations:export',
+    async (_event, id: string, format: 'markdown' | 'json', opts?: { targetPath?: string }) => {
+      const conv = readConversation(appHome, id);
+      if (!conv) return { ok: false, error: 'Conversation not found' };
 
-    const ext = format === 'json' ? 'json' : 'md';
-    const safeTitle = (conv.title ?? conv.fallbackTitle ?? 'chat')
-      .replace(/[^a-zA-Z0-9-_ ]/g, '')
-      .trim()
-      .replace(/\s+/g, '-')
-      .slice(0, 60);
-    const defaultPath = `${safeTitle || 'chat'}.${ext}`;
+      const ext = format === 'json' ? 'json' : 'md';
+      const body = format === 'json' ? JSON.stringify(conv, null, 2) : conversationToMarkdown(conv);
 
-    const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
-    const saveOptions = {
-      title: 'Export Chat',
-      defaultPath,
-      filters:
-        format === 'json' ? [{ name: 'JSON', extensions: ['json'] }] : [{ name: 'Markdown', extensions: ['md'] }],
-    };
-    const result = win ? await dialog.showSaveDialog(win, saveOptions) : await dialog.showSaveDialog(saveOptions);
-    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+      // Headless / CLI path: an explicit targetPath bypasses the native save
+      // dialog (there's no window in a headless backend, and the CLI can't drive
+      // a GUI picker). Resolve against cwd; append the format extension if the
+      // caller gave a bare name without one.
+      if (opts?.targetPath) {
+        let dest = opts.targetPath;
+        if (typeof dest !== 'string' || dest.trim() === '') return { ok: false, error: 'Invalid target path' };
+        dest = isAbsolute(dest) ? dest : resolve(process.cwd(), dest);
+        if (!extname(dest)) dest = `${dest}.${ext}`;
+        try {
+          atomicWriteFileSync(dest, body);
+          return { ok: true, filePath: dest };
+        } catch (err) {
+          return { ok: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
 
-    const body = format === 'json' ? JSON.stringify(conv, null, 2) : conversationToMarkdown(conv);
-    writeFileSync(result.filePath, body, 'utf-8');
-    return { ok: true, filePath: result.filePath };
-  });
+      const safeTitle = (conv.title ?? conv.fallbackTitle ?? 'chat')
+        .replace(/[^a-zA-Z0-9-_ ]/g, '')
+        .trim()
+        .replace(/\s+/g, '-')
+        .slice(0, 60);
+      const defaultPath = `${safeTitle || 'chat'}.${ext}`;
+
+      const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
+      const saveOptions = {
+        title: 'Export Chat',
+        defaultPath,
+        filters:
+          format === 'json' ? [{ name: 'JSON', extensions: ['json'] }] : [{ name: 'Markdown', extensions: ['md'] }],
+      };
+      const result = win ? await dialog.showSaveDialog(win, saveOptions) : await dialog.showSaveDialog(saveOptions);
+      if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+
+      atomicWriteFileSync(result.filePath, body);
+      return { ok: true, filePath: result.filePath };
+    },
+  );
 }
 
 // ── export helpers ─────────────────────────────────────────────────────────
