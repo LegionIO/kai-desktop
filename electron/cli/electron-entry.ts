@@ -1,7 +1,7 @@
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
-import { runHeadlessOnce } from './headless-run.js';
+import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
 import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
 
 /**
@@ -10,8 +10,14 @@ import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEO
  * spawning a headless backend (this same signed binary, re-exec'd with
  * `--kai-headless`) if none is running, then runs the Ink REPL against the
  * inherited terminal TTY. On exit it terminates the Electron process.
+ *
+ * A `-p/--print [prompt]` / `--prompt=` / `--json` flag (parsed from argv, which
+ * still carries `--kai-cli` — harmlessly ignored) runs one-shot headless instead
+ * of the REPL, matching the standalone `kai` entry.
  */
 export async function runCliClient(): Promise<void> {
+  const { print, prompt, json } = parseHeadlessArgs(process.argv.slice(2));
+
   const socketPath = getSocketPath();
   const token = getBridgeToken();
 
@@ -35,11 +41,11 @@ export async function runCliClient(): Promise<void> {
   const activeClient = client;
   process.on('exit', () => activeClient.close());
 
-  if (process.stdin.isTTY && process.stdout.isTTY) {
+  if (!print && process.stdin.isTTY && process.stdout.isTTY) {
     await startRepl(activeClient, () => recoverBackend(activeClient, true));
     process.exit(0);
   } else {
-    await runHeadlessOnce(activeClient);
+    await runHeadlessOnce(activeClient, { prompt, json });
     await activeClient.requestShutdown();
     activeClient.close();
     process.exit(0);

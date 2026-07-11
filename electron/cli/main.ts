@@ -1,7 +1,7 @@
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
-import { runHeadlessOnce } from './headless-run.js';
+import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
 import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
 
 /**
@@ -10,6 +10,8 @@ import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEO
  * packaged CLI uses `cli/electron-entry.ts` instead (re-execs the app binary).
  */
 async function main(): Promise<void> {
+  const { print, prompt, json } = parseHeadlessArgs(process.argv.slice(2));
+
   const socketPath = getSocketPath();
   const token = getBridgeToken();
 
@@ -30,11 +32,13 @@ async function main(): Promise<void> {
   const activeClient = client;
   process.on('exit', () => activeClient.close());
 
-  if (process.stdin.isTTY && process.stdout.isTTY) {
+  // Interactive REPL only when we have a real terminal AND no one-shot flag.
+  // A one-shot (-p/--print, or piped stdin with no TTY) runs headless and exits.
+  if (!print && process.stdin.isTTY && process.stdout.isTTY) {
     await startRepl(activeClient, () => recoverBackend(activeClient, false));
     process.exit(0);
   } else {
-    await runHeadlessOnce(activeClient);
+    await runHeadlessOnce(activeClient, { prompt, json });
     await activeClient.requestShutdown();
     activeClient.close();
     process.exit(0);
