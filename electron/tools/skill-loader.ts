@@ -9,7 +9,7 @@ import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { buildScopedToolName, findToolByName } from './naming.js';
 import type { AppConfig } from '../config/schema.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
-import { isCommandAllowed } from './shell.js';
+import { isCommandAllowed, scrubShellEnv } from './shell.js';
 import { runToolExecution } from './execution.js';
 import { readContainedFileSync, SKILL_MANIFEST_MAX_BYTES } from './skill-fs.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
@@ -232,7 +232,7 @@ async function runShellExecution(
     command: resolvedCommand,
     cwd: skillDir,
     timeoutMs: config.tools.shell.timeout,
-    env: { ...process.env, SKILL_INPUT: JSON.stringify(input) },
+    env: { ...scrubShellEnv(process.env), SKILL_INPUT: JSON.stringify(input) },
     context,
     streaming,
   });
@@ -279,7 +279,7 @@ async function runScriptExecution(
     argv: [execPath, realScriptPath],
     cwd: skillDir,
     timeoutMs: config.tools.shell.timeout,
-    env: { ...process.env, SKILL_INPUT: JSON.stringify(input) },
+    env: { ...scrubShellEnv(process.env), SKILL_INPUT: JSON.stringify(input) },
     context,
     streaming,
   });
