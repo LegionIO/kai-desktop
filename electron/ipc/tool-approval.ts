@@ -36,6 +36,14 @@ export const pendingToolApprovals = new Map<string, { resolve: (approved: boolea
  * If an `abortSignal` is provided, aborting it will reject with 'dismiss'.
  */
 export function registerPendingApproval(toolCallId: string, abortSignal?: AbortSignal): Promise<boolean | 'dismiss'> {
+  // A duplicate toolCallId would overwrite the map entry and orphan the prior
+  // waiter's resolver forever (its Promise never settles → the earlier tool
+  // call hangs). Settle any existing entry fail-closed (deny) before replacing.
+  const existing = pendingToolApprovals.get(toolCallId);
+  if (existing) {
+    existing.resolve(false);
+    pendingToolApprovals.delete(toolCallId);
+  }
   return new Promise<boolean | 'dismiss'>((resolve) => {
     pendingToolApprovals.set(toolCallId, { resolve });
 
