@@ -1044,6 +1044,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     computerUse: config.computerUse,
     dictation: config.dictation,
     appShots: config.appShots,
+    appshots: config.appshots,
     advanced: config.advanced,
     profiles: config.profiles,
     defaultProfileKey: config.defaultProfileKey,

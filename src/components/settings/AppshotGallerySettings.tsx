@@ -1,0 +1,289 @@
+/**
+ * AppshotGallerySettings (#81) — gallery + viewer for PERSISTED appshots, plus
+ * the enable/retention controls. Distinct from AppShotsSettings (the ephemeral
+ * capture-to-attach hotkey feature). Exported as AppshotsSettings.
+ *
+ * (File named AppshotGallerySettings to avoid a case-insensitive-filesystem
+ * collision with AppShotsSettings.tsx on macOS.)
+ */
+import { useState, useEffect, useCallback, type FC } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
+import { XIcon, TrashIcon, PinIcon, PaperclipIcon, ImageIcon } from 'lucide-react';
+import { NumberField, Toggle, type SettingsProps } from './shared';
+import { app } from '@/lib/ipc-client';
+import { useAttachments } from '@/providers/AttachmentContext';
+import type { Appshot } from '../../../shared/appshots';
+
+type AppshotsConfig = {
+  enabled?: boolean;
+  autoCapture?: boolean;
+  captureVisibleText?: boolean;
+  retention?: { maxCount?: number; maxAgeDays?: number; maxTotalBytes?: number };
+};
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () => void }> = ({
+  appshot,
+  onClose,
+  onChanged,
+}) => {
+  const { addAttachments } = useAttachments();
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void app.appshots.getImage(appshot.id).then((url) => {
+      if (!cancelled) setDataUrl(url);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [appshot.id]);
+
+  const attachToChat = useCallback(() => {
+    if (!dataUrl) return;
+    addAttachments([
+      {
+        name: `${appshot.metadata.appName ?? 'appshot'}-${appshot.id}.jpg`,
+        mime: 'image/jpeg',
+        isImage: true,
+        size: appshot.imageBytes,
+        dataUrl,
+      },
+    ]);
+    onClose();
+  }, [dataUrl, appshot, addAttachments, onClose]);
+
+  const del = useCallback(async () => {
+    await app.appshots.delete(appshot.id);
+    onChanged();
+    onClose();
+  }, [appshot.id, onChanged, onClose]);
+
+  const togglePin = useCallback(async () => {
+    await app.appshots.update(appshot.id, { pinned: !appshot.pinned });
+    onChanged();
+  }, [appshot.id, appshot.pinned, onChanged]);
+
+  const meta = appshot.metadata;
+  const rows: Array<[string, string]> = [
+    ['App', meta.appName ?? '—'],
+    ['Window', meta.windowTitle ?? '—'],
+    ['Captured', new Date(appshot.createdAt).toLocaleString()],
+    ['Size', formatBytes(appshot.imageBytes)],
+    ['Conversation', appshot.conversationId ?? '—'],
+    ['Trigger', meta.triggeringAction ?? '—'],
+  ];
+
+  return (
+    <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60" />
+        <Dialog.Content
+          data-testid="appshot-viewer"
+          className="fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-[min(900px,90vw)] -translate-x-1/2 -translate-y-1/2 overflow-auto rounded-xl border border-border bg-card p-4 shadow-xl"
+        >
+          <div className="flex items-center justify-between">
+            <Dialog.Title className="text-sm font-semibold">Appshot</Dialog.Title>
+            <Dialog.Close className="rounded p-1 hover:bg-muted" aria-label="Close">
+              <XIcon className="h-4 w-4" />
+            </Dialog.Close>
+          </div>
+          <div className="mt-3 grid gap-4 md:grid-cols-[1fr_260px]">
+            <div className="flex items-center justify-center rounded-lg border border-border/60 bg-muted/30 p-2">
+              {dataUrl ? (
+                <img src={dataUrl} alt="appshot" className="max-h-[60vh] w-auto rounded" />
+              ) : (
+                <div className="flex h-40 items-center justify-center text-xs text-muted-foreground">Loading…</div>
+              )}
+            </div>
+            <div className="space-y-3">
+              <table className="w-full text-[11px]">
+                <tbody>
+                  {rows.map(([k, v]) => (
+                    <tr key={k} className="align-top">
+                      <td className="pr-2 py-0.5 text-muted-foreground">{k}</td>
+                      <td className="py-0.5 break-words">{v}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {appshot.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {appshot.tags.map((t) => (
+                    <span key={t} className="rounded bg-muted px-1.5 py-0.5 text-[10px]">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-col gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={attachToChat}
+                  disabled={!dataUrl}
+                  className="flex items-center justify-center gap-2 rounded-lg border border-primary/50 bg-primary/5 px-3 py-2 text-xs disabled:opacity-50"
+                >
+                  <PaperclipIcon className="h-3.5 w-3.5" /> Attach to chat
+                </button>
+                <button
+                  type="button"
+                  onClick={togglePin}
+                  className="flex items-center justify-center gap-2 rounded-lg border border-border/60 px-3 py-2 text-xs"
+                >
+                  <PinIcon className="h-3.5 w-3.5" /> {appshot.pinned ? 'Unpin' : 'Pin'}
+                </button>
+                <button
+                  type="button"
+                  onClick={del}
+                  className="flex items-center justify-center gap-2 rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-500 dark:text-red-400"
+                >
+                  <TrashIcon className="h-3.5 w-3.5" /> Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+};
+
+const GalleryThumb: FC<{ appshot: Appshot; onOpen: () => void }> = ({ appshot, onOpen }) => {
+  const [thumb, setThumb] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void app.appshots.getImage(appshot.id).then((url) => {
+      if (!cancelled) setThumb(url);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [appshot.id]);
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="group relative aspect-video overflow-hidden rounded-lg border border-border/60 bg-muted/30"
+      title={appshot.metadata.appName ?? 'appshot'}
+    >
+      {thumb ? (
+        <img src={thumb} alt="appshot" className="h-full w-full object-cover transition group-hover:opacity-90" />
+      ) : (
+        <div className="flex h-full items-center justify-center">
+          <ImageIcon className="h-5 w-5 text-muted-foreground" />
+        </div>
+      )}
+      {appshot.pinned && <PinIcon className="absolute right-1 top-1 h-3 w-3 text-primary" />}
+    </button>
+  );
+};
+
+export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
+  const cfg = (config.appshots as AppshotsConfig | undefined) ?? {};
+  const [appshots, setAppshots] = useState<Appshot[]>([]);
+  const [viewing, setViewing] = useState<Appshot | null>(null);
+
+  const refresh = useCallback(() => {
+    void app.appshots.list().then((list) => setAppshots([...list].reverse())); // newest first
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const off = app.appshots.onChanged(refresh);
+    return off;
+  }, [refresh]);
+
+  const deleteAll = useCallback(async () => {
+    await app.appshots.deleteAll();
+    refresh();
+  }, [refresh]);
+
+  return (
+    <div className="space-y-6">
+      {!hideTitle && (
+        <div>
+          <h3 className="text-sm font-semibold">Appshots</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Persisted, metadata-enhanced screenshots you can browse and re-attach into a chat.
+          </p>
+        </div>
+      )}
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Capture</legend>
+        <Toggle
+          id="appshots.enabled"
+          label="Enable appshots"
+          checked={cfg.enabled ?? false}
+          onChange={(v) => void updateConfig('appshots.enabled', v)}
+        />
+        <Toggle
+          id="appshots.autoCapture"
+          label="Auto-capture frames during computer use"
+          checked={cfg.autoCapture ?? false}
+          onChange={(v) => void updateConfig('appshots.autoCapture', v)}
+        />
+        <Toggle
+          id="appshots.captureVisibleText"
+          label="Store visible text metadata"
+          checked={cfg.captureVisibleText ?? false}
+          onChange={(v) => void updateConfig('appshots.captureVisibleText', v)}
+        />
+        <p className="text-[10px] text-muted-foreground/80">
+          Appshots are stored unencrypted under <span className="font-mono">~/.kai/data/appshots</span> (protected only
+          by filesystem permissions). Full-screen excluded apps are skipped, but other visible windows may be captured.
+        </p>
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Retention</legend>
+        <NumberField
+          id="appshots.retention.maxCount"
+          label="Max appshots"
+          value={cfg.retention?.maxCount ?? 200}
+          onChange={(v) => void updateConfig('appshots.retention.maxCount', v)}
+          min={0}
+          max={100000}
+        />
+        <NumberField
+          id="appshots.retention.maxAgeDays"
+          label="Max age (days)"
+          value={cfg.retention?.maxAgeDays ?? 30}
+          onChange={(v) => void updateConfig('appshots.retention.maxAgeDays', v)}
+          min={0}
+          max={3650}
+        />
+      </fieldset>
+
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Gallery ({appshots.length})</legend>
+        {appshots.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No appshots yet.</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
+            {appshots.map((a) => (
+              <GalleryThumb key={a.id} appshot={a} onOpen={() => setViewing(a)} />
+            ))}
+          </div>
+        )}
+        {appshots.length > 0 && (
+          <button
+            type="button"
+            onClick={deleteAll}
+            className="flex items-center gap-2 rounded-lg border border-red-500/40 px-3 py-1.5 text-xs text-red-500 dark:text-red-400"
+          >
+            <TrashIcon className="h-3.5 w-3.5" /> Delete all appshots
+          </button>
+        )}
+      </fieldset>
+
+      {viewing && <AppshotViewer appshot={viewing} onClose={() => setViewing(null)} onChanged={refresh} />}
+    </div>
+  );
+};

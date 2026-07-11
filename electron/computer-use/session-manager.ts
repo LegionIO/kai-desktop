@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { getActiveConversationId } from '../ipc/conversation-store.js';
 import { app, BrowserWindow, Notification, screen } from 'electron';
 import type {
+  ComputerFrame,
   ComputerOverlayState,
   ComputerSession,
   ComputerUseEvent,
@@ -16,6 +17,9 @@ import type {
   StartComputerSessionOptions,
 } from '../../shared/computer-use.js';
 import { isComputerSessionTerminal, makeComputerUseId, nowIso } from '../../shared/computer-use.js';
+import type { AppshotMetadata } from '../../shared/appshots.js';
+import { createAppshotStore, jpegBytesFromDataUrl } from './appshot-store.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import type { AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveModelForThread } from '../agent/model-catalog.js';
 import { ComputerUseOrchestrator } from './orchestrator.js';
@@ -184,6 +188,11 @@ export class ComputerUseSessionManager extends EventEmitter {
    *  (guard → await preflight → transition to running) can't interleave and
    *  let two local-macos sessions run at once. */
   private localMacosLock: Promise<unknown> = Promise.resolve();
+  /** Lazily-created persisted-appshot store (#81). */
+  private appshotStore: ReturnType<typeof createAppshotStore> | null = null;
+  /** Sessions with an appshot write currently in flight — single-flight per
+   *  session so a burst of frames can't queue unbounded writes. */
+  private appshotInFlight = new Set<string>();
 
   constructor(
     private readonly appHome: string,
@@ -247,6 +256,68 @@ export class ComputerUseSessionManager extends EventEmitter {
 
   private emitEvent(event: ComputerUseEvent): void {
     this.emit('event', event);
+    // Persisted-appshot auto-capture (#81): when a frame is emitted and
+    // auto-capture is enabled, persist the ALREADY-REDACTED frame (never
+    // re-capture). Fire-and-forget + single-flight so it can never throw into
+    // or stall the computer-use loop.
+    if (event.type === 'frame') {
+      this.maybePersistAppshot(event.sessionId, event.frame);
+    }
+  }
+
+  private getAppshotStore(): ReturnType<typeof createAppshotStore> {
+    if (!this.appshotStore) this.appshotStore = createAppshotStore(this.appHome);
+    return this.appshotStore;
+  }
+
+  /** Config-gated, single-flight, never-throwing appshot persist for a frame. */
+  private maybePersistAppshot(sessionId: string, frame: ComputerFrame): void {
+    let cfg: AppConfig['appshots'];
+    try {
+      cfg = this.getConfig().appshots;
+    } catch {
+      return;
+    }
+    if (!cfg?.enabled || !cfg.autoCapture) return;
+    // Single-flight: drop a new appshot if a prior write for this session is
+    // still running (no unbounded queue on a frame burst).
+    if (this.appshotInFlight.has(sessionId)) return;
+
+    const jpeg = jpegBytesFromDataUrl(frame.dataUrl);
+    if (!jpeg) return; // only persist JPEG frames
+
+    const session = this.sessions.get(sessionId);
+    const env = session?.latestEnvironment;
+    const metadata: AppshotMetadata = {
+      appName: env?.appName,
+      windowTitle: env?.windowTitle,
+      ...(cfg.captureVisibleText && typeof env?.visibleText === 'string' ? { visibleText: env.visibleText } : {}),
+      triggeringAction: session?.lastCompletedActionId ? 'computer-use' : undefined,
+      display: { index: 0, width: frame.width, height: frame.height },
+    };
+    const retention = {
+      maxCount: cfg.retention?.maxCount ?? 200,
+      maxAgeDays: cfg.retention?.maxAgeDays ?? 30,
+      maxTotalBytes: cfg.retention?.maxTotalBytes ?? 524288000,
+    };
+
+    this.appshotInFlight.add(sessionId);
+    // Run off the event loop tick; wrap so a throw/reject can never abort the
+    // session. Clear the in-flight flag in finally.
+    void Promise.resolve()
+      .then(() => {
+        this.getAppshotStore().create(
+          { imageData: jpeg, conversationId: session?.conversationId, metadata },
+          retention,
+        );
+        broadcastToAllWindows('appshots:changed', undefined);
+      })
+      .catch((err) => {
+        console.warn('[appshots] auto-capture persist failed:', err);
+      })
+      .finally(() => {
+        this.appshotInFlight.delete(sessionId);
+      });
   }
 
   private upsertSession(session: ComputerSession): ComputerSession {

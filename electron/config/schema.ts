@@ -928,6 +928,37 @@ export const appConfigSchema = z.object({
       autoAttach: z.boolean().default(false),
     })
     .optional(),
+  /**
+   * Appshots (#81) — the PERSISTED, browsable screenshot store (distinct from
+   * `appShots` above, which is the ephemeral capture-to-attach hotkey feature).
+   * All OFF by default; no capture happens until an operator opts in.
+   */
+  appshots: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Auto-persist frames emitted by the computer-use orchestrator. */
+      autoCapture: z.boolean().default(false),
+      /** Persist the harness-redacted visible-text metadata alongside the image. */
+      captureVisibleText: z.boolean().default(false),
+      retention: z
+        .object({
+          maxCount: z.number().int().min(0).max(100000).default(200),
+          maxAgeDays: z.number().int().min(0).max(3650).default(30),
+          maxTotalBytes: z
+            .number()
+            .int()
+            .min(0)
+            .max(50 * 1024 * 1024 * 1024)
+            .default(524288000),
+        })
+        .default({ maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 }),
+    })
+    .default({
+      enabled: false,
+      autoCapture: false,
+      captureVisibleText: false,
+      retention: { maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 },
+    }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
     maxSteps: z.number().positive(),

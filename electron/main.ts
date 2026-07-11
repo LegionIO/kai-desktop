@@ -39,6 +39,7 @@ import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js'
 import { loadSkillsAsTools } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerPlatformHandlers } from './ipc/platform.js';
+import { registerAppshotHandlers } from './ipc/appshots.js';
 import { registerDiffHandlers } from './ipc/diffs.js';
 import { registerArtifactBundleHandlers } from './ipc/artifact-bundle.js';
 import { registerAutomationsHandlers } from './ipc/automations.js';
@@ -1110,6 +1111,7 @@ if (gotSingleInstanceLock) {
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
     registerPlatformHandlers(ipcMain);
+    registerAppshotHandlers(ipcMain, APP_HOME, getConfig);
     registerDiffHandlers(ipcMain, getConfig);
     // "Install `kai` command in PATH" (VS Code `code`-style). Symlinks/copies the
     // shipped launcher onto a per-user PATH dir; no elevation required.

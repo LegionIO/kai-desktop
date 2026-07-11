@@ -10,6 +10,7 @@ import { AudioSettings } from './AudioSettings';
 import { RealtimeSettings } from './RealtimeSettings';
 import { DictationSettings } from './DictationSettings';
 import { AppShotsSettings } from './AppShotsSettings';
+import { AppshotsSettings } from './AppshotGallerySettings';
 import { UsageDashboard } from './UsageDashboard';
 import { ComputerUseSettings } from './ComputerUseSettings';
 import { MediaGenerationSettings } from './MediaGenerationSettings';
@@ -315,7 +316,7 @@ const CombinedToolsSettings: FC<SettingsProps> = ({ config, updateConfig, focusT
   );
 };
 
-type ApplicationTab = 'general' | 'app-shots';
+type ApplicationTab = 'general' | 'app-shots' | 'appshots';
 
 const ApplicationSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab, focusNonce }) => {
   const [activeTab, setActiveTab] = useState<ApplicationTab>('general');
@@ -327,6 +328,7 @@ const ApplicationSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab
   const tabs: Array<{ key: ApplicationTab; label: string }> = [
     { key: 'general', label: 'General' },
     { key: 'app-shots', label: 'App Shots' },
+    { key: 'appshots', label: 'Appshots' },
   ];
 
   return (
@@ -357,6 +359,7 @@ const ApplicationSettings: FC<SettingsProps> = ({ config, updateConfig, focusTab
       {/* Content */}
       {activeTab === 'general' && <GeneralSettings config={config} updateConfig={updateConfig} hideTitle />}
       {activeTab === 'app-shots' && <AppShotsSettings config={config} updateConfig={updateConfig} hideTitle />}
+      {activeTab === 'appshots' && <AppshotsSettings config={config} updateConfig={updateConfig} hideTitle />}
     </div>
   );
 };

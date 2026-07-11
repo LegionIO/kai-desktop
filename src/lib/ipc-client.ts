@@ -8,6 +8,7 @@ import type {
 import type { TaskFile, KaiTaskOrder, TaskConversationMessage, TaskStreamEvent } from '../../shared/task-types';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 import type { AppShotPayload } from '../../shared/app-shots';
+import type { Appshot } from '../../shared/appshots';
 import type { DiffEvent, FileDiff } from '../../shared/diff-types';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
 import type { PlatformCapabilities } from '../../electron/platform/capabilities';
@@ -367,6 +368,18 @@ type AppAPI = {
     resumeHotkey: () => Promise<unknown>;
     resolveRef: (refId: string) => Promise<AppShotPayload | null>;
     onCaptured: (callback: (payload: AppShotPayload) => void) => () => void;
+  };
+  appshots: {
+    list: () => Promise<Appshot[]>;
+    get: (id: string) => Promise<Appshot | null>;
+    getImage: (id: string) => Promise<string | null>;
+    delete: (id: string) => Promise<{ ok: boolean; error?: string }>;
+    deleteAll: () => Promise<{ ok: boolean }>;
+    update: (
+      id: string,
+      patch: { tags?: string[]; pinned?: boolean },
+    ) => Promise<{ ok: boolean; error?: string; appshot?: Appshot }>;
+    onChanged: (callback: () => void) => () => void;
   };
   computerUse: {
     startSession: (goal: string, options: unknown) => Promise<unknown>;

@@ -49,8 +49,13 @@ if (process.platform !== 'darwin') {
 // Spy on crypto.randomUUID so tests can assert against deterministic IDs.
 // Tests that need real UUIDs can call `vi.unstubAllGlobals()` themselves.
 let __uuidCounter = 0;
+const __realCrypto = globalThis.crypto;
 vi.stubGlobal('crypto', {
   ...globalThis.crypto,
+  // The spread of a native `crypto` doesn't copy prototype methods like
+  // getRandomValues, so preserve it explicitly (bound) — code under test that
+  // calls crypto.getRandomValues (e.g. makeComputerUseId) would otherwise throw.
+  getRandomValues: __realCrypto.getRandomValues.bind(__realCrypto),
   randomUUID: vi.fn(
     () =>
       `00000000-0000-0000-0000-${String(++__uuidCounter).padStart(12, '0')}` as `${string}-${string}-${string}-${string}-${string}`,

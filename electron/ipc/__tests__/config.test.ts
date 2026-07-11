@@ -124,6 +124,9 @@ describe('config IPC: desktopConfigPayload round-trip', () => {
     expect(rereadPayload.ui).toEqual(payload.ui);
     expect(rereadPayload.cliTools).toEqual(payload.cliTools);
     expect(rereadPayload.advanced).toEqual(payload.advanced);
+    // #81: the appshots config section must survive the allowlist round-trip.
+    expect(rereadPayload.appshots).toEqual(payload.appshots);
+    expect((rereadPayload.appshots as { enabled?: boolean }).enabled).toBe(false); // secure default
     // The disk file should match the allowlist output byte-for-byte.
     const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect(onDisk).toEqual(rereadPayload);

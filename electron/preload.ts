@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface } from '../shared/computer-use.js';
 import type { AppShotPayload } from '../shared/app-shots.js';
+import type { Appshot } from '../shared/appshots.js';
 import type { DiffEvent, FileDiff } from '../shared/diff-types.js';
 import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
 import type { PlatformCapabilities } from './platform/capabilities.js';
@@ -804,6 +805,24 @@ const appAPI = {
       const handler = (_event: Electron.IpcRendererEvent, payload: AppShotPayload) => callback(payload);
       ipcRenderer.on('app-shots:captured', handler);
       return () => ipcRenderer.removeListener('app-shots:captured', handler);
+    },
+  },
+
+  // Persisted appshot gallery (#81) — distinct from `appShots` (ephemeral capture).
+  appshots: {
+    list: (): Promise<Appshot[]> => ipcRenderer.invoke('appshots:list'),
+    get: (id: string): Promise<Appshot | null> => ipcRenderer.invoke('appshots:get', id),
+    getImage: (id: string): Promise<string | null> => ipcRenderer.invoke('appshots:get-image', id),
+    delete: (id: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('appshots:delete', id),
+    deleteAll: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('appshots:delete-all'),
+    update: (
+      id: string,
+      patch: { tags?: string[]; pinned?: boolean },
+    ): Promise<{ ok: boolean; error?: string; appshot?: Appshot }> => ipcRenderer.invoke('appshots:update', id, patch),
+    onChanged: (callback: () => void) => {
+      const handler = () => callback();
+      ipcRenderer.on('appshots:changed', handler);
+      return () => ipcRenderer.removeListener('appshots:changed', handler);
     },
   },
 
