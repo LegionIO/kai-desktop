@@ -56,8 +56,23 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
     }
     // Use a temporary name so we don't pollute the real connection pool
     const testName = `__test__${server.name}__${Date.now()}`;
+    // Bound the whole test: connectMcpServer's connect() handshake has no
+    // timeout, so a hung stdio/url server would otherwise pin this handler (and
+    // keep the spawned test process alive) forever. Race a deadline; the finally
+    // block always disconnects, killing any spawned process.
+    const CONNECT_TEST_TIMEOUT_MS = 30_000;
+    let timer: NodeJS.Timeout | undefined;
     try {
-      const conn = await connectMcpServer({ ...server, name: testName });
+      const conn = await Promise.race([
+        connectMcpServer({ ...server, name: testName }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Connection test timed out after ${CONNECT_TEST_TIMEOUT_MS / 1000}s`)),
+            CONNECT_TEST_TIMEOUT_MS,
+          );
+          timer.unref?.();
+        }),
+      ]);
       return {
         status: conn.status,
         toolCount: conn.tools.length,
@@ -70,7 +85,14 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
         error: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      await disconnectMcpServer(testName);
+      if (timer) clearTimeout(timer);
+      // Cleanup must not throw (e.g. disconnecting a never-fully-connected test
+      // server) and mask the real result / crash the handler.
+      try {
+        await disconnectMcpServer(testName);
+      } catch {
+        /* best-effort cleanup */
+      }
     }
   });
 }
