@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import { delimiter } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -52,21 +52,10 @@ function defaultPathEntries(): string[] {
     return winEntries.filter(Boolean);
   }
 
-  const entries = [
-    '/usr/bin',
-    '/bin',
-    '/usr/sbin',
-    '/sbin',
-    '/usr/local/bin',
-    '/usr/local/sbin',
-  ];
+  const entries = ['/usr/bin', '/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/local/sbin'];
 
   if (process.platform === 'darwin') {
-    entries.push(
-      '/opt/homebrew/bin',
-      '/opt/homebrew/sbin',
-      '/Library/Developer/CommandLineTools/usr/bin',
-    );
+    entries.push('/opt/homebrew/bin', '/opt/homebrew/sbin', '/Library/Developer/CommandLineTools/usr/bin');
   }
 
   return entries;
@@ -91,8 +80,9 @@ function dedupePathEntries(pathValues: Array<string | undefined | null>): string
 }
 
 function resolveEnvPathKey(env: NodeJS.ProcessEnv): string {
-  return Object.keys(env).find((key) => key.toLowerCase() === 'path')
-    ?? (process.platform === 'win32' ? 'Path' : 'PATH');
+  return (
+    Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? (process.platform === 'win32' ? 'Path' : 'PATH')
+  );
 }
 
 function getEnvPath(env: NodeJS.ProcessEnv): string {
@@ -136,12 +126,9 @@ function parseResolvedPath(stdout: string): string | null {
 }
 
 function shellCandidates(): string[] {
-  const candidates = [
-    process.env.SHELL,
-    '/bin/zsh',
-    '/bin/bash',
-    '/bin/sh',
-  ].filter((candidate): candidate is string => Boolean(candidate));
+  const candidates = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'].filter((candidate): candidate is string =>
+    Boolean(candidate),
+  );
 
   return [...new Set(candidates)].filter((candidate) => existsSync(candidate));
 }
@@ -179,7 +166,7 @@ async function detectShellPath(): Promise<string | null> {
 }
 
 export async function primeResolvedShellPath(force = false): Promise<string> {
-  const isCacheFresh = cachedResolvedPath !== null && (Date.now() - cachedResolvedAt) < PATH_RESOLVE_CACHE_MS;
+  const isCacheFresh = cachedResolvedPath !== null && Date.now() - cachedResolvedAt < PATH_RESOLVE_CACHE_MS;
   if (!force && isCacheFresh && cachedResolvedPath !== null) return cachedResolvedPath;
 
   if (!force && inFlightResolution) return inFlightResolution;
@@ -197,9 +184,7 @@ export async function primeResolvedShellPath(force = false): Promise<string> {
 }
 
 export function getResolvedShellPathSync(): string {
-  return cachedResolvedPath
-    ? normalizePathValue(cachedResolvedPath)
-    : normalizePathValue(getEnvPath(process.env));
+  return cachedResolvedPath ? normalizePathValue(cachedResolvedPath) : normalizePathValue(getEnvPath(process.env));
 }
 
 export function getResolvedProcessEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -214,6 +199,10 @@ export function getResolvedProcessEnv(env: NodeJS.ProcessEnv = process.env): Nod
 
 function isExecutable(filePath: string): boolean {
   try {
+    // Must be a regular file — a directory/FIFO named like a binary passes the
+    // X_OK/F_OK access check (e.g. resolveBinaryPathSync('/tmp') would otherwise
+    // "resolve" a directory), so reject anything that isn't a plain file first.
+    if (!statSync(filePath).isFile()) return false;
     accessSync(filePath, process.platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK);
     return true;
   } catch {
@@ -231,9 +220,7 @@ export function resolveBinaryPathSync(binaryName: string, env: NodeJS.ProcessEnv
   const pathEntries = getResolvedProcessEnv(env).PATH?.split(delimiter).filter(Boolean) ?? [];
 
   if (process.platform === 'win32') {
-    const pathext = (env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM')
-      .split(';')
-      .map((ext) => ext.toLowerCase());
+    const pathext = (env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').map((ext) => ext.toLowerCase());
     const hasExtension = /\.[^./\\]+$/.test(binaryName);
 
     for (const dir of pathEntries) {
