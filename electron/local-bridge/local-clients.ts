@@ -20,7 +20,15 @@ const MAX_CLIENT_BACKLOG_BYTES = 16 * 1024 * 1024;
  */
 export function broadcastToLocalClients(channel: string, data?: unknown): void {
   if (localClients.size === 0) return;
-  const message = JSON.stringify({ type: 'event', channel, data }) + '\n';
+  // Serialize once, guarded — a cyclic/BigInt `data` would otherwise throw here
+  // (before the per-socket try) and propagate to the broadcast call site.
+  let message: string;
+  try {
+    message = JSON.stringify({ type: 'event', channel, data }) + '\n';
+  } catch (err) {
+    console.warn(`[local-clients] dropping unserializable event on "${channel}":`, err);
+    return;
+  }
   for (const socket of localClients) {
     try {
       if (!socket.writable) continue;

@@ -29,14 +29,36 @@ export function registerBroadcastSink(sink: BroadcastSink): () => void {
  */
 export function broadcastToWebClients(channel: string, data?: unknown): void {
   if (webClients.size > 0) {
-    const message = JSON.stringify({ type: 'event', channel, data });
-    for (const ws of webClients) {
-      try {
-        if (ws.readyState === ws.OPEN) {
-          ws.send(message);
+    // Serialize once, guarded: a cyclic/BigInt `data` would otherwise throw
+    // here (outside the per-client try) and propagate to the broadcast call
+    // site. Drop the event rather than crash the caller.
+    let message: string;
+    try {
+      message = JSON.stringify({ type: 'event', channel, data });
+    } catch (err) {
+      console.warn(`[web-clients] dropping unserializable event on "${channel}":`, err);
+      message = '';
+    }
+    if (message) {
+      // Backpressure cap: a stuck client that isn't draining grows
+      // ws.bufferedAmount unbounded (backend memory). Drop it past the cap.
+      const MAX_BUFFERED = 16 * 1024 * 1024;
+      for (const ws of webClients) {
+        try {
+          if (ws.readyState === ws.OPEN) {
+            if (ws.bufferedAmount > MAX_BUFFERED) {
+              webClients.delete(ws);
+              ws.terminate();
+              continue;
+            }
+            ws.send(message);
+          } else if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
+            // Prune sockets the close handler hasn't removed yet.
+            webClients.delete(ws);
+          }
+        } catch {
+          // Ignore send errors on stale sockets
         }
-      } catch {
-        // Ignore send errors on stale sockets
       }
     }
   }
