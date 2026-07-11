@@ -24,6 +24,70 @@ import { dirname, join, sep } from 'path';
 import { tmpdir } from 'os';
 
 // ---------------------------------------------------------------------------
+// Env scrubbing for the spawned Codex CLI
+// ---------------------------------------------------------------------------
+//
+// The Codex CLI runs model-directed shell commands, so those commands inherit
+// whatever env we pass. We must NOT hand Kai's own provider secrets to those
+// commands. The CLI receives its OWN auth via the SDK `apiKey` option (not env)
+// + the bridge token via a dedicated env var, so we can strip secret-shaped
+// keys from the inherited env while keeping PATH/HOME/NODE_*/cert vars the CLI
+// needs to run. Mirrors the `sh` tool's scrub. Patterns support a single
+// leading/trailing `*` wildcard (case-insensitive).
+const CODEX_ENV_SECRET_DENYLIST = [
+  '*SECRET*',
+  '*PASSWORD*',
+  '*PASSWD*',
+  '*TOKEN*',
+  '*CREDENTIAL*',
+  '*API_KEY*',
+  '*APIKEY*',
+  '*ACCESS_KEY*',
+  '*PRIVATE_KEY*',
+  '*_KEY',
+  '*_PAT',
+  '*_BASE_URL',
+  'DATABASE_URL',
+  'ANTHROPIC_*',
+  'OPENAI_*',
+  'AWS_*',
+  'AZURE_*',
+  'GOOGLE_*',
+  'GEMINI_*',
+  'GITHUB_*',
+  'GH_*',
+  'NPM_*',
+];
+
+function codexEnvKeyMatches(key: string, pattern: string): boolean {
+  const k = key.toUpperCase();
+  const p = pattern.toUpperCase();
+  const lead = p.startsWith('*');
+  const trail = p.endsWith('*');
+  const core = p.slice(lead ? 1 : 0, trail ? p.length - 1 : p.length);
+  if (lead && trail) return k.includes(core);
+  if (lead) return k.endsWith(core);
+  if (trail) return k.startsWith(core);
+  return k === core;
+}
+
+/** Copy of `process.env` with the app's secret-bearing keys removed, plus an
+ *  optional bridge token overlaid. Always used for the Codex CLI child so its
+ *  model-directed shell commands never inherit Kai's secrets — even when there
+ *  is no MCP bridge for this run. The bridge-token env var is overlaid AFTER the
+ *  filter so it's always present when supplied. */
+function buildScrubbedCodexEnv(bridgeTokenVar?: string | null, bridgeToken?: string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (CODEX_ENV_SECRET_DENYLIST.some((pat) => codexEnvKeyMatches(key, pat))) continue;
+    out[key] = value;
+  }
+  if (bridgeTokenVar && bridgeToken) out[bridgeTokenVar] = bridgeToken;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Binary path resolution
 // ---------------------------------------------------------------------------
 //
@@ -232,8 +296,13 @@ export class CodexRuntime implements AgentRuntime {
 
     // Extract API key + base URL from modelAuth (pre-resolved by the IPC layer)
     // or fall back to scanning the provider config for an openai-compatible entry.
-    const apiKey = modelAuth?.apiKey ?? extractOpenAiApiKey(config);
-    const baseUrl = modelAuth?.baseUrl ?? undefined;
+    // Keep key+baseUrl PAIRED: use modelAuth's pair when it supplies the key,
+    // otherwise use the fallback provider's OWN pair — never mix modelAuth's
+    // baseUrl with a fallback key (that could send a third-party key to the
+    // wrong endpoint).
+    const fallbackAuth = modelAuth?.apiKey ? undefined : extractOpenAiAuth(config);
+    const apiKey = modelAuth?.apiKey ?? fallbackAuth?.apiKey;
+    const baseUrl = modelAuth?.apiKey ? modelAuth.baseUrl : fallbackAuth?.baseUrl;
 
     // -----------------------------------------------------------------------
     // 3. Extract prompt from messages
@@ -318,17 +387,11 @@ export class CodexRuntime implements AgentRuntime {
         ...(codexPathOverride ? { codexPathOverride } : {}),
         ...(apiKey ? { apiKey } : {}),
         ...(baseUrl ? { baseUrl } : {}),
-        ...(bridgeAuthToken && bridgeAuthTokenEnvVar
-          ? {
-              // The SDK's `env` option replaces the child environment entirely,
-              // so spread process.env and overlay only the bridge token —
-              // otherwise the Codex CLI loses HOME/PATH/cert vars.
-              env: {
-                ...(process.env as Record<string, string>),
-                [bridgeAuthTokenEnvVar]: bridgeAuthToken,
-              },
-            }
-          : {}),
+        // ALWAYS scrub the child env — the Codex CLI runs model-directed shell
+        // commands that would otherwise inherit Kai's provider secrets, whether
+        // or not an MCP bridge is active. Keeps PATH/HOME/cert vars; overlays the
+        // bridge token when present. The CLI's own auth is the `apiKey` above.
+        env: buildScrubbedCodexEnv(bridgeAuthTokenEnvVar, bridgeAuthToken),
         ...(bridgeUrl
           ? {
               config: {
@@ -538,19 +601,30 @@ function extractLastUserInput(messages: unknown[]): {
 // Helper: Extract OpenAI API key from config
 // ---------------------------------------------------------------------------
 
-function extractOpenAiApiKey(config: AppConfig): string | undefined {
+/**
+ * Fallback auth for the Codex CLI when the IPC layer didn't pre-resolve
+ * modelAuth. Returns the apiKey AND its baseUrl TOGETHER from the same
+ * openai-compatible provider, so a third-party provider's key is never sent to
+ * OpenAI's default endpoint (which would happen if we returned the key without
+ * its baseUrl). Prefers a provider whose baseUrl is set (a configured custom
+ * endpoint) over a bare key.
+ */
+function extractOpenAiAuth(config: AppConfig): { apiKey: string; baseUrl?: string } | undefined {
   const providers = (config as Record<string, unknown>).models as Record<string, unknown> | undefined;
   const providerMap = (providers?.providers ?? {}) as Record<
     string,
-    { type?: string; apiKey?: string; enabled?: boolean }
+    { type?: string; apiKey?: string; baseUrl?: string; enabled?: boolean }
   >;
 
-  for (const provider of Object.values(providerMap)) {
-    if (provider.type === 'openai-compatible' && provider.enabled !== false && provider.apiKey) {
-      return provider.apiKey;
-    }
-  }
-  return undefined;
+  const candidates = Object.values(providerMap).filter(
+    (p) => p.type === 'openai-compatible' && p.enabled !== false && p.apiKey,
+  );
+  // Prefer a provider that also defines a baseUrl so the key + endpoint stay
+  // paired; fall back to the first enabled key only if none carry a baseUrl.
+  const withBase = candidates.find((p) => typeof p.baseUrl === 'string' && p.baseUrl.length > 0);
+  const chosen = withBase ?? candidates[0];
+  if (!chosen?.apiKey) return undefined;
+  return { apiKey: chosen.apiKey, ...(chosen.baseUrl ? { baseUrl: chosen.baseUrl } : {}) };
 }
 
 // ---------------------------------------------------------------------------
