@@ -1,8 +1,11 @@
 import { readFileSync, statSync } from 'fs';
 import { isAbsolute, resolve, extname } from 'path';
 
-/** Cap on an image attachment read from disk (raw bytes, pre-base64). */
-export const MAX_IMAGE_BYTES = 15 * 1024 * 1024; // 15 MiB
+/** Cap on an image attachment read from disk (raw bytes, pre-base64). Kept low
+ *  enough that the base64 data URL (~4/3 larger) plus the prompt + JSON envelope
+ *  stays under the local-bridge 8 MiB frame limit — otherwise the socket is
+ *  destroyed before agent:submit sees it. */
+export const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MiB raw (~5.3 MiB as base64)
 
 const IMAGE_EXT_MIME: Record<string, string> = {
   '.png': 'image/png',

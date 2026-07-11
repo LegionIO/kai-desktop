@@ -2418,9 +2418,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // attachments (CLI @image / paste / AppShots). Cap the count and total
       // size — data URLs are large and go straight into the persisted tree +
       // the model request. Non-string / oversized entries are dropped.
+      //
+      // The caps stay UNDER the local-bridge MAX_FRAME_BYTES (8 MiB): the whole
+      // agent:submit call (text + attachments + JSON envelope) travels in one
+      // bridge frame, so an over-frame payload is destroyed at the socket before
+      // it ever reaches here. Keep headroom for the text + envelope so a valid
+      // multi-image message isn't silently killed by the frame guard.
       const MAX_ATTACHMENTS = 8;
-      const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 20 MiB per image (data-URL length)
-      const MAX_ATTACHMENTS_TOTAL_BYTES = 40 * 1024 * 1024; // 40 MiB across all images
+      const MAX_ATTACHMENT_BYTES = 6 * 1024 * 1024; // 6 MiB per image (data-URL length)
+      const MAX_ATTACHMENTS_TOTAL_BYTES = 7 * 1024 * 1024; // 7 MiB across all images (< 8 MiB frame)
       const userContent: Array<Record<string, unknown>> = [{ type: 'text', text: userText }];
       if (Array.isArray(opts?.attachments)) {
         let imageCount = 0;
