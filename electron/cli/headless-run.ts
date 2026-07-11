@@ -126,6 +126,10 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
       } else if (e.type === 'error') {
         errored = e.error ?? 'unknown';
         if (!json) process.stderr.write(`\n[error: ${stripControl(errored)}]\n`);
+        // An error is terminal for a one-shot run. Finish now so a backend that
+        // emits `error` WITHOUT a following `done` can't leave us hanging. (The
+        // `settled` guard makes a later `done` a no-op if one does arrive.)
+        finish();
       } else if (e.type === 'done') {
         if (!json) process.stdout.write('\n');
         finish();
@@ -157,6 +161,9 @@ function readStdin(): Promise<string> {
     process.stdin.setEncoding('utf-8');
     process.stdin.on('data', (chunk) => (data += chunk));
     process.stdin.on('end', () => resolve(data));
+    // A stdin read error must still settle the promise (with whatever was read)
+    // rather than hang the one-shot run forever.
+    process.stdin.on('error', () => resolve(data));
     // If stdin is already closed/empty, resolve promptly.
     if (process.stdin.readableEnded) resolve(data);
   });
