@@ -16,7 +16,18 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -115,8 +126,15 @@ function safeRead(absPath: string): { exists: boolean; content: string; captured
     const probe = buf.subarray(0, Math.min(buf.length, 8192));
     if (probe.includes(0)) return { exists: true, content: '', captured: false };
     return { exists: true, content: buf.toString('utf-8'), captured: true };
-  } catch {
-    return { exists: false, content: '', captured: true };
+  } catch (err) {
+    // Only a genuine "not found" (ENOENT) means the file is absent — in which
+    // case a later revert can safely treat it as agent-created. Any OTHER error
+    // (EACCES, EPERM, EBUSY, transient I/O) is on a file that likely EXISTS but
+    // we couldn't read: treat as present-but-uncaptured so revert refuses rather
+    // than deleting the file or restoring an empty pre-image.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return { exists: false, content: '', captured: true };
+    return { exists: true, content: '', captured: false };
   }
 }
 
@@ -784,12 +802,61 @@ export function getDiffText(conversationId: string, path: string): string | null
 }
 
 function restoreFile(path: string, content: string, shouldDelete: boolean): void {
+  // Refuse to revert THROUGH a symlink at the target path. The tracker only ever
+  // captured regular files, so a symlink here means the path was swapped after
+  // tracking (tampering/drift) and following it would write/delete outside the
+  // tracked target.
   if (shouldDelete) {
-    if (existsSync(path)) unlinkSync(path);
+    // lstat + unlink: unlink() removes the symlink itself (doesn't follow), so a
+    // symlink is refused here rather than deleting its target.
+    let lst: ReturnType<typeof lstatSync> | null = null;
+    try {
+      lst = lstatSync(path);
+    } catch {
+      lst = null; // already absent — nothing to delete
+    }
+    if (lst?.isSymbolicLink()) {
+      throw new Error(`Refusing to revert (delete) through a symlink at ${path}`);
+    }
+    if (lst) unlinkSync(path);
     return;
   }
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, content, 'utf-8');
+  // Open with O_NOFOLLOW so the OS ATOMICALLY refuses if the LEAF is a symlink —
+  // closing the lstat→write TOCTOU on the tracked file itself. (Parent-component
+  // swaps would need openat-style per-dir resolution not available in Node's fs;
+  // the leaf is the practical vector — the tracked file being swapped.) O_CREAT|
+  // O_TRUNC|O_WRONLY replicates writeFileSync's truncate-or-create semantics.
+  const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+  if (O_NOFOLLOW === 0) {
+    // Platform without O_NOFOLLOW (Windows): fall back to an lstat guard. Kai is
+    // macOS-first; this path only runs on the cross-OS CLI where the symlink-swap
+    // threat model differs.
+    try {
+      if (lstatSync(path).isSymbolicLink()) throw new Error(`Refusing to revert through a symlink at ${path}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    }
+    writeFileSync(path, content, 'utf-8');
+    return;
+  }
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | O_NOFOLLOW;
+  let fd: number;
+  try {
+    fd = openSync(path, flags, 0o644);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ELOOP') {
+      throw new Error(`Refusing to revert through a symlink at ${path}`);
+    }
+    throw err;
+  }
+  try {
+    // writeFileSync accepts an fd and performs the full write loop (writeSync
+    // alone can short-write), so content can't be silently truncated.
+    writeFileSync(fd, content, 'utf-8');
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
