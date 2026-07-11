@@ -392,6 +392,72 @@ describe('config: removedBuiltins suppresses built-in provider reconstruction', 
   });
 });
 
+// ---------------------------------------------------------------------------
+// llm.json rebuild must preserve desktop-only provider/catalog fields.
+// ---------------------------------------------------------------------------
+
+describe('config: llm.json rebuild preserves desktop-only fields', () => {
+  it('keeps desktop-only provider and catalog fields across a reload', () => {
+    // Seed an enabled llm.json with an anthropic provider + one model, so the
+    // loader reconstructs the built-in provider/catalog from llm.json.
+    writeFileSync(
+      join(appHome, 'settings', 'llm.json'),
+      JSON.stringify(
+        { llm: { enabled: true, providers: { anthropic: { api_key: 'sk-test', default_model: 'claude-x' } } } },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+
+    const before = readEffectiveConfig(appHome);
+    const entry = (before.models.catalog ?? []).find((m) => m.key === 'claude-x');
+    expect(entry).toBeDefined();
+    expect(before.models.providers.anthropic).toBeDefined();
+
+    // Persist desktop.json carrying desktop-only fields that llm.json never
+    // round-trips: provider extraHeaders/providerTools + catalog
+    // maxInputTokens/visionCapable/computerUseSupport/promptCaching.
+    const payload = desktopConfigPayload(before) as { models: Record<string, unknown> };
+    const models = payload.models as {
+      providers: Record<string, Record<string, unknown>>;
+      catalog: Array<Record<string, unknown>>;
+    };
+    models.providers.anthropic = {
+      ...models.providers.anthropic,
+      extraHeaders: { 'x-team': 'kai' },
+      providerTools: [{ name: 'web_search' }],
+    };
+    models.catalog = models.catalog.map((m) =>
+      m.key === 'claude-x'
+        ? {
+            ...m,
+            maxInputTokens: 123456,
+            visionCapable: true,
+            computerUseSupport: 'anthropic-client-tool',
+            promptCaching: { enabled: true, ttl: '1h' },
+          }
+        : m,
+    );
+    writeFileSync(join(appHome, 'settings', 'desktop.json'), JSON.stringify(payload, null, 2), 'utf-8');
+
+    // Reload: llm.json rebuilds the provider/catalog, and the desktop-only
+    // fields must be overlaid back on rather than dropped.
+    const after = readEffectiveConfig(appHome);
+    const p = after.models.providers.anthropic as Record<string, unknown>;
+    expect(p.extraHeaders).toEqual({ 'x-team': 'kai' });
+    expect(p.providerTools).toEqual([{ name: 'web_search' }]);
+
+    const reloaded = (after.models.catalog ?? []).find((m) => m.key === 'claude-x') as Record<string, unknown>;
+    expect(reloaded.maxInputTokens).toBe(123456);
+    expect(reloaded.visionCapable).toBe(true);
+    expect(reloaded.computerUseSupport).toBe('anthropic-client-tool');
+    expect(reloaded.promptCaching).toEqual({ enabled: true, ttl: '1h' });
+    // Credentials/type stay llm.json-owned (not clobbered by the overlay).
+    expect(p.apiKey).toBe('sk-test');
+  });
+});
+
 // POSIX-only: the secret-bearing config file (MCP env, web password, media keys)
 // must be written owner-only, and the settings dir tightened even if it
 // pre-existed with looser perms. Skipped on win32 (no POSIX mode bits).

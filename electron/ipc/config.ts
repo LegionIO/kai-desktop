@@ -845,12 +845,40 @@ function loadAppModelsConfig(defaults: AppConfig['models']): AppConfig['models']
       catalog.push(...toCatalogEntries(providerKey, provider));
     }
 
-    // Overlay desktop-only per-entry fields onto llm.json-rebuilt entries so
-    // settings like promptCaching survive the rebuild.
-    const desktopByKey = new Map((defaults.catalog ?? []).map((e) => [e.key, e as { promptCaching?: unknown }]));
+    // Overlay desktop-only fields onto the llm.json-rebuilt providers/catalog
+    // so settings that live ONLY in desktop.json (never round-tripped through
+    // llm.json) survive the rebuild. Credentials/type/endpoint stay llm.json-
+    // owned and are intentionally NOT in these lists.
+    const DESKTOP_ONLY_PROVIDER_FIELDS = ['extraHeaders', 'providerTools'] as const;
+    const DESKTOP_ONLY_CATALOG_FIELDS = [
+      'deploymentName',
+      'maxInputTokens',
+      'useResponsesApi',
+      'providerTools',
+      'computerUseSupport',
+      'visionCapable',
+      'preferredTarget',
+      'promptCaching',
+    ] as const;
+
+    const desktopProvidersByKey = new Map<string, Record<string, unknown>>(
+      Object.entries(defaults.providers ?? {}).map(([k, v]) => [k, v as Record<string, unknown>]),
+    );
+    for (const [providerKey, provider] of Object.entries(providers)) {
+      const d = desktopProvidersByKey.get(providerKey);
+      if (!d) continue;
+      for (const field of DESKTOP_ONLY_PROVIDER_FIELDS) {
+        if (d[field] !== undefined && provider[field] === undefined) provider[field] = d[field];
+      }
+    }
+
+    const desktopByKey = new Map((defaults.catalog ?? []).map((e) => [e.key, e as unknown as Record<string, unknown>]));
     for (const entry of catalog) {
       const d = desktopByKey.get(entry.key as string);
-      if (d?.promptCaching !== undefined) entry.promptCaching = d.promptCaching;
+      if (!d) continue;
+      for (const field of DESKTOP_ONLY_CATALOG_FIELDS) {
+        if (d[field] !== undefined && entry[field] === undefined) entry[field] = d[field];
+      }
     }
 
     const preferredDefaultModel = llm.default_model ?? undefined;
