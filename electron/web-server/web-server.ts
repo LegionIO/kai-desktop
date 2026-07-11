@@ -1229,8 +1229,12 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
       }
 
       if (msg.type === 'invoke' && msg.channel && msg.id) {
+        // args must be an array — a malformed frame with a non-array `args`
+        // would otherwise spread a string into char-args or throw on a
+        // non-iterable. Coerce defensively.
+        const invokeArgs = Array.isArray(msg.args) ? msg.args : [];
         try {
-          const result = await invokeHandler(msg.channel, ...(msg.args ?? []));
+          const result = await invokeHandler(msg.channel, ...invokeArgs);
           ws.send(JSON.stringify({ id: msg.id, type: 'result', data: result }));
         } catch (err) {
           ws.send(
