@@ -41,15 +41,10 @@ function sleep(ms: number): Promise<void> {
  *
  * Priority: haiku-class model → thread model → first catalog entry.
  */
-export function resolveTitleModel(
-  config: AppConfig,
-  threadModelKey: string | null,
-): ModelCatalogEntry | null {
+export function resolveTitleModel(config: AppConfig, threadModelKey: string | null): ModelCatalogEntry | null {
   const catalog = resolveModelCatalog(config);
 
-  const haiku = catalog.entries.find((e) =>
-    e.modelConfig.modelName.toLowerCase().includes('haiku'),
-  );
+  const haiku = catalog.entries.find((e) => e.modelConfig.modelName.toLowerCase().includes('haiku'));
   if (haiku) return haiku;
 
   const threadEntry = resolveModelForThread(config, threadModelKey);
@@ -61,26 +56,22 @@ export function resolveTitleModel(
 /**
  * Clean up a raw title string — strip quotes, prefixes, and cap length.
  */
-export function normalizeGeneratedTitle(
-  rawTitle: string | null,
-  maxWords = 4,
-  maxChars = 80,
-): string | null {
+export function normalizeGeneratedTitle(rawTitle: string | null, maxWords = 4, maxChars = 80): string | null {
   if (!rawTitle) return null;
 
   const cleaned = rawTitle
     .trim()
+    // Strip control chars (C0/C1) and bidi-override codepoints: a model can emit
+    // NUL/ANSI-escape/RTL-override bytes that corrupt sidebar + CLI rendering.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '')
     .replace(/^["']|["']$/g, '')
     .replace(/^(title|summary)\s*:\s*/i, '')
-    .replace(/\s+/g, ' ');
+    .replace(/\s+/g, ' ')
+    .trim();
 
   if (!cleaned) return null;
 
-  return cleaned
-    .split(/\s+/)
-    .slice(0, maxWords)
-    .join(' ')
-    .slice(0, maxChars);
+  return cleaned.split(/\s+/).slice(0, maxWords).join(' ').slice(0, maxChars);
 }
 
 /**
