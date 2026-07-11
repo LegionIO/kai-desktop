@@ -235,14 +235,13 @@ async function createBedrockModel(modelConfig: LLMModelConfig) {
     process.env.AWS_DEFAULT_REGION ||
     (modelConfig.endpoint ? 'us-east-1' : '');
 
-  // Build a credential provider when Bedrock is using the default AWS chain
+  // Build a credential provider when Bedrock is using the default AWS chain.
+  // The AWS profile (if any) is threaded explicitly into the provider below;
+  // we deliberately do NOT set process.env.AWS_PROFILE, which would mutate
+  // global process state (racing concurrent model creation and leaking the
+  // profile into every subsequently-spawned child process).
   const hasExplicitKeys = Boolean(modelConfig.accessKeyId && modelConfig.secretAccessKey);
   const needsCredentialProvider = !modelConfig.apiKey && !hasExplicitKeys;
-
-  // If an AWS profile is configured, set it in env for the default provider chain
-  if (modelConfig.awsProfile) {
-    process.env.AWS_PROFILE = modelConfig.awsProfile;
-  }
 
   const credentialProviderFn = needsCredentialProvider
     ? createAwsCredentialProvider(modelConfig.awsProfile)

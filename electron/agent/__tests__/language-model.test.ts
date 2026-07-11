@@ -182,6 +182,33 @@ describe('createLanguageModelFromConfig — HTTP integration', () => {
       httpMock.expectHit(/bedrock-runtime\..+\.amazonaws\.com/);
       httpMock.expectNoUnhandled();
     });
+
+    it('does not mutate process.env.AWS_PROFILE when a profile is configured', async () => {
+      // Regression: createBedrockModel used to set process.env.AWS_PROFILE as a
+      // side effect, mutating global process state (racing concurrent model
+      // creation and leaking the profile into spawned child processes). The
+      // profile must instead flow only through the scoped credential provider.
+      const hadProfile = 'AWS_PROFILE' in process.env;
+      const original = process.env.AWS_PROFILE;
+      delete process.env.AWS_PROFILE;
+      try {
+        await createLanguageModelFromConfig({
+          provider: 'amazon-bedrock',
+          endpoint: 'https://bedrock-runtime.us-east-1.amazonaws.com',
+          apiKey: '',
+          region: 'us-east-1',
+          awsProfile: 'my-sso-profile',
+          modelName: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+          temperature: 0.7,
+          maxSteps: 25,
+          maxRetries: 1,
+        });
+        expect('AWS_PROFILE' in process.env).toBe(false);
+      } finally {
+        if (hadProfile) process.env.AWS_PROFILE = original;
+        else delete process.env.AWS_PROFILE;
+      }
+    });
   });
 
   describe('authorization header propagation', () => {
