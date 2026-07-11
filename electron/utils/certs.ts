@@ -30,16 +30,29 @@ export async function ensureCerts(certsDir: string, host = 'localhost'): Promise
     };
   }
 
-  console.info(`[Certs] Generating self-signed certificate for ${host}...`);
+  console.info(`[Certs] Generating self-signed certificate for ${safeHost}...`);
 
   await execFileAsync('openssl', [
-    'req', '-x509', '-newkey', 'rsa:2048',
-    '-keyout', keyPath,
-    '-out', certPath,
-    '-days', String(CERT_DAYS),
+    'req',
+    '-x509',
+    '-newkey',
+    'rsa:2048',
+    '-keyout',
+    keyPath,
+    '-out',
+    certPath,
+    '-days',
+    String(CERT_DAYS),
     '-nodes',
-    '-subj', `/CN=${host}`,
-    '-addext', `subjectAltName=DNS:${host}`,
+    // Use the sanitized host in the cert subject/SAN too — not just the
+    // filename. openssl parses -subj/-addext as config strings, so a raw host
+    // like `foo/O=Evil` or `foo,DNS:evil.com` would otherwise inject extra
+    // subject fields / SANs (execFile blocks shell injection, not openssl's
+    // own arg parsing). safeHost is already restricted to [a-z0-9.-].
+    '-subj',
+    `/CN=${safeHost}`,
+    '-addext',
+    `subjectAltName=DNS:${safeHost}`,
   ]);
 
   console.info('[Certs] Certificate generated at', certsDir);
