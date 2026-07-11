@@ -169,6 +169,11 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
     // asarUnpack'd (see electron-builder.yml), so point esbuild at the
     // unpacked path instead.
     const resolveDir = app.getAppPath().replace(/app\.asar(?=[/\\]|$)/, 'app.asar.unpacked');
+    // The app's own node_modules root — only importers UNDER this path are
+    // trusted to resolve freely (React's transitive deps). Using an anchored
+    // prefix (not a bare `.includes('node_modules')`) means the allowlist still
+    // holds even if the app itself lives beneath a `node_modules` directory.
+    const nodeModulesRoot = resolveDir.replace(/[/\\]$/, '') + sep + 'node_modules' + sep;
 
     const result = await esbuild.build({
       stdin: {
@@ -195,11 +200,13 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
             build.onResolve({ filter: /.*/ }, (args) => {
               if (args.kind === 'entry-point') return null;
 
-              // React's own transitive imports (importer already inside
-              // node_modules) resolve normally — bare deps like `scheduler` and
-              // relative internals like `./cjs/...`.
-              const importerInNodeModules = args.importer.split(sep).includes('node_modules');
-              if (importerInNodeModules) return null;
+              // React's own transitive imports resolve normally — but ONLY when
+              // the importer is a real file under the app's OWN node_modules root
+              // (resolveDir/node_modules). A bare `.includes('node_modules')`
+              // check would disable the whole allowlist if the app itself is
+              // installed/checked-out beneath a `node_modules` path, letting
+              // artifact imports reach arbitrary files.
+              if (args.importer.startsWith(nodeModulesRoot)) return null;
 
               // Everything else originates from the ARTIFACT source. It may ONLY
               // reference the allowlisted React bare specifiers. Relative and
