@@ -12,6 +12,7 @@ import { resolveModelCatalog, resolveModelForThread, type ModelCatalogEntry } fr
 import { createLanguageModelFromConfig } from './language-model.js';
 import type { AppConfig } from '../config/schema.js';
 import { generateText } from 'ai';
+import { stripDisplayUnsafeChars } from './display-safe.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -59,11 +60,7 @@ export function resolveTitleModel(config: AppConfig, threadModelKey: string | nu
 export function normalizeGeneratedTitle(rawTitle: string | null, maxWords = 4, maxChars = 80): string | null {
   if (!rawTitle) return null;
 
-  const cleaned = rawTitle
-    .trim()
-    // Strip control chars (C0/C1) and bidi-override codepoints: a model can emit
-    // NUL/ANSI-escape/RTL-override bytes that corrupt sidebar + CLI rendering.
-    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '')
+  const cleaned = stripDisplayUnsafeChars(rawTitle.trim())
     .replace(/^["']|["']$/g, '')
     .replace(/^(title|summary)\s*:\s*/i, '')
     .replace(/\s+/g, ' ')

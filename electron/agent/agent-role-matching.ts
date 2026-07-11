@@ -9,6 +9,7 @@
 import { resolveTitleModel } from './title-generation.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import { AGENT_ROLE_CATALOG, type AgentRoleEntry } from './agent-roles.js';
+import { stripDisplayUnsafeChars } from './display-safe.js';
 import type { AppConfig } from '../config/schema.js';
 
 const MATCH_SYSTEM_PROMPT = `You are a role-matching assistant. Given a user's description of what they want an agent to do, you must:
@@ -46,13 +47,12 @@ export async function matchAgentRole(
     const modelEntry = resolveTitleModel(config, null);
     if (!modelEntry) return { role: null, name: '' };
 
-    const catalogText = AGENT_ROLE_CATALOG
-      .map((r) => `- ${r.id} | ${r.name} (${r.division}): ${r.description}`)
-      .join('\n');
+    const catalogText = AGENT_ROLE_CATALOG.map((r) => `- ${r.id} | ${r.name} (${r.division}): ${r.description}`).join(
+      '\n',
+    );
 
-    const existingNamesNote = existingNames.length > 0
-      ? `\n\nAvoid these already-used names: ${existingNames.join(', ')}`
-      : '';
+    const existingNamesNote =
+      existingNames.length > 0 ? `\n\nAvoid these already-used names: ${existingNames.join(', ')}` : '';
 
     const input = `Available roles:\n${catalogText}\n\nUser wants: "${userDescription}"${existingNamesNote}\n\nRespond with JSON:`;
 
@@ -71,7 +71,10 @@ export async function matchAgentRole(
     const rawResponse = (typeof result.text === 'string' ? result.text : '').trim();
 
     // Strip markdown code fences if present
-    const jsonText = rawResponse.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const jsonText = rawResponse
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
 
     let parsed: { roleId?: string; name?: string } = {};
     try {
@@ -85,13 +88,16 @@ export async function matchAgentRole(
     const roleId = typeof parsed.roleId === 'string' ? parsed.roleId.trim().toLowerCase() : '';
     let role: AgentRoleEntry | null = null;
     if (roleId && roleId !== 'none') {
-      role = AGENT_ROLE_CATALOG.find((r) => r.id === roleId)
-        ?? AGENT_ROLE_CATALOG.find((r) => roleId.includes(r.id))
-        ?? null;
+      role =
+        AGENT_ROLE_CATALOG.find((r) => r.id === roleId) ??
+        AGENT_ROLE_CATALOG.find((r) => roleId.includes(r.id)) ??
+        null;
     }
 
-    // Resolve name — accept any non-empty string of 2-4 words, trim whitespace
-    const name = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+    // Resolve name — accept any non-empty string of 2-4 words, trim whitespace.
+    // Strip control/bidi chars first so a model-injected ANSI/RTL byte can't
+    // ride into the sidebar/CLI agent-name display (and doesn't fail validation).
+    const name = typeof parsed.name === 'string' ? stripDisplayUnsafeChars(parsed.name).trim() : '';
     const nameIsValid = name.length >= 3 && name.length <= 40 && /^\S+(\s\S+)+$/.test(name);
 
     return { role, name: nameIsValid ? name : '' };
