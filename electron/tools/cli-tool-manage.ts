@@ -1,7 +1,52 @@
 import { z } from 'zod';
-import type { ToolDefinition } from './types.js';
+import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
 import { binaryExists } from './cli-tools.js';
+import { registerPendingApproval, broadcastStreamEventRaw } from '../ipc/tool-approval.js';
+
+/**
+ * Require an interactive user decision before REGISTERING or EDITING a CLI tool.
+ * Registering a tool around ANY binary is a capability grant — a basename denylist
+ * is porous (awk/find -exec/make/npx/git-aliases, symlinks/wrappers to bash, etc.
+ * all reach arbitrary execution), so we gate every add/edit rather than trying to
+ * enumerate dangerous binaries. Fails CLOSED (deny) when there's no live chat owner
+ * to answer (e.g. an automation `tool` action) — mirrors automation-manage's
+ * ensureApproved. list/enable/disable/delete are not gated.
+ */
+async function approveRegistration(
+  actionLabel: string,
+  binaries: string[],
+  context: ToolExecutionContext | undefined,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const toolCallId = context?.toolCallId;
+  if (!context || !toolCallId || !context.conversationId || !context.abortSignal) {
+    return {
+      ok: false,
+      error: `Cannot ${actionLabel}: registering a CLI tool grants command-execution capability (${binaries.join(', ')}) and requires user approval, but this context has no live chat to prompt. A user can do this in Settings, or approve it in a live chat.`,
+    };
+  }
+  broadcastStreamEventRaw({
+    conversationId: context.conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'cli_tools',
+    args: {
+      approvalKind: 'register-cli-tool',
+      action: actionLabel,
+      binaries,
+      reason: `This registers a CLI tool that can run ${binaries.map((b) => `\`${b}\``).join(', ')}. A CLI tool executes that binary with model-provided arguments — approve only if you trust this.`,
+    },
+  });
+  const decision = await registerPendingApproval(toolCallId, context.abortSignal);
+  if (decision === true) return { ok: true };
+  return {
+    ok: false,
+    error:
+      decision === 'dismiss'
+        ? `Approval dismissed; did not ${actionLabel}.`
+        : `Approval denied; did not ${actionLabel}.`,
+  };
+}
 
 export function createCliToolManageTool(appHome: string): ToolDefinition {
   return {
@@ -22,7 +67,7 @@ export function createCliToolManageTool(appHome: string): ToolDefinition {
       prefix: z.string().optional().describe('Example command prefix for AI hints (for add/edit)'),
       enabled: z.boolean().optional().describe('Whether the tool is enabled (for add/edit, defaults to true)'),
     }),
-    execute: async (input) => {
+    execute: async (input, context) => {
       const { action, name, binary, extraBinaries, description, prefix, enabled } = input as {
         action: string;
         name?: string;
@@ -55,7 +100,17 @@ export function createCliToolManageTool(appHome: string): ToolDefinition {
           if (!name) return { error: 'Tool name is required.' };
           if (!binary) return { error: 'Binary name is required.' };
           if (!description) return { error: 'Description is required.' };
-          if (tools.some((t) => t.name === name)) return { error: `Tool "${name}" already exists. Use "edit" to update it.` };
+          if (tools.some((t) => t.name === name))
+            return { error: `Tool "${name}" already exists. Use "edit" to update it.` };
+
+          {
+            const approval = await approveRegistration(
+              `add CLI tool "${name}"`,
+              [binary, ...(extraBinaries ?? [])],
+              context,
+            );
+            if (!approval.ok) return { error: approval.error };
+          }
 
           const newTool = {
             name,
@@ -88,6 +143,22 @@ export function createCliToolManageTool(appHome: string): ToolDefinition {
           if (description !== undefined) updated.description = description;
           if (prefix !== undefined) updated.prefix = prefix || undefined;
           if (enabled !== undefined) updated.enabled = enabled;
+
+          // Gate an edit that changes the binary or extraBinaries (the execution
+          // surface). A pure description/prefix/enabled edit is not a capability
+          // change and doesn't re-prompt.
+          const execChanged =
+            (binary !== undefined && binary !== previous.binary) ||
+            (extraBinaries !== undefined &&
+              JSON.stringify(updated.extraBinaries ?? []) !== JSON.stringify(previous.extraBinaries ?? []));
+          if (execChanged) {
+            const approval = await approveRegistration(
+              `edit CLI tool "${name}"`,
+              [updated.binary, ...(updated.extraBinaries ?? [])],
+              context,
+            );
+            if (!approval.ok) return { error: approval.error };
+          }
 
           config.cliTools = [...tools];
           config.cliTools[idx] = updated;

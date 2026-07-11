@@ -5,7 +5,7 @@ import type { ToolDefinition } from './types.js';
 import type { PluginCliToolContribution } from '../plugins/types.js';
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { runToolExecution } from './execution.js';
-import { isCommandAllowed } from './shell.js';
+import { isCommandAllowed, scrubShellEnv } from './shell.js';
 import { beginShellSnapshot } from './diff-tracker.js';
 import { binaryExistsInResolvedPath } from '../utils/shell-env.js';
 
@@ -107,7 +107,9 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
               argv,
               cwd: effectiveCwd,
               timeoutMs: timeout || config.tools.shell.timeout,
-              env: { ...process.env },
+              // Scrub Kai's own secrets from the spawned binary's env (same as the
+              // `sh` tool) — the CLI binary shouldn't inherit our API keys.
+              env: scrubShellEnv(process.env),
               context,
               streaming,
             });
