@@ -134,7 +134,7 @@ export function stopAgentForDeletedTask(
 // env/args through a configurable dual deny+allowlist at run time.
 
 /** Runtimes an AgentFile may persist. Mirrors shared/agent-types.ts AgentRuntime. */
-const ALLOWED_AGENT_RUNTIMES: ReadonlySet<string> = new Set(['auto', 'claude-code', 'codex', 'mastra']);
+const ALLOWED_AGENT_RUNTIMES: ReadonlySet<string> = new Set(['auto', 'claude-code', 'codex', 'mastra', 'pi']);
 
 function isValidAgentRuntime(runtime: unknown): runtime is AgentFile['runtime'] {
   return typeof runtime === 'string' && ALLOWED_AGENT_RUNTIMES.has(runtime);
@@ -832,6 +832,7 @@ async function startAgentRunLocked(
     if (configRuntime === 'claude-agent-sdk') effectiveRuntime = 'claude-code';
     else if (configRuntime === 'codex-sdk') effectiveRuntime = 'codex';
     else if (configRuntime === 'mastra') effectiveRuntime = 'mastra';
+    else if (configRuntime === 'pi') effectiveRuntime = 'pi';
     else effectiveRuntime = 'claude-code';
   }
 

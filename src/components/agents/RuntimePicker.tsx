@@ -34,6 +34,12 @@ const RUNTIME_OPTIONS: RuntimeOption[] = [
     icon: BrainIcon,
   },
   {
+    id: 'pi',
+    label: 'pi',
+    description: 'The pi coding-agent CLI',
+    icon: SparklesIcon,
+  },
+  {
     id: 'mastra',
     label: 'Mastra',
     description: 'Mastra AI framework runtime',
@@ -73,17 +79,13 @@ export const RuntimePicker: FC<RuntimePickerProps> = ({ value, onChange }) => {
               <Icon size={16} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className={cn('text-sm font-medium', isSelected && 'text-primary')}>
-                {option.label}
-              </div>
+              <div className={cn('text-sm font-medium', isSelected && 'text-primary')}>{option.label}</div>
               <div className="text-xs text-muted-foreground">{option.description}</div>
             </div>
             <div
               className={cn(
                 'h-4 w-4 shrink-0 rounded-full border-2 transition-colors',
-                isSelected
-                  ? 'border-primary bg-primary'
-                  : 'border-muted-foreground/30',
+                isSelected ? 'border-primary bg-primary' : 'border-muted-foreground/30',
               )}
             >
               {isSelected && (
