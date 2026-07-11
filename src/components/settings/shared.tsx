@@ -13,17 +13,26 @@ export type SettingsProps = {
 export const settingsSelectClass =
   'app-settings-select w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-xs outline-none';
 
-export const Toggle: FC<{ id?: string; label: string; checked: boolean; onChange: (value: boolean) => void }> = ({
-  id,
-  label,
-  checked,
-  onChange,
-}) => (
+export const Toggle: FC<{
+  id?: string;
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  disabled?: boolean;
+}> = ({ id, label, checked, onChange, disabled }) => (
   <label
     data-setting-id={id}
-    className="flex cursor-pointer items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2"
+    className={`flex items-center gap-2 rounded-xl border border-border/70 bg-card/80 px-3 py-2 ${
+      disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+    }`}
   >
-    <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="rounded" />
+    <input
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.checked)}
+      className="rounded"
+    />
     <span className="text-xs">{label}</span>
   </label>
 );

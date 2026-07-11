@@ -380,6 +380,10 @@ jobs:
       contents: read
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # Compile-only smoke test on every PR; does not upload artifacts. The flag
+      # satisfies the ADR-0005 build gate (intentionally builds Windows to catch
+      # breakage; no Windows release artifact is published from CI).
+      KAI_ENABLE_WIN_BUILD: '1'
     steps:
       - uses: actions/checkout@v5
 

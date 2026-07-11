@@ -10,6 +10,7 @@ import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types';
 import type { AppShotPayload } from '../../shared/app-shots';
 import type { DiffEvent, FileDiff } from '../../shared/diff-types';
 import type { AdapterCapabilities, PlatformPermissions } from '../../electron/platform/types';
+import type { PlatformCapabilities } from '../../electron/platform/capabilities';
 import type { ConversationChange } from '../../electron/ipc/conversations';
 import type { CliInstallStatus } from '../../electron/ipc/cli-install';
 
@@ -358,6 +359,7 @@ type AppAPI = {
     homedir: () => Promise<string>;
     getCapabilities: () => Promise<{ kind: string; capabilities: AdapterCapabilities }>;
     getPermissions: () => Promise<PlatformPermissions>;
+    getFeatureCapabilities: () => Promise<PlatformCapabilities>;
   };
   appShots: {
     capture: () => Promise<AppShotPayload>;

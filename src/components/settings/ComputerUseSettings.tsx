@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import { XIcon } from 'lucide-react';
 import { NumberField, Toggle, CollapsibleSection, settingsSelectClass, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
+import type { PlatformCapabilities } from '../../../electron/platform/capabilities';
 
 type ComputerUseConfig = {
   enabled: boolean;
@@ -448,6 +449,24 @@ const DisplayListPicker: FC<{
 export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
   const computerUse = config.computerUse as ComputerUseConfig;
   const models = config.models as { catalog: Array<{ key: string; displayName: string }> };
+  const [featureCaps, setFeatureCaps] = useState<PlatformCapabilities | null>(null);
+
+  // Fetch per-OS feature capabilities so we can honestly gate local computer use
+  // ("Coming to Windows") instead of offering a target that can't work (#82).
+  useEffect(() => {
+    let cancelled = false;
+    void app.platform
+      .getFeatureCapabilities()
+      .then((caps) => {
+        if (!cancelled) setFeatureCaps(caps);
+      })
+      .catch(() => {
+        /* capabilities are advisory UI hints; ignore fetch failures */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleDisplaysDiscovered = useCallback(
     (enabledDisplays: DisplayInfo[]) => {
@@ -504,14 +523,20 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
               onChange={(e) => updateConfig('computerUse.defaultTarget', e.target.value)}
             >
               <option value="isolated-browser">Isolated Browser</option>
-              <option value="local-macos">
+              <option value="local-macos" disabled={featureCaps?.computerUseLocal.supported === false}>
                 {app.platform.os === 'darwin'
                   ? 'Local Mac'
                   : app.platform.os === 'win32'
                     ? 'Local Windows'
                     : 'Local Linux'}
+                {featureCaps?.computerUseLocal.supported === false ? ' (coming soon)' : ''}
               </option>
             </select>
+            {featureCaps?.computerUseLocal.supported === false && (
+              <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
+                {featureCaps.computerUseLocal.reason} Use the isolated browser target for now.
+              </p>
+            )}
           </div>
           <div data-setting-id="computerUse.approvalModeDefault">
             <label className="text-[10px] text-muted-foreground block mb-0.5">Approval Mode</label>

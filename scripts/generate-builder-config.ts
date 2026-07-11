@@ -38,7 +38,9 @@ function getEsbuildBinaryPackageName(): string | null {
 function buildEsbuildExtraResourcesBlock(): string {
   const packageName = getEsbuildBinaryPackageName();
   if (!packageName) {
-    console.warn(`[generate-builder-config] No packaged esbuild binary mapping for ${process.platform}/${process.arch}`);
+    console.warn(
+      `[generate-builder-config] No packaged esbuild binary mapping for ${process.platform}/${process.arch}`,
+    );
     return '';
   }
 
@@ -52,10 +54,7 @@ function buildEsbuildExtraResourcesBlock(): string {
       return '';
     }
 
-    return [
-      `  - from: ${toYamlSingleQuotedPath(binaryPath)}`,
-      `    to: esbuild/bin/${binaryName}`,
-    ].join('\n');
+    return [`  - from: ${toYamlSingleQuotedPath(binaryPath)}`, `    to: esbuild/bin/${binaryName}`].join('\n');
   } catch (error) {
     console.warn('[generate-builder-config] Failed to resolve packaged esbuild binary:', error);
     return '';
@@ -69,6 +68,23 @@ for (const [key, value] of Object.entries(resolved)) {
 }
 
 content = content.replace('{{esbuildExtraResources}}', buildEsbuildExtraResourcesBlock());
+
+// Windows build gate (#82 / ADR-0005): the `win`/`nsis` targets are NOT
+// production-ready (no native Windows automation, unvalidated on real Windows
+// hardware) and must not ship by default. Strip both top-level blocks unless
+// KAI_ENABLE_WIN_BUILD is explicitly set, so CI publishes no Windows artifact.
+if (!process.env.KAI_ENABLE_WIN_BUILD) {
+  // Remove a top-level YAML block (`key:` at column 0 through the line before
+  // the next column-0 key). A block line is either indented content or a blank
+  // line; both are consumed so an interior blank line doesn't truncate the block.
+  const stripTopLevelBlock = (yaml: string, key: string): string =>
+    yaml.replace(new RegExp(`(^|\\n)${key}:[^\\n]*\\n(?:[ \\t]+[^\\n]*\\n|[ \\t]*\\n)*`, 'g'), '$1');
+  content = stripTopLevelBlock(content, 'win');
+  content = stripTopLevelBlock(content, 'nsis');
+  console.info(
+    '[generate-builder-config] Windows target stripped (set KAI_ENABLE_WIN_BUILD to include it). See ADR-0005.',
+  );
+}
 
 // Warn about any remaining un-replaced placeholders
 const remaining = content.match(/\{\{[a-zA-Z]+\}\}/g);

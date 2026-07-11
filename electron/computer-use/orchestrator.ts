@@ -14,6 +14,8 @@ import type { ModelChainEntry, FallbackCallbacks } from './provider-adapters/sha
 import { IsolatedBrowserHarness } from './harnesses/isolated-browser.js';
 import { LocalDesktopHarness } from './harnesses/local-desktop.js';
 import { LocalMacosHarness } from './harnesses/local-macos.js';
+import { WindowsStubHarness } from './harnesses/windows-stub.js';
+import { getPlatformCapabilities } from '../platform/capabilities.js';
 import type { ComputerHarness, ComputerHarnessActionResult } from './harnesses/shared.js';
 import { closeOverlayWindow, hideOverlayForCapture, showOverlayAfterCapture } from './overlay-window.js';
 
@@ -27,9 +29,22 @@ type SessionMutator = (
 type SessionReader = (sessionId: string) => ComputerSession | null;
 type EventSink = (event: ComputerUseEvent) => void;
 
-function getHarness(config: AppConfig, session: ComputerSession, getConfig: () => AppConfig): ComputerHarness {
+export function getHarness(config: AppConfig, session: ComputerSession, getConfig: () => AppConfig): ComputerHarness {
+  // Capability chokepoint (#82): local desktop automation is only available
+  // where the platform seam says so (macOS today). If ANY surface selects a
+  // local target on an unsupported OS — the explicit `local-windows` target, or
+  // a stale `local-macos` default carried onto Windows/Linux — route to the
+  // terminal WindowsStubHarness rather than silently degrading to nut-js. The
+  // browser target stays cross-platform.
+  const isLocalTarget = session.target === 'local-macos' || session.target === 'local-windows';
+  if (isLocalTarget && !getPlatformCapabilities().computerUseLocal.supported) {
+    return new WindowsStubHarness();
+  }
   if (session.target === 'local-macos') {
     return process.platform === 'darwin' ? new LocalMacosHarness(getConfig) : new LocalDesktopHarness(getConfig);
+  }
+  if (session.target === 'local-windows') {
+    return new WindowsStubHarness();
   }
   return new IsolatedBrowserHarness();
 }

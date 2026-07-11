@@ -3,6 +3,7 @@ import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface
 import type { AppShotPayload } from '../shared/app-shots.js';
 import type { DiffEvent, FileDiff } from '../shared/diff-types.js';
 import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
+import type { PlatformCapabilities } from './platform/capabilities.js';
 import type { CliInstallStatus as CliInstallStatusIpc } from './ipc/cli-install.js';
 
 export type AppAPI = typeof appAPI;
@@ -460,6 +461,10 @@ const appAPI = {
     getCapabilities: () =>
       ipcRenderer.invoke('platform:get-capabilities') as Promise<{ kind: string; capabilities: AdapterCapabilities }>,
     getPermissions: () => ipcRenderer.invoke('platform:get-permissions') as Promise<PlatformPermissions>,
+    /** High-level product-feature capabilities per OS (#82). Distinct from the
+     *  low-level adapter capabilities returned by `getCapabilities`. */
+    getFeatureCapabilities: (): Promise<PlatformCapabilities> =>
+      ipcRenderer.invoke('platform:get-feature-capabilities'),
   },
 
   webServer: {

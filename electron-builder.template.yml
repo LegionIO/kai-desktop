@@ -119,6 +119,9 @@ publish:
   - provider: github
     owner: legionio
     repo: kai-desktop
+# NOTE: the `win`/`nsis` blocks below are stripped from the generated config
+# unless KAI_ENABLE_WIN_BUILD is set — Windows is not production-ready yet
+# (no native automation, unvalidated on real hardware). See ADR-0005 and #82.
 win:
   icon: build/icon.ico
   extraResources:

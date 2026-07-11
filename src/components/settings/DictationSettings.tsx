@@ -305,6 +305,27 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
   const [heldModifiers, setHeldModifiers] = useState<string[]>([]);
   const [hotkeyDisplay, setHotkeyDisplay] = useState(dictation.hotkey ?? 'CommandOrControl+Shift+D');
   const [runtimeState, setRuntimeState] = useState<DictationRuntimeState | null>(null);
+  const [dictationAnywhereUnsupportedReason, setDictationAnywhereUnsupportedReason] = useState<string | null>(null);
+
+  // "Dictation anywhere" is macOS-only today (#82). Fetch the platform seam so
+  // we can show an honest "Coming to Windows" banner instead of letting a user
+  // enable a feature that would silently no-op.
+  useEffect(() => {
+    let cancelled = false;
+    void app.platform
+      .getFeatureCapabilities()
+      .then((caps) => {
+        if (!cancelled && caps.dictationAnywhere.supported === false) {
+          setDictationAnywhereUnsupportedReason(caps.dictationAnywhere.reason ?? 'Not available on this platform yet.');
+        }
+      })
+      .catch(() => {
+        /* advisory UI hint; ignore fetch failures */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load audio devices
   useEffect(() => {
@@ -442,11 +463,21 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
       <fieldset className="rounded-lg border border-border/60 p-3 space-y-3">
         <legend className="px-1 text-[10px] font-medium text-muted-foreground">General</legend>
 
+        {dictationAnywhereUnsupportedReason && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <AlertTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>
+              {dictationAnywhereUnsupportedReason} Dictation Anywhere is coming to your platform in a future release.
+            </span>
+          </div>
+        )}
+
         <Toggle
           id="dictation.enabled"
           label="Enable Dictation Anywhere"
-          checked={dictation.enabled ?? false}
+          checked={(dictation.enabled ?? false) && !dictationAnywhereUnsupportedReason}
           onChange={(v) => void updateConfig('dictation.enabled', v)}
+          disabled={!!dictationAnywhereUnsupportedReason}
         />
 
         {/* Speech Provider */}

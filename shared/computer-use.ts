@@ -1,6 +1,6 @@
 export type ComputerUseSurface = 'docked' | 'window';
 
-export type ComputerUseTarget = 'isolated-browser' | 'local-macos';
+export type ComputerUseTarget = 'isolated-browser' | 'local-macos' | 'local-windows';
 
 export type ComputerUseApprovalMode = 'step' | 'goal' | 'autonomous';
 

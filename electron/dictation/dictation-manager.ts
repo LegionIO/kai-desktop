@@ -24,6 +24,7 @@ import { createLanguageModelFromConfig } from '../agent/language-model.js';
 import { resolveModelCatalog } from '../agent/model-catalog.js';
 import { runLocalMacMouseCommand } from '../computer-use/permissions.js';
 import { runDictationViaAdapter } from './adapter-bridge.js';
+import { getDictationPlatform } from './dictation-platform.js';
 import {
   startLocalMacosTakeoverMonitor,
   type LocalMacosTakeoverMonitorHandle,
@@ -563,6 +564,16 @@ function handleNativeSessionExit(generation: number, message: string): void {
 
 async function startDictationInner(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
+
+  // Platform-capability seam (#82): "dictation anywhere" — inserting transcribed
+  // text into any app's focused native field — is only supported where the
+  // platform seam says so (macOS today). On win32/linux, refuse honestly here
+  // instead of starting a session that could never insert. `state` is already
+  // idle, so we simply log and return rather than starting a doomed session.
+  if (!getDictationPlatform().supportsAnywhereInsertion()) {
+    dictationDebugLog('SESSION_REFUSED_UNSUPPORTED_PLATFORM', { platform: process.platform });
+    return;
+  }
 
   state = 'starting';
   sessionGeneration += 1;

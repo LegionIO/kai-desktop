@@ -287,6 +287,10 @@ jobs:
       - run: pnpm install
 
       - run: pnpm build:win
+        env:
+          # This job only runs on manual workflow_dispatch (see `if:` above), a
+          # deliberate opt-in. The flag satisfies the ADR-0005 build gate.
+          KAI_ENABLE_WIN_BUILD: '1'
 
       - name: Verify Windows artifacts present
         shell: bash

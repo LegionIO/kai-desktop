@@ -434,7 +434,8 @@ export function getBridgeScript(): string {
       os: '${process.platform}',
       homedir: function() { return invoke('platform:homedir'); },
       getCapabilities: function() { return invoke('platform:get-capabilities'); },
-      getPermissions: function() { return invoke('platform:get-permissions'); }
+      getPermissions: function() { return invoke('platform:get-permissions'); },
+      getFeatureCapabilities: function() { return invoke('platform:get-feature-capabilities'); }
     },
     appShots: {
       capture: function() { return invoke('app-shots:capture'); },

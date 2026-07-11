@@ -11,7 +11,7 @@ const computerUseSupportSchema = z.enum([
   'none',
 ]);
 
-const computerUseTargetSchema = z.enum(['isolated-browser', 'local-macos']);
+const computerUseTargetSchema = z.enum(['isolated-browser', 'local-macos', 'local-windows']);
 
 const computerUseSurfaceSchema = z.enum(['docked', 'window']);
 
