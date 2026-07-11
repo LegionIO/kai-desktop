@@ -3,6 +3,7 @@ import { dialog } from 'electron';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { readAllConversations } from './conversation-store.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -106,7 +107,10 @@ function readEventStore(): UsageEventStore {
 }
 
 function writeEventStore(store: UsageEventStore): void {
-  writeFileSync(eventStorePath(), JSON.stringify(store, null, 2), 'utf-8');
+  // Atomic write: a crash mid-write must not leave a torn usage-events.json.
+  // (readEventStore already fails safe on a parse error by returning an empty
+  // store, but that silently discards ALL history — atomicity avoids the loss.)
+  atomicWriteFileSync(eventStorePath(), JSON.stringify(store, null, 2));
 }
 
 export function recordUsageEvent(event: Omit<UsageEvent, 'id' | 'timestamp'>): void {

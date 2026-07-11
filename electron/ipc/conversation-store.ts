@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
 import { join } from 'path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -121,24 +122,7 @@ function ensureDirs(appHome: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
-/** Write a file atomically: write to a sibling temp file, then rename into place.
- *  rename(2) is atomic on the same filesystem, so a crash mid-write can never
- *  leave a torn/truncated destination — readers see either the old file or the
- *  fully-written new one. */
-function atomicWriteFileSync(destPath: string, data: string): void {
-  const tmp = `${destPath}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    writeFileSync(tmp, data, 'utf-8');
-    renameSync(tmp, destPath);
-  } catch (err) {
-    try {
-      if (existsSync(tmp)) rmSync(tmp, { force: true });
-    } catch {
-      /* ignore cleanup failure */
-    }
-    throw err;
-  }
-}
+/** Write a file atomically — see {@link atomicWriteFileSync} in utils. */
 
 // ── index derivation ───────────────────────────────────────────────────────
 
