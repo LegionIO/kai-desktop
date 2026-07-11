@@ -166,6 +166,7 @@ describe('agent.confinement schema', () => {
       agent: { ...(base.agent ?? { runtime: 'auto' }), confinement: {} },
     });
     expect(parsed.agent?.confinement).toEqual({
+      enabled: false,
       workspaceOnly: true,
       scrubCredentials: true,
       envAllowlist: [],
@@ -179,6 +180,7 @@ describe('agent.confinement schema', () => {
       agent: {
         ...(base.agent ?? { runtime: 'auto' }),
         confinement: {
+          enabled: true,
           workspaceOnly: false,
           scrubCredentials: true,
           envAllowlist: ['GH_TOKEN', 'MY_VAR'],
@@ -188,6 +190,7 @@ describe('agent.confinement schema', () => {
       },
     });
     const c = parsed.agent!.confinement!;
+    expect(c.enabled).toBe(true);
     expect(c.workspaceOnly).toBe(false);
     expect(c.envAllowlist).toEqual(['GH_TOKEN', 'MY_VAR']);
     expect(c.root).toBe('/work/project');
@@ -207,6 +210,7 @@ describe('agent.confinement schema', () => {
     writeDesktopConfig(appHome, withConfinement);
     const reread = readEffectiveConfig(appHome);
     expect(reread.agent?.confinement).toEqual({
+      enabled: false,
       workspaceOnly: true,
       scrubCredentials: true,
       envAllowlist: ['GH_TOKEN'],

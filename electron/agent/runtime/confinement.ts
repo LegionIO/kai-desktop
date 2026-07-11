@@ -258,3 +258,27 @@ export function resolveConfinedCwd(
 
   return { cwd: real, confined: false, escaped: false, refused: false };
 }
+
+/* ── Provider key → env var (for the chokepoint's modelEnv) ─────────────── */
+
+/**
+ * Map a model provider + its resolved API key to the single provider-key env
+ * var an autonomous CLI expects, for buildAgentChildEnv's `modelEnv`. Returns
+ * an empty object for providers with no single key env (e.g. Bedrock, which
+ * uses the AWS chain) or when the key is absent.
+ */
+export function providerKeyEnv(provider: string | undefined, apiKey: string | undefined): Record<string, string> {
+  if (!apiKey) return {};
+  switch (provider) {
+    case 'anthropic':
+      return { ANTHROPIC_API_KEY: apiKey };
+    case 'openai':
+    case 'openai-compatible':
+      return { OPENAI_API_KEY: apiKey };
+    case 'google':
+    case 'gemini':
+      return { GEMINI_API_KEY: apiKey };
+    default:
+      return {};
+  }
+}

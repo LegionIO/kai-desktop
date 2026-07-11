@@ -626,6 +626,13 @@ const codexSdkConfigSchema = z.object({
  * relax specific runtimes.
  */
 const confinementConfigSchema = z.object({
+  /**
+   * Master gate for the confinement ENFORCEMENT wiring (#71). Default false so
+   * landing the wiring changes no behavior until an operator opts in; the
+   * workspaceOnly/scrubCredentials fields stay secure-by-default so that once
+   * enabled, confinement is on unless explicitly relaxed.
+   */
+  enabled: z.boolean().default(false),
   workspaceOnly: z.boolean().default(true),
   scrubCredentials: z.boolean().default(true),
   envAllowlist: z.array(z.string()).default([]),

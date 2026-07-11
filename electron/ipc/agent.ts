@@ -44,6 +44,7 @@ import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
 import { resolveRuntimeForStream } from '../agent/runtime/index.js';
+import { buildAgentChildEnv, resolveConfinedCwd, providerKeyEnv } from '../agent/runtime/confinement.js';
 import {
   ToolObserverManager,
   resolveToolObserverConfig,
@@ -2141,6 +2142,46 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
         }
 
+        // ── Confinement chokepoint (#71) ───────────────────────────────────
+        // When enabled AND the resolved runtime spawns untrusted, model-directed
+        // tools, pre-build the scrubbed child env + validated cwd here (once) and
+        // hand them to the runtime via StreamOptions. Gated behind
+        // agent.confinement.enabled (default false) so this is inert until an
+        // operator opts in. mastra (executesUntrustedTools=false) is unaffected.
+        let confinedChildEnv: NodeJS.ProcessEnv | undefined;
+        let confinedCwdValue: string | undefined;
+        const confinementCfg = config.agent?.confinement;
+        if (confinementCfg?.enabled && runtime.capabilities.executesUntrustedTools) {
+          const perRuntime = confinementCfg.overrides?.[runtime.id];
+          const scrub = perRuntime?.scrubCredentials ?? confinementCfg.scrubCredentials;
+          const workspaceOnly = perRuntime?.workspaceOnly ?? confinementCfg.workspaceOnly;
+
+          if (scrub) {
+            const mc = modelEntry?.modelConfig;
+            confinedChildEnv = buildAgentChildEnv({
+              modelProvider: mc?.provider,
+              modelEnv: providerKeyEnv(mc?.provider, mc?.apiKey),
+              hasExplicitAwsKeys: Boolean(mc?.accessKeyId && mc?.secretAccessKey),
+              passthrough: confinementCfg.envAllowlist,
+            });
+          }
+          if (workspaceOnly) {
+            const resolved = resolveConfinedCwd(effectiveCwd, { workspaceRoot: confinementCfg.root });
+            if (resolved.refused) {
+              emit({ conversationId, type: 'text-delta', text: `> ⚠️ Agent confinement: ${resolved.reason}\n\n` });
+            } else {
+              confinedCwdValue = resolved.cwd ?? undefined;
+              if (resolved.escaped) {
+                emit({
+                  conversationId,
+                  type: 'text-delta',
+                  text: `> ⚠️ Agent confinement: requested directory is outside the workspace root.\n\n`,
+                });
+              }
+            }
+          }
+        }
+
         const stream = runtime.stream({
           conversationId,
           messages,
@@ -2155,6 +2196,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           modelAuth: resolution.modelAuth,
           conversationMetadata: convMetadata,
           switchContext,
+          childEnv: confinedChildEnv,
+          confinedCwd: confinedCwdValue,
           emitEvent: streamOptions.emitEvent,
           onToolExecutionStart: streamOptions.onToolExecutionStart,
           onToolExecutionEnd: streamOptions.onToolExecutionEnd,
