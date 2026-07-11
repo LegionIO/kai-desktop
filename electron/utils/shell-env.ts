@@ -138,6 +138,10 @@ async function probeShellPath(shellPath: string, args: string[]): Promise<string
     const { stdout } = await execFileAsync(shellPath, args, {
       env: buildShellProbeEnv(),
       timeout: PATH_RESOLVE_TIMEOUT_MS,
+      // Force-kill on timeout: a user rc that traps SIGTERM (`trap '' TERM`)
+      // would otherwise ignore the default SIGTERM and hang the probe past its
+      // timeout, delaying startup. SIGKILL can't be trapped.
+      killSignal: 'SIGKILL',
       maxBuffer: 1024 * 1024,
     });
 
