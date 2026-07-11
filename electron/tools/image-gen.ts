@@ -77,9 +77,16 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
 
         for (const item of result.data) {
           if (item.b64_json) {
+            // Reject BEFORE decoding: Buffer.from(...,'base64') would
+            // materialize the whole (attacker-controlled) blob in memory first,
+            // so a post-decode cap can't prevent an OOM. base64 encodes 3 bytes
+            // per 4 chars, so an encoded length over ceil(MAX/3)*4 can't fit
+            // under MAX_MEDIA_BYTES. (+3 slack for '=' padding.)
+            if (item.b64_json.length > Math.ceil(MAX_MEDIA_BYTES / 3) * 4 + 3) {
+              return { error: 'Generated image exceeds the size limit.' };
+            }
             const buffer = Buffer.from(item.b64_json, 'base64');
-            // Cap the decoded size — a compromised provider could return a huge
-            // base64 blob to exhaust memory/disk.
+            // Belt-and-suspenders: verify the actual decoded size too.
             if (buffer.byteLength > MAX_MEDIA_BYTES) {
               return { error: 'Generated image exceeds the size limit.' };
             }
