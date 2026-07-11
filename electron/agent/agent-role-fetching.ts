@@ -24,6 +24,21 @@ const MAX_REDIRECTS = 5;
 const MAX_TEMPLATE_BYTES = 512 * 1024;
 
 /**
+ * Defense-in-depth validation of a roleId before it is interpolated into the
+ * fetch URL (`${ROLE_BASE_URL}/${roleId}.md`). Today the only caller passes a
+ * catalog-controlled id, but this function is exported, so a future untrusted
+ * caller must not be able to path-traverse (`../`), alter the URL authority
+ * (`@`, `\`, a scheme), or smuggle query/fragment/encoded bytes. The catalog id
+ * shape is `division/role-name` segments of lowercase alphanumerics with
+ * internal hyphens, single slashes, no leading/trailing/double slash, no dots.
+ */
+const VALID_ROLE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+
+export function isValidRoleId(roleId: string): boolean {
+  return VALID_ROLE_ID.test(roleId);
+}
+
+/**
  * Fetch a URL via https.get with TLS verification enabled.
  * Follows up to MAX_REDIRECTS same-host redirects.
  */
@@ -83,6 +98,13 @@ function httpsGet(url: string, timeoutMs = 8000, depth = 0): Promise<string> {
  * Returns the content string, or null on failure.
  */
 export async function fetchRoleTemplate(roleId: string): Promise<string | null> {
+  // Reject anything that isn't a well-formed catalog id BEFORE building the URL,
+  // so an untrusted roleId can't traverse the path or alter the fetch target.
+  if (!isValidRoleId(roleId)) {
+    console.warn(`[RoleFetch] Refusing to fetch invalid roleId: ${JSON.stringify(roleId)}`);
+    return null;
+  }
+
   const cached = templateCache.get(roleId);
   if (cached) return cached;
 
