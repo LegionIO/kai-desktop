@@ -318,6 +318,26 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
   return branch;
 }
 
+/**
+ * Walk DOWN from `startId` to the deepest descendant, always taking the last
+ * (most recent) child, and return that leaf's id. Cycle-guarded the same way as
+ * getActiveBranch so a corrupt parentId cycle can't hang the caller.
+ */
+export function deepestLatestDescendant(tree: StoredMessage[], startId: string): string {
+  let head = startId;
+  const visited = new Set<string>([head]);
+  const childrenOf = (parentId: string) => tree.filter((m) => m.parentId === parentId);
+  let children = childrenOf(head);
+  while (children.length > 0) {
+    const next = children[children.length - 1].id;
+    if (visited.has(next)) break;
+    visited.add(next);
+    head = next;
+    children = childrenOf(head);
+  }
+  return head;
+}
+
 // Sub-agent context
 type SubAgentActions = {
   threads: Map<string, SubAgentThreadState>;
@@ -2929,17 +2949,9 @@ export function RuntimeProvider({
   // Branch navigation
   const goToBranch = useCallback(
     (siblingId: string) => {
-      // Walk from this sibling down to the deepest descendant on the "latest" path
-      let newHead = siblingId;
-      // Find the deepest child chain from this sibling
-      const childrenOf = (parentId: string) => {
-        return tree.filter((m) => m.parentId === parentId);
-      };
-      let children = childrenOf(newHead);
-      while (children.length > 0) {
-        newHead = children[children.length - 1].id; // take last child (most recent)
-        children = childrenOf(newHead);
-      }
+      // Walk from this sibling down to the deepest descendant on the "latest"
+      // path (cycle-guarded — see deepestLatestDescendant).
+      const newHead = deepestLatestDescendant(tree, siblingId);
       setHeadId(newHead);
       // Persist
       const convId = activeIdRef.current;

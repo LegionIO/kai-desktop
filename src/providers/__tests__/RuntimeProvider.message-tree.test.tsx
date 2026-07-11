@@ -14,7 +14,7 @@ vi.mock('@/lib/ipc-client', () => ({
   app: new Proxy({}, { get: () => () => undefined }),
 }));
 
-import { getActiveBranch, ensureTree } from '../RuntimeProvider';
+import { getActiveBranch, ensureTree, deepestLatestDescendant } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
 
@@ -102,5 +102,34 @@ describe('ensureTree', () => {
     expect(headId).toBe('y');
     expect(tree[0].parentId).toBeNull();
     expect(tree[1].parentId).toBe('x');
+  });
+});
+
+describe('deepestLatestDescendant', () => {
+  const asTreeD = (nodes: Node[]) => nodes as unknown as Parameters<typeof deepestLatestDescendant>[0];
+
+  it('walks to the deepest last-child leaf', () => {
+    // a → b → c (linear); starting at a returns c.
+    expect(deepestLatestDescendant(asTreeD([n('a', null), n('b', 'a'), n('c', 'b')]), 'a')).toBe('c');
+  });
+
+  it('takes the LAST child at each level (most recent variant)', () => {
+    // a has children b1, b2; b2 is the last → descends into b2.
+    const tree = asTreeD([n('a', null), n('b1', 'a'), n('b2', 'a'), n('c', 'b2')]);
+    expect(deepestLatestDescendant(tree, 'a')).toBe('c');
+  });
+
+  it('returns the start id when it has no children (leaf)', () => {
+    expect(deepestLatestDescendant(asTreeD([n('a', null)]), 'a')).toBe('a');
+  });
+
+  it('does NOT infinite-loop on a parentId cycle (corrupt tree)', () => {
+    // a↔b cycle in the child direction: childrenOf oscillates without the guard.
+    const leaf = deepestLatestDescendant(asTreeD([n('a', 'b'), n('b', 'a')]), 'a');
+    expect(['a', 'b']).toContain(leaf);
+  });
+
+  it('does NOT infinite-loop on a self-referential node', () => {
+    expect(deepestLatestDescendant(asTreeD([n('a', 'a')]), 'a')).toBe('a');
   });
 });
