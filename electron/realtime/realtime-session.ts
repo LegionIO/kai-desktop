@@ -101,6 +101,10 @@ type PendingToolCall = {
 
 const WS_OPEN = 1; // WS_OPEN constant
 
+/** Cap accumulated function-call args (provider-streamed deltas) so a buggy or
+ *  hostile realtime endpoint can't grow memory unbounded over a session. */
+const MAX_FUNCTION_ARGS_BYTES = 1024 * 1024;
+
 /**
  * Redact a WebSocket/HTTP URL for logging: strips userinfo and masks any
  * query param whose name looks credential-bearing (token/key/secret/password).
@@ -237,8 +241,16 @@ export class RealtimeSession {
           if (this._status !== 'error') {
             this.setStatus('disconnected');
           }
-          // Remote close: tear down computer-use tracking so its listener does
-          // not outlive the socket (setupComputerUseTracking ran before connect).
+          // Remote close (network drop / provider hangup): mark torn down and
+          // abort in-flight tools BEFORE broadcasting done, mirroring
+          // failAndClose(). Otherwise a tool still running when the socket closed
+          // keeps executing uncancelled, and its finishToolCall() would broadcast
+          // a tool-result for a now-dead session (the exact race the torndown
+          // guard exists to prevent).
+          this.torndown = true;
+          this.toolAbort.abort();
+          // Tear down computer-use tracking so its listener does not outlive the
+          // socket (setupComputerUseTracking ran before connect).
           this.teardownComputerUseTracking();
           this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
           this.ws = null;
@@ -260,11 +272,24 @@ export class RealtimeSession {
         // Capture the actual HTTP response body on upgrade failure (400, 401, etc.)
         this.ws.on('unexpected-response', (_req: unknown, res: IncomingMessage) => {
           let body = '';
+          // Cap the error body: a failed handshake response is provider-controlled
+          // and could otherwise stream unbounded before 'end'.
+          const MAX_UPGRADE_BODY = 16 * 1024;
+          let truncated = false;
           res.on('data', (chunk: Buffer) => {
+            if (body.length >= MAX_UPGRADE_BODY) {
+              truncated = true;
+              return;
+            }
             body += chunk.toString();
+            if (body.length > MAX_UPGRADE_BODY) {
+              body = body.slice(0, MAX_UPGRADE_BODY);
+              truncated = true;
+            }
           });
           res.on('end', () => {
-            const msg = `HTTP ${res.statusCode}: ${body || res.statusMessage || 'Unknown error'}`;
+            const shown = truncated ? `${body}…(truncated)` : body;
+            const msg = `HTTP ${res.statusCode}: ${shown || res.statusMessage || 'Unknown error'}`;
             console.error(`[RealtimeSession] WebSocket upgrade rejected: ${msg}`);
             console.error(`[RealtimeSession] Response headers:`, JSON.stringify(res.headers, null, 2));
             this.setStatus('error', msg);
@@ -494,9 +519,9 @@ export class RealtimeSession {
       const wsBase = azureCfg.endpoint.replace(/\/+$/, '').replace(/^http/, 'ws');
       const url = `${wsBase}/openai/realtime?api-version=${apiVersion}&deployment=${encodeURIComponent(deployment)}`;
       console.info(
-        `[RealtimeSession] Azure config: endpoint="${azureCfg.endpoint}" deploymentName="${azureCfg.deploymentName}" model="${model}" → resolved deployment="${deployment}"`,
+        `[RealtimeSession] Azure config: endpoint="${redactUrlForLog(azureCfg.endpoint)}" deploymentName="${azureCfg.deploymentName}" model="${model}" → resolved deployment="${deployment}"`,
       );
-      console.info(`[RealtimeSession] Azure WebSocket URL: ${url}`);
+      console.info(`[RealtimeSession] Azure WebSocket URL: ${redactUrlForLog(url)}`);
       return {
         url,
         headers: withBrandUserAgent({
@@ -852,11 +877,17 @@ export class RealtimeSession {
 
         const buf = this.functionCallBuffers.get(callId);
         if (buf) {
-          buf.args += delta;
+          // Cap accumulated tool-call args: a buggy/hostile provider streaming
+          // endless deltas must not grow memory unbounded for the session's life.
+          // 1 MiB is far above any real tool-args payload; extra deltas are dropped
+          // (the args.done handler will then fail to JSON.parse and error the call).
+          if (buf.args.length < MAX_FUNCTION_ARGS_BYTES) {
+            buf.args += delta;
+          }
         } else {
           this.functionCallBuffers.set(callId, {
             name: (event.name as string) ?? '',
-            args: delta,
+            args: delta.slice(0, MAX_FUNCTION_ARGS_BYTES),
             itemId: event.item_id as string,
             callId,
           });
