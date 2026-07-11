@@ -19,7 +19,7 @@ import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, Reasoning
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
-import { isCommandAllowed } from '../tools/shell.js';
+import { isCommandAllowed, scrubShellEnv } from '../tools/shell.js';
 import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
 import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
 import type { DiffTrackingResultMeta } from '../../shared/diff-types.js';
@@ -852,7 +852,12 @@ async function createWorkspaceForAgent(
     }),
     sandbox: new LocalSandbox({
       workingDirectory: cwd,
-      env: process.env,
+      // Scrub the app's own provider secrets / tokens from the environment the
+      // model's execute_command tool inherits — otherwise the model (or a
+      // prompt-injection via tool output) could `echo $ANTHROPIC_API_KEY` and
+      // exfiltrate app credentials. Mirrors the standalone `sh` tool's scrub;
+      // PATH/HOME/NODE_* are kept so commands still work.
+      env: scrubShellEnv(process.env),
     }),
     tools: {
       mastra_workspace_write_file: { requireReadBeforeWrite: true },
@@ -1493,7 +1498,8 @@ async function* streamWithRealEvents(
             }
             // Extract Anthropic cache token info from providerMetadata or directly from usage
             const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
-              Record<string, unknown> | undefined;
+              | Record<string, unknown>
+              | undefined;
             const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
             if (anthropicMeta) {
               accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
