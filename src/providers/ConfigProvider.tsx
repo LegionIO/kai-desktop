@@ -18,12 +18,21 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     try {
-      app.config.get()
+      app.config
+        .get()
         .then((cfg) => setConfig(cfg as AppConfig))
         .catch((err) => console.error('[Config] Failed to load:', err));
 
-      const unsubscribe = app.config.onChanged((cfg) => {
-        setConfig(cfg as AppConfig);
+      // config:changed carries a REDACTED payload (secrets stripped before the
+      // broadcast fans out to plugin renderers + web-socket peers), so treat it
+      // as a "something changed" signal and re-fetch the full config via the
+      // first-party config:get pull channel rather than trusting the payload
+      // (which would blank the API-key fields in the settings UI).
+      const unsubscribe = app.config.onChanged(() => {
+        app.config
+          .get()
+          .then((cfg) => setConfig(cfg as AppConfig))
+          .catch((err) => console.error('[Config] Failed to refetch after change:', err));
       });
 
       return unsubscribe;
@@ -43,11 +52,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo(() => ({ config, updateConfig }), [config, updateConfig]);
 
-  return (
-    <ConfigContext.Provider value={value}>
-      {children}
-    </ConfigContext.Provider>
-  );
+  return <ConfigContext.Provider value={value}>{children}</ConfigContext.Provider>;
 }
 
 export function useConfig() {

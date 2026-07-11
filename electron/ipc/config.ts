@@ -5,6 +5,7 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { toPluginSafeConfig } from '../plugins/safe-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { binaryExists } from '../tools/cli-tools.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
@@ -1174,7 +1175,13 @@ export function registerConfigHandlers(
     if (snapshot === lastBroadcastSnapshot) return;
 
     lastBroadcastSnapshot = snapshot;
-    broadcastToAllWindows('config:changed', currentConfig);
+    // Redact credential leaves before the broadcast: config:changed fans out via
+    // broadcastToAllWindows to EVERY renderer (incl. third-party plugin renderers)
+    // AND every connected web-server WebSocket peer (a network trust boundary).
+    // The raw config stays on the internal onChanged?.() path (agent runtime / MCP
+    // loader) and on the permission-scoped config:get pull path. Renderers treat
+    // config:changed as a "something changed" signal and re-fetch via config:get.
+    broadcastToAllWindows('config:changed', toPluginSafeConfig(currentConfig));
     onChanged?.(currentConfig);
   };
 
