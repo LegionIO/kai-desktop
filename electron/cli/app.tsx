@@ -43,7 +43,15 @@ type Turn =
   | { kind: 'note'; text: string; id?: string; loading?: boolean }
   | { kind: 'error'; text: string };
 
-type ToolEntry = { id: string; name: string; status: ToolStatus; durationMs?: number; error?: string };
+type ToolEntry = {
+  id: string;
+  name: string;
+  status: ToolStatus;
+  durationMs?: number;
+  error?: string;
+  args?: unknown;
+  result?: unknown;
+};
 
 type PickerState = {
   title: string;
@@ -112,6 +120,8 @@ export function App({
   // resolves waitUntilExit() and lets startRepl clean up the backend.
   useInput((_input, key) => {
     if (key.ctrl && _input === 'c') exit();
+    // Ctrl-O toggles expanded tool views (full args + result) for the run.
+    if (key.ctrl && _input === 'o') setExpandTools((v) => !v);
   });
   const [turns, setTurns] = useState<Turn[]>([]);
   const [tools, setTools] = useState<ToolEntry[]>([]);
@@ -122,6 +132,7 @@ export function App({
   const [fallbackModelLabel, setFallbackModelLabel] = useState<string | null>(null); // runtime model-fallback override
   const [profileLabel, setProfileLabel] = useState<string>('unset');
   const [pending, setPending] = useState<'model' | 'profile' | null>(null); // which banner line is applying
+  const [expandTools, setExpandTools] = useState<boolean>(false); // Ctrl-O: show full tool args/result
   const streamingRef = useRef<string>(''); // in-progress assistant text
   const convIdRef = useRef<string>('');
   const unsavedRecordRef = useRef<Record<string, unknown> | null>(null); // new chat not yet persisted
@@ -347,10 +358,11 @@ export function App({
             // after PreToolUse hook sanitization, so appending would duplicate.
             const id = e.toolCallId;
             const name = e.toolName ?? 'tool';
+            const args = e.args;
             setTools((prev) =>
               prev.some((t) => t.id === id)
-                ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running' } : t))
-                : [...prev, { id, name, status: 'running' }],
+                ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running', args } : t))
+                : [...prev, { id, name, status: 'running', args }],
             );
           }
           break;
@@ -366,6 +378,7 @@ export function App({
                     ...t,
                     status: failed ? 'error' : 'done',
                     durationMs: e.durationMs,
+                    result: e.result,
                     ...(failed ? { error: res?.error ?? 'tool failed' } : {}),
                   }
                 : t,
@@ -510,7 +523,8 @@ export function App({
             kind: 'note',
             text:
               '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear\n' +
-              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents  /quit',
+              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents  /quit\n' +
+              'keys: Esc cancel turn · Esc Esc rewind menu · Ctrl-O expand tool i/o · Ctrl-C quit',
           });
           break;
         case 'new':
@@ -872,6 +886,35 @@ export function App({
     [status, runCommand, pushTurn, sendMessage],
   );
 
+  // ── Keyboard shortcuts ──────────────────────────────────────────────────
+  // ESC while a turn is in flight → cancel it (agent:cancel-stream). Two quick
+  // ESC presses while idle → open the rewind/revert menu (same as /rewind 1).
+  // Skipped entirely when a Picker is open — the Picker owns ESC (its onCancel
+  // rejects a pending tool, etc.), so we must not also act on it here.
+  const lastEscRef = useRef<number>(0);
+  const DOUBLE_ESC_MS = 500;
+  useInput(
+    (_input, key) => {
+      if (!key.escape) return;
+      if (picker) return; // Picker handles its own ESC
+      const now = Date.now();
+      if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+        lastEscRef.current = 0; // a cancel is not part of a double-ESC sequence
+        pushTurn({ kind: 'note', text: 'cancelling…' });
+        void client.invoke('agent:cancel-stream', convIdRef.current).catch(() => {});
+        return;
+      }
+      // Idle: detect a double-ESC within the window → rewind menu.
+      if (now - lastEscRef.current <= DOUBLE_ESC_MS) {
+        lastEscRef.current = 0;
+        void runCommand('rewind', '1');
+      } else {
+        lastEscRef.current = now;
+      }
+    },
+    { isActive: true },
+  );
+
   const cols = stdout?.columns ?? 80;
 
   return (
@@ -901,7 +944,16 @@ export function App({
         {tools.length > 0 ? (
           <Box flexDirection="column" marginTop={1}>
             {tools.map((t) => (
-              <ToolRow key={t.id} name={t.name} status={t.status} durationMs={t.durationMs} error={t.error} />
+              <ToolRow
+                key={t.id}
+                name={t.name}
+                status={t.status}
+                durationMs={t.durationMs}
+                error={t.error}
+                expanded={expandTools}
+                args={t.args}
+                result={t.result}
+              />
             ))}
           </Box>
         ) : null}
