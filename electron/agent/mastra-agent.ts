@@ -1594,6 +1594,10 @@ async function* streamWithRealEvents(
           };
 
           await sleep(delay);
+          // Abort may have fired DURING the backoff sleep — re-check before
+          // starting another attempt so a cancelled turn doesn't open a new
+          // stream with an already-aborted signal.
+          if (options?.abortSignal?.aborted) break compatibilityLoop;
           continue;
         }
 
