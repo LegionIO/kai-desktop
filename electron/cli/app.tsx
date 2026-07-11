@@ -837,13 +837,28 @@ export function App({
           }
           const target = arg.trim();
           if (target) {
-            const match = ids.find((sid) => sid === target || sid.startsWith(target));
+            // Exact match wins; otherwise accept a prefix ONLY if it's
+            // unambiguous — a prefix matching multiple ids must not silently
+            // stop an arbitrary one.
+            let match = ids.find((sid) => sid === target);
+            if (!match) {
+              const prefixed = ids.filter((sid) => sid.startsWith(target));
+              if (prefixed.length === 1) match = prefixed[0];
+              else if (prefixed.length > 1) {
+                pushTurn({ kind: 'note', text: `ambiguous "${target}" — matches: ${prefixed.join(', ')}` });
+                break;
+              }
+            }
             if (!match) {
               pushTurn({ kind: 'note', text: `no sub-agent matching "${target}"` });
               break;
             }
-            await client.invoke('agent:sub-agent-stop', match).catch(() => {});
-            pushTurn({ kind: 'note', text: `stopped sub-agent ${match}` });
+            try {
+              await client.invoke('agent:sub-agent-stop', match);
+              pushTurn({ kind: 'note', text: `stopped sub-agent ${match}` });
+            } catch (err) {
+              pushTurn({ kind: 'error', text: `stop failed: ${(err as { message?: string })?.message ?? err}` });
+            }
             break;
           }
           // No id given → pick from a menu.
