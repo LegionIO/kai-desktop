@@ -390,9 +390,16 @@ export class CodexRuntime implements AgentRuntime {
         ...(baseUrl ? { baseUrl } : {}),
         // ALWAYS scrub the child env — the Codex CLI runs model-directed shell
         // commands that would otherwise inherit Kai's provider secrets, whether
-        // or not an MCP bridge is active. Keeps PATH/HOME/cert vars; overlays the
-        // bridge token when present. The CLI's own auth is the `apiKey` above.
-        env: buildScrubbedCodexEnv(bridgeAuthTokenEnvVar, bridgeAuthToken),
+        // or not an MCP bridge is active. Prefer the IPC chokepoint's pre-built
+        // childEnv (the epic's fail-closed allowlist, #71) when confinement is
+        // enabled; otherwise use this runtime's own denylist scrub. Either way
+        // overlay the bridge token. The CLI's own auth is the `apiKey` above.
+        env: options.childEnv
+          ? {
+              ...(options.childEnv as Record<string, string>),
+              ...(bridgeAuthTokenEnvVar && bridgeAuthToken ? { [bridgeAuthTokenEnvVar]: bridgeAuthToken } : {}),
+            }
+          : buildScrubbedCodexEnv(bridgeAuthTokenEnvVar, bridgeAuthToken),
         ...(bridgeUrl
           ? {
               config: {
@@ -409,7 +416,7 @@ export class CodexRuntime implements AgentRuntime {
 
       threadOptions = {
         ...(modelAuth?.modelName ? { model: modelAuth.modelName } : {}),
-        workingDirectory: cwd ?? process.cwd(),
+        workingDirectory: options.confinedCwd ?? cwd ?? process.cwd(),
         modelReasoningEffort: modelEffort,
         approvalPolicy,
         skipGitRepoCheck: true,

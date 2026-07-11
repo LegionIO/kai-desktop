@@ -93,12 +93,24 @@ function claudeEnvKeyMatches(key: string, pattern: string): boolean {
  * the CLI still authenticates while model-directed Bash commands can't read
  * Kai's other provider keys.
  */
-function buildScrubbedClaudeEnv(auth: { apiKey?: string; baseUrl?: string } | null): Record<string, string> {
+function buildScrubbedClaudeEnv(
+  auth: { apiKey?: string; baseUrl?: string } | null,
+  /** When the IPC chokepoint pre-built a fail-closed childEnv (#71), use it as
+   *  the base instead of scrubbing process.env here. Auth vars are still overlaid
+   *  after so the CLI can authenticate. */
+  baseEnv?: NodeJS.ProcessEnv,
+): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (CLAUDE_ENV_SECRET_DENYLIST.some((pat) => claudeEnvKeyMatches(key, pat))) continue;
-    out[key] = value;
+  if (baseEnv) {
+    for (const [key, value] of Object.entries(baseEnv)) {
+      if (value !== undefined) out[key] = value;
+    }
+  } else {
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value === undefined) continue;
+      if (CLAUDE_ENV_SECRET_DENYLIST.some((pat) => claudeEnvKeyMatches(key, pat))) continue;
+      out[key] = value;
+    }
   }
   if (auth?.apiKey) out.ANTHROPIC_AUTH_TOKEN = auth.apiKey;
   if (auth?.baseUrl) out.ANTHROPIC_BASE_URL = auth.baseUrl;
@@ -448,7 +460,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       // would point at the kai-desktop source tree, causing the Claude Code
       // subprocess to walk up and load kai-desktop's CLAUDE.md + AGENTS.md
       // (~5.8 KB / ~1400 tokens) on every request.
-      cwd: cwd ?? homedir(),
+      cwd: options.confinedCwd ?? cwd ?? homedir(),
       // Model + auth from Kai's model-runtime resolver.
       ...(auth ? { model: auth.modelName } : {}),
       maxTurns,
@@ -478,7 +490,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       // (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL from Kai's resolver). This
       // replaces the prior `settings.env` override, which only ADDED auth vars on
       // top of the unscrubbed inherited env.
-      env: buildScrubbedClaudeEnv(auth),
+      env: buildScrubbedClaudeEnv(auth, options.childEnv),
       // Resume previous session for conversation continuity
       ...(existingSessionId ? { resume: existingSessionId } : {}),
       // Fall back to system-installed CLI when bundled binary is missing

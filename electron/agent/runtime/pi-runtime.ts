@@ -182,9 +182,12 @@ export class PiRuntime implements AgentRuntime {
     args.push('--session-id', piSessionId);
     args.push('--session-dir', join(appHome, 'pi-sessions'));
 
-    // Env: inherit Kai's resolved PATH/env, plus the provider-specific API key
-    // (never on argv). We never log this object.
-    const env: NodeJS.ProcessEnv = { ...getResolvedProcessEnv(), ...mapping.env };
+    // Env: when the IPC chokepoint pre-built a scrubbed childEnv (confinement
+    // enabled), use it as the base — it already excludes app secrets and carries
+    // only the allowlisted vars. Otherwise inherit Kai's resolved env. Either way
+    // overlay the provider-specific API key pi needs (never on argv). Never log.
+    const baseEnv = options.childEnv ?? getResolvedProcessEnv();
+    const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
 
     // -----------------------------------------------------------------------
     // 5. Spawn + stream
@@ -204,7 +207,7 @@ export class PiRuntime implements AgentRuntime {
     }
 
     const child = spawn(piPath, args, {
-      cwd: cwd || process.cwd(),
+      cwd: options.confinedCwd || cwd || process.cwd(),
       env,
       shell: false,
       detached: process.platform !== 'win32', // own process group → reap bash grandchildren
