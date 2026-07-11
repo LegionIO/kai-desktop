@@ -19,6 +19,9 @@ const templateCache = new Map<string, string>();
 const ALLOWED_REDIRECT_HOST = 'raw.githubusercontent.com';
 /** Maximum redirect chain length. */
 const MAX_REDIRECTS = 5;
+/** Cap the response body — a role template is small markdown; an unexpectedly
+ *  huge body must not bloat memory or the synthesized prompt context. */
+const MAX_TEMPLATE_BYTES = 512 * 1024;
 
 /**
  * Fetch a URL via https.get with TLS verification enabled.
@@ -45,7 +48,9 @@ function httpsGet(url: string, timeoutMs = 8000, depth = 0): Promise<string> {
           reject(new Error(`Refusing to follow redirect to disallowed host: ${redirectUrl.hostname}`));
           return;
         }
-        httpsGet(redirectUrl.toString(), timeoutMs, depth + 1).then(resolve).catch(reject);
+        httpsGet(redirectUrl.toString(), timeoutMs, depth + 1)
+          .then(resolve)
+          .catch(reject);
         return;
       }
       if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
@@ -53,7 +58,16 @@ function httpsGet(url: string, timeoutMs = 8000, depth = 0): Promise<string> {
         return;
       }
       const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      let total = 0;
+      res.on('data', (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > MAX_TEMPLATE_BYTES) {
+          req.destroy();
+          reject(new Error(`Role template exceeds ${MAX_TEMPLATE_BYTES / 1024}KB limit`));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
       res.on('error', reject);
     });
