@@ -523,7 +523,7 @@ export function App({
           pushTurn({
             kind: 'note',
             text:
-              '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /clear\n' +
+              '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
               '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents\n' +
               '/subagents  /subagent-stop [id]  /quit\n' +
               'keys: Esc cancel turn · Esc Esc rewind menu · Ctrl-O expand tool i/o · Ctrl-C quit',
@@ -618,9 +618,34 @@ export function App({
           });
           break;
         }
-        case 'compact':
-          pushTurn({ kind: 'note', text: '/compact not yet wired — coming soon' });
+        case 'compact': {
+          if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+            pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
+            break;
+          }
+          if (unsavedRecordRef.current) {
+            pushTurn({ kind: 'note', text: 'nothing to compact yet' });
+            break;
+          }
+          const noteId = `n-${Date.now()}`;
+          pushLoadingNote(noteId, 'compacting conversation…');
+          const res = await client.invoke<{ ok?: boolean; error?: string; summarizedCount?: number }>(
+            'conversations:compact',
+            convIdRef.current,
+          );
+          if (res?.ok) {
+            resolveNote(noteId, `compacted ${res.summarizedCount ?? 0} message(s) into a summary`);
+          } else {
+            const msg =
+              res?.error === 'nothing-to-compact'
+                ? 'nothing to compact yet'
+                : res?.error === 'compaction-disabled'
+                  ? 'compaction is disabled in settings'
+                  : `compact failed: ${res?.error ?? 'unknown'}`;
+            resolveNote(noteId, msg);
+          }
           break;
+        }
         case 'rewind':
         case 'revert': {
           // Rewinding mid-turn would fight the in-flight stream: its terminal

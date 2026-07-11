@@ -8,6 +8,8 @@ import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
+import { resolveStreamConfig } from '../agent/model-catalog.js';
+import { compactConversationPrefix } from '../agent/compaction.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
@@ -554,6 +556,78 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const nextHead = cutIndex > 0 ? branch[cutIndex - 1].id : null;
     const removed = branch.length - cutIndex;
     return { ok: true, removed, conversation: commitTreeUpdate(conv, tree, nextHead) };
+  });
+
+  // On-demand compaction (the CLI /compact command). Summarizes the branch
+  // prefix and PERSISTS the compaction record (conversationCompaction) so the
+  // next turn reuses it — matching the metadata-only, non-destructive design of
+  // the automatic mid-turn path (the message tree is NOT mutated). No renderer
+  // is involved, so unlike the auto path (which emits a `compaction` event the
+  // renderer persists), this writes the record directly.
+  ipcMain.handle('conversations:compact', async (_event, conversationId: string) => {
+    if (typeof conversationId !== 'string' || !conversationId) return { ok: false, error: 'invalid-id' };
+    const config = getConfig?.();
+    if (!config) return { ok: false, error: 'config-unavailable' };
+    if (!config.compaction?.conversation?.enabled) return { ok: false, error: 'compaction-disabled' };
+
+    const conv = readConversation(appHome, conversationId);
+    if (!conv) return { ok: false, error: 'conversation-not-found' };
+    if (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') {
+      return { ok: false, error: 'conversation-busy' };
+    }
+
+    // Resolve the model the same way a turn would (thread model → default),
+    // so token windows + tokenization match what the auto path uses.
+    const streamConfig = resolveStreamConfig(config, {
+      threadModelKey: conv.selectedModelKey ?? null,
+      threadProfileKey: null,
+      fallbackEnabled: false,
+    });
+    const modelEntry = streamConfig?.primaryModel;
+    if (!modelEntry) return { ok: false, error: 'no-model' };
+
+    const { tree, headId } = ensureConversationTree(conv);
+    const branch = getConversationBranch(tree, headId);
+    const messages = branch.map((m) => ({ id: m.id, role: m.role, content: m.content }));
+
+    let result;
+    try {
+      result = await compactConversationPrefix(
+        messages as Parameters<typeof compactConversationPrefix>[0],
+        modelEntry.modelConfig,
+        config.compaction.conversation,
+      );
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    // A null result means "nothing safe to compact" (prefix empty / would drop a
+    // message / summary still over budget) — the auto path treats this the same.
+    if (!result.compactedMessages || !result.summaryText || !result.compactionId) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+
+    // Persist the record only (tree untouched). Re-read to avoid clobbering a
+    // concurrent write, then merge just the compaction field.
+    const fresh = readConversation(appHome, conversationId);
+    if (!fresh) return { ok: false, error: 'conversation-not-found' };
+    // A turn may have started during the (async) summary generation. If so, skip
+    // persisting — that turn will compute its own record, and stamping one now
+    // could race its terminal write. (Even if it slipped through, the agent
+    // reuse path fails-safe on a prefix mismatch, so this is belt-and-braces.)
+    if (fresh.runStatus === 'running' || fresh.runStatus === 'awaiting-approval') {
+      return { ok: false, error: 'conversation-busy' };
+    }
+    fresh.conversationCompaction = {
+      compactionId: result.compactionId,
+      summaryText: result.summaryText,
+      compactedMessageIds: result.compactedMessageIds,
+      boundaryHeadId: headId,
+      createdAt: new Date().toISOString(),
+    } as ConversationRecord['conversationCompaction'];
+    fresh.updatedAt = new Date().toISOString();
+    writeConversation(appHome, fresh);
+    return { ok: true, summarizedCount: result.compactedMessageIds.length };
   });
 
   ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
