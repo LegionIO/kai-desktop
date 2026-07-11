@@ -12,6 +12,17 @@ type Pending = {
 };
 
 /**
+ * Cap on the un-flushed stdout line buffer. A helper that emits a huge line
+ * without a trailing newline (bug, or a swapped-out/compromised binary) would
+ * otherwise grow this string unbounded and exhaust main-process memory. 16 MiB
+ * is far above any legitimate NDJSON line the helpers produce.
+ */
+const MAX_STDOUT_BUFFER_BYTES = 16 * 1024 * 1024;
+
+/** Grace period after SIGTERM before escalating to SIGKILL on stop(). */
+const STOP_SIGKILL_DELAY_MS = 2000;
+
+/**
  * Long-lived child process speaking newline-delimited JSON over stdio.
  *
  * Request shape: `{ "id": <n>, "cmd": "<name>", "args": <any> }`
@@ -58,6 +69,22 @@ export class HelperProcess {
 
     this.child.stdout.on('data', (chunk: Buffer) => {
       this.stdoutBuffer += chunk.toString('utf8');
+      // Guard against a helper that never emits a newline (bug or a
+      // swapped-out/compromised binary): an unbounded line buffer would exhaust
+      // main-process memory. Kill the helper and fail its in-flight calls.
+      if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER_BYTES) {
+        this.stdoutBuffer = '';
+        const reason = `helper produced an oversized line (> ${MAX_STDOUT_BUFFER_BYTES} bytes)`;
+        try {
+          this.child?.kill('SIGKILL');
+        } catch {
+          /* best-effort */
+        }
+        this.child = null;
+        this.spawnError = reason;
+        this.failAllPending(new HelperUnavailable(reason));
+        return;
+      }
       while (true) {
         const newline = this.stdoutBuffer.indexOf('\n');
         if (newline === -1) break;
@@ -85,8 +112,23 @@ export class HelperProcess {
   }
 
   stop(): void {
-    if (this.child && !this.child.killed) {
-      this.child.kill('SIGTERM');
+    const child = this.child;
+    if (child && !child.killed) {
+      child.kill('SIGTERM');
+      // Escalate to SIGKILL if the helper ignores SIGTERM, so a wedged helper
+      // can't linger. The exit handler already nulls this.child + fails pending;
+      // this timer only fires if the process is still alive after the grace
+      // period. `unref` so a pending kill-timer never keeps the app alive.
+      const killTimer = setTimeout(() => {
+        if (!child.killed && child.exitCode === null) {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* already gone */
+          }
+        }
+      }, STOP_SIGKILL_DELAY_MS);
+      killTimer.unref?.();
     }
     this.child = null;
     this.failAllPending(new HelperUnavailable('helper stopped'));
