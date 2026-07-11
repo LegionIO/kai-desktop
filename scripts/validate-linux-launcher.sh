@@ -62,4 +62,55 @@ set -e
 echo "$OUT" | grep -q "could not locate the Kai app binary" || fail "case4 missing guidance: $OUT"
 pass "case4 not-found → exit 127 + guidance"
 
+# ── cli-install.ts install-OUTPUT validation ────────────────────────────────
+# The app's "install kai on PATH" action (electron/ipc/cli-install.ts) writes a
+# wrapper into ~/.local/bin and adds that dir to PATH via a shell rc block.
+# Reproduce the EXACT generated artifacts here and run them, so we validate the
+# real install output (not just the shim's resolution). Kept in sync with
+# cli-install.ts: wrapperContents() + ensurePosixPath().
+MARKER="KAI_MANAGED_CLI_WRAPPER"
+PATH_MARKER="# added by Kai (kai CLI)"
+
+# shSingleQuote(): wrap in '...' and escape embedded ' as '\'' (POSIX-safe).
+sh_single_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# wrapperContents(appBin): the POSIX branch of cli-install.ts.
+write_wrapper() { # $1=dest $2=appBin
+  mkdir -p "$(dirname "$1")" # cli-install.ts mkdirSync(dir, {recursive:true}) before write
+  {
+    printf '#!/bin/sh\n'
+    printf '# %s\n' "$MARKER"
+    printf 'exec %s --kai-cli "$@"\n' "$(sh_single_quote "$2")"
+  } > "$1"
+  chmod +x "$1"
+}
+
+# Case 5: installed wrapper (plain path) resolves + forwards --kai-cli + args.
+BINDIR=$HOME/.local/bin
+make_stub /opt/app/kai-real
+write_wrapper "$BINDIR/kai" /opt/app/kai-real
+[ -x "$BINDIR/kai" ] || fail "case5 wrapper not created"
+grep -q "$MARKER" "$BINDIR/kai" || fail "case5 wrapper missing managed marker"
+OUT=$("$BINDIR/kai" a b 2>&1) || fail "case5 exec failed: $OUT"
+echo "$OUT" | grep -q "LAUNCHED:/opt/app/kai-real:--kai-cli a b" || fail "case5 wrong target/args: $OUT"
+pass "case5 installed wrapper execs app binary with --kai-cli + args"
+
+# Case 6: app path with a space, $ and ! — single-quoting must keep it literal.
+WEIRD='/opt/My $App!/kai bin'
+make_stub "$WEIRD"
+write_wrapper "$BINDIR/kai6" "$WEIRD"
+OUT=$("$BINDIR/kai6" z 2>&1) || fail "case6 exec failed: $OUT"
+echo "$OUT" | grep -q "LAUNCHED:$WEIRD:--kai-cli z" || fail "case6 metachar path not literal: $OUT"
+pass "case6 wrapper single-quotes a path with space/\$/! (no shell expansion)"
+
+# Case 7: rc PATH block makes `kai` resolvable when the dir wasn't on PATH.
+RC=$HOME/.bashrc
+printf '%s\nexport PATH="%s:$PATH"\n' "$PATH_MARKER" "$BINDIR" >> "$RC"
+grep -q "$PATH_MARKER" "$RC" || fail "case7 rc marker not written"
+# Fresh shell WITHOUT ~/.local/bin on PATH, then source the rc → kai resolves.
+OUT=$(env -i HOME="$HOME" PATH=/usr/bin:/bin sh -c ". \"$RC\"; command -v kai >/dev/null && kai ok 2>&1") \
+  || fail "case7 kai not resolvable after sourcing rc"
+echo "$OUT" | grep -q "LAUNCHED:/opt/app/kai-real:--kai-cli ok" || fail "case7 post-PATH exec wrong: $OUT"
+pass "case7 rc block puts ~/.local/bin on PATH → kai resolves"
+
 echo "ALL LINUX LAUNCHER CASES PASSED"
