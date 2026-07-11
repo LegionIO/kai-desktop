@@ -169,6 +169,15 @@ jobs:
 
       - run: pnpm type-check
 
+      # Validate the Linux `kai` launcher + PATH-install output in a clean
+      # container. Runs bin/kai's find_binary() branches and the cli-install.ts
+      # generated wrapper/rc artifacts against a stubbed app binary — catches a
+      # regression in the pure-POSIX shim or the install output before release.
+      # ubuntu-latest ships Docker, so this reuses the exact `validate:linux-cli`
+      # path developers run locally.
+      - name: Validate Linux CLI launcher + PATH install
+        run: pnpm validate:linux-cli
+
       # Emit a JUnit report so dorny/test-reporter can surface failures as
       # PR-level check annotations. The output path is gitignored.
       - name: Unit + component tests
@@ -363,7 +372,7 @@ jobs:
     permissions:
       contents: read
     env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v5
 
