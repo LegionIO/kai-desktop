@@ -220,11 +220,15 @@ export function filePathToUrl(filePath: string): string {
 export async function streamToBuffer(stream: ReadableStream, maxBytes = MAX_MEDIA_BYTES): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let completed = false; // reached `done` normally — no cancel needed
   const reader = stream.getReader();
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       if (value) {
         total += value.byteLength;
         if (total > maxBytes) {
@@ -234,6 +238,16 @@ export async function streamToBuffer(stream: ReadableStream, maxBytes = MAX_MEDI
       }
     }
   } finally {
+    // On cap-exceed / early error, actively CANCEL the reader so an
+    // attacker-controlled provider can't keep the underlying download alive
+    // after we've stopped consuming. releaseLock alone doesn't abort the source.
+    if (!completed) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* best-effort */
+      }
+    }
     try {
       reader.releaseLock();
     } catch {
