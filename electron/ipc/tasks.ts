@@ -52,6 +52,85 @@ const taskCreateSchema = z
   })
   .passthrough(); // allow additional fields for forward compat
 
+// Validates the PARTIAL payload of `tasks:update` (#100 review MED). Previously
+// only `status` was checked, so a caller could forge/corrupt runs, reviewResults,
+// timestamps, exit codes, and completion metadata, or blank required fields with
+// wrong types. Every field is optional (partial merge) and type/-bound checked;
+// `.passthrough()` keeps forward-compat for fields not yet enumerated here.
+const taskMetadataSchema = z.object({
+  category: z.enum(['feature', 'bug_fix', 'refactoring', 'docs', 'other']).optional(),
+  labels: z.array(z.string().max(100)).max(50).optional(),
+  planFileName: z.string().max(200).optional(),
+  cwd: z.string().max(500).optional(),
+});
+
+const taskReviewNoteSchema = z.object({
+  source: z.enum(['ai', 'human']),
+  content: z.string().max(20000),
+  timestamp: z.string().max(64),
+  fromStatus: kaiTaskStatusSchema,
+});
+
+const taskReviewResultSchema = z.object({
+  agentId: z.string().max(100),
+  agentName: z.string().max(200),
+  status: z.enum(['pending', 'approved', 'rejected']),
+  feedback: z.string().max(20000).optional(),
+  timestamp: z.string().max(64).optional(),
+  terminalSessionId: z.string().max(100).optional(),
+});
+
+const taskRunSchema = z
+  .object({
+    id: z.string().max(100),
+    number: z.number().int().min(0),
+    type: z.enum(['execution', 'review']),
+    agentId: z.string().max(100),
+    agentName: z.string().max(200),
+    terminalSessionId: z.string().max(100),
+    startedAt: z.string().max(64),
+    completedAt: z.string().max(64).optional(),
+    exitCode: z.number().int().optional(),
+    outcome: z.enum(['promoted', 'blocked', 'rejected', 'approved', 'timeout', 'crashed', 'stopped']).optional(),
+    summary: z.string().max(20000).optional(),
+  })
+  .passthrough();
+
+const taskConversationMessageSchema = z.object({
+  role: z.enum(['user', 'assistant']),
+  content: z.string().max(100000),
+  timestamp: z.string().max(64),
+});
+
+export const taskUpdateSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH).optional(),
+    description: z.string().max(MAX_DESCRIPTION_LENGTH).optional(),
+    status: kaiTaskStatusSchema.optional(),
+    startedAt: z.string().max(64).optional(),
+    completedAt: z.string().max(64).optional(),
+    reviewNotes: z.array(taskReviewNoteSchema).max(500).optional(),
+    sourceConversationId: z.string().max(100).optional(),
+    sourceToolCallId: z.string().max(100).optional(),
+    agentRuntime: z.string().max(100).optional(),
+    terminalSessionId: z.string().max(100).optional(),
+    metadata: taskMetadataSchema.optional(),
+    assignedAgentId: z.string().max(100).nullable().optional(),
+    reviewerAgentIds: z.array(z.string().max(100)).max(50).optional(),
+    reviewMode: z.enum(['parallel', 'sequential']).optional(),
+    reviewResults: z.array(taskReviewResultSchema).max(500).optional(),
+    workspaceId: z.string().max(100).optional(),
+    conversationHistory: z.array(taskConversationMessageSchema).max(1000).optional(),
+    archivedAt: z.string().max(64).optional(),
+    priority: z.number().int().min(-100).max(100).optional(),
+    completionSummary: z.string().max(20000).optional(),
+    lastExitCode: z.number().int().optional(),
+    retryCount: z.number().int().min(0).max(100000).optional(),
+    unblockAttempts: z.number().int().min(0).max(100000).optional(),
+    runs: z.array(taskRunSchema).max(1000).optional(),
+  })
+  .passthrough();
+
 const taskOrderSchema = z
   .record(
     kaiTaskStatusSchema,
@@ -248,17 +327,26 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       try {
         const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
 
+        // Validate the whole partial payload — not just `status` — so a caller
+        // can't forge/corrupt runs, reviewResults, timestamps, exit codes, or
+        // blank required fields with wrong types (#100 review MED). Each field
+        // is optional; unknown fields pass through for forward-compat.
+        const parsedUpdates = taskUpdateSchema.safeParse(updates);
+        if (!parsedUpdates.success) {
+          return { error: `Invalid task update: ${parsedUpdates.error.issues[0]?.message ?? 'validation failed'}` };
+        }
+
         // Validate the status transition whenever the status key is PRESENT.
         // A truthiness-only check let status: undefined/null/'' slip past the
         // state machine and then get spread into the persisted task, wiping the
         // status and dropping the task off the board / out of listAllTasks.
         if ('status' in updates) {
-          const parsed = kaiTaskStatusSchema.safeParse(updates.status);
-          if (!parsed.success) {
+          const nextStatus = parsedUpdates.data.status;
+          if (nextStatus === undefined) {
             return { error: `Invalid task status: ${JSON.stringify(updates.status)}` };
           }
-          if (existing.status !== parsed.data && !isValidTransition(existing.status, parsed.data)) {
-            return { error: `Invalid transition: ${existing.status} → ${parsed.data}` };
+          if (existing.status !== nextStatus && !isValidTransition(existing.status, nextStatus)) {
+            return { error: `Invalid transition: ${existing.status} → ${nextStatus}` };
           }
         }
 
