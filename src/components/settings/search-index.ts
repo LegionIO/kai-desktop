@@ -42,6 +42,7 @@ export const TAB_LABELS: Record<string, string> = {
   // Application
   general: 'General',
   'app-shots': 'App Shots',
+  appshots: 'Appshots',
   // Voice
   realtime: 'Voice Chat',
   dictation: 'Dictation',
@@ -394,6 +395,43 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     section: 'general',
     tab: 'app-shots',
     keywords: ['accessibility'],
+  },
+
+  // ─── Application › Appshots (persisted gallery) ───
+  {
+    id: 'appshots.enabled',
+    label: 'Enable appshots',
+    section: 'general',
+    tab: 'appshots',
+    keywords: ['appshot', 'screenshot', 'gallery', 'persisted', 'snapshot'],
+  },
+  {
+    id: 'appshots.autoCapture',
+    label: 'Auto-capture frames during computer use',
+    section: 'general',
+    tab: 'appshots',
+    keywords: ['appshot', 'screenshot', 'automatic', 'computer use', 'capture'],
+  },
+  {
+    id: 'appshots.captureVisibleText',
+    label: 'Store visible text metadata',
+    section: 'general',
+    tab: 'appshots',
+    keywords: ['appshot', 'ocr', 'visible text', 'metadata', 'privacy'],
+  },
+  {
+    id: 'appshots.retention.maxCount',
+    label: 'Max appshots',
+    section: 'general',
+    tab: 'appshots',
+    keywords: ['appshot', 'retention', 'limit', 'count', 'cleanup'],
+  },
+  {
+    id: 'appshots.retention.maxAgeDays',
+    label: 'Appshot max age (days)',
+    section: 'general',
+    tab: 'appshots',
+    keywords: ['appshot', 'retention', 'age', 'expiry', 'cleanup'],
   },
 
   // ─── Audio ───
