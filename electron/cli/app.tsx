@@ -8,6 +8,7 @@ import { InputBox } from './components/InputBox.js';
 import { ToolRow, type ToolStatus } from './components/ToolRow.js';
 import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
+import { expandFileMentions } from './mentions.js';
 
 type StreamEvent = {
   conversationId?: string;
@@ -870,11 +871,12 @@ export function App({
   }, []);
 
   const sendMessage = useCallback(
-    (trimmed: string) => {
+    (trimmed: string, submitText?: string) => {
       pushTurn({ kind: 'user', text: trimmed });
       setStatus('running');
       streamingRef.current = '';
       turnSettledRef.current = false; // new turn — arm the terminal-event guard
+      const toSubmit = submitText ?? trimmed;
       void (async () => {
         try {
           // Persist a lazily-created chat on its first message (see createNew).
@@ -892,7 +894,7 @@ export function App({
           const res = await client.invoke<{ ok?: boolean; error?: string }>(
             'agent:submit',
             convIdRef.current,
-            trimmed,
+            toSubmit,
             {
               cwd: CWD,
             },
@@ -930,6 +932,15 @@ export function App({
       if (status === 'running' || status === 'awaiting-approval') {
         queueRef.current.push(trimmed);
         pushTurn({ kind: 'note', text: `queued: ${trimmed}` });
+        return;
+      }
+      // Expand @file mentions by inlining file contents (agent:submit is
+      // text-only). The visible turn keeps the original @path; only the
+      // submitted text carries the inlined bodies. Surface per-file notes.
+      if (/(^|\s)@/.test(trimmed)) {
+        const { text, notes } = expandFileMentions(trimmed, CWD);
+        for (const note of notes) pushTurn({ kind: 'note', text: note });
+        sendMessage(trimmed, text !== trimmed ? text : undefined);
         return;
       }
       sendMessage(trimmed);
