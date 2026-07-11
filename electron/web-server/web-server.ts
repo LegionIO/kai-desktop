@@ -444,6 +444,15 @@ export function getBridgeScript(): string {
       resolveRef: function(refId) { return invoke('app-shots:resolve-ref', refId); },
       onCaptured: function(cb) { return on('app-shots:captured', cb); }
     },
+    appshots: {
+      list: function() { return invoke('appshots:list'); },
+      get: function(id) { return invoke('appshots:get', id); },
+      getImage: function(id) { return invoke('appshots:get-image', id); },
+      delete: function(id) { return invoke('appshots:delete', id); },
+      deleteAll: function() { return invoke('appshots:delete-all'); },
+      update: function(id, patch) { return invoke('appshots:update', id, patch); },
+      onChanged: function(cb) { return on('appshots:changed', cb); }
+    },
     webServer: {
       getLanAddresses: function() { return invoke('webServer:lan-addresses'); },
       createToken: function() { return invoke('webServer:create-token'); }
