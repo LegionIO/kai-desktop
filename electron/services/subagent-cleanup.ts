@@ -113,13 +113,28 @@ export async function cleanupOrphanedSubagents(config: AppConfig, dbPath: string
 /**
  * Wire up the daily cron + the startup catch-up sweep. Called once from
  * `main.ts`. Safe to call when memory is disabled (it short-circuits).
+ *
+ * Idempotent: a second call while a schedule is already armed is a no-op (the
+ * timers would otherwise leak — they're `unref`'d so they don't block exit, but
+ * a re-init would run two overlapping daily sweeps with no handle to cancel the
+ * first). Mirrors `startLocalServer`'s single-arm guard.
  */
+let scheduled = false;
+let initialTimer: ReturnType<typeof setTimeout> | null = null;
+let intervalTimer: ReturnType<typeof setInterval> | null = null;
+
 export function initializeSubagentCleanup(getConfig: () => AppConfig, appHome: string, dbPath: string): void {
   const initialConfig = getConfig();
   if (!initialConfig.memory?.enabled) {
     console.info('[Cleanup] Memory disabled — skipping sub-agent cleanup');
     return;
   }
+
+  if (scheduled) {
+    console.info('[Cleanup] Sub-agent cleanup already scheduled — skipping re-init');
+    return;
+  }
+  scheduled = true;
 
   const runSweep = async (trigger: 'cron' | 'startup'): Promise<void> => {
     try {
@@ -149,9 +164,9 @@ export function initializeSubagentCleanup(getConfig: () => AppConfig, appHome: s
     next3am.setDate(next3am.getDate() + 1);
   }
   const msUntilNext = next3am.getTime() - now.getTime();
-  const initialTimer = setTimeout(() => {
+  initialTimer = setTimeout(() => {
     void runSweep('cron');
-    const intervalTimer = setInterval(() => {
+    intervalTimer = setInterval(() => {
       void runSweep('cron');
     }, ONE_DAY_MS);
     // Allow the process to exit even with the interval pending.
@@ -159,4 +174,22 @@ export function initializeSubagentCleanup(getConfig: () => AppConfig, appHome: s
   }, msUntilNext);
   initialTimer.unref?.();
   console.info('[Cleanup] Sub-agent cleanup scheduled (daily at 03:00)');
+}
+
+/**
+ * Cancel the scheduled sweep timers and reset the arm guard. Idempotent. Exists
+ * so a restart (or a test) can tear down cleanly and re-arm; `main.ts` boots
+ * once so this is not on the normal path, but leaving armed timers uncancelable
+ * is the leak this closes.
+ */
+export function stopSubagentCleanup(): void {
+  if (initialTimer) {
+    clearTimeout(initialTimer);
+    initialTimer = null;
+  }
+  if (intervalTimer) {
+    clearInterval(intervalTimer);
+    intervalTimer = null;
+  }
+  scheduled = false;
 }
