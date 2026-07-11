@@ -90,11 +90,7 @@ export class ToolMcpBridge {
   private conversationId: string;
   private cwd?: string;
 
-  constructor(options: {
-    tools: ToolDefinition[];
-    conversationId: string;
-    cwd?: string;
-  }) {
+  constructor(options: { tools: ToolDefinition[]; conversationId: string; cwd?: string }) {
     this.tools = new Map(options.tools.map((t) => [t.name, t]));
     this.conversationId = options.conversationId;
     this.cwd = options.cwd;
@@ -125,17 +121,21 @@ export class ToolMcpBridge {
     }
 
     try {
-      // Validate args against Zod schema before execution
+      // Validate args against the Zod schema before execution. These tools run
+      // with full local privileges, so if the schema rejects, fail the call
+      // rather than passing unvalidated input through.
       let validatedArgs = args;
-      try {
-        const parseResult = tool.inputSchema.safeParse(args);
-        if (parseResult.success) {
-          validatedArgs = parseResult.data;
+      const safeParse = (tool.inputSchema as { safeParse?: (v: unknown) => { success: boolean; data?: unknown } })
+        .safeParse;
+      if (typeof safeParse === 'function') {
+        const parseResult = safeParse.call(tool.inputSchema, args);
+        if (!parseResult.success) {
+          return {
+            content: [{ type: 'text', text: `Invalid arguments for tool "${name}".` }],
+            isError: true,
+          };
         }
-        // If validation fails we still pass args through — the tool's own
-        // execute() may handle partial/relaxed input gracefully.
-      } catch {
-        // Ignore validation errors for exotic schemas
+        validatedArgs = parseResult.data;
       }
 
       const context: ToolExecutionContext = {
@@ -148,8 +148,17 @@ export class ToolMcpBridge {
       const result = await tool.execute(validatedArgs, context);
       const text = typeof result === 'string' ? result : JSON.stringify(result);
 
+      // Surface an error-shaped tool result as an MCP error, not a success.
+      const resultIsError =
+        !!result &&
+        typeof result === 'object' &&
+        ((result as { isError?: unknown }).isError === true ||
+          (typeof (result as { error?: unknown }).error === 'string' &&
+            (result as { error: string }).error.length > 0));
+
       return {
         content: [{ type: 'text', text }],
+        ...(resultIsError ? { isError: true } : {}),
       };
     } catch (error) {
       return {

@@ -18,10 +18,12 @@ function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
     name: overrides.name ?? 'test-tool',
     description: overrides.description ?? 'A test tool',
-    inputSchema: overrides.inputSchema ?? z.object({
-      path: z.string().describe('The file path'),
-      content: z.string().optional().describe('File content'),
-    }),
+    inputSchema:
+      overrides.inputSchema ??
+      z.object({
+        path: z.string().describe('The file path'),
+        content: z.string().optional().describe('File content'),
+      }),
     execute: overrides.execute ?? (async (input) => `Executed with: ${JSON.stringify(input)}`),
     ...overrides,
   };
@@ -124,7 +126,10 @@ describe('ToolMcpBridge', () => {
     it('catches execution errors and returns them as MCP error', async () => {
       const failingTool = createTool({
         name: 'failing-tool',
-        execute: async () => { throw new Error('Intentional test failure'); },
+        inputSchema: z.object({}),
+        execute: async () => {
+          throw new Error('Intentional test failure');
+        },
       });
 
       const bridge = createBridge([failingTool]);
@@ -138,7 +143,10 @@ describe('ToolMcpBridge', () => {
       let receivedArgs: unknown;
       const tool = createTool({
         inputSchema: z.object({ count: z.number() }),
-        execute: async (input) => { receivedArgs = input; return 'ok'; },
+        execute: async (input) => {
+          receivedArgs = input;
+          return 'ok';
+        },
       });
 
       const bridge = createBridge([tool]);
@@ -147,22 +155,29 @@ describe('ToolMcpBridge', () => {
       expect(receivedArgs).toEqual({ count: 42 });
     });
 
-    it('passes through args even when validation fails', async () => {
-      let receivedArgs: unknown;
+    it('rejects args that fail validation instead of passing them through', async () => {
+      let executed = false;
       const tool = createTool({
         inputSchema: z.object({ count: z.number() }),
-        execute: async (input) => { receivedArgs = input; return 'ok'; },
+        execute: async () => {
+          executed = true;
+          return 'ok';
+        },
       });
 
       const bridge = createBridge([tool]);
-      // Pass a string instead of number — validation fails but args pass through
-      await bridge.callTool('test-tool', { count: 'not-a-number' });
+      // Pass a string instead of number — validation fails, so the tool must NOT
+      // run and the call must be reported as an error (privileged tools should
+      // never receive unvalidated input).
+      const result = await bridge.callTool('test-tool', { count: 'not-a-number' });
 
-      expect(receivedArgs).toEqual({ count: 'not-a-number' });
+      expect(executed).toBe(false);
+      expect(result.isError).toBe(true);
     });
 
     it('stringifies non-string results as JSON', async () => {
       const tool = createTool({
+        inputSchema: z.object({}),
         execute: async () => ({ files: ['a.txt', 'b.txt'], count: 2 }),
       });
 
@@ -195,10 +210,7 @@ describe('ToolMcpBridge', () => {
     });
 
     it('size returns count of registered tools', () => {
-      const bridge = createBridge([
-        createTool({ name: 'a' }),
-        createTool({ name: 'b' }),
-      ]);
+      const bridge = createBridge([createTool({ name: 'a' }), createTool({ name: 'b' })]);
       expect(bridge.size).toBe(2);
     });
   });

@@ -68,9 +68,7 @@ export function getCodexMcpToolEntries(tools: ToolDefinition[]): CodexMcpToolEnt
     // name (e.g. "plugin__rally__rally_list_user_story_tasks") for model use.
     const preferredName = makeCodexMcpToolName(tool.originalName ?? tool.name);
     const fallbackName = makeCodexMcpToolName(tool.name);
-    const name = seen.has(preferredName)
-      ? makeUniqueToolName(fallbackName, seen)
-      : preferredName;
+    const name = seen.has(preferredName) ? makeUniqueToolName(fallbackName, seen) : preferredName;
     seen.add(name);
     entries.push({ name, tool });
   }
@@ -166,6 +164,27 @@ function extractZodShape(schema: unknown): Record<string, unknown> | null {
 // Bridge implementation
 // ---------------------------------------------------------------------------
 
+/** True if a tool result is error-shaped (so we can set the MCP isError flag). */
+function isErrorResult(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const r = result as { isError?: unknown; error?: unknown };
+  return r.isError === true || (typeof r.error === 'string' && r.error.length > 0);
+}
+
+/** Short human-readable description of a Zod safeParse error for the MCP client. */
+function describeZodError(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const issues = (error as { issues?: Array<{ path?: unknown[]; message?: string }> }).issues;
+    if (Array.isArray(issues) && issues.length > 0) {
+      return issues
+        .slice(0, 5)
+        .map((i) => `${Array.isArray(i.path) && i.path.length ? i.path.join('.') + ': ' : ''}${i.message ?? 'invalid'}`)
+        .join('; ');
+    }
+  }
+  return 'arguments did not match the expected schema';
+}
+
 export class CodexMcpBridge {
   private httpServer: HttpServer | null = null;
   private mcpServer: McpServerInstance | null = null;
@@ -173,6 +192,9 @@ export class CodexMcpBridge {
   private port: number | null = null;
   private authToken: string | null = null;
   private authTokenEnvVar: string | null = null;
+  /** In-flight start() promise — serializes concurrent starts so two callers
+   *  can't both pass the already-running guard and leak a server. */
+  private startPromise: Promise<string> | null = null;
 
   /**
    * Start the local MCP bridge server.
@@ -188,27 +210,58 @@ export class CodexMcpBridge {
     cwd?: string,
     abortSignal?: AbortSignal,
   ): Promise<string> {
+    // Serialize concurrent start() calls: a second caller awaits the first's
+    // in-flight promise instead of racing past the already-running guard (which
+    // would overwrite state + leak the first server).
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = (async () => {
+      // Guard against a double-start leaking the previous server/port/token.
+      if (this.httpServer || this.mcpServer || this.transport) {
+        await this.stop();
+      }
+      try {
+        return await this.startInternal(tools, conversationId, cwd, abortSignal);
+      } catch (err) {
+        // Partial start (e.g. listen() succeeded but connect() threw) would leave
+        // a live HTTP server + stale state; tear everything down before rethrowing.
+        await this.stop();
+        throw err;
+      }
+    })();
+    try {
+      return await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  private async startInternal(
+    tools: ToolDefinition[],
+    conversationId: string,
+    cwd?: string,
+    abortSignal?: AbortSignal,
+  ): Promise<string> {
     // Dynamic imports to avoid hard dependency if SDK is not installed
     const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
-    const { StreamableHTTPServerTransport } = await import(
-      '@modelcontextprotocol/sdk/server/streamableHttp.js'
-    );
+    const { StreamableHTTPServerTransport } = await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
 
     // 1. Create MCP server with instructions for the model
     const toolEntries = getCodexMcpToolEntries(tools);
-    const toolCatalog = JSON.stringify({
-      tools: toolEntries.map(({ name, tool }) => ({
-        name,
-        description: tool.description ?? '',
-        source: tool.source,
-        sourceId: tool.sourceId,
-        internalName: tool.name,
-        originalName: tool.originalName,
-      })),
-    }, null, 2);
-    const toolSummary = toolEntries
-      .map(({ name, tool }) => `- ${name}: ${tool.description ?? ''}`)
-      .join('\n');
+    const toolCatalog = JSON.stringify(
+      {
+        tools: toolEntries.map(({ name, tool }) => ({
+          name,
+          description: tool.description ?? '',
+          source: tool.source,
+          sourceId: tool.sourceId,
+          internalName: tool.name,
+          originalName: tool.originalName,
+        })),
+      },
+      null,
+      2,
+    );
+    const toolSummary = toolEntries.map(({ name, tool }) => `- ${name}: ${tool.description ?? ''}`).join('\n');
     this.mcpServer = new McpServer(
       { name: 'kai', version: '1.0.0' },
       {
@@ -254,20 +307,38 @@ export class CodexMcpBridge {
         };
 
         try {
-          // Validate if possible
+          // Validate against the tool's Zod schema. These tools run with full
+          // local privileges, so if the schema EXISTS and rejects, fail the call
+          // instead of passing unvalidated input through. Tools without a
+          // safeParse-capable schema can't be validated here — pass args as-is.
           let validatedArgs: unknown = args;
-          try {
-            const parseResult = (boundTool.inputSchema as { safeParse?: (v: unknown) => { success: boolean; data?: unknown } }).safeParse?.(args);
-            if (parseResult?.success) {
-              validatedArgs = parseResult.data;
+          const safeParse = (
+            boundTool.inputSchema as {
+              safeParse?: (v: unknown) => { success: boolean; data?: unknown; error?: unknown };
             }
-          } catch {
-            // Use raw args
+          ).safeParse;
+          if (typeof safeParse === 'function') {
+            const parseResult = safeParse.call(boundTool.inputSchema, args);
+            if (!parseResult.success) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Invalid arguments for tool "${finalName}": ${describeZodError(parseResult.error)}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            validatedArgs = parseResult.data;
           }
 
           const result = await boundTool.execute(validatedArgs, context);
           const text = typeof result === 'string' ? result : JSON.stringify(result);
-          return { content: [{ type: 'text' as const, text }] };
+          // A tool that returns an error-shaped result (isError / error field)
+          // must surface as an MCP error, not a successful call — otherwise Codex
+          // treats a failed tool as success.
+          return { content: [{ type: 'text' as const, text }], ...(isErrorResult(result) ? { isError: true } : {}) };
         } catch (error) {
           return {
             content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }],
@@ -278,19 +349,9 @@ export class CodexMcpBridge {
 
       // Register with McpServer — use shape if available, otherwise pass empty shape
       if (zodShape) {
-        (this.mcpServer as unknown as McpServerInstance).tool(
-          finalName,
-          tool.description ?? '',
-          zodShape,
-          handler,
-        );
+        (this.mcpServer as unknown as McpServerInstance).tool(finalName, tool.description ?? '', zodShape, handler);
       } else {
-        (this.mcpServer as unknown as McpServerInstance).tool(
-          finalName,
-          tool.description ?? '',
-          {},
-          handler,
-        );
+        (this.mcpServer as unknown as McpServerInstance).tool(finalName, tool.description ?? '', {}, handler);
       }
     }
 
@@ -304,8 +365,7 @@ export class CodexMcpBridge {
     this.authToken = randomUUID();
     // Unique env-var name per bridge instance so concurrent Codex runs each
     // read their own token instead of racing on a shared process.env key.
-    this.authTokenEnvVar =
-      'KAI_MCP_BRIDGE_TOKEN_' + randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
+    this.authTokenEnvVar = 'KAI_MCP_BRIDGE_TOKEN_' + randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
 
     // 4. Create HTTP server
     await new Promise<void>((resolve, reject) => {
