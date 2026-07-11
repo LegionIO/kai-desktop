@@ -1,14 +1,49 @@
 import { useState, useEffect, useCallback, type FC } from 'react';
-import { settingsSelectClass, Toggle, NumberField, type SettingsProps } from './shared';
+import { settingsSelectClass, Toggle, NumberField, TextField, type SettingsProps } from './shared';
 import { app } from '@/lib/ipc-client';
 
 type RuntimeInfo = { id: string; name: string; available: boolean; reason?: string; description?: string };
+
+type ConfinementConfig = {
+  enabled?: boolean;
+  workspaceOnly?: boolean;
+  scrubCredentials?: boolean;
+  envAllowlist?: string[];
+  root?: string;
+};
 
 type AgentConfig = {
   runtime: string;
   maxTurns?: number;
   autoContinueOnMaxTurns?: boolean;
+  confinement?: ConfinementConfig;
 };
+
+/** Parse a comma/whitespace/newline-separated allowlist into a deduped, trimmed list. */
+export function parseEnvAllowlist(raw: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of raw.split(/[\s,]+/)) {
+    const name = token.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Heuristic match for env-var names that likely carry a secret. Used only to
+ * surface a non-blocking warning in the confinement allowlist editor — the
+ * operator may still legitimately need one (e.g. a proxy that reads a token),
+ * so this never rejects, it just flags. Mirrors the backend scrub denylist
+ * intent in confinement.ts.
+ */
+export function looksLikeSecretEnvName(name: string): boolean {
+  return /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE|SESSION|AUTH|API[_-]?KEY)(?:$|_)|AWS_SECRET|AWS_SESSION|ANTHROPIC|OPENAI|GEMINI|GH_TOKEN|GITHUB_TOKEN/i.test(
+    name,
+  );
+}
 
 const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   mastra: 'Built-in runtime with full Kai feature support (memory, observer, compaction, multi-provider models).',
@@ -63,6 +98,13 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
 
   const selectedRuntime = agentConfig.runtime;
   const sortedRuntimes = sortRuntimes(runtimes);
+  const confinement = agentConfig.confinement ?? {};
+  const confinementEnabled = confinement.enabled ?? false;
+  const workspaceOnly = confinement.workspaceOnly ?? true;
+  const scrubCredentials = confinement.scrubCredentials ?? true;
+  const envAllowlist = confinement.envAllowlist ?? [];
+  const relaxed = confinementEnabled && (!workspaceOnly || !scrubCredentials);
+  const riskyEnvNames = envAllowlist.filter(looksLikeSecretEnvName);
 
   return (
     <div className="space-y-6">
@@ -151,6 +193,72 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
           When auto-continue is enabled, the agent will automatically resume after hitting the turn limit instead of
           prompting you.
         </p>
+      </fieldset>
+
+      {/* Confinement (#66/#77): blast-radius containment for autonomous runtimes */}
+      <fieldset className="rounded-lg border p-3 space-y-3">
+        <legend className="text-xs font-semibold px-1">Confinement</legend>
+        <p className="text-[10px] text-muted-foreground/80">
+          Contain the blast radius of runtimes that execute untrusted tool calls (Claude Code, Codex, pi). When on,
+          agents run with a scrubbed environment and are refused a working directory in your home, root, or any
+          credential-bearing folder. Off by default — no effect until you enable it.
+        </p>
+        <Toggle
+          id="agent.confinement.enabled"
+          label="Enable confinement enforcement"
+          checked={confinementEnabled}
+          onChange={(v) => void updateConfig('agent.confinement.enabled', v)}
+        />
+
+        {confinementEnabled && (
+          <div className="space-y-3 border-l-2 border-border/50 pl-3">
+            <Toggle
+              id="agent.confinement.workspaceOnly"
+              label="Restrict working directory to the workspace"
+              checked={workspaceOnly}
+              onChange={(v) => void updateConfig('agent.confinement.workspaceOnly', v)}
+            />
+            <Toggle
+              id="agent.confinement.scrubCredentials"
+              label="Scrub credentials from the agent environment"
+              checked={scrubCredentials}
+              onChange={(v) => void updateConfig('agent.confinement.scrubCredentials', v)}
+            />
+            {relaxed && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+                ⚠️ Confinement is enabled but a core protection is turned off
+                {!workspaceOnly && !scrubCredentials
+                  ? ' (working-directory restriction and credential scrubbing)'
+                  : !workspaceOnly
+                    ? ' (working-directory restriction)'
+                    : ' (credential scrubbing)'}
+                . Agents that execute untrusted tool calls can then reach{' '}
+                {!workspaceOnly && !scrubCredentials
+                  ? 'your credentials and directories outside the workspace'
+                  : !workspaceOnly
+                    ? 'directories outside the workspace, including your home folder'
+                    : 'credentials from the parent environment'}
+                . Only relax this if you understand the risk.
+              </p>
+            )}
+            <TextField
+              id="agent.confinement.envAllowlist"
+              label="Environment allowlist"
+              value={envAllowlist.join(', ')}
+              onChange={(raw) => void updateConfig('agent.confinement.envAllowlist', parseEnvAllowlist(raw))}
+              placeholder="GIT_SSH_COMMAND, HTTPS_PROXY"
+              mono
+              hint="Extra environment variables to pass through to confined runtimes, on top of the built-in safe set. Comma- or space-separated."
+            />
+            {riskyEnvNames.length > 0 && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+                ⚠️ These allowlisted names look like they carry a secret and will pass their value from your environment
+                into confined agents, undoing the scrub for them:{' '}
+                <span className="font-mono">{riskyEnvNames.join(', ')}</span>. Remove any you did not intend.
+              </p>
+            )}
+          </div>
+        )}
       </fieldset>
     </div>
   );

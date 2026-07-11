@@ -48,3 +48,4 @@ ota-private*.pem
 ota-public*.pem
 *.signing.key
 .claude/worktrees/
+.claude/scheduled_tasks.lock

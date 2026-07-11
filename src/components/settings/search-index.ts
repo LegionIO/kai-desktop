@@ -118,6 +118,21 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     keywords: ['limit', 'resume'],
   },
   {
+    id: 'agent.confinement.enabled',
+    label: 'Enable confinement enforcement',
+    section: 'models',
+    tab: 'runtimes',
+    keywords: ['confinement', 'sandbox', 'blast radius', 'scrub', 'credentials', 'workspace', 'isolation', 'security'],
+  },
+  {
+    id: 'agent.confinement.envAllowlist',
+    label: 'Environment allowlist',
+    section: 'models',
+    tab: 'runtimes',
+    fallbackId: 'agent.confinement.enabled',
+    keywords: ['confinement', 'env', 'environment', 'passthrough', 'allowlist', 'variables'],
+  },
+  {
     id: 'mastra.advanced',
     label: 'Memory & compaction (Mastra)',
     section: 'models',
