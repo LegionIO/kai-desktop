@@ -55,19 +55,26 @@ export class HelperProcess {
     if (this.isRunning()) return;
     this.spawnError = null;
     this.stdoutBuffer = '';
+    let child: ChildProcessWithoutNullStreams;
     try {
-      this.child = spawn(this.command, this.args, {
+      child = spawn(this.command, this.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: this.options.env,
         cwd: this.options.cwd,
       });
+      this.child = child;
     } catch (error) {
       this.spawnError = error instanceof Error ? error.message : String(error);
       this.child = null;
       return;
     }
 
-    this.child.stdout.on('data', (chunk: Buffer) => {
+    // All handlers below capture THIS `child` and only mutate shared state when
+    // `this.child === child`. A late event from an OLD child (after start() was
+    // called again and spawned a new one) must not null/kill the new child or
+    // fail the new child's pending calls.
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (this.child !== child) return; // stale child — ignore
       this.stdoutBuffer += chunk.toString('utf8');
       // Guard against a helper that never emits a newline (bug or a
       // swapped-out/compromised binary): an unbounded line buffer would exhaust
@@ -76,7 +83,7 @@ export class HelperProcess {
         this.stdoutBuffer = '';
         const reason = `helper produced an oversized line (> ${MAX_STDOUT_BUFFER_BYTES} bytes)`;
         try {
-          this.child?.kill('SIGKILL');
+          child.kill('SIGKILL');
         } catch {
           /* best-effort */
         }
@@ -94,17 +101,28 @@ export class HelperProcess {
       }
     });
 
-    this.child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim();
       if (text) console.warn(`[helper:${this.command}] ${text}`);
     });
 
-    this.child.on('error', (error) => {
+    // A stdin write can emit an async error (e.g. EPIPE after the child dies);
+    // without a listener that would throw as an unhandled 'error' event. Fail
+    // this child's pending calls (only if it's still the active child).
+    child.stdin.on('error', (error: Error) => {
+      if (this.child !== child) return;
       this.spawnError = error.message;
       this.failAllPending(new HelperUnavailable(error.message));
     });
 
-    this.child.on('exit', (code, signal) => {
+    child.on('error', (error) => {
+      if (this.child !== child) return;
+      this.spawnError = error.message;
+      this.failAllPending(new HelperUnavailable(error.message));
+    });
+
+    child.on('exit', (code, signal) => {
+      if (this.child !== child) return; // an old child exiting — leave the new one alone
       const reason = `helper exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`;
       this.failAllPending(new HelperUnavailable(reason));
       this.child = null;
