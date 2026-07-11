@@ -45,8 +45,10 @@ export const baseConfig = defineConfig({
   test: {
     // Test files live alongside source code or in __tests__ directories.
     // Component tests under `src/**` are owned by `vitest.component.config.ts`,
-    // not this base config.
-    include: ['electron/**/__tests__/**/*.test.ts', 'electron/**/*.test.ts'],
+    // not this base config. `scripts/__tests__/**` build-tooling tests are
+    // included here too so the canonical `pnpm test` (CI + pre-push) runs them —
+    // vitest.unit.config.ts's broader include otherwise left them CI-invisible.
+    include: ['electron/**/__tests__/**/*.test.ts', 'electron/**/*.test.ts', 'scripts/__tests__/**/*.test.ts'],
     // Nightly-only suites are opted out of the default run; trigger them
     // explicitly via the dedicated config (or a workflow on a schedule).
     //

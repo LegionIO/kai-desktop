@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { branding } from '../branding.config.js';
 import { resolveBranding } from './resolve-branding.js';
+import { stripTopLevelBlock, toYamlSingleQuotedPath } from './builder-config-strip.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -20,10 +21,6 @@ const outputPath = resolve(root, 'electron-builder.yml');
 const require = createRequire(import.meta.url);
 
 let content = readFileSync(templatePath, 'utf-8');
-
-function toYamlSingleQuotedPath(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
 
 function getEsbuildBinaryPackageName(): string | null {
   if (process.platform === 'darwin' && process.arch === 'arm64') return '@esbuild/darwin-arm64';
@@ -74,11 +71,6 @@ content = content.replace('{{esbuildExtraResources}}', buildEsbuildExtraResource
 // hardware) and must not ship by default. Strip both top-level blocks unless
 // KAI_ENABLE_WIN_BUILD is explicitly set, so CI publishes no Windows artifact.
 if (!process.env.KAI_ENABLE_WIN_BUILD) {
-  // Remove a top-level YAML block (`key:` at column 0 through the line before
-  // the next column-0 key). A block line is either indented content or a blank
-  // line; both are consumed so an interior blank line doesn't truncate the block.
-  const stripTopLevelBlock = (yaml: string, key: string): string =>
-    yaml.replace(new RegExp(`(^|\\n)${key}:[^\\n]*\\n(?:[ \\t]+[^\\n]*\\n|[ \\t]*\\n)*`, 'g'), '$1');
   content = stripTopLevelBlock(content, 'win');
   content = stripTopLevelBlock(content, 'nsis');
   console.info(
