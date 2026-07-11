@@ -15,6 +15,9 @@
  */
 
 import { getResolvedProcessEnv } from '../../utils/shell-env.js';
+import { existsSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, parse as parsePath, resolve as resolvePath, sep } from 'node:path';
 
 /**
  * Non-secret environment variables the child legitimately needs to run:
@@ -129,4 +132,129 @@ export function buildAgentChildEnv(options: BuildAgentChildEnvOptions = {}): Nod
   }
 
   return out;
+}
+
+/* ── Confined working directory (issue #68) ────────────────────────────── */
+
+/** Top-level entries whose presence marks a dir as credential-bearing — an
+ *  autonomous agent must not be rooted where it can read these. */
+const CREDENTIAL_MARKERS: readonly string[] = ['.aws', '.ssh', '.npmrc', '.git-credentials', '.kube', '.docker'];
+
+export type ConfinedCwdResult = {
+  /** Canonical (realpath'd) working directory to use, or null when refused. */
+  cwd: string | null;
+  /** True when the requested path was clamped/validated under confinement. */
+  confined: boolean;
+  /** True when the requested path resolved outside the workspace root. */
+  escaped: boolean;
+  /** True when the cwd is too dangerous to spawn in (home/root/cred-bearing). */
+  refused: boolean;
+  /** Human-readable reason when refused. */
+  reason?: string;
+};
+
+/** True when `p` is a filesystem root ('/' or a Windows drive root like 'C:\'). */
+function isFilesystemRoot(p: string): boolean {
+  const parsed = parsePath(p);
+  return parsed.root === p || parsed.dir === p;
+}
+
+/**
+ * Resolve + validate a requested agent working directory (issue #68).
+ *
+ * Canonicalizes via realpath, then refuses to spawn in high-blast-radius
+ * locations: the user's home dir, a filesystem/drive root, or any directory
+ * whose top level holds live credential files (.aws/.ssh/.npmrc/…). A normal
+ * repo/workspace dir proceeds. Pure aside from the realpath/existence probes;
+ * never mutates anything.
+ *
+ * `confinement` is optional so callers can gate the clamp behavior; when a
+ * `workspaceRoot` is provided and the requested path escapes it, `escaped` is
+ * reported (the caller decides whether to clamp or refuse).
+ */
+export function resolveConfinedCwd(
+  requested: string | null | undefined,
+  opts: { workspaceRoot?: string | null; homeDir?: string } = {},
+): ConfinedCwdResult {
+  const home = opts.homeDir ?? homedir();
+  const raw = requested?.trim();
+
+  if (!raw) {
+    return { cwd: null, confined: false, escaped: false, refused: true, reason: 'No working directory specified.' };
+  }
+
+  // Expand ~ then make absolute.
+  let abs: string;
+  if (raw === '~') abs = home;
+  else if (raw.startsWith('~/')) abs = resolvePath(home, raw.slice(2));
+  else if (isAbsolute(raw)) abs = raw;
+  else abs = resolvePath(home, raw);
+
+  // Canonicalize through symlinks so a symlinked workspace can't alias a
+  // refused location (and vice-versa). Fall back to the resolved path when it
+  // doesn't exist yet.
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch {
+    real = abs;
+  }
+
+  const canonicalHome = (() => {
+    try {
+      return realpathSync(home);
+    } catch {
+      return home;
+    }
+  })();
+
+  if (real === canonicalHome) {
+    return {
+      cwd: null,
+      confined: false,
+      escaped: false,
+      refused: true,
+      reason:
+        'Refusing to run an agent rooted at your home directory (too broad a blast radius). Point it at a project/workspace directory.',
+    };
+  }
+
+  if (isFilesystemRoot(real)) {
+    return {
+      cwd: null,
+      confined: false,
+      escaped: false,
+      refused: true,
+      reason: `Refusing to run an agent at the filesystem root (${real}).`,
+    };
+  }
+
+  // Refuse a dir that directly holds credential files.
+  for (const marker of CREDENTIAL_MARKERS) {
+    if (existsSync(resolvePath(real, marker))) {
+      return {
+        cwd: null,
+        confined: false,
+        escaped: false,
+        refused: true,
+        reason: `Refusing to run an agent in a directory that holds credential files (found ${marker} in ${real}).`,
+      };
+    }
+  }
+
+  // Optional workspace clamp: report escape when the requested path resolved
+  // outside a provided workspace root.
+  const workspaceRoot = opts.workspaceRoot?.trim();
+  if (workspaceRoot) {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(workspaceRoot);
+    } catch {
+      canonicalRoot = resolvePath(workspaceRoot);
+    }
+    const withinRoot = real === canonicalRoot || real.startsWith(canonicalRoot + sep);
+    return { cwd: real, confined: true, escaped: !withinRoot, refused: false };
+  }
+
+  return { cwd: real, confined: false, escaped: false, refused: false };
 }

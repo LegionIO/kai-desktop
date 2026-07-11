@@ -127,3 +127,71 @@ describe('buildAgentChildEnv', () => {
     expect(env.GH_TOKEN).toBeUndefined();
   });
 });
+
+import { resolveConfinedCwd } from '../confinement.js';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join } from 'node:path';
+
+describe('resolveConfinedCwd', () => {
+  it('refuses an unset/empty cwd (no default to $HOME)', () => {
+    expect(resolveConfinedCwd(undefined).refused).toBe(true);
+    expect(resolveConfinedCwd('').refused).toBe(true);
+    expect(resolveConfinedCwd('   ').refused).toBe(true);
+  });
+
+  it('refuses the home directory', () => {
+    const r = resolveConfinedCwd(homedir());
+    expect(r.refused).toBe(true);
+    expect(r.cwd).toBeNull();
+    expect(r.reason).toMatch(/home directory/i);
+    expect(resolveConfinedCwd('~').refused).toBe(true);
+  });
+
+  it('refuses a filesystem root', () => {
+    const r = resolveConfinedCwd('/');
+    expect(r.refused).toBe(true);
+    expect(r.reason).toMatch(/filesystem root/i);
+  });
+
+  it('refuses a directory that holds credential files (.aws / .ssh / …)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kai-cwd-cred-'));
+    try {
+      mkdirSync(join(dir, '.aws'));
+      const r = resolveConfinedCwd(dir);
+      expect(r.refused).toBe(true);
+      expect(r.reason).toMatch(/\.aws/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('proceeds for a normal repo/workspace dir (canonicalized)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kai-cwd-ok-'));
+    try {
+      writeFileSync(join(dir, 'README.md'), '# ok');
+      const r = resolveConfinedCwd(dir);
+      expect(r.refused).toBe(false);
+      expect(r.cwd).toBeTruthy();
+      expect(r.cwd).toContain(dir.split('/').pop() as string);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports escaped=true when requested resolves outside a workspaceRoot', () => {
+    const root = mkdtempSync(join(tmpdir(), 'kai-ws-'));
+    const outside = mkdtempSync(join(tmpdir(), 'kai-outside-'));
+    try {
+      const inside = join(root, 'sub');
+      mkdirSync(inside);
+      expect(resolveConfinedCwd(inside, { workspaceRoot: root }).escaped).toBe(false);
+      const r = resolveConfinedCwd(outside, { workspaceRoot: root });
+      expect(r.escaped).toBe(true);
+      expect(r.confined).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
