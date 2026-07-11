@@ -102,8 +102,15 @@ function renderInline(line: string): string {
     text = bullet[2];
   }
 
-  // Links [label](url) → OSC-8
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => `${UNDERLINE}${osc8Link(label, url)}${RESET}`);
+  // Links [label](url) → OSC-8. Label/url quantifiers are BOUNDED to defang a
+  // quadratic-backtracking ReDoS: on model-controlled input, repeated unmatched
+  // `[` made the unbounded `[^\]]+` rescan the suffix at every position (~2.7s
+  // for 80k chars). No real markdown link has a 500-char label / 2000-char URL,
+  // so anything longer simply renders unlinked.
+  text = text.replace(
+    /\[([^\]]{1,500})\]\(([^)]{1,2000})\)/g,
+    (_m, label, url) => `${UNDERLINE}${osc8Link(label, url)}${RESET}`,
+  );
   // Bare URLs → OSC-8
   text = text.replace(/(^|\s)(https?:\/\/[^\s]+)/g, (_m, sp, url) => `${sp}${UNDERLINE}${osc8Link(url, url)}${RESET}`);
   // Inline code
