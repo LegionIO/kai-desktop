@@ -104,7 +104,7 @@ export function resolveMediaGenEndpoint(
     return {
       url: `https://api.openai.com/v1${path}`,
       headers: withBrandUserAgent({
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       }),
     };
@@ -135,7 +135,7 @@ export function resolveMediaGenEndpoint(
     const url = `${endpoint}/openai/deployments/${deploymentName}${path}?api-version=${apiVersion}`;
     const headers = withBrandUserAgent({
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${azureCfg?.apiKey ?? ''}`,
+      Authorization: `Bearer ${azureCfg?.apiKey ?? ''}`,
     });
 
     return { url, headers };
@@ -169,6 +169,10 @@ export function resolveMediaGenEndpoint(
  * @param appHome - The app home directory (e.g. ~/.<slug>)
  * @returns The absolute file path of the saved file
  */
+/** Cap on generated-media file size (defends against a compromised provider
+ *  returning a multi-GB body → memory/disk exhaustion). */
+export const MAX_MEDIA_BYTES = 512 * 1024 * 1024; // 512 MiB
+
 export function saveMediaToFile(
   data: Buffer,
   type: 'images' | 'videos' | 'audio',
@@ -178,9 +182,14 @@ export function saveMediaToFile(
   const dir = join(appHome, 'media', type);
   mkdirSync(dir, { recursive: true });
 
+  // Sanitize the extension to a short alphanumeric token — it's config-derived
+  // (config.outputFormat), but an ext containing `/` or `..` would let the
+  // generated filename escape the media directory via join().
+  const safeExt = /^[a-z0-9]{1,8}$/i.test(ext) ? ext.toLowerCase() : 'bin';
+
   const timestamp = Date.now();
   const uuid = randomUUID().slice(0, 8);
-  const filename = `${timestamp}-${uuid}.${ext}`;
+  const filename = `${timestamp}-${uuid}.${safeExt}`;
   const filePath = join(dir, filename);
 
   writeFileSync(filePath, data);
@@ -205,15 +214,31 @@ export function filePathToUrl(filePath: string): string {
 }
 
 /**
- * Read a ReadableStream into a Buffer.
+ * Read a ReadableStream into a Buffer, bounded by MAX_MEDIA_BYTES so a
+ * compromised/misbehaving provider can't exhaust memory with an unbounded body.
  */
-export async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
+export async function streamToBuffer(stream: ReadableStream, maxBytes = MAX_MEDIA_BYTES): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
+  let total = 0;
   const reader = stream.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          throw new Error(`Media stream exceeded the ${Math.round(maxBytes / (1024 * 1024))} MiB size limit.`);
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* best-effort */
+    }
   }
   return Buffer.concat(chunks);
 }

@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
-import { resolveMediaGenEndpoint, saveMediaToFile, filePathToUrl } from './media-gen-utils.js';
+import { resolveMediaGenEndpoint, saveMediaToFile, filePathToUrl, MAX_MEDIA_BYTES } from './media-gen-utils.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
+import { safeFetch, readCappedArrayBuffer } from '../utils/ssrf-guard.js';
 import { recordUsageEvent } from '../ipc/usage.js';
 
 export function createImageGenTool(getConfig: () => AppConfig, appHome: string): ToolDefinition {
@@ -14,7 +15,10 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
       'The image is saved to disk automatically.',
     inputSchema: z.object({
       prompt: z.string().describe('A detailed description of the image to generate.'),
-      size: z.string().optional().describe('Image dimensions, e.g. "1024x1024", "1536x1024", "1024x1536". Defaults to config or "1024x1024".'),
+      size: z
+        .string()
+        .optional()
+        .describe('Image dimensions, e.g. "1024x1024", "1536x1024", "1024x1536". Defaults to config or "1024x1024".'),
       quality: z.string().optional().describe('Image quality: "low", "medium", "high". Defaults to config or "high".'),
       n: z.number().optional().default(1).describe('Number of images to generate. Defaults to 1.'),
     }),
@@ -60,7 +64,7 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
           };
         }
 
-        const result = await response.json() as {
+        const result = (await response.json()) as {
           data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
         };
 
@@ -74,6 +78,11 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
         for (const item of result.data) {
           if (item.b64_json) {
             const buffer = Buffer.from(item.b64_json, 'base64');
+            // Cap the decoded size — a compromised provider could return a huge
+            // base64 blob to exhaust memory/disk.
+            if (buffer.byteLength > MAX_MEDIA_BYTES) {
+              return { error: 'Generated image exceeds the size limit.' };
+            }
             const filePath = saveMediaToFile(buffer, 'images', ext, appHome);
             images.push({
               filePath,
@@ -81,14 +90,20 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
               revisedPrompt: item.revised_prompt,
             });
           } else if (item.url) {
-            // If the API returns a URL instead of base64, download and save it
+            // If the API returns a URL instead of base64, download and save it.
+            // Route through the SSRF guard + a size cap: `item.url` comes from the
+            // (user-configured, but potentially compromised) provider, so a
+            // returned metadata-IP/localhost URL or a giant body must not reach a
+            // raw fetch. On failure we DO NOT fall back to returning the raw
+            // provider URL — the renderer would then load an arbitrary remote URL
+            // (re-introducing SSRF / tracking / remote-content risk).
             try {
-              const imgResponse = await fetch(item.url, {
+              const imgResponse = await safeFetch(item.url, {
                 headers: withBrandUserAgent(),
-                signal: AbortSignal.timeout(30000),
+                timeoutMs: 30000,
               });
               if (imgResponse.ok) {
-                const buffer = Buffer.from(await imgResponse.arrayBuffer());
+                const buffer = await readCappedArrayBuffer(imgResponse, MAX_MEDIA_BYTES);
                 const filePath = saveMediaToFile(buffer, 'images', ext, appHome);
                 images.push({
                   filePath,
@@ -97,12 +112,8 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
                 });
               }
             } catch {
-              // Fall back to using the remote URL directly
-              images.push({
-                filePath: '',
-                url: item.url,
-                revisedPrompt: item.revised_prompt,
-              });
+              // Download failed (network / blocked-by-SSRF-guard / too large):
+              // skip this item rather than surfacing the raw provider URL.
             }
           }
         }
