@@ -6,6 +6,12 @@ import { isAbsolute, resolve, extname } from 'path';
  *  stays under the local-bridge 8 MiB frame limit — otherwise the socket is
  *  destroyed before agent:submit sees it. */
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MiB raw (~5.3 MiB as base64)
+/** Max number of image mentions attached from one prompt. */
+export const MAX_IMAGE_MENTIONS = 6;
+/** Aggregate raw-byte budget across all image mentions. Kept so the combined
+ *  base64 (~4/3 larger) + prompt + JSON envelope stays under the 8 MiB bridge
+ *  frame — otherwise the socket is destroyed before agent:submit sees it. */
+export const MAX_IMAGE_TOTAL_BYTES = 5 * 1024 * 1024; // 5 MiB raw (~6.7 MiB base64)
 
 const IMAGE_EXT_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -51,6 +57,7 @@ export function extractImageMentions(prompt: string, cwd: string): ImageMentionR
   const notes: string[] = [];
   const seen = new Set<string>();
   const strip: Array<{ start: number; end: number }> = [];
+  let totalBytes = 0;
 
   let m: RegExpExecArray | null;
   IMAGE_MENTION_RE.lastIndex = 0;
@@ -79,6 +86,16 @@ export function extractImageMentions(prompt: string, cwd: string): ImageMentionR
       notes.push(`@${raw}: too large (${Math.round(st.size / 1024 / 1024)} MiB, skipped)`);
       continue;
     }
+    if (attachments.length >= MAX_IMAGE_MENTIONS) {
+      notes.push(`(reached ${MAX_IMAGE_MENTIONS}-image limit; ignoring further image @mentions)`);
+      break;
+    }
+    if (totalBytes + st.size > MAX_IMAGE_TOTAL_BYTES) {
+      notes.push(
+        `@${raw}: skipped (total image budget ${Math.round(MAX_IMAGE_TOTAL_BYTES / 1024 / 1024)} MiB exceeded)`,
+      );
+      continue;
+    }
     let buf: Buffer;
     try {
       buf = readFileSync(abs);
@@ -86,6 +103,7 @@ export function extractImageMentions(prompt: string, cwd: string): ImageMentionR
       notes.push(`@${raw}: unreadable (skipped)`);
       continue;
     }
+    totalBytes += st.size;
     const mime = IMAGE_EXT_MIME[extname(abs).toLowerCase()] ?? 'application/octet-stream';
     attachments.push({ image: `data:${mime};base64,${buf.toString('base64')}`, mimeType: mime });
     notes.push(`@${raw}: attached image (${Math.round(st.size / 1024) || 1} KiB)`);

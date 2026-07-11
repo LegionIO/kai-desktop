@@ -39,7 +39,7 @@ describe('expandFileMentions', () => {
   it('skips a directory target', () => {
     mkdirSync(join(dir, 'sub'));
     const r = expandFileMentions('@sub', dir);
-    expect(r.notes.some((n) => n.includes('is a directory'))).toBe(true);
+    expect(r.notes.some((n) => n.includes('not a regular file'))).toBe(true);
     expect(r.text).toBe('@sub');
   });
 

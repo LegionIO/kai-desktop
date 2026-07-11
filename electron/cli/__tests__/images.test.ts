@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { extractImageMentions, isImagePath, MAX_IMAGE_BYTES } from '../images.js';
+import { extractImageMentions, isImagePath, MAX_IMAGE_BYTES, MAX_IMAGE_MENTIONS } from '../images.js';
 
 describe('isImagePath', () => {
   it('recognizes image extensions (case-insensitive)', () => {
@@ -69,5 +69,16 @@ describe('extractImageMentions', () => {
     writeFileSync(join(dir, 'a.png'), Buffer.from([1, 2, 3]));
     const r = extractImageMentions('@a.png and @a.png', dir);
     expect(r.attachments).toHaveLength(1);
+  });
+
+  it('caps the number of image attachments', () => {
+    const names = [];
+    for (let i = 0; i < MAX_IMAGE_MENTIONS + 3; i++) {
+      writeFileSync(join(dir, `i${i}.png`), Buffer.from([i]));
+      names.push(`@i${i}.png`);
+    }
+    const r = extractImageMentions(names.join(' '), dir);
+    expect(r.attachments.length).toBe(MAX_IMAGE_MENTIONS);
+    expect(r.notes.some((n) => n.includes('image limit'))).toBe(true);
   });
 });

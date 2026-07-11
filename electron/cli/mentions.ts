@@ -57,8 +57,11 @@ export function expandFileMentions(prompt: string, cwd: string): MentionResult {
       notes.push(`@${raw}: not found`);
       continue;
     }
-    if (st.isDirectory()) {
-      notes.push(`@${raw}: is a directory (skipped)`);
+    if (!st.isFile()) {
+      // Skip directories AND special files (fifos, /dev/zero, sockets…): a
+      // char-device reports st.size 0 (passing the size cap) but readFileSync
+      // would then read forever → OOM. Only regular files are inlined.
+      notes.push(`@${raw}: not a regular file (skipped)`);
       continue;
     }
     if (st.size > MAX_MENTION_BYTES) {
