@@ -34,7 +34,7 @@ const PRICING_TABLE: Record<string, PricingEntry> = {
   'gpt-4.1-mini': { inputPer1M: 0.4, outputPer1M: 1.6 },
   'gpt-4o': { inputPer1M: 2.5, outputPer1M: 10 },
   'gpt-4o-mini': { inputPer1M: 0.15, outputPer1M: 0.6 },
-  'o3': { inputPer1M: 10, outputPer1M: 40 },
+  o3: { inputPer1M: 10, outputPer1M: 40 },
   'o3-mini': { inputPer1M: 1.1, outputPer1M: 4.4 },
   'o4-mini': { inputPer1M: 1.1, outputPer1M: 4.4 },
   // Google
@@ -104,13 +104,19 @@ export function estimateCost(modelName: string, usage: TokenUsageData): number {
   const pricing = lookupPricing(modelName);
   if (!pricing) return 0;
 
-  const inputCost = (usage.inputTokens / 1_000_000) * pricing.inputPer1M;
-  const outputCost = (usage.outputTokens / 1_000_000) * pricing.outputPer1M;
-  const cacheReadCost = pricing.cacheReadPer1M
-    ? (usage.cacheReadTokens / 1_000_000) * pricing.cacheReadPer1M
-    : 0;
+  // Usage values come from stored events that could be malformed (undefined,
+  // NaN, negative, or absurdly large). Normalize each to a finite, non-negative,
+  // bounded count so a corrupt event can't surface a `$NaN`/`$Infinity`/negative
+  // cost. 1e12 tokens is far beyond any real conversation.
+  const MAX_TOKENS = 1e12;
+  const tok = (n: number | undefined): number =>
+    typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TOKENS) : 0;
+
+  const inputCost = (tok(usage.inputTokens) / 1_000_000) * pricing.inputPer1M;
+  const outputCost = (tok(usage.outputTokens) / 1_000_000) * pricing.outputPer1M;
+  const cacheReadCost = pricing.cacheReadPer1M ? (tok(usage.cacheReadTokens) / 1_000_000) * pricing.cacheReadPer1M : 0;
   const cacheWriteCost = pricing.cacheWritePer1M
-    ? (usage.cacheWriteTokens / 1_000_000) * pricing.cacheWritePer1M
+    ? (tok(usage.cacheWriteTokens) / 1_000_000) * pricing.cacheWritePer1M
     : 0;
 
   return inputCost + outputCost + cacheReadCost + cacheWriteCost;
