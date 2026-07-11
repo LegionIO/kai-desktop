@@ -603,7 +603,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
     // A null result means "nothing safe to compact" (prefix empty / would drop a
     // message / summary still over budget) — the auto path treats this the same.
-    if (!result.compactedMessages || !result.summaryText || !result.compactionId) {
+    if (!result || !result.compactedMessages || !result.summaryText || !result.compactionId) {
       return { ok: false, error: 'nothing-to-compact' };
     }
 
