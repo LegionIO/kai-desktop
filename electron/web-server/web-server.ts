@@ -1205,6 +1205,13 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
   wss.on('connection', (ws: WebSocket) => {
     webClients.add(ws);
 
+    // Per-connection in-flight cap: each WS message spawns an independent async
+    // invoke (the EventEmitter doesn't await the prior one), so an authenticated
+    // client could otherwise fire thousands of concurrent expensive invokes.
+    // Cap concurrency and reject past it rather than queueing unbounded.
+    const MAX_IN_FLIGHT = 32;
+    let inFlight = 0;
+
     // Heartbeat: ping every 30s, terminate if no pong within 10s
     let alive = true;
     ws.on('pong', () => {
@@ -1223,27 +1230,40 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     ws.on('message', async (raw: Buffer | string) => {
       let msg: { id?: string; type?: string; channel?: string; args?: unknown[]; data?: unknown };
       try {
-        msg = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf-8'));
+        const parsed: unknown = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf-8'));
+        // A literal `null`/array/primitive parses fine but reading `.type` off a
+        // non-object throws OUTSIDE this catch — guard for a plain object.
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return;
+        msg = parsed as typeof msg;
       } catch {
         return;
       }
 
       if (msg.type === 'invoke' && msg.channel && msg.id) {
+        const id = msg.id;
+        // Reject past the per-connection concurrency cap rather than piling on.
+        if (inFlight >= MAX_IN_FLIGHT) {
+          ws.send(JSON.stringify({ id, type: 'error', message: 'Too many concurrent requests' }));
+          return;
+        }
         // args must be an array — a malformed frame with a non-array `args`
         // would otherwise spread a string into char-args or throw on a
         // non-iterable. Coerce defensively.
         const invokeArgs = Array.isArray(msg.args) ? msg.args : [];
+        inFlight += 1;
         try {
           const result = await invokeHandler(msg.channel, ...invokeArgs);
-          ws.send(JSON.stringify({ id: msg.id, type: 'result', data: result }));
+          ws.send(JSON.stringify({ id, type: 'result', data: result }));
         } catch (err) {
           ws.send(
             JSON.stringify({
-              id: msg.id,
+              id,
               type: 'error',
               message: err instanceof Error ? err.message : String(err),
             }),
           );
+        } finally {
+          inFlight -= 1;
         }
       }
 
