@@ -42,6 +42,9 @@ export function registerRealtimeHandlers(
     // an end-session will bump this again and supersede US.
     const myGeneration = ++startGeneration;
     const isStale = () => myGeneration !== startGeneration;
+    // Hoisted so the catch can tear down a session that threw during start()
+    // (at that point it isn't installed as `activeSession` yet).
+    let session: RealtimeSession | null = null;
     try {
       console.info(`[Realtime IPC] start-session called for conversationId="${conversationId}"`);
 
@@ -80,7 +83,7 @@ export function registerRealtimeHandlers(
       }
 
       const tools = getTools();
-      const session = new RealtimeSession(getConfig, tools);
+      session = new RealtimeSession(getConfig, tools);
       await session.start(conversationId, memoryContext);
 
       // Re-check after the (async) connect: if superseded meanwhile, tear down
@@ -99,16 +102,20 @@ export function registerRealtimeHandlers(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Realtime IPC] Failed to start session:', msg);
-      // Start failed — don't leave a half-initialized session as the active one
-      // (its computer-use tracking + socket would leak and block the next start).
-      if (activeSession) {
+      // Start failed — tear down whatever we built so its computer-use tracking
+      // + socket don't leak and block the next start. On a throw from
+      // session.start(), the failed session is NOT yet installed as
+      // `activeSession` (that assignment is after the await), so close the local
+      // `session` too; fall back to `activeSession` for a pre-construction throw.
+      const leaked = session ?? activeSession;
+      if (leaked) {
         try {
-          activeSession.close();
+          leaked.close();
         } catch {
           /* best-effort */
         }
-        activeSession = null;
       }
+      if (activeSession === leaked) activeSession = null;
       return { error: msg };
     }
   });
