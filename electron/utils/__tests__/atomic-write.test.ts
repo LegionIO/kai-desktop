@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../atomic-write.js';
@@ -48,5 +48,25 @@ describe('atomicWriteFileSync', () => {
     const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp-'));
     expect(leftovers).toEqual([]);
     expect(existsSync(dest)).toBe(false);
+  });
+
+  it('applies the restricted mode to the final file (POSIX)', () => {
+    if (process.platform === 'win32') return; // POSIX perms only
+    const dest = join(dir, 'secret.json');
+    atomicWriteFileSync(dest, '{"key":"secret"}', { mode: 0o600 });
+    expect(statSync(dest).mode & 0o777).toBe(0o600);
+    expect(readFileSync(dest, 'utf-8')).toBe('{"key":"secret"}');
+  });
+
+  it('replaces a pre-existing looser file with the restricted mode (POSIX)', () => {
+    if (process.platform === 'win32') return;
+    const dest = join(dir, 'secret.json');
+    writeFileSync(dest, 'old', { mode: 0o644 });
+    expect(statSync(dest).mode & 0o777).toBe(0o644);
+    atomicWriteFileSync(dest, 'new', { mode: 0o600 });
+    // rename replaces the inode, so the new file carries the temp's 0o600 —
+    // never a window where the secret sits at 0o644.
+    expect(statSync(dest).mode & 0o777).toBe(0o600);
+    expect(readFileSync(dest, 'utf-8')).toBe('new');
   });
 });

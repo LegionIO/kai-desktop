@@ -1,10 +1,11 @@
 import type { IpcMain } from 'electron';
-import { readFileSync, writeFileSync, existsSync, watch, mkdirSync, chmodSync } from 'fs';
+import { readFileSync, existsSync, watch, mkdirSync, chmodSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { appConfigSchema, type AppConfig } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { binaryExists } from '../tools/cli-tools.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
 import { getLanAddresses } from '../web-server/network.js';
@@ -688,15 +689,11 @@ function writeAppLlmConfig(config: AppLlmFile): void {
   } catch {
     /* best-effort on platforms without POSIX perms */
   }
-  // Secret-bearing (provider API keys) — restrict to the owner. writeFileSync's
-  // mode only applies on create, so chmod after to also tighten a pre-existing
-  // file that was written with looser perms before this hardening.
-  writeFileSync(p, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort on platforms without POSIX perms */
-  }
+  // Secret-bearing (provider API keys) — restrict to the owner. Atomic write so
+  // a crash can't leave a torn config; mode 0o600 is enforced on the temp file
+  // BEFORE the rename, so the secret never lands with wider perms (and a
+  // pre-existing looser file is replaced by the 0o600 temp).
+  atomicWriteFileSync(p, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 function toAppProvider(providerKey: AppProviderType, provider: AppProviderConfig | undefined): Record<string, unknown> {
@@ -1114,16 +1111,9 @@ export function writeDesktopConfig(appHome: string, config: AppConfig): void {
     /* best-effort on platforms without POSIX perms */
   }
   // Secret-bearing (MCP env vars, web password, media/realtime keys) — owner-only.
-  // chmod after write since mode only applies when the file is first created.
-  writeFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  try {
-    chmodSync(configPath, 0o600);
-  } catch {
-    /* best-effort on platforms without POSIX perms */
-  }
+  // Atomic write with mode 0o600 enforced on the temp before rename, so the
+  // secret never lands with wider perms and a crash can't leave a torn file.
+  atomicWriteFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), { mode: 0o600 });
 }
 
 function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
