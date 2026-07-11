@@ -6,9 +6,10 @@
  */
 
 import type { IpcMain } from 'electron';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import type { AgentFile, CreateAgentPayload } from '../../shared/agent-types.js';
 import type { TaskFile, TaskReviewResult, TaskRun } from '../../shared/task-types.js';
 import type { TaskTerminalManager } from '../terminal/task-terminal-manager.js';
@@ -253,7 +254,7 @@ function readAgent(appHome: string, id: string): AgentFile | null {
 }
 
 function writeAgent(appHome: string, agent: AgentFile): void {
-  writeFileSync(join(getAgentsDir(appHome), `${agent.id}.json`), JSON.stringify(agent, null, 2), 'utf-8');
+  atomicWriteFileSync(join(getAgentsDir(appHome), `${agent.id}.json`), JSON.stringify(agent, null, 2));
 }
 
 function readTask(appHome: string, id: string): TaskFile | null {
@@ -272,7 +273,7 @@ function readTask(appHome: string, id: string): TaskFile | null {
 }
 
 function writeTask(appHome: string, task: TaskFile): void {
-  writeFileSync(join(getTasksDir(appHome), `${task.id}.json`), JSON.stringify(task, null, 2), 'utf-8');
+  atomicWriteFileSync(join(getTasksDir(appHome), `${task.id}.json`), JSON.stringify(task, null, 2));
 }
 
 function broadcastAgentChange(appHome: string): void {

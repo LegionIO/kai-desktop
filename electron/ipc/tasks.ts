@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import type {
@@ -228,7 +229,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       const id = randomUUID();
       const now = new Date().toISOString();
       const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
-      writeFileSync(join(getTasksDir(appHome), `${id}.json`), JSON.stringify(task, null, 2), 'utf-8');
+      atomicWriteFileSync(join(getTasksDir(appHome), `${id}.json`), JSON.stringify(task, null, 2));
       broadcastTaskChange(appHome);
       return task;
     } catch (err) {
@@ -282,7 +283,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           id, // prevent ID mutation
           ...(isMeaningful && { updatedAt: new Date().toISOString() }),
         };
-        writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+        atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
         broadcastTaskChange(appHome);
         return updated;
       } catch {
@@ -299,7 +300,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
       const { archivedAt: _removed, ...rest } = existing as TaskFile & { archivedAt?: string };
       const updated = { ...rest, updatedAt: new Date().toISOString() };
-      writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+      atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
       broadcastTaskChange(appHome);
       return updated;
     } catch (err) {
@@ -374,7 +375,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         // Move back to in_progress
         task.status = 'in_progress';
         task.updatedAt = new Date().toISOString();
-        writeFileSync(filePath, JSON.stringify(task, null, 2), 'utf-8');
+        atomicWriteFileSync(filePath, JSON.stringify(task, null, 2));
         broadcastTaskChange(appHome);
 
         // Auto-restart the assigned agent (regardless of autopilot setting)
@@ -408,7 +409,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
     }
 
     try {
-      writeFileSync(join(getTasksDir(appHome), 'order.json'), JSON.stringify(order, null, 2), 'utf-8');
+      atomicWriteFileSync(join(getTasksDir(appHome), 'order.json'), JSON.stringify(order, null, 2));
       return { ok: true };
     } catch (err) {
       console.error('[tasks] Failed to save order:', err);
@@ -529,7 +530,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
                 conversationHistory: newHistory,
                 updatedAt: new Date().toISOString(),
               };
-              writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+              atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
               broadcastTaskChange(appHome);
             }
           }
