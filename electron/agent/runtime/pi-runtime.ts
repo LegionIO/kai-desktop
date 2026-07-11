@@ -224,7 +224,11 @@ export class PiRuntime implements AgentRuntime {
     // synchronous try/catch can't catch — swallow it to avoid an unhandled error.
     child.stdin.on('error', () => {});
     child.stderr.on('data', (d: Buffer) => {
-      if (stderrBuf.length < STDERR_CAP) stderrBuf += d.toString('utf8');
+      if (stderrBuf.length < STDERR_CAP) {
+        // Hard-cap on append: a single large stderr chunk must not push the
+        // buffer well past STDERR_CAP.
+        stderrBuf = (stderrBuf + d.toString('utf8')).slice(0, STDERR_CAP);
+      }
     });
     const exited = new Promise<void>((resolve) => {
       child.on('close', (code) => {
