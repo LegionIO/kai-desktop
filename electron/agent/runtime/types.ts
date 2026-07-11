@@ -56,6 +56,15 @@ export type RuntimeCapabilities = {
 
   /** Can accept custom Kai tools (skills, plugins, CLI tools) at stream time. */
   customTools: boolean;
+
+  /**
+   * Runtime spawns a subprocess that executes untrusted, model-directed tools
+   * (shell, file edits) unsupervised. Drives blast-radius confinement at the
+   * IPC chokepoint (env scrub + cwd confinement). True for the autonomous SDK
+   * runtimes (pi / claude-agent-sdk / codex-sdk); false for mastra, whose tool
+   * execution stays in-process behind Kai's own guards.
+   */
+  executesUntrustedTools: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +87,15 @@ export type StreamOptions = {
   reasoningEffort?: ReasoningEffort;
   abortSignal?: AbortSignal;
   cwd?: string;
+
+  /**
+   * Confinement inputs pre-built by the IPC layer (issue #66) for runtimes with
+   * `executesUntrustedTools`. `childEnv` is the fail-closed allowlist env
+   * (buildAgentChildEnv) to hand the spawned CLI; `confinedCwd` is the
+   * validated/clamped working directory (resolveConfinedCwd). Absent for mastra.
+   */
+  childEnv?: NodeJS.ProcessEnv;
+  confinedCwd?: string;
 
   // --- Callback hooks (used by IPC middleware) ---
 

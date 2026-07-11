@@ -29,6 +29,7 @@ export type StubRuntimeCapabilities = {
   subAgents: boolean;
   sessions: boolean;
   customTools: boolean;
+  executesUntrustedTools: boolean;
 };
 
 const DEFAULT_CAPABILITIES: StubRuntimeCapabilities = {
@@ -42,6 +43,7 @@ const DEFAULT_CAPABILITIES: StubRuntimeCapabilities = {
   subAgents: false,
   sessions: false,
   customTools: false,
+  executesUntrustedTools: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ export function stubClaudeAgent(overrides: Partial<StubClaudeAgentRuntime> = {})
     subAgents: true,
     sessions: true,
     customTools: true,
+    executesUntrustedTools: true,
   });
   return { ...base, ...overrides } as StubClaudeAgentRuntime;
 }
@@ -125,6 +128,7 @@ export function stubCodex(overrides: Partial<StubCodexRuntime> = {}): StubCodexR
     mcpSupport: true,
     sessions: true,
     customTools: true,
+    executesUntrustedTools: true,
   });
   return { ...base, ...overrides } as StubCodexRuntime;
 }

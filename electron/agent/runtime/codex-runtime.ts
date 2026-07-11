@@ -152,6 +152,7 @@ const CODEX_CAPABILITIES: RuntimeCapabilities = {
   subAgents: false, // No sub-agent delegation
   sessions: true, // Thread resume via thread ID
   customTools: true, // Custom Kai tools via local MCP bridge
+  executesUntrustedTools: true, // spawns the Codex CLI which runs shell/edits
 };
 
 // ---------------------------------------------------------------------------

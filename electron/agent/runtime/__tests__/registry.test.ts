@@ -15,13 +15,7 @@ import type { AppConfig } from '../../../config/schema.js';
 // For simplicity, we'll import once and use registerRuntime to set up state.
 // ---------------------------------------------------------------------------
 
-import {
-  registerRuntime,
-  getRuntime,
-  resolveRuntime,
-  getAvailableRuntimes,
-  getActiveRuntimeId,
-} from '../index.js';
+import { registerRuntime, getRuntime, resolveRuntime, getAvailableRuntimes, getActiveRuntimeId } from '../index.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -38,6 +32,7 @@ const STUB_CAPABILITIES: RuntimeCapabilities = {
   subAgents: false,
   sessions: false,
   customTools: false,
+  executesUntrustedTools: false,
 };
 
 function createStubRuntime(

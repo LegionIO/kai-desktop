@@ -132,9 +132,23 @@ export async function resolveRuntimeForStream(
  * Used by the settings UI.
  */
 export async function getAvailableRuntimes(): Promise<
-  Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }>
+  Array<{
+    id: string;
+    name: string;
+    available: boolean;
+    reason?: string;
+    description?: string;
+    executesUntrustedTools?: boolean;
+  }>
 > {
-  const results: Array<{ id: string; name: string; available: boolean; reason?: string; description?: string }> = [];
+  const results: Array<{
+    id: string;
+    name: string;
+    available: boolean;
+    reason?: string;
+    description?: string;
+    executesUntrustedTools?: boolean;
+  }> = [];
 
   for (const [, runtime] of runtimes) {
     const available = await runtime.isAvailable();
@@ -142,6 +156,7 @@ export async function getAvailableRuntimes(): Promise<
       id: runtime.id,
       name: runtime.name,
       available,
+      executesUntrustedTools: runtime.capabilities.executesUntrustedTools,
       reason: available
         ? undefined
         : runtime.id === 'claude-agent-sdk'

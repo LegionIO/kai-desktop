@@ -130,6 +130,7 @@ const CLAUDE_CAPABILITIES: RuntimeCapabilities = {
   subAgents: true, // SDK has native Agent tool
   sessions: true, // SDK supports session resume
   customTools: true, // Via MCP bridge
+  executesUntrustedTools: true, // SDK subprocess runs Bash/Write unsupervised
 };
 
 // ---------------------------------------------------------------------------
