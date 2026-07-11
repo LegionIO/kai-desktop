@@ -747,15 +747,18 @@ export function App({
           break;
         }
         case 'export': {
-          // Syntax: /export [json|markdown] [path]  — either arg optional, any order.
-          const parts = arg.trim().split(/\s+/).filter(Boolean);
+          // Syntax: /export [json|md] [path…]. A leading format token is
+          // consumed; EVERYTHING after it is the path (so paths with spaces
+          // work). A format token anywhere alone (no path) is also accepted.
+          const raw = arg.trim();
           let fmt: 'json' | 'markdown' = 'markdown';
-          let targetPath: string | undefined;
-          for (const p of parts) {
-            const low = p.toLowerCase();
-            if (low === 'json' || low === 'md' || low === 'markdown') fmt = low === 'json' ? 'json' : 'markdown';
-            else targetPath = p;
+          let targetPath = raw;
+          const fmtMatch = raw.match(/^(json|md|markdown)\b\s*/i);
+          if (fmtMatch) {
+            fmt = fmtMatch[1].toLowerCase() === 'json' ? 'json' : 'markdown';
+            targetPath = raw.slice(fmtMatch[0].length);
           }
+          targetPath = targetPath.trim();
           if (!targetPath) targetPath = `${convIdRef.current.slice(0, 8)}.${fmt === 'json' ? 'json' : 'md'}`;
           const res = await client.invoke<{ ok?: boolean; filePath?: string; error?: string }>(
             'conversations:export',
@@ -764,63 +767,73 @@ export function App({
             { targetPath },
           );
           if (res?.ok && res.filePath) {
-            pushTurn({ kind: 'note', text: `exported (${fmt}) → ${res.filePath}` });
+            pushTurn({ kind: 'note', text: `exported (${fmt}) → ${stripControl(res.filePath)}` });
           } else {
-            pushTurn({ kind: 'note', text: `export failed: ${res?.error ?? 'unknown'}` });
+            pushTurn({ kind: 'note', text: `export failed: ${stripControl(res?.error ?? 'unknown')}` });
           }
           break;
         }
         case 'mcp': {
           const config = await client.invoke<{ mcpServers?: Array<{ name: string; enabled?: boolean }> }>('config:get');
-          const servers = config?.mcpServers ?? [];
+          const servers = Array.isArray(config?.mcpServers) ? config.mcpServers : [];
           if (servers.length === 0) {
             pushTurn({ kind: 'note', text: 'no MCP servers configured' });
             break;
           }
-          const lines = servers.map((sv) => `  ${sv.enabled === false ? '○' : '●'} ${sv.name}`);
+          const lines = servers.map(
+            (sv) => `  ${sv.enabled === false ? '○' : '●'} ${stripControl(String(sv.name ?? '?'))}`,
+          );
           pushTurn({ kind: 'note', text: `MCP servers:\n${lines.join('\n')}` });
           break;
         }
         case 'tools': {
           const config = await client.invoke<{ cliTools?: Array<{ name: string; enabled?: boolean }> }>('config:get');
-          const cliTools = config?.cliTools ?? [];
+          const cliTools = Array.isArray(config?.cliTools) ? config.cliTools : [];
           if (cliTools.length === 0) {
             pushTurn({ kind: 'note', text: 'no CLI tools configured' });
             break;
           }
-          const lines = cliTools.map((t) => `  ${t.enabled === false ? '○' : '●'} ${t.name}`);
+          const lines = cliTools.map(
+            (t) => `  ${t.enabled === false ? '○' : '●'} ${stripControl(String(t.name ?? '?'))}`,
+          );
           pushTurn({ kind: 'note', text: `CLI tools:\n${lines.join('\n')}` });
           break;
         }
         case 'skills': {
-          const skills = (await client.invoke<Array<{ name: string; enabled?: boolean }>>('skills:list')) ?? [];
+          const listed = await client.invoke<Array<{ name: string; enabled?: boolean }>>('skills:list');
+          const skills = Array.isArray(listed) ? listed : [];
           if (skills.length === 0) {
             pushTurn({ kind: 'note', text: 'no skills installed' });
             break;
           }
-          const lines = skills.map((sk) => `  ${sk.enabled === false ? '○' : '●'} ${sk.name}`);
+          const lines = skills.map(
+            (sk) => `  ${sk.enabled === false ? '○' : '●'} ${stripControl(String(sk.name ?? '?'))}`,
+          );
           pushTurn({ kind: 'note', text: `skills:\n${lines.join('\n')}` });
           break;
         }
         case 'agents': {
-          const agents = (await client.invoke<Array<{ name: string; status?: string }>>('agents:list')) ?? [];
+          const listed = await client.invoke<Array<{ name: string; status?: string }>>('agents:list');
+          const agents = Array.isArray(listed) ? listed : [];
           if (agents.length === 0) {
             pushTurn({ kind: 'note', text: 'no agents configured' });
             break;
           }
-          const lines = agents.map((a) => `  ${a.name}${a.status ? `  (${a.status})` : ''}`);
+          const lines = agents.map(
+            (a) => `  ${stripControl(String(a.name ?? '?'))}${a.status ? `  (${stripControl(String(a.status))})` : ''}`,
+          );
           pushTurn({ kind: 'note', text: `agents:\n${lines.join('\n')}` });
           break;
         }
         case 'subagents':
         case 'sub-agents': {
           const res = await client.invoke<{ ids?: string[] }>('agent:sub-agent-list');
-          const ids = res?.ids ?? [];
+          const ids = Array.isArray(res?.ids) ? res.ids : [];
           if (ids.length === 0) {
             pushTurn({ kind: 'note', text: 'no active sub-agents' });
             break;
           }
-          const lines = ids.map((sid) => `  • ${sid}`);
+          const lines = ids.map((sid) => `  • ${stripControl(String(sid))}`);
           pushTurn({
             kind: 'note',
             text: `active sub-agents (${ids.length}):\n${lines.join('\n')}\n(stop one with /subagent-stop <id>)`,
