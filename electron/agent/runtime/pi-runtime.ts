@@ -277,20 +277,32 @@ export class PiRuntime implements AgentRuntime {
           buf = buf.slice(nl + 1);
           const trimmed = line.trim();
           if (!trimmed || trimmed.length > MAX_LINE_BYTES) continue;
-          let parsed: PiEvent;
+          let parsed: unknown;
           try {
-            parsed = JSON.parse(trimmed) as PiEvent;
+            parsed = JSON.parse(trimmed);
           } catch {
             continue; // skip non-JSON / partial garbage
           }
-          for (const evt of translatePiEvent(conversationId, parsed)) yield evt;
+          // A pi event is always a JSON object; a bare primitive (null, number,
+          // string) from a hostile/buggy stream would crash translatePiEvent on
+          // `event.type`. Skip it.
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) yield evt;
         }
+        // Enforce the per-line cap DURING buffering too: a newline-free hostile
+        // line must not grow `buf` up to the whole-turn ceiling. Once the pending
+        // (unterminated) buffer exceeds the line cap it can't become a valid line,
+        // so drop it.
+        if (buf.length > MAX_LINE_BYTES) buf = '';
       }
       // Flush any trailing line without a newline.
       const tail = buf.trim();
       if (!abortSignal?.aborted && tail && tail.length <= MAX_LINE_BYTES) {
         try {
-          for (const evt of translatePiEvent(conversationId, JSON.parse(tail) as PiEvent)) yield evt;
+          const parsedTail: unknown = JSON.parse(tail);
+          if (parsedTail && typeof parsedTail === 'object' && !Array.isArray(parsedTail)) {
+            for (const evt of translatePiEvent(conversationId, parsedTail as PiEvent)) yield evt;
+          }
         } catch {
           /* ignore */
         }
@@ -313,7 +325,7 @@ export class PiRuntime implements AgentRuntime {
         yield {
           conversationId,
           type: 'error',
-          error: stderrBuf.trim() || `pi exited with code ${exitCode}`,
+          error: redactSecretsFromText(stderrBuf.trim()) || `pi exited with code ${exitCode}`,
         };
       }
     } catch (err) {
@@ -602,4 +614,26 @@ function extractUsage(
   const inT = inputTokens ?? 0;
   const outT = outputTokens ?? 0;
   return { inputTokens: inT, outputTokens: outT, totalTokens: usage.totalTokens ?? inT + outT };
+}
+
+/**
+ * Redact secret-shaped tokens from subprocess stderr before it's surfaced to
+ * the renderer as an error. API keys are passed via env (not argv), but pi or a
+ * provider may echo a key / bearer token / connection string in a diagnostic;
+ * strip common secret shapes so a hostile-or-buggy error line can't leak them.
+ */
+export function redactSecretsFromText(text: string): string {
+  if (!text) return text;
+  return (
+    text
+      // provider key prefixes: sk-..., sk-ant-..., ghp_/gho_/github_pat_, AKIA...
+      .replace(
+        /\b(sk-[A-Za-z0-9-]{8,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,})\b/g,
+        '[redacted]',
+      )
+      // Authorization: Bearer <token>
+      .replace(/(authorization|bearer)\s*[:=]?\s*[A-Za-z0-9._-]{12,}/gi, '$1 [redacted]')
+      // KEY/TOKEN/SECRET/PASSWORD = value (env-echo style)
+      .replace(/\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\s*[:=]\s*\S+/g, '$1=[redacted]')
+  );
 }

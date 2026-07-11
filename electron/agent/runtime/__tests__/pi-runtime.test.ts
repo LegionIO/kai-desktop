@@ -347,3 +347,32 @@ describe('PiRuntime', () => {
     });
   });
 });
+
+import { redactSecretsFromText } from '../pi-runtime.js';
+
+describe('redactSecretsFromText (stderr leak guard, #65 review)', () => {
+  it('redacts provider key prefixes', () => {
+    expect(redactSecretsFromText('error: bad key sk-ant-abcdef123456789')).toContain('[redacted]');
+    expect(redactSecretsFromText('error: bad key sk-ant-abcdef123456789')).not.toContain('abcdef123456789');
+    expect(redactSecretsFromText('ghp_0123456789abcdefghij failed')).toContain('[redacted]');
+    expect(redactSecretsFromText('creds AKIAABCDEFGHIJKLM rejected')).toContain('[redacted]');
+  });
+
+  it('redacts Authorization: Bearer tokens', () => {
+    const out = redactSecretsFromText('Authorization: Bearer abc123def456ghi789');
+    expect(out).not.toContain('abc123def456ghi789');
+    expect(out.toLowerCase()).toContain('[redacted]');
+  });
+
+  it('redacts KEY/TOKEN/SECRET=value env-echo shapes', () => {
+    expect(redactSecretsFromText('ANTHROPIC_API_KEY=sk-secret')).toBe('ANTHROPIC_API_KEY=[redacted]');
+    expect(redactSecretsFromText('MY_TOKEN: hunter2xyz')).not.toContain('hunter2xyz');
+  });
+
+  it('leaves ordinary error text intact', () => {
+    expect(redactSecretsFromText('pi exited: model not found in registry')).toBe(
+      'pi exited: model not found in registry',
+    );
+    expect(redactSecretsFromText('')).toBe('');
+  });
+});
