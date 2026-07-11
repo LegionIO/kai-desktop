@@ -263,6 +263,11 @@ function writeAgent(appHome: string, agent: AgentFile): void {
 }
 
 function readTask(appHome: string, id: string): TaskFile | null {
+  // Fail closed on a non-UUID id (defense-in-depth, mirrors readAgent): `id` is
+  // joined into a file path. Callers currently validate (assign-task guards
+  // taskId; stored currentTaskId is only ever a validated id), but enforcing the
+  // UUID shape here keeps the read path traversal-safe if a future caller forgets.
+  if (!isValidId(id)) return null;
   const filePath = join(getTasksDir(appHome), `${id}.json`);
   if (!existsSync(filePath)) return null;
   try {
