@@ -55,7 +55,12 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
     const manifestRaw = readContainedFileSync(skillDir, manifestPath, SKILL_MANIFEST_MAX_BYTES);
     if (manifestRaw == null) return { error: `Skill "${name}" manifest is missing, too large, or not a regular file.` };
-    const manifest = JSON.parse(manifestRaw);
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(manifestRaw);
+    } catch {
+      return { error: `Skill "${name}" manifest is not valid JSON.` };
+    }
     const files: Record<string, string> = {};
 
     try {
