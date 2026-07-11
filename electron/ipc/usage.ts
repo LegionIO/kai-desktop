@@ -536,9 +536,19 @@ function bucketKey(isoDate: string, period: string): string {
   return isoDate.slice(0, 10);
 }
 
-function csvEscape(value: string): string {
-  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
-    return `"${value.replace(/"/g, '""')}"`;
+export function csvEscape(value: string): string {
+  // Neutralize spreadsheet formula/DDE injection: a cell whose first character
+  // is one of = + - @ (or a leading tab/CR that some parsers strip) is treated
+  // as a formula by Excel/Sheets, so a user/model-influenced value like
+  // `=HYPERLINK(...)` or `@SUM(...)` could execute on open. Prefix such cells
+  // with a single quote — the standard OWASP mitigation — before delimiter
+  // quoting. Empty strings are untouched.
+  let safe = value;
+  if (safe && /^[=+\-@\t\r]/.test(safe)) {
+    safe = `'${safe}`;
   }
-  return value;
+  if (safe.includes(',') || safe.includes('"') || safe.includes('\n')) {
+    return `"${safe.replace(/"/g, '""')}"`;
+  }
+  return safe;
 }
