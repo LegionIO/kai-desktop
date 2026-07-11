@@ -35,8 +35,8 @@
  * Inspired by Claude Code's CLAUDE.md system (src/utils/claudemd.ts).
  */
 
-import { readFile, stat, readdir } from 'fs/promises';
-import { join, resolve, dirname, isAbsolute } from 'path';
+import { readFile, stat, readdir, realpath } from 'fs/promises';
+import { join, resolve, dirname, isAbsolute, sep } from 'path';
 import { homedir } from 'os';
 
 export type InstructionSource = {
@@ -52,14 +52,62 @@ const MAX_INCLUDE_DEPTH = 5;
 
 // Text file extensions allowed for @include (matches Claude Code's convention)
 const TEXT_EXTENSIONS = new Set([
-  '.md', '.txt', '.json', '.yaml', '.yml', '.toml', '.xml', '.csv',
-  '.ts', '.tsx', '.js', '.jsx', '.py', '.rb', '.go', '.rs', '.java',
-  '.c', '.cpp', '.h', '.hpp', '.cs', '.swift', '.kt', '.scala',
-  '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
-  '.html', '.css', '.scss', '.less', '.sql', '.graphql',
-  '.env', '.ini', '.cfg', '.conf', '.properties',
-  '.r', '.R', '.jl', '.lua', '.pl', '.pm', '.ex', '.exs',
-  '.zig', '.nim', '.v', '.dart', '.proto',
+  '.md',
+  '.txt',
+  '.json',
+  '.yaml',
+  '.yml',
+  '.toml',
+  '.xml',
+  '.csv',
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.py',
+  '.rb',
+  '.go',
+  '.rs',
+  '.java',
+  '.c',
+  '.cpp',
+  '.h',
+  '.hpp',
+  '.cs',
+  '.swift',
+  '.kt',
+  '.scala',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.fish',
+  '.ps1',
+  '.bat',
+  '.cmd',
+  '.html',
+  '.css',
+  '.scss',
+  '.less',
+  '.sql',
+  '.graphql',
+  '.env',
+  '.ini',
+  '.cfg',
+  '.conf',
+  '.properties',
+  '.r',
+  '.R',
+  '.jl',
+  '.lua',
+  '.pl',
+  '.pm',
+  '.ex',
+  '.exs',
+  '.zig',
+  '.nim',
+  '.v',
+  '.dart',
+  '.proto',
 ]);
 
 // ─── Claude Code conventions ────────────────────────────────────────
@@ -83,24 +131,32 @@ export async function loadProjectInstructions(cwd: string): Promise<InstructionS
   const sources: InstructionSource[] = [];
   const processedPaths = new Set<string>();
 
-  // ── 1. Global (user-level) ──────────────────────────────────────
-
   const home = homedir();
+
+  // Roots that an @include directive is allowed to reach. Instruction files
+  // themselves are read from trusted discovery paths, but their @include
+  // targets come from (possibly untrusted) file *content* — a malicious repo's
+  // CLAUDE.md/AGENTS.md must not be able to splice ~/.ssh/id_rsa or /etc/passwd
+  // into the system prompt. Includes are contained to the user's ~/.claude tree
+  // and the opened project tree (cwd). Realpath'd so symlinks can't escape.
+  const allowedRoots = await resolveAllowedIncludeRoots(cwd, home);
+
+  // ── 1. Global (user-level) ──────────────────────────────────────
 
   // ~/.claude/CLAUDE.md
   const globalClaudeMd = join(home, CLAUDE_GLOBAL_FILE);
-  const globalContent = await safeReadWithIncludes(globalClaudeMd, processedPaths, 0);
+  const globalContent = await safeReadWithIncludes(globalClaudeMd, processedPaths, 0, allowedRoots);
   if (globalContent) {
     sources.push({ path: globalClaudeMd, tier: 'global', origin: 'claude', content: globalContent });
   }
 
   // ~/.claude/rules/*.md (recursive)
   const globalRulesDir = join(home, CLAUDE_GLOBAL_RULES);
-  await collectRulesDir(globalRulesDir, 'global', 'claude', sources, processedPaths);
+  await collectRulesDir(globalRulesDir, 'global', 'claude', sources, processedPaths, allowedRoots);
 
   // ── 2. Project (walk cwd → root) ───────────────────────────────
 
-  const projectSources = await discoverProjectInstructions(cwd, processedPaths);
+  const projectSources = await discoverProjectInstructions(cwd, processedPaths, allowedRoots);
   for (const src of projectSources) {
     sources.push(src);
   }
@@ -108,12 +164,36 @@ export async function loadProjectInstructions(cwd: string): Promise<InstructionS
   // ── 3. Local override (cwd only, highest priority) ─────────────
 
   const localPath = join(cwd, CLAUDE_LOCAL_FILE);
-  const localContent = await safeReadWithIncludes(localPath, processedPaths, 0);
+  const localContent = await safeReadWithIncludes(localPath, processedPaths, 0, allowedRoots);
   if (localContent) {
     sources.push({ path: localPath, tier: 'local', origin: 'claude', content: localContent });
   }
 
   return sources;
+}
+
+/**
+ * Compute the realpath'd roots an @include is allowed to resolve within:
+ * the user's ~/.claude tree and the opened project tree (cwd). realpath()
+ * is best-effort — a root that doesn't exist yet falls back to its resolved
+ * (non-canonical) form so a later-created dir is still covered.
+ */
+async function resolveAllowedIncludeRoots(cwd: string, home: string): Promise<string[]> {
+  const candidates = [join(home, '.claude'), resolve(cwd)];
+  const roots: string[] = [];
+  for (const c of candidates) {
+    try {
+      roots.push(await realpath(c));
+    } catch {
+      roots.push(resolve(c));
+    }
+  }
+  return roots;
+}
+
+/** True when `realResolved` (an already-realpath'd file) sits under an allowed root. */
+function isWithinAllowedRoots(realResolved: string, allowedRoots: string[]): boolean {
+  return allowedRoots.some((root) => realResolved === root || realResolved.startsWith(root + sep));
 }
 
 /**
@@ -143,13 +223,14 @@ export function buildInstructionsPrompt(sources: InstructionSource[]): string {
 
     totalSize += contentSize;
 
-    const tierLabel = source.tier === 'global' ? 'user instructions'
-      : source.tier === 'local' ? 'local project instructions'
-      : 'project instructions';
+    const tierLabel =
+      source.tier === 'global'
+        ? 'user instructions'
+        : source.tier === 'local'
+          ? 'local project instructions'
+          : 'project instructions';
 
-    parts.push(
-      `Contents of ${source.path} (${tierLabel}):\n\n${content}`,
-    );
+    parts.push(`Contents of ${source.path} (${tierLabel}):\n\n${content}`);
   }
 
   if (parts.length === 0) return '';
@@ -170,6 +251,7 @@ export function buildInstructionsPrompt(sources: InstructionSource[]): string {
 async function discoverProjectInstructions(
   cwd: string,
   processedPaths: Set<string>,
+  allowedRoots: string[],
 ): Promise<InstructionSource[]> {
   const sources: InstructionSource[] = [];
   const directories: string[] = [];
@@ -190,7 +272,7 @@ async function discoverProjectInstructions(
     // Claude Code project files (CLAUDE.md, .claude/CLAUDE.md)
     for (const fileName of CLAUDE_PROJECT_FILES) {
       const filePath = join(directory, fileName);
-      const content = await safeReadWithIncludes(filePath, processedPaths, 0);
+      const content = await safeReadWithIncludes(filePath, processedPaths, 0, allowedRoots);
       if (content) {
         sources.push({ path: filePath, tier: 'project', origin: 'claude', content });
       }
@@ -198,7 +280,7 @@ async function discoverProjectInstructions(
 
     // .claude/rules/*.md (recursive)
     const rulesDir = join(directory, CLAUDE_RULES_DIR);
-    await collectRulesDir(rulesDir, 'project', 'claude', sources, processedPaths);
+    await collectRulesDir(rulesDir, 'project', 'claude', sources, processedPaths, allowedRoots);
 
     // AGENTS.md (Codex convention, also walked up)
     for (const fileName of CODEX_PROJECT_FILES) {
@@ -222,6 +304,7 @@ async function collectRulesDir(
   origin: string,
   sources: InstructionSource[],
   processedPaths: Set<string>,
+  allowedRoots: string[],
 ): Promise<void> {
   try {
     const entries = await readdir(rulesDir, { withFileTypes: true });
@@ -230,9 +313,9 @@ async function collectRulesDir(
     for (const entry of sorted) {
       const entryPath = join(rulesDir, entry.name);
       if (entry.isDirectory()) {
-        await collectRulesDir(entryPath, tier, origin, sources, processedPaths);
+        await collectRulesDir(entryPath, tier, origin, sources, processedPaths, allowedRoots);
       } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        const content = await safeReadWithIncludes(entryPath, processedPaths, 0);
+        const content = await safeReadWithIncludes(entryPath, processedPaths, 0, allowedRoots);
         if (content) {
           sources.push({ path: entryPath, tier, origin, content });
         }
@@ -253,22 +336,34 @@ async function safeReadWithIncludes(
   filePath: string,
   processedPaths: Set<string>,
   depth: number,
+  allowedRoots: string[],
 ): Promise<string | null> {
   if (depth > MAX_INCLUDE_DEPTH) return '[Max include depth exceeded]';
 
   const resolved = resolve(filePath);
 
-  // Circular reference prevention
-  if (processedPaths.has(resolved)) return null;
-
   try {
     const fileStat = await stat(resolved);
     if (!fileStat.isFile()) return null;
 
-    processedPaths.add(resolved);
-    const raw = await readFile(resolved, 'utf-8');
+    // Canonicalize through symlinks so containment + cycle checks operate on the
+    // real target (a project symlink must not alias an out-of-tree secret).
+    const real = await realpath(resolved);
+
+    // Depth 0 = a trusted discovery path chosen by the loader (CLAUDE.md,
+    // AGENTS.md, rules/*.md). Depth >= 1 = an @include target that came from
+    // (possibly untrusted) file content — it must stay within an allowed root.
+    if (depth > 0 && !isWithinAllowedRoots(real, allowedRoots)) {
+      return null;
+    }
+
+    // Circular reference prevention — key on the real path.
+    if (processedPaths.has(real)) return null;
+    processedPaths.add(real);
+
+    const raw = await readFile(real, 'utf-8');
     const stripped = stripHtmlComments(raw);
-    return await processIncludes(stripped, dirname(resolved), processedPaths, depth);
+    return await processIncludes(stripped, dirname(real), processedPaths, depth, allowedRoots);
   } catch (error) {
     if ((error as { code?: string }).code === 'ENOENT') return null;
     return null;
@@ -299,6 +394,7 @@ async function processIncludes(
   baseDir: string,
   processedPaths: Set<string>,
   depth: number,
+  allowedRoots: string[],
 ): Promise<string> {
   const lines = content.split('\n');
   const result: string[] = [];
@@ -320,7 +416,10 @@ async function processIncludes(
     const trimmed = line.trim();
 
     // Match @path lines (but not @mentions like @user or email-like patterns)
-    if (/^@[.\/~]/.test(trimmed) || (trimmed.startsWith('@') && trimmed.length > 1 && !trimmed.includes(' ') && !trimmed.includes('@', 1))) {
+    if (
+      /^@[.\/~]/.test(trimmed) ||
+      (trimmed.startsWith('@') && trimmed.length > 1 && !trimmed.includes(' ') && !trimmed.includes('@', 1))
+    ) {
       let includePath = trimmed.slice(1);
 
       // Strip fragment identifiers (@file.md#section → @file.md)
@@ -336,14 +435,16 @@ async function processIncludes(
         resolved = join(baseDir, includePath);
       }
 
-      // Only include text files
+      // Only include text files. Extensionless paths are NOT auto-allowed:
+      // many secrets are extensionless (id_rsa, .netrc, /etc/passwd), so an
+      // empty extension must be rejected rather than treated as text.
       const ext = getExtension(resolved);
-      if (!TEXT_EXTENSIONS.has(ext) && ext !== '') {
+      if (!TEXT_EXTENSIONS.has(ext)) {
         result.push(line);
         continue;
       }
 
-      const included = await safeReadWithIncludes(resolved, processedPaths, depth + 1);
+      const included = await safeReadWithIncludes(resolved, processedPaths, depth + 1, allowedRoots);
       if (included !== null) {
         result.push(included);
       }
@@ -401,7 +502,7 @@ export async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: strin
     const now = Date.now();
     let instructionsPrompt: string;
 
-    if (cached && (now - cached.loadedAt) < INSTRUCTIONS_CACHE_TTL_MS) {
+    if (cached && now - cached.loadedAt < INSTRUCTIONS_CACHE_TTL_MS) {
       instructionsPrompt = cached.prompt;
     } else {
       const sources = await loadProjectInstructions(cwd);
@@ -409,7 +510,9 @@ export async function withWorkingDirectoryPrompt(basePrompt: string, cwd?: strin
       instructionsCache.set(cwd, { prompt: instructionsPrompt, loadedAt: now });
 
       if (sources.length > 0) {
-        console.info(`[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`);
+        console.info(
+          `[Instructions] Loaded ${sources.length} instruction file(s) for ${cwd}: ${sources.map((s) => `${s.origin}:${s.path}`).join(', ')}`,
+        );
       }
     }
 
