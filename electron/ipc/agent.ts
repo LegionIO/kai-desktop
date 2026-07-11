@@ -2361,6 +2361,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         fallbackEnabled?: boolean;
         cwd?: string;
         executionMode?: ExecutionMode;
+        /** Optional image attachments (CLI @image / paste / AppShots). Each
+         *  `image` is a data URL or base64 string; appended as image parts to
+         *  the user message so vision-capable models receive them. */
+        attachments?: Array<{ image: string; mimeType?: string }>;
       },
     ) => {
       const conv = readConversation(appHome, conversationId);
@@ -2410,6 +2414,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { ok: false, error: 'conversation-busy' };
       }
 
+      // Build the user message content: the text part plus any validated image
+      // attachments (CLI @image / paste / AppShots). Cap the count and total
+      // size — data URLs are large and go straight into the persisted tree +
+      // the model request. Non-string / oversized entries are dropped.
+      const MAX_ATTACHMENTS = 8;
+      const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 20 MiB per image (data-URL length)
+      const MAX_ATTACHMENTS_TOTAL_BYTES = 40 * 1024 * 1024; // 40 MiB across all images
+      const userContent: Array<Record<string, unknown>> = [{ type: 'text', text: userText }];
+      if (Array.isArray(opts?.attachments)) {
+        let imageCount = 0;
+        let totalBytes = 0;
+        for (const att of opts!.attachments) {
+          if (imageCount >= MAX_ATTACHMENTS) break;
+          const image = att?.image;
+          if (typeof image !== 'string' || image.length === 0) continue;
+          if (image.length > MAX_ATTACHMENT_BYTES) continue; // single image too big — skip
+          if (totalBytes + image.length > MAX_ATTACHMENTS_TOTAL_BYTES) break; // budget exhausted
+          totalBytes += image.length;
+          imageCount += 1;
+          userContent.push(
+            typeof att.mimeType === 'string'
+              ? { type: 'image', image, mimeType: att.mimeType }
+              : { type: 'image', image },
+          );
+        }
+      }
+
       // Mark the conversation running so automation busy-checks and the GUI
       // index see a live CLI turn and don't target it with a concurrent write.
       // The terminal assistant/error persist (or cancel) resets it to idle.
@@ -2418,7 +2449,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const promptWrite = appendConversationMessages(
         appHome,
         conversationId,
-        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+        [{ role: 'user', content: userContent }],
         { skipIfBusy: true, runStatus: 'running' },
       );
       if (!promptWrite) return { ok: false, error: 'conversation-busy' };

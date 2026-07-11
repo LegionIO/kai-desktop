@@ -9,6 +9,7 @@ import { ToolRow, type ToolStatus } from './components/ToolRow.js';
 import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
+import { extractImageMentions } from './images.js';
 
 type StreamEvent = {
   conversationId?: string;
@@ -141,7 +142,9 @@ export function App({
   // at a time after each `done`, instead of aborting the live turn. A ref (not
   // state) so the stream-event effect can read/flush without re-subscribing.
   const queueRef = useRef<string[]>([]);
-  const sendMessageRef = useRef<(text: string) => void>(() => {});
+  const sendMessageRef = useRef<
+    (text: string, submitText?: string, attachments?: Array<{ image: string; mimeType?: string }>) => void
+  >(() => {});
   // Guards double-draining the queue: the backend can emit `error` THEN `done`
   // for the same turn. Only the first terminal event of a turn drains one
   // queued message. Reset when a new turn starts (sendMessage).
@@ -525,8 +528,8 @@ export function App({
             text:
               '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
               '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents\n' +
-              '/subagents  /subagent-stop [id]  /quit\n' +
-              'keys: Esc cancel turn · Esc Esc rewind menu · Ctrl-O expand tool i/o · Ctrl-C quit',
+              '/shot [caption]  /subagents  /subagent-stop [id]  /quit\n' +
+              'attach an image inline with @path.png · keys: Esc cancel · Esc Esc rewind · Ctrl-O tools · Ctrl-C quit',
           });
           break;
         case 'new':
@@ -859,6 +862,33 @@ export function App({
           });
           break;
         }
+        case 'shot':
+        case 'screenshot': {
+          if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
+            pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
+            break;
+          }
+          const noteId = `n-${Date.now()}`;
+          pushLoadingNote(noteId, 'capturing screenshot…');
+          let shot: { imageDataUrl?: string } | null = null;
+          try {
+            shot = await client.invoke<{ imageDataUrl?: string }>('app-shots:capture');
+          } catch (err) {
+            resolveNote(
+              noteId,
+              `screenshot failed: ${(err as { message?: string })?.message ?? 'App Shots may be disabled'}`,
+            );
+            break;
+          }
+          if (!shot?.imageDataUrl) {
+            resolveNote(noteId, 'screenshot failed: no image captured');
+            break;
+          }
+          resolveNote(noteId, 'captured screenshot — sending');
+          const caption = arg.trim() || 'Describe this screenshot.';
+          sendMessageRef.current(caption, undefined, [{ image: shot.imageDataUrl, mimeType: 'image/png' }]);
+          break;
+        }
         case 'quit':
         case 'exit':
           exit();
@@ -896,7 +926,7 @@ export function App({
   }, []);
 
   const sendMessage = useCallback(
-    (trimmed: string, submitText?: string) => {
+    (trimmed: string, submitText?: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
       pushTurn({ kind: 'user', text: trimmed });
       setStatus('running');
       streamingRef.current = '';
@@ -922,6 +952,7 @@ export function App({
             toSubmit,
             {
               cwd: CWD,
+              ...(attachments && attachments.length > 0 ? { attachments } : {}),
             },
           );
           if (res && res.ok === false) {
@@ -959,14 +990,21 @@ export function App({
         pushTurn({ kind: 'note', text: `queued: ${trimmed}` });
         return;
       }
-      // Expand @file mentions by inlining file contents (agent:submit is
-      // text-only). The visible turn keeps the original @path; only the
-      // submitted text carries the inlined bodies. Surface per-file notes.
+      // Handle @mentions. Image mentions (@foo.png) become real image
+      // attachments (agent:submit accepts image parts) and are stripped from the
+      // prompt text; remaining @file mentions inline their contents as text.
       if (/(^|\s)@/.test(trimmed)) {
-        const { text, notes } = expandFileMentions(trimmed, CWD);
-        for (const note of notes) pushTurn({ kind: 'note', text: note });
-        sendMessage(trimmed, text !== trimmed ? text : undefined);
-        return;
+        const img = extractImageMentions(trimmed, CWD);
+        for (const note of img.notes) pushTurn({ kind: 'note', text: note });
+        // Run text @file expansion on whatever text remains after image tokens.
+        const file = expandFileMentions(img.text, CWD);
+        for (const note of file.notes) pushTurn({ kind: 'note', text: note });
+        const attachments = img.attachments;
+        const submitText = file.text !== trimmed ? file.text : undefined;
+        if (submitText !== undefined || attachments.length > 0) {
+          sendMessage(trimmed, submitText, attachments.length > 0 ? attachments : undefined);
+          return;
+        }
       }
       sendMessage(trimmed);
     },
