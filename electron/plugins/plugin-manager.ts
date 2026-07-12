@@ -1100,7 +1100,10 @@ export class PluginManager {
     return this.validatePluginConfig(instance.manifest, {});
   }
 
-  resolveRendererAssetRequest(pluginName: string, assetPath: string): { filePath: string; contentType: string } | null {
+  resolveRendererAssetRequest(
+    pluginName: string,
+    assetPath: string,
+  ): { filePath: string; baseDir: string; contentType: string } | null {
     const instance = this.plugins.get(pluginName);
     if (!instance || instance.state !== 'active' || !instance.rendererBuild) return null;
 
@@ -1116,7 +1119,7 @@ export class PluginManager {
       css: 'text/css; charset=utf-8',
       json: 'application/json; charset=utf-8',
     };
-    return { filePath: resolvedPath, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
+    return { filePath: resolvedPath, baseDir, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
   }
 
   setPluginConfig(pluginName: string, path: string, value: unknown): void {

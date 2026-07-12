@@ -1872,8 +1872,13 @@ if (gotSingleInstanceLock) {
         return new Response('Not Found', { status: 404 });
       }
 
-      const data = readFileSync(resolved.filePath);
-      return new Response(data, {
+      // Symlink/TOCTOU-safe read: a malicious plugin could plant a symlink in
+      // its own dir to exfiltrate files outside it via its renderer bundle.
+      const data = safeReadFileWithin(resolved.baseDir, resolved.filePath);
+      if (!data) {
+        return new Response('Not Found', { status: 404 });
+      }
+      return new Response(new Uint8Array(data), {
         headers: {
           'Content-Type': resolved.contentType,
           'Cache-Control': 'no-cache',
