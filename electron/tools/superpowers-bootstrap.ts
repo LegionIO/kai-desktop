@@ -5,7 +5,7 @@ import { join } from 'node:path';
 const SUPERPOWERS_REPO = 'https://github.com/obra/superpowers.git';
 const SUPERPOWERS_DIR_NAME = 'superpowers';
 
-function parseSkillMdFrontmatter(content: string): { name?: string; description?: string } {
+export function parseSkillMdFrontmatter(content: string): { name?: string; description?: string } {
   const match = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return {};
 
@@ -27,12 +27,12 @@ function parseSkillMdFrontmatter(content: string): { name?: string; description?
   return result;
 }
 
-function getSkillMdBody(content: string): string {
+export function getSkillMdBody(content: string): string {
   const match = content.match(/^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n([\s\S]*)$/);
   return match ? match[1].trim() : content.trim();
 }
 
-function generateSkillJson(sourceDir: string, outputDir: string, skillName: string): boolean {
+export function generateSkillJson(sourceDir: string, outputDir: string, skillName: string): boolean {
   const skillMdPath = join(sourceDir, 'SKILL.md');
   const skillJsonPath = join(outputDir, 'skill.json');
 
