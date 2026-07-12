@@ -233,6 +233,20 @@ app.on('browser-window-created', (_event, win) => {
   }
 });
 
+// App-wide window-open guard: every webContents (main window, operator window,
+// mic recorder, and any future window) denies native window.open by default and
+// safe-routes http(s)/mailto to the OS browser via openExternalSafely. Windows
+// that need their own handler (e.g. the main window) still set one, which
+// overrides this default for that contents. This closes the gap where only the
+// main window was guarded. Not a will-navigate guard — the browsing/plugin
+// windows legitimately navigate to arbitrary pages.
+app.on('web-contents-created', (_event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    openExternalSafely(url);
+    return { action: 'deny' };
+  });
+});
+
 type MainProcessUnhandledKind = 'uncaughtException' | 'unhandledRejection';
 
 /**
