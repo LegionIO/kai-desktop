@@ -168,43 +168,60 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
       break;
     }
     case 'error': {
+      // Annotate the accumulated turn with the error, but do NOT finalize here:
+      // `error` is not always terminal (a mid-stream tool error can be followed
+      // by more content + a closing `done`), so persisting now could truncate the
+      // turn. The turn is persisted on `done`; the accumulator is guaranteed to
+      // be released even on an abnormal (done-less) termination by the stream
+      // loop's finally → discardPersistenceAccumulator (ipc/agent.ts), so it
+      // cannot leak.
       const acc = ensureAcc(conversationId, parentId);
       appendText(acc, `\n\n**Error:** ${event.error ?? 'unknown error'}`);
       break;
     }
     case 'done': {
-      const acc = accumulators.get(conversationId);
-      accumulators.delete(conversationId);
-      if (!acc || !acc.sawContent || acc.parts.length === 0) {
-        // Nothing to persist, but agent:submit marked the conversation
-        // 'running' for this turn — reset it so it doesn't look stuck busy, and
-        // broadcast so non-active GUI/web clients drop the running indicator too.
-        try {
-          const conv = readConversation(appHome, conversationId);
-          if (conv && conv.runStatus === 'running') {
-            conv.runStatus = 'idle';
-            writeConversation(appHome, conv);
-            broadcastUpsert(appHome, conv);
-          }
-        } catch {
-          // best-effort
-        }
-        return;
-      }
-      try {
-        // Parent on the head captured at submit so a mid-run branch change
-        // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
-        // in options falls back to the current head, so only pass it when known.
-        // Reset runStatus to idle: agent:submit set it 'running' for the turn.
-        appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
-          runStatus: 'idle',
-          ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
-        });
-      } catch {
-        // Persistence is best-effort; a failure must not break the stream.
-      }
+      finalizeTurn(appHome, conversationId);
       break;
     }
+  }
+}
+
+/**
+ * Persist the accumulated assistant turn for a server-persisted stream and clear
+ * its accumulator (idempotent — safe to call more than once per conversation).
+ * If there's nothing to persist, still reset a lingering `running` runStatus so
+ * the conversation doesn't look stuck busy. Persistence is best-effort.
+ */
+function finalizeTurn(appHome: string, conversationId: string): void {
+  const acc = accumulators.get(conversationId);
+  accumulators.delete(conversationId);
+  if (!acc || !acc.sawContent || acc.parts.length === 0) {
+    // Nothing to persist, but agent:submit marked the conversation 'running' for
+    // this turn — reset it so it doesn't look stuck busy, and broadcast so
+    // non-active GUI/web clients drop the running indicator too.
+    try {
+      const conv = readConversation(appHome, conversationId);
+      if (conv && conv.runStatus === 'running') {
+        conv.runStatus = 'idle';
+        writeConversation(appHome, conv);
+        broadcastUpsert(appHome, conv);
+      }
+    } catch {
+      // best-effort
+    }
+    return;
+  }
+  try {
+    // Parent on the head captured at submit so a mid-run branch change
+    // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
+    // in options falls back to the current head, so only pass it when known.
+    // Reset runStatus to idle: agent:submit set it 'running' for the turn.
+    appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
+      runStatus: 'idle',
+      ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
+    });
+  } catch {
+    // Persistence is best-effort; a failure must not break the stream.
   }
 }
 

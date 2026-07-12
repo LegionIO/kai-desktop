@@ -130,4 +130,39 @@ describe('stream persistence accumulator', () => {
     expect(options).toEqual({ runStatus: 'idle' });
     expect(options.parentId).toBeUndefined();
   });
+
+  it('appends an error note to the turn but only persists once, on the trailing done', () => {
+    feed({ conversationId: 'e1', type: 'text-delta', text: 'partial' });
+    feed({ conversationId: 'e1', type: 'error', error: 'boom' });
+    // error does NOT persist (it may be mid-stream); the turn persists on done.
+    expect(appendMock).not.toHaveBeenCalled();
+    feed({ conversationId: 'e1', type: 'done' });
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, , msgs] = appendMock.mock.calls[0];
+    const text = (msgs[0].content as Array<{ type: string; text?: string }>).find((p) => p.type === 'text')?.text;
+    expect(text).toContain('partial');
+    expect(text).toContain('**Error:** boom');
+  });
+
+  it('does not double-persist when a mid-stream error is followed by more content + done', () => {
+    feed({ conversationId: 'e2', type: 'text-delta', text: 'a' });
+    feed({ conversationId: 'e2', type: 'error', error: 'transient' });
+    feed({ conversationId: 'e2', type: 'text-delta', text: 'b' }); // stream continued
+    feed({ conversationId: 'e2', type: 'done' });
+    expect(appendMock).toHaveBeenCalledTimes(1); // single persist, no premature write on error
+    const [, , msgs] = appendMock.mock.calls[0];
+    const text = (msgs[0].content as Array<{ type: string; text?: string }>).find((p) => p.type === 'text')?.text;
+    expect(text).toContain('a');
+    expect(text).toContain('b'); // content after the error is preserved
+  });
+
+  it('discardPersistenceAccumulator releases an accumulator with no trailing done (no leak)', () => {
+    feed({ conversationId: 'e3', type: 'text-delta', text: 'orphan' });
+    feed({ conversationId: 'e3', type: 'error', error: 'fatal, no done follows' });
+    // Simulate the stream loop's finally cleanup on an abnormal (done-less) end.
+    discardPersistenceAccumulator('e3');
+    // A late/duplicate done now finds nothing → no persist (accumulator was released).
+    feed({ conversationId: 'e3', type: 'done' });
+    expect(appendMock).not.toHaveBeenCalled();
+  });
 });

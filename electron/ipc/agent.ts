@@ -2381,6 +2381,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (activeObserverSessions.get(conversationId) === observerSessionId) {
           activeObserverSessions.delete(conversationId);
         }
+        // If this run still owns server-persist here, the stream ended WITHOUT a
+        // `done` (abnormal termination — a producer that didn't emit the closing
+        // event). `done` deletes the token + the accumulator; its absence would
+        // otherwise leak the persistence accumulator forever. Release both.
+        if (serverPersistAppHome && serverPersistTokens.get(conversationId) === streamToken) {
+          serverPersistTokens.delete(conversationId);
+          serverPersistParents.delete(conversationId);
+          discardPersistenceAccumulator(conversationId);
+        }
       }
     })();
 
