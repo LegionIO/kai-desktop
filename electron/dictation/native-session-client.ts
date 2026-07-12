@@ -81,6 +81,12 @@ export class DictationNativeSessionError extends Error {
 }
 
 const READY_TIMEOUT_MS = 5000;
+
+// Cap the unparsed-line buffer: the trusted native helper emits compact
+// newline-terminated JSON, so a line this long means a helper bug/compromise —
+// drop it rather than grow memory unbounded waiting for a newline. Mirrors the
+// local-macos takeover-monitor + pi-runtime stdout caps.
+const MAX_STDOUT_LINE_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 8000;
 
 export class DictationNativeSessionClient {
@@ -281,11 +287,17 @@ export class DictationNativeSessionClient {
     this.stdoutBuffer += text;
     while (true) {
       const newline = this.stdoutBuffer.indexOf('\n');
-      if (newline === -1) return;
+      if (newline === -1) break;
       const line = this.stdoutBuffer.slice(0, newline).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
       if (!line) continue;
       this.handleLine(line);
+    }
+    // A newline-less line past the cap can't become a valid frame — drop the
+    // pending buffer so a hung/hostile helper can't grow it without bound.
+    if (this.stdoutBuffer.length > MAX_STDOUT_LINE_BYTES) {
+      this.stdoutBuffer = '';
+      this.options.onProtocolError?.('Dictation helper output exceeded the line buffer cap; dropped.');
     }
   }
 

@@ -185,4 +185,22 @@ describe('DictationNativeSessionClient', () => {
       expect.objectContaining({ env: { PATH: '/usr/bin' } }),
     );
   });
+
+  it('drops the stdout buffer + reports when a newline-less flood exceeds the cap', async () => {
+    const onProtocolError = vi.fn();
+    const { DictationNativeSessionClient } = await import('../native-session-client.js');
+    const client = new DictationNativeSessionClient({ onProtocolError });
+
+    const started = client.start();
+    child.stdout.emitData('{"event":"ready","protocolVersion":1}\n');
+    await started;
+
+    // A single newline-less chunk larger than the 64 KiB cap must not accumulate.
+    child.stdout.emitData('x'.repeat(70 * 1024));
+    expect(onProtocolError).toHaveBeenCalledWith(expect.stringContaining('line buffer cap'));
+
+    // The session still works afterward: a valid framed response is routed.
+    child.stdout.emitData('{"event":"targetDirty","kind":"keyboard","eventType":"keyDown","keyCode":4}\n');
+    // (no throw / hang — buffer was reset, parser recovered)
+  });
 });
