@@ -253,6 +253,7 @@ function getDefaultConfig() {
       safety: {
         pauseOnTerminal: true,
         manualTakeoverPauses: true,
+        experimentalScreenCaptureConsent: false,
       },
       localMacos: {
         autoRequestPermissions: true,

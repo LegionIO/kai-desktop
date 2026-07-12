@@ -260,6 +260,14 @@ const computerUseConfigSchema = z.object({
   safety: z.object({
     pauseOnTerminal: z.boolean(),
     manualTakeoverPauses: z.boolean(),
+    /**
+     * Consent gate for the experimental Windows/Linux computer-use path
+     * (ADR-0005 experimental-on). On those platforms the perception loop
+     * screenshots ALL displays via nut-js with NO OS screen-recording consent
+     * prompt (unlike macOS TCC). Capture is refused until the user opts in here.
+     * Ignored on macOS (OS TCC gates capture there). Default false = privacy-safe.
+     */
+    experimentalScreenCaptureConsent: z.boolean().default(false),
   }),
   localMacos: z.object({
     autoRequestPermissions: z.boolean(),

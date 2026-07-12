@@ -32,6 +32,7 @@ type ComputerUseConfig = {
   safety: {
     pauseOnTerminal: boolean;
     manualTakeoverPauses: boolean;
+    experimentalScreenCaptureConsent?: boolean;
   };
   localMacos: {
     autoRequestPermissions: boolean;
@@ -641,6 +642,20 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
             onChange={(value) => updateConfig('computerUse.safety.manualTakeoverPauses', value)}
           />
         </div>
+        {featureCaps?.computerUseLocal.experimental && (
+          <div data-setting-id="computerUse.safety.experimentalScreenCaptureConsent" className="mt-1">
+            <Toggle
+              label="Allow experimental screen capture"
+              checked={computerUse.safety.experimentalScreenCaptureConsent ?? false}
+              onChange={(value) => updateConfig('computerUse.safety.experimentalScreenCaptureConsent', value)}
+            />
+            <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
+              Experimental local computer use screenshots your entire screen (all displays) to see the desktop. Unlike
+              macOS, this platform shows no system screen-recording prompt — enable only if you understand the screen
+              contents are sent to the model. Local computer use won&apos;t start until this is on.
+            </p>
+          </div>
+        )}
       </fieldset>
 
       {app.platform.os === 'darwin' && (

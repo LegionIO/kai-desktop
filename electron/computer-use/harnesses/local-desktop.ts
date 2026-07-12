@@ -8,6 +8,7 @@ import type {
 import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../../shared/computer-use.js';
 import type { AppConfig } from '../../config/schema.js';
 import { getFallbackAdapter, getPlatformAdapter } from '../../platform/index.js';
+import { getPlatformCapabilities } from '../../platform/capabilities.js';
 import type { NativePlatformAdapter } from '../../platform/types.js';
 import { suppressTakeoverEvents } from '../takeover-monitor.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
@@ -89,6 +90,22 @@ export class LocalDesktopHarness implements ComputerHarness {
   }
 
   async initialize(_session: ComputerSession): Promise<void> {
+    // Privacy consent gate (ADR-0005 experimental-on). On Windows/Linux this
+    // harness screenshots ALL displays via nut-js with NO OS screen-recording
+    // consent prompt (macOS gates capture via the TCC screen-recording
+    // permission; nut-js has no equivalent). So on a platform where local
+    // computer use is only EXPERIMENTAL, refuse to start a session until the
+    // user has explicitly opted in via computerUse.safety.experimentalScreenCaptureConsent.
+    // Fail-closed: no consent → clean error surfaced as a failed action, no capture.
+    if (getPlatformCapabilities().computerUseLocal.experimental) {
+      if (!this.getConfig().computerUse.safety.experimentalScreenCaptureConsent) {
+        throw new Error(
+          'Local computer use is experimental on this platform and captures your screen. ' +
+            'Enable "Allow experimental screen capture" in Computer Use settings to try it.',
+        );
+      }
+    }
+
     const adapter = await this.getAdapter();
     const perms = await adapter.checkPermissions();
     if (!perms.helperReady) {
