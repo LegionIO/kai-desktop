@@ -128,6 +128,10 @@ export function startLocalMacosTakeoverMonitor(params: {
   }
 
   let stdoutBuffer = '';
+  // Cap the unparsed-line buffer: the trusted helper emits compact newline-
+  // terminated JSON, so a line this long means a helper bug/compromise — drop it
+  // rather than grow memory unbounded waiting for a newline that never comes.
+  const MAX_MONITOR_LINE_BYTES = 64 * 1024;
   child.stdout.on('data', (chunk) => {
     stdoutBuffer += chunk.toString();
     while (true) {
@@ -139,6 +143,9 @@ export function startLocalMacosTakeoverMonitor(params: {
       if (event) {
         params.onEvent(event);
       }
+    }
+    if (stdoutBuffer.length > MAX_MONITOR_LINE_BYTES) {
+      stdoutBuffer = '';
     }
   });
 
@@ -175,6 +182,24 @@ function buildResult(summary: string, cursor?: { x: number; y: number }): Comput
     summary,
     ...(cursor ? { cursor: { x: cursor.x, y: cursor.y, visible: true } } : {}),
   };
+}
+
+/**
+ * Validate a model-supplied app name for `open -a` / `focusWindow`. Name-only:
+ * reject a path (so a bundle can't be launched by absolute/relative path) and a
+ * leading dash (defense-in-depth against option-like values). Returns the
+ * trimmed name or throws.
+ */
+export function resolveAppName(raw: string | undefined, verb: string): string {
+  const name = raw?.trim();
+  if (!name) throw new Error(`${verb} requires appName.`);
+  if (name.includes('/') || name.includes('\\')) {
+    throw new Error(`Refusing to ${verb.toLowerCase()} a path; provide an application name, not a path: ${name}`);
+  }
+  if (name.startsWith('-')) {
+    throw new Error(`Refusing an application name that begins with '-': ${name}`);
+  }
+  return name;
 }
 
 function resolveMovementPath(
@@ -651,18 +676,19 @@ export class LocalMacosHarness implements ComputerHarness {
   }
 
   async openApp(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const appName = action.appName?.trim();
-    if (!appName) throw new Error('Open app requires appName.');
+    const appName = resolveAppName(action.appName, 'Open app');
     await execFileAsync('open', ['-a', appName], { timeout: 15000 });
     return buildResult(`Opened ${appName}.`);
   }
 
   async focusWindow(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const appName = action.appName?.trim();
-    if (!appName) throw new Error('Focus window requires appName.');
-    // Pass model-supplied appName as argv data, never interpolate into script source.
+    const appName = resolveAppName(action.appName, 'Focus window');
+    // Pass model-supplied appName as argv DATA, never as an option. osascript
+    // keeps parsing -e/-l/etc. after the first -e, so an appName like
+    // "-e return 99" would be read as another script fragment; the `--`
+    // separator forces everything after it to be positional (run-handler argv).
     const FOCUS_SCRIPT = 'on run argv\n  tell application (item 1 of argv) to activate\nend run';
-    await execFileAsync('osascript', ['-e', FOCUS_SCRIPT, appName], { timeout: 15000 });
+    await execFileAsync('osascript', ['-e', FOCUS_SCRIPT, '--', appName], { timeout: 15000 });
     return buildResult(`Focused ${appName}.`);
   }
 
