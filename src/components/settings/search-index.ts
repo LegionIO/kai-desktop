@@ -600,6 +600,12 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     keywords: ['safety'],
   },
   {
+    id: 'computerUse.safety.isolatedBrowserAllowPrivateNetwork',
+    label: 'Allow the isolated browser to reach private / local addresses',
+    section: 'computer-use',
+    keywords: ['safety', 'localhost', 'private', 'ssrf', 'network', 'browser', 'dev server'],
+  },
+  {
     id: 'computerUse.localMacos.allowedDisplays',
     label: 'Allowed displays',
     section: 'computer-use',

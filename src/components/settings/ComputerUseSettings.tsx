@@ -33,6 +33,7 @@ type ComputerUseConfig = {
     pauseOnTerminal: boolean;
     manualTakeoverPauses: boolean;
     experimentalScreenCaptureConsent?: boolean;
+    isolatedBrowserAllowPrivateNetwork?: boolean;
   };
   localMacos: {
     autoRequestPermissions: boolean;
@@ -641,6 +642,18 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
             checked={computerUse.safety.manualTakeoverPauses}
             onChange={(value) => updateConfig('computerUse.safety.manualTakeoverPauses', value)}
           />
+        </div>
+        <div data-setting-id="computerUse.safety.isolatedBrowserAllowPrivateNetwork" className="mt-1">
+          <Toggle
+            label="Allow the isolated browser to reach private / local addresses"
+            checked={computerUse.safety.isolatedBrowserAllowPrivateNetwork ?? false}
+            onChange={(value) => updateConfig('computerUse.safety.isolatedBrowserAllowPrivateNetwork', value)}
+          />
+          <p className="text-[10px] text-muted-foreground mt-0.5">
+            Off by default: the browsing agent can&apos;t navigate to localhost, private (10/172.16/192.168), or
+            link-local addresses, so untrusted page content can&apos;t steer it into probing services on your network.
+            Enable only to drive a local dev server.
+          </p>
         </div>
         {featureCaps?.computerUseLocal.experimental && (
           <div data-setting-id="computerUse.safety.experimentalScreenCaptureConsent" className="mt-1">

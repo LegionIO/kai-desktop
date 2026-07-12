@@ -22,6 +22,13 @@ describe('searchSettings', () => {
     expect(results.some((r) => r.id === 'ui.theme')).toBe(true);
   });
 
+  it('surfaces the isolated-browser private-network toggle by its keywords', () => {
+    for (const q of ['localhost', 'ssrf', 'dev server']) {
+      const ids = searchSettings(q).map((r) => r.id);
+      expect(ids).toContain('computerUse.safety.isolatedBrowserAllowPrivateNetwork');
+    }
+  });
+
   it('surfaces all max-turns/steps settings for "max"', () => {
     const ids = searchSettings('max').map((r) => r.id);
     expect(ids).toContain('agent.maxTurns');
