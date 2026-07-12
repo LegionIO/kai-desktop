@@ -77,6 +77,20 @@ const toolActionRule = {
   actions: [{ type: 'tool', toolName: 'sh', input: { command: 'echo {{payload.text}}' } }],
 };
 
+// An agent action WITH tools runs an autonomous agent (no interactive approval)
+// that can call exec/file tools → capability grant, must be gated. tools:false
+// is text-only → benign.
+const agentToolsRule = {
+  name: 'autonomous agent on a plugin event',
+  trigger: { source: 'plugin.foo', event: 'thing' },
+  actions: [{ type: 'agent', mode: 'background', prompt: 'do {{payload.task}}', tools: true }],
+};
+const agentNoToolsRule = {
+  name: 'text-only agent on a plugin event',
+  trigger: { source: 'plugin.foo', event: 'thing' },
+  actions: [{ type: 'agent', mode: 'background', prompt: 'summarize {{payload.text}}', tools: false }],
+};
+
 async function run(action: string, extra: Record<string, unknown> = {}) {
   const tool = createAutomationManageTool('/tmp');
   return (await tool.execute({ action, ...extra }, CTX as never)) as Record<string, unknown>;
@@ -141,6 +155,31 @@ describe('automations tool approval gate', () => {
     freshConfig('block', [{ id: 'r-tool', enabled: true, conditions: [], conditionMode: 'all', ...toolActionRule }]);
     const res = await run('test', { id: 'r-tool' });
     expect(res.error).toMatch(/block/i);
+  });
+
+  it('block: refuses to create an agent-action rule WITH tools (autonomous exec)', async () => {
+    freshConfig('block');
+    const res = await run('create', { rule: agentToolsRule });
+    expect(res.error).toMatch(/block/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
+  it('prompt-user: gates an agent-with-tools rule and explains the agent runs tools', async () => {
+    freshConfig('prompt-user');
+    approvalDecision = true;
+    const res = await run('create', { rule: agentToolsRule });
+    expect(res.success).toBe(true);
+    const evt = broadcastSpy.mock.calls[0][0] as { type: string; args: { reason?: string } };
+    expect(evt.type).toBe('tool-approval-required');
+    expect(evt.args.reason).toMatch(/autonomous agent turn with tools/i);
+  });
+
+  it('does NOT gate a text-only agent action (tools:false is not a capability grant)', async () => {
+    freshConfig('block');
+    const res = await run('create', { rule: agentNoToolsRule });
+    expect(res.success).toBe(true); // benign → not blocked even under block mode
+    expect(broadcastSpy).not.toHaveBeenCalled();
+    expect(mockConfig.automations.rules).toHaveLength(1);
   });
 
   it('prompt-user + approve: prompts then persists', async () => {

@@ -63,15 +63,28 @@ function toolActionNames(rule: Pick<AutomationRule, 'actions'>): string[] {
     .map((a) => a.toolName);
 }
 
+/** A rule runs an autonomous agent turn WITH tools enabled. `runAgentAction`
+ *  (electron/automations/actions.ts) streams through `generateForPlugin`, which
+ *  has NO interactive per-tool approval — so the agent executes whatever tools
+ *  it calls (including exec tools like sh) freely. `tools` defaults TRUE, so
+ *  this is the same unattended-exec capability grant as a `tool` action and must
+ *  clear the same gate. A `tools:false` agent action is text-only (no exec). */
+function hasAgentToolExecAction(rule: Pick<AutomationRule, 'actions'>): boolean {
+  return rule.actions.some((a) => a.type === 'agent' && a.tools !== false);
+}
+
 /**
  * A rule is "dangerous" when the AGENT creating/enabling it would gain a
  * powerful capability without the user in the loop: it subscribes to lifecycle
  * hook events (can observe raw prompts + tool payloads), runs an arbitrary shell
- * command, or executes a registered tool (which can itself be a shell/file/exec
- * tool). All three are gated behind the automations approval policy.
+ * command, executes a registered tool, or runs an autonomous agent turn WITH
+ * tools (which can call exec/file tools with no interactive approval). All are
+ * gated behind the automations approval policy.
  */
 function isDangerousRule(rule: AutomationRule): boolean {
-  return ruleTriggersOnHookEvents(rule) || hasShellHookAction(rule) || hasToolAction(rule);
+  return (
+    ruleTriggersOnHookEvents(rule) || hasShellHookAction(rule) || hasToolAction(rule) || hasAgentToolExecAction(rule)
+  );
 }
 
 type ApprovalDecision = { ok: true } | { ok: false; error: string };
@@ -135,6 +148,9 @@ async function ensureApproved(
     reasonParts.push(
       `executes ${toolNames.length === 1 ? 'the tool' : 'tools'} ${toolNames.map((t) => `\`${t}\``).join(', ')} (which may run shell/file operations)`,
     );
+  }
+  if (hasAgentToolExecAction(rule)) {
+    reasonParts.push('runs an autonomous agent turn with tools enabled (the agent can call exec/file tools directly)');
   }
   if (ruleTriggersOnHookEvents(rule)) {
     reasonParts.push('subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads');
