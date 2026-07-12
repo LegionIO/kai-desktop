@@ -69,40 +69,52 @@ export async function matchAgentRole(
 
     const result = await agent.generate(input, { maxSteps: 1 });
     const rawResponse = (typeof result.text === 'string' ? result.text : '').trim();
-
-    // Strip markdown code fences if present
-    const jsonText = rawResponse
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/, '')
-      .trim();
-
-    let parsed: { roleId?: string; name?: string } = {};
-    try {
-      parsed = JSON.parse(jsonText) as { roleId?: string; name?: string };
-    } catch {
-      console.warn('[RoleMatch] Failed to parse JSON response:', rawResponse);
-      return { role: null, name: '' };
-    }
-
-    // Resolve role
-    const roleId = typeof parsed.roleId === 'string' ? parsed.roleId.trim().toLowerCase() : '';
-    let role: AgentRoleEntry | null = null;
-    if (roleId && roleId !== 'none') {
-      role =
-        AGENT_ROLE_CATALOG.find((r) => r.id === roleId) ??
-        AGENT_ROLE_CATALOG.find((r) => roleId.includes(r.id)) ??
-        null;
-    }
-
-    // Resolve name — accept any non-empty string of 2-4 words, trim whitespace.
-    // Strip control/bidi chars first so a model-injected ANSI/RTL byte can't
-    // ride into the sidebar/CLI agent-name display (and doesn't fail validation).
-    const name = typeof parsed.name === 'string' ? stripDisplayUnsafeChars(parsed.name).trim() : '';
-    const nameIsValid = name.length >= 3 && name.length <= 40 && /^\S+(\s\S+)+$/.test(name);
-
-    return { role, name: nameIsValid ? name : '' };
+    return parseRoleMatchResponse(rawResponse);
   } catch (error) {
     console.warn('[RoleMatch] Failed to match agent role:', error);
     return { role: null, name: '' };
   }
+}
+
+/**
+ * Parse the role-matcher model's raw text into a validated {role, name}.
+ * Pure (no I/O) so it can be unit-tested directly. Behavior:
+ *  - strips markdown code fences, then JSON.parse; unparseable → {null, ''}
+ *  - resolves roleId against the catalog: exact id match, then a fuzzy
+ *    `roleId.includes(entry.id)` fallback; 'none'/empty/unmatched → null role
+ *  - name is stripped of control/bidi chars (so a model-injected ANSI/RTL byte
+ *    can't ride into the sidebar/CLI display) and must be 3–40 chars of 2+ words
+ */
+export function parseRoleMatchResponse(
+  rawResponse: string,
+  catalog: readonly AgentRoleEntry[] = AGENT_ROLE_CATALOG,
+): RoleMatchResult {
+  // Strip markdown code fences if present
+  const jsonText = rawResponse
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  let parsed: { roleId?: string; name?: string } = {};
+  try {
+    parsed = JSON.parse(jsonText) as { roleId?: string; name?: string };
+  } catch {
+    console.warn('[RoleMatch] Failed to parse JSON response:', rawResponse);
+    return { role: null, name: '' };
+  }
+
+  // Resolve role
+  const roleId = typeof parsed.roleId === 'string' ? parsed.roleId.trim().toLowerCase() : '';
+  let role: AgentRoleEntry | null = null;
+  if (roleId && roleId !== 'none') {
+    role = catalog.find((r) => r.id === roleId) ?? catalog.find((r) => roleId.includes(r.id)) ?? null;
+  }
+
+  // Resolve name — accept any non-empty string of 2-4 words, trim whitespace.
+  // Strip control/bidi chars first so a model-injected ANSI/RTL byte can't
+  // ride into the sidebar/CLI agent-name display (and doesn't fail validation).
+  const name = typeof parsed.name === 'string' ? stripDisplayUnsafeChars(parsed.name).trim() : '';
+  const nameIsValid = name.length >= 3 && name.length <= 40 && /^\S+(\s\S+)+$/.test(name);
+
+  return { role, name: nameIsValid ? name : '' };
 }
