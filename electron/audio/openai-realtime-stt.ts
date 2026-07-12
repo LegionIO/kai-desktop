@@ -14,6 +14,14 @@
 
 import WebSocket from 'ws';
 
+/**
+ * Gate verbose logging that includes the user's dictated transcript content and
+ * full protocol payloads. Off by default so a user's speech isn't written to the
+ * app's console/stdout (which can be captured/redirected) on every session.
+ * Set KAI_DEBUG_STT=1 to enable when troubleshooting.
+ */
+const STT_DEBUG = !!process.env.KAI_DEBUG_STT;
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface OpenAIRealtimeSttConfig {
@@ -178,14 +186,17 @@ export class OpenAIRealtimeSttSession {
     if (this.state !== 'open' || !this.ws) return;
 
     // Resample to 24kHz if the input is at a different rate (e.g. 16kHz mic capture)
-    const audio = this.config.sampleRate && this.config.sampleRate !== 24000
-      ? resamplePcm16(pcmBase64, this.config.sampleRate, 24000)
-      : pcmBase64;
+    const audio =
+      this.config.sampleRate && this.config.sampleRate !== 24000
+        ? resamplePcm16(pcmBase64, this.config.sampleRate, 24000)
+        : pcmBase64;
 
-    this.ws.send(JSON.stringify({
-      type: 'input_audio_buffer.append',
-      audio,
-    }));
+    this.ws.send(
+      JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio,
+      }),
+    );
   }
 
   /**
@@ -228,7 +239,11 @@ export class OpenAIRealtimeSttSession {
     this.state = 'closed';
 
     if (this.ws) {
-      try { this.ws.close(1000); } catch { /* ignore */ }
+      try {
+        this.ws.close(1000);
+      } catch {
+        /* ignore */
+      }
       this.ws = null;
     }
 
@@ -250,7 +265,11 @@ export class OpenAIRealtimeSttSession {
     this.state = 'closed';
 
     if (this.ws) {
-      try { this.ws.close(1000); } catch { /* ignore */ }
+      try {
+        this.ws.close(1000);
+      } catch {
+        /* ignore */
+      }
       this.ws = null;
     }
 
@@ -324,9 +343,7 @@ export class OpenAIRealtimeSttSession {
     // transcription model (e.g. "gpt-4o-transcribe"), NOT the WebSocket routing
     // model (e.g. "gpt-realtime-whisper"). We default to "gpt-4o-transcribe"
     // but allow override via config if a "transcribe" model is explicitly set.
-    const transcriptionModel = this.config.model.includes('transcribe')
-      ? this.config.model
-      : 'gpt-4o-transcribe';
+    const transcriptionModel = this.config.model.includes('transcribe') ? this.config.model : 'gpt-4o-transcribe';
 
     const transcription: Record<string, unknown> = {
       model: transcriptionModel,
@@ -357,12 +374,18 @@ export class OpenAIRealtimeSttSession {
     };
 
     this.ws.send(JSON.stringify(sessionConfig));
-    console.info('[OpenAI-RTT] Sent session.update (type=transcription, model=%s, language=%s, turn_detection=server_vad)',
-      transcriptionModel, this.config.language ?? 'auto');
-    console.info('[OpenAI-RTT] Full payload: %s', JSON.stringify(sessionConfig));
+    console.info(
+      '[OpenAI-RTT] Sent session.update (type=transcription, model=%s, language=%s, turn_detection=server_vad)',
+      transcriptionModel,
+      this.config.language ?? 'auto',
+    );
+    if (STT_DEBUG) console.info('[OpenAI-RTT] Full payload: %s', JSON.stringify(sessionConfig));
   }
 
   private handleMessage(data: WebSocket.Data): void {
+    // Ignore anything that arrives after teardown — a late server message must
+    // not invoke onPartial/onFinal callbacks against a canceled/destroyed session.
+    if (this.aborted || this.state === 'closed') return;
     let msg: { type?: string; [key: string]: unknown };
     try {
       msg = JSON.parse(String(data));
@@ -373,8 +396,9 @@ export class OpenAIRealtimeSttSession {
     const type = msg.type;
     if (!type) return;
 
-    // Debug: log all received messages for troubleshooting
-    if (type !== 'input_audio_buffer.speech_started' && type !== 'input_audio_buffer.speech_stopped') {
+    // Verbose recv log includes transcript deltas (the user's speech) — gated so
+    // it isn't written to the console on every session by default.
+    if (STT_DEBUG && type !== 'input_audio_buffer.speech_started' && type !== 'input_audio_buffer.speech_stopped') {
       console.info('[OpenAI-RTT] recv: %s %s', type, JSON.stringify(msg).slice(0, 500));
     }
 
@@ -446,10 +470,18 @@ export class OpenAIRealtimeSttSession {
         break;
 
       case 'error': {
-        const errorMsg = String((msg as Record<string, unknown>).message ??
-          (msg as { error?: { message?: string } }).error?.message ?? 'Unknown error');
+        const errorMsg = String(
+          (msg as Record<string, unknown>).message ??
+            (msg as { error?: { message?: string } }).error?.message ??
+            'Unknown error',
+        );
         console.error('[OpenAI-RTT] Server error: %s', errorMsg);
+        // A top-level protocol `error` is fatal for the session — surface it AND
+        // tear the socket down, rather than leaving a half-open WS that keeps
+        // consuming audio no one is transcribing. (Per-segment transcription
+        // failures above are non-fatal and keep the session open.)
         this.handleError(errorMsg);
+        this.failAndClose();
         break;
       }
 
@@ -460,7 +492,36 @@ export class OpenAIRealtimeSttSession {
   }
 
   private handleError(message: string): void {
+    // No-op after teardown so a late error can't fire onError on a
+    // canceled/destroyed session.
+    if (this.aborted) return;
     this.callbacks.onError(message);
+  }
+
+  /**
+   * Tear down on a fatal protocol error: mark aborted, close the socket, and
+   * settle any pending start/stop so callers don't hang. Idempotent.
+   */
+  private failAndClose(): void {
+    if (this.aborted && !this.ws) return;
+    this.aborted = true;
+    this.clearConnectTimeout();
+    this.clearStopTimeout();
+    this.state = 'closed';
+    if (this.ws) {
+      try {
+        this.ws.close(1011);
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+    }
+    if (this.openReject) {
+      this.openReject(new Error('Session failed: fatal server error'));
+      this.openResolve = null;
+      this.openReject = null;
+    }
+    this.resolveStop();
   }
 }
 
