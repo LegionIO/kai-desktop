@@ -251,3 +251,6 @@ export function createMcpManageTool(appHome: string): ToolDefinition {
     },
   };
 }
+
+/** Test-only exposure of the pure secret-redaction helpers. */
+export const __internal = { redactServer, redactUrl, describeServerForApproval };
