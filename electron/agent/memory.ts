@@ -13,7 +13,7 @@ const RESOURCE_ID = __BRAND_RESOURCE_ID;
 
 let sharedMemory: Memory | null | undefined;
 
-function normalizeOpenAIBaseUrl(endpoint?: string): string | undefined {
+export function normalizeOpenAIBaseUrl(endpoint?: string): string | undefined {
   const base = endpoint?.trim()?.replace(/\/+$/, '') ?? '';
   if (!base) return undefined;
   let parsed: URL;
@@ -68,7 +68,7 @@ type EmbeddingResult = {
  *   "https://foo.cognitiveservices.azure.com/openai"   → "https://foo.cognitiveservices.azure.com/openai"
  *   "https://foo.openai.azure.com/openai"              → "https://foo.openai.azure.com/openai"
  */
-function normalizeAzureBaseUrl(endpoint: string): string | undefined {
+export function normalizeAzureBaseUrl(endpoint: string): string | undefined {
   const trimmed = endpoint.trim().replace(/\/+$/, '');
   if (!trimmed) return undefined;
   try {
@@ -212,10 +212,11 @@ export function getSharedMemory(config: AppConfig, dbPath: string): Memory | nul
     // Observational memory config
     let observationalMemory: Record<string, unknown> | false = false;
     if (config.memory.observationalMemory.enabled && openAIProvider) {
-      const obsModelId = config.memory.observationalMemory.deploymentName
-        || config.models.catalog[0]?.deploymentName
-        || config.models.catalog[0]?.modelName
-        || '';
+      const obsModelId =
+        config.memory.observationalMemory.deploymentName ||
+        config.models.catalog[0]?.deploymentName ||
+        config.models.catalog[0]?.modelName ||
+        '';
       if (obsModelId) {
         observationalMemory = {
           model: openAIProvider(obsModelId),
