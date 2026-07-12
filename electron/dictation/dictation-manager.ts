@@ -566,10 +566,11 @@ async function startDictationInner(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
   // Platform-capability seam (#82): "dictation anywhere" — inserting transcribed
-  // text into any app's focused native field — is only supported where the
-  // platform seam says so (macOS today). On win32/linux, refuse honestly here
-  // instead of starting a session that could never insert. `state` is already
-  // idle, so we simply log and return rather than starting a doomed session.
+  // text into any app's focused native field. Supported natively on macOS and
+  // EXPERIMENTALLY on Windows/Linux (ADR-0005), where the manager's helper
+  // vocabulary routes through adapter-bridge → the UIA/AT-SPI adapter. The seam
+  // still refuses on a genuinely-unsupported platform (unknown OS). `state` is
+  // already idle, so we log and return rather than starting a doomed session.
   if (!getDictationPlatform().supportsAnywhereInsertion()) {
     dictationDebugLog('SESSION_REFUSED_UNSUPPORTED_PLATFORM', { platform: process.platform });
     return;

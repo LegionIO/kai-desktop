@@ -22,26 +22,37 @@ export interface DictationPlatform {
   readonly insertionMode: DictationInsertionMode;
   /** True when transcribed text can be inserted into any app's focused field. */
   supportsAnywhereInsertion(): boolean;
+  /** True when insertion works but is unvalidated on this OS (win/linux). The UI
+   *  surfaces an "(experimental)" label + warning; behavior is otherwise live. */
+  readonly experimental: boolean;
 }
 
 class MacosDictationPlatform implements DictationPlatform {
   readonly insertionMode: DictationInsertionMode = 'native-ax';
+  readonly experimental = false;
   supportsAnywhereInsertion(): boolean {
     return true;
   }
 }
 
+// Windows/Linux insertion is fully wired: the dictation manager routes its
+// helper-command vocabulary (postText / deleteBack / applyTextPatch /
+// focusedTextSelection / …) through adapter-bridge → the platform adapter
+// (UIA on Windows, AT-SPI/xdotool on Linux). It runs but is unvalidated on real
+// hardware, so it's EXPERIMENTAL rather than "coming soon" (ADR-0005 posture).
 class WindowsDictationPlatform implements DictationPlatform {
-  readonly insertionMode: DictationInsertionMode = 'unsupported';
+  readonly insertionMode: DictationInsertionMode = 'native-ax';
+  readonly experimental = true;
   supportsAnywhereInsertion(): boolean {
-    return false;
+    return true;
   }
 }
 
 class LinuxDictationPlatform implements DictationPlatform {
-  readonly insertionMode: DictationInsertionMode = 'unsupported';
+  readonly insertionMode: DictationInsertionMode = 'native-ax';
+  readonly experimental = true;
   supportsAnywhereInsertion(): boolean {
-    return false;
+    return true;
   }
 }
 

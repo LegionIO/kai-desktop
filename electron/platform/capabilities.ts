@@ -88,11 +88,12 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
         computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Windows'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        // Dictation-anywhere + dock badges have NO Windows implementation yet
-        // (native AX insertion / taskbar badges are macOS-only). Offering them as
-        // "experimental" would present a toggle that silently no-ops, so they
-        // stay "coming soon" until the native path is built.
-        dictationAnywhere: COMING_SOON('Dictation anywhere', 'Windows'),
+        // Dictation-anywhere IS wired on Windows: the manager routes its helper
+        // vocabulary (postText / applyTextPatch / focusedTextSelection / …)
+        // through adapter-bridge → the UIA adapter. It runs but is unvalidated on
+        // real hardware → experimental (not "coming soon"). dockIcon (taskbar
+        // badges) has no implementation behind the capability, so it stays gated.
+        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Windows'),
         dockIcon: COMING_SOON('Taskbar icon badges', 'Windows'),
       };
     case 'linux':
@@ -100,7 +101,8 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
         computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Linux'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        dictationAnywhere: COMING_SOON('Dictation anywhere', 'Linux'),
+        // Wired via adapter-bridge → the AT-SPI/xdotool adapter → experimental.
+        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Linux'),
         dockIcon: COMING_SOON('Dock icon badges', 'Linux'),
       };
     default:

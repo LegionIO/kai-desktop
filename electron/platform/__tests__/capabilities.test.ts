@@ -47,7 +47,7 @@ describe('getPlatformCapabilities', () => {
     });
   });
 
-  it('marks local computer use EXPERIMENTAL (nut-js runs), keeps browser+capture native, and dictation-anywhere/dock COMING-SOON on win32', () => {
+  it('marks local computer use + dictation-anywhere EXPERIMENTAL (both wired), keeps browser+capture native, dock COMING-SOON on win32', () => {
     const caps = getPlatformCapabilities('win32');
     expect(caps.computerUseBrowser).toEqual({ supported: true });
     expect(caps.dictationCapture).toEqual({ supported: true });
@@ -55,19 +55,21 @@ describe('getPlatformCapabilities', () => {
     expect(caps.computerUseLocal.supported).toBe(true);
     expect(caps.computerUseLocal.experimental).toBe(true);
     expect(caps.computerUseLocal.reason).toMatch(/experimental on Windows/i);
-    // Dictation-anywhere + dock have no Windows implementation → coming-soon
-    // (supported:false), NOT experimental — offering a no-op toggle would mislead.
-    expect(caps.dictationAnywhere.supported).toBe(false);
-    expect(caps.dictationAnywhere.experimental).toBeUndefined();
+    // Dictation-anywhere IS wired (adapter-bridge → UIA adapter) → experimental,
+    // NOT coming-soon. dock badges have no implementation → coming-soon.
+    expect(caps.dictationAnywhere.supported).toBe(true);
+    expect(caps.dictationAnywhere.experimental).toBe(true);
+    expect(caps.dictationAnywhere.reason).toMatch(/experimental on Windows/i);
     expect(caps.dockIcon.supported).toBe(false);
   });
 
-  it('marks the same split on linux (computer-use experimental, dictation/dock coming-soon)', () => {
+  it('marks the same split on linux (computer-use + dictation experimental, dock coming-soon)', () => {
     const caps = getPlatformCapabilities('linux');
     expect(caps.computerUseBrowser).toEqual({ supported: true });
     expect(caps.computerUseLocal).toMatchObject({ supported: true, experimental: true });
     expect(caps.computerUseLocal.reason).toMatch(/experimental on Linux/i);
-    expect(caps.dictationAnywhere.supported).toBe(false);
+    expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
+    expect(caps.dockIcon.supported).toBe(false);
   });
 
   it('an unknown platform is still conservatively unsupported for OS-specific features', () => {
@@ -192,19 +194,23 @@ describe('getHarness routing', () => {
 });
 
 describe('getDictationPlatform', () => {
-  it('macOS supports anywhere insertion via native AX', () => {
+  it('macOS supports anywhere insertion via native AX (not experimental)', () => {
     const p = getDictationPlatform('darwin');
     expect(p.insertionMode).toBe('native-ax');
     expect(p.supportsAnywhereInsertion()).toBe(true);
+    expect(p.experimental).toBe(false);
   });
 
-  it('Windows does not support anywhere insertion yet', () => {
+  it('Windows supports anywhere insertion EXPERIMENTALLY (adapter-bridge → UIA)', () => {
     const p = getDictationPlatform('win32');
-    expect(p.insertionMode).toBe('unsupported');
-    expect(p.supportsAnywhereInsertion()).toBe(false);
+    expect(p.insertionMode).toBe('native-ax');
+    expect(p.supportsAnywhereInsertion()).toBe(true);
+    expect(p.experimental).toBe(true);
   });
 
-  it('Linux does not support anywhere insertion yet', () => {
-    expect(getDictationPlatform('linux').supportsAnywhereInsertion()).toBe(false);
+  it('Linux supports anywhere insertion EXPERIMENTALLY (adapter-bridge → AT-SPI)', () => {
+    const p = getDictationPlatform('linux');
+    expect(p.supportsAnywhereInsertion()).toBe(true);
+    expect(p.experimental).toBe(true);
   });
 });

@@ -306,20 +306,26 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
   const [hotkeyDisplay, setHotkeyDisplay] = useState(dictation.hotkey ?? 'CommandOrControl+Shift+D');
   const [runtimeState, setRuntimeState] = useState<DictationRuntimeState | null>(null);
   const [dictationAnywhereUnsupportedReason, setDictationAnywhereUnsupportedReason] = useState<string | null>(null);
+  const [dictationAnywhereExperimentalReason, setDictationAnywhereExperimentalReason] = useState<string | null>(null);
 
-  // "Dictation anywhere" (inserting into any app's native field via AX) is
-  // macOS-only — there is no Windows/Linux insertion path yet, so the platform
-  // seam reports it unsupported off macOS. Fetch it to show an honest
-  // "coming soon" banner + disable the toggle rather than let a user enable a
-  // feature that would silently no-op. (Local computer use IS experimental on
-  // Win/Linux, but that's a separate capability handled in ComputerUseSettings.)
+  // "Dictation anywhere" (inserting into any app's focused field) is native on
+  // macOS, EXPERIMENTAL on Windows/Linux (the manager routes its helper
+  // vocabulary through adapter-bridge → the UIA/AT-SPI adapter — it runs but is
+  // unvalidated on real hardware, ADR-0005), and unsupported on unknown OSes.
+  // Fetch the capability so we can: disable + "coming soon" a genuinely
+  // unsupported platform, or surface an "(experimental)" note where it runs but
+  // is unproven — rather than silently enabling a doomed toggle.
   useEffect(() => {
     let cancelled = false;
     void app.platform
       .getFeatureCapabilities()
       .then((caps) => {
-        if (!cancelled && caps.dictationAnywhere.supported === false) {
-          setDictationAnywhereUnsupportedReason(caps.dictationAnywhere.reason ?? 'Not available on this platform yet.');
+        if (cancelled) return;
+        const cap = caps.dictationAnywhere;
+        if (cap.supported === false) {
+          setDictationAnywhereUnsupportedReason(cap.reason ?? 'Not available on this platform yet.');
+        } else if (cap.experimental) {
+          setDictationAnywhereExperimentalReason(cap.reason ?? 'Experimental on this platform.');
         }
       })
       .catch(() => {
@@ -475,9 +481,19 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
           </div>
         )}
 
+        {!dictationAnywhereUnsupportedReason && dictationAnywhereExperimentalReason && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <AlertTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>
+              {dictationAnywhereExperimentalReason} It types into the focused field of the active app via the platform
+              accessibility layer; behavior is unvalidated, so please report how it works.
+            </span>
+          </div>
+        )}
+
         <Toggle
           id="dictation.enabled"
-          label="Enable Dictation Anywhere"
+          label={`Enable Dictation Anywhere${dictationAnywhereExperimentalReason && !dictationAnywhereUnsupportedReason ? ' (experimental)' : ''}`}
           checked={(dictation.enabled ?? false) && !dictationAnywhereUnsupportedReason}
           onChange={(v) => void updateConfig('dictation.enabled', v)}
           disabled={!!dictationAnywhereUnsupportedReason}

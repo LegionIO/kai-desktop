@@ -92,13 +92,21 @@ Windows" state. The seam is retained; only the _posture_ changes:
    `dictationCapture` remain plainly supported. An _unknown_ OS is still
    conservatively `supported:false`.
 
-   CORRECTION (2026-07-12): `dictationAnywhere` + `dockIcon` were initially
-   flipped to experimental too, but they have NO Windows/Linux implementation
-   (native AX text insertion / taskbar badges are macOS-only) — an
-   "experimental" toggle would present a control that silently no-ops
-   (dictation-manager hard-returns at its `supportsAnywhereInsertion()` gate). So
-   they are `supported:false` ("coming soon"), not experimental. Experimental
-   means "works but unvalidated," NOT "not built yet."
+   CORRECTION (2026-07-12): `dictationAnywhere` was initially left `supported:false`
+   ("coming soon") on the belief that Windows/Linux text insertion was unbuilt.
+   In fact it IS wired: the dictation manager routes its helper-command
+   vocabulary (`postText` / `deleteBack` / `applyTextPatch` /
+   `focusedTextSelection` / …) through `adapter-bridge` → the platform adapter
+   (UIA on Windows, AT-SPI/xdotool on Linux), which implement
+   `readFocusedTextField` / `writeFocusedTextField` / `typeText` / `pressKeys`.
+   So `dictationAnywhere` is now `EXPERIMENTAL_ON` for win/linux (works, but
+   unvalidated on real hardware) — matching `computerUseLocal`. The
+   `getDictationPlatform()` seam's `supportsAnywhereInsertion()` returns true for
+   win/linux (with `experimental:true`), so the manager no longer hard-returns.
+
+   `dockIcon` genuinely has NO implementation (no code reads the capability;
+   taskbar badges are unbuilt), so it stays `supported:false` ("coming soon").
+   Experimental means "works but unvalidated," NOT "not built yet."
 
 2. `getHarness` no longer routes a local target to `WindowsStubHarness` on
    win32/linux; it attempts the real cross-platform `LocalDesktopHarness`
