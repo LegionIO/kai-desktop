@@ -174,3 +174,39 @@ describe('manualRollback', () => {
     expect(existsSync(join(ROLLBACK, 'entry.js'))).toBe(true); // new current moved in
   });
 });
+
+describe('meta hardening (corrupt/malformed tolerance)', () => {
+  it('treats a truncated/corrupt meta file as defaults (crashCount 0), not a crash', () => {
+    mkdirSync(OTA_ROOT, { recursive: true });
+    writeFileSync(META, '{ "crashCount": 2, "lastStabl'); // truncated JSON (crash mid-write)
+    // A corrupt meta must not read as a high crashCount; it falls back to 0.
+    expect(readCount()).toBe(0);
+  });
+
+  it('coerces a valid-JSON-but-wrong-shape meta to defaults', () => {
+    mkdirSync(OTA_ROOT, { recursive: true });
+    writeFileSync(META, 'null'); // valid JSON, wrong shape — must not crash readMeta
+    expect(readCount()).toBe(0);
+    writeFileSync(META, JSON.stringify({ crashCount: 'not-a-number' }));
+    expect(readCount()).toBe(0); // non-numeric crashCount coerced to 0
+  });
+
+  it('round-trips a well-formed meta unchanged', () => {
+    writeMeta({ crashCount: 1, lastStableVersion: '1.2.3', shellVersion: '9.9', lastStableTimestamp: null });
+    expect(readCount()).toBe(1);
+    expect(getOtaMeta(SLUG).lastStableVersion).toBe('1.2.3');
+  });
+
+  it('persists the crash count atomically across a simulated boot sequence', () => {
+    mkOverlay();
+    // 2 crash boots tolerated (count reaches 2, no rollback yet)
+    expect(checkAndHandleRollback(SLUG, '1.0.0')).toBeNull();
+    expect(checkAndHandleRollback(SLUG, '1.0.0')).toBeNull();
+    expect(readCount()).toBe(2);
+    // 3rd boot rolls back (overlay wiped) and resets the counter
+    const res = checkAndHandleRollback(SLUG, '1.0.0');
+    expect(res).not.toBeNull();
+    expect(existsSync(CURRENT)).toBe(false);
+    expect(readCount()).toBe(0);
+  });
+});

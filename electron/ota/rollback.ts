@@ -6,10 +6,11 @@
  * falls back to the bundled (signed) code.
  */
 
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, readFileSync, rmSync, mkdirSync, renameSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { OtaMeta } from './types.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import {
   OTA_DIR_NAME,
   OTA_CURRENT_DIR,
@@ -38,7 +39,19 @@ function readMeta(otaRoot: string): OtaMeta {
   const metaPath = join(otaRoot, OTA_META_FILE);
   try {
     if (existsSync(metaPath)) {
-      return JSON.parse(readFileSync(metaPath, 'utf-8'));
+      const parsed = JSON.parse(readFileSync(metaPath, 'utf-8')) as unknown;
+      // Schema-validate before trusting it: a valid-JSON-but-wrong-shape file
+      // (e.g. `null`, or a non-numeric crashCount) must not crash the rollback
+      // check or mis-drive the threshold. Coerce/repair into a well-formed meta.
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const p = parsed as Record<string, unknown>;
+        return {
+          crashCount: typeof p.crashCount === 'number' && Number.isFinite(p.crashCount) ? p.crashCount : 0,
+          lastStableVersion: typeof p.lastStableVersion === 'string' ? p.lastStableVersion : null,
+          shellVersion: typeof p.shellVersion === 'string' ? p.shellVersion : '',
+          lastStableTimestamp: typeof p.lastStableTimestamp === 'string' ? p.lastStableTimestamp : null,
+        };
+      }
     }
   } catch {
     // Corrupted meta file — return defaults
@@ -52,13 +65,16 @@ function readMeta(otaRoot: string): OtaMeta {
 }
 
 /**
- * Write the OTA meta file.
+ * Write the OTA meta file atomically (write-temp + rename) so a crash DURING the
+ * write can't leave a truncated file — which readMeta would treat as corrupt and
+ * reset crashCount to 0, letting a persistent crash-loop evade the rollback
+ * threshold indefinitely.
  */
 function writeMeta(otaRoot: string, meta: OtaMeta): void {
   const metaPath = join(otaRoot, OTA_META_FILE);
   try {
     mkdirSync(otaRoot, { recursive: true });
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    atomicWriteFileSync(metaPath, JSON.stringify(meta, null, 2));
   } catch (err) {
     console.error('[ota-rollback] Failed to write meta:', err);
   }
@@ -67,16 +83,21 @@ function writeMeta(otaRoot: string, meta: OtaMeta): void {
 /**
  * Wipe the current OTA overlay, forcing the app to fall back to bundled code.
  * Preserves the rollback directory if it exists (in case we want to inspect it).
+ * Returns true only if the overlay is gone afterward — so the caller doesn't
+ * reset the crash counter (and report a successful rollback) while a broken
+ * overlay actually remains on disk.
  */
-function wipeOverlay(otaRoot: string): void {
+function wipeOverlay(otaRoot: string): boolean {
   const currentDir = join(otaRoot, OTA_CURRENT_DIR);
   try {
     if (existsSync(currentDir)) {
       rmSync(currentDir, { recursive: true, force: true });
       console.info('[ota-rollback] Wiped OTA overlay due to repeated crashes');
     }
+    return !existsSync(currentDir);
   } catch (err) {
     console.error('[ota-rollback] Failed to wipe overlay:', err);
+    return !existsSync(currentDir);
   }
 }
 
@@ -116,7 +137,14 @@ export function checkAndHandleRollback(
   // If we've hit the threshold, wipe the overlay
   if (meta.crashCount >= OTA_MAX_CRASHES) {
     const rolledBackFrom = meta.lastStableVersion ?? 'unknown';
-    wipeOverlay(otaRoot);
+    // Only reset the counter + report success if the overlay is actually gone.
+    // If the wipe failed, keep the elevated count so the next boot retries
+    // rather than resurrecting a broken overlay under a fresh (0) counter.
+    if (!wipeOverlay(otaRoot)) {
+      writeMeta(otaRoot, meta);
+      console.error('[ota-rollback] Overlay wipe did not complete; keeping crash count for retry.');
+      return null;
+    }
     meta.crashCount = 0;
     meta.lastStableVersion = null;
     writeMeta(otaRoot, meta);

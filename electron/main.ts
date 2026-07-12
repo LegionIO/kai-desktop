@@ -316,10 +316,24 @@ process.on('unhandledRejection', (reason) => {
 // Initialize terminal output buffer persistence (must be before any terminal usage)
 initOutputBuffer(APP_HOME);
 
+// ── Single-instance lock (acquired BEFORE the OTA rollback check) ─────────
+// CLI mode never requests the singleton lock — the backend (GUI or headless)
+// owns it. A `false` here also disables the whole backend bootstrap block below.
+// Acquired up here (not later) so the OTA crash-counter is only touched by the
+// process that actually boots the backend: a CLI client or a duplicate GUI
+// launch that loses the lock must NOT increment the counter (three `kai`
+// invocations would otherwise wipe a healthy overlay).
+const gotSingleInstanceLock = IS_CLI ? false : app.requestSingleInstanceLock();
+if (!IS_CLI && !gotSingleInstanceLock) {
+  app.quit();
+}
+
 // ── OTA Bootstrap ────────────────────────────────────────────────────────
 // Check for crash-based rollback BEFORE resolving code paths, so a broken
-// overlay gets wiped before we try to load it.
-const otaRollbackResult = checkAndHandleRollback(__BRAND_APP_SLUG, __APP_VERSION);
+// overlay gets wiped before we try to load it. Only the real backend boot
+// (won the lock, not a CLI client) accounts a crash / can trigger a rollback.
+const otaRollbackResult =
+  !IS_CLI && gotSingleInstanceLock ? checkAndHandleRollback(__BRAND_APP_SLUG, __APP_VERSION) : null;
 if (otaRollbackResult) {
   console.warn(`[OTA] Rolled back from v${otaRollbackResult.rolledBackFrom}: ${otaRollbackResult.reason}`);
 }
@@ -445,13 +459,6 @@ if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
   } catch (err) {
     console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to remap userData for isolated home:`, err);
   }
-}
-
-// CLI mode never requests the singleton lock — the backend (GUI or headless)
-// owns it. A `false` here also disables the whole backend bootstrap block below.
-const gotSingleInstanceLock = IS_CLI ? false : app.requestSingleInstanceLock();
-if (!IS_CLI && !gotSingleInstanceLock) {
-  app.quit();
 }
 
 // Module-level ref for cleanup in before-quit handler
