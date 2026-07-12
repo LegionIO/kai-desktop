@@ -43,6 +43,7 @@ import type {
   AutomationEvent,
 } from './types.js';
 import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandboxed-exec.js';
+import { isExternallyOpenableUrl } from '../utils/safe-external-url.js';
 import { writeAuditEntry } from './audit-log.js';
 import { resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { AppConfig } from '../config/schema.js';
@@ -884,6 +885,12 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     shell: {
       openExternal: (url: string) => {
         requirePermission('navigation:open');
+        // navigation:open means "open a web link" — never let a plugin launch
+        // file://, ms-settings:, or an arbitrary custom OS protocol handler.
+        // Same http/https/mailto allowlist the main window uses (openExternalSafely).
+        if (!isExternallyOpenableUrl(url)) {
+          throw new Error(`Plugin "${manifest.name}" cannot open a non-http(s)/mailto URL: ${url}`);
+        }
         return shell.openExternal(url);
       },
     },
