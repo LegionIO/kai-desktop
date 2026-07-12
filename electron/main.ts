@@ -60,6 +60,7 @@ import { ClaudeAgentRuntime } from './agent/runtime/claude-agent-runtime.js';
 import { CodexRuntime } from './agent/runtime/codex-runtime.js';
 import { PiRuntime } from './agent/runtime/pi-runtime.js';
 import { registerComputerUseHandlers } from './ipc/computer-use.js';
+import { getExistingComputerUseManager } from './computer-use/service.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
@@ -2077,6 +2078,8 @@ app.on('before-quit', () => {
   cleanupMicRecorder();
   cleanupDictation();
   cleanupAppShots();
+  // Stop the computer-use takeover monitor's native helper child (not auto-killed on exit).
+  getExistingComputerUseManager()?.dispose();
   closeAllOverlayWindows();
   taskTerminalManagerRef?.dispose();
   flushOutputBuffers();

@@ -255,13 +255,24 @@ export class ComputerUseOrchestrator {
     const controller = new AbortController();
     this.activeRuns.set(sessionId, controller);
     void this.run(sessionId, controller).finally(() => {
-      this.activeRuns.delete(sessionId);
+      // Compare-and-delete: only clear the map if THIS run is still the active
+      // one. A pause→resume can replace the controller while this (aborted) run
+      // is still settling; an unconditional delete would evict the NEW run's
+      // controller and leave it unstoppable.
+      if (this.activeRuns.get(sessionId) === controller) {
+        this.activeRuns.delete(sessionId);
+      }
     });
   }
 
   pause(sessionId: string): void {
-    this.activeRuns.get(sessionId)?.abort();
-    this.activeRuns.delete(sessionId);
+    const controller = this.activeRuns.get(sessionId);
+    if (!controller) return;
+    controller.abort();
+    // Only delete if still the current controller (mirrors resume's guard).
+    if (this.activeRuns.get(sessionId) === controller) {
+      this.activeRuns.delete(sessionId);
+    }
   }
 
   stop(sessionId: string): void {

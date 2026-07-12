@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { getActiveConversationId } from '../ipc/conversation-store.js';
 import { app, BrowserWindow, Notification, screen } from 'electron';
 import type {
@@ -42,6 +43,17 @@ type SessionMap = Map<string, ComputerSession>;
 type SessionAlertKind = 'completed' | 'failed' | 'takeover';
 
 const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
+
+/**
+ * Shape a computer-use session id MUST match before it is turned into a
+ * filesystem path (persist/remove). Mirrors makeComputerUseId('cs') =
+ * `cs-<Date.now()>-<8 hex>`. Guards the sessionPath chokepoint so a tampered or
+ * corrupt id read back from disk during hydrate() can't redirect a later
+ * writeFile — or the recursive rmSync in removeSession — outside sessionsDir.
+ */
+const SESSION_ID_RE = /^cs-\d+-[0-9a-f]{8}$/;
+export { SESSION_ID_RE };
+
 const SESSION_ALERT_SOUND_BY_KIND: Record<SessionAlertKind, string> = {
   completed: 'Glass',
   failed: 'Basso',
@@ -233,10 +245,16 @@ export class ComputerUseSessionManager extends EventEmitter {
     if (!existsSync(this.sessionsDir)) return;
     for (const entry of readdirSync(this.sessionsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
+      // Skip a dir whose name isn't a well-formed session id — a tampered/foreign
+      // dir must not be hydrated into a session whose id later drives file ops.
+      if (!SESSION_ID_RE.test(entry.name)) continue;
       const sessionPath = join(this.sessionsDir, entry.name, 'session.json');
       if (!existsSync(sessionPath)) continue;
       try {
         const session = normalizeHydratedSession(JSON.parse(readFileSync(sessionPath, 'utf-8')) as ComputerSession);
+        // The stored id must be well-formed AND match the containing directory,
+        // so a file whose JSON body carries a traversal id can't be trusted.
+        if (!SESSION_ID_RE.test(session.id) || session.id !== entry.name) continue;
         this.sessions.set(session.id, session);
       } catch {
         // Ignore malformed session files.
@@ -245,13 +263,18 @@ export class ComputerUseSessionManager extends EventEmitter {
   }
 
   private sessionPath(sessionId: string): string {
+    // Central chokepoint: reject any id that isn't the exact generated shape
+    // before it becomes a path (persistSession write, removeSession rmSync).
+    if (!SESSION_ID_RE.test(sessionId)) {
+      throw new Error(`Refusing to derive a session path from a malformed id: ${JSON.stringify(sessionId)}`);
+    }
     return join(this.sessionsDir, sessionId);
   }
 
   private persistSession(session: ComputerSession): void {
     const dir = this.sessionPath(session.id);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'session.json'), JSON.stringify(session, null, 2), 'utf-8');
+    atomicWriteFileSync(join(dir, 'session.json'), JSON.stringify(session, null, 2));
   }
 
   private emitEvent(event: ComputerUseEvent): void {
@@ -1087,7 +1110,13 @@ export class ComputerUseSessionManager extends EventEmitter {
   removeSession(sessionId: string): void {
     this.stopSession(sessionId);
     this.sessions.delete(sessionId);
-    rmSync(this.sessionPath(sessionId), { recursive: true, force: true });
+    // sessionPath throws on a malformed id; skip the on-disk delete rather than
+    // crash cleanup (a bad id has no legitimate dir to remove anyway).
+    try {
+      rmSync(this.sessionPath(sessionId), { recursive: true, force: true });
+    } catch {
+      /* malformed id or already gone */
+    }
     this.emitEvent({ type: 'session-removed', sessionId });
     this.refreshTakeoverMonitor();
   }
@@ -1119,6 +1148,18 @@ export class ComputerUseSessionManager extends EventEmitter {
       if (session.conversationId === conversationId && session.status === 'completed' && !session.completionSeen) {
         this.upsertSession({ ...session, completionSeen: true, updatedAt: nowIso() });
       }
+    }
+  }
+
+  /**
+   * Tear down process-level resources on app quit. The takeover monitor spawns
+   * a native helper child that is NOT killed automatically when Electron exits,
+   * so it must be stopped explicitly here or it orphans. Idempotent.
+   */
+  dispose(): void {
+    if (this.takeoverMonitorActive) {
+      stopLocalMacosTakeoverMonitor();
+      this.takeoverMonitorActive = false;
     }
   }
 }

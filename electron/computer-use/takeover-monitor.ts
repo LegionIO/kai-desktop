@@ -97,9 +97,11 @@ function startMonitor(listener: Listener): void {
   activeMonitor = monitor;
 
   monitor.process.on('exit', (code, signal) => {
-    if (activeMonitor?.process === monitor.process) {
-      activeMonitor = null;
-    }
+    // A superseded monitor's delayed exit must not schedule a restart: if this
+    // process is no longer the active one (stop→rapid-start replaced it), just
+    // return so we don't spawn an untracked duplicate on top of the new monitor.
+    if (activeMonitor?.process !== monitor.process) return;
+    activeMonitor = null;
     if (!shouldRun) return;
     listener.onError?.(`Local macOS takeover monitor exited (${signal ?? code ?? 'unknown'}).`);
     scheduleRestart();
