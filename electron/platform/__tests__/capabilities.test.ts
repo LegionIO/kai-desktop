@@ -60,7 +60,8 @@ describe('getPlatformCapabilities', () => {
     expect(caps.dictationAnywhere.supported).toBe(true);
     expect(caps.dictationAnywhere.experimental).toBe(true);
     expect(caps.dictationAnywhere.reason).toMatch(/experimental on Windows/i);
-    expect(caps.dockIcon.supported).toBe(false);
+    // Taskbar overlay badge (setOverlayIcon) is now wired → experimental.
+    expect(caps.dockIcon).toMatchObject({ supported: true, experimental: true });
   });
 
   it('marks the same split on linux (computer-use + dictation experimental, dock coming-soon)', () => {
@@ -69,7 +70,7 @@ describe('getPlatformCapabilities', () => {
     expect(caps.computerUseLocal).toMatchObject({ supported: true, experimental: true });
     expect(caps.computerUseLocal.reason).toMatch(/experimental on Linux/i);
     expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
-    expect(caps.dockIcon.supported).toBe(false);
+    expect(caps.dockIcon).toMatchObject({ supported: true, experimental: true });
   });
 
   it('an unknown platform is still conservatively unsupported for OS-specific features', () => {

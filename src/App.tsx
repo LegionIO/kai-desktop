@@ -1577,6 +1577,24 @@ function AppShell() {
   const dockBadgeStyle =
     (config?.ui as { dockBadgeStyle?: 'dot' | 'truncate' | 'full' } | undefined)?.dockBadgeStyle ?? 'dot';
 
+  // Aggregate the "attention" badge across plugin nav items + plugin updates and
+  // push it to the OS app icon (macOS Dock / Windows taskbar overlay / Linux
+  // Unity count). Numeric badges sum into a count; any non-numeric badge sets the
+  // text-present flag (rendered as a dot). Best-effort — main swallows failures.
+  useEffect(() => {
+    const navItems = pluginUIState?.navigationItems ?? [];
+    let count = pluginUpdateCount ?? 0;
+    let hasText = false;
+    for (const item of navItems) {
+      const b = item.badge;
+      if (b == null || b === '' || b === 0) continue;
+      if (typeof b === 'number') count += b;
+      else if (/^\d+$/.test(b)) count += Number.parseInt(b, 10);
+      else hasText = true;
+    }
+    void app.platform.setDockBadge?.({ count, hasText, style: dockBadgeStyle }).catch(() => {});
+  }, [pluginUIState?.navigationItems, pluginUpdateCount, dockBadgeStyle]);
+
   const dockItems: DockItem[] = useMemo(() => {
     // Check if a specific plugin panel dock icon is active
     const pluginPanelActive =

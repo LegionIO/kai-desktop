@@ -466,6 +466,10 @@ const appAPI = {
      *  low-level adapter capabilities returned by `getCapabilities`. */
     getFeatureCapabilities: (): Promise<PlatformCapabilities> =>
       ipcRenderer.invoke('platform:get-feature-capabilities'),
+    /** Push the aggregate attention badge to the OS app icon (macOS Dock /
+     *  Windows taskbar overlay / Linux Unity count). Best-effort. */
+    setDockBadge: (value: { count: number; hasText: boolean; style: 'dot' | 'truncate' | 'full' }): Promise<void> =>
+      ipcRenderer.invoke('ui:set-dock-badge', value),
   },
 
   webServer: {

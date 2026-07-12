@@ -361,6 +361,7 @@ type AppAPI = {
     getCapabilities: () => Promise<{ kind: string; capabilities: AdapterCapabilities }>;
     getPermissions: () => Promise<PlatformPermissions>;
     getFeatureCapabilities: () => Promise<PlatformCapabilities>;
+    setDockBadge: (value: { count: number; hasText: boolean; style: 'dot' | 'truncate' | 'full' }) => Promise<void>;
   };
   appShots: {
     capture: () => Promise<AppShotPayload>;

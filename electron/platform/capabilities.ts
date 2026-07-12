@@ -59,8 +59,10 @@ const EXPERIMENTAL_ON = (feature: string, os: string): CapabilityResult => ({
  * A feature that genuinely does NOT work on this OS yet (no implementation
  * exists), as opposed to EXPERIMENTAL_ON (works but unvalidated). The UI shows a
  * "Coming soon" state and disables the control, rather than offering an
- * experimental toggle that would silently no-op.
+ * experimental toggle that would silently no-op. Kept as the documented
+ * counterpart to EXPERIMENTAL_ON for the next genuinely-unbuilt feature.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const COMING_SOON = (feature: string, os: string): CapabilityResult => ({
   supported: false,
   reason: `${feature} is not available on ${os} yet.`,
@@ -94,7 +96,8 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
         // real hardware → experimental (not "coming soon"). dockIcon (taskbar
         // badges) has no implementation behind the capability, so it stays gated.
         dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Windows'),
-        dockIcon: COMING_SOON('Taskbar icon badges', 'Windows'),
+        // Taskbar overlay badge via BrowserWindow.setOverlayIcon → experimental.
+        dockIcon: EXPERIMENTAL_ON('Taskbar icon badges', 'Windows'),
       };
     case 'linux':
       return {
@@ -103,7 +106,8 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
         dictationCapture: supported(),
         // Wired via adapter-bridge → the AT-SPI/xdotool adapter → experimental.
         dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Linux'),
-        dockIcon: COMING_SOON('Dock icon badges', 'Linux'),
+        // Unity launcher count via app.setBadgeCount → experimental.
+        dockIcon: EXPERIMENTAL_ON('Dock icon badges', 'Linux'),
       };
     default:
       return {
