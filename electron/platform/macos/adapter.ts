@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { shell } from 'electron';
+import { assertPlainAppName } from '../app-name-guard.js';
 import {
   buildDisplayLayout,
   getComputerUsePermissions,
@@ -32,22 +33,9 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-/**
- * Validate an app name before it reaches `open -a` / osascript: name-only, so a
- * bundle can't be launched by path, and no leading dash (option-like). Mirrors
- * the local-macos harness's resolveAppName guard.
- */
-export function assertPlainAppName(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) throw new Error('App name is required.');
-  if (trimmed.includes('/') || trimmed.includes('\\')) {
-    throw new Error(`Refusing an application path; provide a name, not a path: ${trimmed}`);
-  }
-  if (trimmed.startsWith('-')) {
-    throw new Error(`Refusing an application name that begins with '-': ${trimmed}`);
-  }
-  return trimmed;
-}
+// Re-exported for existing importers/tests; the guard now lives in the shared
+// platform/app-name-guard module (used by the Windows adapter too).
+export { assertPlainAppName };
 
 async function runOsascript(script: string, timeout = 5000): Promise<string> {
   const { stdout } = await execFileAsync('/usr/bin/osascript', ['-e', script], { timeout });

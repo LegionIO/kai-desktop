@@ -581,6 +581,19 @@ function Get-ActiveWindowInfo() {
   }
 }
 
+# Reject a path/UNC/drive-relative app name so `Start-Process -FilePath` can only
+# launch a bare, PATH/App-Paths-resolvable application — never an arbitrary
+# executable by path. Defense-in-depth: the adapter validates too, but the
+# execution boundary must be independently safe. Throws on a bad name.
+function Assert-PlainAppName([string]$name) {
+  $n = ($name).Trim()
+  if ([string]::IsNullOrEmpty($n)) { throw 'app name is required' }
+  if ($n.StartsWith('-')) { throw "refusing app name beginning with '-': $n" }
+  if ($n.Contains('/') -or $n.Contains('\') -or $n.Contains(':')) { throw "refusing an application path, expected a name: $n" }
+  foreach ($ch in $n.ToCharArray()) { if ([int]$ch -lt 32 -or [int]$ch -eq 127) { throw 'refusing app name with control characters' } }
+  return $n
+}
+
 # -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
@@ -642,11 +655,12 @@ while ($true) {
       }
       'isFullscreen'   { Respond $id $true @{ fullscreen = [Kai]::IsFullscreen() } $null }
       'exitFullscreen' { [Kai]::PressKeys(@('f11'), 30); Respond $id $true $null $null }
-      'openApp'        { Start-Process -FilePath ([string]$a.name) | Out-Null; Respond $id $true $null $null }
+      'openApp'        { $appName = Assert-PlainAppName ([string]$a.name); Start-Process -FilePath $appName | Out-Null; Respond $id $true $null $null }
       'focusApp' {
-        $p = Get-Process -Name ([string]$a.name) -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+        $appName = Assert-PlainAppName ([string]$a.name)
+        $p = Get-Process -Name $appName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
         if ($p) { [Kai]::Restore($p.MainWindowHandle) | Out-Null; Respond $id $true $null $null }
-        else { Respond $id $false $null "process '$($a.name)' not found" }
+        else { Respond $id $false $null "process '$appName' not found" }
       }
 
       'readTextField' {

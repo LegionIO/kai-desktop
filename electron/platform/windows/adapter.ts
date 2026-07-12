@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { ComputerDisplayLayout } from '../../../shared/computer-use.js';
 import { HelperProcess } from '../helper-process.js';
 import { safeNavigateUrl } from '../safe-url.js';
+import { assertPlainAppName } from '../app-name-guard.js';
 import {
   HelperUnavailable,
   type ActiveWindowInfo,
@@ -147,11 +148,13 @@ export class WindowsAdapter implements NativePlatformAdapter {
   }
 
   async openApp(name: string): Promise<void> {
-    await this.call('openApp', { name });
+    // Name-only: the helper does `Start-Process -FilePath <name>`, which would
+    // launch an arbitrary local/UNC/drive-relative executable if given a path.
+    await this.call('openApp', { name: assertPlainAppName(name) });
   }
 
   async focusApp(name: string): Promise<void> {
-    await this.call('focusApp', { name });
+    await this.call('focusApp', { name: assertPlainAppName(name) });
   }
 
   async openUrl(url: string): Promise<void> {
