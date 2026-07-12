@@ -3,6 +3,7 @@ import type {
   ComputerSession,
   ComputerUseApprovalMode,
   ComputerUseEvent,
+  ComputerUseTarget,
 } from '../../shared/computer-use.js';
 import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../shared/computer-use.js';
 import type { AppConfig } from '../config/schema.js';
@@ -115,7 +116,23 @@ function getMaxRetries(config: AppConfig, session: ComputerSession): number {
   return profile?.maxRetries ?? config.advanced.maxRetries;
 }
 
-function approvalRequired(mode: ComputerUseApprovalMode, action: ComputerActionProposal, config: AppConfig): boolean {
+export function approvalRequired(
+  mode: ComputerUseApprovalMode,
+  action: ComputerActionProposal,
+  config: AppConfig,
+  target: ComputerUseTarget,
+): boolean {
+  // Safety guard for the experimental-on posture (ADR-0005 amendment): a LOCAL
+  // desktop target on Windows/Linux runs the real nut-js harness UNVALIDATED on
+  // that OS. Misdirected global synthetic input (focus/DPI/multi-monitor
+  // differences) could click/type into the wrong app. So when local computer use
+  // is only EXPERIMENTAL on this platform, force per-action approval for local
+  // targets even in `autonomous`/`goal` mode — the user stays in the loop (which
+  // is also the feedback signal) and uncontrolled input can't fire unattended.
+  // The cross-platform isolated-browser target and native macOS are unaffected.
+  const isLocalTarget = target === 'local-macos' || target === 'local-windows';
+  if (isLocalTarget && getPlatformCapabilities().computerUseLocal.experimental) return true;
+
   if (mode === 'autonomous') return false;
   if (mode === 'goal') return action.risk === 'high';
   if (config.computerUse.safety.pauseOnTerminal && action.appName?.toLowerCase().includes('terminal')) return true;
@@ -450,7 +467,12 @@ export class ComputerUseOrchestrator {
           if (controller.signal.aborted) return;
           const currentSession = this.readSession(sessionId);
           if (!currentSession) return;
-          const requiresApproval = approvalRequired(currentSession.approvalMode, proposed, config);
+          const requiresApproval = approvalRequired(
+            currentSession.approvalMode,
+            proposed,
+            config,
+            currentSession.target,
+          );
           const action: ComputerActionProposal = {
             ...proposed,
             requiresApproval,
