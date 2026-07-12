@@ -5,6 +5,13 @@ import type {
   ComputerUseCursorState,
 } from '../../../shared/computer-use.js';
 import { withBrandUserAgent } from '../../utils/user-agent.js';
+import { readCappedArrayBuffer } from '../../utils/ssrf-guard.js';
+
+/** Byte caps for VM responses — a hostile/buggy VM endpoint must not exhaust
+ *  main-process memory. A screenshot-bearing JSON frame is the large case
+ *  (~24 MiB decoded image → base64 in JSON); error bodies are tiny. */
+const MAX_VM_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_VM_ERROR_BODY_BYTES = 64 * 1024;
 
 /**
  * Remote VM protocol (HTTP polling variant):
@@ -105,12 +112,14 @@ function readBoolean(obj: Record<string, unknown>, key: string): boolean | undef
   return typeof value === 'boolean' ? value : undefined;
 }
 
-async function readResponseBody(res: Response): Promise<string> {
-  try {
-    return await res.text();
-  } catch {
-    return '';
-  }
+async function readResponseBody(res: Response, maxBytes: number): Promise<string> {
+  // Bounded read: a hostile/buggy VM returning an unbounded body (e.g. a giant
+  // frame dataBase64) must not exhaust memory. readCappedArrayBuffer streams the
+  // body and throws past maxBytes. Do NOT swallow the error — an abort/transport
+  // failure mid-read must propagate, not be silently converted into an empty
+  // (falsely-successful) response.
+  const buf = await readCappedArrayBuffer(res, maxBytes);
+  return buf.toString('utf-8');
 }
 
 function ensureUrl(baseUrl: string, path: string): string {
@@ -127,7 +136,13 @@ async function withAbortTimeout<T>(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs);
   const onAbort = () => controller.abort(signal?.reason ?? new Error('Aborted'));
-  signal?.addEventListener('abort', onAbort, { once: true });
+  // addEventListener doesn't fire for an ALREADY-aborted signal, so honor it up
+  // front — otherwise a request could start despite the caller having canceled.
+  if (signal?.aborted) {
+    controller.abort(signal.reason ?? new Error('Aborted'));
+  } else {
+    signal?.addEventListener('abort', onAbort, { once: true });
+  }
 
   try {
     return await run(controller.signal);
@@ -414,7 +429,13 @@ export class VmHttpClient {
       });
 
       if (!response.ok) {
-        const bodyText = (await readResponseBody(response)).slice(0, 800);
+        // Best-effort error body (small cap); never let reading it mask the HTTP error.
+        let bodyText = '';
+        try {
+          bodyText = (await readResponseBody(response, MAX_VM_ERROR_BODY_BYTES)).slice(0, 800);
+        } catch {
+          /* ignore — surface the status below regardless */
+        }
         throw new Error(`Remote VM request failed (${response.status} ${response.statusText}) for ${url}: ${bodyText}`);
       }
 
@@ -422,7 +443,7 @@ export class VmHttpClient {
         return {};
       }
 
-      const text = await readResponseBody(response);
+      const text = await readResponseBody(response, MAX_VM_BODY_BYTES);
       if (!text) return {};
 
       try {
