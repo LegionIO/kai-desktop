@@ -29,6 +29,27 @@ describe('buildScopedToolName', () => {
     const long = 'z'.repeat(90);
     expect(buildScopedToolName('plugin', 'p', long)).toBe(buildScopedToolName('plugin', 'p', long));
   });
+
+  it('keeps a short skill scope intact', () => {
+    const name = buildScopedToolName('skill', 'my-skill');
+    expect(name).toBe('skill__my-skill');
+    expect(name.length).toBeLessThanOrEqual(MAX_TOOL_NAME_LENGTH);
+  });
+
+  it('caps a long SKILL name to the length limit (regression: skill branch used to skip the cap)', () => {
+    const name = buildScopedToolName('skill', 'a'.repeat(80));
+    expect(name.length).toBeLessThanOrEqual(MAX_TOOL_NAME_LENGTH);
+    expect(isValidToolName(name)).toBe(true);
+  });
+
+  it('distinct long skill names sharing a prefix do NOT collide after truncation', () => {
+    const base = 'y'.repeat(70);
+    const a = buildScopedToolName('skill', base + 'AAAA');
+    const b = buildScopedToolName('skill', base + 'BBBB');
+    expect(a).not.toBe(b);
+    expect(a.length).toBeLessThanOrEqual(MAX_TOOL_NAME_LENGTH);
+    expect(b.length).toBeLessThanOrEqual(MAX_TOOL_NAME_LENGTH);
+  });
 });
 
 describe('dedupeToolNames', () => {

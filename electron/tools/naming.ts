@@ -36,27 +36,31 @@ export function buildScopedToolName(
   scope: string,
   rawName?: string,
 ): string {
-  if (source === 'skill') return getScopedToolPrefix(source, scope);
+  if (source === 'skill') return capToolNameLength(getScopedToolPrefix(source, scope));
 
   const full = [
     getScopedToolPrefix(source, scope).replace(/__$/, ''),
     sanitizeToolSegment(rawName ?? 'tool', 'tool'),
   ].join('__');
 
-  // Enforce the API tool name length limit. Truncate WITH a short deterministic
-  // hash suffix so two distinct long names that share a 54-char prefix don't
-  // collide (and silently shadow each other when spread into the tool map).
-  if (full.length > MAX_TOOL_NAME_LENGTH) {
-    const suffix = '_' + createHash('sha1').update(full).digest('hex').slice(0, 6);
-    const head = full.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length).replace(/[_-]+$/, '');
-    const truncated = head + suffix;
-    console.warn(
-      `[naming] Tool name exceeds ${MAX_TOOL_NAME_LENGTH}-char limit and was truncated: "${full}" → "${truncated}"`,
-    );
-    return truncated;
-  }
+  return capToolNameLength(full);
+}
 
-  return full;
+/**
+ * Enforce the API tool-name length limit. Truncates WITH a short deterministic
+ * hash suffix so two distinct long names that share a 54-char prefix don't
+ * collide (and silently shadow each other when spread into the tool map). A
+ * name already within the limit is returned unchanged.
+ */
+function capToolNameLength(full: string): string {
+  if (full.length <= MAX_TOOL_NAME_LENGTH) return full;
+  const suffix = '_' + createHash('sha1').update(full).digest('hex').slice(0, 6);
+  const head = full.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length).replace(/[_-]+$/, '');
+  const truncated = head + suffix;
+  console.warn(
+    `[naming] Tool name exceeds ${MAX_TOOL_NAME_LENGTH}-char limit and was truncated: "${full}" → "${truncated}"`,
+  );
+  return truncated;
 }
 
 export function getScopedToolPrefix(source: Extract<ToolSource, 'mcp' | 'skill' | 'plugin'>, scope: string): string {
