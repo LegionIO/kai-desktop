@@ -37,6 +37,7 @@ import { detectPiCli, resolvePiCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
 import { getResolvedProcessEnv } from '../../utils/shell-env.js';
+import { scrubSecretEnv } from './confinement.js';
 
 // ---------------------------------------------------------------------------
 // Capabilities
@@ -101,6 +102,8 @@ type PiModelMapping = {
   args: string[];
   env: Record<string, string>;
   unmappableReason?: string;
+  /** Bedrock via the ambient AWS credential chain — the env scrub must keep AWS_*. */
+  preserveAwsChain?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -184,9 +187,13 @@ export class PiRuntime implements AgentRuntime {
 
     // Env: when the IPC chokepoint pre-built a scrubbed childEnv (confinement
     // enabled), use it as the base — it already excludes app secrets and carries
-    // only the allowlisted vars. Otherwise inherit Kai's resolved env. Either way
-    // overlay the provider-specific API key pi needs (never on argv). Never log.
-    const baseEnv = options.childEnv ?? getResolvedProcessEnv();
+    // only the allowlisted vars. Otherwise inherit Kai's resolved env BUT scrub
+    // the app's secret-bearing keys first (denylist) — pi runs model-directed
+    // shell commands and must not inherit Kai's own provider/credential env even
+    // when confinement is off. Either way overlay the ONE provider key pi needs
+    // (never on argv). Never log.
+    const baseEnv =
+      options.childEnv ?? scrubSecretEnv(getResolvedProcessEnv(), { preserveAwsChain: mapping.preserveAwsChain });
     const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
 
     // -----------------------------------------------------------------------
@@ -294,7 +301,10 @@ export class PiRuntime implements AgentRuntime {
           // string) from a hostile/buggy stream would crash translatePiEvent on
           // `event.type`. Skip it.
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-          for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) yield evt;
+          for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) {
+            if (evt.type === 'error') errorYielded = true;
+            yield evt;
+          }
         }
         // Enforce the per-line cap DURING buffering too: a newline-free hostile
         // line must not grow `buf` up to the whole-turn ceiling. Once the pending
@@ -308,7 +318,10 @@ export class PiRuntime implements AgentRuntime {
         try {
           const parsedTail: unknown = JSON.parse(tail);
           if (parsedTail && typeof parsedTail === 'object' && !Array.isArray(parsedTail)) {
-            for (const evt of translatePiEvent(conversationId, parsedTail as PiEvent)) yield evt;
+            for (const evt of translatePiEvent(conversationId, parsedTail as PiEvent)) {
+              if (evt.type === 'error') errorYielded = true;
+              yield evt;
+            }
           }
         } catch {
           /* ignore */
@@ -327,7 +340,7 @@ export class PiRuntime implements AgentRuntime {
               ? `pi CLI could not be launched (not found at ${piPath}). Reinstall with \`npm i -g @earendil-works/pi-coding-agent\`.`
               : `pi CLI failed to start: ${spawnError.message}`,
         };
-      } else if (!abortSignal?.aborted && exitCode && exitCode !== 0) {
+      } else if (!abortSignal?.aborted && !errorYielded && exitCode && exitCode !== 0) {
         errorYielded = true;
         yield {
           conversationId,
@@ -362,26 +375,30 @@ export class PiRuntime implements AgentRuntime {
 // ---------------------------------------------------------------------------
 
 function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  // NOTE: do NOT early-return when the LEADER (pi) has already exited. The whole
+  // point of a process-GROUP signal is to reap bash grandchildren that the pi
+  // leader spawned and outlived — those survive the leader's exit. Signaling an
+  // already-empty group is a harmless ESRCH (caught below).
   try {
     if (child.pid && process.platform !== 'win32') {
       // Negative pid → signal the entire process group (child was spawned detached).
       process.kill(-child.pid, 'SIGTERM');
+      const pid = child.pid;
       const timer = setTimeout(() => {
         try {
-          if (child.exitCode === null && child.signalCode === null && child.pid) {
-            process.kill(-child.pid, 'SIGKILL');
-          }
+          process.kill(-pid, 'SIGKILL');
         } catch {
-          /* already gone */
+          /* group already gone (ESRCH) */
         }
       }, 2000);
       timer.unref?.();
-    } else {
+    } else if (child.exitCode === null && child.signalCode === null) {
+      // No process group (win32 / no pid): only the leader to signal, and only
+      // if it's still alive.
       child.kill('SIGTERM');
     }
   } catch {
-    /* process already exited */
+    /* process/group already exited */
   }
 }
 
@@ -498,8 +515,13 @@ function buildPiModelArgs(primaryModel: ModelCatalogEntry | null | undefined): P
       break;
     case 'amazon-bedrock':
       if (firstParty) {
-        // No --api-key: rely on pi's ambient AWS credential chain.
-        return { args: ['--provider', 'bedrock', '--model', `bedrock/${mc.modelName}`], env: {} };
+        // No --api-key: rely on pi's ambient AWS credential chain. The env scrub
+        // must therefore KEEP AWS_* (preserveAwsChain), unlike other providers.
+        return {
+          args: ['--provider', 'bedrock', '--model', `bedrock/${mc.modelName}`],
+          env: {},
+          preserveAwsChain: true,
+        };
       }
       break;
     default:

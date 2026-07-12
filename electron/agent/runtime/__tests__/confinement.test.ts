@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildAgentChildEnv } from '../confinement.js';
+import { buildAgentChildEnv, scrubSecretEnv } from '../confinement.js';
 
 // getResolvedProcessEnv overwrites PATH via login-shell resolution; that's
 // orthogonal to the allowlist logic under test, so these assertions focus on
@@ -193,5 +193,107 @@ describe('resolveConfinedCwd', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe('scrubSecretEnv (non-confined denylist)', () => {
+  it('strips app secret-bearing keys but keeps non-secret env', () => {
+    const env = scrubSecretEnv({
+      PATH: '/usr/bin:/bin',
+      HOME: '/home/dev',
+      LANG: 'en_US.UTF-8',
+      GIT_AUTHOR_NAME: 'Dev',
+      MY_APP_MODE: 'prod',
+      ANTHROPIC_API_KEY: 'sk-ant-leak',
+      OPENAI_API_KEY: 'sk-openai-leak',
+      GEMINI_API_KEY: 'gemini-leak',
+      AWS_ACCESS_KEY_ID: 'AKIA_leak',
+      AWS_SECRET_ACCESS_KEY: 'secret_leak',
+      AZURE_OPENAI_KEY: 'azure_leak',
+      GH_TOKEN: 'gho_leak',
+      NPM_TOKEN: 'npm_leak',
+      DATABASE_URL: 'postgres://u:p@h/db',
+      MY_SERVICE_TOKEN: 'tok_leak',
+      SOME_PASSWORD: 'pw_leak',
+      APP_BASE_URL: 'https://internal',
+      SIGNING_PRIVATE_KEY: 'pk_leak',
+    });
+    // non-secret survives
+    expect(env.PATH).toBe('/usr/bin:/bin');
+    expect(env.HOME).toBe('/home/dev');
+    expect(env.LANG).toBe('en_US.UTF-8');
+    expect(env.GIT_AUTHOR_NAME).toBe('Dev');
+    expect(env.MY_APP_MODE).toBe('prod');
+    // every secret pattern stripped
+    for (const k of [
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'GEMINI_API_KEY',
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'AZURE_OPENAI_KEY',
+      'GH_TOKEN',
+      'NPM_TOKEN',
+      'DATABASE_URL',
+      'MY_SERVICE_TOKEN',
+      'SOME_PASSWORD',
+      'APP_BASE_URL',
+      'SIGNING_PRIVATE_KEY',
+    ]) {
+      expect(env[k], `${k} should be stripped`).toBeUndefined();
+    }
+  });
+
+  it('is case-insensitive on key patterns', () => {
+    const env = scrubSecretEnv({ anthropic_api_key: 'x', My_Token: 'y', keep: 'z' });
+    expect(env.anthropic_api_key).toBeUndefined();
+    expect(env.My_Token).toBeUndefined();
+    expect(env.keep).toBe('z');
+  });
+
+  it('drops undefined values and does not mutate the input', () => {
+    const input: NodeJS.ProcessEnv = { A: '1', B: undefined, GH_TOKEN: 'leak' };
+    const out = scrubSecretEnv(input);
+    expect(out.A).toBe('1');
+    expect('B' in out).toBe(false);
+    expect(out.GH_TOKEN).toBeUndefined();
+    // input untouched
+    expect(input.GH_TOKEN).toBe('leak');
+  });
+
+  it('the one provider key overlaid AFTER the scrub survives (caller pattern)', () => {
+    const scrubbed = scrubSecretEnv({ PATH: '/bin', ANTHROPIC_API_KEY: 'parent-leak' });
+    const final = { ...scrubbed, ANTHROPIC_API_KEY: 'selected-key' };
+    expect(final.ANTHROPIC_API_KEY).toBe('selected-key');
+  });
+
+  it('preserveAwsChain keeps AWS_* (ambient Bedrock auth) but still strips other secrets', () => {
+    const env = scrubSecretEnv(
+      {
+        PATH: '/bin',
+        AWS_ACCESS_KEY_ID: 'AKIA_keep',
+        AWS_SECRET_ACCESS_KEY: 'secret_keep',
+        AWS_SESSION_TOKEN: 'sess_keep',
+        AWS_REGION: 'us-east-1',
+        ANTHROPIC_API_KEY: 'still-strip',
+        GH_TOKEN: 'still-strip',
+      },
+      { preserveAwsChain: true },
+    );
+    // AWS chain kept for ambient Bedrock auth
+    expect(env.AWS_ACCESS_KEY_ID).toBe('AKIA_keep');
+    expect(env.AWS_SECRET_ACCESS_KEY).toBe('secret_keep');
+    expect(env.AWS_SESSION_TOKEN).toBe('sess_keep');
+    expect(env.AWS_REGION).toBe('us-east-1');
+    // non-AWS secrets still stripped
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.PATH).toBe('/bin');
+  });
+
+  it('without preserveAwsChain, AWS_* is stripped (default)', () => {
+    const env = scrubSecretEnv({ AWS_ACCESS_KEY_ID: 'strip', PATH: '/bin' });
+    expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+    expect(env.PATH).toBe('/bin');
   });
 });

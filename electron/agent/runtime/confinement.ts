@@ -282,3 +282,74 @@ export function providerKeyEnv(provider: string | undefined, apiKey: string | un
       return {};
   }
 }
+
+/* ── Secret denylist scrub (non-confined child env) ────────────────────── */
+
+/**
+ * Secret-bearing env key patterns. `*` is a single leading/trailing wildcard.
+ * Mirrors the codex/claude runtime denylists so a spawned autonomous CLI never
+ * inherits Kai's own provider/credential env — even when confinement (the
+ * fail-closed allowlist) is OFF. The CLI receives ONLY the one provider key it
+ * needs, overlaid by the caller after this scrub.
+ */
+const SECRET_ENV_DENYLIST: readonly string[] = [
+  '*SECRET*',
+  '*PASSWORD*',
+  '*PASSWD*',
+  '*TOKEN*',
+  '*CREDENTIAL*',
+  '*API_KEY*',
+  '*APIKEY*',
+  '*ACCESS_KEY*',
+  '*PRIVATE_KEY*',
+  '*_KEY',
+  '*_PAT',
+  '*_BASE_URL',
+  'DATABASE_URL',
+  'ANTHROPIC_*',
+  'OPENAI_*',
+  'AWS_*',
+  'AZURE_*',
+  'GOOGLE_*',
+  'GEMINI_*',
+  'GITHUB_*',
+  'GH_*',
+  'NPM_*',
+];
+
+function secretEnvKeyMatches(key: string, pattern: string): boolean {
+  const k = key.toUpperCase();
+  const p = pattern.toUpperCase();
+  const lead = p.startsWith('*');
+  const trail = p.endsWith('*');
+  const core = p.slice(lead ? 1 : 0, trail ? p.length - 1 : p.length);
+  if (lead && trail) return k.includes(core);
+  if (lead) return k.endsWith(core);
+  if (trail) return k.startsWith(core);
+  return k === core;
+}
+
+/**
+ * Return a copy of `env` with the app's secret-bearing keys removed. Use on the
+ * NON-confined path for an autonomous CLI child (confinement off), so its
+ * model-directed shell commands never inherit Kai's secrets. The single
+ * provider key the CLI needs is overlaid by the caller AFTER this scrub.
+ *
+ * `opts.preserveAwsChain` keeps the ambient `AWS_*` credential chain (for a
+ * Bedrock model that authenticates via the environment rather than an explicit
+ * key) — mirrors buildAgentChildEnv's conditional AWS handling. All other secret
+ * patterns are still stripped.
+ */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv, opts: { preserveAwsChain?: boolean } = {}): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    if (opts.preserveAwsChain && key.toUpperCase().startsWith('AWS_')) {
+      out[key] = value;
+      continue;
+    }
+    if (SECRET_ENV_DENYLIST.some((pat) => secretEnvKeyMatches(key, pat))) continue;
+    out[key] = value;
+  }
+  return out;
+}
