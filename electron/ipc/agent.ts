@@ -2639,10 +2639,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
-    // Store answers so the tool's execute() can read them, then approve the tool
-    pendingQuestionAnswers.set(toolCallId, answers);
+    // Only stash answers if there's actually a pending approval to resolve; a
+    // stale toolCallId (already dismissed/aborted) would otherwise leave an
+    // orphaned pendingQuestionAnswers entry that the terminated tool never reads.
     const pending = pendingToolApprovals.get(toolCallId);
     if (pending) {
+      pendingQuestionAnswers.set(toolCallId, answers);
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
     }

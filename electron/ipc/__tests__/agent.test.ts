@@ -241,6 +241,24 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
   });
 
+  it('does NOT stash answers on agent:answer-tool-question when the toolCallId has no pending approval', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+
+    // No pendingToolApprovals entry for this id (already dismissed/aborted).
+    const result = await harness.invoke<{ ok: boolean }>('agent:answer-tool-question', FAKE_EVENT, 'tc-stale', {
+      q1: 'ignored',
+    });
+
+    expect(result).toEqual({ ok: true });
+    // Guard: a stale id must not leave an orphaned answers entry the terminated
+    // tool will never read.
+    expect(pendingQuestionAnswers.has('tc-stale')).toBe(false);
+  });
+
   it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
