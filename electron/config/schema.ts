@@ -268,6 +268,14 @@ const computerUseConfigSchema = z.object({
      * Ignored on macOS (OS TCC gates capture there). Default false = privacy-safe.
      */
     experimentalScreenCaptureConsent: z.boolean().default(false),
+    /**
+     * When false (default), the isolated-browser computer-use harness refuses to
+     * navigate to private / loopback / link-local IP-literal hosts (127.0.0.1,
+     * 10/8, 192.168/16, 169.254/16, ::1, …). A browsing agent steered by
+     * untrusted page content or prompt injection could otherwise probe internal
+     * services on the host's network. Opt in only to drive a local dev server.
+     */
+    isolatedBrowserAllowPrivateNetwork: z.boolean().default(false),
   }),
   localMacos: z.object({
     autoRequestPermissions: z.boolean(),

@@ -9,8 +9,42 @@ import type {
 import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
 import { applyBrandUserAgent } from '../../utils/user-agent.js';
+import { isUrlAllowed } from '../../utils/ssrf-guard.js';
+import type { AppConfig } from '../../config/schema.js';
 
 const windows = new Map<string, BrowserWindow>();
+
+/**
+ * Decide whether the isolated browser may navigate to a model-supplied URL.
+ * Normalizes a bare host to https://, then — unless the user opted into private
+ * network access — refuses private/loopback/link-local IP-literal hosts (via the
+ * shared SSRF guard) AND the localhost hostname family (which resolves to
+ * loopback but isn't an IP literal). A browsing agent steered by untrusted page
+ * content or prompt injection could otherwise probe internal services on the
+ * host's network. Pure + exported for unit tests. (A DNS name that resolves to a
+ * private IP is not caught here — that needs connect-time resolution, matching
+ * the shared guard's contract.)
+ */
+export function checkIsolatedBrowserNavigation(
+  rawUrl: string,
+  allowPrivate: boolean,
+): { ok: true; url: string } | { ok: false; reason: string } {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return { ok: false, reason: 'empty URL' };
+  const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  let host: string;
+  try {
+    host = new URL(normalized).hostname.toLowerCase();
+  } catch {
+    return { ok: false, reason: `invalid URL ${normalized}` };
+  }
+  if (!allowPrivate && (host === 'localhost' || host.endsWith('.localhost'))) {
+    return { ok: false, reason: `private/local network addresses are disabled (${host})` };
+  }
+  const verdict = isUrlAllowed(normalized, allowPrivate);
+  if (!verdict.ok) return { ok: false, reason: verdict.reason };
+  return { ok: true, url: normalized };
+}
 
 type BrowserPoint = {
   x: number;
@@ -102,6 +136,10 @@ function ensureWindow(sessionId: string): BrowserWindow {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      // This window loads fully-untrusted arbitrary web pages. Explicit OS-level
+      // renderer sandbox (belt-and-suspenders over the Electron default) so a
+      // renderer compromise can't reach the main process. No preload needs Node.
+      sandbox: true,
       // Per-session, in-memory partition (NOT `persist:`) so each automation
       // session gets isolated cookies/storage/cache that vanish with the window
       // — no state bleed between targets or into the app's default session.
@@ -713,6 +751,8 @@ async function dispatchChromiumDrag(
 export class IsolatedBrowserHarness implements ComputerHarness {
   readonly target = 'isolated-browser' as const;
 
+  constructor(private readonly getConfig?: () => AppConfig) {}
+
   async initialize(session: ComputerSession): Promise<void> {
     const win = ensureWindow(session.id);
     try {
@@ -1040,9 +1080,13 @@ export class IsolatedBrowserHarness implements ComputerHarness {
     const win = ensureWindow(session.id);
     const url = action.url?.trim();
     if (!url) throw new Error('Navigation requires a URL.');
-    const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    await loadURLWithTimeout(win, normalized);
-    return result(`Navigated to ${normalized}.`);
+    const allowPrivate = this.getConfig?.().computerUse.safety.isolatedBrowserAllowPrivateNetwork ?? false;
+    const decision = checkIsolatedBrowserNavigation(url, allowPrivate);
+    if (!decision.ok) {
+      throw new Error(`Navigation refused: ${decision.reason}`);
+    }
+    await loadURLWithTimeout(win, decision.url);
+    return result(`Navigated to ${decision.url}.`);
   }
 
   async waitForIdle(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {

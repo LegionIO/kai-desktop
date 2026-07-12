@@ -50,7 +50,7 @@ export function getHarness(config: AppConfig, session: ComputerSession, getConfi
     // behavior. macOS uses its native harness for the local-windows alias too.
     return process.platform === 'darwin' ? new LocalMacosHarness(getConfig) : new LocalDesktopHarness(getConfig);
   }
-  return new IsolatedBrowserHarness();
+  return new IsolatedBrowserHarness(getConfig);
 }
 
 function getEntryForRole(
