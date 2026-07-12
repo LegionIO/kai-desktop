@@ -63,20 +63,7 @@ export async function selectReviewers(
       maxOutputTokens: 200,
     });
 
-    // Parse the JSON array from the response
-    const raw = (text ?? '').trim();
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (match) {
-      const ids = JSON.parse(match[0]) as string[];
-      // Validate + DEDUPE: a repeated valid id must not satisfy the quorum
-      // (that would silently shrink the reviewer set below `count`).
-      const availableIds = new Set(availableReviewers.map((a) => a.id));
-      const validIds = [...new Set(ids)].filter((id) => availableIds.has(id));
-      if (validIds.length >= count) return validIds.slice(0, count);
-      // If AI returned fewer valid IDs, supplement with remaining reviewers
-      const remaining = availableReviewers.filter((a) => !validIds.includes(a.id)).slice(0, count - validIds.length);
-      return [...validIds, ...remaining.map((a) => a.id)].slice(0, count);
-    }
+    return selectReviewersFromResponse(text ?? '', availableReviewers, count);
   } catch (err) {
     console.warn('[reviewer-selection] AI selection failed, using fallback:', err);
   }
@@ -85,4 +72,39 @@ export async function selectReviewers(
   return byName()
     .slice(0, count)
     .map((a) => a.id);
+}
+
+/**
+ * Pure parse+validate of the reviewer-selection model output. Extracts the first
+ * JSON array from `text`, keeps only ids that exist in `availableReviewers`,
+ * DEDUPEs (a repeated valid id must not satisfy the quorum and silently shrink
+ * the set), and supplements from the remaining reviewers to reach `count`. On no
+ * match / malformed JSON / too-few valid ids, falls back to the first `count`
+ * reviewers by name. Never mutates the caller array. Exported for unit testing.
+ */
+export function selectReviewersFromResponse(text: string, availableReviewers: AgentFile[], count: number): string[] {
+  const byName = (): string[] =>
+    [...availableReviewers]
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, count)
+      .map((a) => a.id);
+
+  const raw = text.trim();
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) return byName();
+
+  let ids: unknown;
+  try {
+    ids = JSON.parse(match[0]);
+  } catch {
+    return byName();
+  }
+  if (!Array.isArray(ids)) return byName();
+
+  const availableIds = new Set(availableReviewers.map((a) => a.id));
+  const validIds = [...new Set(ids)].filter((id): id is string => typeof id === 'string' && availableIds.has(id));
+  if (validIds.length >= count) return validIds.slice(0, count);
+  // Supplement with remaining reviewers to reach `count`.
+  const remaining = availableReviewers.filter((a) => !validIds.includes(a.id)).slice(0, count - validIds.length);
+  return [...validIds, ...remaining.map((a) => a.id)].slice(0, count);
 }
