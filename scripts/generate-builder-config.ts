@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { branding } from '../branding.config.js';
 import { resolveBranding } from './resolve-branding.js';
-import { stripTopLevelBlock, toYamlSingleQuotedPath } from './builder-config-strip.js';
+import { stripTopLevelBlock, toYamlSingleQuotedPath, shouldStripWindowsTargets } from './builder-config-strip.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -71,8 +71,7 @@ content = content.replace('{{esbuildExtraResources}}', buildEsbuildExtraResource
 // as experimental for feedback). Set KAI_DISABLE_WIN_BUILD to strip them (e.g.
 // a mac-only release). The legacy KAI_ENABLE_WIN_BUILD is still honored as an
 // explicit include, but is no longer required.
-const winBuildDisabled = !!process.env.KAI_DISABLE_WIN_BUILD;
-if (winBuildDisabled) {
+if (shouldStripWindowsTargets()) {
   content = stripTopLevelBlock(content, 'win');
   content = stripTopLevelBlock(content, 'nsis');
   console.info('[generate-builder-config] Windows target stripped (KAI_DISABLE_WIN_BUILD set). See ADR-0005.');

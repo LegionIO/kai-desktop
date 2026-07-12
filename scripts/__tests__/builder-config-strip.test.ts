@@ -9,7 +9,7 @@
  * build — release-breaking.
  */
 import { describe, it, expect } from 'vitest';
-import { stripTopLevelBlock, toYamlSingleQuotedPath } from '../builder-config-strip.js';
+import { stripTopLevelBlock, toYamlSingleQuotedPath, shouldStripWindowsTargets } from '../builder-config-strip.js';
 
 const SAMPLE = `mac:
   category: dev
@@ -92,5 +92,24 @@ describe('toYamlSingleQuotedPath', () => {
 
   it('handles a path with spaces and special chars literally', () => {
     expect(toYamlSingleQuotedPath('/My Apps/kai $x')).toBe("'/My Apps/kai $x'");
+  });
+});
+
+describe('shouldStripWindowsTargets (default-on gate)', () => {
+  it('does NOT strip by default (Windows builds when no env is set)', () => {
+    expect(shouldStripWindowsTargets({})).toBe(false);
+  });
+
+  it('strips only when KAI_DISABLE_WIN_BUILD is set', () => {
+    expect(shouldStripWindowsTargets({ KAI_DISABLE_WIN_BUILD: '1' })).toBe(true);
+  });
+
+  it('the legacy KAI_ENABLE_WIN_BUILD is a no-op (Windows still built without it)', () => {
+    expect(shouldStripWindowsTargets({})).toBe(false); // absent → built
+    expect(shouldStripWindowsTargets({ KAI_ENABLE_WIN_BUILD: '1' })).toBe(false); // present → still built (no-op)
+  });
+
+  it('KAI_DISABLE_WIN_BUILD wins even if the legacy enable is also set', () => {
+    expect(shouldStripWindowsTargets({ KAI_ENABLE_WIN_BUILD: '1', KAI_DISABLE_WIN_BUILD: '1' })).toBe(true);
   });
 });
