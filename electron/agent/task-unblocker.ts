@@ -127,14 +127,21 @@ export async function assessComplexity(task: TaskFile): Promise<boolean> {
     });
 
     const answer = (text ?? '').trim().toUpperCase();
-    // Fail-safe: only a STANDALONE "NO" skips human review. Require the whole
-    // answer to be exactly NO (optionally with trailing punctuation), so
-    // "NONE", "NOT SURE", "NO123", empty, and malformed output all still require
-    // review.
-    const isStandaloneNo = /^NO[.!]?$/.test(answer);
-    return !isStandaloneNo;
+    return assessComplexityFromAnswer(answer);
   } catch (err) {
     console.warn('[task-unblocker] Complexity assessment failed:', err);
     return true; // Conservative fallback
   }
+}
+
+/**
+ * Map the complexity-check model's raw answer to "does this task still require
+ * human review?". Pure + fail-safe: ONLY a standalone "NO" (optionally with
+ * trailing . or !) skips review; "NONE", "NOT SURE", "NO123", empty, and any
+ * other/malformed output all still require review. Exported for unit testing.
+ * Callers pass the already trimmed+uppercased answer.
+ */
+export function assessComplexityFromAnswer(upperTrimmedAnswer: string): boolean {
+  const isStandaloneNo = /^NO[.!]?$/.test(upperTrimmedAnswer);
+  return !isStandaloneNo;
 }
