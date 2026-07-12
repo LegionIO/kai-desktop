@@ -280,9 +280,8 @@ window._mic = {
         let bin = '';
         for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
         const b64 = btoa(bin);
-        // Use require('electron').ipcRenderer since we have nodeIntegration:false
-        // Actually we don't have ipcRenderer here — we need a different way to send to main
-        // We'll store chunks and let main poll them
+        // No IPC from this page (nodeIntegration:false, no preload): buffer the
+        // chunks here and let the main process pull them via drainLiveChunks().
         if (!this._liveChunks) this._liveChunks = [];
         this._liveChunks.push(b64);
       };
@@ -403,7 +402,7 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
     try {
       const win = await ensureRecorderWindow();
       isRecording = false;
-      const result = await win.webContents.executeJavaScript('window._mic.stop()') as {
+      const result = (await win.webContents.executeJavaScript('window._mic.stop()')) as {
         wavBase64?: string;
         durationSec?: number;
         maxAmplitude?: number;
@@ -413,8 +412,12 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
       if (result.error) {
         console.error('[MicRecorder] stop error:', result.error);
       } else if (result.wavBase64) {
-        console.log('[MicRecorder] stop: %d b64 chars, %.2fs, amplitude=%.6f',
-          result.wavBase64.length, result.durationSec ?? 0, result.maxAmplitude ?? 0);
+        console.log(
+          '[MicRecorder] stop: %d b64 chars, %.2fs, amplitude=%.6f',
+          result.wavBase64.length,
+          result.durationSec ?? 0,
+          result.maxAmplitude ?? 0,
+        );
 
         if (result.durationSec && result.durationSec > 0) {
           recordUsageEvent({
@@ -438,7 +441,9 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
     try {
       const win = await ensureRecorderWindow();
       await win.webContents.executeJavaScript('window._mic.cancel()');
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return { ok: true };
   });
 
@@ -467,7 +472,9 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
       if (recorderWindow && !recorderWindow.isDestroyed()) {
         await recorderWindow.webContents.executeJavaScript('window._mic.stopMonitorAll()');
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return { ok: true };
   });
 
@@ -496,7 +503,9 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
       if (recorderWindow && !recorderWindow.isDestroyed()) {
         await recorderWindow.webContents.executeJavaScript('window._mic.stopLiveStream()');
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return { ok: true };
   });
 }
