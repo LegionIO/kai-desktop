@@ -5,7 +5,7 @@ import type {
   ComputerUseEvent,
   ComputerUseTarget,
 } from '../../shared/computer-use.js';
-import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../shared/computer-use.js';
+import { makeComputerUseId, nowIso, primaryDisplayIndex, isRiskyAction } from '../../shared/computer-use.js';
 import type { AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveModelForThread, type ModelCatalogEntry } from '../agent/model-catalog.js';
 import { anthropicPlanSession } from './provider-adapters/anthropic.js';
@@ -134,6 +134,15 @@ export function approvalRequired(
   if (isLocalTarget && getPlatformCapabilities().computerUseLocal.experimental) return true;
 
   if (mode === 'autonomous') return false;
+
+  // Server-side risk FLOOR: the action's `risk`/`requiresApproval` fields come
+  // from the model's own output (provider-adapters/shared.ts), so a model could
+  // self-label an inherently risky action (openApp/focusWindow/pressKeys/
+  // typeText/drag) as 'low' to skip approval. Enforce approval for those kinds
+  // in step + goal modes regardless of the model's self-assessment; the model
+  // can only ever RAISE the requirement, never lower it below this floor.
+  if (isRiskyAction(action.kind)) return true;
+
   if (mode === 'goal') return action.risk === 'high';
   if (config.computerUse.safety.pauseOnTerminal && action.appName?.toLowerCase().includes('terminal')) return true;
   return action.requiresApproval;

@@ -80,3 +80,44 @@ describe('approvalRequired — configured modes on non-experimental platform (da
     expect(approvalRequired('step', action({ appName: 'Terminal' }), termConfig, 'local-macos')).toBe(true);
   });
 });
+
+describe('approvalRequired — server-side risk floor (model cannot downgrade)', () => {
+  // The proposal's risk/requiresApproval come from the model's own output, so a
+  // model must not be able to self-label an inherently risky action as low-risk
+  // to skip approval. openApp/focusWindow/pressKeys/typeText/drag are risky kinds.
+  const RISKY_KINDS = ['openApp', 'focusWindow', 'pressKeys', 'typeText', 'drag'] as const;
+
+  it('forces approval for risky kinds in goal mode even when the model claims risk=low', () => {
+    setPlatform('darwin');
+    for (const kind of RISKY_KINDS) {
+      expect(
+        approvalRequired('goal', action({ kind, risk: 'low', requiresApproval: false }), config, 'isolated-browser'),
+        `${kind} should require approval in goal mode`,
+      ).toBe(true);
+    }
+  });
+
+  it('forces approval for risky kinds in step mode even when the model sets requiresApproval=false', () => {
+    setPlatform('darwin');
+    for (const kind of RISKY_KINDS) {
+      expect(
+        approvalRequired('step', action({ kind, risk: 'low', requiresApproval: false }), config, 'isolated-browser'),
+        `${kind} should require approval in step mode`,
+      ).toBe(true);
+    }
+  });
+
+  it('does NOT change autonomous mode — an explicit no-prompt opt-out still skips (browser/macOS)', () => {
+    setPlatform('darwin');
+    expect(approvalRequired('autonomous', action({ kind: 'openApp', risk: 'low' }), config, 'isolated-browser')).toBe(
+      false,
+    );
+  });
+
+  it('leaves non-risky kinds (click/scroll/navigate/wait) governed by the model risk in goal mode', () => {
+    setPlatform('darwin');
+    expect(approvalRequired('goal', action({ kind: 'click', risk: 'low' }), config, 'isolated-browser')).toBe(false);
+    expect(approvalRequired('goal', action({ kind: 'scroll', risk: 'low' }), config, 'isolated-browser')).toBe(false);
+    expect(approvalRequired('goal', action({ kind: 'navigate', risk: 'high' }), config, 'isolated-browser')).toBe(true);
+  });
+});
