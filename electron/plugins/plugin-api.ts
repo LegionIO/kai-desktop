@@ -1335,12 +1335,45 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       callbacks.registerActionHandler(targetId, handler);
     },
 
-    fetch: ((...args: Parameters<typeof globalThis.fetch>) => {
+    fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
       requirePermission('network:fetch');
       const [input, init] = args;
-      const normalizedInput = input instanceof URL ? input.toString() : input;
+      // network:fetch is a NETWORK grant — it must not double as a local-file
+      // read. Electron's net.fetch honors file:// (and other non-http schemes),
+      // so a plugin could otherwise `fetch('file:///etc/passwd')`. Resolve the
+      // request URL to a canonical string, validate its scheme, and forward that
+      // SAME validated string to net.fetch (never the original object) so what we
+      // check is exactly what gets fetched — no validate-one/use-another gap.
+      // async so all rejections propagate as a rejected Promise (fetch contract),
+      // and TypeError matches what fetch throws for a bad/unsupported request.
+      let urlString: string;
+      let forwardInput: string | Request;
+      if (typeof input === 'string') {
+        urlString = input;
+        forwardInput = input;
+      } else if (input instanceof URL) {
+        urlString = input.toString();
+        forwardInput = urlString;
+      } else if (input instanceof Request) {
+        // A Request's URL is fixed at construction, so validating input.url and
+        // forwarding the same Request can't diverge (unlike String()-coercing an
+        // arbitrary object, which could validate one URL and fetch another).
+        urlString = input.url;
+        forwardInput = input;
+      } else {
+        throw new TypeError(`Plugin "${manifest.name}" fetch: unsupported input; pass a string, URL, or Request.`);
+      }
+      let scheme: string;
+      try {
+        scheme = new URL(urlString).protocol;
+      } catch {
+        throw new TypeError(`Plugin "${manifest.name}" fetch: invalid URL: ${urlString}`);
+      }
+      if (scheme !== 'http:' && scheme !== 'https:') {
+        throw new TypeError(`Plugin "${manifest.name}" fetch is restricted to http(s); refusing "${scheme}" URL.`);
+      }
       return net.fetch(
-        normalizedInput as Parameters<typeof net.fetch>[0],
+        forwardInput as Parameters<typeof net.fetch>[0],
         init as Parameters<typeof net.fetch>[1],
       ) as ReturnType<typeof globalThis.fetch>;
     }) as typeof globalThis.fetch,
