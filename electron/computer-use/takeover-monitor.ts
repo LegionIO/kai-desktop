@@ -31,6 +31,11 @@ export function suppressTakeoverEvents(durationMs: number): void {
   suppressedUntil = Math.max(suppressedUntil, Date.now() + durationMs);
 }
 
+/** True while takeover events are being suppressed (within a suppression window). */
+export function isTakeoverSuppressed(now = Date.now()): boolean {
+  return now < suppressedUntil;
+}
+
 function clearRestartTimer(): void {
   if (restartTimer) {
     clearTimeout(restartTimer);
@@ -59,7 +64,7 @@ function startMonitor(listener: Listener): void {
       if (!shouldRun) return;
       const handle = adapter.startInputMonitor(
         (e) => {
-          if (Date.now() < suppressedUntil) return;
+          if (isTakeoverSuppressed()) return;
           listener.onEvent({
             event: 'takeover',
             kind: e.kind,
@@ -103,6 +108,9 @@ function startMonitor(listener: Listener): void {
 
 export function startLocalMacosTakeoverMonitor(listener: Listener): void {
   shouldRun = true;
+  // Clear any suppression window left over from a prior session so the first
+  // moments of this session aren't blind to a genuine manual takeover.
+  suppressedUntil = 0;
   activeListener = listener;
   if (activeMonitor && activeMonitor.process && !activeMonitor.process.killed) {
     return;
@@ -119,4 +127,7 @@ export function stopLocalMacosTakeoverMonitor(): void {
   activeListener = null;
   activeMonitor?.stop();
   activeMonitor = null;
+  // Reset the suppression window so it can't carry into a later session and
+  // briefly blind takeover detection at that session's start.
+  suppressedUntil = 0;
 }
