@@ -116,6 +116,7 @@ import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
+import { safeReadFileWithin } from './utils/safe-file-read.js';
 
 /**
  * Open a URL in the OS default handler, but ONLY for safe web schemes. Displayed
@@ -1811,16 +1812,18 @@ if (gotSingleInstanceLock) {
       const urlPath = decodeURIComponent(rawPath);
       const filePath = join(mediaDir, urlPath);
 
-      // Security: ensure the resolved path is under the media directory
+      // Security: lexical containment first, then a symlink/TOCTOU-safe read
+      // (realpath re-check + O_NOFOLLOW fd) so a symlink planted inside mediaDir
+      // can't turn this handler into a main-process file-read oracle.
       if (!filePath.startsWith(mediaDir + sep) && filePath !== mediaDir) {
         return new Response('Forbidden', { status: 403 });
       }
 
-      if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      const data = safeReadFileWithin(mediaDir, filePath);
+      if (!data) {
         return new Response('Not Found', { status: 404 });
       }
 
-      const data = readFileSync(filePath);
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
       const mimeTypes: Record<string, string> = {
         png: 'image/png',
@@ -1839,7 +1842,7 @@ if (gotSingleInstanceLock) {
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 
-      return new Response(data, {
+      return new Response(new Uint8Array(data), {
         headers: { 'Content-Type': contentType, 'Cache-Control': 'no-cache' },
       });
     });
