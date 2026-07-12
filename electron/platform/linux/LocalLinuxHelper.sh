@@ -43,6 +43,27 @@ emit_err() { jq -nc --argjson id "$1" --arg err "$2" '{id:$id, ok:false, error:$
 
 json_str() { jq -Rn --arg v "$1" '$v'; }
 
+# Reject anything that could resolve to an arbitrary executable path rather than
+# a bare desktop-entry / PATH name. Mirrors electron/platform/app-name-guard.ts
+# (defense-in-depth: the adapter validates too). Prints the trimmed name on
+# success; on failure prints nothing and returns 1 so the caller emits an error.
+assert_plain_app_name() {
+  local n="$1"
+  # Trim leading/trailing ASCII whitespace.
+  n="${n#"${n%%[![:space:]]*}"}"
+  n="${n%"${n##*[![:space:]]}"}"
+  [ -z "$n" ] && return 1
+  case "$n" in
+    -*) return 1 ;;            # leading dash (option-like)
+    */*|*\\*|*:*) return 1 ;;  # path separators / drive-relative / stream
+  esac
+  # Reject control characters (incl. NUL, tab, newline).
+  case "$n" in
+    *[[:cntrl:]]*) return 1 ;;
+  esac
+  printf '%s' "$n"
+}
+
 # --- input ------------------------------------------------------------------
 
 map_button() {
@@ -382,7 +403,9 @@ while IFS= read -r line; do
     isFullscreen) emit_ok "$id" "$(is_fullscreen_json)" ;;
     openApp)
       n="$(jq -r '.name' <<<"$args")"
-      if have gtk-launch; then
+      if ! n="$(assert_plain_app_name "$n")"; then
+        emit_err "$id" "invalid application name (expected a bare name, not a path)"
+      elif have gtk-launch; then
         if err="$(gtk-launch "$n" 2>&1 >/dev/null)"; then emit_okn "$id"
         else emit_err "$id" "gtk-launch '$n' failed: ${err:-unknown error}"; fi
       elif command -v "$n" >/dev/null 2>&1; then
@@ -394,7 +417,9 @@ while IFS= read -r line; do
       fi ;;
     focusApp)
       n="$(jq -r '.name' <<<"$args")"
-      if [ "$HAVE_WMCTRL" -eq 1 ] && wmctrl -x -a "$n" 2>/dev/null; then emit_okn "$id"
+      if ! n="$(assert_plain_app_name "$n")"; then
+        emit_err "$id" "invalid application name (expected a bare name, not a path)"
+      elif [ "$HAVE_WMCTRL" -eq 1 ] && wmctrl -x -a "$n" 2>/dev/null; then emit_okn "$id"
       elif [ "$HAVE_XDOTOOL" -eq 1 ]; then
         w="$(xdotool search --onlyvisible --classname "$n" 2>/dev/null | head -1)"
         [ -z "$w" ] && w="$(xdotool search --onlyvisible --name "$n" 2>/dev/null | head -1)"

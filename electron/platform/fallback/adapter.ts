@@ -2,6 +2,7 @@ import { screen, shell } from 'electron';
 import type * as NutNS from '@nut-tree-fork/nut-js';
 import type * as ActiveWinNS from 'active-win';
 import type { ComputerDisplayLayout } from '../../../shared/computer-use.js';
+import { assertPlainAppName } from '../app-name-guard.js';
 import {
   HelperUnavailable,
   type ActiveWindowInfo,
@@ -236,10 +237,14 @@ export class FallbackAdapter implements NativePlatformAdapter {
   }
 
   async openApp(name: string): Promise<void> {
-    const error = await shell.openPath(name);
+    // shell.openPath opens via the OS default handler; a full/relative path
+    // would launch an arbitrary target. Require a bare name (chokepoint in
+    // local-desktop.ts already validates, but guard here too).
+    const safe = assertPlainAppName(name);
+    const error = await shell.openPath(safe);
     if (error) {
       throw new HelperUnavailable(
-        `fallback adapter cannot launch '${name}': ${error}. Use the native helper or provide a full executable path.`,
+        `fallback adapter cannot launch '${safe}': ${error}. Install the native helper for reliable app launching.`,
       );
     }
   }

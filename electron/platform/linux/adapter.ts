@@ -6,6 +6,7 @@ import { app, shell } from 'electron';
 import type { ComputerDisplayLayout } from '../../../shared/computer-use.js';
 import { HelperProcess } from '../helper-process.js';
 import { safeNavigateUrl } from '../safe-url.js';
+import { assertPlainAppName } from '../app-name-guard.js';
 import {
   HelperUnavailable,
   type ActiveWindowInfo,
@@ -269,11 +270,13 @@ export class LinuxAdapter implements NativePlatformAdapter {
   }
 
   async openApp(name: string): Promise<void> {
-    await this.call('openApp', { name });
+    // Name-only: the helper falls back to `command -v <name>` + `setsid <name>`,
+    // which would launch an arbitrary executable if given an absolute/relative path.
+    await this.call('openApp', { name: assertPlainAppName(name) });
   }
 
   async focusApp(name: string): Promise<void> {
-    await this.call('focusApp', { name });
+    await this.call('focusApp', { name: assertPlainAppName(name) });
   }
 
   async openUrl(url: string): Promise<void> {

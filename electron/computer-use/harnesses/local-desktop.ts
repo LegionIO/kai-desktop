@@ -9,6 +9,7 @@ import { makeComputerUseId, nowIso, primaryDisplayIndex } from '../../../shared/
 import type { AppConfig } from '../../config/schema.js';
 import { getFallbackAdapter, getPlatformAdapter } from '../../platform/index.js';
 import { getPlatformCapabilities } from '../../platform/capabilities.js';
+import { assertPlainAppName } from '../../platform/app-name-guard.js';
 import type { NativePlatformAdapter } from '../../platform/types.js';
 import { suppressTakeoverEvents } from '../takeover-monitor.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
@@ -371,15 +372,16 @@ export class LocalDesktopHarness implements ComputerHarness {
   }
 
   async openApp(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const name = action.appName?.trim();
-    if (!name) throw new Error('Open app requires appName.');
+    // Validate at the chokepoint: withFallback retries on the fallback adapter
+    // (shell.openPath) if the native adapter throws, so an adapter-level guard
+    // alone would be bypassed when the rejection triggers the fallback.
+    const name = assertPlainAppName(action.appName ?? '');
     await this.withFallback((a) => a.openApp(name));
     return { summary: `Opened ${name}.` };
   }
 
   async focusWindow(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
-    const name = action.appName?.trim();
-    if (!name) throw new Error('Focus window requires appName.');
+    const name = assertPlainAppName(action.appName ?? '');
     await this.withFallback((a) => a.focusApp(name));
     return { summary: `Focused ${name}.` };
   }
