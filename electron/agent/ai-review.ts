@@ -160,3 +160,6 @@ function parseReviewResponse(text: string): AIReviewResult {
     ...(issues && issues.length > 0 ? { issues } : {}),
   };
 }
+
+/** Test-only exposure of the pure parse/truncate helpers. */
+export const __internal = { parseReviewResponse, truncateTerminalOutput };
