@@ -310,3 +310,12 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
   }
   return openai.chat(modelId);
 }
+
+/** Test-only exposure of the pure URL/routing helpers. */
+export const __internal = {
+  stripTrailingSlashes,
+  isAzureOpenAIHost,
+  hasOpenAIV1Path,
+  normalizeOpenAIBaseUrl,
+  isResponsesEndpoint,
+};
