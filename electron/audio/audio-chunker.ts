@@ -29,24 +29,30 @@ const BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
 const BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS; // 32000
 
 /**
+ * The PCM data size to trust: the header's declared size (offset 40) clamped to
+ * what the buffer actually holds. A truncated/malformed WAV whose header claims
+ * more data than is present would otherwise yield wrong durations and empty
+ * trailing chunks; clamping keeps every derived offset/duration honest.
+ */
+function effectiveDataSize(wavBuffer: Buffer): number {
+  if (wavBuffer.length < WAV_HEADER_SIZE) return 0;
+  const declared = wavBuffer.readUInt32LE(40);
+  const available = wavBuffer.length - WAV_HEADER_SIZE;
+  return Math.max(0, Math.min(declared, available));
+}
+
+/**
  * Calculate the duration of a WAV buffer from its header.
  */
 export function calculateWavDuration(wavBuffer: Buffer): number {
-  if (wavBuffer.length < WAV_HEADER_SIZE) return 0;
-  const dataSize = wavBuffer.readUInt32LE(40);
-  return dataSize / BYTES_PER_SEC;
+  return effectiveDataSize(wavBuffer) / BYTES_PER_SEC;
 }
 
 /**
  * Find the best split point near the target offset by looking for
  * a silence window (lowest RMS amplitude) within ±searchWindowSec.
  */
-function findBestSplitPoint(
-  data: Buffer,
-  dataOffset: number,
-  targetOffset: number,
-  searchWindowSec: number,
-): number {
+function findBestSplitPoint(data: Buffer, dataOffset: number, targetOffset: number, searchWindowSec: number): number {
   const searchWindowBytes = Math.floor(searchWindowSec * BYTES_PER_SEC);
   // RMS analysis window: 200ms
   const windowSizeBytes = Math.floor(0.2 * BYTES_PER_SEC);
@@ -123,28 +129,31 @@ function createWavHeader(dataSize: number): Buffer {
  * @param targetDurationSec Target chunk duration in seconds (default: 120 = 2 min)
  * @returns Array of AudioChunk objects, each containing a complete WAV file
  */
-export function chunkWavBuffer(
-  wavBuffer: Buffer,
-  targetDurationSec = 120,
-): AudioChunk[] {
+export function chunkWavBuffer(wavBuffer: Buffer, targetDurationSec = 120): AudioChunk[] {
   if (wavBuffer.length < WAV_HEADER_SIZE) {
     return [];
   }
 
-  const totalDataSize = wavBuffer.readUInt32LE(40);
+  const totalDataSize = effectiveDataSize(wavBuffer);
   const totalDurationSec = totalDataSize / BYTES_PER_SEC;
   const dataStart = WAV_HEADER_SIZE;
-  const targetChunkBytes = Math.floor(targetDurationSec * BYTES_PER_SEC);
+  // Floor the chunk size to a sane minimum (1s of audio) so a tiny/zero/negative
+  // targetDurationSec can't stall the progress guard (which advances by
+  // 0.5 * targetChunkBytes) into an infinite loop OR pathologically many tiny
+  // chunks. Callers pass ~120s; this only guards a bogus argument.
+  const targetChunkBytes = Math.max(BYTES_PER_SEC, Math.floor(targetDurationSec * BYTES_PER_SEC));
 
   // If the recording fits in a single chunk, return as-is
   if (totalDataSize <= targetChunkBytes * 1.5) {
-    return [{
-      wavBuffer,
-      startSec: 0,
-      endSec: totalDurationSec,
-      index: 0,
-      total: 1,
-    }];
+    return [
+      {
+        wavBuffer,
+        startSec: 0,
+        endSec: totalDurationSec,
+        index: 0,
+        total: 1,
+      },
+    ];
   }
 
   const chunks: AudioChunk[] = [];
@@ -171,12 +180,7 @@ export function chunkWavBuffer(
     }
 
     // Find the best split point near the target boundary
-    const splitOffset = findBestSplitPoint(
-      wavBuffer,
-      dataStart,
-      currentOffset + targetChunkBytes,
-      searchWindowSec,
-    );
+    const splitOffset = findBestSplitPoint(wavBuffer, dataStart, currentOffset + targetChunkBytes, searchWindowSec);
 
     // Ensure we make progress (at least half the target chunk)
     const effectiveSplit = Math.max(
@@ -205,8 +209,12 @@ export function chunkWavBuffer(
     chunk.total = total;
   }
 
-  console.log('[AudioChunker] Split %.1fs recording into %d chunks of ~%ds each',
-    totalDurationSec, total, targetDurationSec);
+  console.log(
+    '[AudioChunker] Split %.1fs recording into %d chunks of ~%ds each',
+    totalDurationSec,
+    total,
+    targetDurationSec,
+  );
 
   return chunks;
 }
