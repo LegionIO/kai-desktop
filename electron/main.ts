@@ -1147,7 +1147,7 @@ if (gotSingleInstanceLock) {
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
-    registerPlatformHandlers(ipcMain);
+    registerPlatformHandlers(ipcMain, () => primaryWindowRef);
     registerAppshotHandlers(ipcMain, APP_HOME, getConfig);
     registerDiffHandlers(ipcMain, getConfig);
     // "Install `kai` command in PATH" (VS Code `code`-style). Symlinks/copies the
