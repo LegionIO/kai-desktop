@@ -32,6 +32,23 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Validate an app name before it reaches `open -a` / osascript: name-only, so a
+ * bundle can't be launched by path, and no leading dash (option-like). Mirrors
+ * the local-macos harness's resolveAppName guard.
+ */
+export function assertPlainAppName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error('App name is required.');
+  if (trimmed.includes('/') || trimmed.includes('\\')) {
+    throw new Error(`Refusing an application path; provide a name, not a path: ${trimmed}`);
+  }
+  if (trimmed.startsWith('-')) {
+    throw new Error(`Refusing an application name that begins with '-': ${trimmed}`);
+  }
+  return trimmed;
+}
+
 async function runOsascript(script: string, timeout = 5000): Promise<string> {
   const { stdout } = await execFileAsync('/usr/bin/osascript', ['-e', script], { timeout });
   return stdout.trim();
@@ -203,12 +220,14 @@ export class MacosAdapter implements NativePlatformAdapter {
   }
 
   async openApp(name: string): Promise<void> {
-    await execFileAsync('open', ['-a', name], { timeout: 15000 });
+    await execFileAsync('open', ['-a', assertPlainAppName(name)], { timeout: 15000 });
   }
 
   async focusApp(name: string): Promise<void> {
     const script = 'on run argv\n  tell application (item 1 of argv) to activate\nend run';
-    await execFileAsync('/usr/bin/osascript', ['-e', script, name], { timeout: 15000 });
+    // `--` so the app name is positional argv, never a re-parsed osascript
+    // option (osascript keeps consuming -e/-l after the first -e).
+    await execFileAsync('/usr/bin/osascript', ['-e', script, '--', assertPlainAppName(name)], { timeout: 15000 });
   }
 
   async openUrl(url: string): Promise<void> {

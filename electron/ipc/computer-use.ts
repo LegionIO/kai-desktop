@@ -96,7 +96,9 @@ async function exitFullScreenApps(appNames: string[]): Promise<{ exited: string[
 end run`;
   for (const appName of appNames) {
     try {
-      await execFileAsync('osascript', ['-e', script, appName], { timeout: 5000 });
+      // `--` so a name is positional argv, never re-parsed as an osascript
+      // option (osascript keeps consuming -e/-l after the first -e).
+      await execFileAsync('osascript', ['-e', script, '--', appName], { timeout: 5000 });
       exited.push(appName);
     } catch {
       failed.push(appName);
