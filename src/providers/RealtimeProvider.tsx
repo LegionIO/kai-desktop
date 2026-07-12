@@ -811,3 +811,6 @@ function computePcmLevel(pcmBase64: string): number {
     return 0;
   }
 }
+
+/** Test-only exposure of the pure audio-level helper. */
+export const __internal = { computePcmLevel };
