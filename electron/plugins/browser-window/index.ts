@@ -51,12 +51,19 @@ export function hardenWebviewAttach(webPreferences: Record<string, unknown>, par
   webPreferences.contextIsolation = true;
   webPreferences.sandbox = true;
   webPreferences.webSecurity = true;
+  // Keep the guest on standard, secure web platform behavior: no mixed-content
+  // downgrade, no non-standard/experimental Blink features that widen the
+  // attack surface for an untrusted page.
+  webPreferences.allowRunningInsecureContent = false;
+  webPreferences.experimentalFeatures = false;
+  delete webPreferences.enableBlinkFeatures;
   // Strip tag attributes that would otherwise re-enable Node / inject a preload
   // on the guest regardless of the webPreferences above.
   delete params.nodeintegration;
   delete params.nodeintegrationinsubframes;
   delete params.preload;
   delete params.webpreferences;
+  delete params.enableblinkfeatures;
 }
 
 function isHttpUrl(u: string): boolean {

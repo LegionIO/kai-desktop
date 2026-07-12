@@ -16,6 +16,9 @@ describe('hardenWebviewAttach', () => {
       contextIsolation: false,
       sandbox: false,
       webSecurity: false,
+      allowRunningInsecureContent: true,
+      experimentalFeatures: true,
+      enableBlinkFeatures: 'CSSVariables',
       preload: '/evil/preload.js',
     };
     hardenWebviewAttach(webPreferences, {});
@@ -25,6 +28,9 @@ describe('hardenWebviewAttach', () => {
     expect(webPreferences.contextIsolation).toBe(true);
     expect(webPreferences.sandbox).toBe(true);
     expect(webPreferences.webSecurity).toBe(true);
+    expect(webPreferences.allowRunningInsecureContent).toBe(false);
+    expect(webPreferences.experimentalFeatures).toBe(false);
+    expect('enableBlinkFeatures' in webPreferences).toBe(false);
     expect('preload' in webPreferences).toBe(false);
   });
 
@@ -35,6 +41,7 @@ describe('hardenWebviewAttach', () => {
       nodeintegrationinsubframes: '',
       preload: 'file:///evil.js',
       webpreferences: 'nodeIntegration=yes,contextIsolation=no',
+      enableblinkfeatures: 'CSSVariables',
       partition: 'persist:browser',
     };
     hardenWebviewAttach({}, params);
@@ -42,6 +49,7 @@ describe('hardenWebviewAttach', () => {
     expect('nodeintegrationinsubframes' in params).toBe(false);
     expect('preload' in params).toBe(false);
     expect('webpreferences' in params).toBe(false);
+    expect('enableblinkfeatures' in params).toBe(false);
     // Legitimate attributes are preserved.
     expect(params.src).toBe('https://evil.example');
     expect(params.partition).toBe('persist:browser');
@@ -54,6 +62,8 @@ describe('hardenWebviewAttach', () => {
     expect(webPreferences.nodeIntegration).toBe(false);
     expect(webPreferences.contextIsolation).toBe(true);
     expect(webPreferences.sandbox).toBe(true);
+    expect(webPreferences.allowRunningInsecureContent).toBe(false);
+    expect(webPreferences.experimentalFeatures).toBe(false);
     expect(params.src).toBe('https://ok.example');
   });
 });
