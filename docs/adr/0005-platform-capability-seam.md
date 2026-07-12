@@ -87,11 +87,19 @@ available** so they can try them and give feedback — not an inert "Coming to
 Windows" state. The seam is retained; only the _posture_ changes:
 
 1. `CapabilityResult` gains an optional `experimental?: boolean`. On win32/linux
-   the previously-`supported:false` capabilities (`computerUseLocal`,
-   `dictationAnywhere`, `dockIcon`) are now `{ supported: true, experimental:
-true, reason: '… experimental on <OS> — please report how it behaves.' }`.
-   `computerUseBrowser` + `dictationCapture` remain plainly supported. An
-   _unknown_ OS is still conservatively `supported:false`.
+   `computerUseLocal` is `{ supported: true, experimental: true }` — it genuinely
+   runs (nut-js) so users can try it and report back. `computerUseBrowser` +
+   `dictationCapture` remain plainly supported. An _unknown_ OS is still
+   conservatively `supported:false`.
+
+   CORRECTION (2026-07-12): `dictationAnywhere` + `dockIcon` were initially
+   flipped to experimental too, but they have NO Windows/Linux implementation
+   (native AX text insertion / taskbar badges are macOS-only) — an
+   "experimental" toggle would present a control that silently no-ops
+   (dictation-manager hard-returns at its `supportsAnywhereInsertion()` gate). So
+   they are `supported:false` ("coming soon"), not experimental. Experimental
+   means "works but unvalidated," NOT "not built yet."
+
 2. `getHarness` no longer routes a local target to `WindowsStubHarness` on
    win32/linux; it attempts the real cross-platform `LocalDesktopHarness`
    (nut-js) so users exercise real behavior. `WindowsStubHarness` remains only

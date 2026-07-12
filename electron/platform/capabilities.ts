@@ -56,6 +56,17 @@ const EXPERIMENTAL_ON = (feature: string, os: string): CapabilityResult => ({
 });
 
 /**
+ * A feature that genuinely does NOT work on this OS yet (no implementation
+ * exists), as opposed to EXPERIMENTAL_ON (works but unvalidated). The UI shows a
+ * "Coming soon" state and disables the control, rather than offering an
+ * experimental toggle that would silently no-op.
+ */
+const COMING_SOON = (feature: string, os: string): CapabilityResult => ({
+  supported: false,
+  reason: `${feature} is not available on ${os} yet.`,
+});
+
+/**
  * Resolve the capability set for a platform. Pure — no side effects, no
  * environment reads, and every call returns fresh objects so a caller mutating
  * one result cannot affect another. Unknown platforms are treated
@@ -73,19 +84,24 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
       };
     case 'win32':
       return {
+        // Local computer use genuinely runs (nut-js) on this OS → experimental.
         computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Windows'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Windows'),
-        dockIcon: EXPERIMENTAL_ON('Taskbar icon badges', 'Windows'),
+        // Dictation-anywhere + dock badges have NO Windows implementation yet
+        // (native AX insertion / taskbar badges are macOS-only). Offering them as
+        // "experimental" would present a toggle that silently no-ops, so they
+        // stay "coming soon" until the native path is built.
+        dictationAnywhere: COMING_SOON('Dictation anywhere', 'Windows'),
+        dockIcon: COMING_SOON('Taskbar icon badges', 'Windows'),
       };
     case 'linux':
       return {
         computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Linux'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Linux'),
-        dockIcon: EXPERIMENTAL_ON('Dock icon badges', 'Linux'),
+        dictationAnywhere: COMING_SOON('Dictation anywhere', 'Linux'),
+        dockIcon: COMING_SOON('Dock icon badges', 'Linux'),
       };
     default:
       return {

@@ -47,24 +47,27 @@ describe('getPlatformCapabilities', () => {
     });
   });
 
-  it('marks local computer use + dictation-anywhere + dock as EXPERIMENTAL (not gated) on win32, keeps browser + capture native', () => {
+  it('marks local computer use EXPERIMENTAL (nut-js runs), keeps browser+capture native, and dictation-anywhere/dock COMING-SOON on win32', () => {
     const caps = getPlatformCapabilities('win32');
     expect(caps.computerUseBrowser).toEqual({ supported: true });
     expect(caps.dictationCapture).toEqual({ supported: true });
-    // Experimental-on posture (ADR-0005): available for feedback, flagged.
+    // Local computer use genuinely runs (nut-js) → experimental-on.
     expect(caps.computerUseLocal.supported).toBe(true);
     expect(caps.computerUseLocal.experimental).toBe(true);
     expect(caps.computerUseLocal.reason).toMatch(/experimental on Windows/i);
-    expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
-    expect(caps.dockIcon).toMatchObject({ supported: true, experimental: true });
+    // Dictation-anywhere + dock have no Windows implementation → coming-soon
+    // (supported:false), NOT experimental — offering a no-op toggle would mislead.
+    expect(caps.dictationAnywhere.supported).toBe(false);
+    expect(caps.dictationAnywhere.experimental).toBeUndefined();
+    expect(caps.dockIcon.supported).toBe(false);
   });
 
-  it('marks the same set experimental on linux', () => {
+  it('marks the same split on linux (computer-use experimental, dictation/dock coming-soon)', () => {
     const caps = getPlatformCapabilities('linux');
     expect(caps.computerUseBrowser).toEqual({ supported: true });
     expect(caps.computerUseLocal).toMatchObject({ supported: true, experimental: true });
     expect(caps.computerUseLocal.reason).toMatch(/experimental on Linux/i);
-    expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
+    expect(caps.dictationAnywhere.supported).toBe(false);
   });
 
   it('an unknown platform is still conservatively unsupported for OS-specific features', () => {
