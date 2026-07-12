@@ -475,3 +475,6 @@ export function createRealtimeSettingsTool(appHome: string): ToolDefinition {
     },
   };
 }
+
+/** Test-only exposure of the pure guardrail/redaction/path helpers. */
+export const __internal = { isImmutableToolField, redactSecrets, setNested, getNested };
