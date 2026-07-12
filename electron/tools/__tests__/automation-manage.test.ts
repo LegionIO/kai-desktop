@@ -68,6 +68,15 @@ const benignRule = {
   actions: [{ type: 'notification', title: 'hi' }],
 };
 
+// A NON-hook-triggered rule whose action executes a registered tool. This is a
+// capability grant (the tool can be sh/file/exec), so it must be gated even
+// though it neither triggers on hook events nor uses runHookCommand.
+const toolActionRule = {
+  name: 'run a tool on a plugin event',
+  trigger: { source: 'plugin.foo', event: 'thing' },
+  actions: [{ type: 'tool', toolName: 'sh', input: { command: 'echo {{payload.text}}' } }],
+};
+
 async function run(action: string, extra: Record<string, unknown> = {}) {
   const tool = createAutomationManageTool('/tmp');
   return (await tool.execute({ action, ...extra }, CTX as never)) as Record<string, unknown>;
@@ -107,6 +116,31 @@ describe('automations tool approval gate', () => {
     const res = await run('create', { rule: { ...shellRule, enabled: false } });
     expect(res.error).toMatch(/block/i);
     expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
+  it('block: refuses to create a tool-action rule (executes a registered tool = capability grant)', async () => {
+    freshConfig('block');
+    const res = await run('create', { rule: toolActionRule });
+    expect(res.error).toMatch(/block/i);
+    expect(res.error).toMatch(/tool/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
+  it('prompt-user: gates a tool-action rule and surfaces the tool name in the approval', async () => {
+    freshConfig('prompt-user');
+    approvalDecision = true;
+    const res = await run('create', { rule: toolActionRule });
+    expect(res.success).toBe(true);
+    const evt = broadcastSpy.mock.calls[0][0] as { type: string; args: { toolActions?: string[]; reason?: string } };
+    expect(evt.type).toBe('tool-approval-required');
+    expect(evt.args.toolActions).toEqual(['sh']);
+    expect(evt.args.reason).toMatch(/sh/);
+  });
+
+  it('block: refuses to `test` a tool-action rule (test executes the real action)', async () => {
+    freshConfig('block', [{ id: 'r-tool', enabled: true, conditions: [], conditionMode: 'all', ...toolActionRule }]);
+    const res = await run('test', { id: 'r-tool' });
+    expect(res.error).toMatch(/block/i);
   });
 
   it('prompt-user + approve: prompts then persists', async () => {

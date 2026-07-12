@@ -46,14 +46,32 @@ function hasShellHookAction(rule: Pick<AutomationRule, 'actions'>): boolean {
   return rule.actions.some((a) => a.type === 'runHookCommand');
 }
 
+/** A rule executes a registered tool. A `tool` action can invoke ANY registered
+ *  tool — including model-directed exec tools (sh, file writes) — with the rule's
+ *  interpolated input, on every matching event. That is a capability grant
+ *  equivalent to (or exceeding) a shell hook, so it must clear the same approval
+ *  gate; otherwise the agent could self-grant unattended tool execution by
+ *  writing (or `test`ing) a rule the approval flow never sees. */
+function hasToolAction(rule: Pick<AutomationRule, 'actions'>): boolean {
+  return rule.actions.some((a) => a.type === 'tool');
+}
+
+/** Tool names a rule's `tool` actions would execute (for the approval prompt). */
+function toolActionNames(rule: Pick<AutomationRule, 'actions'>): string[] {
+  return rule.actions
+    .filter((a): a is Extract<AutomationRule['actions'][number], { type: 'tool' }> => a.type === 'tool')
+    .map((a) => a.toolName);
+}
+
 /**
  * A rule is "dangerous" when the AGENT creating/enabling it would gain a
- * powerful capability without the user in the loop: it either subscribes to
- * lifecycle hook events (can observe raw prompts + tool payloads) or runs an
- * arbitrary shell command.
+ * powerful capability without the user in the loop: it subscribes to lifecycle
+ * hook events (can observe raw prompts + tool payloads), runs an arbitrary shell
+ * command, or executes a registered tool (which can itself be a shell/file/exec
+ * tool). All three are gated behind the automations approval policy.
  */
 function isDangerousRule(rule: AutomationRule): boolean {
-  return ruleTriggersOnHookEvents(rule) || hasShellHookAction(rule);
+  return ruleTriggersOnHookEvents(rule) || hasShellHookAction(rule) || hasToolAction(rule);
 }
 
 type ApprovalDecision = { ok: true } | { ok: false; error: string };
@@ -77,7 +95,7 @@ async function ensureApproved(
   if (mode === 'block') {
     return {
       ok: false,
-      error: `Blocked: automations.approvalMode is "block", so the agent cannot ${actionLabel} a rule that observes lifecycle hook events or runs shell commands. The user can change this in Settings → Automations.`,
+      error: `Blocked: automations.approvalMode is "block", so the agent cannot ${actionLabel} a rule that observes lifecycle hook events, runs shell commands, or executes registered tools. The user can change this in Settings → Automations.`,
     };
   }
 
@@ -92,17 +110,35 @@ async function ensureApproved(
   if (!context || !toolCallId || !context.conversationId || !context.abortSignal) {
     return {
       ok: false,
-      error: `Cannot request interactive approval from this context (no live chat). This rule (${actionLabel}) observes lifecycle hook events or runs shell commands and requires user approval. A user must perform this in Settings → Automations, or set automations.approvalMode to "auto-allow".`,
+      error: `Cannot request interactive approval from this context (no live chat). This rule (${actionLabel}) observes lifecycle hook events, runs shell commands, or executes registered tools, and requires user approval. A user must perform this in Settings → Automations, or set automations.approvalMode to "auto-allow".`,
     };
   }
-  // Surface the actual shell commands (command/mode/matcher) so the approval
-  // card shows exactly what will run — summarizeRule reduces actions to type
-  // names, which is not enough to consent to arbitrary shell execution.
+  // Surface the actual shell commands (command/mode/matcher) AND any tool
+  // actions so the approval card shows exactly what will run — summarizeRule
+  // reduces actions to type names, which is not enough to consent to arbitrary
+  // shell/tool execution.
   const shellActions = rule.actions
     .filter(
       (a): a is Extract<AutomationRule['actions'][number], { type: 'runHookCommand' }> => a.type === 'runHookCommand',
     )
     .map((a) => ({ command: a.command, mode: a.mode, matcher: a.matcher ?? '*' }));
+  const toolNames = toolActionNames(rule);
+  const reasonParts: string[] = [];
+  if (shellActions.length) {
+    reasonParts.push(
+      `runs ${shellActions.length === 1 ? 'the shell command' : 'shell commands'}: ${shellActions
+        .map((s) => `\`${s.command}\` (${s.mode})`)
+        .join(', ')}`,
+    );
+  }
+  if (toolNames.length) {
+    reasonParts.push(
+      `executes ${toolNames.length === 1 ? 'the tool' : 'tools'} ${toolNames.map((t) => `\`${t}\``).join(', ')} (which may run shell/file operations)`,
+    );
+  }
+  if (ruleTriggersOnHookEvents(rule)) {
+    reasonParts.push('subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads');
+  }
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
@@ -113,11 +149,8 @@ async function ensureApproved(
       action: actionLabel,
       rule: summarizeRule(rule),
       ...(shellActions.length ? { shellCommands: shellActions } : {}),
-      reason: hasShellHookAction(rule)
-        ? `This rule runs ${shellActions.length === 1 ? 'the shell command' : 'shell commands'}: ${shellActions
-            .map((s) => `\`${s.command}\` (${s.mode})`)
-            .join(', ')}`
-        : 'This rule subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads.',
+      ...(toolNames.length ? { toolActions: toolNames } : {}),
+      reason: `This rule ${reasonParts.join('; ') || 'requires approval'}.`,
     },
   });
   const decision = await registerPendingApproval(toolCallId, context.abortSignal);

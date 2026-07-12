@@ -137,6 +137,21 @@ describe('interpolateString', () => {
       }),
     ).toBe('plugin.msgraph:message-received');
   });
+
+  it('leaves an over-long template literal (avoids the quadratic regex scan)', () => {
+    // 20 KiB of unmatched `{{` would be quadratic to scan; the cap returns it as-is.
+    const huge = '{{'.repeat(10_000); // 20 000 chars > 16 KiB cap
+    const started = Date.now();
+    const out = interpolateString(huge, { payload: {}, result: [] });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(out).toBe(huge); // returned literal, not scanned
+  });
+
+  it('caps a single interpolated value so a huge payload field cannot inflate output', () => {
+    const big = 'x'.repeat(50 * 1024); // 50 KiB value > 32 KiB cap
+    const out = interpolateString('{{payload.v}}', { payload: { v: big }, result: [] });
+    expect(out.length).toBe(32 * 1024);
+  });
 });
 
 describe('executeActions source/event interpolation', () => {

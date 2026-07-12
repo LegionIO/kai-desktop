@@ -50,12 +50,22 @@ export function abortAutomationRun(conversationId: string): boolean {
 }
 
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
+/** Cap the template length: the `{{…}}` regex is quadratic on many unmatched
+ *  `{{`, so a pathological user template shouldn't be able to pin the main
+ *  thread. Templates are user-authored config; a real one is tiny. */
+const MAX_TEMPLATE_BYTES = 16 * 1024;
+/** Cap a single interpolated value so a huge (untrusted) payload field can't
+ *  inflate the output into tool input / notification / prompt. */
+const MAX_INTERPOLATED_VALUE_BYTES = 32 * 1024;
 
 export function interpolateString(template: string, ctx: InterpolationCtx): string {
+  // Over-long template → leave it literal rather than run the quadratic scan.
+  if (template.length > MAX_TEMPLATE_BYTES) return template;
   return template.replace(TEMPLATE_RE, (_, path: string) => {
     const value = getPath(ctx, path.trim());
     if (value === undefined || value === null) return '';
-    return typeof value === 'string' ? value : JSON.stringify(value);
+    const str = typeof value === 'string' ? value : JSON.stringify(value);
+    return str.length > MAX_INTERPOLATED_VALUE_BYTES ? str.slice(0, MAX_INTERPOLATED_VALUE_BYTES) : str;
   });
 }
 
