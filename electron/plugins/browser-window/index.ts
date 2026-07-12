@@ -32,6 +32,33 @@ let downloadIdCounter = 0;
 
 const GUEST_ALLOWED_PERMISSIONS = ['clipboard-read', 'clipboard-sanitized-write'];
 
+/**
+ * Force safe webPreferences on an attaching <webview> guest and strip any tag
+ * attributes that could re-enable Node or inject a preload. Called from the
+ * chrome window's `will-attach-webview` handler (fires before the guest
+ * webContents exists, so it cannot be bypassed by attributes on the tag).
+ * Exported for direct unit testing of the hardening invariants.
+ *
+ * `webPreferences` and `params` are the mutable objects Electron hands the
+ * `will-attach-webview` event; the loose typing mirrors that event's signature.
+ */
+export function hardenWebviewAttach(webPreferences: Record<string, unknown>, params: Record<string, unknown>): void {
+  // A preload here would run inside the untrusted guest — never allow one.
+  delete webPreferences.preload;
+  webPreferences.nodeIntegration = false;
+  webPreferences.nodeIntegrationInSubFrames = false;
+  webPreferences.nodeIntegrationInWorker = false;
+  webPreferences.contextIsolation = true;
+  webPreferences.sandbox = true;
+  webPreferences.webSecurity = true;
+  // Strip tag attributes that would otherwise re-enable Node / inject a preload
+  // on the guest regardless of the webPreferences above.
+  delete params.nodeintegration;
+  delete params.nodeintegrationinsubframes;
+  delete params.preload;
+  delete params.webpreferences;
+}
+
 function isHttpUrl(u: string): boolean {
   return typeof u === 'string' && /^https?:\/\//i.test(u);
 }
@@ -90,6 +117,19 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
   });
 
   win.webContents.on('before-input-event', makeKeyHandler(win));
+
+  // Harden every <webview> the chrome page attaches: it renders UNTRUSTED web
+  // pages, so force safe guest webPreferences and strip anything (a preload, or
+  // an attacker-influenced nodeintegration attribute) that could hand the remote
+  // page Node/RCE. The chrome page itself is app-authored, but this is the
+  // defense-in-depth chokepoint Electron recommends for webview hosts — it fires
+  // BEFORE the guest webContents is created, so it can't be bypassed by tag attrs.
+  win.webContents.on('will-attach-webview', (_event, webPreferences, params) => {
+    hardenWebviewAttach(
+      webPreferences as unknown as Record<string, unknown>,
+      params as unknown as Record<string, unknown>,
+    );
+  });
 
   win.webContents.on('did-attach-webview', (_event, guest) => {
     guestIds.add(guest.id);
