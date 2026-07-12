@@ -66,16 +66,18 @@ for (const [key, value] of Object.entries(resolved)) {
 
 content = content.replace('{{esbuildExtraResources}}', buildEsbuildExtraResourcesBlock());
 
-// Windows build gate (#82 / ADR-0005): the `win`/`nsis` targets are NOT
-// production-ready (no native Windows automation, unvalidated on real Windows
-// hardware) and must not ship by default. Strip both top-level blocks unless
-// KAI_ENABLE_WIN_BUILD is explicitly set, so CI publishes no Windows artifact.
-if (!process.env.KAI_ENABLE_WIN_BUILD) {
+// Windows build gate (#82 / ADR-0005): Windows targets (`win`/`nsis`) are now
+// built BY DEFAULT (experimental-on posture — the app ships win/linux features
+// as experimental for feedback). Set KAI_DISABLE_WIN_BUILD to strip them (e.g.
+// a mac-only release). The legacy KAI_ENABLE_WIN_BUILD is still honored as an
+// explicit include, but is no longer required.
+const winBuildDisabled = !!process.env.KAI_DISABLE_WIN_BUILD;
+if (winBuildDisabled) {
   content = stripTopLevelBlock(content, 'win');
   content = stripTopLevelBlock(content, 'nsis');
-  console.info(
-    '[generate-builder-config] Windows target stripped (set KAI_ENABLE_WIN_BUILD to include it). See ADR-0005.',
-  );
+  console.info('[generate-builder-config] Windows target stripped (KAI_DISABLE_WIN_BUILD set). See ADR-0005.');
+} else {
+  console.info('[generate-builder-config] Windows target INCLUDED (default; set KAI_DISABLE_WIN_BUILD to strip).');
 }
 
 // Warn about any remaining un-replaced placeholders

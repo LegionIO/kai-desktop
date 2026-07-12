@@ -1,11 +1,12 @@
 /**
  * Tests for the electron-builder config generator's pure helpers
  * (scripts/builder-config-strip.ts). The stripTopLevelBlock regex is the
- * ADR-0005 / #82 Windows gate: it must remove the `win` and `nsis` top-level
- * YAML blocks (unless KAI_ENABLE_WIN_BUILD is set) so CI never publishes an
- * unvalidated Windows artifact. A regression that strips the wrong block, leaks
- * the win block, or truncates an adjacent block would either ship Windows by
- * default or break the mac/linux config — both release-breaking.
+ * ADR-0005 / #82 Windows-target strip: Windows (`win`/`nsis`) now builds BY
+ * DEFAULT (experimental-on posture); the generator strips both blocks only when
+ * KAI_DISABLE_WIN_BUILD is set (e.g. a mac-only release). This helper is that
+ * strip. A regression that strips the wrong block, leaks the win block, or
+ * truncates an adjacent block would break the mac/linux config on a disabled
+ * build — release-breaking.
  */
 import { describe, it, expect } from 'vitest';
 import { stripTopLevelBlock, toYamlSingleQuotedPath } from '../builder-config-strip.js';
@@ -57,7 +58,7 @@ describe('stripTopLevelBlock', () => {
     expect(out).toContain('maintainer: x');
   });
 
-  it('strips BOTH win and nsis leaving only mac + linux (the ADR-0005 default gate)', () => {
+  it('strips BOTH win and nsis leaving only mac + linux (KAI_DISABLE_WIN_BUILD opt-out)', () => {
     let out = stripTopLevelBlock(SAMPLE, 'win');
     out = stripTopLevelBlock(out, 'nsis');
     expect(out).not.toContain('win:');

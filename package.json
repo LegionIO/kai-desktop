@@ -23,7 +23,7 @@
     "generate:builder": "tsx scripts/generate-builder-config.ts",
     "generate:dmg-bg": "tsx scripts/generate-dmg-background.ts",
     "build:mac": "pnpm generate:dmg-bg && pnpm build && pnpm generate:builder && electron-builder --mac --publish never --config",
-    "build:win": "node -e \"if(!process.env.KAI_ENABLE_WIN_BUILD){console.error('Windows build is gated off (not production-ready — see ADR-0005). Set KAI_ENABLE_WIN_BUILD=1 to build it.');process.exit(1)}\" && pnpm build && pnpm generate:builder && electron-builder --win --publish never --config",
+    "build:win": "pnpm build && pnpm generate:builder && electron-builder --win --publish never --config",
     "build:linux": "pnpm build && pnpm generate:builder && electron-builder --linux --publish never --config",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",

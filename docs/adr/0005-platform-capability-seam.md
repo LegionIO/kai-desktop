@@ -57,10 +57,12 @@ gating, and the fact that a not-yet-ready Windows build cannot ship.
    web-server bridge). Settings render the local-computer-use control disabled
    with the `reason` when unsupported.
 
-5. **The Windows build is gated off by default.** `generate-builder-config.ts`
-   strips the `win`/`nsis` targets from the generated electron-builder config
-   unless `KAI_ENABLE_WIN_BUILD` is set, so CI publishes no Windows artifact
-   until a real Windows build is validated.
+5. **The Windows build is ON by default (updated 2026-07-12).** Originally the
+   `win`/`nsis` targets were stripped unless `KAI_ENABLE_WIN_BUILD` was set. Per
+   the experimental-on posture (win/linux ship as experimental for feedback),
+   `generate-builder-config.ts` now INCLUDES the Windows targets by default and
+   strips them only when `KAI_DISABLE_WIN_BUILD` is set (e.g. a mac-only
+   release). The legacy `KAI_ENABLE_WIN_BUILD` is now a no-op.
 
 ## Consequences
 
@@ -114,9 +116,9 @@ Windows" state. The seam is retained; only the _posture_ changes:
    for the genuinely-unsupported (unknown-OS) branch.
 3. The UI surfaces an **"Experimental"** label + the `reason` (an amber banner /
    "(experimental)" suffix) instead of disabling the control.
-4. The `KAI_ENABLE_WIN_BUILD` build gate and `release.yml`'s win/linux build
-   jobs are UNCHANGED — release already produces those artifacts; only the
-   per-feature UX posture moved from gated-off to experimental-on.
+4. The Windows build gate now defaults ON (see item 5 below — updated
+   2026-07-12); `release.yml`'s win/linux build jobs already produce those
+   artifacts. The per-feature UX posture is experimental-on.
 
 **Consequence:** on Windows/Linux a local computer-use / dictation-anywhere
 attempt now runs the real nut-js path and may succeed OR surface a real runtime
