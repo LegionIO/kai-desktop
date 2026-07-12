@@ -115,6 +115,20 @@ import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
+import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
+
+/**
+ * Open a URL in the OS default handler, but ONLY for safe web schemes. Displayed
+ * chat content and tool output are partially untrusted, and shell.openExternal
+ * hands the URL to the OS: `file:`/`smb:`/custom-protocol URLs can leak
+ * credentials (NTLM over UNC) or launch registered handlers with attacker-
+ * controlled arguments (see isExternallyOpenableUrl for the threat model).
+ */
+function openExternalSafely(url: string): void {
+  if (isExternallyOpenableUrl(url)) {
+    void shell.openExternal(url);
+  }
+}
 
 /**
  * Resolve the directory used to persist app config, conversations, skills, etc.
@@ -665,7 +679,7 @@ function createWindow(): BrowserWindow {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    openExternalSafely(url);
     return { action: 'deny' };
   });
 
@@ -785,7 +799,7 @@ function createWindow(): BrowserWindow {
       menu.append(
         new MenuItem({
           label: 'Open Link',
-          click: () => shell.openExternal(params.linkURL),
+          click: () => openExternalSafely(params.linkURL),
         }),
       );
       menu.append(
