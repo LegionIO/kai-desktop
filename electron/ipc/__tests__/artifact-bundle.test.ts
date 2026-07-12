@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { artifactBindsReact } from '../artifact-bundle.js';
+import { describe, expect, it, vi } from 'vitest';
+
+// bundleReact resolves react/react-dom from app.getAppPath()/node_modules — in
+// the test env that's the repo root (where React is a real dependency), so the
+// resolve-and-validate path succeeds for React and rejects everything else.
+vi.mock('electron', () => ({ app: { getAppPath: () => process.cwd() } }));
+
+import { artifactBindsReact, __internal } from '../artifact-bundle.js';
+
+const { bundleReact } = __internal;
 
 describe('artifactBindsReact', () => {
   it('detects a default import', () => {
@@ -35,5 +43,47 @@ describe('artifactBindsReact', () => {
 
   it('handles double-quoted and single-quoted specifiers', () => {
     expect(artifactBindsReact('import React from "react";')).toBe(true);
+  });
+});
+
+describe('bundleReact import allowlist (end-to-end esbuild)', () => {
+  it('bundles a real React artifact (react resolves + validates under node_modules)', async () => {
+    const res = await bundleReact('export default function App(){ return <div>hi</div>; }');
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.code.length).toBeGreaterThan(0);
+  });
+
+  it('rejects a non-allowlisted bare package import', async () => {
+    // The import must be USED — esbuild tree-shakes an unused import before it
+    // ever reaches the resolver (so an unused import is harmless anyway).
+    const res = await bundleReact("import fs from 'fs'; export default () => fs.readFileSync('x');");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/not allowed/i);
+  });
+
+  it('rejects a relative import (arbitrary local file)', async () => {
+    const res = await bundleReact("import x from '../../secret'; export default () => x;");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/not allowed/i);
+  });
+
+  it('rejects an absolute-path import', async () => {
+    const res = await bundleReact("import x from '/etc/passwd'; export default () => x;");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/not allowed/i);
+  });
+
+  it('rejects a traversal disguised behind an allowlisted prefix', async () => {
+    // raw specifier reaches onResolve unnormalized → exact-set check rejects it
+    const res = await bundleReact("import x from 'react-dom/../../../etc/passwd'; export default () => x;");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/not allowed/i);
+  });
+
+  it('rejects source exceeding the size cap', async () => {
+    const huge = 'export default () => null;\n' + '//'.padEnd(600 * 1024, 'x');
+    const res = await bundleReact(huge);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/512KB/i);
   });
 });

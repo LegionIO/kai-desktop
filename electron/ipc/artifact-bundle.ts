@@ -197,8 +197,15 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
         {
           name: 'artifact-import-allowlist',
           setup(build) {
-            build.onResolve({ filter: /.*/ }, (args) => {
+            build.onResolve({ filter: /.*/ }, async (args) => {
               if (args.kind === 'entry-point') return null;
+
+              // Recursion guard: our own build.resolve() call below re-enters this
+              // hook. When it does, delegate to esbuild's default resolver (the
+              // path was already allowlisted + is being validated).
+              if ((args.pluginData as { __allowlistResolving?: boolean } | undefined)?.__allowlistResolving) {
+                return null;
+              }
 
               // React's own transitive imports resolve normally — but ONLY when
               // the importer is a real file under the app's OWN node_modules root
@@ -214,14 +221,39 @@ async function bundleReact(source: string): Promise<BundleReactResult> {
               // reach arbitrary files (`../../secret`) or arbitrary packages via
               // `./node_modules/<pkg>` (whose resolved path contains
               // node_modules but is not React).
-              if (IMPORT_ALLOWLIST.has(args.path)) return null;
-              return {
-                errors: [
-                  {
-                    text: `Import of "${args.path}" is not allowed in React artifacts (only 'react', 'react-dom', and 'react-dom/client' may be imported).`,
-                  },
-                ],
-              };
+              if (!IMPORT_ALLOWLIST.has(args.path)) {
+                return {
+                  errors: [
+                    {
+                      text: `Import of "${args.path}" is not allowed in React artifacts (only 'react', 'react-dom', and 'react-dom/client' may be imported).`,
+                    },
+                  ],
+                };
+              }
+
+              // Defense in depth: the name is allowlisted, but WHERE it resolves
+              // is not guaranteed to be React. A tsconfig path-mapping, a symlink,
+              // or a missing local package could resolve `react` to a file OUTSIDE
+              // the app's node_modules. Resolve it ourselves and reject if the
+              // result escapes nodeModulesRoot, so the allowlist can't be turned
+              // into an arbitrary-file read via resolver state.
+              const resolved = await build.resolve(args.path, {
+                kind: args.kind,
+                importer: args.importer,
+                resolveDir: args.resolveDir,
+                pluginData: { __allowlistResolving: true },
+              });
+              if (resolved.errors.length > 0) return resolved;
+              if (!resolved.path.startsWith(nodeModulesRoot)) {
+                return {
+                  errors: [
+                    {
+                      text: `Import of "${args.path}" resolved outside the app's node_modules ("${resolved.path}") and was rejected.`,
+                    },
+                  ],
+                };
+              }
+              return resolved;
             });
           },
         } as EsbuildPlugin,
@@ -246,3 +278,6 @@ export function registerArtifactBundleHandlers(ipcMain: IpcMain): void {
     return bundleReact(source as string);
   });
 }
+
+/** Test-only exposure of the bundler for end-to-end import-allowlist coverage. */
+export const __internal = { bundleReact };
