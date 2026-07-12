@@ -149,7 +149,6 @@ function resolveExplicitMode(
   preferred: RuntimeId,
   available: Set<string>,
 ): RuntimeResolution {
-
   // Runtime not available.
   if (!available.has(preferred)) {
     const isBuiltInRuntime = preferred === 'mastra' || preferred === 'claude-agent-sdk' || preferred === 'codex-sdk';
@@ -221,9 +220,14 @@ function resolveExplicitMode(
       // failing inside the Claude Code runtime.
       const rawEntry = config.models.catalog.find((m) => m.key === model.key);
       const providerKey = rawEntry?.provider ?? '';
-      const isBuiltInProvider = providerKey === 'anthropic' || providerKey === 'amazon-bedrock'
-        || providerKey === 'openai' || providerKey === 'google' || providerKey === 'gemini'
-        || providerKey === 'ollama' || providerKey === 'bedrock';
+      const isBuiltInProvider =
+        providerKey === 'anthropic' ||
+        providerKey === 'amazon-bedrock' ||
+        providerKey === 'openai' ||
+        providerKey === 'google' ||
+        providerKey === 'gemini' ||
+        providerKey === 'ollama' ||
+        providerKey === 'bedrock';
       if (!isBuiltInProvider) {
         return {
           runtimeId: 'claude-agent-sdk',
@@ -276,27 +280,27 @@ function extractModelAuth(model: ModelCatalogEntry): ModelAuth {
  * Anthropic or Bedrock provider. This handles the enterprise gateway case
  * where the same model is registered under both OpenAI and Anthropic endpoints.
  */
-function crossReferenceAnthropicProvider(
-  modelName: string,
-  config: AppConfig,
-): ModelAuth | null {
+function crossReferenceAnthropicProvider(modelName: string, config: AppConfig): ModelAuth | null {
   const catalog = resolveModelCatalog(config);
 
+  const isAnthropicMatch = (entry: (typeof catalog.entries)[number]): boolean =>
+    entry.modelConfig.modelName === modelName &&
+    (entry.modelConfig.provider === 'anthropic' || entry.modelConfig.provider === 'amazon-bedrock');
 
-  for (const entry of catalog.entries) {
-    if (
-      entry.modelConfig.modelName === modelName &&
-      (entry.modelConfig.provider === 'anthropic' || entry.modelConfig.provider === 'amazon-bedrock')
-    ) {
-      return {
-        modelName: entry.modelConfig.modelName,
-        baseUrl: stripV1Suffix(entry.modelConfig.endpoint),
-        apiKey: entry.modelConfig.apiKey,
-      };
-    }
-  }
-
-  return null;
+  // `modelName` is provider-scoped, not globally unique — two Anthropic/Bedrock
+  // providers can expose the same `claude-*` name. Prefer a match that actually
+  // carries a credential so a keyless duplicate entry can't shadow a configured
+  // one (which would route to an endpoint with no key). Catalog order is the
+  // tiebreaker among usable matches. Key + endpoint always stay paired from the
+  // SAME entry (no cross-provider credential mixing).
+  const usable = catalog.entries.find((e) => isAnthropicMatch(e) && !!e.modelConfig.apiKey);
+  const entry = usable ?? catalog.entries.find(isAnthropicMatch);
+  if (!entry) return null;
+  return {
+    modelName: entry.modelConfig.modelName,
+    baseUrl: stripV1Suffix(entry.modelConfig.endpoint),
+    apiKey: entry.modelConfig.apiKey,
+  };
 }
 
 /**
@@ -313,10 +317,15 @@ function stripV1Suffix(url: string): string {
 
 function providerTypeLabel(type: LLMProviderType): string {
   switch (type) {
-    case 'openai-compatible': return 'an OpenAI-compatible';
-    case 'anthropic': return 'an Anthropic';
-    case 'amazon-bedrock': return 'an Amazon Bedrock';
-    case 'google': return 'a Google';
-    default: return `a ${type}`;
+    case 'openai-compatible':
+      return 'an OpenAI-compatible';
+    case 'anthropic':
+      return 'an Anthropic';
+    case 'amazon-bedrock':
+      return 'an Amazon Bedrock';
+    case 'google':
+      return 'a Google';
+    default:
+      return `a ${type}`;
   }
 }

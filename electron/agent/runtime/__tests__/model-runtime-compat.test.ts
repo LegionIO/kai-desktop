@@ -110,3 +110,57 @@ describe('resolveRuntimeForModel — provider/runtime resolution', () => {
     expect(resolution.runtimeId).toBe('mastra');
   });
 });
+
+describe('crossReferenceAnthropicProvider — prefers a keyed entry (via resolveRuntimeForModel)', () => {
+  // An openai-compatible `claude-*` model whose modelName ALSO exists under two
+  // Anthropic providers: a catalog-FIRST keyless one and a later keyed one. The
+  // cross-reference must route claude-agent-sdk to the KEYED entry so a keyless
+  // duplicate can't shadow it (which would hit an endpoint with no credential).
+  function makeDupConfig(): AppConfig {
+    return {
+      agent: { runtime: 'auto' },
+      advanced: { temperature: 0.7, maxSteps: 25, maxRetries: 2 },
+      models: {
+        defaultModelKey: 'gw-claude',
+        providers: {
+          gateway: { type: 'openai-compatible', endpoint: 'https://gw.example/v1', apiKey: 'gw-key' },
+          anthropicKeyless: { type: 'anthropic', endpoint: 'https://a1.example/v1', apiKey: '' },
+          anthropicKeyed: { type: 'anthropic', endpoint: 'https://a2.example/v1', apiKey: 'real-anthropic-key' },
+        },
+        catalog: [
+          { key: 'gw-claude', provider: 'gateway', modelName: 'claude-sonnet-4' },
+          { key: 'a1-claude', provider: 'anthropicKeyless', modelName: 'claude-sonnet-4' },
+          { key: 'a2-claude', provider: 'anthropicKeyed', modelName: 'claude-sonnet-4' },
+        ],
+      },
+    } as unknown as AppConfig;
+  }
+
+  function gatewayModel(): ModelCatalogEntry {
+    return {
+      key: 'gw-claude',
+      displayName: 'gw-claude',
+      modelConfig: {
+        provider: 'openai-compatible',
+        endpoint: 'https://gw.example/v1',
+        apiKey: 'gw-key',
+        modelName: 'claude-sonnet-4',
+        temperature: 0.7,
+        maxSteps: 25,
+        maxRetries: 2,
+      },
+    } as unknown as ModelCatalogEntry;
+  }
+
+  it('routes to the keyed Anthropic entry, not the catalog-first keyless one', () => {
+    const resolution = resolveRuntimeForModel(
+      gatewayModel(),
+      makeDupConfig(),
+      'auto',
+      new Set(['mastra', 'claude-agent-sdk']),
+    );
+    expect(resolution.runtimeId).toBe('claude-agent-sdk');
+    expect(resolution.modelAuth?.apiKey).toBe('real-anthropic-key');
+    expect(resolution.modelAuth?.baseUrl).toBe('https://a2.example'); // /v1 stripped, paired with its key
+  });
+});
