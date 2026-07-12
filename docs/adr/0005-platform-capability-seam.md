@@ -78,3 +78,34 @@ Native Windows computer-use harness (UIAutomation/SendInput/capture), Windows
 AX text insertion, composer-only Windows dictation, refactoring the inline
 dictation darwin guards behind the seam, a Windows permissions model,
 re-enabling the Windows build, and a Windows dock/tray equivalent.
+
+## Amendment 2026-07-12 — experimental-on posture
+
+**Supersedes decision points 1–2 and the "honest gating" framing above.** The
+maintainer wants Windows/Linux users to get these features **experimentally
+available** so they can try them and give feedback — not an inert "Coming to
+Windows" state. The seam is retained; only the _posture_ changes:
+
+1. `CapabilityResult` gains an optional `experimental?: boolean`. On win32/linux
+   the previously-`supported:false` capabilities (`computerUseLocal`,
+   `dictationAnywhere`, `dockIcon`) are now `{ supported: true, experimental:
+true, reason: '… experimental on <OS> — please report how it behaves.' }`.
+   `computerUseBrowser` + `dictationCapture` remain plainly supported. An
+   _unknown_ OS is still conservatively `supported:false`.
+2. `getHarness` no longer routes a local target to `WindowsStubHarness` on
+   win32/linux; it attempts the real cross-platform `LocalDesktopHarness`
+   (nut-js) so users exercise real behavior. `WindowsStubHarness` remains only
+   for the genuinely-unsupported (unknown-OS) branch.
+3. The UI surfaces an **"Experimental"** label + the `reason` (an amber banner /
+   "(experimental)" suffix) instead of disabling the control.
+4. The `KAI_ENABLE_WIN_BUILD` build gate and `release.yml`'s win/linux build
+   jobs are UNCHANGED — release already produces those artifacts; only the
+   per-feature UX posture moved from gated-off to experimental-on.
+
+**Consequence:** on Windows/Linux a local computer-use / dictation-anywhere
+attempt now runs the real nut-js path and may succeed OR surface a real runtime
+error — either outcome is the intended feedback signal. macOS behavior is still
+byte-unchanged. The `getDictationPlatform` native-insertion seam
+(`dictation-platform.ts`) still reports `unsupported` on win32/linux (it
+describes the actual AX insertion mechanism, a lower layer than the product
+capability); folding real Windows/Linux insertion behind it remains future work.

@@ -7,13 +7,24 @@
  * with a typed error, the dictation seam gates, and macOS output is unchanged.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// LocalDesktopHarness installs an app.on('activate'/'before-quit') recovery hook
+// in its constructor; the global electron stub omits app.on. Provide a minimal
+// no-op app + BrowserWindow so the experimental routing tests can construct it.
+vi.mock('electron', () => ({
+  app: { on: vi.fn(), getPath: () => '/tmp' },
+  BrowserWindow: { getAllWindows: () => [] },
+  nativeImage: { createFromBuffer: () => ({}) },
+}));
+
 import { getPlatformCapabilities } from '../capabilities.js';
 import { getDictationPlatform } from '../../dictation/dictation-platform.js';
 import { WindowsStubHarness, ComputerHarnessUnsupportedError } from '../../computer-use/harnesses/windows-stub.js';
 import { getHarness } from '../../computer-use/orchestrator.js';
 import type { ComputerHarness } from '../../computer-use/harnesses/shared.js';
 import { LocalMacosHarness } from '../../computer-use/harnesses/local-macos.js';
+import { LocalDesktopHarness } from '../../computer-use/harnesses/local-desktop.js';
 import type { ComputerSession, ComputerUseTarget } from '../../../shared/computer-use.js';
 import type { AppConfig } from '../../config/schema.js';
 
@@ -36,21 +47,31 @@ describe('getPlatformCapabilities', () => {
     });
   });
 
-  it('gates local computer use + dictation-anywhere + dock on win32, keeps browser + capture', () => {
+  it('marks local computer use + dictation-anywhere + dock as EXPERIMENTAL (not gated) on win32, keeps browser + capture native', () => {
     const caps = getPlatformCapabilities('win32');
-    expect(caps.computerUseBrowser.supported).toBe(true);
-    expect(caps.dictationCapture.supported).toBe(true);
-    expect(caps.computerUseLocal.supported).toBe(false);
-    expect(caps.computerUseLocal.reason).toMatch(/Windows/);
-    expect(caps.dictationAnywhere.supported).toBe(false);
-    expect(caps.dockIcon.supported).toBe(false);
+    expect(caps.computerUseBrowser).toEqual({ supported: true });
+    expect(caps.dictationCapture).toEqual({ supported: true });
+    // Experimental-on posture (ADR-0005): available for feedback, flagged.
+    expect(caps.computerUseLocal.supported).toBe(true);
+    expect(caps.computerUseLocal.experimental).toBe(true);
+    expect(caps.computerUseLocal.reason).toMatch(/experimental on Windows/i);
+    expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
+    expect(caps.dockIcon).toMatchObject({ supported: true, experimental: true });
   });
 
-  it('gates the same set on linux', () => {
+  it('marks the same set experimental on linux', () => {
     const caps = getPlatformCapabilities('linux');
-    expect(caps.computerUseBrowser.supported).toBe(true);
+    expect(caps.computerUseBrowser).toEqual({ supported: true });
+    expect(caps.computerUseLocal).toMatchObject({ supported: true, experimental: true });
+    expect(caps.computerUseLocal.reason).toMatch(/experimental on Linux/i);
+    expect(caps.dictationAnywhere).toMatchObject({ supported: true, experimental: true });
+  });
+
+  it('an unknown platform is still conservatively unsupported for OS-specific features', () => {
+    const caps = getPlatformCapabilities('sunos' as NodeJS.Platform);
     expect(caps.computerUseLocal.supported).toBe(false);
     expect(caps.dictationAnywhere.supported).toBe(false);
+    expect(caps.computerUseBrowser.supported).toBe(true);
   });
 
   it('is pure: mutating one result does not affect a later call', () => {
@@ -75,9 +96,10 @@ describe('getPlatformCapabilities', () => {
       for (const result of Object.values(caps)) {
         expect(typeof result.supported).toBe('boolean');
         const keys = Object.keys(result).sort();
-        // Only `supported` (+ optional `reason`) — nothing else may leak in.
-        expect(keys.every((k) => k === 'supported' || k === 'reason')).toBe(true);
+        // `supported` (+ optional `reason`/`experimental`) — nothing else may leak in.
+        expect(keys.every((k) => k === 'supported' || k === 'reason' || k === 'experimental')).toBe(true);
         if (result.reason !== undefined) expect(typeof result.reason).toBe('string');
+        if (result.experimental !== undefined) expect(typeof result.experimental).toBe('boolean');
       }
     }
   });
@@ -119,22 +141,24 @@ describe('WindowsStubHarness', () => {
 });
 
 describe('getHarness routing', () => {
-  it('routes the local-windows target to the terminal WindowsStubHarness', () => {
+  it('routes the local-windows target to the real desktop harness (experimental), native on darwin', () => {
     const h = getHarness(noopConfig(), sessionWithTarget('local-windows'), noopConfig);
-    expect(h).toBeInstanceOf(WindowsStubHarness);
+    // Experimental-on: local-windows attempts a real harness, never the terminal stub.
+    expect(h).not.toBeInstanceOf(WindowsStubHarness);
+    if (process.platform === 'darwin') expect(h).toBeInstanceOf(LocalMacosHarness);
+    else expect(h).toBeInstanceOf(LocalDesktopHarness);
   });
 
-  it('routes local-macos per platform capability: native on darwin, terminal stub elsewhere', () => {
+  it('routes local-macos to the native harness on darwin, the real desktop harness elsewhere (experimental)', () => {
     const h = getHarness(noopConfig(), sessionWithTarget('local-macos'), noopConfig);
     if (process.platform === 'darwin') {
-      // macOS supports local computer use → the real native harness, never the stub.
       expect(h).toBeInstanceOf(LocalMacosHarness);
-      expect(h).not.toBeInstanceOf(WindowsStubHarness);
     } else {
-      // On an unsupported OS a stale local-macos default must NOT silently
-      // degrade to nut-js — it routes to the terminal stub (#82 chokepoint).
-      expect(h).toBeInstanceOf(WindowsStubHarness);
+      // Experimental-on posture: no longer degrades to the terminal stub — it
+      // attempts the real cross-platform nut-js harness so users can try it.
+      expect(h).toBeInstanceOf(LocalDesktopHarness);
     }
+    expect(h).not.toBeInstanceOf(WindowsStubHarness);
   });
 
   it('routes the browser target cross-platform (never gated)', () => {
@@ -142,18 +166,19 @@ describe('getHarness routing', () => {
     expect(h).not.toBeInstanceOf(WindowsStubHarness);
   });
 
-  it('capability chokepoint: on win32 a local target routes to the terminal stub, not nut-js', () => {
-    // vitest.setup forces process.platform=darwin in CI; override to win32 for
-    // this case so the capability chokepoint's unsupported-OS branch is actually
-    // exercised (a regression removing the chokepoint would fail here).
+  it('experimental-on: on win32 a local target attempts the real desktop harness, not the terminal stub', () => {
+    // vitest.setup forces process.platform=darwin in CI; override to win32 so the
+    // win32 branch is actually exercised. Under the experimental-on posture the
+    // capability is supported → LocalDesktopHarness, NOT the stub.
     const original = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
     try {
-      expect(getHarness(noopConfig(), sessionWithTarget('local-macos'), noopConfig)).toBeInstanceOf(WindowsStubHarness);
-      expect(getHarness(noopConfig(), sessionWithTarget('local-windows'), noopConfig)).toBeInstanceOf(
-        WindowsStubHarness,
+      expect(getHarness(noopConfig(), sessionWithTarget('local-macos'), noopConfig)).toBeInstanceOf(
+        LocalDesktopHarness,
       );
-      // The browser target stays cross-platform even on win32.
+      expect(getHarness(noopConfig(), sessionWithTarget('local-windows'), noopConfig)).toBeInstanceOf(
+        LocalDesktopHarness,
+      );
       expect(getHarness(noopConfig(), sessionWithTarget('isolated-browser'), noopConfig)).not.toBeInstanceOf(
         WindowsStubHarness,
       );

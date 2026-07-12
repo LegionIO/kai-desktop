@@ -306,17 +306,24 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
   const [hotkeyDisplay, setHotkeyDisplay] = useState(dictation.hotkey ?? 'CommandOrControl+Shift+D');
   const [runtimeState, setRuntimeState] = useState<DictationRuntimeState | null>(null);
   const [dictationAnywhereUnsupportedReason, setDictationAnywhereUnsupportedReason] = useState<string | null>(null);
+  const [dictationAnywhereExperimentalReason, setDictationAnywhereExperimentalReason] = useState<string | null>(null);
 
-  // "Dictation anywhere" is macOS-only today (#82). Fetch the platform seam so
-  // we can show an honest "Coming to Windows" banner instead of letting a user
-  // enable a feature that would silently no-op.
+  // "Dictation anywhere" is macOS-native today; on Windows/Linux it's now
+  // EXPERIMENTALLY available (#82 / ADR-0005 experimental-on posture) so users
+  // can try it and report back. Fetch the platform seam to show either an
+  // "unsupported" banner (feature genuinely off) or an "experimental" banner
+  // (feature live-but-unproven) — the latter does NOT disable the toggle.
   useEffect(() => {
     let cancelled = false;
     void app.platform
       .getFeatureCapabilities()
       .then((caps) => {
-        if (!cancelled && caps.dictationAnywhere.supported === false) {
-          setDictationAnywhereUnsupportedReason(caps.dictationAnywhere.reason ?? 'Not available on this platform yet.');
+        if (cancelled) return;
+        const cap = caps.dictationAnywhere;
+        if (cap.supported === false) {
+          setDictationAnywhereUnsupportedReason(cap.reason ?? 'Not available on this platform yet.');
+        } else if (cap.experimental) {
+          setDictationAnywhereExperimentalReason(cap.reason ?? 'Experimental on this platform.');
         }
       })
       .catch(() => {
@@ -469,6 +476,13 @@ export const DictationSettings: FC<SettingsProps> = ({ config, updateConfig }) =
             <span>
               {dictationAnywhereUnsupportedReason} Dictation Anywhere is coming to your platform in a future release.
             </span>
+          </div>
+        )}
+
+        {!dictationAnywhereUnsupportedReason && dictationAnywhereExperimentalReason && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <AlertTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>{dictationAnywhereExperimentalReason}</span>
           </div>
         )}
 

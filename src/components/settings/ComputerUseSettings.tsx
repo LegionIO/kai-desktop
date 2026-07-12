@@ -451,8 +451,9 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
   const models = config.models as { catalog: Array<{ key: string; displayName: string }> };
   const [featureCaps, setFeatureCaps] = useState<PlatformCapabilities | null>(null);
 
-  // Fetch per-OS feature capabilities so we can honestly gate local computer use
-  // ("Coming to Windows") instead of offering a target that can't work (#82).
+  // Fetch per-OS feature capabilities so we can label local computer use as
+  // "(experimental)" on Windows/Linux (ADR-0005 experimental-on posture) rather
+  // than disabling it — users can try the real nut-js harness and report back.
   useEffect(() => {
     let cancelled = false;
     void app.platform
@@ -529,14 +530,22 @@ export const ComputerUseSettings: FC<SettingsProps> = ({ config, updateConfig })
                   : app.platform.os === 'win32'
                     ? 'Local Windows'
                     : 'Local Linux'}
-                {featureCaps?.computerUseLocal.supported === false ? ' (coming soon)' : ''}
+                {featureCaps?.computerUseLocal.supported === false
+                  ? ' (coming soon)'
+                  : featureCaps?.computerUseLocal.experimental
+                    ? ' (experimental)'
+                    : ''}
               </option>
             </select>
-            {featureCaps?.computerUseLocal.supported === false && (
+            {featureCaps?.computerUseLocal.supported === false ? (
               <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
                 {featureCaps.computerUseLocal.reason} Use the isolated browser target for now.
               </p>
-            )}
+            ) : featureCaps?.computerUseLocal.experimental ? (
+              <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
+                {featureCaps.computerUseLocal.reason}
+              </p>
+            ) : null}
           </div>
           <div data-setting-id="computerUse.approvalModeDefault">
             <label className="text-[10px] text-muted-foreground block mb-0.5">Approval Mode</label>

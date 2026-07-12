@@ -16,7 +16,14 @@ export type SupportedPlatform = 'darwin' | 'win32' | 'linux';
 
 export type CapabilityResult = {
   supported: boolean;
-  /** Human-readable explanation shown in the UI when `supported` is false. */
+  /**
+   * True when the feature is available but UNPROVEN on this OS — wired up so
+   * users can try it and give feedback, but not yet validated on real hardware.
+   * The UI should surface an "Experimental" label + the `reason` string.
+   */
+  experimental?: boolean;
+  /** Human-readable explanation shown in the UI: why it's unavailable
+   *  (`supported:false`) or why it's flagged (`experimental:true`). */
   reason?: string;
 };
 
@@ -36,14 +43,16 @@ export type PlatformCapabilities = {
 
 const supported = (): CapabilityResult => ({ supported: true });
 
-const COMING_TO_WINDOWS = (feature: string): CapabilityResult => ({
-  supported: false,
-  reason: `${feature} is not available on Windows yet.`,
-});
-
-const COMING_TO_LINUX = (feature: string): CapabilityResult => ({
-  supported: false,
-  reason: `${feature} is not available on Linux yet.`,
+/**
+ * A feature that's available for the user to try on this OS but NOT yet
+ * validated on real hardware. Surfaced with an "Experimental" label so users
+ * understand it's unproven and their use is the feedback signal. Kept
+ * `supported: true` so the feature is selectable/live rather than disabled.
+ */
+const EXPERIMENTAL_ON = (feature: string, os: string): CapabilityResult => ({
+  supported: true,
+  experimental: true,
+  reason: `${feature} is experimental on ${os} — please report how it behaves.`,
 });
 
 /**
@@ -64,19 +73,19 @@ export function getPlatformCapabilities(platform: NodeJS.Platform = process.plat
       };
     case 'win32':
       return {
-        computerUseLocal: COMING_TO_WINDOWS('Local computer use'),
+        computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Windows'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        dictationAnywhere: COMING_TO_WINDOWS('Dictation anywhere'),
-        dockIcon: COMING_TO_WINDOWS('Dock icon badges'),
+        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Windows'),
+        dockIcon: EXPERIMENTAL_ON('Taskbar icon badges', 'Windows'),
       };
     case 'linux':
       return {
-        computerUseLocal: COMING_TO_LINUX('Local computer use'),
+        computerUseLocal: EXPERIMENTAL_ON('Local computer use', 'Linux'),
         computerUseBrowser: supported(),
         dictationCapture: supported(),
-        dictationAnywhere: COMING_TO_LINUX('Dictation anywhere'),
-        dockIcon: COMING_TO_LINUX('Dock icon badges'),
+        dictationAnywhere: EXPERIMENTAL_ON('Dictation anywhere', 'Linux'),
+        dockIcon: EXPERIMENTAL_ON('Dock icon badges', 'Linux'),
       };
     default:
       return {

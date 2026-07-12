@@ -30,12 +30,12 @@ type SessionReader = (sessionId: string) => ComputerSession | null;
 type EventSink = (event: ComputerUseEvent) => void;
 
 export function getHarness(config: AppConfig, session: ComputerSession, getConfig: () => AppConfig): ComputerHarness {
-  // Capability chokepoint (#82): local desktop automation is only available
-  // where the platform seam says so (macOS today). If ANY surface selects a
-  // local target on an unsupported OS — the explicit `local-windows` target, or
-  // a stale `local-macos` default carried onto Windows/Linux — route to the
-  // terminal WindowsStubHarness rather than silently degrading to nut-js. The
-  // browser target stays cross-platform.
+  // Capability chokepoint (#82 / ADR-0005). Local desktop automation is native
+  // on macOS and EXPERIMENTALLY available on Windows/Linux (experimental-on
+  // posture): users can try the nut-js `LocalDesktopHarness` and report back.
+  // Only route to the terminal WindowsStubHarness when the seam says a local
+  // target is genuinely unsupported (an unknown OS). The browser target stays
+  // cross-platform.
   const isLocalTarget = session.target === 'local-macos' || session.target === 'local-windows';
   if (isLocalTarget && !getPlatformCapabilities().computerUseLocal.supported) {
     return new WindowsStubHarness();
@@ -44,7 +44,10 @@ export function getHarness(config: AppConfig, session: ComputerSession, getConfi
     return process.platform === 'darwin' ? new LocalMacosHarness(getConfig) : new LocalDesktopHarness(getConfig);
   }
   if (session.target === 'local-windows') {
-    return new WindowsStubHarness();
+    // Experimental: attempt the real cross-platform desktop harness (nut-js)
+    // rather than the always-reject stub, so Windows/Linux users exercise real
+    // behavior. macOS uses its native harness for the local-windows alias too.
+    return process.platform === 'darwin' ? new LocalMacosHarness(getConfig) : new LocalDesktopHarness(getConfig);
   }
   return new IsolatedBrowserHarness();
 }
