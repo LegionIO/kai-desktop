@@ -30,9 +30,11 @@ import { join } from 'path';
 // ---------------------------------------------------------------------------
 // Debug logging for stream pipeline diagnostics
 // ---------------------------------------------------------------------------
+const IPC_DEBUG_ENABLED = !!process.env.KAI_DEBUG_STREAM;
 const IPC_DEBUG_DIR = join(process.cwd(), 'debug-logs');
 const IPC_DEBUG_LOG = join(IPC_DEBUG_DIR, 'stream-pipeline.log');
 function ipcDebugLog(msg: string): void {
+  if (!IPC_DEBUG_ENABLED) return;
   try {
     mkdirSync(IPC_DEBUG_DIR, { recursive: true });
     appendFileSync(IPC_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
