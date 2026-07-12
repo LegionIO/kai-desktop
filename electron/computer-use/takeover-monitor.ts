@@ -108,9 +108,6 @@ function startMonitor(listener: Listener): void {
 
 export function startLocalMacosTakeoverMonitor(listener: Listener): void {
   shouldRun = true;
-  // Clear any suppression window left over from a prior session so the first
-  // moments of this session aren't blind to a genuine manual takeover.
-  suppressedUntil = 0;
   activeListener = listener;
   if (activeMonitor && activeMonitor.process && !activeMonitor.process.killed) {
     return;
@@ -118,6 +115,11 @@ export function startLocalMacosTakeoverMonitor(listener: Listener): void {
   if (activeMonitor && !activeMonitor.process) {
     return;
   }
+  // Clear any suppression window left over from a prior session so the first
+  // moments of this session aren't blind to a genuine manual takeover. Done
+  // AFTER the already-active guards so an idempotent re-entry on a running
+  // monitor can't clear a legitimately-active window mid-action.
+  suppressedUntil = 0;
   startMonitor(listener);
 }
 

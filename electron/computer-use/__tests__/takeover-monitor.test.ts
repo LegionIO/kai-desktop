@@ -16,7 +16,12 @@ vi.mock('../harnesses/local-macos.js', () => ({
 }));
 vi.mock('../permissions.js', () => ({ resolveMaterializedHelperPath: () => '/tmp/helper' }));
 
-import { suppressTakeoverEvents, isTakeoverSuppressed, stopLocalMacosTakeoverMonitor } from '../takeover-monitor.js';
+import {
+  suppressTakeoverEvents,
+  isTakeoverSuppressed,
+  startLocalMacosTakeoverMonitor,
+  stopLocalMacosTakeoverMonitor,
+} from '../takeover-monitor.js';
 
 afterEach(() => {
   stopLocalMacosTakeoverMonitor(); // resets the window
@@ -63,5 +68,29 @@ describe('stopLocalMacosTakeoverMonitor resets the suppression window', () => {
     stopLocalMacosTakeoverMonitor();
     // The window is reset to 0 → not suppressed, even though 10s haven't passed.
     expect(isTakeoverSuppressed()).toBe(false);
+  });
+});
+
+describe('startLocalMacosTakeoverMonitor suppression-window reset', () => {
+  const listener = { onEvent: vi.fn() };
+
+  it('clears a stale window on a fresh (inactive→running) start', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000_000);
+    suppressTakeoverEvents(10_000); // leftover window from "a prior session"
+    expect(isTakeoverSuppressed()).toBe(true);
+    startLocalMacosTakeoverMonitor(listener); // fresh start → resets
+    expect(isTakeoverSuppressed()).toBe(false);
+  });
+
+  it('does NOT clear an active window on an idempotent re-entry (monitor already running)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(6_000_000);
+    startLocalMacosTakeoverMonitor(listener); // activates the monitor
+    suppressTakeoverEvents(10_000); // harness suppresses around a long action
+    expect(isTakeoverSuppressed()).toBe(true);
+    startLocalMacosTakeoverMonitor(listener); // re-entry on the RUNNING monitor
+    // The active window must survive — the reset is past the already-active guard.
+    expect(isTakeoverSuppressed()).toBe(true);
   });
 });
