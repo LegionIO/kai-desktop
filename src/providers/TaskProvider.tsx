@@ -576,3 +576,6 @@ export function useTasks(): TaskContextValue {
 export function useTasksOptional(): TaskContextValue | null {
   return useContext(TaskContext);
 }
+
+/** Test-only exposure of the pure reducer + initial state. */
+export const __internal = { taskReducer, initialState };
