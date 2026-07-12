@@ -87,23 +87,66 @@ const SESSIONS_PATH = join(SESSIONS_DIR, 'web-sessions.json');
 /** token -> expiry epoch ms. Map (not plain object) so prototype keys like '__proto__' can't poison lookups. */
 type SessionStore = Map<string, number>;
 
-function loadSessions(): SessionStore {
+/**
+ * Fingerprint of the auth secret a session set was issued under. Sessions are
+ * discarded when it changes so a password rotation (or an anonymous↔password
+ * switch) invalidates every previously-issued cookie — a leaked/stale token
+ * must not survive a credential change. Inputs are domain-separated so a literal
+ * password of "anonymous" can't collide with anonymous mode.
+ */
+export function authFingerprint(config: WebServerConfig): string {
+  const input = config.auth.mode === 'password' ? `pw ${config.auth.password}` : 'anon';
+  return crypto.createHash('sha256').update(input, 'utf-8').digest('hex');
+}
+
+/**
+ * Decide whether previously-issued sessions survive a (re)start. They carry over
+ * only when the auth secret is unchanged from what they were issued under. A
+ * null loaded fingerprint (legacy bare-map file, or absent file) never matches,
+ * so those sessions are always discarded once. Pure so it can be unit-tested
+ * without standing up the HTTPS server.
+ */
+export function sessionsCarryOver(loadedFingerprint: string | null, currentFingerprint: string): boolean {
+  return loadedFingerprint !== null && loadedFingerprint === currentFingerprint;
+}
+
+/** Load the persisted `{ fingerprint, sessions }`. Tolerates the legacy
+ *  bare-map format (no fingerprint) by returning a null fingerprint so the
+ *  caller discards those sessions once and rewrites in the new format. */
+function loadSessions(): { fingerprint: string | null; store: SessionStore } {
   try {
-    if (!existsSync(SESSIONS_PATH)) return new Map();
-    const parsed = JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8')) as Record<string, number>;
-    return new Map(Object.entries(parsed));
+    if (!existsSync(SESSIONS_PATH)) return { fingerprint: null, store: new Map() };
+    const parsed = JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8')) as unknown;
+    // New format: { fingerprint: string, sessions: Record<token, expiry> }
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as { fingerprint?: unknown }).fingerprint === 'string' &&
+      (parsed as { sessions?: unknown }).sessions &&
+      typeof (parsed as { sessions?: unknown }).sessions === 'object'
+    ) {
+      const p = parsed as { fingerprint: string; sessions: Record<string, number> };
+      return { fingerprint: p.fingerprint, store: new Map(Object.entries(p.sessions)) };
+    }
+    // Legacy bare-map format → discard once (null fingerprint never matches).
+    return { fingerprint: null, store: new Map(Object.entries(parsed as Record<string, number>)) };
   } catch {
-    return new Map();
+    return { fingerprint: null, store: new Map() };
   }
 }
 
 function saveSessions(store: SessionStore): void {
   try {
     mkdirSync(SESSIONS_DIR, { recursive: true });
-    writeFileSync(SESSIONS_PATH, JSON.stringify(Object.fromEntries(store)), {
-      encoding: 'utf-8',
-      mode: 0o600,
-    });
+    writeFileSync(
+      SESSIONS_PATH,
+      JSON.stringify({ fingerprint: currentAuthFingerprint, sessions: Object.fromEntries(store) }),
+      {
+        encoding: 'utf-8',
+        mode: 0o600,
+      },
+    );
     // writeFileSync's mode only applies on create; tighten a pre-existing file
     // that an older build may have written with looser perms (session tokens).
     try {
@@ -127,8 +170,17 @@ function pruneExpired(store: SessionStore): SessionStore {
 }
 
 /** In-memory mirror of the on-disk store, loaded once at startup. */
-let sessions: SessionStore = pruneExpired(loadSessions());
-saveSessions(sessions); // persist any pruning
+const _loaded = loadSessions();
+let sessions: SessionStore = pruneExpired(_loaded.store);
+/** Fingerprint the loaded sessions were issued under (null for legacy/absent). */
+let loadedFingerprint: string | null = _loaded.fingerprint;
+/**
+ * Fingerprint of the auth secret currently in force. Written into every
+ * persisted session set so a later load can detect a credential change.
+ * Populated in startWebServer; empty until the first server start.
+ */
+let currentAuthFingerprint = loadedFingerprint ?? '';
+saveSessions(sessions); // persist any pruning (rewrites legacy format)
 
 /**
  * One-time QR login tokens, kept separate from `sessions` so they cannot be
@@ -737,6 +789,20 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
   // rather than silently accepting an empty-string credential.
   if (config.auth.mode === 'password' && !config.auth.password) {
     throw new Error('[WebServer] Refusing to start: auth mode is "password" but no password is set.');
+  }
+
+  // Invalidate all previously-issued session cookies if the auth secret changed
+  // since they were persisted (password rotation, or an anon↔password switch).
+  // A leaked/stale token must not survive a credential change. restartWebServer
+  // (stop→start) runs on every config change, so this is the rotation trigger.
+  const fingerprint = authFingerprint(config);
+  currentAuthFingerprint = fingerprint;
+  if (!sessionsCarryOver(loadedFingerprint, fingerprint)) {
+    sessions.clear();
+    loadedFingerprint = fingerprint;
+    saveSessions(sessions);
+  } else {
+    loadedFingerprint = fingerprint;
   }
 
   const bridgeScript = getBridgeScript();
