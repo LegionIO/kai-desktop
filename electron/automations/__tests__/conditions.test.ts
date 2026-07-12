@@ -63,6 +63,39 @@ describe('evaluateCondition', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toBeTruthy();
   });
+
+  it('does not hang on a ReDoS pattern against adversarial input (timeout → false)', () => {
+    // (a+)+$ against a long non-matching string catastrophically backtracks;
+    // the vm timeout must bound it so the main thread never hangs.
+    const adversarial = { body: 'a'.repeat(60) + '!' };
+    const started = Date.now();
+    const r = evaluateCondition({ path: 'body', op: 'matches', value: '(a+)+$', caseSensitive: true }, adversarial);
+    const elapsed = Date.now() - started;
+    expect(r.ok).toBe(false); // timed out → non-match
+    expect(elapsed).toBeLessThan(2000); // bounded well under a real ReDoS hang
+  });
+
+  it('rejects an over-long regex source', () => {
+    const r = evaluateCondition(
+      { path: 'body', op: 'matches', value: 'a'.repeat(3000), caseSensitive: false },
+      payload,
+    );
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/source exceeds/i);
+  });
+
+  it('rejects an over-long test input', () => {
+    const big = { body: 'x'.repeat(70 * 1024) };
+    const r = evaluateCondition({ path: 'body', op: 'matches', value: 'x', caseSensitive: false }, big);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/input exceeds/i);
+  });
+
+  it('a normal regex still matches within caps', () => {
+    expect(evaluateCondition({ path: 'body', op: 'matches', value: 'URGENT', caseSensitive: true }, payload).ok).toBe(
+      true,
+    );
+  });
   it('in', () => {
     expect(
       evaluateCondition(

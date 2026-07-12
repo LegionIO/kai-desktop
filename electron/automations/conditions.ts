@@ -32,6 +32,47 @@ function asComparableString(v: unknown, caseSensitive: boolean): string {
   return caseSensitive ? s : s.toLowerCase();
 }
 
+/** Hygiene caps for the `matches` regex op (defense-in-depth on top of the
+ *  timeout, which is the actual ReDoS protection). */
+const MAX_REGEX_SOURCE_BYTES = 2 * 1024;
+const MAX_REGEX_INPUT_BYTES = 64 * 1024;
+/** Wall-clock budget for a single regex test — a catastrophic-backtracking
+ *  (ReDoS) pattern from a user rule against untrusted payload content must not
+ *  hang the main thread. Mirrors the `expression` op's vm timeout. */
+const REGEX_TEST_TIMEOUT_MS = 50;
+
+/**
+ * Run `regex.test(input)` with a hard wall-clock timeout so a ReDoS pattern
+ * can't hang the Electron main thread. A plain re.test() is synchronous and
+ * uninterruptible, so we execute it inside a node:vm context with a timeout —
+ * the same mechanism the `expression` op already uses. `codeGeneration` is
+ * disabled and the globals are the regex + input only (no realm escape).
+ * Returns false on timeout, oversize input/source, or any error.
+ */
+function safeRegexTest(source: string, input: string, caseSensitive: boolean): ConditionEvalResult {
+  if (source.length > MAX_REGEX_SOURCE_BYTES) {
+    return { ok: false, error: `matches: regex source exceeds ${MAX_REGEX_SOURCE_BYTES} bytes` };
+  }
+  if (input.length > MAX_REGEX_INPUT_BYTES) {
+    // Anchors make truncation change semantics, so reject rather than truncate.
+    return { ok: false, error: `matches: input exceeds ${MAX_REGEX_INPUT_BYTES} bytes` };
+  }
+  let re: RegExp;
+  try {
+    re = new RegExp(source, caseSensitive ? '' : 'i');
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    const ctx = createContext({ __re: re, __input: input }, { codeGeneration: { strings: false, wasm: false } });
+    const result = runInContext('__re.test(__input)', ctx, { timeout: REGEX_TEST_TIMEOUT_MS });
+    return { ok: Boolean(result) };
+  } catch (err) {
+    // Timeout (ReDoS) or any vm error → treat as non-match, surface the reason.
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export type ConditionEvalResult = { ok: boolean; error?: string };
 
 export function evaluateCondition(cond: AutomationCondition, payload: unknown): ConditionEvalResult {
@@ -86,12 +127,11 @@ export function evaluateCondition(cond: AutomationCondition, payload: unknown): 
     case 'endsWith':
       return { ok: asComparableString(actual, caseSensitive).endsWith(asComparableString(value, caseSensitive)) };
     case 'matches':
-      try {
-        const re = new RegExp(String(value ?? ''), caseSensitive ? '' : 'i');
-        return { ok: re.test(typeof actual === 'string' ? actual : safeStringify(actual)) };
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
-      }
+      return safeRegexTest(
+        String(value ?? ''),
+        typeof actual === 'string' ? actual : safeStringify(actual),
+        caseSensitive,
+      );
     case 'in':
       if (!Array.isArray(value)) return { ok: false };
       return {
@@ -109,11 +149,23 @@ export function evaluateConditions(
 ): { ok: boolean; errors: string[] } {
   if (conditions.length === 0) return { ok: true, errors: [] };
   const errors: string[] = [];
-  const results = conditions.map((c) => {
+  // Short-circuit: stop as soon as the outcome is decided (an 'all' that hits a
+  // false, or an 'any' that hits a true) so a cheap early condition can avoid
+  // running an expensive later one (e.g. a regex/expression) against untrusted
+  // payload content — reduces amplification.
+  let ok = mode === 'all';
+  for (const c of conditions) {
     const r = evaluateCondition(c, payload);
     if (r.error) errors.push(r.error);
-    return r.ok;
-  });
-  const ok = mode === 'any' ? results.some(Boolean) : results.every(Boolean);
+    if (mode === 'any') {
+      if (r.ok) {
+        ok = true;
+        break;
+      }
+    } else if (!r.ok) {
+      ok = false;
+      break;
+    }
+  }
   return { ok, errors };
 }
