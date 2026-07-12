@@ -1,2 +1,5 @@
 #!/usr/bin/env sh
-pnpm type-check && pnpm test --run --passWithNoTests
+# `pnpm test` runs the electron/scripts (node-env) suite; `test:component` runs
+# the src/** renderer tests (jsdom). Both must gate — the component suite was
+# previously CI/pre-push-invisible (only `pnpm test` was run).
+pnpm type-check && pnpm test --run --passWithNoTests && pnpm test:component --run --passWithNoTests

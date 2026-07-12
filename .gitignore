@@ -36,6 +36,7 @@ e2e/.cache/
 playwright-report/
 test-results/
 pw-results.xml
+pw-results-component.xml
 
 # Vitest v8 coverage output (see vitest.unit.config.ts; reporting only)
 coverage/

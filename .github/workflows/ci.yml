@@ -180,15 +180,21 @@ jobs:
 
       # Emit a JUnit report so dorny/test-reporter can surface failures as
       # PR-level check annotations. The output path is gitignored.
-      - name: Unit + component tests
+      - name: Unit tests (electron + scripts)
         run: pnpm test --reporter=default --reporter=junit --outputFile.junit=./pw-results.xml -- --passWithNoTests
+
+      # Renderer component suite (src/**, jsdom) — a separate vitest config, so it
+      # needs its own run. Previously omitted here, leaving the component tests
+      # ungated in CI.
+      - name: Component tests (renderer)
+        run: pnpm test:component --reporter=default --reporter=junit --outputFile.junit=./pw-results-component.xml -- --passWithNoTests
 
       - name: Report vitest results
         if: always()
         uses: dorny/test-reporter@v2
         with:
           name: vitest
-          path: pw-results.xml
+          path: 'pw-results.xml,pw-results-component.xml'
           reporter: jest-junit
           fail-on-error: false
 
