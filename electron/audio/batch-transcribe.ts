@@ -38,6 +38,22 @@ const CHUNK_THRESHOLD_SEC = 180; // 3 minutes
 /** Target chunk duration in seconds */
 const CHUNK_TARGET_SEC = 120; // 2 minutes
 
+/**
+ * A BCP-47-ish language tag: a 2–3 letter primary subtag optionally followed by
+ * `-`-separated alphanumeric subtags (region/script/variant), e.g. `en`,
+ * `en-US`, `zh-Hans-CN`. Enforced at the IPC boundary so an unvalidated string
+ * from the renderer can't flow into the manually-built Whisper multipart body or
+ * the Azure SDK's recognition-language property. The explicit CR/LF guard is
+ * belt-and-suspenders: JS `$` can match just before a trailing newline.
+ */
+const LANGUAGE_RE = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
+
+export function isValidTranscriptionLanguage(language: unknown): language is string {
+  return (
+    typeof language === 'string' && language.length <= 64 && !/[\r\n]/.test(language) && LANGUAGE_RE.test(language)
+  );
+}
+
 /** Safety timeout per chunk: audio duration × 3 + 30s base, capped at 120s */
 function chunkTimeout(wavBuffer: Buffer): number {
   const durationSec = calculateWavDuration(wavBuffer);
@@ -60,10 +76,7 @@ function transcribeSingleBuffer(
     let speechConfig: sdk.SpeechConfig;
 
     if (azureEndpoint) {
-      speechConfig = sdk.SpeechConfig.fromEndpoint(
-        new URL(azureEndpoint),
-        azureKey,
-      );
+      speechConfig = sdk.SpeechConfig.fromEndpoint(new URL(azureEndpoint), azureKey);
     } else {
       speechConfig = sdk.SpeechConfig.fromSubscription(azureKey, azureRegion);
     }
@@ -89,10 +102,23 @@ function transcribeSingleBuffer(
     const safetyTimer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      console.warn('[BatchTranscribe] Safety timeout (%dms) for chunk %d/%d — resolving with %d results',
-        timeoutMs, chunkIndex + 1, totalChunks, results.length);
-      try { recognizer.stopContinuousRecognitionAsync(); } catch { /* ignore */ }
-      try { recognizer.close(); } catch { /* ignore */ }
+      console.warn(
+        '[BatchTranscribe] Safety timeout (%dms) for chunk %d/%d — resolving with %d results',
+        timeoutMs,
+        chunkIndex + 1,
+        totalChunks,
+        results.length,
+      );
+      try {
+        recognizer.stopContinuousRecognitionAsync();
+      } catch {
+        /* ignore */
+      }
+      try {
+        recognizer.close();
+      } catch {
+        /* ignore */
+      }
 
       if (sender && !sender.isDestroyed()) {
         sender.send('stt:transcription-progress', {
@@ -109,7 +135,11 @@ function transcribeSingleBuffer(
       if (resolved) return;
       resolved = true;
       clearTimeout(safetyTimer);
-      try { recognizer.close(); } catch { /* ignore */ }
+      try {
+        recognizer.close();
+      } catch {
+        /* ignore */
+      }
 
       if (sender && !sender.isDestroyed()) {
         sender.send('stt:transcription-progress', {
@@ -123,14 +153,22 @@ function transcribeSingleBuffer(
     };
 
     recognizer.recognizing = (_s, e) => {
-      console.log('[BatchTranscribe] recognizing (chunk %d/%d): "%s"',
-        chunkIndex + 1, totalChunks, e.result.text?.substring(0, 80));
+      console.log(
+        '[BatchTranscribe] recognizing (chunk %d/%d): "%s"',
+        chunkIndex + 1,
+        totalChunks,
+        e.result.text?.substring(0, 80),
+      );
     };
 
     recognizer.recognized = (_s, e) => {
       if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
-        console.log('[BatchTranscribe] recognized (chunk %d/%d): "%s"',
-          chunkIndex + 1, totalChunks, e.result.text.substring(0, 80));
+        console.log(
+          '[BatchTranscribe] recognized (chunk %d/%d): "%s"',
+          chunkIndex + 1,
+          totalChunks,
+          e.result.text.substring(0, 80),
+        );
         results.push(e.result.text);
       } else if (e.result.reason === sdk.ResultReason.NoMatch) {
         console.log('[BatchTranscribe] NoMatch (chunk %d/%d)', chunkIndex + 1, totalChunks);
@@ -142,21 +180,34 @@ function transcribeSingleBuffer(
     };
 
     recognizer.sessionStopped = () => {
-      console.log('[BatchTranscribe] sessionStopped (chunk %d/%d), results=%d',
-        chunkIndex + 1, totalChunks, results.length);
+      console.log(
+        '[BatchTranscribe] sessionStopped (chunk %d/%d), results=%d',
+        chunkIndex + 1,
+        totalChunks,
+        results.length,
+      );
       finish(results.join(' '));
     };
 
     recognizer.canceled = (_s, e) => {
-      console.log('[BatchTranscribe] canceled (chunk %d/%d), reason=%s, errorDetails=%s',
-        chunkIndex + 1, totalChunks, sdk.CancellationReason[e.reason], e.errorDetails ?? 'none');
+      console.log(
+        '[BatchTranscribe] canceled (chunk %d/%d), reason=%s, errorDetails=%s',
+        chunkIndex + 1,
+        totalChunks,
+        sdk.CancellationReason[e.reason],
+        e.errorDetails ?? 'none',
+      );
 
       if (resolved) return;
 
       if (e.reason === sdk.CancellationReason.Error) {
         resolved = true;
         clearTimeout(safetyTimer);
-        try { recognizer.close(); } catch { /* ignore */ }
+        try {
+          recognizer.close();
+        } catch {
+          /* ignore */
+        }
         reject(new Error(e.errorDetails || 'Azure Speech SDK cancellation error'));
       } else {
         // EndOfStream or other non-error cancellation — return what we have
@@ -166,14 +217,22 @@ function transcribeSingleBuffer(
 
     recognizer.startContinuousRecognitionAsync(
       () => {
-        console.log('[BatchTranscribe] Recognition started for chunk %d/%d (timeout=%dms)',
-          chunkIndex + 1, totalChunks, timeoutMs);
+        console.log(
+          '[BatchTranscribe] Recognition started for chunk %d/%d (timeout=%dms)',
+          chunkIndex + 1,
+          totalChunks,
+          timeoutMs,
+        );
       },
       (err) => {
         if (resolved) return;
         resolved = true;
         clearTimeout(safetyTimer);
-        try { recognizer.close(); } catch { /* ignore */ }
+        try {
+          recognizer.close();
+        } catch {
+          /* ignore */
+        }
         reject(new Error(`Failed to start recognition: ${err}`));
       },
     );
@@ -239,7 +298,7 @@ function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null
   if (rt?.provider === 'openai' && rt.openai?.apiKey) {
     return {
       url: 'https://api.openai.com/v1/audio/transcriptions',
-      headers: { 'Authorization': `Bearer ${rt.openai.apiKey}` },
+      headers: { Authorization: `Bearer ${rt.openai.apiKey}` },
       model: 'whisper-1',
       fileField: 'file',
     };
@@ -253,7 +312,7 @@ function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null
     }
     return {
       url: `${httpBase}/v1/audio/transcriptions`,
-      headers: { 'Authorization': `Bearer ${rt.custom.apiKey}` },
+      headers: { Authorization: `Bearer ${rt.custom.apiKey}` },
       model: 'whisper-1',
       fileField: 'file',
     };
@@ -266,7 +325,7 @@ function resolveWhisperCredentials(config: AppConfig): WhisperCredentials | null
         const base = provider.endpoint?.replace(/\/+$/, '') || 'https://api.openai.com';
         return {
           url: `${base}/v1/audio/transcriptions`,
-          headers: { 'Authorization': `Bearer ${provider.apiKey}` },
+          headers: { Authorization: `Bearer ${provider.apiKey}` },
           model: 'whisper-1',
           fileField: 'file',
         };
@@ -296,35 +355,39 @@ async function transcribeWithWhisper(
   const parts: Buffer[] = [];
 
   // file/audio field (field name varies by provider)
-  parts.push(Buffer.from(
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="${creds.fileField}"; filename="recording.wav"\r\n` +
-    `Content-Type: audio/wav\r\n\r\n`
-  ));
+  parts.push(
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${creds.fileField}"; filename="recording.wav"\r\n` +
+        `Content-Type: audio/wav\r\n\r\n`,
+    ),
+  );
   parts.push(wavBuffer);
   parts.push(Buffer.from('\r\n'));
 
   // model field
-  parts.push(Buffer.from(
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="model"\r\n\r\n` +
-    `${creds.model}\r\n`
-  ));
+  parts.push(
+    Buffer.from(`--${boundary}\r\n` + `Content-Disposition: form-data; name="model"\r\n\r\n` + `${creds.model}\r\n`),
+  );
 
   // language field
-  parts.push(Buffer.from(
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="language"\r\n\r\n` +
-    `${langCode}\r\n`
-  ));
+  parts.push(
+    Buffer.from(`--${boundary}\r\n` + `Content-Disposition: form-data; name="language"\r\n\r\n` + `${langCode}\r\n`),
+  );
 
   // closing boundary
   parts.push(Buffer.from(`--${boundary}--\r\n`));
 
   const body = Buffer.concat(parts);
 
-  console.log('[BatchTranscribe:Whisper] POST %s, model=%s, language=%s, wav=%d bytes, body=%d bytes',
-    creds.url, creds.model, langCode, wavBuffer.length, body.length);
+  console.log(
+    '[BatchTranscribe:Whisper] POST %s, model=%s, language=%s, wav=%d bytes, body=%d bytes',
+    creds.url,
+    creds.model,
+    langCode,
+    wavBuffer.length,
+    body.length,
+  );
 
   const response = await net.fetch(creds.url, {
     method: 'POST',
@@ -351,7 +414,7 @@ async function transcribeWithWhisper(
     };
     // Gateway format: { combinedPhrases: [{ text: "..." }] }
     if (json.combinedPhrases?.length) {
-      transcribedText = json.combinedPhrases.map(p => p.text).join(' ');
+      transcribedText = json.combinedPhrases.map((p) => p.text).join(' ');
     } else {
       // Standard OpenAI JSON format: { text: "..." }
       transcribedText = json.text ?? responseText;
@@ -367,8 +430,11 @@ async function transcribeWithWhisper(
 
 export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => AppConfig): void {
   ipc.handle('stt:batch-transcribe', async (event, request: BatchTranscribeRequest): Promise<BatchTranscribeResult> => {
-    console.log('[BatchTranscribe] Request received, language=%s, hasWavBase64=%s',
-      request.language, Boolean(request.wavBase64));
+    console.log(
+      '[BatchTranscribe] Request received, language=%s, hasWavBase64=%s',
+      request.language,
+      Boolean(request.wavBase64),
+    );
 
     try {
       const config = getConfig();
@@ -377,6 +443,15 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => A
       if (!request.wavBase64) {
         return { text: '', error: 'No audio data provided' };
       }
+
+      // Validate the language tag at the boundary: it flows into a manually-built
+      // multipart body (Whisper) and the Azure SDK's recognition-language prop.
+      // Reject rather than silently fall back so a malformed tag can't produce
+      // wrong-language recognition or a corrupt request.
+      if (!isValidTranscriptionLanguage(request.language)) {
+        return { text: '', error: 'Invalid transcription language' };
+      }
+
       const wavBuffer = Buffer.from(request.wavBase64, 'base64');
 
       if (wavBuffer.length < 44) {
@@ -391,11 +466,7 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => A
       if (whisperCreds) {
         console.log('[BatchTranscribe] Using Whisper API: %s', whisperCreds.url);
         try {
-          const result = await transcribeWithWhisper(
-            wavBuffer,
-            request.language,
-            whisperCreds,
-          );
+          const result = await transcribeWithWhisper(wavBuffer, request.language, whisperCreds);
           return { text: result.text, durationSec };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -407,7 +478,11 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => A
       // ── Azure Speech SDK path ───────────────────────────────────
       const azureConfig = config.audio?.azure;
       if (!azureConfig?.subscriptionKey) {
-        return { text: '', error: 'No transcription credentials configured. Configure an OpenAI-compatible provider or Azure Speech credentials.' };
+        return {
+          text: '',
+          error:
+            'No transcription credentials configured. Configure an OpenAI-compatible provider or Azure Speech credentials.',
+        };
       }
 
       const sender = event.sender;
@@ -458,7 +533,6 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => A
       const fullText = results.join(' ');
       console.log('[BatchTranscribe] Done (chunked): %d chars from %d chunks', fullText.length, chunks.length);
       return { text: fullText, durationSec };
-
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error('[BatchTranscribe] Error:', message);
@@ -466,3 +540,6 @@ export function registerBatchTranscribeHandlers(ipc: IpcMain, getConfig: () => A
     }
   });
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { resolveWhisperCredentials };
