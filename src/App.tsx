@@ -775,7 +775,12 @@ function AppShell() {
         // surfaces the CLI's new chat without moving our outline.
       } else if (activeId == null) {
         applyStore(null, null);
-      } else {
+      } else if (shouldAdoptBroadcastActiveId(activeConversationIdRef.current, activeId)) {
+        // Same anti-hijack guard as the upsert branch above: the backend's
+        // global active-id can be flipped by another client (the `kai` CLI
+        // creating/selecting a chat). Only follow it into a full selection
+        // change when THIS window has no selection yet or it already matches —
+        // otherwise a CLI action would yank the user off their current chat.
         // Sequence-guard the async fetch: rapid onChanged events can resolve out
         // of order, letting an older active-id's record overwrite a newer one.
         const seq = ++activeSyncSeqRef.current;
@@ -784,6 +789,8 @@ function AppShell() {
           applyStore(activeId, (conv as ConversationRecord | null) ?? null);
         });
       }
+      // else: another client's active-id we're not adopting — keep our
+      // selection; loadConversations still surfaces the new chat in the list.
     });
 
     return () => {
