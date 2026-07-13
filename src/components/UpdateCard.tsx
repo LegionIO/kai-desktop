@@ -33,6 +33,9 @@ const fmtEta = (transferred?: number, total?: number, bytesPerSecond?: number): 
   return `${hrs}h ${mins % 60}m left`;
 };
 
+/** Test-only export of the pure ETA formatter. */
+export const __test__ = { fmtEta };
+
 export const UpdateCard: FC = () => {
   const [status, setStatus] = useState<UpdateStatus>({ state: 'idle' });
   const [dismissed, setDismissed] = useState(false);
