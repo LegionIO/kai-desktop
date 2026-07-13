@@ -347,9 +347,11 @@ export class MarketplaceService {
 
       // Reject an oversized advertised length up front, then read the body with
       // a hard byte cap so a malicious/broken host can't exhaust memory before
-      // the integrity check runs.
-      const advertised = Number(response.headers.get('content-length') ?? 0);
-      if (advertised > MAX_PLUGIN_ARCHIVE_BYTES) {
+      // the integrity check runs. (A missing/garbage Content-Length yields NaN,
+      // which fails the > check — the streaming cap below is the real gate; the
+      // isFinite guard just documents that and keeps the early-out meaningful.)
+      const advertised = Number(response.headers.get('content-length') ?? '');
+      if (Number.isFinite(advertised) && advertised > MAX_PLUGIN_ARCHIVE_BYTES) {
         throw new Error(`Plugin "${entry.name}" archive too large: ${advertised} > ${MAX_PLUGIN_ARCHIVE_BYTES}`);
       }
       const archiveBuffer = await readCappedResponse(response, MAX_PLUGIN_ARCHIVE_BYTES, entry.name, dlSignal);
