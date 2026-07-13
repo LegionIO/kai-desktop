@@ -280,17 +280,15 @@ function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): Abor
   if (!primary && !secondary) return undefined;
   if (!primary) return secondary;
   if (!secondary) return primary;
-
-  const controller = new AbortController();
-  if (primary.aborted || secondary.aborted) {
-    controller.abort();
-    return controller.signal;
-  }
-
-  const abort = (): void => controller.abort();
-  primary.addEventListener('abort', abort, { once: true });
-  secondary.addEventListener('abort', abort, { once: true });
-  return controller.signal;
+  // AbortSignal.any (Node 18.17+/22) composes the two without installing ordinary
+  // event listeners: it uses weak references + a finalization registry, so the
+  // derived signal (and its links to the sources) is reclaimed once the consumer
+  // releases it — no listener leak on a long-lived source signal. This matters
+  // for callers that reuse one AbortController across many merges (e.g. the
+  // sub-agent multi-turn loop, or plugin-supplied signals), where the previous
+  // manual addEventListener approach retained one listener per merge until the
+  // source aborted. It also propagates the winning signal's abort reason.
+  return AbortSignal.any([primary, secondary]);
 }
 
 /** Detect reasoning gateway Bedrock models that don't support streaming. */
@@ -1936,4 +1934,5 @@ export const __internal = {
   normalizeOpenAIWebSearchFilters,
   normalizeProviderToolType,
   normalizeWorkspacePath,
+  mergeAbortSignals,
 };
