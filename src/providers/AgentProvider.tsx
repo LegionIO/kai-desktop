@@ -56,9 +56,7 @@ function agentReducer(state: AgentState, action: AgentAction): AgentState {
     case 'UPDATE_AGENT':
       return {
         ...state,
-        agents: state.agents.map((a) =>
-          a.id === action.id ? { ...a, ...action.updates, id: action.id } : a,
-        ),
+        agents: state.agents.map((a) => (a.id === action.id ? { ...a, ...action.updates, id: action.id } : a)),
       };
     case 'DELETE_AGENT':
       return {
@@ -160,19 +158,16 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
 
   // ── Actions ──────────────────────────────────────────────────────────
 
-  const createAgent = useCallback(
-    async (payload: CreateAgentPayload): Promise<AgentFile | null> => {
-      try {
-        const agent = await app.agents.create(payload);
-        // Broadcast from main process triggers SET_AGENTS
-        return agent;
-      } catch (err) {
-        console.error('[AgentProvider] Failed to create agent:', err);
-        return null;
-      }
-    },
-    [],
-  );
+  const createAgent = useCallback(async (payload: CreateAgentPayload): Promise<AgentFile | null> => {
+    try {
+      const agent = await app.agents.create(payload);
+      // Broadcast from main process triggers SET_AGENTS
+      return agent;
+    } catch (err) {
+      console.error('[AgentProvider] Failed to create agent:', err);
+      return null;
+    }
+  }, []);
 
   const deleteAgent = useCallback(async (id: string) => {
     try {
@@ -199,41 +194,32 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
     dispatch({ type: 'SET_CREATING', creating });
   }, []);
 
-  const assignTask = useCallback(
-    async (agentId: string, taskId: string): Promise<{ ok: boolean; error?: string }> => {
-      try {
-        const result = await app.agents.assignTask(agentId, taskId);
-        return result;
-      } catch (err) {
-        return { ok: false, error: String(err) };
-      }
-    },
-    [],
-  );
+  const assignTask = useCallback(async (agentId: string, taskId: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const result = await app.agents.assignTask(agentId, taskId);
+      return result;
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  }, []);
 
-  const unassignTask = useCallback(
-    async (agentId: string): Promise<{ ok: boolean; error?: string }> => {
-      try {
-        const result = await app.agents.unassignTask(agentId);
-        return result;
-      } catch (err) {
-        return { ok: false, error: String(err) };
-      }
-    },
-    [],
-  );
+  const unassignTask = useCallback(async (agentId: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const result = await app.agents.unassignTask(agentId);
+      return result;
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  }, []);
 
-  const startAgent = useCallback(
-    async (agentId: string): Promise<{ sessionId?: string; error?: string }> => {
-      try {
-        const result = await app.agents.start(agentId);
-        return result;
-      } catch (err) {
-        return { error: String(err) };
-      }
-    },
-    [],
-  );
+  const startAgent = useCallback(async (agentId: string): Promise<{ sessionId?: string; error?: string }> => {
+    try {
+      const result = await app.agents.start(agentId);
+      return result;
+    } catch (err) {
+      return { error: String(err) };
+    }
+  }, []);
 
   const stopAgent = useCallback(async (agentId: string) => {
     try {
@@ -266,7 +252,19 @@ export const AgentProvider: FC<PropsWithChildren> = ({ children }) => {
       stopAgent,
       synthesizePrompt,
     }),
-    [state, createAgent, deleteAgent, updateAgent, selectAgent, setCreatingAgent, assignTask, unassignTask, startAgent, stopAgent, synthesizePrompt],
+    [
+      state,
+      createAgent,
+      deleteAgent,
+      updateAgent,
+      selectAgent,
+      setCreatingAgent,
+      assignTask,
+      unassignTask,
+      startAgent,
+      stopAgent,
+      synthesizePrompt,
+    ],
   );
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;
@@ -281,3 +279,6 @@ export function useAgents(): AgentContextValue {
   }
   return context;
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { agentReducer, initialState };
