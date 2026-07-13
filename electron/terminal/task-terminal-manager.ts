@@ -26,6 +26,21 @@ interface TaskTerminal {
   runtime: string;
 }
 
+/**
+ * Coerce a renderer/web-supplied terminal dimension into a positive integer
+ * node-pty will accept. cols/rows arrive as unknown-typed IPC JSON and flow
+ * straight into pty.spawn / proc.resize, whose native wrappers THROW on any
+ * value that is <= 0, NaN, Infinity, or fractional. Because tasks:terminal-resize
+ * is fire-and-forget on the renderer (no .catch), such a throw would surface as
+ * an unhandled rejection and silently drop the resize. Clamp to [1, 9999] and
+ * fall back to a sane default for anything non-finite/non-positive.
+ */
+function sanitizeDimension(value: unknown, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), 9999);
+}
+
 export class TaskTerminalManager {
   /** Hard bound on the exit-code cache so orphaned sessions (renderer-created
    *  terminals with no consumer, or agent exits stranded before reconciliation)
@@ -94,8 +109,8 @@ export class TaskTerminalManager {
 
     const proc = pty.spawn(shell.command, shell.args, {
       name: 'xterm-256color',
-      cols: options.cols ?? 80,
-      rows: options.rows ?? 24,
+      cols: sanitizeDimension(options.cols, 80),
+      rows: sanitizeDimension(options.rows, 24),
       cwd: options.cwd ?? homedir(),
       env: options.envIsComplete
         ? ({ ...options.env, TERM: 'xterm-256color' } as Record<string, string>)
@@ -153,7 +168,9 @@ export class TaskTerminalManager {
   }
 
   resize(sessionId: string, cols: number, rows: number): void {
-    this.terminals.get(sessionId)?.process.resize(cols, rows);
+    // cols/rows are renderer-supplied; node-pty throws on non-positive/non-finite
+    // dimensions and the resize IPC is fire-and-forget, so sanitize before passing.
+    this.terminals.get(sessionId)?.process.resize(sanitizeDimension(cols, 80), sanitizeDimension(rows, 24));
   }
 
   kill(sessionId: string): void {
@@ -294,3 +311,6 @@ export function registerTaskTerminalHandlers(ipcMain: IpcMain, terminalManager: 
     return getBuffer(sessionId);
   });
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { sanitizeDimension };

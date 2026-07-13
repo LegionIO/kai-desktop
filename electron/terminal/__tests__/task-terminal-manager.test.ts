@@ -48,7 +48,7 @@ vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() })
 // output-buffer appends to module-global maps + disk; stub the append we hit.
 vi.mock('../output-buffer.js', () => ({ appendOutput: vi.fn(), getBuffer: vi.fn(() => '') }));
 
-const { TaskTerminalManager } = await import('../task-terminal-manager.js');
+const { TaskTerminalManager, __internal } = await import('../task-terminal-manager.js');
 
 beforeEach(() => {
   spawned.length = 0;
@@ -139,5 +139,44 @@ describe('TaskTerminalManager exit-code lifecycle', () => {
     expect(mgr.getExitCode(sessionId)).toBe(2);
     mgr.dispose();
     expect(mgr.getExitCode(sessionId)).toBeUndefined();
+  });
+});
+
+describe('sanitizeDimension (renderer-supplied cols/rows → node-pty-safe)', () => {
+  // node-pty's spawn/resize THROW on cols/rows that are <= 0, NaN, Infinity, or
+  // non-integer, and the resize IPC is fire-and-forget (unhandled rejection +
+  // dropped resize). sanitizeDimension clamps to a positive integer first.
+  const { sanitizeDimension } = __internal;
+
+  it('passes through a normal positive integer', () => {
+    expect(sanitizeDimension(80, 80)).toBe(80);
+    expect(sanitizeDimension(200, 24)).toBe(200);
+  });
+
+  it('floors a fractional value (node-pty native cast dislikes non-integers)', () => {
+    expect(sanitizeDimension(80.9, 80)).toBe(80);
+    expect(sanitizeDimension(1.5, 24)).toBe(1);
+  });
+
+  it('falls back for the values node-pty rejects: <=0, NaN, Infinity', () => {
+    for (const bad of [0, -1, -999, NaN, Infinity, -Infinity]) {
+      expect(sanitizeDimension(bad, 80), String(bad)).toBe(80);
+    }
+  });
+
+  it('falls back for non-number junk (IPC JSON can carry anything)', () => {
+    for (const bad of [undefined, null, 'abc', {}, [], 'NaN']) {
+      expect(sanitizeDimension(bad, 24), JSON.stringify(bad)).toBe(24);
+    }
+  });
+
+  it('coerces a numeric string to its integer value', () => {
+    expect(sanitizeDimension('120', 80)).toBe(120);
+  });
+
+  it('caps an absurdly large value at 9999', () => {
+    expect(sanitizeDimension(1e9, 80)).toBe(9999);
+    expect(sanitizeDimension(10000, 24)).toBe(9999);
+    expect(sanitizeDimension(9999, 24)).toBe(9999);
   });
 });
