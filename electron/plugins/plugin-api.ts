@@ -67,6 +67,21 @@ const PLUGIN_HTTP_MAX_BODY_BYTES = 1_048_576;
 /** Max time a plugin HTTP request/headers may take before the socket is closed. */
 const PLUGIN_HTTP_REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * True only for loopback bind hosts. A plugin's http.listen must not bind to a
+ * routable/wildcard address (0.0.0.0, ::, a LAN IP) — that would expose its
+ * unauthenticated, plugin-controlled handler to the local network. IPv6 forms
+ * are normalized by stripping brackets and any zone id.
+ */
+function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1') return true;
+  const stripped = h.replace(/^\[/, '').replace(/\]$/, '').split('%', 1)[0];
+  if (stripped === '::1') return true;
+  // Any 127.0.0.0/8 address is loopback.
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(stripped);
+}
+
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
 // last BrowserWindow using that partition's session closes.  For auth windows
@@ -1228,7 +1243,22 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             }
           });
 
-          const host = options?.host ?? '127.0.0.1';
+          const requestedHost = options?.host ?? '127.0.0.1';
+          // http:listen is a LOCAL-server grant, not a network-exposure grant.
+          // A plugin passing host '0.0.0.0'/'::'/a LAN address would bind the
+          // (unauthenticated, plugin-controlled) handler to every interface and
+          // expose it to the LAN. Restrict binds to loopback so the permission
+          // means what it says; reject anything else rather than silently
+          // downgrading, so a plugin author sees the misconfiguration.
+          if (!isLoopbackHost(requestedHost)) {
+            reject(
+              new Error(
+                `Plugin "${manifest.name}" http.listen host must be loopback (127.0.0.1/::1/localhost); refusing "${requestedHost}".`,
+              ),
+            );
+            return;
+          }
+          const host = requestedHost;
           // Bound how long a client can hold a request/socket open, so a slow-
           // loris style connection can't tie up the plugin's server.
           httpServer.requestTimeout = PLUGIN_HTTP_REQUEST_TIMEOUT_MS;
@@ -1584,3 +1614,6 @@ export async function cleanupPluginAPI(api: PluginAPI): Promise<void> {
     // Ignore cleanup errors
   }
 }
+
+/** Test-only exposure of pure helpers. */
+export const __internal = { isLoopbackHost };
