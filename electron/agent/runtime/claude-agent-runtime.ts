@@ -12,7 +12,16 @@
  *   - Custom Kai tools (skills, plan mode, ask_user, settings, CLI tools) are
  *     registered as an MCP server via `createSdkMcpServer()`. Tool handlers
  *     run in Kai's main process with full Electron IPC access.
- *   - Permissions handled via `bypassPermissions` mode (Kai manages its own UX)
+ *   - Permissions: the SDK runs in `bypassPermissions` mode. IMPORTANT trust
+ *     boundary — the SDK's BUILT-IN tools (Read/Write/Edit/Bash/Glob/Grep/
+ *     WebFetch/etc., see the `tools:` list below) execute INSIDE the Claude Code
+ *     subprocess and are NOT routed through Kai's per-tool approval (`execute()`
+ *     / the tool-approval UX). Only Kai's own MCP-bridged custom tools go through
+ *     Kai gating. `confinedCwd` sets the subprocess CWD but is NOT a sandbox —
+ *     the built-in tools can still reach paths outside it. Choosing the
+ *     claude-agent-sdk runtime therefore grants the model direct filesystem/exec
+ *     authority; this is an accepted, deliberate posture (Kai defers permission
+ *     UX to the SDK for this runtime), not an oversight.
  *   - Session resume supported via `resume` / `sessionId` options
  */
 
