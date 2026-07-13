@@ -35,36 +35,75 @@ function assertSecureMarketplaceUrl(rawUrl: string): void {
   }
   if (parsed.protocol === 'https:') return;
   const host = parsed.hostname;
-  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  // Node reports the IPv6 loopback hostname WITH brackets ('[::1]'), so include
+  // both forms for the localhost exception.
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
   if (parsed.protocol === 'http:' && isLocal) return;
   throw new Error(`Refusing insecure marketplace URL (must be https): ${rawUrl}`);
 }
+
+/** Timeout for a marketplace network op (catalog fetch or tarball download),
+ *  bounding BOTH the response-headers wait and the body read so a host that
+ *  trickles the body slowly under the byte cap can't hang the install/refresh
+ *  indefinitely. */
+const MARKETPLACE_FETCH_TIMEOUT_MS = 60_000;
 
 /** Hard cap on a downloaded plugin archive (before extraction). Real plugins are
  *  a small fraction of this; the cap only stops a malicious/broken host from
  *  exhausting memory/disk before the integrity check. */
 const MAX_PLUGIN_ARCHIVE_BYTES = 128 * 1024 * 1024; // 128 MiB
 
-/** Read a fetch Response body into a Buffer, aborting once it exceeds maxBytes. */
-async function readCappedResponse(response: Response, maxBytes: number, pluginName: string): Promise<Buffer> {
+/** Read a fetch Response body into a Buffer, aborting once it exceeds maxBytes
+ *  OR the optional signal fires. read() takes no signal, so each read is raced
+ *  against an abort promise — this bounds a host that trickles the body slowly
+ *  under the byte cap (a hang the byte cap alone can't catch). */
+async function readCappedResponse(
+  response: Response,
+  maxBytes: number,
+  pluginName: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
   if (!response.body) return Buffer.from(await response.arrayBuffer());
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let received = 0;
+  let completed = false;
+  let onAbort: (() => void) | undefined;
+  const abortPromise: Promise<never> | null = signal
+    ? new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(new Error(`Plugin "${pluginName}" download timed out or was aborted.`));
+          return;
+        }
+        onAbort = () => reject(new Error(`Plugin "${pluginName}" download timed out or was aborted.`));
+        signal.addEventListener('abort', onAbort, { once: true });
+      })
+    : null;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = abortPromise ? await Promise.race([reader.read(), abortPromise]) : await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
       if (value) {
         received += value.byteLength;
         if (received > maxBytes) {
-          void reader.cancel();
           throw new Error(`Plugin "${pluginName}" archive exceeded ${maxBytes} bytes`);
         }
         chunks.push(value);
       }
     }
   } finally {
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    // Best-effort, non-awaited cancel on an EARLY exit (cap/abort/error) so a
+    // trickling host's underlying download stops and a pathological cancel()
+    // can't itself hang teardown. A cleanly-finished stream needs no cancel.
+    if (!completed) {
+      void reader.cancel().catch(() => {
+        /* best-effort */
+      });
+    }
     reader.releaseLock();
   }
   return Buffer.concat(chunks.map((c) => Buffer.from(c)));
@@ -175,6 +214,7 @@ export class MarketplaceService {
     assertSecureMarketplaceUrl(url);
     const fetchUrl = bustCache ? `${url}?_=${Date.now()}` : url;
     const response = await net.fetch(fetchUrl, {
+      signal: AbortSignal.timeout(MARKETPLACE_FETCH_TIMEOUT_MS),
       headers: {
         Accept: 'application/json',
         'Cache-Control': 'no-cache',
@@ -296,7 +336,11 @@ export class MarketplaceService {
       // download lets a MITM swap the archive before the hash check.
       assertSecureMarketplaceUrl(tarballUrl);
 
-      const response = await net.fetch(tarballUrl, { headers });
+      // One deadline bounds BOTH the headers wait (via net.fetch signal) AND the
+      // body read (via readCappedResponse racing each read) so a trickling host
+      // can't hang the download indefinitely under the byte cap.
+      const dlSignal = AbortSignal.timeout(MARKETPLACE_FETCH_TIMEOUT_MS);
+      const response = await net.fetch(tarballUrl, { headers, signal: dlSignal });
       if (!response.ok) {
         throw new Error(`Failed to download plugin "${entry.name}": HTTP ${response.status}`);
       }
@@ -308,7 +352,7 @@ export class MarketplaceService {
       if (advertised > MAX_PLUGIN_ARCHIVE_BYTES) {
         throw new Error(`Plugin "${entry.name}" archive too large: ${advertised} > ${MAX_PLUGIN_ARCHIVE_BYTES}`);
       }
-      const archiveBuffer = await readCappedResponse(response, MAX_PLUGIN_ARCHIVE_BYTES, entry.name);
+      const archiveBuffer = await readCappedResponse(response, MAX_PLUGIN_ARCHIVE_BYTES, entry.name, dlSignal);
 
       // Verify the tarball integrity BEFORE writing it to disk or feeding it
       // to tar — a malicious archive could otherwise exploit the extractor.
@@ -693,3 +737,6 @@ export class MarketplaceService {
     }
   }
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { assertSecureMarketplaceUrl, readCappedResponse, MARKETPLACE_FETCH_TIMEOUT_MS };
