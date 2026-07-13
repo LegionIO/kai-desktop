@@ -143,16 +143,22 @@ export async function loadProjectInstructions(cwd: string): Promise<InstructionS
 
   // ── 1. Global (user-level) ──────────────────────────────────────
 
-  // ~/.claude/CLAUDE.md
+  // ~/.claude/CLAUDE.md — contained under ~/.claude (the global config tree).
   const globalClaudeMd = join(home, CLAUDE_GLOBAL_FILE);
-  const globalContent = await safeReadWithIncludes(globalClaudeMd, processedPaths, 0, allowedRoots);
+  const globalContent = await safeReadWithIncludes(
+    globalClaudeMd,
+    processedPaths,
+    0,
+    allowedRoots,
+    join(home, '.claude'),
+  );
   if (globalContent) {
     sources.push({ path: globalClaudeMd, tier: 'global', origin: 'claude', content: globalContent });
   }
 
-  // ~/.claude/rules/*.md (recursive)
+  // ~/.claude/rules/*.md (recursive) — contained under the global rules dir.
   const globalRulesDir = join(home, CLAUDE_GLOBAL_RULES);
-  await collectRulesDir(globalRulesDir, 'global', 'claude', sources, processedPaths, allowedRoots);
+  await collectRulesDir(globalRulesDir, 'global', 'claude', sources, processedPaths, allowedRoots, globalRulesDir);
 
   // ── 2. Project (walk cwd → root) ───────────────────────────────
 
@@ -164,7 +170,7 @@ export async function loadProjectInstructions(cwd: string): Promise<InstructionS
   // ── 3. Local override (cwd only, highest priority) ─────────────
 
   const localPath = join(cwd, CLAUDE_LOCAL_FILE);
-  const localContent = await safeReadWithIncludes(localPath, processedPaths, 0, allowedRoots);
+  const localContent = await safeReadWithIncludes(localPath, processedPaths, 0, allowedRoots, cwd);
   if (localContent) {
     sources.push({ path: localPath, tier: 'local', origin: 'claude', content: localContent });
   }
@@ -189,6 +195,18 @@ async function resolveAllowedIncludeRoots(cwd: string, home: string): Promise<st
     }
   }
   return roots;
+}
+
+/** Realpath a directory best-effort for containment comparison (falls back to
+ *  its resolved non-canonical form if it doesn't exist / can't be resolved), so
+ *  a file's realpath is compared against the directory's realpath — a symlinked
+ *  ancestor dir doesn't cause a spurious containment miss. */
+async function realpathDirForContainment(dir: string): Promise<string> {
+  try {
+    return await realpath(dir);
+  } catch {
+    return resolve(dir);
+  }
 }
 
 /** True when `realResolved` (an already-realpath'd file) sits under an allowed root. */
@@ -269,23 +287,25 @@ async function discoverProjectInstructions(
   directories.reverse();
 
   for (const directory of directories) {
-    // Claude Code project files (CLAUDE.md, .claude/CLAUDE.md)
+    // Claude Code project files (CLAUDE.md, .claude/CLAUDE.md). Each discovered
+    // file must realpath-resolve beneath the ancestor `directory` it was found
+    // in — a symlinked CLAUDE.md must not read an out-of-tree secret.
     for (const fileName of CLAUDE_PROJECT_FILES) {
       const filePath = join(directory, fileName);
-      const content = await safeReadWithIncludes(filePath, processedPaths, 0, allowedRoots);
+      const content = await safeReadWithIncludes(filePath, processedPaths, 0, allowedRoots, directory);
       if (content) {
         sources.push({ path: filePath, tier: 'project', origin: 'claude', content });
       }
     }
 
-    // .claude/rules/*.md (recursive)
+    // .claude/rules/*.md (recursive) — contained under the rules dir.
     const rulesDir = join(directory, CLAUDE_RULES_DIR);
-    await collectRulesDir(rulesDir, 'project', 'claude', sources, processedPaths, allowedRoots);
+    await collectRulesDir(rulesDir, 'project', 'claude', sources, processedPaths, allowedRoots, rulesDir);
 
-    // AGENTS.md (Codex convention, also walked up)
+    // AGENTS.md (Codex convention, also walked up) — contained under `directory`.
     for (const fileName of CODEX_PROJECT_FILES) {
       const filePath = join(directory, fileName);
-      const content = await safeReadPlain(filePath);
+      const content = await safeReadPlain(filePath, directory);
       if (content) {
         sources.push({ path: filePath, tier: 'project', origin: 'codex', content });
       }
@@ -305,6 +325,7 @@ async function collectRulesDir(
   sources: InstructionSource[],
   processedPaths: Set<string>,
   allowedRoots: string[],
+  containRoot: string,
 ): Promise<void> {
   try {
     const entries = await readdir(rulesDir, { withFileTypes: true });
@@ -313,9 +334,11 @@ async function collectRulesDir(
     for (const entry of sorted) {
       const entryPath = join(rulesDir, entry.name);
       if (entry.isDirectory()) {
-        await collectRulesDir(entryPath, tier, origin, sources, processedPaths, allowedRoots);
+        await collectRulesDir(entryPath, tier, origin, sources, processedPaths, allowedRoots, containRoot);
       } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        const content = await safeReadWithIncludes(entryPath, processedPaths, 0, allowedRoots);
+        // Contain each rule file under the TOP rules root (containRoot), not the
+        // current subdir — a nested symlink must not escape the rules tree.
+        const content = await safeReadWithIncludes(entryPath, processedPaths, 0, allowedRoots, containRoot);
         if (content) {
           sources.push({ path: entryPath, tier, origin, content });
         }
@@ -337,6 +360,7 @@ async function safeReadWithIncludes(
   processedPaths: Set<string>,
   depth: number,
   allowedRoots: string[],
+  containDir?: string,
 ): Promise<string | null> {
   if (depth > MAX_INCLUDE_DEPTH) return '[Max include depth exceeded]';
 
@@ -350,10 +374,16 @@ async function safeReadWithIncludes(
     // real target (a project symlink must not alias an out-of-tree secret).
     const real = await realpath(resolved);
 
-    // Depth 0 = a trusted discovery path chosen by the loader (CLAUDE.md,
-    // AGENTS.md, rules/*.md). Depth >= 1 = an @include target that came from
-    // (possibly untrusted) file content — it must stay within an allowed root.
-    if (depth > 0 && !isWithinAllowedRoots(real, allowedRoots)) {
+    // Depth 0 = a discovery path chosen by the loader (CLAUDE.md, rules/*.md,
+    // local). The FILE ITSELF is loader-chosen, but a hostile repo can make that
+    // path a SYMLINK to an out-of-tree secret (e.g. CLAUDE.md → ~/.ssh/id_rsa),
+    // which would then be spliced into the system prompt sent to the model. So a
+    // depth-0 file must still realpath-resolve beneath the specific directory it
+    // was discovered in (containDir). Depth >= 1 = an @include target from
+    // (untrusted) file content — contained to allowedRoots.
+    if (depth === 0) {
+      if (containDir && !isWithinAllowedRoots(real, [await realpathDirForContainment(containDir)])) return null;
+    } else if (!isWithinAllowedRoots(real, allowedRoots)) {
       return null;
     }
 
@@ -371,14 +401,20 @@ async function safeReadWithIncludes(
 }
 
 /**
- * Read a plain file without @include processing (for companion tools).
- * Returns null if the file doesn't exist.
+ * Read a plain file without @include processing (for companion tools like
+ * AGENTS.md). Canonicalizes through symlinks and requires the real target to sit
+ * beneath `containDir` — so a hostile repo's `AGENTS.md → ~/.ssh/id_rsa` symlink
+ * can't splice an out-of-tree secret into the system prompt. Returns null if the
+ * file doesn't exist or escapes containment.
  */
-async function safeReadPlain(filePath: string): Promise<string | null> {
+async function safeReadPlain(filePath: string, containDir: string): Promise<string | null> {
   try {
-    const fileStat = await stat(filePath);
+    const resolved = resolve(filePath);
+    const fileStat = await stat(resolved);
     if (!fileStat.isFile()) return null;
-    return await readFile(filePath, 'utf-8');
+    const real = await realpath(resolved);
+    if (!isWithinAllowedRoots(real, [await realpathDirForContainment(containDir)])) return null;
+    return await readFile(real, 'utf-8');
   } catch {
     return null;
   }
