@@ -576,11 +576,15 @@ export function registerUsageHandlers(ipcMain: IpcMain, appHome: string): void {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function bucketKey(isoDate: string, period: string): string {
-  const d = new Date(isoDate);
   if (period === 'weekly') {
-    const day = d.getDay();
-    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-    d.setDate(diff);
+    // Compute the week's Monday entirely in UTC so it stays consistent with the
+    // daily/monthly branches (which slice the UTC ISO string). Mixing local-time
+    // getDay()/getDate() with a UTC-parsed date + toISOString() readback shifted
+    // events near UTC midnight into the wrong week for users behind UTC.
+    const d = new Date(isoDate);
+    const day = d.getUTCDay(); // 0=Sun … 6=Sat
+    const diff = d.getUTCDate() - day + (day === 0 ? -6 : 1); // back up to Monday
+    d.setUTCDate(diff);
     return d.toISOString().slice(0, 10);
   }
   if (period === 'monthly') {

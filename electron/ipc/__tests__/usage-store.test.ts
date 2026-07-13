@@ -141,6 +141,24 @@ describe('bucketKey', () => {
     expect(bucketKey('2026-07-08T12:00:00.000Z', 'weekly')).toBe('2026-07-06'); // a Wednesday
     // Monday maps to itself.
     expect(bucketKey('2026-07-06T12:00:00.000Z', 'weekly')).toBe('2026-07-06');
+    // Sunday maps back to the PRIOR Monday (day===0 → -6).
+    expect(bucketKey('2026-07-12T12:00:00.000Z', 'weekly')).toBe('2026-07-06');
+  });
+
+  it('weekly bucketing is UTC-consistent at the UTC-midnight boundary', () => {
+    // These early-UTC timestamps are the previous day in tz behind UTC; a
+    // local-time computation would bucket them into the wrong week. Assert the
+    // UTC week: 2026-07-13 is a Monday → these Mon/Tue-early-UTC stamps bucket to
+    // 2026-07-13, NOT the prior week (2026-07-06).
+    expect(bucketKey('2026-07-13T00:30:00.000Z', 'weekly')).toBe('2026-07-13'); // Monday 00:30 UTC
+    expect(bucketKey('2026-07-14T01:00:00.000Z', 'weekly')).toBe('2026-07-13'); // Tuesday early UTC
+    // A Sunday just before UTC midnight stays in the week ending that Sunday.
+    expect(bucketKey('2026-07-12T23:30:00.000Z', 'weekly')).toBe('2026-07-06');
+  });
+
+  it('weekly bucketing crosses a month boundary correctly', () => {
+    // 2026-08-02 is a Sunday → its week's Monday is 2026-07-27 (prior month).
+    expect(bucketKey('2026-08-02T06:00:00.000Z', 'weekly')).toBe('2026-07-27');
   });
   it('unknown period falls back to daily', () => {
     expect(bucketKey('2026-07-12T15:30:00.000Z', 'nonsense')).toBe('2026-07-12');
