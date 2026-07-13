@@ -14,6 +14,7 @@ import {
   supportsComputerUse,
   shouldShowComputerSetup,
   primaryDisplayIndex,
+  makeComputerUseId,
 } from '../../../shared/computer-use';
 import type {
   ComputerUseActionKind,
@@ -132,5 +133,22 @@ describe('primaryDisplayIndex', () => {
       ],
     } as unknown as ComputerDisplayLayout;
     expect(primaryDisplayIndex(layout)).toBe(7);
+  });
+});
+
+describe('makeComputerUseId', () => {
+  it('formats as `${prefix}-${millis}-${8hex}`', () => {
+    const id = makeComputerUseId('session');
+    expect(id).toMatch(/^session-\d+-[0-9a-f]{8}$/);
+  });
+
+  it('preserves an arbitrary prefix verbatim', () => {
+    expect(makeComputerUseId('checkpoint')).toMatch(/^checkpoint-\d+-[0-9a-f]{8}$/);
+  });
+
+  it('produces unique ids even when minted in the same millisecond (random suffix)', () => {
+    const ids = new Set(Array.from({ length: 200 }, () => makeComputerUseId('x')));
+    // The random 8-hex suffix must prevent collisions within one tick.
+    expect(ids.size).toBe(200);
   });
 });
