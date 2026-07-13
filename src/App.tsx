@@ -504,6 +504,13 @@ function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean 
 
 function AppShell() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  // Mirror of activeConversationId for reads inside the []-deps onChanged effect,
+  // which must decide whether a cross-client broadcast should move THIS window's
+  // selection without re-subscribing on every selection change.
+  const activeConversationIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
   const sidePanelTabs = useMemo<SidePanelTab[]>(
     () => [
       { id: ARTIFACT_PREVIEW_TAB_ID, label: 'Preview', render: () => <ArtifactPanel /> },
@@ -752,7 +759,19 @@ function AppShell() {
       // record IS the active one, use it directly; otherwise re-fetch just that
       // one (cheap, single-file) so the title/hasMessages stay correct.
       if (change.kind === 'upsert' && change.conversation.id === activeId) {
-        applyStore(activeId, change.conversation as unknown as ConversationRecord);
+        // "Active conversation" is a single GLOBAL backend value, so another
+        // client (e.g. the `kai` CLI creating/selecting a chat) flipping it
+        // would otherwise HIJACK this window's selection. Only adopt the new
+        // active-id on an upsert when THIS window has no selection yet (initial
+        // load) or it already matches — never yank the user off their chat
+        // because the CLI made a new one. (Our own new-chat creation runs under
+        // suppressStoreSync, so it isn't affected by this guard.)
+        const mine = activeConversationIdRef.current;
+        if (mine == null || mine === activeId) {
+          applyStore(activeId, change.conversation as unknown as ConversationRecord);
+        }
+        // else: keep our selection; the list refresh (loadConversations) still
+        // surfaces the CLI's new chat without moving our outline.
       } else if (activeId == null) {
         applyStore(null, null);
       } else {
