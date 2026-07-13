@@ -21,6 +21,39 @@ type CliToolSpec = {
   prefix?: string;
 };
 
+/**
+ * Tokenize a CLI-tool command into an argv the tool can run with shell:false,
+ * enforcing the two security invariants: (1) NO shell control operators
+ * (;, &&, ||, |, >, <, &, $(…), <(…), backtick-less-only, etc.) so the validated
+ * binary can't be chained into a second command, and (2) argv[0] must be one of
+ * the binaries allowed for this tool. shell-quote returns plain words as strings,
+ * unquoted globs as {op:'glob'}, and every control operator as an {op} object —
+ * so anything that isn't a string, an allowed glob, or a trailing #comment is a
+ * rejected operator. Returns { argv } on success or { error } on rejection.
+ */
+export function parseAndValidateCliCommand(
+  command: string,
+  allBinaries: string[],
+): { argv: string[]; error?: undefined } | { argv?: undefined; error: string } {
+  const rawTokens = shellParse(command, process.env as Record<string, string>);
+  const argv: string[] = [];
+  for (const t of rawTokens) {
+    if (typeof t === 'string') {
+      argv.push(t);
+    } else if ('op' in t && t.op === 'glob' && 'pattern' in t) {
+      argv.push(t.pattern as string);
+    } else if ('comment' in t) {
+      break; // ignore trailing # comment
+    } else {
+      return { error: 'Shell control operators (;, &&, ||, |, >, <, etc.) are not allowed in CLI tool commands' };
+    }
+  }
+  if (argv.length === 0 || !allBinaries.includes(argv[0])) {
+    return { error: `Command must start with one of: ${allBinaries.join(', ')}` };
+  }
+  return { argv };
+}
+
 function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefinition {
   return {
     name: spec.name,
@@ -40,39 +73,15 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
           const { command, cwd, timeout } = input as { command: string; cwd?: string; timeout?: number };
           const config = getConfig();
 
-          // Tokenize the command. Pass process.env so $VAR references expand to
-          // the user's actual environment instead of empty strings.
-          // shell-quote returns:
-          //   - strings for plain words
-          //   - {op: 'glob', pattern: '*.ts'} for unquoted glob patterns
-          //   - {op: ';' | '&&' | ...} for control operators
-          //   - {comment: '...'} for # comments
-          // We pass globs through as literal strings (the target binary may
-          // handle them itself, e.g. `git add '*.ts'`); we reject control
-          // operators so the validated binary cannot be chained.
-          const rawTokens = shellParse(command, process.env as Record<string, string>);
-          const argv: string[] = [];
-          for (const t of rawTokens) {
-            if (typeof t === 'string') {
-              argv.push(t);
-            } else if ('op' in t && t.op === 'glob' && 'pattern' in t) {
-              argv.push(t.pattern as string);
-            } else if ('comment' in t) {
-              break; // ignore trailing # comment
-            } else {
-              return {
-                error: 'Shell control operators (;, &&, ||, |, >, <, etc.) are not allowed in CLI tool commands',
-                command,
-                isError: true,
-              };
-            }
-          }
-
-          // Validate command starts with an allowed binary for this tool
+          // Tokenize + validate: reject shell control operators and enforce that
+          // the command starts with a binary allowed for this tool. (Globs pass
+          // through as literal strings; the command later runs with shell:false.)
           const allBinaries = [spec.binary, ...(spec.extraBinaries ?? [])];
-          if (argv.length === 0 || !allBinaries.includes(argv[0])) {
-            return { error: `Command must start with one of: ${allBinaries.join(', ')}`, command, isError: true };
+          const parsed = parseAndValidateCliCommand(command, allBinaries);
+          if (parsed.error) {
+            return { error: parsed.error, command, isError: true };
           }
+          const { argv } = parsed;
 
           // Apply shell allow/deny guardrails (operates on the original string for deny-pattern matching)
           const check = isCommandAllowed(command, config);
