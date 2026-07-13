@@ -307,3 +307,6 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
     },
   };
 }
+
+/** Exposed for unit tests only — the path-safety validators guarding skill writes. */
+export const __internal = { validateSkillName, isContained, isValidSkillFilename };
