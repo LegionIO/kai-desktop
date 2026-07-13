@@ -1445,6 +1445,7 @@ if (gotSingleInstanceLock) {
     // leader persists.
     startLocalServer({
       idleShutdown: IS_HEADLESS,
+      serverVersion: app.getVersion(),
       // What keeps a headless/demoted backend alive besides local CLI sockets:
       // connected web-UI clients. (Windows don't count — a headless backend
       // blocks/destroys them; a windowed GUI leader doesn't enable idleShutdown

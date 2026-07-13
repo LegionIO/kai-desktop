@@ -11,6 +11,22 @@ export function cliLog(msg: string): void {
 }
 
 /**
+ * Warn if the CLI build version differs from the backend it attached to. After a
+ * Kai app update, an OLD backend may still be running (headless leader spawned
+ * detached); the new CLI attaches to it and appears to lack the update's fixes.
+ * Surfacing the mismatch tells the user to restart Kai. No-op when versions match
+ * or the backend didn't report one (an older backend predating the field).
+ * `interactive` suppresses it inline in the REPL where the banner draws — return
+ * the message so the caller can show it in-UI instead.
+ */
+export function checkVersionMismatch(client: LocalBridgeClient): string | null {
+  const cliVersion = typeof __APP_VERSION === 'string' ? __APP_VERSION : '';
+  const backendVersion = client.serverVersion;
+  if (!backendVersion || !cliVersion || backendVersion === cliVersion) return null;
+  return `version mismatch: CLI ${cliVersion} is attached to a backend running ${backendVersion}. Restart Kai to pick up the update.`;
+}
+
+/**
  * Spawn a detached headless backend.
  *
  * Two launch shapes:

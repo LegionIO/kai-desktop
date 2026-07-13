@@ -136,12 +136,26 @@ describe.skipIf(isWin)('local-server auth gate', () => {
     send(sock, { id: 'auth1', type: 'auth', token });
     const authReply = await next();
     expect(authReply.type).toBe('result');
-    expect(authReply.data).toEqual({ ok: true });
+    // Auth result now also carries the backend serverVersion (empty here since
+    // startLocalServer() was called without the option) for CLI mismatch detection.
+    expect(authReply.data).toMatchObject({ ok: true });
+    expect((authReply.data as { serverVersion?: unknown }).serverVersion).toBe('');
 
     send(sock, { id: 'inv1', type: 'invoke', channel: 'probe:echo', args: ['payload'] });
     const invReply = await next();
     expect(invReply.type).toBe('result');
     expect(invReply.data).toEqual({ echoed: 'payload' });
+  });
+
+  it('echoes the configured serverVersion in the auth result (CLI mismatch detection)', async () => {
+    await startLocalServer({ serverVersion: '1.2.3' });
+    const token = getBridgeToken();
+    const { sock, next } = await connectClient(getSocketPath());
+    send(sock, { id: 'a', type: 'auth', token });
+    const reply = await next();
+    expect(reply.type).toBe('result');
+    expect((reply.data as { ok?: boolean; serverVersion?: string }).ok).toBe(true);
+    expect((reply.data as { serverVersion?: string }).serverVersion).toBe('1.2.3');
   });
 
   it('rejects invoke with non-array or oversized args after auth', async () => {

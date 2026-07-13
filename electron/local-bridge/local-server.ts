@@ -48,6 +48,10 @@ let idleShutdownEnabled = false;
 let idleTimer: NodeJS.Timeout | null = null;
 let hasOtherClients: (() => boolean) | null = null;
 let onIdleExit: (() => void) | null = null;
+/** Backend (app) version, sent in the auth result so a client can detect a
+ *  CLI-vs-backend version mismatch (e.g. after an app update while an old
+ *  backend is still running). Empty string when unknown. */
+let serverVersion = '';
 /** Set when a client explicitly requested shutdown — triggers fast exit on disconnect. */
 let shutdownRequested = false;
 
@@ -172,7 +176,9 @@ async function handleMessage(socket: Socket, line: string): Promise<void> {
       // Now (and only now) join the broadcast set + count toward liveness.
       localClients.add(socket);
       cancelIdleTimer();
-      writeLine(socket, { id: msg.id, type: 'result', data: { ok: true } });
+      // Include the backend version so the client can flag a mismatch with its
+      // own build (a stale backend still running after an app update).
+      writeLine(socket, { id: msg.id, type: 'result', data: { ok: true, serverVersion } });
     } else {
       writeLine(socket, { id: msg.id, type: 'error', message: 'auth failed' });
       socket.destroy();
@@ -257,6 +263,8 @@ export interface LocalServerOptions {
   idleShutdown?: boolean;
   hasOtherClients?: () => boolean;
   onIdleExit?: () => void;
+  /** Backend/app version, echoed in the auth result for client mismatch detection. */
+  serverVersion?: string;
 }
 
 /**
@@ -295,6 +303,7 @@ export function startLocalServer(options: LocalServerOptions = {}): Promise<stri
   idleShutdownEnabled = options.idleShutdown ?? false;
   hasOtherClients = options.hasOtherClients ?? null;
   onIdleExit = options.onIdleExit ?? null;
+  serverVersion = options.serverVersion ?? '';
 
   const socketPath = getSocketPath();
   const runDir = getRunDir();

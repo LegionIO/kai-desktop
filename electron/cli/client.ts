@@ -39,6 +39,8 @@ export class LocalBridgeClient {
   private readonly disconnectHandlers = new Set<() => void>();
   private connected = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  /** Backend version reported in the auth result (empty if unknown / older backend). */
+  private _serverVersion = '';
   private pongMissed = 0;
   private intentionalClose = false; // set by close() so disconnect handlers can tell crash from quit
 
@@ -95,7 +97,15 @@ export class LocalBridgeClient {
         this.pending.delete(id);
         reject(new Error('timeout waiting for auth'));
       }, INVOKE_TIMEOUT_MS);
-      this.pending.set(id, { resolve: () => resolve(), reject, timer });
+      this.pending.set(id, {
+        resolve: (data) => {
+          const v = (data as { serverVersion?: unknown } | undefined)?.serverVersion;
+          if (typeof v === 'string') this._serverVersion = v;
+          resolve();
+        },
+        reject,
+        timer,
+      });
       try {
         socket.write(JSON.stringify({ id, type: 'auth', token: this.authToken }) + '\n');
       } catch (err) {
@@ -128,6 +138,12 @@ export class LocalBridgeClient {
   /** True if the last disconnect was caused by our own close(), not a drop. */
   wasIntentionalClose(): boolean {
     return this.intentionalClose;
+  }
+
+  /** Backend version from the auth handshake ('' if unknown / an older backend
+   *  that predates the version field). Used to warn on a CLI↔backend mismatch. */
+  get serverVersion(): string {
+    return this._serverVersion;
   }
 
   private wire(socket: Socket): void {

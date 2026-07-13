@@ -2,7 +2,14 @@ import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
 import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
-import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
+import {
+  spawnHeadlessBackend,
+  waitForSocket,
+  recoverBackend,
+  cliLog,
+  checkVersionMismatch,
+  BOOT_TIMEOUT_MS,
+} from './spawn-backend.js';
 import { confirmFolderTrust } from './folder-trust.js';
 
 /**
@@ -48,6 +55,9 @@ async function main(): Promise<void> {
 
   const activeClient = client;
   process.on('exit', () => activeClient.close());
+
+  const mismatch = checkVersionMismatch(activeClient);
+  if (mismatch) cliLog(mismatch);
 
   if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, false));

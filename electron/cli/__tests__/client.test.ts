@@ -103,6 +103,41 @@ describe.skipIf(isWin)('LocalBridgeClient', () => {
     expect(sawAuth).toBe(false);
   });
 
+  it('captures the backend serverVersion from the auth result', async () => {
+    // A custom server whose auth reply carries a serverVersion.
+    server = net.createServer((socket) => {
+      serverSockets.push(socket);
+      let buf = '';
+      socket.on('data', (chunk) => {
+        buf += chunk.toString('utf-8');
+        let i: number;
+        while ((i = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          const msg = JSON.parse(line) as Record<string, unknown>;
+          if (msg.type === 'auth') {
+            socket.write(
+              JSON.stringify({ id: msg.id, type: 'result', data: { ok: true, serverVersion: '9.9.9' } }) + '\n',
+            );
+          }
+        }
+      });
+      socket.on('error', () => {});
+    });
+    await new Promise<void>((r) => server!.listen(socketPath, () => r()));
+    client = new LocalBridgeClient(socketPath, 'the-token');
+    await client.connect();
+    expect(client.serverVersion).toBe('9.9.9');
+  });
+
+  it('serverVersion is empty when the backend does not report one (older backend)', async () => {
+    await startServer(); // default auth reply has no serverVersion
+    client = new LocalBridgeClient(socketPath, 'the-token');
+    await client.connect();
+    expect(client.serverVersion).toBe('');
+  });
+
   it('round-trips invoke → result by id', async () => {
     await startServer((socket, msg) => {
       if (msg.type === 'invoke' && msg.channel === 'echo') {
