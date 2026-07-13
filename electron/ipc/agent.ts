@@ -674,16 +674,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
 
+    // Is this run driven by agent:submit (CLI/headless)? That path ALREADY
+    // broadcast the user-message (with a submitNonce for dedup) before calling us
+    // — so we must NOT broadcast it again here, or a co-viewing CLI renders the
+    // turn twice (the second, un-nonced copy escapes the dedup). Only a GUI
+    // (agent:stream) turn needs us to mirror the prompt to peers. The
+    // pendingServerPersist marker is set by agent:submit and consumed just below.
+    const isFromSubmit = pendingServerPersist.has(conversationId);
+
     // Mirror the newest user turn to OTHER attached clients (e.g. a `kai` CLI
     // viewing this same conversation) so a GUI-driven turn shows the prompt there
-    // too — agent:stream turns don't go through agent:submit's user-message
-    // broadcast, and the renderer appends the user turn only to its own tree.
-    // The originating renderer already rendered it, so this is purely for peers;
-    // no submitNonce (the GUI dedups by its own tree, and a peer CLI never
-    // submitted this turn so it won't match a nonce).
-    const lastUserText = extractLastUserText(messages);
-    if (lastUserText) {
-      broadcastStreamEvent({ conversationId, type: 'user-message', text: lastUserText }, streamToken);
+    // too. Skipped for agent:submit turns (they broadcast their own, nonced).
+    // No submitNonce here — a GUI turn's peers never submitted it, and the
+    // originating renderer ignores user-message (manages its own tree).
+    if (!isFromSubmit) {
+      const lastUserText = extractLastUserText(messages);
+      if (lastUserText) {
+        broadcastStreamEvent({ conversationId, type: 'user-message', text: lastUserText }, streamToken);
+      }
     }
     // If agent:submit flagged this turn for server-side persistence, bind that
     // ownership to THIS run's token (so a later superseding run doesn't inherit
