@@ -145,6 +145,10 @@ export function App({
   const [turns, setTurns] = useState<Turn[]>([]);
   const [tools, setTools] = useState<ToolEntry[]>([]);
   const [status, setStatus] = useState<'idle' | 'running' | 'awaiting-approval'>('idle');
+  // Transient connection status shown near the composer (NOT in the scrollback
+  // thread, so a reconnect can't clobber assistant output or clutter history).
+  const [connState, setConnState] = useState<'ok' | 'reconnecting' | 'reconnected'>('ok');
+  const connClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [conversationId, setConversationId] = useState<string>('');
   const [picker, setPicker] = useState<PickerState>(null);
   const [modelLabel, setModelLabel] = useState<string>('default');
@@ -491,10 +495,9 @@ export function App({
         return;
       }
       // Unexpected drop (leader crash) — try to recover the backend and resume.
-      setTurns((prev) => [
-        ...prev,
-        { kind: 'note', text: 'backend disconnected — reconnecting…', loading: true, id: 'reconnect' },
-      ]);
+      // Show the status near the composer (transient), not as a thread turn.
+      if (connClearRef.current) clearTimeout(connClearRef.current);
+      setConnState('reconnecting');
       setStatus('idle'); // any in-flight turn is lost with the crashed leader
       streamingRef.current = '';
       void (async () => {
@@ -510,7 +513,9 @@ export function App({
         if (convIdRef.current) {
           await client.invoke('conversations:set-active-id', convIdRef.current).catch(() => {});
         }
-        resolveNote('reconnect', 'reconnected');
+        setConnState('reconnected');
+        if (connClearRef.current) clearTimeout(connClearRef.current);
+        connClearRef.current = setTimeout(() => setConnState('ok'), 2500);
       })();
     });
 
@@ -518,7 +523,7 @@ export function App({
       off();
       offDisc();
     };
-  }, [client, recover, exit, resolveNote, promptAskUser]);
+  }, [client, recover, exit, promptAskUser]);
 
   // ── command + input handling ────────────────────────────────────────
   // Single-round-trip selection change. The backend patches only the selection
@@ -1165,6 +1170,19 @@ export function App({
       ) : (
         <InputBox status={status} conversationId={conversationId} onSubmit={submit} />
       )}
+      {connState !== 'ok' ? (
+        <Box>
+          {connState === 'reconnecting' ? (
+            <Text color="yellow">
+              <Spinner type="dots" /> <Text dimColor>backend disconnected — reconnecting…</Text>
+            </Text>
+          ) : (
+            <Text color="green" dimColor>
+              reconnected
+            </Text>
+          )}
+        </Box>
+      ) : null}
       {quitHint ? (
         <Box>
           <Text dimColor>Press Ctrl+C again to quit</Text>
