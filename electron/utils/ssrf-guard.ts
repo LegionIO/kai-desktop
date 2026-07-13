@@ -176,3 +176,14 @@ export async function readCappedArrayBuffer(resp: Response, maxBytes: number): P
   }
   return Buffer.concat(chunks);
 }
+
+/**
+ * Read a response body as UTF-8 text, bounded by maxBytes. A fetch timeout bounds
+ * only how long we wait for headers/first byte, NOT the total body size — a slow
+ * or hostile server (or a MITM) can stream an unbounded body into resp.text().
+ * Use this for text responses whose size we don't otherwise control.
+ */
+export async function readCappedText(resp: Response, maxBytes: number): Promise<string> {
+  const buf = await readCappedArrayBuffer(resp, maxBytes);
+  return buf.toString('utf-8');
+}

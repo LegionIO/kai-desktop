@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isUrlAllowed, isPrivateAddress } from '../ssrf-guard.js';
+import { isUrlAllowed, isPrivateAddress, readCappedText, readCappedArrayBuffer } from '../ssrf-guard.js';
 
 describe('ssrf-guard isPrivateAddress', () => {
   it('flags loopback / private / link-local / ULA', () => {
@@ -44,5 +44,42 @@ describe('ssrf-guard isUrlAllowed', () => {
 
   it('rejects an unparseable URL', () => {
     expect(isUrlAllowed('not a url', false).ok).toBe(false);
+  });
+});
+
+describe('ssrf-guard readCappedArrayBuffer / readCappedText', () => {
+  // Minimal Response-like object streaming the given chunks, with an optional
+  // content-length header for the pre-read declared-size check.
+  const resp = (chunks: Uint8Array[], contentLength?: number): Response =>
+    ({
+      headers: { get: (k: string) => (k === 'content-length' && contentLength != null ? String(contentLength) : null) },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const c of chunks) controller.enqueue(c);
+          controller.close();
+        },
+      }),
+    }) as unknown as Response;
+
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  it('reads a full body under the cap as text', async () => {
+    const out = await readCappedText(resp([enc('hello '), enc('world')]), 1000);
+    expect(out).toBe('hello world');
+  });
+
+  it('rejects up front when Content-Length declares a size over the cap', async () => {
+    await expect(readCappedArrayBuffer(resp([enc('x')], 9999), 100)).rejects.toThrow(/Content-Length 9999 exceeds 100/);
+  });
+
+  it('rejects mid-stream when the streamed body exceeds the cap (no declared length)', async () => {
+    // 120 bytes across two chunks, cap 100 — the running total trips at chunk 2.
+    const big = resp([new Uint8Array(60), new Uint8Array(60)]);
+    await expect(readCappedText(big, 100)).rejects.toThrow(/exceeded 100 bytes/);
+  });
+
+  it('decodes multi-byte UTF-8 that spans the byte count correctly', async () => {
+    const out = await readCappedText(resp([enc('café — ✓')]), 1000);
+    expect(out).toBe('café — ✓');
   });
 });

@@ -3,6 +3,12 @@ import sanitizeHtml from 'sanitize-html';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
+import { readCappedText } from '../utils/ssrf-guard.js';
+
+/** DuckDuckGo HTML result pages are small; cap the body so a hostile/MITM'd
+ *  response can't stream an unbounded body into memory (the fetch timeout bounds
+ *  only the header wait, not the body size). */
+const MAX_SEARCH_HTML_BYTES = 8 * 1024 * 1024;
 
 export function createWebSearchTool(getConfig: () => AppConfig): ToolDefinition {
   return {
@@ -22,7 +28,7 @@ export function createWebSearchTool(getConfig: () => AppConfig): ToolDefinition 
           signal: AbortSignal.timeout(timeout),
         });
         if (!resp.ok) return { error: `HTTP ${resp.status}` };
-        const html = await resp.text();
+        const html = await readCappedText(resp, MAX_SEARCH_HTML_BYTES);
 
         const results: Array<{ title: string; url: string; snippet: string }> = [];
         const resultRegex = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -30,8 +36,7 @@ export function createWebSearchTool(getConfig: () => AppConfig): ToolDefinition 
 
         const links = [...html.matchAll(resultRegex)];
         const snippets = [...html.matchAll(snippetRegex)];
-        const stripTags = (s: string) =>
-          sanitizeHtml(s, { allowedTags: [], allowedAttributes: {} }).trim();
+        const stripTags = (s: string) => sanitizeHtml(s, { allowedTags: [], allowedAttributes: {} }).trim();
 
         for (let i = 0; i < Math.min(links.length, maxResults); i++) {
           const rawUrl = links[i][1];
