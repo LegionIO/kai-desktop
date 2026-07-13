@@ -29,6 +29,45 @@ export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void 
   activeSession?.updateTools(tools);
 }
 
+/**
+ * Record usage for the active session (best-effort) then close + clear it.
+ * Shared by end-session (hangup) and start-session (superseding a live call) so
+ * neither path can (a) skip usage for a session it tears down, nor (b) leak the
+ * session if usage recording throws. Usage recording is wrapped so a disk-write
+ * failure never blocks the socket/computer-use cleanup in close().
+ */
+function recordAndCloseActiveSession(): void {
+  const session = activeSession;
+  const startedAt = sessionStartTime;
+  const convId = sessionConversationId;
+  // Detach + clear FIRST so close() failures or a re-entrant call can't act on a
+  // half-torn-down session.
+  activeSession = null;
+  sessionStartTime = null;
+  sessionConversationId = null;
+
+  if (!session) return;
+
+  if (startedAt) {
+    try {
+      const durationSec = (Date.now() - new Date(startedAt).getTime()) / 1000;
+      recordUsageEvent({
+        modality: 'realtime',
+        conversationId: convId ?? undefined,
+        durationSec: Math.round(durationSec),
+      });
+    } catch (err) {
+      console.warn('[Realtime IPC] Failed to record usage (continuing to close):', err);
+    }
+  }
+
+  try {
+    session.close();
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function registerRealtimeHandlers(
   ipcMain: IpcMain,
   getConfig: () => AppConfig,
@@ -48,14 +87,12 @@ export function registerRealtimeHandlers(
     try {
       console.info(`[Realtime IPC] start-session called for conversationId="${conversationId}"`);
 
-      // End any existing session
+      // End any existing session — record its usage before tearing it down so a
+      // start-while-active (e.g. switching calls) doesn't drop the prior call's
+      // duration.
       if (activeSession) {
-        activeSession.close();
-        activeSession = null;
+        recordAndCloseActiveSession();
       }
-
-      sessionStartTime = new Date().toISOString();
-      sessionConversationId = conversationId;
 
       const config = getConfig();
       console.info(`[Realtime IPC] memoryContext config: ${JSON.stringify(config.realtime.memoryContext)}`);
@@ -98,15 +135,21 @@ export function registerRealtimeHandlers(
         return { error: 'Session start superseded' };
       }
       activeSession = session;
+      // Set timing/attribution at INSTALL time so a superseded start can't leave
+      // stale globals, and so the recorded duration reflects connected time
+      // (not the memory-context build / connect setup that preceded this point).
+      sessionStartTime = new Date().toISOString();
+      sessionConversationId = conversationId;
       return { ok: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Realtime IPC] Failed to start session:', msg);
       // Start failed — tear down whatever we built so its computer-use tracking
-      // + socket don't leak and block the next start. On a throw from
-      // session.start(), the failed session is NOT yet installed as
-      // `activeSession` (that assignment is after the await), so close the local
-      // `session` too; fall back to `activeSession` for a pre-construction throw.
+      // + socket don't leak and block the next start. The failed session is NOT
+      // installed as `activeSession` (that assignment is after the await), and any
+      // prior active session was already recorded+closed at the top of this
+      // handler, so close the local `session`. The identity guard ensures a
+      // concurrent newer start that DID install itself is never closed here.
       const leaked = session ?? activeSession;
       if (leaked) {
         try {
@@ -124,21 +167,7 @@ export function registerRealtimeHandlers(
     // Supersede any in-flight start (a hangup during the "ringing"/memory-context
     // phase) so it aborts instead of connecting after the user hung up.
     startGeneration++;
-    if (activeSession) {
-      // Record usage event before closing
-      if (sessionStartTime) {
-        const durationSec = (Date.now() - new Date(sessionStartTime).getTime()) / 1000;
-        recordUsageEvent({
-          modality: 'realtime',
-          conversationId: sessionConversationId ?? undefined,
-          durationSec: Math.round(durationSec),
-        });
-      }
-      activeSession.close();
-      activeSession = null;
-      sessionStartTime = null;
-      sessionConversationId = null;
-    }
+    recordAndCloseActiveSession();
     return { ok: true };
   });
 
