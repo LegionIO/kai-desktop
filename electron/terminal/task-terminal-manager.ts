@@ -27,18 +27,42 @@ interface TaskTerminal {
 }
 
 export class TaskTerminalManager {
+  /** Hard bound on the exit-code cache so orphaned sessions (renderer-created
+   *  terminals with no consumer, or agent exits stranded before reconciliation)
+   *  can't leak the map without limit. Oldest entries are evicted first. */
+  private static readonly MAX_EXIT_CODES = 256;
+
   private terminals = new Map<string, TaskTerminal>();
-  /** Exit codes for recently-exited sessions, keyed by sessionId. */
+  /** Exit codes for recently-exited sessions, keyed by sessionId. Bounded via
+   *  {@link cacheExitCode}. */
   private exitCodes = new Map<string, number>();
   /** Callbacks invoked immediately when a terminal session exits. */
   private exitCallbacks = new Map<string, (exitCode: number) => void>();
 
   /**
    * Register a callback to be notified immediately when a terminal session exits.
-   * The callback is automatically removed after it fires.
+   * The callback is automatically removed after it fires. If the session ALREADY
+   * exited before this registration (a fast-failing PTY can exit between create()
+   * returning and the caller registering here), the recorded exit code is
+   * consumed and the callback fired synchronously so the exit is never lost.
    */
   onSessionExit(sessionId: string, callback: (exitCode: number) => void): void {
+    const alreadyExited = this.consumeExitCode(sessionId);
+    if (alreadyExited !== undefined) {
+      callback(alreadyExited);
+      return;
+    }
     this.exitCallbacks.set(sessionId, callback);
+  }
+
+  /** Record an exit code with insertion-order eviction to enforce the size cap. */
+  private cacheExitCode(sessionId: string, exitCode: number): void {
+    this.exitCodes.set(sessionId, exitCode);
+    while (this.exitCodes.size > TaskTerminalManager.MAX_EXIT_CODES) {
+      const oldest = this.exitCodes.keys().next().value;
+      if (oldest === undefined) break;
+      this.exitCodes.delete(oldest);
+    }
   }
 
   async create(
@@ -85,14 +109,20 @@ export class TaskTerminalManager {
 
     proc.onExit(({ exitCode }: { exitCode: number }) => {
       this.terminals.delete(sessionId);
-      this.exitCodes.set(sessionId, exitCode);
       const cb = this.exitCallbacks.get(sessionId);
       this.exitCallbacks.delete(sessionId);
-      // If a callback consumed the exit, clean up the code immediately
+      // If a callback is already waiting, hand the code straight to it and never
+      // cache it (avoids a stranded entry if nobody later calls consumeExitCode).
+      // Otherwise cache it (bounded) for a later onSessionExit/reconciler consume.
       if (cb) {
-        cb(exitCode);
-        this.exitCodes.delete(sessionId);
+        try {
+          cb(exitCode);
+        } finally {
+          this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
+        }
+        return;
       }
+      this.cacheExitCode(sessionId, exitCode);
       this.broadcast('tasks:terminal-exit', { sessionId, exitCode });
     });
 
