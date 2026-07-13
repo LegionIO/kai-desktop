@@ -33,6 +33,27 @@ function dirSize(dirPath: string, budget = { entriesLeft: 200_000 }, depth = 0):
   return total;
 }
 
+/**
+ * Whether `name` is safe to delete as a DIRECT child directory of
+ * `partitionsDir`. Rejects (returns null) anything that could escape or that
+ * resolves back to `partitionsDir` itself (which would rmSync the ENTIRE
+ * partitions tree): non-strings, ''/'.'/'..' , names containing '..' / '/' /
+ * '\\' / NUL, and any path that doesn't resolve to a strict child. On success
+ * returns the resolved absolute directory path to delete.
+ */
+export function resolveSafePartitionDir(name: unknown, partitionsDir: string): string | null {
+  if (typeof name !== 'string' || name === '' || name === '.' || name === '..') return null;
+  if (name.includes('..') || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    return null;
+  }
+  const dirPath = join(partitionsDir, name);
+  const relative = resolve(dirPath);
+  if (relative === resolve(partitionsDir) || !relative.startsWith(resolve(partitionsDir) + sep)) {
+    return null;
+  }
+  return dirPath;
+}
+
 export function registerPartitionHandlers(ipcMain: IpcMain): void {
   const partitionsDir = join(app.getPath('userData'), 'Partitions');
 
@@ -66,22 +87,11 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
 
     try {
       for (const name of names) {
-        // Sanitize: reject anything that isn't a plain single-segment directory
-        // name. `..`/`/`/`\` are path traversal; `''` and `.` both resolve
-        // join(partitionsDir, name) back to partitionsDir itself, which would
-        // rmSync the ENTIRE partitions directory. Require a non-empty name that
-        // resolves to a DIRECT child of partitionsDir.
-        if (typeof name !== 'string' || name === '' || name === '.' || name === '..') continue;
-        if (name.includes('..') || name.includes('/') || name.includes('\\') || name.includes('\0')) {
-          continue;
-        }
-        const dirPath = join(partitionsDir, name);
-        // Defense in depth: the resolved path must be a strict child of
-        // partitionsDir (not partitionsDir itself, not an escape).
-        const relative = resolve(dirPath);
-        if (relative === resolve(partitionsDir) || !relative.startsWith(resolve(partitionsDir) + sep)) {
-          continue;
-        }
+        // Reject anything that isn't a plain single-segment name resolving to a
+        // DIRECT child of partitionsDir (see resolveSafePartitionDir). `''`/`.`
+        // would otherwise resolve back to partitionsDir and rmSync the whole tree.
+        const dirPath = resolveSafePartitionDir(name, partitionsDir);
+        if (dirPath === null) continue;
 
         // Clear in-memory session data first
         try {
@@ -94,7 +104,7 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
 
         // Also try without persist: prefix (plugins may use either form)
         try {
-          const ses = session.fromPartition(name);
+          const ses = session.fromPartition(name as string);
           await ses.clearStorageData();
           await ses.clearCache();
         } catch {
@@ -106,7 +116,7 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
           rmSync(dirPath, { recursive: true, force: true });
         }
 
-        deleted.push(name);
+        deleted.push(name as string);
       }
 
       return { success: true, deleted };
