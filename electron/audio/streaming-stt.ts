@@ -59,7 +59,9 @@ function cleanupStream(getMicWindow: () => BrowserWindow | null): void {
 
   const micWin = getMicWindow();
   if (micWin && !micWin.isDestroyed()) {
-    micWin.webContents.executeJavaScript('window._mic.stopLiveStream()').catch(() => { /* ignore */ });
+    micWin.webContents.executeJavaScript('window._mic.stopLiveStream()').catch(() => {
+      /* ignore */
+    });
   }
 }
 
@@ -68,102 +70,134 @@ export function registerStreamingSttHandlers(
   getConfig: () => AppConfig,
   getMicWindow: () => BrowserWindow | null,
 ): void {
-
-  ipc.handle('stt:stream-start', async (_event, options?: {
-    deviceId?: string;
-    language?: string;
-  }) => {
-    if (streamSession || streamStarting) {
-      return { error: 'Stream already active' };
-    }
-
-    const config = getConfig();
-    const sttConfig = resolveOpenAISttConfig(config as Record<string, unknown>, 'composer');
-    if (!sttConfig) {
-      return { error: 'No OpenAI Realtime STT credentials configured' };
-    }
-
-    const language = options?.language ?? 'en-US';
-    const deviceId = options?.deviceId;
-
-    console.info('[StreamingSTT] Starting: model=%s, language=%s, device=%s',
-      sttConfig.model, language, deviceId ?? 'default');
-
-    // Ensure mic window is available
-    const micWin = getMicWindow();
-    if (!micWin || micWin.isDestroyed()) {
-      return { error: 'Mic recorder window not available' };
-    }
-
-    // Set starting flag to prevent concurrent start/cancel races
-    streamStarting = true;
-
-    try {
-      // Start the live PCM stream on the mic window FIRST (so audio flows before WS connects)
-      const escapedDeviceId = deviceId ? JSON.stringify(deviceId) : 'null';
-      const micResult = await micWin.webContents.executeJavaScript(
-        `window._mic.startLiveStream(${escapedDeviceId})`
-      ) as { ok?: boolean; error?: string };
-
-      // Check if canceled during mic startup
-      if (!streamStarting) {
-        try { await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()'); } catch { /* ignore */ }
-        return { error: 'Canceled during startup' };
+  ipc.handle(
+    'stt:stream-start',
+    async (
+      _event,
+      options?: {
+        deviceId?: string;
+        language?: string;
+      },
+    ) => {
+      if (streamSession || streamStarting) {
+        return { error: 'Stream already active' };
       }
 
-      if (micResult.error) {
-        console.error('[StreamingSTT] Mic start failed: %s', micResult.error);
-        streamStarting = false;
-        return { error: `Mic start failed: ${micResult.error}` };
+      const config = getConfig();
+      const sttConfig = resolveOpenAISttConfig(config as Record<string, unknown>, 'composer');
+      if (!sttConfig) {
+        return { error: 'No OpenAI Realtime STT credentials configured' };
       }
 
-      // Create and start the OpenAI Realtime STT session
-      streamSession = new OpenAIRealtimeSttSession(
-        { ...sttConfig, sampleRate: 16000, language },
-        {
-          onPartial: (text) => { broadcast('stt:partial', text); },
-          onFinal: (text) => { broadcast('stt:final', text); },
-          onError: (error) => {
-            console.error('[StreamingSTT] Error: %s', error);
-            broadcast('stt:error', error);
-            // Runtime errors should trigger cleanup to prevent resource leak
-            cleanupStream(getMicWindow);
-          },
-        },
+      const language = options?.language ?? 'en-US';
+      const deviceId = options?.deviceId;
+
+      // IPC JSON doesn't enforce the TS `string` type — reject a non-string
+      // deviceId before it's JSON.stringify'd into the mic-window executeJavaScript
+      // call. (JSON.stringify already prevents JS breakout; this enforces the
+      // contract so a malformed device selector fails clearly instead of silently
+      // passing a bogus argument.)
+      if (deviceId != null && typeof deviceId !== 'string') {
+        return { error: 'Invalid deviceId' };
+      }
+
+      console.info(
+        '[StreamingSTT] Starting: model=%s, language=%s, device=%s',
+        sttConfig.model,
+        language,
+        deviceId ?? 'default',
       );
 
-      await streamSession.start();
-
-      // Check if canceled during WS connect
-      if (!streamStarting) {
-        streamSession?.destroy();
-        streamSession = null;
-        try { await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()'); } catch { /* ignore */ }
-        return { error: 'Canceled during startup' };
+      // Ensure mic window is available
+      const micWin = getMicWindow();
+      if (!micWin || micWin.isDestroyed()) {
+        return { error: 'Mic recorder window not available' };
       }
 
-      streamStartTime = Date.now();
-      streamStarting = false;
+      // Set starting flag to prevent concurrent start/cancel races
+      streamStarting = true;
 
-      // Start polling mic chunks and forwarding to the WS session
-      startStreamPolling(getMicWindow);
-
-      return { ok: true };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[StreamingSTT] Start failed: %s', msg);
-
-      // Clean up: stop mic stream and destroy session
       try {
-        await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
-      } catch { /* ignore */ }
+        // Start the live PCM stream on the mic window FIRST (so audio flows before WS connects)
+        const escapedDeviceId = deviceId ? JSON.stringify(deviceId) : 'null';
+        const micResult = (await micWin.webContents.executeJavaScript(
+          `window._mic.startLiveStream(${escapedDeviceId})`,
+        )) as { ok?: boolean; error?: string };
 
-      streamSession?.destroy();
-      streamSession = null;
-      streamStarting = false;
-      return { error: msg };
-    }
-  });
+        // Check if canceled during mic startup
+        if (!streamStarting) {
+          try {
+            await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
+          } catch {
+            /* ignore */
+          }
+          return { error: 'Canceled during startup' };
+        }
+
+        if (micResult.error) {
+          console.error('[StreamingSTT] Mic start failed: %s', micResult.error);
+          streamStarting = false;
+          return { error: `Mic start failed: ${micResult.error}` };
+        }
+
+        // Create and start the OpenAI Realtime STT session
+        streamSession = new OpenAIRealtimeSttSession(
+          { ...sttConfig, sampleRate: 16000, language },
+          {
+            onPartial: (text) => {
+              broadcast('stt:partial', text);
+            },
+            onFinal: (text) => {
+              broadcast('stt:final', text);
+            },
+            onError: (error) => {
+              console.error('[StreamingSTT] Error: %s', error);
+              broadcast('stt:error', error);
+              // Runtime errors should trigger cleanup to prevent resource leak
+              cleanupStream(getMicWindow);
+            },
+          },
+        );
+
+        await streamSession.start();
+
+        // Check if canceled during WS connect
+        if (!streamStarting) {
+          streamSession?.destroy();
+          streamSession = null;
+          try {
+            await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
+          } catch {
+            /* ignore */
+          }
+          return { error: 'Canceled during startup' };
+        }
+
+        streamStartTime = Date.now();
+        streamStarting = false;
+
+        // Start polling mic chunks and forwarding to the WS session
+        startStreamPolling(getMicWindow);
+
+        return { ok: true };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[StreamingSTT] Start failed: %s', msg);
+
+        // Clean up: stop mic stream and destroy session
+        try {
+          await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
+        } catch {
+          /* ignore */
+        }
+
+        streamSession?.destroy();
+        streamSession = null;
+        streamStarting = false;
+        return { error: msg };
+      }
+    },
+  );
 
   ipc.handle('stt:stream-stop', async () => {
     if (!streamSession) {
@@ -184,28 +218,34 @@ export function registerStreamingSttHandlers(
     try {
       // Wait for any in-flight drain to complete before doing the final drain
       if (streamDrainPromise) {
-        try { await streamDrainPromise; } catch { /* ignore */ }
+        try {
+          await streamDrainPromise;
+        } catch {
+          /* ignore */
+        }
       }
 
       // Final drain: flush any buffered audio chunks before committing
       if (micWin && !micWin.isDestroyed()) {
         try {
-          const finalChunks = await micWin.webContents.executeJavaScript(
-            'window._mic.drainLiveChunks()'
-          ) as string[];
+          const finalChunks = (await micWin.webContents.executeJavaScript('window._mic.drainLiveChunks()')) as string[];
           if (finalChunks && finalChunks.length > 0 && session) {
             for (const chunk of finalChunks) {
               session.pushAudio(chunk);
             }
           }
-        } catch { /* ignore final drain errors */ }
+        } catch {
+          /* ignore final drain errors */
+        }
       }
 
       // Stop mic immediately (user sees mic release) before waiting for transcription
       if (micWin && !micWin.isDestroyed()) {
         try {
           await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
 
       // Stop the STT session (commits audio buffer, waits for final transcription)
@@ -216,8 +256,7 @@ export function registerStreamingSttHandlers(
         recordUsageEvent({ modality: 'stt', durationSec });
       }
 
-      console.info('[StreamingSTT] Stopped: transcript=%d chars, duration=%.1fs',
-        transcript.length, durationSec);
+      console.info('[StreamingSTT] Stopped: transcript=%d chars, duration=%.1fs', transcript.length, durationSec);
 
       session.destroy();
       streamSession = null;
@@ -235,7 +274,9 @@ export function registerStreamingSttHandlers(
       if (micWin && !micWin.isDestroyed()) {
         try {
           await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
 
       return { text: '', error: msg };
@@ -265,7 +306,9 @@ export function registerStreamingSttHandlers(
     if (micWin && !micWin.isDestroyed()) {
       try {
         await micWin.webContents.executeJavaScript('window._mic.stopLiveStream()');
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
 
     console.info('[StreamingSTT] Canceled');
@@ -290,7 +333,8 @@ function startStreamPolling(getMicWindow: () => BrowserWindow | null): void {
       return;
     }
 
-    streamDrainPromise = micWin.webContents.executeJavaScript('window._mic.drainLiveChunks()')
+    streamDrainPromise = micWin.webContents
+      .executeJavaScript('window._mic.drainLiveChunks()')
       .then((chunks: string[]) => {
         if (chunks && chunks.length > 0 && capturedSession === streamSession && streamSession) {
           for (const chunk of chunks) {
@@ -298,8 +342,12 @@ function startStreamPolling(getMicWindow: () => BrowserWindow | null): void {
           }
         }
       })
-      .catch(() => { /* ignore drain errors */ })
-      .finally(() => { streamDrainInFlight = false; });
+      .catch(() => {
+        /* ignore drain errors */
+      })
+      .finally(() => {
+        streamDrainInFlight = false;
+      });
   }, 50);
 }
 

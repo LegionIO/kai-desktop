@@ -24,111 +24,142 @@ let recognizer: sdk.SpeechRecognizer | null = null;
 let pushStream: sdk.PushAudioInputStream | null = null;
 let isRunning = false;
 
+/** Azure Speech host suffixes. A host matches if it equals one of these OR is a
+ *  subdomain of one — so the leading-dot check enforces DNS-label boundaries
+ *  (`evil-azure.com` / `azure.com.evil.com` don't match). */
+const AZURE_SPEECH_SUFFIXES = ['microsoft.com', 'azure.com', 'azure.cn', 'azure.us'];
+
+/**
+ * Classify whether a Speech endpoint host is an official Azure host (→ use the
+ * SDK's redirect-capable `fromEndpoint`) vs. a custom/proxy host (→ `fromHost`,
+ * which skips the HTTPS:443 redirect dance). Strips a single trailing DNS dot so
+ * an FQDN like `foo.azure.com.` still classifies as Azure, and matches the root
+ * suffix itself (`azure.com`) as well as any subdomain.
+ */
+export function isAzureSpeechHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, '');
+  return AZURE_SPEECH_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
 export function registerLiveSttHandlers(ipc: IpcMain): void {
+  ipc.handle(
+    'stt:live-start',
+    async (
+      _event,
+      config: {
+        subscriptionKey: string;
+        region?: string;
+        endpoint?: string;
+        language: string;
+      },
+    ) => {
+      console.log('[LiveSTT] Starting with config:');
+      console.log('[LiveSTT]   endpoint=%s', config.endpoint ?? '(none — will use region)');
+      console.log('[LiveSTT]   region=%s', config.region ?? '(none)');
+      console.log('[LiveSTT]   language=%s', config.language);
+      console.log('[LiveSTT]   subscriptionKeyConfigured=%s', Boolean(config.subscriptionKey));
 
-  ipc.handle('stt:live-start', async (_event, config: {
-    subscriptionKey: string;
-    region?: string;
-    endpoint?: string;
-    language: string;
-  }) => {
-    console.log('[LiveSTT] Starting with config:');
-    console.log('[LiveSTT]   endpoint=%s', config.endpoint ?? '(none — will use region)');
-    console.log('[LiveSTT]   region=%s', config.region ?? '(none)');
-    console.log('[LiveSTT]   language=%s', config.language);
-    console.log('[LiveSTT]   subscriptionKeyConfigured=%s', Boolean(config.subscriptionKey));
+      if (isRunning) return { error: 'Already running' };
 
-    if (isRunning) return { error: 'Already running' };
+      try {
+        // Speech config
+        let speechConfig: sdk.SpeechConfig;
+        if (config.endpoint) {
+          // Detect if this is a non-Azure custom endpoint (not *.microsoft.com, *.azure.com, etc.)
+          const endpointUrl = new URL(config.endpoint.replace(/\/+$/, ''));
+          const isAzureEndpoint = isAzureSpeechHost(endpointUrl.hostname);
 
-    try {
-      // Speech config
-      let speechConfig: sdk.SpeechConfig;
-      if (config.endpoint) {
-        // Detect if this is a non-Azure custom endpoint (not *.microsoft.com, *.azure.com, etc.)
-        const endpointUrl = new URL(config.endpoint.replace(/\/+$/, ''));
-        const host = endpointUrl.hostname.toLowerCase();
-        const isAzureEndpoint = host.endsWith('.microsoft.com') ||
-                                host.endsWith('.azure.com') ||
-                                host.endsWith('.azure.cn') ||
-                                host.endsWith('.azure.us');
-
-        if (isAzureEndpoint) {
-          // Standard Azure endpoint — use fromEndpoint (supports redirect flow)
-          console.log('[LiveSTT] Using fromEndpoint (Azure): %s', endpointUrl.toString());
-          speechConfig = sdk.SpeechConfig.fromEndpoint(endpointUrl, config.subscriptionKey);
+          if (isAzureEndpoint) {
+            // Standard Azure endpoint — use fromEndpoint (supports redirect flow)
+            console.log('[LiveSTT] Using fromEndpoint (Azure): %s', endpointUrl.toString());
+            speechConfig = sdk.SpeechConfig.fromEndpoint(endpointUrl, config.subscriptionKey);
+          } else {
+            // Custom/proxy endpoint — use fromHost to skip the HTTPS:443 redirect dance.
+            // fromHost preserves the exact protocol, host, and port.
+            // The SDK will append the speech path (e.g., /speech/recognition/conversation/cognitiveservices/v1)
+            // and connect via WebSocket directly.
+            const hostUrl = new URL(endpointUrl.origin);
+            console.log('[LiveSTT] Using fromHost (custom): %s', hostUrl.toString());
+            speechConfig = sdk.SpeechConfig.fromHost(hostUrl, config.subscriptionKey);
+          }
         } else {
-          // Custom/proxy endpoint — use fromHost to skip the HTTPS:443 redirect dance.
-          // fromHost preserves the exact protocol, host, and port.
-          // The SDK will append the speech path (e.g., /speech/recognition/conversation/cognitiveservices/v1)
-          // and connect via WebSocket directly.
-          const hostUrl = new URL(endpointUrl.origin);
-          console.log('[LiveSTT] Using fromHost (custom): %s', hostUrl.toString());
-          speechConfig = sdk.SpeechConfig.fromHost(hostUrl, config.subscriptionKey);
+          console.log('[LiveSTT] Using fromSubscription: region=%s', config.region ?? 'eastus');
+          speechConfig = sdk.SpeechConfig.fromSubscription(config.subscriptionKey, config.region ?? 'eastus');
         }
-      } else {
-        console.log('[LiveSTT] Using fromSubscription: region=%s', config.region ?? 'eastus');
-        speechConfig = sdk.SpeechConfig.fromSubscription(config.subscriptionKey, config.region ?? 'eastus');
+        speechConfig.speechRecognitionLanguage = config.language;
+        console.log('[LiveSTT] SpeechConfig created, language=%s', speechConfig.speechRecognitionLanguage);
+
+        // Push stream (16kHz, 16-bit, mono)
+        const format = sdk.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
+        pushStream = sdk.AudioInputStream.createPushStream(format);
+        const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
+
+        // Recognizer
+        recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+        recognizer.recognizing = (_sender, e) => {
+          if (e.result.text) {
+            broadcast('stt:partial', e.result.text);
+          }
+        };
+
+        recognizer.recognized = (_sender, e) => {
+          if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
+            console.log('[LiveSTT] Final: "%s"', e.result.text);
+            broadcast('stt:final', e.result.text);
+          }
+        };
+
+        recognizer.canceled = (_sender, e) => {
+          console.log(
+            '[LiveSTT] Canceled: reason=%s errorCode=%s hasDetails=%s',
+            sdk.CancellationReason[e.reason],
+            sdk.CancellationErrorCode[e.errorCode],
+            Boolean(e.errorDetails),
+          );
+          if (e.reason === sdk.CancellationReason.Error) {
+            broadcast(
+              'stt:error',
+              'Speech recognition failed. Check Audio & Voice settings, microphone access, and network connectivity.',
+            );
+          }
+        };
+
+        recognizer.sessionStopped = () => {
+          console.log('[LiveSTT] Session stopped');
+        };
+
+        // Start continuous recognition (with timeout to prevent IPC hang)
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(
+              new Error('Speech recognition start timed out after 15 seconds — check your endpoint and credentials'),
+            );
+          }, 15000);
+
+          recognizer!.startContinuousRecognitionAsync(
+            () => {
+              clearTimeout(timeout);
+              console.log('[LiveSTT] Started');
+              resolve();
+            },
+            (err) => {
+              clearTimeout(timeout);
+              reject(new Error(err));
+            },
+          );
+        });
+
+        isRunning = true;
+        return { ok: true };
+      } catch (err) {
+        cleanup();
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[LiveSTT] Start error:', msg);
+        return { error: msg };
       }
-      speechConfig.speechRecognitionLanguage = config.language;
-      console.log('[LiveSTT] SpeechConfig created, language=%s', speechConfig.speechRecognitionLanguage);
-
-      // Push stream (16kHz, 16-bit, mono)
-      const format = sdk.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
-      pushStream = sdk.AudioInputStream.createPushStream(format);
-      const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
-
-      // Recognizer
-      recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
-
-      recognizer.recognizing = (_sender, e) => {
-        if (e.result.text) {
-          broadcast('stt:partial', e.result.text);
-        }
-      };
-
-      recognizer.recognized = (_sender, e) => {
-        if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
-          console.log('[LiveSTT] Final: "%s"', e.result.text);
-          broadcast('stt:final', e.result.text);
-        }
-      };
-
-      recognizer.canceled = (_sender, e) => {
-        console.log('[LiveSTT] Canceled: reason=%s errorCode=%s hasDetails=%s',
-          sdk.CancellationReason[e.reason],
-          sdk.CancellationErrorCode[e.errorCode],
-          Boolean(e.errorDetails));
-        if (e.reason === sdk.CancellationReason.Error) {
-          broadcast('stt:error', 'Speech recognition failed. Check Audio & Voice settings, microphone access, and network connectivity.');
-        }
-      };
-
-      recognizer.sessionStopped = () => {
-        console.log('[LiveSTT] Session stopped');
-      };
-
-      // Start continuous recognition (with timeout to prevent IPC hang)
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Speech recognition start timed out after 15 seconds — check your endpoint and credentials'));
-        }, 15000);
-
-        recognizer!.startContinuousRecognitionAsync(
-          () => { clearTimeout(timeout); console.log('[LiveSTT] Started'); resolve(); },
-          (err) => { clearTimeout(timeout); reject(new Error(err)); },
-        );
-      });
-
-      isRunning = true;
-      return { ok: true };
-
-    } catch (err) {
-      cleanup();
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[LiveSTT] Start error:', msg);
-      return { error: msg };
-    }
-  });
+    },
+  );
 
   // Receive PCM16 audio chunks from the renderer (which polls the hidden window)
   let audioChunkCount = 0;
@@ -158,7 +189,11 @@ export function registerLiveSttHandlers(ipc: IpcMain): void {
 
     // Signal end of audio
     if (pushStream) {
-      try { pushStream.close(); } catch { /* ignore */ }
+      try {
+        pushStream.close();
+      } catch {
+        /* ignore */
+      }
       pushStream = null;
     }
 
@@ -169,7 +204,9 @@ export function registerLiveSttHandlers(ipc: IpcMain): void {
           () => resolve(),
         );
       });
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
 
     cleanup();
     return { ok: true };
@@ -179,7 +216,11 @@ export function registerLiveSttHandlers(ipc: IpcMain): void {
 function broadcast(channel: string, data: string) {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
-      try { win.webContents.send(channel, data); } catch { /* ignore */ }
+      try {
+        win.webContents.send(channel, data);
+      } catch {
+        /* ignore */
+      }
     }
   }
   broadcastToWebClients(channel, data);
@@ -187,6 +228,20 @@ function broadcast(channel: string, data: string) {
 
 function cleanup() {
   isRunning = false;
-  if (pushStream) { try { pushStream.close(); } catch { /* ignore */ } pushStream = null; }
-  if (recognizer) { try { recognizer.close(); } catch { /* ignore */ } recognizer = null; }
+  if (pushStream) {
+    try {
+      pushStream.close();
+    } catch {
+      /* ignore */
+    }
+    pushStream = null;
+  }
+  if (recognizer) {
+    try {
+      recognizer.close();
+    } catch {
+      /* ignore */
+    }
+    recognizer = null;
+  }
 }
