@@ -793,11 +793,20 @@ function createWindow(): BrowserWindow {
                 filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }],
               });
               if (!result.canceled && result.filePath) {
-                const resp = await net.fetch(params.srcURL, {
-                  headers: withBrandUserAgent(),
-                });
+                // srcURL comes from the UNTRUSTED in-app browser page. http(s)
+                // must go through the SSRF-guarded, byte-capped fetch (blocks
+                // private/loopback/metadata targets + redirect bypass + unbounded
+                // body); the media: protocol is a LOCAL file via the app's own
+                // handler, not a network request, so it uses net.fetch directly.
+                // Mirrors the image:fetch IPC handler.
+                const isMedia = parsed.protocol === __BRAND_MEDIA_PROTOCOL + ':';
+                const resp = isMedia
+                  ? await net.fetch(params.srcURL, { headers: withBrandUserAgent() })
+                  : await safeFetch(params.srcURL, { headers: withBrandUserAgent() as Record<string, string> });
                 if (resp.ok) {
-                  const buffer = Buffer.from(await resp.arrayBuffer());
+                  const buffer = isMedia
+                    ? Buffer.from(await resp.arrayBuffer())
+                    : await readCappedArrayBuffer(resp, 256 * 1024 * 1024);
                   writeFileSync(result.filePath, buffer);
                 }
               }
