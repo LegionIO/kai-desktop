@@ -118,7 +118,7 @@ vi.mock('../language-model.js', () => ({
   shouldUseOpenAIResponsesApi: vi.fn(() => false),
 }));
 
-const { streamAgentResponse, streamWithFallback, normalizeAgentCwd } = await import('../mastra-agent.js');
+const { streamAgentResponse, streamWithFallback, normalizeAgentCwd, __internal } = await import('../mastra-agent.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,6 +205,51 @@ describe('mastra-agent — pure helpers', () => {
     it('resolves relative paths against homedir', () => {
       const result = normalizeAgentCwd('Projects');
       expect(result.endsWith('/Projects')).toBe(true);
+    });
+
+    it('defaults empty / null / whitespace to homedir', () => {
+      // empty, null, and whitespace all fall back to homedir (an absolute path)
+      for (const v of ['', '   ', null, undefined]) {
+        const r = normalizeAgentCwd(v);
+        expect(r.startsWith('/')).toBe(true);
+        expect(r.length).toBeGreaterThan(1);
+      }
+    });
+
+    it('expands "~/sub" under homedir', () => {
+      const r = normalizeAgentCwd('~/Documents/notes');
+      expect(r).not.toContain('~');
+      expect(r.endsWith('/Documents/notes')).toBe(true);
+    });
+  });
+
+  describe('normalizeWorkspacePath', () => {
+    const { normalizeWorkspacePath } = __internal;
+    const base = '/work/base';
+
+    it('returns basePath for empty / "." / whitespace', () => {
+      expect(normalizeWorkspacePath(base, '')).toBe(base);
+      expect(normalizeWorkspacePath(base, '.')).toBe(base);
+      expect(normalizeWorkspacePath(base, '   ')).toBe(base);
+    });
+
+    it('returns an absolute path unchanged', () => {
+      expect(normalizeWorkspacePath(base, '/etc/hosts')).toBe('/etc/hosts');
+    });
+
+    it('resolves a relative path against basePath (incl. .. traversal — confinement is enforced later by isPathAllowed)', () => {
+      expect(normalizeWorkspacePath(base, 'sub/file.txt')).toBe('/work/base/sub/file.txt');
+      expect(normalizeWorkspacePath(base, '../escape')).toBe('/work/escape');
+    });
+
+    it('expands "~" and "~/sub" to homedir (not basePath)', () => {
+      const home = normalizeWorkspacePath(base, '~');
+      expect(home).not.toContain('~');
+      expect(home.startsWith('/')).toBe(true);
+      const sub = normalizeWorkspacePath(base, '~/x/y');
+      expect(sub).not.toContain('~');
+      expect(sub.endsWith('/x/y')).toBe(true);
+      expect(sub.startsWith('/work/base')).toBe(false); // resolved under home, not base
     });
   });
 });

@@ -1935,4 +1935,5 @@ export const __internal = {
   normalizeApproximateLocation,
   normalizeOpenAIWebSearchFilters,
   normalizeProviderToolType,
+  normalizeWorkspacePath,
 };
