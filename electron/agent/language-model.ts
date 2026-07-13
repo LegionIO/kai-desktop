@@ -145,6 +145,29 @@ function createResponsesApiPatchingFetch(): typeof fetch {
         }
       }
 
+      // Backfill a missing `output` on any EXISTING tool-result item. The
+      // Responses API requires a function_call_output (and custom_tool_call_output)
+      // to carry a string `output`; the AI SDK can emit one with an
+      // undefined/absent output when a tool returned an unserializable/empty
+      // result — the gateway then 400s with "Missing required parameter:
+      // 'input[N].output'". The orphan-inject above only covers MISSING output
+      // items, not present-but-malformed ones. Coerce to a string in place.
+      for (let i = 0; i < patched.length; i++) {
+        const item = patched[i] as Record<string, unknown> | null;
+        if (
+          item &&
+          typeof item === 'object' &&
+          (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') &&
+          typeof item.output !== 'string'
+        ) {
+          patched[i] = {
+            ...item,
+            output: item.output == null ? 'Tool execution did not return a result.' : JSON.stringify(item.output),
+          };
+          patchApplied = true;
+        }
+      }
+
       // Remove trailing assistant messages — Mastra's MessageMerger can produce
       // duplicate/redundant assistant items for each agentic loop step.  The
       // gateway rejects these because Anthropic requires the conversation to end
@@ -318,4 +341,5 @@ export const __internal = {
   hasOpenAIV1Path,
   normalizeOpenAIBaseUrl,
   isResponsesEndpoint,
+  createResponsesApiPatchingFetch,
 };
