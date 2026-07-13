@@ -124,7 +124,7 @@ vi.mock('../conversation-store.js', () => ({
 // the resolution before the production module loads.
 // ---------------------------------------------------------------------------
 
-import { registerAgentHandlers } from '../agent.js';
+import { registerAgentHandlers, __internal } from '../agent.js';
 import { pendingToolApprovals } from '../tool-approval.js';
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 
@@ -297,3 +297,45 @@ describe('agent IPC: sub-agent channels', () => {
 // loaded. Keeping them here would have inflated this file's stated scope
 // (IPC handler coverage) with code that exercises only the fixture.
 // ---------------------------------------------------------------------------
+
+describe('extractLastUserText (mirror a GUI-driven turn to co-viewing clients)', () => {
+  const { extractLastUserText } = __internal;
+
+  it('returns the last user turn as plain text (string content)', () => {
+    expect(
+      extractLastUserText([
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+        { role: 'user', content: 'how are you doing' },
+      ]),
+    ).toBe('how are you doing');
+  });
+
+  it('extracts + concatenates text parts from content-part array content', () => {
+    expect(
+      extractLastUserText([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'what folder' },
+            { type: 'image', image: 'x' },
+          ],
+        },
+      ]),
+    ).toBe('what folder [Image]');
+  });
+
+  it('returns the LAST user turn, not an earlier one', () => {
+    expect(
+      extractLastUserText([
+        { role: 'user', content: 'first' },
+        { role: 'user', content: 'second' },
+      ]),
+    ).toBe('second');
+  });
+
+  it('returns empty string when there is no user turn', () => {
+    expect(extractLastUserText([{ role: 'assistant', content: 'hi' }])).toBe('');
+    expect(extractLastUserText([])).toBe('');
+  });
+});

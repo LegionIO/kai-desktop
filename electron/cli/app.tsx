@@ -383,7 +383,15 @@ export function App({
             ownSubmitNoncesRef.current.delete(nonce);
             break;
           }
+          // A PEER-driven turn (e.g. the GUI on the same conversation). Flush any
+          // in-progress assistant text into its own turn first, then open a clean
+          // slate for this turn's response — otherwise the incoming text-deltas
+          // accumulate onto stale streaming state and render mangled/partial.
+          finalizeAssistant();
+          streamingRef.current = '';
+          turnSettledRef.current = false; // arm the terminal-event (done/error) guard
           if (e.text) pushTurn({ kind: 'user', text: e.text });
+          setStatus('running');
           break;
         }
         case 'text-delta':

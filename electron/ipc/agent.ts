@@ -110,6 +110,15 @@ function lastUserMessage(messages: unknown[]): { role?: unknown; content?: unkno
   return null;
 }
 
+/** Plain text of the newest user turn in a branch — string content as-is, or the
+ *  concatenated text parts of a content-part array. Used to mirror a GUI-driven
+ *  turn's prompt to co-viewing clients (the `kai` CLI) via a user-message event. */
+function extractLastUserText(messages: unknown[]): string {
+  const content = lastUserMessage(messages)?.content;
+  if (typeof content === 'string') return content.trim();
+  return extractMessageText(content);
+}
+
 /** Structural JSON of a value for change detection (undefined → ''). */
 function jsonStableString(value: unknown): string {
   if (value === undefined) return '';
@@ -664,6 +673,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
+
+    // Mirror the newest user turn to OTHER attached clients (e.g. a `kai` CLI
+    // viewing this same conversation) so a GUI-driven turn shows the prompt there
+    // too — agent:stream turns don't go through agent:submit's user-message
+    // broadcast, and the renderer appends the user turn only to its own tree.
+    // The originating renderer already rendered it, so this is purely for peers;
+    // no submitNonce (the GUI dedups by its own tree, and a peer CLI never
+    // submitted this turn so it won't match a nonce).
+    const lastUserText = extractLastUserText(messages);
+    if (lastUserText) {
+      broadcastStreamEvent({ conversationId, type: 'user-message', text: lastUserText }, streamToken);
+    }
     // If agent:submit flagged this turn for server-side persistence, bind that
     // ownership to THIS run's token (so a later superseding run doesn't inherit
     // or clobber it). Consume the one-shot pending marker.
@@ -2817,3 +2838,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
   });
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { extractLastUserText };
