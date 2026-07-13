@@ -2,7 +2,7 @@ import net from 'net';
 import { mkdirSync, existsSync, unlinkSync, chmodSync, statSync } from 'fs';
 import { timingSafeEqual } from 'crypto';
 import type { Socket, Server } from 'net';
-import { localClients, broadcastToLocalClients } from './local-clients.js';
+import { localClients, broadcastToLocalClients, markSocketActivity, msSinceActivity } from './local-clients.js';
 import { registerBroadcastSink } from '../web-server/web-clients.js';
 import { invokeHandler } from '../web-server/ipc-bridge.js';
 import { getRunDir, getSocketPath, getBridgeToken } from './paths.js';
@@ -106,23 +106,24 @@ function attachClient(socket: Socket): void {
   }, AUTH_TIMEOUT_MS);
 
   // Heartbeat: the client is expected to send {type:'ping'} periodically. If we
-  // see no traffic for HEARTBEAT_TIMEOUT_MS we consider the client dead and
-  // destroy the socket — this catches force-kills / crashes / sleep where the
-  // OS never delivers a clean close, so an orphaned backend can still notice
-  // its client vanished and (if idle-shutdown is on) exit.
-  let alive = true;
+  // see NO traffic in EITHER direction for HEARTBEAT_TIMEOUT_MS we consider the
+  // client dead and destroy the socket — catching force-kills / crashes / sleep
+  // where the OS never delivers a clean close. Timestamp-based (not a per-tick
+  // boolean flip) and counting OUTBOUND writes too (markSocketActivity in
+  // broadcastToLocalClients): during a heavy agent stream the client's ping can
+  // be delayed by its own busy event loop, but we're actively streaming TO it —
+  // so it's plainly alive and must not be reaped mid-stream.
+  markSocketActivity(socket);
   const beat = setInterval(() => {
-    if (!alive) {
+    if (msSinceActivity(socket) > HEARTBEAT_TIMEOUT_MS) {
       clearInterval(beat);
       socket.destroy();
-      return;
     }
-    alive = false;
   }, HEARTBEAT_TIMEOUT_MS);
 
   let buffer = '';
   socket.on('data', (chunk: Buffer) => {
-    alive = true; // any inbound traffic counts as liveness
+    markSocketActivity(socket); // any inbound traffic counts as liveness
     buffer += chunk.toString('utf-8');
     // Bound the pre-newline buffer: a client that never sends a newline (or sends
     // an oversized frame) must not grow backend memory without limit.

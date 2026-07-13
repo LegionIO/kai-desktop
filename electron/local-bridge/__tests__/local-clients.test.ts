@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Socket } from 'net';
-import { localClients, broadcastToLocalClients } from '../local-clients.js';
+import { localClients, broadcastToLocalClients, markSocketActivity, msSinceActivity } from '../local-clients.js';
 
 const MAX_BACKLOG = 16 * 1024 * 1024;
 
@@ -107,5 +107,37 @@ describe('broadcastToLocalClients', () => {
     for (const s of socks) localClients.add(s as unknown as Socket);
     broadcastToLocalClients('multi', { n: 1 });
     for (const s of socks) expect(s.write).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('socket activity tracking (server-heartbeat liveness)', () => {
+  it('msSinceActivity is Infinity before any activity is marked', () => {
+    const s = fakeSocket();
+    expect(msSinceActivity(s as unknown as Socket)).toBe(Infinity);
+  });
+
+  it('markSocketActivity resets the elapsed time to ~0', () => {
+    const s = fakeSocket();
+    markSocketActivity(s as unknown as Socket);
+    expect(msSinceActivity(s as unknown as Socket)).toBeLessThan(1000);
+  });
+
+  it('a successful broadcast write marks the socket active (outbound counts as liveness)', () => {
+    // This is the #206 fix: streaming TO the client refreshes liveness so the
+    // server heartbeat can't reap it mid-stream on a delayed inbound ping.
+    const s = fakeSocket();
+    localClients.add(s as unknown as Socket);
+    expect(msSinceActivity(s as unknown as Socket)).toBe(Infinity); // no activity yet
+    broadcastToLocalClients('stream:token', { text: 'chunk' });
+    expect(s.write).toHaveBeenCalled();
+    expect(msSinceActivity(s as unknown as Socket)).toBeLessThan(1000); // now marked active
+  });
+
+  it('a DROPPED (over-backlog) client is not marked active by the broadcast', () => {
+    const slow = fakeSocket({ writableLength: MAX_BACKLOG + 1 });
+    localClients.add(slow as unknown as Socket);
+    broadcastToLocalClients('flood', 'data');
+    // Destroyed before write → never marked active (it's gone, not alive).
+    expect(msSinceActivity(slow as unknown as Socket)).toBe(Infinity);
   });
 });
