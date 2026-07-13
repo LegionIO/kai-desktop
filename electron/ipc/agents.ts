@@ -100,6 +100,27 @@ function agentStillOwnsSession(appHome: string, agentId: string, sessionId: stri
 }
 
 /**
+ * True when `task` is currently owned by the run identified by (`agentId`,
+ * `virtualSessionId`) AND is still in_progress — the fence promote_task/block_task
+ * apply before mutating a task. A stale run (task reassigned to another agent, or
+ * a superseded prior run of this agent whose session id differs) fails this, so
+ * its still-draining Mastra tool call can't promote/block work it no longer owns.
+ * Exported for unit testing.
+ */
+export function isOwningTaskRun(
+  task: Pick<TaskFile, 'status' | 'assignedAgentId' | 'terminalSessionId'> | null | undefined,
+  agentId: string,
+  virtualSessionId: string,
+): boolean {
+  return (
+    !!task &&
+    task.status === 'in_progress' &&
+    task.assignedAgentId === agentId &&
+    task.terminalSessionId === virtualSessionId
+  );
+}
+
+/**
  * Stop and reset the agent that owns a task being deleted. Called from the
  * tasks:delete seam (tasks.ts has no terminalManager/agent access). Aborts the
  * agent's Mastra stream / kills its PTY and resets it to idle so a deleted
@@ -980,7 +1001,12 @@ async function startAgentRunLocked(
             execute: async (input: unknown) => {
               const { summary } = input as { summary: string };
               const t = readTask(appHome, task.id);
-              if (t && t.status === 'in_progress') {
+              // Ownership + session fence: only THIS agent's CURRENT run may
+              // promote the task. A stale run (task reassigned to another agent,
+              // or a superseded prior run of this agent) whose Mastra stream is
+              // still draining must NOT promote work it no longer owns — abort
+              // only signals the stream; it doesn't stop an in-flight tool call.
+              if (t && isOwningTaskRun(t, agentId, virtualSessionId)) {
                 console.info(`[Agent:task] promote_task called for "${t.title}" summary="${summary?.slice(0, 80)}..."`);
                 t.completionSummary = summary;
                 t.updatedAt = new Date().toISOString();
@@ -1021,9 +1047,16 @@ async function startAgentRunLocked(
                   void startReviewProcess(appHome, t);
                 }
 
-                // Also mark agent as idle immediately (task is done)
+                // Also mark agent as idle immediately (task is done). Guard on the
+                // agent still running THIS task+session so a stale run can't idle
+                // a newer run of the same agent.
                 const ag = readAgent(appHome, agentId);
-                if (ag && ag.status === 'running') {
+                if (
+                  ag &&
+                  ag.status === 'running' &&
+                  ag.currentTaskId === t.id &&
+                  ag.terminalSessionId === virtualSessionId
+                ) {
                   ag.status = 'idle';
                   ag.currentTaskId = undefined;
                   ag.stats.tasksCompleted = (ag.stats.tasksCompleted ?? 0) + 1;
@@ -1037,6 +1070,12 @@ async function startAgentRunLocked(
                   success: true,
                   newStatus,
                   message: `Task promoted to ${newStatus === 'ai_review' ? 'AI Review' : 'Human Review'}.`,
+                };
+              }
+              if (t && (t.assignedAgentId !== agentId || t.terminalSessionId !== virtualSessionId)) {
+                return {
+                  success: false,
+                  message: 'Task is no longer owned by this agent run; ignoring stale promote.',
                 };
               }
               return { success: false, message: `Task is in status '${t?.status}', cannot promote.` };
@@ -1053,7 +1092,10 @@ async function startAgentRunLocked(
             execute: async (input: unknown) => {
               const { reason } = input as { reason: string };
               const t = readTask(appHome, task.id);
-              if (t) {
+              // Same ownership + status + session fence as promote_task: a stale
+              // run must not block a task now owned by another agent/run, and
+              // block_task previously accepted ANY status (no in_progress gate).
+              if (t && isOwningTaskRun(t, agentId, virtualSessionId)) {
                 console.info(`[Agent:task] block_task called for "${t.title}" reason="${reason?.slice(0, 80)}"`);
 
                 t.status = 'blocked';
@@ -1079,9 +1121,14 @@ async function startAgentRunLocked(
                 writeTask(appHome, t);
                 broadcastTaskChange(appHome);
 
-                // Also mark agent as idle immediately
+                // Mark agent idle — guarded on it still running THIS task+session.
                 const ag = readAgent(appHome, agentId);
-                if (ag && ag.status === 'running') {
+                if (
+                  ag &&
+                  ag.status === 'running' &&
+                  ag.currentTaskId === t.id &&
+                  ag.terminalSessionId === virtualSessionId
+                ) {
                   ag.status = 'idle';
                   ag.currentTaskId = undefined;
                   ag.updatedAt = new Date().toISOString();
@@ -1091,7 +1138,10 @@ async function startAgentRunLocked(
 
                 return { success: true, newStatus: 'blocked', message: 'Task marked as blocked.' };
               }
-              return { success: false, message: 'Task not found.' };
+              if (t && (t.assignedAgentId !== agentId || t.terminalSessionId !== virtualSessionId)) {
+                return { success: false, message: 'Task is no longer owned by this agent run; ignoring stale block.' };
+              }
+              return { success: false, message: `Task is in status '${t?.status}', cannot block.` };
             },
           },
         ];
