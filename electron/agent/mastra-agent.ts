@@ -1919,3 +1919,6 @@ async function* asAsyncIterable<T>(stream: ReadableStream<T>): AsyncGenerator<T>
     reader.releaseLock();
   }
 }
+
+/** Test-only exposure of the pure stream-payload parsers. */
+export const __internal = { extractStreamText, extractStreamFinishReason, isExpectedMastraStructuralEvent };
