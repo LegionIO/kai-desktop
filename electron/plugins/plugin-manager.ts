@@ -1,5 +1,5 @@
 import { Notification, BrowserWindow } from 'electron';
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, mkdirSync, unlinkSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, statSync, mkdirSync, unlinkSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import { pathToFileURL } from 'url';
 import type {
@@ -39,6 +39,7 @@ import type { AppConfig } from '../config/schema.js';
 import { toPluginSafeConfig, resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { eventBus } from '../automations/event-bus.js';
 import { convertJsonSchemaToZod } from '../tools/skill-loader.js';
 import { broadcastUpsert, broadcastActive } from '../ipc/conversations.js';
@@ -1069,7 +1070,7 @@ export class PluginManager {
           const legacyData = readFileSync(legacyPath, 'utf-8');
           const dir = join(this.appHome, 'plugin-settings', pluginName);
           mkdirSync(dir, { recursive: true });
-          writeFileSync(settingsPath, legacyData, 'utf-8');
+          atomicWriteFileSync(settingsPath, legacyData);
           try {
             unlinkSync(legacyPath);
           } catch {
@@ -1127,7 +1128,7 @@ export class PluginManager {
     const settingsPath = this.pluginSettingsPath(pluginName);
     const dir = join(this.appHome, 'plugin-settings', pluginName);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify(validated, null, 2), 'utf-8');
+    atomicWriteFileSync(settingsPath, JSON.stringify(validated, null, 2));
     this.broadcastUIState();
 
     // Fire the plugin's own config-change listeners so api.config.onChanged
