@@ -581,3 +581,29 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
     expect(mocks.startLocalMacosTakeoverMonitor).toHaveBeenCalled();
   });
 });
+
+describe('coerceDeviceId (mic deviceId → executeJavaScript-safe)', () => {
+  // A mic deviceId is JSON.stringify'd into window._mic.startLiveStream(...) run
+  // via executeJavaScript. IPC (dictation:set-device) is untyped and a bad value
+  // could also be read back from persisted config, so a non-string / empty id
+  // falls back to undefined (= default device). JSON.stringify already blocks a
+  // JS breakout; this enforces the contract as defense-in-depth.
+  it('passes a non-empty string through unchanged', async () => {
+    const { __internal } = await import('../dictation-manager.js');
+    expect(__internal.coerceDeviceId('mic-abc-123')).toBe('mic-abc-123');
+  });
+
+  it('maps null/undefined/empty-string to undefined (default device)', async () => {
+    const { __internal } = await import('../dictation-manager.js');
+    expect(__internal.coerceDeviceId(null)).toBeUndefined();
+    expect(__internal.coerceDeviceId(undefined)).toBeUndefined();
+    expect(__internal.coerceDeviceId('')).toBeUndefined();
+  });
+
+  it('maps non-string junk (untyped IPC / bad persisted config) to undefined', async () => {
+    const { __internal } = await import('../dictation-manager.js');
+    for (const bad of [42, true, {}, [], { deviceId: 'x' }, ['mic']]) {
+      expect(__internal.coerceDeviceId(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+});

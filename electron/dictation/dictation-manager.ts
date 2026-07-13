@@ -418,6 +418,11 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('dictation:set-device', async (_event, deviceId: string) => {
+    // IPC JSON doesn't enforce the TS `string` type; reject a non-string id
+    // before it's persisted or JSON.stringify'd into the mic-window
+    // executeJavaScript call (contract enforcement + defense-in-depth, matching
+    // mic-recorder.ts / streaming-stt.ts).
+    if (deviceId != null && typeof deviceId !== 'string') return { ok: false, error: 'Invalid deviceId' };
     if (config) {
       config.inputDeviceId = deviceId;
     }
@@ -1167,7 +1172,11 @@ async function ensureRecorderWindow(): Promise<BrowserWindow> {
 
 async function startMicCapture(deviceId?: string): Promise<void> {
   const win = await ensureRecorderWindow();
-  const escaped = deviceId ? JSON.stringify(deviceId) : 'null';
+  // Defense-in-depth: a non-string id (untyped IPC, or a legacy bad value read
+  // back from persisted config at the dictation-start path) falls back to the
+  // default device rather than reaching the executeJavaScript sink as-is.
+  const safeId = coerceDeviceId(deviceId);
+  const escaped = safeId ? JSON.stringify(safeId) : 'null';
   const result = await win.webContents.executeJavaScript(`window._mic.startLiveStream(${escaped})`);
   if (!result || result.ok !== true) {
     throw new Error(result?.error ?? 'Unable to start microphone capture');
@@ -1252,6 +1261,19 @@ function normalizeMicSampleRate(value: unknown): number {
   const rounded = Math.round(value);
   if (rounded < 8000 || rounded > 96000) return AZURE_STT_SAMPLE_RATE_HZ;
   return rounded;
+}
+
+/**
+ * A mic deviceId is JSON.stringify'd into a `window._mic.startLiveStream(...)`
+ * expression run via executeJavaScript in the hidden recorder window. IPC JSON
+ * (dictation:set-device) does not enforce the declared `string` type, and a bad
+ * value could also be read back from persisted config at the dictation-start
+ * path. Coerce anything that isn't a non-empty string to undefined (= default
+ * device). JSON.stringify already prevents a JS breakout; this enforces the
+ * contract as defense-in-depth, matching mic-recorder.ts / streaming-stt.ts.
+ */
+function coerceDeviceId(deviceId: unknown): string | undefined {
+  return typeof deviceId === 'string' && deviceId.length > 0 ? deviceId : undefined;
 }
 
 async function getMicLevel(): Promise<number> {
@@ -3082,6 +3104,9 @@ function broadcastTypingMode(mode: TypingMode): void {
 }
 
 // ─── Recorder HTML (minimal, just for mic capture) ───────────────────────────
+
+/** Exposed for unit tests only. */
+export const __internal = { coerceDeviceId };
 
 const DICTATION_RECORDER_HTML = `<!DOCTYPE html>
 <html><head><title>Dictation Mic</title></head>
