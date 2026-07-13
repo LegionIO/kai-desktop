@@ -18,6 +18,21 @@ import { recordUsageEvent } from '../ipc/usage.js';
 let recorderWindow: BrowserWindow | null = null;
 let isRecording = false;
 
+/**
+ * A renderer-supplied deviceId is JSON.stringify'd into a `window._mic.*(...)`
+ * expression run via executeJavaScript in the hidden mic window. JSON.stringify
+ * already prevents a JS breakout, but IPC JSON does not enforce the TS `string`
+ * type, so these guards reject a non-string id up front (contract enforcement +
+ * defense-in-depth, matching streaming-stt.ts). null/undefined are allowed (they
+ * mean "default device").
+ */
+function isValidDeviceId(deviceId: unknown): boolean {
+  return deviceId == null || typeof deviceId === 'string';
+}
+function isValidDeviceIdList(deviceIds: unknown): boolean {
+  return deviceIds == null || (Array.isArray(deviceIds) && deviceIds.every((d) => typeof d === 'string'));
+}
+
 function getRecorderHtmlPath(): string {
   // Always rewrite the HTML to ensure it's up-to-date with the current code
   const dir = join(tmpdir(), __BRAND_APP_SLUG + '-mic');
@@ -381,6 +396,11 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
   ipc.handle('stt:start-recording', async (_event, deviceId?: string) => {
     console.log('[MicRecorder] stt:start-recording, deviceId=%s', deviceId ?? 'default');
     if (isRecording) return { error: 'Already recording' };
+    // IPC JSON doesn't enforce the TS `string` type — reject a non-string
+    // deviceId before it's JSON.stringify'd into the mic-window executeJavaScript
+    // call. (JSON.stringify already prevents a JS breakout; this enforces the
+    // contract and matches streaming-stt.ts.)
+    if (!isValidDeviceId(deviceId)) return { error: 'Invalid deviceId' };
 
     try {
       const win = await ensureRecorderWindow();
@@ -450,6 +470,9 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
   // Multi-device level monitoring for device picker
   ipc.handle('stt:start-monitor', async (_event, deviceIds?: string[]) => {
     try {
+      // Reject a non-array or any non-string element before it reaches the
+      // mic-window executeJavaScript call (IPC JSON is untyped).
+      if (!isValidDeviceIdList(deviceIds)) return { error: 'Invalid deviceIds' };
       const win = await ensureRecorderWindow();
       const escaped = JSON.stringify(deviceIds ?? ['default']);
       return await win.webContents.executeJavaScript(`window._mic.startMonitorAll(${escaped})`);
@@ -481,6 +504,7 @@ export function registerMicRecorderHandlers(ipc: IpcMain): void {
   // Live PCM streaming for Speech SDK
   ipc.handle('stt:live-mic-start', async (_event, deviceId?: string) => {
     try {
+      if (!isValidDeviceId(deviceId)) return { error: 'Invalid deviceId' };
       const win = await ensureRecorderWindow();
       const escaped = deviceId ? JSON.stringify(deviceId) : 'null';
       return await win.webContents.executeJavaScript(`window._mic.startLiveStream(${escaped})`);
@@ -522,3 +546,6 @@ export function cleanupMicRecorder(): void {
   }
   recorderWindow = null;
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { isValidDeviceId, isValidDeviceIdList };
