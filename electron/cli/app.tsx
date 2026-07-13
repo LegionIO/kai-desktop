@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useApp, useStdout, useInput } from 'ink';
 import Spinner from 'ink-spinner';
 import { randomUUID } from 'crypto';
+import { appendFileSync } from 'fs';
+import { join } from 'path';
 import type { LocalBridgeClient } from './client.js';
 import { renderMarkdown, stripControl } from './render/markdown.js';
 import { InputBox } from './components/InputBox.js';
@@ -10,6 +12,21 @@ import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
 import { extractImageMentions } from './images.js';
+
+// TEMP debug (issue #217): trace which stream events reach the CLI and whether
+// the conversationId guard passes. Gated on the SAME env var as the backend's
+// stream-pipeline log (KAI_DEBUG_STREAM) and written alongside it, so one flag
+// lights up both ends of the GUI->CLI pipeline. Remove once #217 is resolved.
+const CLI_DEBUG_ENABLED = !!process.env.KAI_DEBUG_STREAM;
+const CLI_DEBUG_LOG = join(process.cwd(), 'debug-logs', 'stream-pipeline.log');
+function cliDebugLog(msg: string): void {
+  if (!CLI_DEBUG_ENABLED) return;
+  try {
+    appendFileSync(CLI_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    /* best-effort */
+  }
+}
 
 type StreamEvent = {
   conversationId?: string;
@@ -380,6 +397,9 @@ export function App({
 
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
+      cliDebugLog(
+        `[CLI-EVT] type=${e?.type} evConv=${e?.conversationId} myConv=${convIdRef.current} pass=${!!e && e.conversationId === convIdRef.current} streamLen=${streamingRef.current.length}`,
+      );
       if (!e || e.conversationId !== convIdRef.current) return;
       switch (e.type) {
         case 'user-message': {
@@ -405,6 +425,7 @@ export function App({
         case 'text-delta':
           if (e.text) {
             streamingRef.current += e.text;
+            cliDebugLog(`[CLI-DELTA] appended len=${e.text.length} total=${streamingRef.current.length}`);
             // Force a re-render by touching state (streaming text shown live).
             setTurns((prev) => [...prev]);
           }
