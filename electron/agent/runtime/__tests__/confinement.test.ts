@@ -129,7 +129,7 @@ describe('buildAgentChildEnv', () => {
 });
 
 import { resolveConfinedCwd } from '../confinement.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -192,6 +192,50 @@ describe('resolveConfinedCwd', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('reports escaped=true when an in-tree path is a SYMLINK resolving OUTSIDE the workspaceRoot', () => {
+    // The security-critical symlink property: a dir that LEXICALLY sits under the
+    // workspace root but is a symlink to an out-of-tree location must be detected
+    // as an escape (realpath canonicalizes before the containment check). A
+    // regression dropping the realpathSync would pass the lexical prefix check
+    // and silently confine to the symlink's out-of-tree target.
+    const root = mkdtempSync(join(tmpdir(), 'kai-ws-'));
+    const outside = mkdtempSync(join(tmpdir(), 'kai-outside-'));
+    try {
+      const link = join(root, 'escape-link'); // lexically under root…
+      symlinkSync(outside, link); // …but points outside it
+      const r = resolveConfinedCwd(link, { workspaceRoot: root });
+      expect(r.escaped).toBe(true); // realpath saw through the symlink
+      expect(r.confined).toBe(true);
+      // And a genuine in-tree symlink (target under root) is NOT an escape.
+      const innerReal = join(root, 'real-sub');
+      mkdirSync(innerReal);
+      const innerLink = join(root, 'inner-link');
+      symlinkSync(innerReal, innerLink);
+      expect(resolveConfinedCwd(innerLink, { workspaceRoot: root }).escaped).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('canonicalizes a symlinked workspaceRoot so an in-tree path is not a false escape (macOS /tmp→/private)', () => {
+    // workspaceRoot may itself be under a symlinked ancestor (macOS tmpdir). The
+    // requested path's realpath and the root's realpath must be compared on the
+    // same canonical footing, or every in-tree path would falsely report escape.
+    const root = mkdtempSync(join(tmpdir(), 'kai-ws-'));
+    try {
+      const inside = join(root, 'sub');
+      mkdirSync(inside);
+      // Pass the NON-canonical root; resolveConfinedCwd realpaths both sides.
+      const r = resolveConfinedCwd(inside, { workspaceRoot: root });
+      expect(r.escaped).toBe(false);
+      // Sanity: the canonical root differs from the literal on macOS.
+      void realpathSync(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
