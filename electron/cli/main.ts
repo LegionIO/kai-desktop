@@ -3,6 +3,7 @@ import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
 import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
 import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
+import { confirmFolderTrust } from './folder-trust.js';
 
 /**
  * Standalone (dev) `kai` entry: run with system node against the built bundle
@@ -19,6 +20,17 @@ async function main(): Promise<void> {
   // the REPL the banner UI replaces these status lines, so keep them for the
   // headless/scripting path only (stderr).
   const interactive = !print && process.stdin.isTTY && process.stdout.isTTY;
+
+  // Workspace trust: gate an unfamiliar folder behind an explicit prompt before
+  // spawning/attaching a backend (the interactive REPL can run tools scoped to
+  // the cwd). HOME + already-trusted dirs pass silently; declining exits.
+  if (interactive) {
+    const trusted = await confirmFolderTrust(process.cwd());
+    if (!trusted) {
+      cliLog('folder not trusted — exiting. Re-run and choose trust, or cd to a trusted folder.');
+      process.exit(0);
+    }
+  }
 
   let client = await tryConnect(socketPath, token);
   if (!client) {

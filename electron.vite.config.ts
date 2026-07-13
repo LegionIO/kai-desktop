@@ -104,6 +104,15 @@ export default defineConfig({
           index: resolve(__dirname, 'electron/main.ts'),
           cli: resolve(__dirname, 'electron/cli/main.ts'),
         },
+        output: {
+          // Suppress Node's own deprecation warnings (e.g. the `punycode`
+          // DEP0040 a transitive dep triggers) at the VERY START of the bundle —
+          // before any import runs. Setting process.noDeprecation inside a
+          // function (e.g. runCliClient) is too late in the packaged app: main.ts's
+          // large static import graph loads first and fires the warning to the
+          // CLI's stderr before our code runs.
+          banner: 'process.noDeprecation = true;',
+        },
       },
     },
   },

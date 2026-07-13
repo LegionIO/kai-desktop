@@ -3,6 +3,7 @@ import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
 import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
 import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEOUT_MS } from './spawn-backend.js';
+import { confirmFolderTrust } from './folder-trust.js';
 
 /**
  * Run the `kai` CLI client from inside the packaged Electron main process
@@ -29,6 +30,19 @@ export async function runCliClient(): Promise<void> {
   // "attached"/"ready" status lines only orphan above it. Keep them for
   // headless/scripting (stderr) where there's no UI to replace them.
   const interactive = !print && process.stdin.isTTY && process.stdout.isTTY;
+
+  // Workspace trust: in the interactive REPL the agent can run tools scoped to
+  // this directory, so gate an unfamiliar folder behind an explicit "do you
+  // trust this folder?" before we spawn/attach a backend. HOME + already-trusted
+  // dirs pass silently. Declining exits (conservative v1). Headless (-p) does not
+  // prompt — it requires an already-trusted folder.
+  if (interactive) {
+    const trusted = await confirmFolderTrust(process.cwd());
+    if (!trusted) {
+      cliLog('folder not trusted — exiting. Re-run and choose trust, or cd to a trusted folder.');
+      process.exit(0);
+    }
+  }
 
   let client = await tryConnect(socketPath, token);
   if (!client) {

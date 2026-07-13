@@ -101,5 +101,59 @@ export function trustFolder(dir: string): string | null {
   return canon;
 }
 
+/**
+ * Pure gate state for a startup directory: 'trusted' when it needs no prompt
+ * (already trusted or HOME), else 'prompt'. Kept separate from the readline UI
+ * so it's testable.
+ */
+export function trustGateState(dir: string): 'trusted' | 'prompt' {
+  return isFolderTrusted(dir) ? 'trusted' : 'prompt';
+}
+
+/**
+ * Interactive folder-trust gate for the CLI REPL. If `dir` is already trusted
+ * (or is HOME), returns true immediately. Otherwise prompts on the TTY:
+ *   [t] trust this folder   [Enter/n] don't (exit)
+ * On "trust" the folder is persisted and true is returned; otherwise false
+ * (the caller blocks — the conservative v1: the agent can run tools scoped to
+ * the cwd, so we don't start a capable session in an unfamiliar folder).
+ *
+ * `readLine` is injectable for tests; it defaults to a one-shot readline
+ * question on stdin/stdout.
+ */
+export async function confirmFolderTrust(
+  dir: string,
+  readLine: (question: string) => Promise<string> = defaultReadLine,
+): Promise<boolean> {
+  if (trustGateState(dir) === 'trusted') return true;
+  const canon = canonicalizeDir(dir) ?? dir;
+  const answer = (
+    await readLine(
+      `\nKai can run commands and edit files in this folder:\n  ${canon}\n` +
+        `Do you trust the authors of the files here? [t = trust, Enter = no] `,
+    )
+  )
+    .trim()
+    .toLowerCase();
+  if (answer === 't' || answer === 'trust' || answer === 'y' || answer === 'yes') {
+    trustFolder(dir);
+    return true;
+  }
+  return false;
+}
+
+function defaultReadLine(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    // Lazy import so the pure helpers don't pull readline in test/other contexts.
+    void import('readline').then(({ createInterface }) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      rl.question(question, (ans) => {
+        rl.close();
+        resolve(ans);
+      });
+    });
+  });
+}
+
 /** Exposed for unit tests only. */
 export const __internal = { storePath, loadStore, canonicalHome };
