@@ -395,16 +395,18 @@ export function App({
       }
     };
 
-    // On turn completion, any tool row still marked running/awaiting can't have
-    // been left mid-execution — the turn is over. This is a backstop for a
-    // GUI-driven (peer) turn whose tool-result arrives with a toolCallId that
-    // doesn't match the CLI's tool-call row (execute-vs-stream id spaces), which
-    // would otherwise leave the row spinning forever ("stuck on CLI, done on
-    // GUI"). Mark such rows done so the CLI reflects the finished turn.
+    // On turn completion, any tool row still marked "running" can't have been
+    // left mid-execution — the turn is over. This is a backstop for a GUI-driven
+    // (peer) turn whose tool-result arrives with a toolCallId that doesn't match
+    // the CLI's tool-call row (execute-vs-stream id spaces), which would
+    // otherwise leave the row spinning forever ("stuck on CLI, done on GUI").
+    // Only "running" rows are settled — an "awaiting" row has a live approval
+    // picker on THIS CLI and resolves through its own approve/reject path, so we
+    // must not force it done out from under the user.
     const settleOpenToolRows = (): void => {
       setTools((prev) =>
-        prev.some((t) => t.status === 'running' || t.status === 'awaiting')
-          ? prev.map((t) => (t.status === 'running' || t.status === 'awaiting' ? { ...t, status: 'done' } : t))
+        prev.some((t) => t.status === 'running')
+          ? prev.map((t) => (t.status === 'running' ? { ...t, status: 'done' } : t))
           : prev,
       );
     };
