@@ -45,19 +45,27 @@ export function registerPendingApproval(toolCallId: string, abortSignal?: AbortS
     pendingToolApprovals.delete(toolCallId);
   }
   return new Promise<boolean | 'dismiss'>((resolve) => {
-    pendingToolApprovals.set(toolCallId, { resolve });
+    // Wrap the stored resolver so EVERY resolution path (user approve/reject via
+    // the IPC handler, abort, or duplicate-eviction) tears down the abort
+    // listener + map entry exactly once. The abort listener was previously
+    // {once:true} with no removal on the normal (approve/reject) path, so it
+    // stayed attached to the (turn-scoped, reused per tool call) abortSignal
+    // until the signal aborted — accumulating one listener per approved tool call.
+    let settled = false;
+    const onAbort = (): void => settle('dismiss');
+    const settle = (value: boolean | 'dismiss'): void => {
+      if (settled) return;
+      settled = true;
+      abortSignal?.removeEventListener('abort', onAbort);
+      pendingToolApprovals.delete(toolCallId);
+      resolve(value);
+    };
 
-    // Clean up on abort
+    pendingToolApprovals.set(toolCallId, { resolve: settle });
+
     if (abortSignal) {
-      const onAbort = (): void => {
-        const pending = pendingToolApprovals.get(toolCallId);
-        if (pending) {
-          pending.resolve('dismiss');
-          pendingToolApprovals.delete(toolCallId);
-        }
-      };
       if (abortSignal.aborted) {
-        onAbort();
+        settle('dismiss');
       } else {
         abortSignal.addEventListener('abort', onAbort, { once: true });
       }

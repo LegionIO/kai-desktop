@@ -406,17 +406,15 @@ function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): Abor
   if (!primary && !secondary) return undefined;
   if (!primary) return secondary;
   if (!secondary) return primary;
-
-  const controller = new AbortController();
-  if (primary.aborted || secondary.aborted) {
-    controller.abort();
-    return controller.signal;
-  }
-
-  const abort = (): void => controller.abort();
-  primary.addEventListener('abort', abort, { once: true });
-  secondary.addEventListener('abort', abort, { once: true });
-  return controller.signal;
+  // AbortSignal.any (Node 22) composes without installing ordinary 'abort'
+  // listeners: it uses weak refs + a finalization registry, so the derived
+  // signal is reclaimed once the consumer releases it — no listener retained on
+  // a long-lived source. The previous manual addEventListener({once:true})
+  // approach leaked one listener per merge on the (turn-scoped, reused across
+  // every tool call in a turn) `primary` signal, cleared only if it aborted.
+  // Mirrors the mastra-agent.ts mergeAbortSignals fix (78639c2); also propagates
+  // the winning signal's abort reason.
+  return AbortSignal.any([primary, secondary]);
 }
 
 function toolsForExecutionMode(tools: ToolDefinition[], executionMode: ExecutionMode): ToolDefinition[] {

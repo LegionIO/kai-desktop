@@ -83,6 +83,31 @@ describe('registerPendingApproval', () => {
     registerPendingApproval('c-pending');
     expect(pendingToolApprovals.has('c-pending')).toBe(true);
   });
+
+  it('removes the abort listener when resolved via approve/deny (no leak on the normal path)', async () => {
+    // The leak fix: resolving through the map entry (user approve/reject) must
+    // remove the {once} abort listener that was attached to the (turn-scoped,
+    // reused-per-tool-call) signal — otherwise one listener accumulates per
+    // approved tool call until the signal aborts.
+    const ctrl = new AbortController();
+    const removeSpy = vi.spyOn(ctrl.signal, 'removeEventListener');
+    const p = registerPendingApproval('c-leak', ctrl.signal);
+    pendingToolApprovals.get('c-leak')!.resolve(true); // normal approve — abort never fires
+    await expect(p).resolves.toBe(true);
+    expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(pendingToolApprovals.has('c-leak')).toBe(false);
+    // A subsequent abort must NOT re-resolve or throw (listener already removed + settled).
+    expect(() => ctrl.abort()).not.toThrow();
+  });
+
+  it('duplicate-eviction with an abort signal removes the prior waiter listener too', async () => {
+    const ctrl = new AbortController();
+    const removeSpy = vi.spyOn(ctrl.signal, 'removeEventListener');
+    const first = registerPendingApproval('dup2', ctrl.signal);
+    registerPendingApproval('dup2'); // evicts `first` (fail-closed deny)
+    await expect(first).resolves.toBe(false);
+    expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
 });
 
 describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
