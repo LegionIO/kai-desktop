@@ -176,7 +176,7 @@ import {
 } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
-import { pendingQuestionAnswers } from '../tools/ask-user.js';
+import { pendingQuestionAnswers, stashQuestionAnswers } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
@@ -2022,7 +2022,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // Copy answers from stream-side ID to execute-side ID so the tool's execute() can find them
                 const answers = pendingQuestionAnswers.get(streamId);
                 if (answers) {
-                  pendingQuestionAnswers.set(state.toolCallId, answers);
+                  stashQuestionAnswers(state.toolCallId, answers);
                   pendingQuestionAnswers.delete(streamId);
                 }
               }
@@ -2642,7 +2642,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // orphaned pendingQuestionAnswers entry that the terminated tool never reads.
     const pending = pendingToolApprovals.get(toolCallId);
     if (pending) {
-      pendingQuestionAnswers.set(toolCallId, answers);
+      stashQuestionAnswers(toolCallId, answers);
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
     }
