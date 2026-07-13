@@ -54,6 +54,25 @@ export type PluginPermission =
   | 'audit:log'
   | 'lifecycle:hook';
 
+/**
+ * Permissions that grant code-execution or secret-read capability and therefore
+ * require explicit user consent before a plugin is loaded/installed. This is the
+ * SINGLE SOURCE OF TRUTH — both the runtime consent gate (plugin-manager.ts) and
+ * the marketplace install flow (marketplace-service.ts) import it, so a new
+ * dangerous permission can't be gated in one path but silently skipped in the
+ * other.
+ *   - 'exec:whitelisted'   — run whitelisted binaries.
+ *   - 'config:read-secrets'— read provider API keys, AWS/MCP secrets, web-server
+ *                            password, TLS key paths (vs. the redacted safe config).
+ *   - 'agent:hook'         — full MITM on the agent loop (observe/block/modify
+ *                            prompts, tool args + results); ≈ arbitrary tool exec.
+ */
+export const DANGEROUS_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new Set<PluginPermission>([
+  'exec:whitelisted',
+  'config:read-secrets',
+  'agent:hook',
+]);
+
 export type PluginApprovalRecord = {
   hash: string;
   permissions?: string[];

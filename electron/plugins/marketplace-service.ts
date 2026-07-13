@@ -11,6 +11,7 @@ import {
   readPluginManifest,
 } from './plugin-integrity.js';
 import type { PluginIntegrity } from './plugin-integrity.js';
+import { DANGEROUS_PLUGIN_PERMISSIONS } from './types.js';
 
 type InstalledPluginRecord = NonNullable<NonNullable<AppConfig['marketplace']>['installedPlugins']>[string];
 type PluginApprovalRecord = NonNullable<AppConfig['pluginApprovals']>[string];
@@ -152,13 +153,6 @@ export class UnverifiedPluginError extends Error {
     this.name = 'UnverifiedPluginError';
   }
 }
-
-/**
- * Permissions that grant code-execution or secret-read capability and
- * therefore require explicit user consent. Mirrors
- * PluginManager.DANGEROUS_PERMISSIONS (private) — keep in sync.
- */
-const DANGEROUS_PERMISSIONS = new Set<string>(['exec:whitelisted', 'config:read-secrets', 'agent:hook']);
 
 const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
@@ -434,7 +428,7 @@ export class MarketplaceService {
       this.setConfig('marketplace.installedPlugins', installedPlugins);
 
       const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
-      const hasDangerous = manifest.permissions.some((p) => DANGEROUS_PERMISSIONS.has(p));
+      const hasDangerous = manifest.permissions.some((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p));
       if (isBrandRequired || !hasDangerous) {
         this.persistPluginApproval(entry.name, fileHash, manifest.permissions);
       }
@@ -673,7 +667,7 @@ export class MarketplaceService {
       !arePermissionSetsEqual(approval.permissions, installed.permissions)
     ) {
       const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
-      const hasDangerous = installed.permissions.some((p) => DANGEROUS_PERMISSIONS.has(p));
+      const hasDangerous = installed.permissions.some((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p));
       if (isBrandRequired || !hasDangerous) {
         this.persistPluginApproval(entry.name, installed.fileHash, installed.permissions);
       }

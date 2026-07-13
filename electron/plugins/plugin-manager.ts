@@ -33,6 +33,7 @@ import type {
   PluginInferenceProvider,
   PluginCliToolContribution,
 } from './types.js';
+import { DANGEROUS_PLUGIN_PERMISSIONS } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
 import type { AppConfig } from '../config/schema.js';
 import { toPluginSafeConfig, resolvePluginConfigView, type PluginSafeConfig } from './safe-config.js';
@@ -227,18 +228,6 @@ export class PluginManager {
   }
 
   /** Permissions that require explicit user consent via modal. */
-  private static readonly DANGEROUS_PERMISSIONS: Set<PluginPermission> = new Set([
-    'exec:whitelisted',
-    // Grants the plugin direct access to provider API keys, AWS secrets,
-    // MCP env vars, web server password, TLS private key paths, and Azure
-    // subscription keys via api.config.get() / onConfigChanged. Without
-    // this permission, only the redacted PluginSafeConfig is returned.
-    'config:read-secrets',
-    // Full MITM on the agent loop: observe/block/modify prompts, tool args
-    // and tool results. Effectively equivalent to arbitrary tool execution.
-    'agent:hook',
-  ]);
-
   /** Plugins waiting for user consent. Maps pluginName → pending load info. */
   private pendingConsent: Map<string, { manifest: PluginManifest; fileHash: string }> = new Map();
   private pendingConsentRollback: Map<
@@ -247,7 +236,7 @@ export class PluginManager {
   > = new Map();
 
   private hasDangerousPermissions(manifest: PluginManifest): boolean {
-    return manifest.permissions.some((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p));
+    return manifest.permissions.some((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p));
   }
 
   private buildConsentRequest(manifest: PluginManifest, fileHash: string): PluginConsentRequest {
@@ -256,7 +245,7 @@ export class PluginManager {
       pluginName: manifest.name,
       displayName: manifest.displayName ?? manifest.name,
       permissions,
-      dangerousPermissions: permissions.filter((p) => PluginManager.DANGEROUS_PERMISSIONS.has(p)),
+      dangerousPermissions: permissions.filter((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p)),
       execScope: manifest.execScope,
       fileHash,
     };
