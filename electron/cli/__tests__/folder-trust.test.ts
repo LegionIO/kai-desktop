@@ -117,3 +117,49 @@ describe('folder-trust — fail closed', () => {
     expect(isFolderTrusted(home)).toBe(true);
   });
 });
+
+describe('confirmFolderTrust (the interactive gate)', () => {
+  it('returns true WITHOUT prompting for an already-trusted dir (HOME)', async () => {
+    const { confirmFolderTrust } = await load();
+    let prompted = false;
+    const readLine = async () => {
+      prompted = true;
+      return '';
+    };
+    expect(await confirmFolderTrust(homedir(), readLine)).toBe(true);
+    expect(prompted).toBe(false); // trusted → no prompt
+  });
+
+  it('prompts for an untrusted dir; "t" trusts it (and persists) → returns true', async () => {
+    const sub = join(work, 'proj');
+    mkdirSync(sub);
+    const { confirmFolderTrust, isFolderTrusted } = await load();
+    let prompted = false;
+    const readLine = async () => {
+      prompted = true;
+      return 't';
+    };
+    expect(await confirmFolderTrust(sub, readLine)).toBe(true);
+    expect(prompted).toBe(true);
+    expect(isFolderTrusted(sub)).toBe(true); // persisted, so a later check passes without prompting
+  });
+
+  it('accepts y / yes / trust as affirmative (case-insensitive)', async () => {
+    const { confirmFolderTrust } = await load();
+    for (const ans of ['y', 'yes', 'trust', 'TRUST', 'Yes']) {
+      const sub = mkdtempSync(join(tmpdir(), 'kai-trust-ans-'));
+      expect(await confirmFolderTrust(sub, async () => ans), ans).toBe(true);
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  it('declines (Enter / n / anything else) → returns false, does NOT trust', async () => {
+    const sub = join(work, 'proj2');
+    mkdirSync(sub);
+    const { confirmFolderTrust, isFolderTrusted } = await load();
+    for (const ans of ['', 'n', 'no', 'x']) {
+      expect(await confirmFolderTrust(sub, async () => ans), JSON.stringify(ans)).toBe(false);
+    }
+    expect(isFolderTrusted(sub)).toBe(false); // a decline never persists trust
+  });
+});
