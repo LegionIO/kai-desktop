@@ -68,6 +68,12 @@ import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 
 const activeStreams = new Map<string, { abort: () => void; token: string }>();
 
+/** True if any conversation currently has a live agent stream. Used by the
+ *  headless update-restart watcher to avoid exiting mid-turn. */
+export function hasActiveStreams(): boolean {
+  return activeStreams.size > 0;
+}
+
 // Delete the active-stream entry only if it still belongs to this run. A newer
 // run (e.g. from an edit/regenerate mid-stream) replaces the entry with its own
 // token; the old run's cleanup must not remove the new run's controller, or

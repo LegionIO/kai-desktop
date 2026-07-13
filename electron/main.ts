@@ -27,6 +27,7 @@ import {
   getRegisteredTools,
   setWorkspaceToolDefinitions,
   getWorkspaceToolDefinitions,
+  hasActiveStreams,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { resetStaleRunStatus } from './ipc/conversation-store.js';
@@ -110,6 +111,7 @@ import {
   restartIdleShutdown,
 } from './local-bridge/local-server.js';
 import { localClients } from './local-bridge/local-clients.js';
+import { shouldStepAsideForUpdate, clearUpdateReady } from './local-bridge/update-signal.js';
 import { webClients } from './web-server/web-clients.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
@@ -1476,6 +1478,27 @@ if (gotSingleInstanceLock) {
         }
       });
 
+    // Headless update-restart watcher: a detached headless leader (spawned by a
+    // prior `kai` CLI) is NOT touched by a GUI-driven quitAndInstall, so after an
+    // update it would keep serving OLD code to new CLIs. When the GUI downloads a
+    // newer version it writes an update-ready signal into the shared run dir; a
+    // headless leader watches for it and self-exits ONCE IDLE (no active stream),
+    // so the next `kai` connect spawns a fresh backend on the new version. Guarded
+    // to headless — a windowed GUI leader updates itself normally.
+    if (IS_HEADLESS) {
+      const watcher = setInterval(() => {
+        if (!shouldStepAsideForUpdate(app.getVersion())) return;
+        if (hasActiveStreams()) return; // never bail mid-turn — wait for the next tick
+        console.info(
+          `[${__BRAND_PRODUCT_NAME}] Newer version downloaded — headless backend stepping aside to restart.`,
+        );
+        clearInterval(watcher);
+        app.quit();
+        setTimeout(() => app.exit(0), 2000).unref();
+      }, 5000);
+      watcher.unref();
+    }
+
     // ── Headless ⇄ windowed transitions ──────────────────────────────────
     // A single leader process can start headless (spawned by the CLI) and later
     // gain/lose a GUI window as GUIs open/close, without ever tearing down the
@@ -1991,6 +2014,10 @@ if (gotSingleInstanceLock) {
         // If this launch follows a successful update, fire post-update hooks
         // (e.g., revoke admin privileges granted by pre-update hook).
         const updateMarker = consumePostUpdateMarker();
+        // This process IS the current version; any update-ready signal is now
+        // satisfied (or stale) — clear it so a fresh leader isn't told to step
+        // aside for an update it already IS.
+        clearUpdateReady();
         if (updateMarker) {
           // Only report success if the app actually relaunched into the marker's
           // target version. A failed/rolled-back Squirrel install can leave a

@@ -2,6 +2,7 @@ import { app, dialog, type IpcMain } from 'electron';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { writeUpdateReady } from '../local-bridge/update-signal.js';
 import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync, appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -423,6 +424,10 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
       downloadedFilePath = maybeFile;
     }
     broadcast({ state: 'downloaded', version: info.version });
+    // Signal any detached HEADLESS backend leader (spawned by a prior `kai` CLI,
+    // untouched by this GUI's quitAndInstall) that a newer version exists, so it
+    // self-exits when idle and the next CLI connect spawns a fresh backend.
+    writeUpdateReady(info.version);
     onUpdateDownloaded?.();
   });
   autoUpdater.on('error', (err) => {
