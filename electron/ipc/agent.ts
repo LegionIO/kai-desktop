@@ -2417,6 +2417,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
          *  `image` is a data URL or base64 string; appended as image parts to
          *  the user message so vision-capable models receive them. */
         attachments?: Array<{ image: string; mimeType?: string }>;
+        /** Opaque per-submit id from the originating client. Echoed back in the
+         *  broadcast `user-message` stream event so that client can skip
+         *  re-rendering its own optimistic local turn (other clients render it). */
+        submitNonce?: string;
       },
     ) => {
       const conv = readConversation(appHome, conversationId);
@@ -2525,6 +2529,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         { skipIfBusy: true, runStatus: 'running' },
       );
       if (!promptWrite) return { ok: false, error: 'conversation-busy' };
+
+      // Broadcast the user turn so OTHER attached clients (e.g. the `kai` CLI
+      // when this submit came from the GUI) render the prompt, not just the
+      // streamed reply. The originating client passes a submitNonce and skips
+      // its own echo (it already showed the turn optimistically).
+      broadcastStreamEvent({
+        conversationId,
+        type: 'user-message',
+        text: userText,
+        data: opts?.submitNonce ? { submitNonce: opts.submitNonce } : undefined,
+      });
 
       const updated = readConversation(appHome, conversationId);
       if (!updated) return { ok: false, error: 'conversation-not-found' };

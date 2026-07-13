@@ -51,7 +51,12 @@ export type StreamEvent = {
     | 'enrichment'
     | 'retry'
     | 'step-progress'
-    | 'max-steps-reached';
+    | 'max-steps-reached'
+    // Broadcast when a user turn is submitted (so OTHER attached clients — e.g.
+    // the `kai` CLI when the GUI sends — render the prompt, not just the reply).
+    // Carries the text; `submitNonce` (in `data`) lets the originating client
+    // skip re-rendering its own optimistic local turn.
+    | 'user-message';
   messageMeta?: Record<string, unknown>;
   text?: string;
   toolCallId?: string;

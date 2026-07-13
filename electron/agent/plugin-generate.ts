@@ -36,7 +36,11 @@ export type PluginGenerateResult = {
   toolCalls: PluginGenerateToolCall[];
 };
 
-export type PluginGenerateStreamEvent = StreamEvent & {
+export type PluginGenerateStreamEvent = Omit<StreamEvent, 'type'> & {
+  // The plugin generate stream never emits the internal cross-client
+  // 'user-message' broadcast (that's a submit-path event), so exclude it here to
+  // stay assignable to the plugin-facing PluginAgentStreamEvent union.
+  type: Exclude<StreamEvent['type'], 'user-message'>;
   modelKey?: string;
 };
 
@@ -134,7 +138,13 @@ export async function* streamForPlugin(options: PluginGenerateOptions): AsyncGen
   const { stream, modelKey } = await preparePluginStream(options);
 
   for await (const event of stream) {
-    yield event.type === 'done' ? { ...event, modelKey } : event;
+    // 'user-message' is a submit-path cross-client broadcast, never part of a
+    // generate stream — skip it defensively so it's never forwarded to plugins.
+    if (event.type === 'user-message') continue;
+    // event.type is now narrowed to exclude 'user-message'; assert the shape so
+    // the yield stays within PluginGenerateStreamEvent.
+    const forwarded = (event.type === 'done' ? { ...event, modelKey } : event) as PluginGenerateStreamEvent;
+    yield forwarded;
   }
 }
 

@@ -149,6 +149,10 @@ export function App({
   // for the same turn. Only the first terminal event of a turn drains one
   // queued message. Reset when a new turn starts (sendMessage).
   const turnSettledRef = useRef<boolean>(false);
+  // Submit nonces this CLI originated. The backend echoes the nonce in the
+  // broadcast `user-message` event; we skip rendering our OWN echo (we already
+  // showed the turn optimistically), but render turns submitted elsewhere (GUI).
+  const ownSubmitNoncesRef = useRef<Set<string>>(new Set());
   // Mirror of `status` for reads inside callbacks that must not re-create on
   // every status change (runCommand). Kept in sync below.
   const statusRef = useRef<'idle' | 'running' | 'awaiting-approval'>('idle');
@@ -349,6 +353,18 @@ export function App({
       const e = raw as StreamEvent;
       if (!e || e.conversationId !== convIdRef.current) return;
       switch (e.type) {
+        case 'user-message': {
+          // A user turn submitted into THIS conversation (the guard above already
+          // scoped it). Skip our OWN echo — we showed it optimistically in
+          // sendMessage and tagged it with a nonce the backend echoes here.
+          const nonce = (e.data as { submitNonce?: string } | undefined)?.submitNonce;
+          if (nonce && ownSubmitNoncesRef.current.has(nonce)) {
+            ownSubmitNoncesRef.current.delete(nonce);
+            break;
+          }
+          if (e.text) pushTurn({ kind: 'user', text: e.text });
+          break;
+        }
         case 'text-delta':
           if (e.text) {
             streamingRef.current += e.text;
@@ -959,6 +975,10 @@ export function App({
       setStatus('running');
       streamingRef.current = '';
       turnSettledRef.current = false; // new turn — arm the terminal-event guard
+      // Tag this submit so we skip re-rendering our own broadcast echo of the
+      // user turn (we just showed it above); the backend echoes this nonce.
+      const submitNonce = randomUUID();
+      ownSubmitNoncesRef.current.add(submitNonce);
       const toSubmit = submitText ?? trimmed;
       void (async () => {
         try {
@@ -980,6 +1000,7 @@ export function App({
             toSubmit,
             {
               cwd: CWD,
+              submitNonce,
               ...(attachments && attachments.length > 0 ? { attachments } : {}),
             },
           );
