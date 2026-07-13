@@ -308,7 +308,9 @@ export class PluginManager {
       const discovered = this.discoverPlugins();
       const pluginInfo = discovered.find((p) => p.manifest.name === pluginName);
       if (!pluginInfo) {
-        void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval');
+        void this.resolvePendingConsentRollback(pluginName, false, 'Plugin not found after approval').catch((err) =>
+          console.error(`[plugins] consent rollback for "${pluginName}" failed:`, err),
+        );
         return false;
       }
 
@@ -325,7 +327,9 @@ export class PluginManager {
   denyPlugin(pluginName: string): void {
     this.pendingConsent.delete(pluginName);
     if (this.pendingConsentRollback.has(pluginName)) {
-      void this.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user');
+      void this.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user').catch((err) =>
+        console.error(`[plugins] consent rollback for "${pluginName}" failed:`, err),
+      );
       return;
     }
     const instance = this.plugins.get(pluginName);
