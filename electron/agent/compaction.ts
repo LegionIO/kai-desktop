@@ -26,6 +26,42 @@ function extractToolCallIds(message: ChatMessage): Set<string> {
   return ids;
 }
 
+/**
+ * Tool-CALL ids this message ISSUES (assistant): legacy `tool_calls[].id` plus
+ * content-part `{type:'tool-call', toolCallId}`. Excludes tool-RESULT parts (a
+ * result references a call but doesn't issue one) — used to locate the call that
+ * a retained result depends on.
+ */
+function extractCallIds(message: ChatMessage): Set<string> {
+  const ids = new Set<string>();
+  for (const tc of message.tool_calls ?? []) {
+    if (tc.id) ids.add(tc.id);
+  }
+  if (Array.isArray(message.content)) {
+    for (const part of message.content as Array<{ type?: string; toolCallId?: string }>) {
+      if (part.type === 'tool-call' && part.toolCallId) ids.add(part.toolCallId);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Tool-RESULT ids this message CARRIES: legacy `{role:'tool', tool_call_id}` plus
+ * content-part `{type:'tool-result', toolCallId}`. Used to detect a result whose
+ * matching call would otherwise be compacted away, leaving an orphan result in
+ * the kept suffix.
+ */
+function extractResultIds(message: ChatMessage): Set<string> {
+  const ids = new Set<string>();
+  if (message.role === 'tool' && message.tool_call_id) ids.add(message.tool_call_id);
+  if (Array.isArray(message.content)) {
+    for (const part of message.content as Array<{ type?: string; toolCallId?: string }>) {
+      if (part.type === 'tool-result' && part.toolCallId) ids.add(part.toolCallId);
+    }
+  }
+  return ids;
+}
+
 export function selectProtectedTail(
   messages: ChatMessage[],
   ignoreRecentUser: number,
@@ -48,17 +84,46 @@ export function selectProtectedTail(
     } else if (remainingUsers <= 0 && remainingAssistants <= 0) break;
   }
 
+  // Protect a tool-RESULT for any protected call — in BOTH shapes: the legacy
+  // `{role:'tool', tool_call_id}` message AND the content-part
+  // `{type:'tool-result', toolCallId}` form (which the earlier version missed).
   for (let i = 0; i < messages.length; i++) {
-    if (
-      messages[i].role === 'tool' &&
-      messages[i].tool_call_id &&
-      protectedToolCallIds.has(messages[i].tool_call_id!)
-    ) {
-      protectedIds.add(i);
+    for (const rid of extractResultIds(messages[i])) {
+      if (protectedToolCallIds.has(rid)) {
+        protectedIds.add(i);
+        break;
+      }
     }
   }
 
-  const boundaryIndex = protectedIds.size > 0 ? Math.min(...protectedIds) : messages.length;
+  let boundaryIndex = protectedIds.size > 0 ? Math.min(...protectedIds) : messages.length;
+
+  // Pair-integrity across the boundary: a tool-RESULT kept in the suffix
+  // (index >= boundaryIndex) whose matching CALL sits in the prefix (compacted
+  // away) would leave an ORPHAN result with no call in the model context. This
+  // is reachable when a result is positioned after the protected-tail boundary
+  // but its call is older (e.g. plugin-mutated history with a standalone result).
+  // Walk the suffix; for any result whose call index is before the boundary,
+  // pull the boundary back to that call so the whole pair stays in the suffix.
+  // Iterate to a fixed point (extending the boundary can expose earlier results).
+  const callIndexById = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    for (const cid of extractCallIds(messages[i])) {
+      if (!callIndexById.has(cid)) callIndexById.set(cid, i);
+    }
+  }
+  for (;;) {
+    let earliestCall = boundaryIndex;
+    for (let i = boundaryIndex; i < messages.length; i++) {
+      for (const rid of extractResultIds(messages[i])) {
+        const callIdx = callIndexById.get(rid);
+        if (callIdx !== undefined && callIdx < earliestCall) earliestCall = callIdx;
+      }
+    }
+    if (earliestCall >= boundaryIndex) break; // no straddling pair — done
+    boundaryIndex = earliestCall; // keep the call (and everything after) in the suffix
+  }
+
   return { boundaryIndex, protectedIds, protectedToolCallIds };
 }
 
