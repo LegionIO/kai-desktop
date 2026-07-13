@@ -68,6 +68,7 @@ import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelecto
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app, type ConversationChange } from '@/lib/ipc-client';
 import { cn, generateId } from '@/lib/utils';
+import { shouldAdoptBroadcastActiveId } from '@/lib/conversation-selection';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
 import { usePlugins } from '@/providers/PluginProvider';
@@ -767,7 +768,7 @@ function AppShell() {
         // because the CLI made a new one. (Our own new-chat creation runs under
         // suppressStoreSync, so it isn't affected by this guard.)
         const mine = activeConversationIdRef.current;
-        if (mine == null || mine === activeId) {
+        if (shouldAdoptBroadcastActiveId(mine, activeId)) {
           applyStore(activeId, change.conversation as unknown as ConversationRecord);
         }
         // else: keep our selection; the list refresh (loadConversations) still
