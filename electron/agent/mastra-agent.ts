@@ -1920,5 +1920,19 @@ async function* asAsyncIterable<T>(stream: ReadableStream<T>): AsyncGenerator<T>
   }
 }
 
-/** Test-only exposure of the pure stream-payload parsers. */
-export const __internal = { extractStreamText, extractStreamFinishReason, isExpectedMastraStructuralEvent };
+/** Test-only exposure of the pure stream-payload parsers + option normalizers. */
+export const __internal = {
+  extractStreamText,
+  extractStreamFinishReason,
+  isExpectedMastraStructuralEvent,
+  compactToolArgs,
+  getStringOption,
+  getNumberOption,
+  getBooleanOption,
+  getStringArrayOption,
+  getRecordOption,
+  normalizeSearchContextSize,
+  normalizeApproximateLocation,
+  normalizeOpenAIWebSearchFilters,
+  normalizeProviderToolType,
+};
