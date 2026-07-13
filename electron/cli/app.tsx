@@ -116,12 +116,29 @@ export function App({
   const { exit } = useApp();
   const { stdout } = useStdout();
 
-  // Ctrl-C: Ink's built-in exitOnCtrlC is disabled (so startRepl's graceful
-  // shutdown handshake can run) — in raw mode Ctrl-C arrives as input, not a
-  // SIGINT signal, so we catch it here and route to Ink's exit(), which
-  // resolves waitUntilExit() and lets startRepl clean up the backend.
+  // Double Ctrl-C to quit (like codex/claude CLI): the first Ctrl-C shows a hint
+  // under the composer; a second within the window actually quits. Ink's built-in
+  // exitOnCtrlC is disabled (so startRepl's graceful shutdown handshake runs) and
+  // in raw mode Ctrl-C arrives as input (not SIGINT), so we debounce it here.
+  const [quitHint, setQuitHint] = useState(false);
+  const quitArmedRef = useRef(false);
+  const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useInput((_input, key) => {
-    if (key.ctrl && _input === 'c') exit();
+    if (key.ctrl && _input === 'c') {
+      if (quitArmedRef.current) {
+        if (quitTimerRef.current) clearTimeout(quitTimerRef.current);
+        exit();
+        return;
+      }
+      quitArmedRef.current = true;
+      setQuitHint(true);
+      if (quitTimerRef.current) clearTimeout(quitTimerRef.current);
+      quitTimerRef.current = setTimeout(() => {
+        quitArmedRef.current = false;
+        setQuitHint(false);
+      }, 2000);
+      return;
+    }
     // Ctrl-O toggles expanded tool views (full args + result) for the run.
     if (key.ctrl && _input === 'o') setExpandTools((v) => !v);
   });
@@ -1148,6 +1165,11 @@ export function App({
       ) : (
         <InputBox status={status} conversationId={conversationId} onSubmit={submit} />
       )}
+      {quitHint ? (
+        <Box>
+          <Text dimColor>Press Ctrl+C again to quit</Text>
+        </Box>
+      ) : null}
     </Box>
   );
 }
