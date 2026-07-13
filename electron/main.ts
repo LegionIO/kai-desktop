@@ -1248,7 +1248,13 @@ if (gotSingleInstanceLock) {
         console.info(`[Agent:task] Auto-restarting agent ${assignedAgentId} after kick-back`);
         // Deferred so the kick-back write completes first
         setTimeout(() => {
-          void startAgentRun(APP_HOME, taskTerminalManager, assignedAgentId);
+          // startAgentRun returns {error} for expected failures but can still
+          // throw on an unexpected one (terminal spawn / mastra / fs). This is
+          // fire-and-forget inside a setTimeout, so an uncaught throw would be an
+          // unhandled rejection — log and swallow it.
+          void startAgentRun(APP_HOME, taskTerminalManager, assignedAgentId).catch((err) => {
+            console.error(`[Agent:task] Auto-restart of agent ${assignedAgentId} failed:`, err);
+          });
         }, 500);
       },
       onTaskDeleted: (taskId, assignedAgentId) => {
@@ -1341,8 +1347,13 @@ if (gotSingleInstanceLock) {
 
             // Auto-restart the assigned agent
             if (task.assignedAgentId) {
+              const restartAgentId = task.assignedAgentId;
               setTimeout(() => {
-                void startAgentRun(APP_HOME, taskTerminalManager, task.assignedAgentId);
+                // Fire-and-forget: startAgentRun can throw on an unexpected
+                // failure, which would be an unhandled rejection here — log it.
+                void startAgentRun(APP_HOME, taskTerminalManager, restartAgentId).catch((err) => {
+                  console.error(`[Autopilot] Auto-restart of agent ${restartAgentId} failed:`, err);
+                });
               }, 500);
             }
             return true;
