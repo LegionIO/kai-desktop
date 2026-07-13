@@ -46,6 +46,33 @@ autoUpdater.logger = {
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
+/** Upper bound on pre-update hooks (e.g. admin elevation). A hook that never
+ *  settles (a stuck elevation prompt, a wedged helper) must not pin the app in
+ *  the 'preparing' state forever — on expiry we fail closed exactly like a
+ *  thrown hook: abort the install, revert to 'downloaded', allow a later retry. */
+export const PRE_UPDATE_HOOK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Race a promise against a timeout. Resolves to `{ timedOut: true }` when the
+ * deadline wins (the pending promise is abandoned, not cancelled — the caller
+ * decides what to do). Clears the timer on either outcome so it can't leak.
+ * Exported for unit testing.
+ */
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<{ timedOut: false; value: T } | { timedOut: true }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<{ timedOut: true }>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  try {
+    const value = await Promise.race([promise.then((v) => ({ timedOut: false as const, value: v })), timeout]);
+    return value;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // Set KAI_UPDATE_TEST_VERSION=0.0.1 to test the auto-updater in dev mode.
 // This fakes the current version so the updater sees the latest release as new.
@@ -186,10 +213,24 @@ export async function performQuitAndInstall(): Promise<void> {
   if (hookRunner) {
     broadcast({ state: 'preparing', version: downloadedVersion });
     try {
-      const result = await hookRunner.runPreUpdateHooks({
-        version: downloadedVersion ?? 'unknown',
-        artifactPath: downloadedFilePath ?? '',
-      });
+      const outcome = await withTimeout(
+        hookRunner.runPreUpdateHooks({
+          version: downloadedVersion ?? 'unknown',
+          artifactPath: downloadedFilePath ?? '',
+        }),
+        PRE_UPDATE_HOOK_TIMEOUT_MS,
+      );
+      if (outcome.timedOut) {
+        // A hook that never settled must not pin the app in 'preparing' forever.
+        // Fail closed: abort the install, revert to 'downloaded', allow a retry.
+        console.error(
+          `[auto-update] Pre-update hooks timed out after ${PRE_UPDATE_HOOK_TIMEOUT_MS}ms — aborting install.`,
+        );
+        broadcast({ state: 'downloaded', version: downloadedVersion });
+        installInProgress = false;
+        return;
+      }
+      const result = outcome.value;
       if (result.abort) {
         console.info('[auto-update] Pre-update hook aborted install:', result.abortReason ?? '(no reason)');
         broadcast({ state: 'downloaded', version: downloadedVersion });

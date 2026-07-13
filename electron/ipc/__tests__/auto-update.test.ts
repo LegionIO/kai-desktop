@@ -29,7 +29,7 @@ vi.mock('electron-updater', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() }));
 
-const { consumePostUpdateMarker } = await import('../auto-update.js');
+const { consumePostUpdateMarker, withTimeout, PRE_UPDATE_HOOK_TIMEOUT_MS } = await import('../auto-update.js');
 
 const MARKER = join(USERDATA, '.update-completed');
 const writeMarker = (obj: unknown) => writeFileSync(MARKER, JSON.stringify(obj));
@@ -82,5 +82,45 @@ describe('consumePostUpdateMarker', () => {
     writeMarker({ version: CURRENT_VERSION, fromVersion: '2.4.0' });
     const r = consumePostUpdateMarker();
     expect(r?.version === CURRENT_VERSION).toBe(true);
+  });
+});
+
+describe('withTimeout (pre-update-hook bound)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('resolves { timedOut:false, value } when the promise settles before the deadline', async () => {
+    const p = withTimeout(Promise.resolve('ok'), 1000);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(p).resolves.toEqual({ timedOut: false, value: 'ok' });
+  });
+
+  it('resolves { timedOut:true } when the promise never settles before the deadline', async () => {
+    const never = new Promise<string>(() => {}); // never resolves
+    const p = withTimeout(never, 5000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await expect(p).resolves.toEqual({ timedOut: true });
+  });
+
+  it('does not time out a promise that settles just under the deadline', async () => {
+    let resolveFn!: (v: string) => void;
+    const slow = new Promise<string>((r) => (resolveFn = r));
+    const p = withTimeout(slow, 5000);
+    await vi.advanceTimersByTimeAsync(4999);
+    resolveFn('done');
+    await expect(p).resolves.toEqual({ timedOut: false, value: 'done' });
+  });
+
+  it('propagates a rejection from the raced promise (not swallowed by the timeout)', async () => {
+    // Reject inside an executor so the rejection isn't a floating unhandled
+    // promise before withTimeout attaches its handler.
+    const failing = new Promise<string>((_resolve, reject) => reject(new Error('hook failed')));
+    const p = withTimeout(failing, 1000);
+    await expect(p).rejects.toThrow('hook failed');
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('PRE_UPDATE_HOOK_TIMEOUT_MS is a sane positive bound (5 min)', () => {
+    expect(PRE_UPDATE_HOOK_TIMEOUT_MS).toBe(5 * 60 * 1000);
   });
 });
