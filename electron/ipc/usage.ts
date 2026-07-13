@@ -1,9 +1,8 @@
 import type { IpcMain } from 'electron';
 import { dialog } from 'electron';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, rmSync } from 'fs';
 import { join } from 'path';
 import { readAllConversations } from './conversation-store.js';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +88,14 @@ type UsageSummary = {
 };
 
 // ── Event store I/O ──────────────────────────────────────────────────────────
+//
+// Events are stored as an append-only NDJSON log (one compact JSON object per
+// line) rather than a single JSON array. Recording an event is then an O(1)
+// append instead of an O(n) read-parse-mutate-stringify-rewrite of the whole
+// file — the old scheme made cumulative recording O(n²) and blocked the main
+// process for ~1s per event once the array grew large. A legacy
+// `usage-events.json` (JSON `{events:[...]}`) is migrated into the NDJSON log
+// on first access so no historical usage is lost.
 
 let _appHome: string | null = null;
 
@@ -96,32 +103,74 @@ function eventStorePath(): string {
   return join(_appHome!, 'data', 'usage-events.json');
 }
 
+function eventLogPath(): string {
+  return join(_appHome!, 'data', 'usage-events.ndjson');
+}
+
+/** Serialize one event as a single NDJSON line (no embedded newlines — JSON.stringify
+ *  escapes any \n inside string fields, so one event is always exactly one line). */
+function serializeEventLine(event: UsageEvent): string {
+  return JSON.stringify(event) + '\n';
+}
+
+function parseEventLines(text: string): UsageEvent[] {
+  const out: UsageEvent[] = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as UsageEvent);
+    } catch {
+      // Tolerate a torn final line after a crash (or any single corrupt line)
+      // without discarding the rest of the log.
+    }
+  }
+  return out;
+}
+
+/** Fold a legacy `usage-events.json` array into the NDJSON log exactly once, then
+ *  remove the legacy file so its events aren't double-counted on later reads. */
+function migrateLegacyStoreIfNeeded(): void {
+  const legacyPath = eventStorePath();
+  if (!existsSync(legacyPath)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(legacyPath, 'utf-8')) as UsageEventStore;
+    const events = Array.isArray(parsed?.events) ? parsed.events : [];
+    if (events.length > 0) {
+      // Append (don't overwrite) so any NDJSON events written concurrently survive.
+      appendFileSync(eventLogPath(), events.map(serializeEventLine).join(''));
+    }
+    // Remove the legacy file so this migration runs only once.
+    rmSync(legacyPath, { force: true });
+  } catch {
+    // A corrupt legacy file: leave it in place (don't delete unread data) and
+    // continue with whatever the NDJSON log holds.
+  }
+}
+
 function readEventStore(): UsageEventStore {
-  const p = eventStorePath();
+  migrateLegacyStoreIfNeeded();
+  const p = eventLogPath();
   if (!existsSync(p)) return { events: [] };
   try {
-    return JSON.parse(readFileSync(p, 'utf-8'));
+    return { events: parseEventLines(readFileSync(p, 'utf-8')) };
   } catch {
     return { events: [] };
   }
 }
 
-function writeEventStore(store: UsageEventStore): void {
-  // Atomic write: a crash mid-write must not leave a torn usage-events.json.
-  // (readEventStore already fails safe on a parse error by returning an empty
-  // store, but that silently discards ALL history — atomicity avoids the loss.)
-  atomicWriteFileSync(eventStorePath(), JSON.stringify(store, null, 2));
-}
-
 export function recordUsageEvent(event: Omit<UsageEvent, 'id' | 'timestamp'>): void {
   if (!_appHome) return;
-  const store = readEventStore();
-  store.events.push({
+  // Fold any legacy JSON store into the NDJSON log first so this event lands in
+  // the same place history will be read from.
+  migrateLegacyStoreIfNeeded();
+  const full: UsageEvent = {
     ...event,
     id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp: new Date().toISOString(),
-  });
-  writeEventStore(store);
+  };
+  // O(1) append — no read-modify-write of the whole log.
+  appendFileSync(eventLogPath(), serializeEventLine(full));
 }
 
 // ── Conversation metadata (from conversations.json) ─────────────────────────
@@ -556,3 +605,18 @@ export function csvEscape(value: string): string {
   }
   return safe;
 }
+
+/** Exposed for unit tests only. */
+export const __internal = {
+  serializeEventLine,
+  parseEventLines,
+  bucketKey,
+  readEventStore,
+  recordUsageEvent,
+  migrateLegacyStoreIfNeeded,
+  setAppHomeForTest: (home: string | null): void => {
+    _appHome = home;
+  },
+  eventLogPath,
+  eventStorePath,
+};
