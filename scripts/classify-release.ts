@@ -28,14 +28,7 @@ const root = resolve(__dirname, '..');
 const distDir = resolve(root, 'dist');
 
 // Native dependencies that require full updates when changed
-const NATIVE_DEPS = [
-  'better-sqlite3',
-  'tiktoken',
-  '@lydell/node-pty',
-  'libsql',
-  '@libsql/client',
-  'esbuild',
-];
+const NATIVE_DEPS = ['better-sqlite3', 'tiktoken', '@lydell/node-pty', 'libsql', '@libsql/client', 'esbuild'];
 
 // Parse command line args
 const args = process.argv.slice(2);
@@ -64,7 +57,9 @@ function getPreviousTag(): string | null {
       const tags = execSync('git tag --sort=-v:refname', {
         cwd: root,
         encoding: 'utf-8',
-      }).trim().split('\n');
+      })
+        .trim()
+        .split('\n');
       // Return the second tag (first is current)
       return tags[1] || tags[0] || null;
     } catch {
@@ -95,6 +90,60 @@ interface CompareResult {
   minBaseVersion: string;
 }
 
+/**
+ * Pure OTA-eligibility decision: given the current and previous parsed
+ * package.json objects, decide whether a delta (OTA) update is safe. A release
+ * is OTA-eligible ONLY when the Electron version, every native dependency, and
+ * the Node engines requirement are all unchanged — otherwise the prebuilt native
+ * ABI in the shipped shell can't be reused and a full install is required.
+ * Extracted from classifyRelease() so the rules are testable without git/fs.
+ */
+export function comparePackages(currentPkg: Record<string, unknown>, prevPkg: Record<string, unknown>): CompareResult {
+  const currentVersion = currentPkg.version as string;
+  const reasons: string[] = [];
+  const prevVersion = prevPkg.version as string;
+
+  // Check Electron version
+  const currentElectron = ((currentPkg.devDependencies as Record<string, unknown>)?.electron ??
+    (currentPkg.dependencies as Record<string, unknown>)?.electron) as string | undefined;
+  const prevElectron = ((prevPkg.devDependencies as Record<string, unknown>)?.electron ??
+    (prevPkg.dependencies as Record<string, unknown>)?.electron) as string | undefined;
+
+  if (currentElectron !== prevElectron) {
+    reasons.push(`Electron version changed: ${prevElectron} → ${currentElectron}`);
+  }
+
+  // Check native dependencies
+  const currentDeps = { ...currentPkg.dependencies, ...currentPkg.devDependencies } as Record<string, string>;
+  const prevDeps = {
+    ...(prevPkg.dependencies as Record<string, string>),
+    ...(prevPkg.devDependencies as Record<string, string>),
+  };
+
+  for (const dep of NATIVE_DEPS) {
+    const currentVer = currentDeps[dep];
+    const prevVer = prevDeps[dep];
+    if (currentVer !== prevVer) {
+      reasons.push(`Native dep ${dep} changed: ${prevVer ?? '(none)'} → ${currentVer ?? '(none)'}`);
+    }
+  }
+
+  // Check Node engines
+  const currentEngines = (currentPkg.engines as Record<string, unknown>)?.node as string | undefined;
+  const prevEngines = (prevPkg.engines as Record<string, unknown>)?.node as string | undefined;
+  if (currentEngines !== prevEngines) {
+    reasons.push(`Node engines changed: ${prevEngines} → ${currentEngines}`);
+  }
+
+  const otaEligible = reasons.length === 0;
+
+  // minBaseVersion: if OTA-eligible, the previous version's shell is compatible.
+  // If not OTA-eligible, minBaseVersion equals current (requires fresh install).
+  const minBaseVersion = otaEligible ? prevVersion : currentVersion;
+
+  return { otaEligible, reasons, minBaseVersion };
+}
+
 function classifyRelease(): CompareResult {
   const currentPkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8'));
   const currentVersion = currentPkg.version;
@@ -117,76 +166,47 @@ function classifyRelease(): CompareResult {
     };
   }
 
-  const reasons: string[] = [];
-  const prevVersion = prevPkg.version as string;
-
-  // Check Electron version
-  const currentElectron = (currentPkg.devDependencies?.electron ?? currentPkg.dependencies?.electron) as string | undefined;
-  const prevElectron = ((prevPkg.devDependencies as Record<string, unknown>)?.electron ?? (prevPkg.dependencies as Record<string, unknown>)?.electron) as string | undefined;
-
-  if (currentElectron !== prevElectron) {
-    reasons.push(`Electron version changed: ${prevElectron} → ${currentElectron}`);
-  }
-
-  // Check native dependencies
-  const currentDeps = { ...currentPkg.dependencies, ...currentPkg.devDependencies } as Record<string, string>;
-  const prevDeps = { ...(prevPkg.dependencies as Record<string, string>), ...(prevPkg.devDependencies as Record<string, string>) };
-
-  for (const dep of NATIVE_DEPS) {
-    const currentVer = currentDeps[dep];
-    const prevVer = prevDeps[dep];
-    if (currentVer !== prevVer) {
-      reasons.push(`Native dep ${dep} changed: ${prevVer ?? '(none)'} → ${currentVer ?? '(none)'}`);
-    }
-  }
-
-  // Check Node engines
-  const currentEngines = currentPkg.engines?.node as string | undefined;
-  const prevEngines = (prevPkg.engines as Record<string, unknown>)?.node as string | undefined;
-  if (currentEngines !== prevEngines) {
-    reasons.push(`Node engines changed: ${prevEngines} → ${currentEngines}`);
-  }
-
-  const otaEligible = reasons.length === 0;
-
-  // minBaseVersion: if OTA-eligible, the previous version's shell is compatible
-  // If not OTA-eligible, minBaseVersion equals current (requires fresh install)
-  const minBaseVersion = otaEligible ? prevVersion : currentVersion;
-
-  return { otaEligible, reasons, minBaseVersion };
+  return comparePackages(currentPkg, prevPkg);
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
 
-const result = classifyRelease();
-const currentPkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8'));
+function main(): void {
+  const result = classifyRelease();
+  const currentPkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8'));
 
-console.info(`\n[classify-release] Version: ${currentPkg.version}`);
-console.info(`[classify-release] OTA Eligible: ${result.otaEligible}`);
-console.info(`[classify-release] Min Base Version: ${result.minBaseVersion}`);
+  console.info(`\n[classify-release] Version: ${currentPkg.version}`);
+  console.info(`[classify-release] OTA Eligible: ${result.otaEligible}`);
+  console.info(`[classify-release] Min Base Version: ${result.minBaseVersion}`);
 
-if (result.reasons.length > 0) {
-  console.info(`[classify-release] Reasons for full update:`);
-  for (const reason of result.reasons) {
-    console.info(`  - ${reason}`);
+  if (result.reasons.length > 0) {
+    console.info(`[classify-release] Reasons for full update:`);
+    for (const reason of result.reasons) {
+      console.info(`  - ${reason}`);
+    }
   }
+
+  // Output in GitHub Actions format
+  console.info(`\nOTA_ELIGIBLE=${result.otaEligible}`);
+  console.info(`MIN_BASE_VERSION=${result.minBaseVersion}`);
+
+  // Write classification to file for CI
+  mkdirSync(distDir, { recursive: true });
+  const output = {
+    version: currentPkg.version,
+    otaEligible: result.otaEligible,
+    minBaseVersion: result.minBaseVersion,
+    reasons: result.reasons,
+    classifiedAt: new Date().toISOString(),
+  };
+  writeFileSync(resolve(distDir, 'ota-classification.json'), JSON.stringify(output, null, 2));
+  console.info(`\n[classify-release] Classification written to dist/ota-classification.json`);
+
+  // Exit with code 0 always — let CI read the output
+  process.exit(0);
 }
 
-// Output in GitHub Actions format
-console.info(`\nOTA_ELIGIBLE=${result.otaEligible}`);
-console.info(`MIN_BASE_VERSION=${result.minBaseVersion}`);
-
-// Write classification to file for CI
-mkdirSync(distDir, { recursive: true });
-const output = {
-  version: currentPkg.version,
-  otaEligible: result.otaEligible,
-  minBaseVersion: result.minBaseVersion,
-  reasons: result.reasons,
-  classifiedAt: new Date().toISOString(),
-};
-writeFileSync(resolve(distDir, 'ota-classification.json'), JSON.stringify(output, null, 2));
-console.info(`\n[classify-release] Classification written to dist/ota-classification.json`);
-
-// Exit with code 0 always — let CI read the output
-process.exit(0);
+// Run only when invoked as a script (node/tsx), not when imported by a test.
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main();
+}
