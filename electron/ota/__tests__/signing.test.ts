@@ -17,6 +17,11 @@
 import { describe, it, expect } from 'vitest';
 import { generateKeyPairSync, sign as cryptoSign } from 'crypto';
 import { buildSignedPayload, computeFilesHash, verifyOtaSignature, type OtaSignedFields } from '../signing.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
@@ -70,6 +75,51 @@ describe('computeFilesHash', () => {
   it('returns a stable hex digest for the empty map', () => {
     const h = computeFilesHash({});
     expect(h).toMatch(/^[0-9a-f]{64}$/); // sha256 hex
+  });
+
+  it('pins the EXACT digest for a known map (golden value anchors the canonical byte format)', () => {
+    // The relative properties above hold for ANY self-consistent canonicalization,
+    // so they would NOT catch a delimiter/format change. This golden value pins
+    // the exact canon (`${key}\0${sha512}\n`, keys sorted, sha256-hex) that BOTH
+    // signing.ts AND scripts/build-ota-archive.ts#computeFilesHash must emit — a
+    // drift between signer and verifier silently breaks every OTA update, so if
+    // either copy's format changes, this assertion (and thus CI) fails.
+    expect(computeFilesHash({ 'a.js': { sha512: '1' }, 'b.js': { sha512: '2' } })).toBe(
+      '9fa1b4823f049731ec6128f8d2acfb3f968f3998252aa7ae85dc08f6b05dd629',
+    );
+    // Empty map → sha256 of the empty string.
+    expect(computeFilesHash({})).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  });
+});
+
+describe('computeFilesHash — signer↔verifier source parity', () => {
+  // signing.ts (verifier) and scripts/build-ota-archive.ts (signer) each carry a
+  // duplicated computeFilesHash whose header says "MUST match ... exactly". A
+  // divergence silently breaks every OTA update. Enforce it here: extract each
+  // function body and assert they are byte-identical (modulo the param name +
+  // whitespace), so editing one without the other fails CI.
+  const extractBody = (src: string): string => {
+    const start = src.indexOf('function computeFilesHash');
+    expect(start, 'computeFilesHash not found').toBeGreaterThanOrEqual(0);
+    // Grab from the opening brace to its matching close via a simple depth scan.
+    let i = src.indexOf('{', start);
+    let depth = 0;
+    const from = i;
+    for (; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}' && --depth === 0) break;
+    }
+    return src
+      .slice(from + 1, i)
+      .replace(/\bfiles\b/g, 'f') // signing.ts uses `files`, build script uses `f`
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  it('the two copies compute the identical canonical hash body', () => {
+    const verifier = readFileSync(resolve(__dirname, '../signing.ts'), 'utf-8');
+    const signer = readFileSync(resolve(__dirname, '../../../scripts/build-ota-archive.ts'), 'utf-8');
+    expect(extractBody(signer)).toBe(extractBody(verifier));
   });
 });
 
