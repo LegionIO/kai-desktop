@@ -714,43 +714,52 @@ async function waitForFollowUp(
   const immediate = await getFollowUp();
   if (immediate) return immediate;
 
-  // Poll with timeout
+  // Poll with timeout. Uses a self-scheduling setTimeout (re-armed AFTER each
+  // async getFollowUp resolves) rather than setInterval, so a slow getter can
+  // never overlap ticks. All handles + the abort listener are torn down exactly
+  // once in finish() — the previous version left the deadline timer running for
+  // up to timeoutMs after an early resolve and never removed the {once} abort
+  // listener on the (run-scoped, reused-across-turns) signal.
   return new Promise<string | null>((resolve) => {
     let resolved = false;
-    const finish = (val: string | null) => {
-      if (!resolved) {
-        resolved = true;
-        resolve(val);
-      }
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = (): void => finish(null);
+
+    const teardown = (): void => {
+      if (pollTimer) clearTimeout(pollTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      abortSignal?.removeEventListener('abort', onAbort);
     };
 
-    const interval = setInterval(async () => {
+    function finish(val: string | null): void {
+      if (resolved) return;
+      resolved = true;
+      teardown();
+      resolve(val);
+    }
+
+    const poll = async (): Promise<void> => {
+      if (resolved) return;
       if (abortSignal?.aborted) {
-        clearInterval(interval);
         finish(null);
         return;
       }
       const msg = await getFollowUp();
+      if (resolved) return; // finished (deadline/abort) while this tick awaited
       if (msg) {
-        clearInterval(interval);
         finish(msg);
+        return;
       }
-    }, 300);
+      pollTimer = setTimeout(poll, 300); // re-arm only after the await settles
+    };
 
-    setTimeout(() => {
-      clearInterval(interval);
-      finish(null);
-    }, timeoutMs);
+    deadlineTimer = setTimeout(() => finish(null), timeoutMs);
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
-    if (abortSignal) {
-      abortSignal.addEventListener(
-        'abort',
-        () => {
-          clearInterval(interval);
-          finish(null);
-        },
-        { once: true },
-      );
-    }
+    void poll();
   });
 }
+
+/** Exposed for unit tests only. */
+export const __internal = { waitForFollowUp };
