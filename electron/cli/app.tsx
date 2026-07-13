@@ -60,6 +60,7 @@ type PickerState = {
   items: PickerItem[];
   onSelect: (value: string) => void;
   onCancel?: () => void; // Esc handler — e.g. reject/dismiss a pending tool so the backend isn't left hung
+  onFreeText?: (value: string) => void; // when set, offer an "Other (type a message)" free-text row
 } | null;
 
 const CWD = process.cwd();
@@ -332,6 +333,13 @@ export function App({
           title: stripControl(q.question),
           items: q.options.map((o) => ({ label: stripControl(o.label), value: o.label })),
           onSelect: (v) => {
+            setPicker(null);
+            answers[q.question] = v;
+            askNext(i + 1);
+          },
+          // "Other (type a message)" — free-text answer, matching the GUI's
+          // AskUserQuestion affordance so the user isn't boxed into the options.
+          onFreeText: (v) => {
             setPicker(null);
             answers[q.question] = v;
             askNext(i + 1);
@@ -1169,6 +1177,7 @@ export function App({
           title={picker.title}
           items={picker.items}
           onSelect={picker.onSelect}
+          onFreeText={picker.onFreeText}
           onCancel={() => {
             const c = picker.onCancel;
             setPicker(null);
