@@ -81,6 +81,23 @@ export const SAFE_ENV_VARS = new Set([
 // ─── Scope Resolution ───────────────────────────────────────────────────────
 
 /**
+ * Build the environment for a sandboxed child. The Electron main process env
+ * carries app secrets (provider API keys, OAuth/PATs, AWS creds); spreading it
+ * wholesale into a plugin-spawned child would leak all of them. Start from the
+ * SAFE_ENV_VARS allowlist of the current env (PATH/HOME/etc. the allowlisted
+ * binaries actually need), then layer the plugin's explicit env on top. Applied
+ * unconditionally, so even a spawn with no custom env is scrubbed.
+ */
+function buildSandboxedEnv(pluginEnv?: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {};
+  for (const name of SAFE_ENV_VARS) {
+    const value = process.env[name];
+    if (typeof value === 'string') base[name] = value;
+  }
+  return pluginEnv ? { ...base, ...pluginEnv } : base;
+}
+
+/**
  * Resolve a ScopedDirectory token to an absolute path.
  */
 export function resolveScopeDirectory(scope: ScopedDirectory): string {
@@ -238,7 +255,7 @@ export async function executeCommand(
     const proc = spawn(binaryPath, args, {
       shell: false,
       cwd: cwd ?? undefined,
-      env: env ? { ...process.env, ...env } : undefined,
+      env: buildSandboxedEnv(env),
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: timeoutMs,
     });
@@ -352,3 +369,6 @@ export async function detectTool(binary: AllowedBinary): Promise<ToolDetectionRe
     return { name: binary, installed: true, path, error: String(err) };
   }
 }
+
+/** Test-only exposure of pure helpers. */
+export const __internal = { buildSandboxedEnv };
