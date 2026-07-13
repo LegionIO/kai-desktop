@@ -10,31 +10,34 @@ import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEO
  * packaged CLI uses `cli/electron-entry.ts` instead (re-execs the app binary).
  */
 async function main(): Promise<void> {
+  process.noDeprecation = true; // silence Node DEP warnings (e.g. punycode) — noise to a `kai` user
   const { print, prompt, json } = parseHeadlessArgs(process.argv.slice(2));
 
   const socketPath = getSocketPath();
   const token = getBridgeToken();
+  // Interactive REPL only when we have a real terminal AND no one-shot flag. In
+  // the REPL the banner UI replaces these status lines, so keep them for the
+  // headless/scripting path only (stderr).
+  const interactive = !print && process.stdin.isTTY && process.stdout.isTTY;
 
   let client = await tryConnect(socketPath, token);
   if (!client) {
-    cliLog('no running Kai backend found — starting a headless one…');
+    if (!interactive) cliLog('no running Kai backend found — starting a headless one…');
     if (!spawnHeadlessBackend(false)) process.exit(1);
     client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS, token);
     if (!client) {
       cliLog('timed out waiting for the headless backend to come up');
       process.exit(1);
     }
-    cliLog('headless backend ready');
+    if (!interactive) cliLog('headless backend ready');
   } else {
-    cliLog('attached to running Kai backend');
+    if (!interactive) cliLog('attached to running Kai backend');
   }
 
   const activeClient = client;
   process.on('exit', () => activeClient.close());
 
-  // Interactive REPL only when we have a real terminal AND no one-shot flag.
-  // A one-shot (-p/--print, or piped stdin with no TTY) runs headless and exits.
-  if (!print && process.stdin.isTTY && process.stdout.isTTY) {
+  if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, false));
     process.exit(0);
   } else {

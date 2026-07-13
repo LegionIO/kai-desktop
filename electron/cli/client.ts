@@ -12,8 +12,12 @@ type EventHandler = (data: unknown) => void;
 const INVOKE_TIMEOUT_MS = 60_000;
 /** Client → backend ping cadence. Must be < the server's heartbeat timeout (12s). */
 const HEARTBEAT_INTERVAL_MS = 5_000;
-/** Consecutive missed pongs before the client declares the backend dead. */
-const HEARTBEAT_MAX_MISSED = 2;
+/** Consecutive ticks with NO inbound traffic before the client declares the
+ *  backend dead. At 5s/tick this tolerates ~15-20s of silence — comfortably
+ *  under the server's 12-24s teardown window, but with enough margin that a
+ *  brief event-loop stall during a heavy agent stream doesn't trip a false
+ *  disconnect (the miss counter is also reset on ANY inbound byte in wire()). */
+const HEARTBEAT_MAX_MISSED = 3;
 
 /**
  * CLI-side client for the leader's local IPC socket. Speaks the same
@@ -128,6 +132,13 @@ export class LocalBridgeClient {
 
   private wire(socket: Socket): void {
     socket.on('data', (chunk: Buffer) => {
+      // ANY inbound byte proves the backend is alive — reset the heartbeat miss
+      // counter here (not only on a 'pong'). During a busy agent stream the
+      // event-loop can delay a pong past a tick even though data is flowing;
+      // resetting on all traffic prevents a false "dead backend" mid-response
+      // (which tore the socket down and overwrote the streaming reply with
+      // "reconnected"). Mirrors the server's own alive-on-any-traffic rule.
+      this.pongMissed = 0;
       this.buffer += chunk.toString('utf-8');
       let idx: number;
       while ((idx = this.buffer.indexOf('\n')) !== -1) {

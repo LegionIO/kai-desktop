@@ -16,14 +16,23 @@ import { spawnHeadlessBackend, waitForSocket, recoverBackend, cliLog, BOOT_TIMEO
  * of the REPL, matching the standalone `kai` entry.
  */
 export async function runCliClient(): Promise<void> {
+  // Silence Node's own deprecation warnings (e.g. the `punycode` DEP0040 a
+  // transitive dep triggers) — printed to stderr before our UI draws and pure
+  // noise to a `kai` user who can't act on them.
+  process.noDeprecation = true;
+
   const { print, prompt, json } = parseHeadlessArgs(process.argv.slice(2));
 
   const socketPath = getSocketPath();
   const token = getBridgeToken();
+  // In the interactive Ink REPL the banner UI draws immediately, so transient
+  // "attached"/"ready" status lines only orphan above it. Keep them for
+  // headless/scripting (stderr) where there's no UI to replace them.
+  const interactive = !print && process.stdin.isTTY && process.stdout.isTTY;
 
   let client = await tryConnect(socketPath, token);
   if (!client) {
-    cliLog('no running Kai backend found — starting a headless one…');
+    if (!interactive) cliLog('no running Kai backend found — starting a headless one…');
     if (!spawnHeadlessBackend(true)) {
       process.exit(1);
     }
@@ -32,16 +41,16 @@ export async function runCliClient(): Promise<void> {
       cliLog('timed out waiting for the headless backend to come up');
       process.exit(1);
     }
-    cliLog('headless backend ready');
+    if (!interactive) cliLog('headless backend ready');
   } else {
-    cliLog('attached to running Kai backend');
+    if (!interactive) cliLog('attached to running Kai backend');
   }
 
   // On any exit, close the socket so the backend can reap itself promptly.
   const activeClient = client;
   process.on('exit', () => activeClient.close());
 
-  if (!print && process.stdin.isTTY && process.stdout.isTTY) {
+  if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, true));
     process.exit(0);
   } else {
