@@ -42,7 +42,7 @@
  */
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getCurrentFuseWire, FuseV1Options } from '@electron/fuses';
 import type { FuseConfig } from '@electron/fuses';
@@ -67,17 +67,6 @@ type FuseStateByte = typeof FUSE_DISABLE | typeof FUSE_ENABLE | typeof FUSE_INHE
  * reading the verifier output.
  */
 const KNOWN_FUSE_STATE_BYTES = new Set<number>([FUSE_DISABLE, FUSE_ENABLE, FUSE_INHERIT, FUSE_REMOVED]);
-function assertKnownFuseByte(byte: number, fuseName: string): asserts byte is FuseStateByte {
-  if (!KNOWN_FUSE_STATE_BYTES.has(byte)) {
-    console.error(
-      `[fuses] FATAL: fuse "${fuseName}" reported unknown byte=${byte} (0x${byte.toString(16)}). ` +
-        `This usually means @electron/fuses has shipped a new FuseState value that the verifier ` +
-        `does not yet understand. Update scripts/verify-fuses.ts to add the new byte before relying ` +
-        `on this gate again.`,
-    );
-    process.exit(1);
-  }
-}
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = dirname(__dirname);
@@ -159,6 +148,36 @@ function describeState(state: FuseStateByte | undefined): string {
   }
 }
 
+/**
+ * Pure fuse-verification decision: given a read fuse wire (fuse option → byte)
+ * and the expected table, return the human-readable failure lines. A fuse fails
+ * when its byte is undefined, INHERIT/REMOVED (i.e. not a hard ENABLE/DISABLE),
+ * or set to the opposite of `want`. This is the security-load-bearing bit — a
+ * bug here would let an insecurely-fused build pass CI — so it's extracted from
+ * main() to be testable without a packaged .app. Throws on an unrecognized byte
+ * (so a new @electron/fuses FuseState fails loudly rather than silently passing).
+ */
+export function evaluateFuses(
+  wire: Record<number, number | undefined>,
+  expected: ReadonlyArray<{ name: string; option: FuseV1Options; want: boolean }> = EXPECTED,
+): string[] {
+  const failures: string[] = [];
+  for (const { name, option, want } of expected) {
+    const rawByte = wire[option as unknown as number];
+    if (rawByte !== undefined && !KNOWN_FUSE_STATE_BYTES.has(rawByte)) {
+      throw new Error(
+        `fuse "${name}" reported unknown byte=${rawByte} (0x${rawByte.toString(16)}) — @electron/fuses may have a new FuseState`,
+      );
+    }
+    const got = rawByte as FuseStateByte | undefined;
+    const gotBool = got === undefined ? null : stateToBoolean(got);
+    if (gotBool === null || gotBool !== want) {
+      failures.push(`  - ${name}: expected ${want ? 'ENABLE (true)' : 'DISABLE (false)'}, got ${describeState(got)}`);
+    }
+  }
+  return failures;
+}
+
 async function main(): Promise<void> {
   const appPath = findAppBundle();
   console.info(`[fuses] reading fuse wire from ${appPath}`);
@@ -174,20 +193,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const failures: string[] = [];
-
-  for (const { name, option, want } of EXPECTED) {
-    const rawByte = wire[option] as number | undefined;
-    if (rawByte !== undefined) {
-      // Fail-loud on a byte value the verifier doesn't recognise — see the
-      // comment on `KNOWN_FUSE_STATE_BYTES` above.
-      assertKnownFuseByte(rawByte, name);
-    }
-    const got = rawByte as FuseStateByte | undefined;
-    const gotBool = got === undefined ? null : stateToBoolean(got);
-    if (gotBool === null || gotBool !== want) {
-      failures.push(`  - ${name}: expected ${want ? 'ENABLE (true)' : 'DISABLE (false)'}, got ${describeState(got)}`);
-    }
+  let failures: string[];
+  try {
+    failures = evaluateFuses(wire as unknown as Record<number, number | undefined>);
+  } catch (err) {
+    // An unrecognized fuse byte — fail loud with the guidance the assert used to print.
+    console.error(`[fuses] FATAL: ${(err as Error).message}. Update scripts/verify-fuses.ts.`);
+    process.exit(1);
   }
 
   if (failures.length > 0) {
@@ -244,7 +256,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error(`[fuses] unexpected error: ${(err as Error).message}`);
-  process.exit(1);
-});
+// Run only when invoked as a script (node/tsx), not when imported by a test.
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main().catch((err: unknown) => {
+    console.error(`[fuses] unexpected error: ${(err as Error).message}`);
+    process.exit(1);
+  });
+}
