@@ -54,6 +54,25 @@ const SYSTEM_SOUND_DIR = '/System/Library/Sounds';
 const SESSION_ID_RE = /^cs-\d+-[0-9a-f]{8}$/;
 export { SESSION_ID_RE };
 
+/**
+ * Whether `actionId` is STILL consumable as an approval decision in `session`:
+ * there is an approval for it in `pending` AND the action itself is in
+ * `awaiting-approval`. Both approveAction and rejectAction gate on this so a
+ * stale/duplicate decision (arriving after the action already ran, was
+ * rejected, stopped, or finalized) is a no-op — approving would resurrect the
+ * session to 'running' and re-run a decision; rejecting would flip an
+ * executing/completed action's records to 'rejected' and yank the session to
+ * 'paused', corrupting history that later feeds model prompts.
+ */
+export function isApprovalDecisionConsumable(
+  session: Pick<ComputerSession, 'approvals' | 'actions'>,
+  actionId: string,
+): boolean {
+  const pendingApproval = session.approvals.find((a) => a.actionId === actionId && a.status === 'pending');
+  const awaitingAction = session.actions.find((a) => a.id === actionId && a.status === 'awaiting-approval');
+  return Boolean(pendingApproval && awaitingAction);
+}
+
 const SESSION_ALERT_SOUND_BY_KIND: Record<SessionAlertKind, string> = {
   completed: 'Glass',
   failed: 'Basso',
@@ -1026,12 +1045,10 @@ export class ComputerUseSessionManager extends EventEmitter {
       const current = this.sessions.get(sessionId);
       if (!current) return null;
       // Atomicity: only consume an approval that is STILL pending for an action
-      // STILL awaiting approval. A stale/double approve (arriving after a reject,
-      // stop, or a prior approve already ran) must be a no-op — otherwise it
-      // would resurrect the session to 'running' and re-run/undo a decision.
-      const pendingApproval = current.approvals.find((a) => a.actionId === actionId && a.status === 'pending');
-      const awaitingAction = current.actions.find((a) => a.id === actionId && a.status === 'awaiting-approval');
-      if (!pendingApproval || !awaitingAction) {
+      // STILL awaiting approval (see isApprovalDecisionConsumable). A stale/double
+      // approve (after a reject, stop, or a prior approve) must be a no-op —
+      // otherwise it would resurrect the session to 'running' and re-run a decision.
+      if (!isApprovalDecisionConsumable(current, actionId)) {
         console.warn(
           `[Computer Use] Ignoring stale approve for ${actionId} in session ${sessionId} ` +
             `(approval or action no longer pending) — likely a double-approve or approve-after-reject/stop.`,
@@ -1066,27 +1083,52 @@ export class ComputerUseSessionManager extends EventEmitter {
     return session.target === 'local-macos' ? this.runExclusiveLocalMacos(approve) : approve();
   }
 
-  rejectAction(sessionId: string, actionId: string, reason?: string): ComputerSession | null {
+  async rejectAction(sessionId: string, actionId: string, reason?: string): Promise<ComputerSession | null> {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
-    return this.upsertSession({
-      ...session,
-      approvals: session.approvals.map((approval) =>
-        approval.actionId === actionId
-          ? { ...approval, status: 'rejected' as const, rationale: reason ?? approval.rationale }
-          : approval,
-      ),
-      actions: session.actions.map((action) =>
-        action.id === actionId
-          ? { ...action, status: 'rejected' as const, error: reason ?? 'Rejected by user' }
-          : action,
-      ),
-      status: 'paused',
-      humanInControl: false,
-      pauseReason: 'approval',
-      statusMessage: reason ?? 'Action rejected by user.',
-      updatedAt: nowIso(),
-    });
+
+    const reject = (): ComputerSession | null => {
+      // Re-read inside the lock — the session may have changed while queued.
+      const current = this.sessions.get(sessionId);
+      if (!current) return null;
+      // Atomicity (mirrors approveAction): only consume an approval STILL pending
+      // for an action STILL awaiting approval (see isApprovalDecisionConsumable).
+      // A stale reject — after an approve already resumed+executed the action,
+      // after a prior reject/stop, or for an already-finalized action — must be a
+      // no-op. Otherwise it would flip an executing/completed action's records to
+      // 'rejected' and yank the session to 'paused', corrupting history that
+      // later feeds model prompts.
+      if (!isApprovalDecisionConsumable(current, actionId)) {
+        console.warn(
+          `[Computer Use] Ignoring stale reject for ${actionId} in session ${sessionId} ` +
+            `(approval or action no longer pending) — likely a double-reject or reject-after-approve/stop.`,
+        );
+        return current;
+      }
+      return this.upsertSession({
+        ...current,
+        approvals: current.approvals.map((approval) =>
+          approval.actionId === actionId
+            ? { ...approval, status: 'rejected' as const, rationale: reason ?? approval.rationale }
+            : approval,
+        ),
+        actions: current.actions.map((action) =>
+          action.id === actionId
+            ? { ...action, status: 'rejected' as const, error: reason ?? 'Rejected by user' }
+            : action,
+        ),
+        status: 'paused',
+        humanInControl: false,
+        pauseReason: 'approval',
+        statusMessage: reason ?? 'Action rejected by user.',
+        updatedAt: nowIso(),
+      });
+    };
+
+    // Serialize local-macos rejects on the same lock as approves so a reject
+    // can't interleave with (or leapfrog) an approval already queued for that
+    // session.
+    return session.target === 'local-macos' ? this.runExclusiveLocalMacos(async () => reject()) : reject();
   }
 
   setSurface(sessionId: string, surface: ComputerUseSurface): ComputerSession | null {

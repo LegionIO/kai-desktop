@@ -363,7 +363,7 @@ export async function buildToolRegistry(
                   : payload.action === 'approve'
                     ? await manager.approveAction(targetSessionId, payload.actionId ?? '')
                     : payload.action === 'reject'
-                      ? manager.rejectAction(targetSessionId, payload.actionId ?? '', payload.reason)
+                      ? await manager.rejectAction(targetSessionId, payload.actionId ?? '', payload.reason)
                       : manager.setSurface(targetSessionId, payload.surface ?? 'docked');
         return result ?? { isError: true, error: 'Computer-use session not found.' };
       },
