@@ -189,6 +189,14 @@ saveSessions(sessions); // persist any pruning (rewrites legacy format)
  */
 const loginTokens = new Map<string, number>();
 
+/** Delete entries whose expiry (ms epoch) is strictly before `now`. Shared by
+ *  the login-token sweep; exported for unit testing. */
+export function pruneExpiredTokens(map: Map<string, number>, now: number): void {
+  for (const [key, expiresAt] of map) {
+    if (expiresAt < now) map.delete(key);
+  }
+}
+
 function addSession(token: string, expiresAt: number): void {
   sessions.set(token, expiresAt);
   saveSessions(sessions);
@@ -913,6 +921,10 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
         });
         res.end();
       } else {
+        // Reject: delete a presented-but-expired token so it doesn't linger in
+        // the map (createLoginToken also sweeps, but deleting on presentation
+        // reclaims it immediately).
+        if (loginToken) loginTokens.delete(loginToken);
         res.writeHead(302, { Location: '/login' });
         res.end();
       }
@@ -1473,8 +1485,14 @@ export async function stopWebServer(): Promise<void> {
  */
 export function createLoginToken(): string | null {
   if (!httpServer) return null;
+  const now = Date.now();
+  // Sweep expired-but-never-presented tokens before issuing. loginTokens is
+  // otherwise only cleaned when a token is consumed/presented, so an abandoned
+  // QR token (dialog opened but never scanned, or regenerated) would linger
+  // indefinitely. The map stays tiny, so an unconditional sweep is fine.
+  pruneExpiredTokens(loginTokens, now);
   const token = crypto.randomUUID();
-  loginTokens.set(token, Date.now() + LOGIN_TOKEN_LIFETIME_MS);
+  loginTokens.set(token, now + LOGIN_TOKEN_LIFETIME_MS);
   return token;
 }
 
