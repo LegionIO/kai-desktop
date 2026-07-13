@@ -217,14 +217,35 @@ export function filePathToUrl(filePath: string): string {
  * Read a ReadableStream into a Buffer, bounded by MAX_MEDIA_BYTES so a
  * compromised/misbehaving provider can't exhaust memory with an unbounded body.
  */
-export async function streamToBuffer(stream: ReadableStream, maxBytes = MAX_MEDIA_BYTES): Promise<Buffer> {
+export async function streamToBuffer(
+  stream: ReadableStream,
+  opts: { maxBytes?: number; signal?: AbortSignal } = {},
+): Promise<Buffer> {
+  const maxBytes = opts.maxBytes ?? MAX_MEDIA_BYTES;
+  const signal = opts.signal;
   const chunks: Uint8Array[] = [];
   let total = 0;
   let completed = false; // reached `done` normally — no cancel needed
   const reader = stream.getReader();
+
+  // read() takes no AbortSignal, so race each read against an abort promise.
+  // This bounds a provider that returns headers quickly then trickles the body
+  // slowly forever under the byte cap (a hang the byte cap alone can't catch).
+  let onAbort: (() => void) | undefined;
+  const abortPromise: Promise<never> | null = signal
+    ? new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(new Error('Media stream read was aborted.'));
+          return;
+        }
+        onAbort = () => reject(new Error('Media stream read was aborted.'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      })
+    : null;
+
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = abortPromise ? await Promise.race([reader.read(), abortPromise]) : await reader.read();
       if (done) {
         completed = true;
         break;
@@ -238,14 +259,20 @@ export async function streamToBuffer(stream: ReadableStream, maxBytes = MAX_MEDI
       }
     }
   } finally {
-    // On cap-exceed / early error, actively CANCEL the reader so an
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    // On cap-exceed / abort / early error, actively CANCEL the reader so an
     // attacker-controlled provider can't keep the underlying download alive
     // after we've stopped consuming. releaseLock alone doesn't abort the source.
+    // Best-effort + NON-awaited: a pathological cancel() must not itself hang the
+    // teardown (we've already stopped reading; the connection drop is a bonus).
+    // Cancel BEFORE releaseLock — cancelling a released reader throws.
     if (!completed) {
       try {
-        await reader.cancel();
+        void reader.cancel().catch(() => {
+          /* best-effort */
+        });
       } catch {
-        /* best-effort */
+        /* cancel() itself threw synchronously — ignore */
       }
     }
     try {

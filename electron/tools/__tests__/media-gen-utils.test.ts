@@ -164,17 +164,51 @@ describe('streamToBuffer', () => {
     });
 
   it('concatenates all chunks into a single buffer', async () => {
-    const buf = await streamToBuffer(streamOf([new Uint8Array([1, 2]), new Uint8Array([3])]), 1000);
+    const buf = await streamToBuffer(streamOf([new Uint8Array([1, 2]), new Uint8Array([3])]), { maxBytes: 1000 });
     expect([...buf]).toEqual([1, 2, 3]);
   });
 
   it('throws once the cumulative size exceeds the cap', async () => {
     const big = streamOf([new Uint8Array(60), new Uint8Array(60)]); // 120 bytes
-    await expect(streamToBuffer(big, 100)).rejects.toThrow(/size limit/);
+    await expect(streamToBuffer(big, { maxBytes: 100 })).rejects.toThrow(/size limit/);
   });
 
   it('returns an empty buffer for an empty stream', async () => {
-    const buf = await streamToBuffer(streamOf([]), 100);
+    const buf = await streamToBuffer(streamOf([]), { maxBytes: 100 });
     expect(buf.length).toBe(0);
+  });
+
+  it('defaults to the MAX_MEDIA_BYTES cap when called with just a stream (no opts)', async () => {
+    const buf = await streamToBuffer(streamOf([new Uint8Array([9])]));
+    expect([...buf]).toEqual([9]);
+  });
+
+  it('aborts a trickling stream when the signal fires mid-read (the DoS the fix closes)', async () => {
+    // A stream that yields one chunk then never produces another must be
+    // interruptible: streamToBuffer races each read against the abort signal and
+    // cancels the reader on abort.
+    let cancelled = false;
+    const trickle = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1])); // one chunk, then hang
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const ac = new AbortController();
+    const p = streamToBuffer(trickle, { signal: ac.signal });
+    await new Promise((r) => setTimeout(r, 10)); // let the first read land
+    ac.abort(); // next read() never resolves — only the abort race unblocks it
+    await expect(p).rejects.toThrow(/aborted/i);
+    await new Promise((r) => setTimeout(r, 0)); // best-effort cancel is a microtask
+    expect(cancelled).toBe(true);
+  });
+
+  it('rejects immediately when handed an already-aborted signal', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const never = new ReadableStream({ start() {} }); // never enqueues/closes
+    await expect(streamToBuffer(never, { signal: ac.signal })).rejects.toThrow(/aborted/i);
   });
 });

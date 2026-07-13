@@ -164,7 +164,16 @@ export function createVideoGenTool(getConfig: () => AppConfig, appHome: string):
           return { error: 'Failed to download video content.', jobId };
         }
 
-        const videoBuffer = await streamToBuffer(videoResponse.body);
+        // Bound the BODY read too: downloadContent() returns after headers (the
+        // SDK doesn't buffer the binary), so a provider that trickles the body
+        // slowly under the byte cap would otherwise hang past the deadline.
+        // Combine the remaining operation deadline with the caller's abort.
+        const bodyDeadlineMs = Math.max(0, deadline - Date.now());
+        const bodySignals: AbortSignal[] = [AbortSignal.timeout(bodyDeadlineMs)];
+        if (context.abortSignal) bodySignals.push(context.abortSignal);
+        const videoBuffer = await streamToBuffer(videoResponse.body, {
+          signal: bodySignals.length > 1 ? AbortSignal.any(bodySignals) : bodySignals[0],
+        });
         const filePath = saveMediaToFile(videoBuffer, 'videos', 'mp4', appHome);
         const fileUrl = filePathToUrl(filePath);
 
