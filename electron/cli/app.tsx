@@ -395,6 +395,20 @@ export function App({
       }
     };
 
+    // On turn completion, any tool row still marked running/awaiting can't have
+    // been left mid-execution — the turn is over. This is a backstop for a
+    // GUI-driven (peer) turn whose tool-result arrives with a toolCallId that
+    // doesn't match the CLI's tool-call row (execute-vs-stream id spaces), which
+    // would otherwise leave the row spinning forever ("stuck on CLI, done on
+    // GUI"). Mark such rows done so the CLI reflects the finished turn.
+    const settleOpenToolRows = (): void => {
+      setTools((prev) =>
+        prev.some((t) => t.status === 'running' || t.status === 'awaiting')
+          ? prev.map((t) => (t.status === 'running' || t.status === 'awaiting' ? { ...t, status: 'done' } : t))
+          : prev,
+      );
+    };
+
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
       cliDebugLog(
@@ -437,6 +451,7 @@ export function App({
             const id = e.toolCallId;
             const name = e.toolName ?? 'tool';
             const args = e.args;
+            cliDebugLog(`[CLI-TOOL-CALL] id=${id} name=${name}`);
             setTools((prev) =>
               prev.some((t) => t.id === id)
                 ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running', args } : t))
@@ -449,6 +464,9 @@ export function App({
           // tool-result with { isError: true } / { error }. Don't show success.
           const res = e.result as { isError?: boolean; error?: string } | undefined;
           const failed = !!res?.isError || typeof res?.error === 'string';
+          cliDebugLog(
+            `[CLI-TOOL-RESULT] id=${e.toolCallId} failed=${failed} matchesOpenRow=${tools.some((t) => t.id === e.toolCallId && t.status === 'running')}`,
+          );
           setTools((prev) =>
             prev.map((t) =>
               t.id === e.toolCallId
@@ -516,10 +534,12 @@ export function App({
           finalizeAssistant();
           setTurns((prev) => [...prev, { kind: 'error', text: e.error ?? 'unknown error' }]);
           settleTurn();
+          settleOpenToolRows();
           break;
         case 'done':
           finalizeAssistant();
           settleTurn();
+          settleOpenToolRows();
           break;
       }
     });
