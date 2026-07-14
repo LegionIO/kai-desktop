@@ -12,6 +12,7 @@ vi.mock('electron', () => ({ BrowserWindow: { getAllWindows: () => [] } }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: vi.fn() }));
 
 import { __internal } from '../plan-mode.js';
+import { createExitPlanModeTool } from '../plan-mode.js';
 
 const { slugifyPlanTitle } = __internal;
 
@@ -52,5 +53,17 @@ describe('slugifyPlanTitle', () => {
   it('caps the slug at 60 chars', () => {
     const s = slugifyPlanTitle('a'.repeat(200));
     expect(s.length).toBe(60);
+  });
+});
+
+describe('exit_plan_mode size cap', () => {
+  it('rejects an oversized plan before writing anything', async () => {
+    const tool = createExitPlanModeTool();
+    const huge = 'x'.repeat(1024 * 1024 + 1); // 1 MiB + 1 byte
+    const res = (await tool.execute!({ planContent: huge, planTitle: 'big' }, {
+      toolCallId: 't1',
+    } as never)) as { success?: boolean; error?: string };
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/too large/i);
   });
 });

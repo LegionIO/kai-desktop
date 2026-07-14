@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { BrowserWindow } from 'electron';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, openSync, writeSync, closeSync, constants as fsConstants } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
@@ -167,12 +167,39 @@ export function createExitPlanModeTool(): ToolDefinition {
         summary?: string;
       };
 
+      // Bound the plan size: model-generated content is normally small, but a
+      // runaway plan shouldn't be able to write an unbounded file / block the
+      // main process. 1 MiB is far larger than any real plan.
+      const MAX_PLAN_BYTES = 1024 * 1024;
+      if (typeof planContent === 'string' && Buffer.byteLength(planContent, 'utf-8') > MAX_PLAN_BYTES) {
+        return { success: false, error: `Plan is too large (max ${MAX_PLAN_BYTES} bytes).` };
+      }
+
       // Write the plan to ~/.kai/plans/<name>.md
       const planName = slugifyPlanTitle(planTitle);
       const plansDir = join(homedir(), '.kai', 'plans');
-      mkdirSync(plansDir, { recursive: true });
       const planFilePath = join(plansDir, `${planName}.md`);
-      writeFileSync(planFilePath, planContent, 'utf-8');
+      try {
+        mkdirSync(plansDir, { recursive: true });
+        // O_NOFOLLOW so a pre-existing symlink at the target can't redirect the
+        // write outside the plans dir. O_TRUNC keeps the overwrite-on-same-title
+        // behavior (plan files are ephemeral working artifacts). Fd write + close
+        // in finally so the descriptor never leaks on a mid-write error.
+        const fd = openSync(
+          planFilePath,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+          0o644,
+        );
+        try {
+          writeSync(fd, planContent, null, 'utf-8');
+        } finally {
+          closeSync(fd);
+        }
+      } catch (err) {
+        // Fail soft — stay in plan mode so the user can retry rather than crash
+        // the tool call.
+        return { success: false, error: `Failed to save plan: ${err instanceof Error ? err.message : String(err)}` };
+      }
 
       broadcastModeChange('auto');
       return {
