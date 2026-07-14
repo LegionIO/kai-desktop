@@ -319,17 +319,43 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 }
 
 /**
- * True when the last turn in `branch` is already a user message whose text
- * equals `text`. Used to dedup a broadcast `user-message` (from the `kai` CLI
- * or a second GUI window) against THIS window's own just-submitted turn — the
- * originating window already has that turn in its tree, so inserting the echo
- * would double it. A peer's turn has no such matching last-user turn, so it's
- * not a duplicate and renders immediately. Exported for testing.
+ * True when the last turn in `branch` is already a user message equivalent to
+ * `text`. Used to dedup a broadcast `user-message` (from the `kai` CLI, a second
+ * GUI window, OR this window's OWN turn echoed back by the backend) against the
+ * turn already in this window's tree — inserting the echo would double it.
+ *
+ * The backend FLATTENS a user turn's content parts to text before broadcasting:
+ * text as-is, image → `[Image]`, file → `[File: name]`/`[File]`, space-joined
+ * and whitespace-collapsed (see extractMessageText in electron/ipc/agent.ts). So
+ * we must flatten the local last-user message the SAME way before comparing —
+ * otherwise a message with an image (local text = "hi", broadcast = "hi [Image]")
+ * fails the naive text-only compare and the echo gets appended as a duplicate.
+ * Exported for testing.
  */
+export function flattenUserContentForDedup(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      const p = part as { type?: string; text?: string; filename?: string };
+      if (p?.type === 'text') return p.text ?? '';
+      if (p?.type === 'file') return p.filename ? `[File: ${p.filename}]` : '[File]';
+      if (p?.type === 'image') return '[Image]';
+      return '';
+    })
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function isDuplicateLastUserMessage(branch: StoredMessage[], text: string): boolean {
   const last = branch[branch.length - 1];
   if (!last || last.role !== 'user') return false;
   const content = Array.isArray(last.content) ? last.content : [];
+  // Compare against the flattened representation (matching the backend's
+  // broadcast flattening), and also against the bare text part as a fallback
+  // for older/simple text-only broadcasts.
+  const flattened = flattenUserContentForDedup(content);
+  if (flattened === text) return true;
   const textPart = content.find((p: unknown) => (p as { type?: string }).type === 'text') as
     | { text?: string }
     | undefined;
@@ -2687,25 +2713,6 @@ export function RuntimeProvider({
       if (!convId) return;
 
       const pendingAttachments = consumeAttachments();
-      // [DBG-PASTE] Diagnose the image-paste double-user-message report. Gated on
-      // localStorage 'kai:dbgPaste'='1' so it's opt-in, not noise. Logs each
-      // onNew with incoming part types + pending attachment kinds + the current
-      // head, so a repro shows whether onNew fires TWICE (double-submit) or once
-      // (render-side dup), and what content each turn carries. Remove once fixed.
-      if (typeof localStorage !== 'undefined' && localStorage.getItem('kai:dbgPaste') === '1') {
-        // Include a trimmed stack so a repro shows WHICH trigger fired onNew
-        // (ComposerInput.handleSubmit vs Thread.handleSend vs assistant-ui's
-        // built-in composer submit) — codex's review confirms the fix hinges on
-        // whether one gesture fires two submits, not on dedup inside onNew.
-        const src = (new Error().stack ?? '').split('\n').slice(2, 6).join(' | ');
-        console.warn(
-          `[DBG-PASTE] onNew conv=${convId} head=${headId ?? 'null'} ts=${Date.now()} msgParts=${JSON.stringify(
-            (message.content ?? []).map((p) => (p as { type?: string }).type),
-          )} pendingAttachments=${JSON.stringify(
-            pendingAttachments.map((a) => ({ isImage: a.isImage, hasText: !!a.text, name: a.name })),
-          )} src=${src}`,
-        );
-      }
       const cwd = currentWorkingDirectoryRef.current;
       const userContent: ContentPart[] = [];
       for (const part of message.content) {

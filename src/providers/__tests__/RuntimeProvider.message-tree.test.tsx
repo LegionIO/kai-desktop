@@ -161,4 +161,48 @@ describe('isDuplicateLastUserMessage — peer user-message dedup (#222)', () => 
     const imgOnly: Msg = { role: 'user', content: [{ type: 'image', image: 'x' }] };
     expect(isDuplicateLastUserMessage(asBranch([imgOnly]), 'hello')).toBe(false);
   });
+
+  // #234: a text+image user message is broadcast back flattened as "text [Image]"
+  // (the backend replaces image parts with the [Image] placeholder). The dedup
+  // must flatten the local message the SAME way, or the echo doubles the turn.
+  it('dedups a text+image message against its flattened "text [Image]" broadcast (#234)', () => {
+    const withImage: Msg = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is this?' },
+        { type: 'image', image: 'data:image/png;base64,AAAA' },
+      ],
+    };
+    // The backend broadcasts the flattened form → must be recognized as our own echo.
+    expect(isDuplicateLastUserMessage(asBranch([withImage]), 'What is this? [Image]')).toBe(true);
+    // Bare-text fallback still works (older/simple broadcasts).
+    expect(isDuplicateLastUserMessage(asBranch([withImage]), 'What is this?')).toBe(true);
+  });
+
+  it('dedups an image-only message against the "[Image]" broadcast', () => {
+    const imgOnly: Msg = { role: 'user', content: [{ type: 'image', image: 'x' }] };
+    expect(isDuplicateLastUserMessage(asBranch([imgOnly]), '[Image]')).toBe(true);
+  });
+
+  it('dedups a text+file message against its flattened "text [File: name]" broadcast', () => {
+    const withFile: Msg = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'check this' },
+        { type: 'file', filename: 'notes.txt' },
+      ],
+    };
+    expect(isDuplicateLastUserMessage(asBranch([withFile]), 'check this [File: notes.txt]')).toBe(true);
+  });
+
+  it('is NOT a duplicate when a peer sends different text even if ours had an image', () => {
+    const withImage: Msg = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is this?' },
+        { type: 'image', image: 'x' },
+      ],
+    };
+    expect(isDuplicateLastUserMessage(asBranch([withImage]), 'something else [Image]')).toBe(false);
+  });
 });
