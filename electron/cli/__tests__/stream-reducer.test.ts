@@ -87,6 +87,8 @@ describe('reduceCliStreamEvent — tool lifecycle + stuck-row backstop (#218)', 
       { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh', args: { cmd: 'ls' } },
     ]);
     expect(s.tools).toEqual([{ id: 'tc1', name: 'sh', status: 'running', args: { cmd: 'ls' } }]);
+    // A new tool call also drops an inline `tool` marker in the transcript.
+    expect(s.turns).toContainEqual({ kind: 'tool', id: 'tc1' });
 
     const done = reduceCliStreamEvent(s, {
       type: 'tool-result',
@@ -96,6 +98,24 @@ describe('reduceCliStreamEvent — tool lifecycle + stuck-row backstop (#218)', 
     });
     expect(done.tools[0].status).toBe('done');
     expect(done.tools[0].durationMs).toBe(12);
+  });
+
+  it('interleaves tool markers in occurrence order (text → tool → text), matching the GUI', () => {
+    const s = run([
+      { type: 'user-message', text: 'time?' },
+      { type: 'text-delta', text: 'I will grab it from the shell.' },
+      { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh' },
+      { type: 'tool-result', toolCallId: 'tc1', result: { ok: true } },
+      { type: 'text-delta', text: "It's Monday." },
+      { type: 'done' },
+    ]);
+    // Transcript order: user, assistant(intro), tool marker, assistant(result).
+    expect(s.turns).toEqual([
+      { kind: 'user', text: 'time?' },
+      { kind: 'assistant', text: 'I will grab it from the shell.' },
+      { kind: 'tool', id: 'tc1' },
+      { kind: 'assistant', text: "It's Monday." },
+    ]);
   });
 
   it('marks a tool-result with isError as error', () => {
@@ -156,6 +176,19 @@ describe('reduceCliStreamEvent — terminal + misc', () => {
     ]);
     const after = reduceCliStreamEvent(start, { type: 'model-fallback', data: { toModel: 'gpt-5.6' } });
     expect(after).toEqual(start);
+  });
+
+  it('model-fallback with discardPartialAssistant clears the superseded streaming text', () => {
+    const start = run([
+      { type: 'user-message', text: 'q' },
+      { type: 'text-delta', text: 'superseded partial' },
+    ]);
+    expect(start.streaming).toBe('superseded partial');
+    const after = reduceCliStreamEvent(start, {
+      type: 'model-fallback',
+      data: { toModel: 'gpt-5.6', discardPartialAssistant: true },
+    });
+    expect(after.streaming).toBe('');
   });
 
   it('is pure — does not mutate the input state', () => {

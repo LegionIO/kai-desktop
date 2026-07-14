@@ -31,6 +31,7 @@ export type CliTurn =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
   | { kind: 'note'; text: string; id?: string; loading?: boolean }
+  | { kind: 'tool'; id: string }
   | { kind: 'error'; text: string };
 
 export type CliToolStatus = 'running' | 'awaiting' | 'done' | 'error';
@@ -137,7 +138,12 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
       const tools = exists
         ? state.tools.map((t) => (t.id === id ? { ...t, name, status: 'running' as const, args } : t))
         : [...state.tools, { id, name, status: 'running' as const, args }];
-      return { ...state, tools };
+      if (exists) return { ...state, tools };
+      // A NEW tool call: flush any streamed assistant text into its own turn,
+      // then drop an inline `tool` marker so the transcript renders in occurrence
+      // order (text → tool → text), matching the GUI. Mirrors app.tsx.
+      const flushed = finalizeAssistant(state);
+      return { ...flushed, tools, turns: [...flushed.turns, { kind: 'tool', id }] };
     }
 
     case 'tool-result': {
@@ -193,8 +199,17 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
       return { ...flushed, turnSettled: true, tools: settleOpenToolRows(flushed.tools) };
     }
 
+    case 'model-fallback': {
+      // If the runtime discarded the partial output before failing over, drop
+      // what we've streamed so a superseded fragment doesn't render. (The banner
+      // model-label update is a side effect the caller handles.) Mirrors app.tsx.
+      const fb = event.data as { discardPartialAssistant?: boolean } | undefined;
+      if (fb?.discardPartialAssistant) return { ...state, streaming: '' };
+      return state;
+    }
+
     default:
-      // model-fallback, context-usage, and other non-transcript events: no change.
+      // context-usage and other non-transcript events: no change.
       return state;
   }
 }

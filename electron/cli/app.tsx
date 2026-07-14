@@ -60,6 +60,7 @@ type Turn =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
   | { kind: 'note'; text: string; id?: string; loading?: boolean }
+  | { kind: 'tool'; id: string }
   | { kind: 'error'; text: string };
 
 type ToolEntry = {
@@ -454,11 +455,23 @@ export function App({
             const name = e.toolName ?? 'tool';
             const args = e.args;
             cliDebugLog(`[CLI-TOOL-CALL] id=${id} name=${name}`);
+            const isNew = !tools.some((t) => t.id === id);
             setTools((prev) =>
               prev.some((t) => t.id === id)
                 ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running', args } : t))
                 : [...prev, { id, name, status: 'running', args }],
             );
+            // Interleave the tool inline in the transcript at its occurrence
+            // point (matching the GUI order: text → tool → text). Only for a NEW
+            // tool call: flush any assistant text streamed so far into its own
+            // turn, then drop a `tool` marker (TurnView renders it by looking the
+            // row up in `tools`). Without this, tools rendered in a block AFTER
+            // all text, so a mid-response tool call appeared below the reply.
+            if (isNew) {
+              finalizeAssistant();
+              streamingRef.current = '';
+              pushTurn({ kind: 'tool', id });
+            }
           }
           break;
         case 'tool-result': {
@@ -1172,6 +1185,16 @@ export function App({
 
   const cols = stdout?.columns ?? 80;
 
+  // Tool rows are rendered inline via `tool` turn markers (see the tool-call
+  // handler). Build an id→row lookup for those markers, plus the set of tool
+  // ids already placed inline, so any tool WITHOUT a marker (observer-launched,
+  // or created before the interleave logic) still renders as a fallback block.
+  const toolsById = new Map(tools.map((t) => [t.id, t]));
+  const interleavedToolIds = new Set(
+    turns.filter((t): t is { kind: 'tool'; id: string } => t.kind === 'tool').map((t) => t.id),
+  );
+  const orphanTools = tools.filter((t) => !interleavedToolIds.has(t.id));
+
   return (
     <Box flexDirection="column" width={cols}>
       <Banner
@@ -1183,11 +1206,33 @@ export function App({
         pending={pending}
         cwd={CWD}
       />
-      {/* Transcript */}
+      {/* Transcript — turns render in order, with tool rows interleaved inline
+          at their occurrence point (a `tool` turn looks its row up in `tools`
+          by id). This matches the GUI order (text → tool → text) instead of
+          dumping all tools in a block after the reply. */}
       <Box flexDirection="column" flexGrow={1}>
-        {turns.map((t, i) => (
-          <TurnView key={i} turn={t} />
-        ))}
+        {turns.map((t, i) =>
+          t.kind === 'tool' ? (
+            (() => {
+              const tool = toolsById.get(t.id);
+              return tool ? (
+                <Box key={i} marginTop={1} flexDirection="column">
+                  <ToolRow
+                    name={tool.name}
+                    status={tool.status}
+                    durationMs={tool.durationMs}
+                    error={tool.error}
+                    expanded={expandTools}
+                    args={tool.args}
+                    result={tool.result}
+                  />
+                </Box>
+              ) : null;
+            })()
+          ) : (
+            <TurnView key={i} turn={t} />
+          ),
+        )}
         {streamingRef.current.trim() ? (
           <Box marginTop={1} flexDirection="column">
             <Text color="magenta" bold>
@@ -1196,9 +1241,12 @@ export function App({
             <Text>{renderMarkdown(streamingRef.current)}</Text>
           </Box>
         ) : null}
-        {tools.length > 0 ? (
+        {/* Fallback: any tool row NOT yet interleaved via a `tool` turn (e.g. a
+            row created before this build's marker logic, or an observer tool
+            with no stream marker) still renders here so it isn't lost. */}
+        {orphanTools.length > 0 ? (
           <Box flexDirection="column" marginTop={1}>
-            {tools.map((t) => (
+            {orphanTools.map((t) => (
               <ToolRow
                 key={t.id}
                 name={t.name}
@@ -1252,7 +1300,7 @@ export function App({
   );
 }
 
-function TurnView({ turn }: { turn: Turn }): React.ReactElement {
+function TurnView({ turn }: { turn: Turn }): React.ReactElement | null {
   switch (turn.kind) {
     case 'user':
       return (
@@ -1291,5 +1339,9 @@ function TurnView({ turn }: { turn: Turn }): React.ReactElement {
           <Text dimColor>{stripControl(turn.text)}</Text>
         </Box>
       );
+    case 'tool':
+      // Tool turns are rendered inline by the transcript (looked up in `tools`);
+      // they never reach TurnView. Defensive no-op for exhaustiveness.
+      return null;
   }
 }
