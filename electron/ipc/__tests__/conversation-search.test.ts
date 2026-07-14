@@ -46,6 +46,12 @@ describe('matchConversation', () => {
     expect(hit?.matchedIn).toBe('title');
   });
 
+  it('falls back to fallbackTitle when title is an EMPTY string (not just null)', () => {
+    const hit = matchConversation(conv({ title: '', fallbackTitle: 'Deploy Notes' }), 'deploy');
+    expect(hit?.matchedIn).toBe('title');
+    expect(hit?.snippet).toBe('Deploy Notes');
+  });
+
   it('matches message content and returns a snippet around the hit', () => {
     const c = conv({
       title: 'Some title',

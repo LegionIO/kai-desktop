@@ -63,23 +63,28 @@ export function matchConversation(
   const lowerTerm = term.trim().toLowerCase();
   if (!lowerTerm) return null;
 
-  const title = conversation.title ?? conversation.fallbackTitle ?? '';
+  // `||` (not `??`): an empty-string title must fall through to fallbackTitle,
+  // not suppress it (some records persist title as '' rather than null).
+  const title = conversation.title || conversation.fallbackTitle || '';
   if (title.toLowerCase().includes(lowerTerm)) {
     return { matchedIn: 'title', snippet: title };
   }
 
   const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
-  let scanned = 0;
+  let remaining = MAX_SCAN_CHARS;
   for (const msg of messages) {
+    if (remaining <= 0) break; // perf guard: bounded total scan across the chat
     if (!msg || typeof msg !== 'object') continue;
-    const text = messageTextForSearch((msg as { content?: unknown }).content);
+    let text = messageTextForSearch((msg as { content?: unknown }).content);
     if (!text) continue;
+    // Bound the work THIS message contributes to the scan budget (a single huge
+    // message shouldn't blow past the cap before it's checked).
+    if (text.length > remaining) text = text.slice(0, remaining);
+    remaining -= text.length;
     const lowerText = text.toLowerCase();
     if (lowerText.includes(lowerTerm)) {
       return { matchedIn: 'content', snippet: makeSnippet(text, lowerText, lowerTerm) };
     }
-    scanned += text.length;
-    if (scanned > MAX_SCAN_CHARS) break; // perf guard: stop scanning a huge chat
   }
 
   return null;
