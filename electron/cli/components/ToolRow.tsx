@@ -15,7 +15,10 @@ function previewValue(value: unknown): string {
   if (typeof value === 'string') text = value;
   else {
     try {
-      text = JSON.stringify(value, null, 2);
+      // JSON.stringify returns undefined for bare functions/symbols (no throw) —
+      // fall back to String() so stripControl always gets a string.
+      const serialized = JSON.stringify(value, null, 2);
+      text = serialized ?? String(value);
     } catch {
       text = String(value);
     }

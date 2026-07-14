@@ -40,20 +40,35 @@ export function Picker({
 
   useInput(
     (input, key) => {
-      if (typing) return; // TextInput owns keystrokes in free-text mode
+      // While typing free-text, TextInput owns keystrokes — but it doesn't
+      // handle Escape, and the footer advertises "esc cancel". So keep this
+      // handler active during typing and act ONLY on Escape (drop back out of
+      // free-text mode into the list rather than cancelling the whole picker).
+      if (typing) {
+        if (key.escape) setTyping(false);
+        return;
+      }
+      // Ignore navigation/select when there are no rows (avoids `% 0` → NaN).
+      if (rowCount === 0) {
+        if (key.escape) onCancel();
+        return;
+      }
+      // Require UNMODIFIED keys for select/quick-select so a stray
+      // Ctrl/Meta/Shift+Enter or Meta+digit can't trigger a selection.
+      const modified = key.ctrl || key.meta || key.shift;
       if (key.upArrow) setIndex((i) => (i - 1 + rowCount) % rowCount);
       else if (key.downArrow) setIndex((i) => (i + 1) % rowCount);
-      else if (key.return) {
+      else if (key.return && !modified) {
         if (index === otherIndex) setTyping(true);
         else if (items[index]) onSelect(items[index].value);
       } else if (key.escape) onCancel();
-      else if (/^[1-9]$/.test(input)) {
+      else if (!modified && /^[1-9]$/.test(input)) {
         const n = parseInt(input, 10) - 1;
         if (n === otherIndex) setTyping(true);
         else if (n < items.length) onSelect(items[n].value);
       }
     },
-    { isActive: !typing },
+    { isActive: true },
   );
 
   if (typing && onFreeText) {
@@ -71,7 +86,7 @@ export function Picker({
             placeholder="type your answer…"
           />
         </Box>
-        <Text dimColor>enter submit · esc cancel</Text>
+        <Text dimColor>enter submit · esc back to options</Text>
       </Box>
     );
   }
