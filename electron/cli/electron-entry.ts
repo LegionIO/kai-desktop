@@ -1,7 +1,7 @@
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
-import { runHeadlessOnce, parseHeadlessArgs } from './headless-run.js';
+import { runHeadlessOnce, parseHeadlessArgs, helpText } from './headless-run.js';
 import {
   spawnHeadlessBackend,
   waitForSocket,
@@ -29,7 +29,15 @@ export async function runCliClient(): Promise<void> {
   // noise to a `kai` user who can't act on them.
   process.noDeprecation = true;
 
-  const { print, prompt, json } = parseHeadlessArgs(process.argv.slice(2));
+  const { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled } = parseHeadlessArgs(
+    process.argv.slice(2),
+  );
+
+  // `kai --help` / `-h`: print the usage manual and exit before any connect.
+  if (help) {
+    process.stdout.write(helpText() + '\n');
+    process.exit(0);
+  }
 
   const socketPath = getSocketPath();
   const token = getBridgeToken();
@@ -80,7 +88,15 @@ export async function runCliClient(): Promise<void> {
     await startRepl(activeClient, () => recoverBackend(activeClient, true));
     process.exit(0);
   } else {
-    await runHeadlessOnce(activeClient, { prompt, json });
+    await runHeadlessOnce(activeClient, {
+      prompt,
+      json,
+      modelKey,
+      profileKey,
+      reasoningEffort,
+      fallbackEnabled,
+      recover: () => recoverBackend(activeClient, true),
+    });
     await activeClient.requestShutdown();
     activeClient.close();
     process.exit(0);
