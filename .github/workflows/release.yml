@@ -222,10 +222,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kai-mac
-          # DMG (stable-named) + the auto-update zip + latest-mac.yml manifest.
+          # DMG (stable-named) + the auto-update zip + its blockmap + the
+          # latest-mac.yml manifest. The .zip.blockmap is REQUIRED for
+          # electron-updater's differential (delta) download on macOS — without
+          # it the updater always falls back to downloading the full zip.
           path: |
             dist/*.dmg
             dist/*.zip
+            dist/*.blockmap
             dist/latest-mac.yml
           if-no-files-found: error
           retention-days: 1
@@ -426,6 +430,20 @@ jobs:
               exit 1
             fi
             assets+=("$f")
+          done
+          # Blockmaps (attach ALL). electron-updater needs the .zip.blockmap next
+          # to the update zip to do a differential (delta) download on macOS —
+          # without it the client always downloads the full zip. Require at least
+          # one so a delta-less release fails loudly instead of shipping silently.
+          blockmaps=()
+          while IFS= read -r f; do blockmaps+=("$f"); done < <(find dist -maxdepth 1 -type f -name '*.blockmap')
+          if [ "${#blockmaps[@]}" -eq 0 ]; then
+            echo "ERROR: no *.blockmap in dist/ — macOS differential updates would fall back to full downloads" >&2
+            exit 1
+          fi
+          for f in "${blockmaps[@]}"; do
+            assets+=("$f")
+            echo "Including blockmap asset: $(basename "$f")"
           done
           # OTA (optional)
           for pat in '*-ota-*.tar.gz' 'latest-ota.json'; do
