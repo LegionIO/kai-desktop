@@ -2687,6 +2687,20 @@ export function RuntimeProvider({
       if (!convId) return;
 
       const pendingAttachments = consumeAttachments();
+      // [DBG-PASTE] Diagnose the image-paste double-user-message report. Gated on
+      // localStorage 'kai:dbgPaste'='1' so it's opt-in, not noise. Logs each
+      // onNew with incoming part types + pending attachment kinds + the current
+      // head, so a repro shows whether onNew fires TWICE (double-submit) or once
+      // (render-side dup), and what content each turn carries. Remove once fixed.
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('kai:dbgPaste') === '1') {
+        console.warn(
+          `[DBG-PASTE] onNew conv=${convId} head=${headId ?? 'null'} msgParts=${JSON.stringify(
+            (message.content ?? []).map((p) => (p as { type?: string }).type),
+          )} pendingAttachments=${JSON.stringify(
+            pendingAttachments.map((a) => ({ isImage: a.isImage, hasText: !!a.text, name: a.name })),
+          )}`,
+        );
+      }
       const cwd = currentWorkingDirectoryRef.current;
       const userContent: ContentPart[] = [];
       for (const part of message.content) {
