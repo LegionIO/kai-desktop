@@ -404,7 +404,7 @@ export function getBridgeScript(): string {
       get: function(id) { return invoke('alerts:get', id); },
       unreadCount: function() { return invoke('alerts:unreadCount'); },
       answer: function(id, answer) { return invoke('alerts:answer', id, answer); },
-      decide: function(id, decision) { return invoke('alerts:decide', id, decision); },
+      decide: function(id, decision, note) { return invoke('alerts:decide', id, decision, note); },
       dismiss: function(id) { return invoke('alerts:dismiss', id); },
       onChanged: function(cb) { return on('alerts:changed', cb); }
     },

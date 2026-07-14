@@ -33,6 +33,7 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   BotIcon,
+  BellIcon,
   CheckSquareIcon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -83,6 +84,9 @@ import { AgentProvider, useAgents } from '@/providers/AgentProvider';
 import { PlanPanel } from '@/components/thread/PlanPanel';
 import { TaskQueue } from '@/components/tasks/TaskQueue';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
+import { AlertsView } from '@/components/alerts/AlertsView';
+import { AlertModalHost } from '@/components/alerts/AlertModalHost';
+import { useAlerts } from '@/components/alerts/useAlerts';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
 import { AgentListPanel } from '@/components/agents/AgentListPanel';
 import { AgentSwarmView } from '@/components/agents/AgentSwarmView';
@@ -434,6 +438,7 @@ const MARKETPLACE_VIEW = 'marketplace';
 const PLUGINS_VIEW = 'plugins';
 const TASKS_VIEW = 'tasks';
 const AGENTS_VIEW = 'agents';
+const ALERTS_VIEW = 'alerts';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
 
 function isPluginView(view: string): boolean {
@@ -1622,6 +1627,8 @@ function AppShell() {
     void app.platform.setDockBadge?.({ count, hasText, style: dockBadgeStyle }).catch(() => {});
   }, [pluginUIState?.navigationItems, pluginUpdateCount, dockBadgeStyle]);
 
+  const { unread: alertUnread } = useAlerts();
+
   const dockItems: DockItem[] = useMemo(() => {
     // Check if a specific plugin panel dock icon is active
     const pluginPanelActive =
@@ -1661,6 +1668,23 @@ function AppShell() {
           setActiveView(AGENTS_VIEW);
         },
         active: sidebarSection === 'agents' && activeView !== SETTINGS_VIEW,
+      },
+      {
+        id: 'alerts',
+        label: 'Alerts',
+        icon: <BellIcon className="h-[18px] w-[18px]" />,
+        group: 'builtin',
+        onClick: () => {
+          setSidebarSection('alerts');
+          setActiveView(ALERTS_VIEW);
+        },
+        active: sidebarSection === 'alerts' && activeView !== SETTINGS_VIEW,
+        badge:
+          alertUnread > 0 ? (
+            <span className="absolute -top-0.5 -right-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-amber-500 px-0.5 text-[9px] font-bold leading-none text-white">
+              {alertUnread > 9 ? '9+' : alertUnread}
+            </span>
+          ) : undefined,
       },
       {
         id: 'plugins',
@@ -1755,6 +1779,7 @@ function AppShell() {
     sidebarSection,
     activeView,
     pluginUpdateCount,
+    alertUnread,
     showPluginDockIcons,
     dockBadgeStyle,
     pluginPanels,
@@ -1817,6 +1842,7 @@ function AppShell() {
             <PluginErrorBoundary fallback={() => null}>
               <PluginToastHost />
             </PluginErrorBoundary>
+            <AlertModalHost />
             <PluginErrorBoundary fallback={() => null}>
               <PermissionConsentModal />
             </PluginErrorBoundary>
@@ -2768,6 +2794,10 @@ function AppShell() {
                           onClose={() => setAgentDeleteModal(null)}
                         />
                       )}
+                    </div>
+                  ) : activeView === ALERTS_VIEW ? (
+                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                      <AlertsView />
                     </div>
                   ) : (
                     <PlanPanelProvider onOpenPlan={handleOpenPlan}>

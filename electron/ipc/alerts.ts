@@ -117,11 +117,14 @@ function formatAnswer(alert: Alert, answer: Record<string, string>): string {
   return `[Answering your earlier question "${alert.title}"]\n${body}`;
 }
 
-function formatDecision(alert: Alert, decision: 'approve' | 'deny'): string {
+function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: string): string {
   const action = alert.approvalAction ? ` for: ${alert.approvalAction}` : '';
-  return decision === 'approve'
-    ? `[Approved${action}] You may proceed.`
-    : `[Denied${action}] Do not proceed; stop or choose a different course.`;
+  const base =
+    decision === 'approve'
+      ? `[Approved${action}] You may proceed.`
+      : `[Denied${action}] Do not proceed; stop or choose a different course.`;
+  const trimmed = note?.trim();
+  return trimmed ? `${base}\nNote from the user: ${trimmed}` : base;
 }
 
 /** Append the user's response into the originating conversation and re-run the agent. */
@@ -168,11 +171,14 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
     return { ok: true };
   });
 
-  ipcMain.handle('alerts:decide', async (_e, id: string, decision: 'approve' | 'deny') => {
+  ipcMain.handle('alerts:decide', async (_e, id: string, decision: 'approve' | 'deny', note?: string) => {
     if (!deps) return { ok: false, error: 'alerts not initialized' };
     if (!isValidAlertId(id)) return { ok: false, error: 'invalid alert id' };
     if (decision !== 'approve' && decision !== 'deny') {
       return { ok: false, error: "decision must be 'approve' or 'deny'" };
+    }
+    if (note !== undefined && (typeof note !== 'string' || note.length > 4000)) {
+      return { ok: false, error: 'note must be a string under 4000 chars' };
     }
     const existing = readAlert(deps.appHome, id);
     if (!existing) return { ok: false, error: 'alert not found' };
@@ -182,7 +188,7 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
     const resolved = resolveAlert(deps.appHome, id, decision);
     if (!resolved) return { ok: false, error: 'alert not open' };
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
-    void resume(resolved, formatDecision(resolved, decision)).catch((err) => {
+    void resume(resolved, formatDecision(resolved, decision, note)).catch((err) => {
       console.error('[alerts] resume after decision failed:', err);
     });
     return { ok: true };

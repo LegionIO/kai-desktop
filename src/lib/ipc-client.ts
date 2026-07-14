@@ -123,7 +123,7 @@ type AppAPI = {
     get: (id: string) => Promise<Alert | null>;
     unreadCount: () => Promise<number>;
     answer: (id: string, answer: Record<string, string>) => Promise<{ ok: boolean; error?: string }>;
-    decide: (id: string, decision: 'approve' | 'deny') => Promise<{ ok: boolean; error?: string }>;
+    decide: (id: string, decision: 'approve' | 'deny', note?: string) => Promise<{ ok: boolean; error?: string }>;
     dismiss: (id: string) => Promise<{ ok: boolean; error?: string }>;
     onChanged: (callback: (payload: AlertsChangedPayload) => void) => () => void;
   };

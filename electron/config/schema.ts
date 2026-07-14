@@ -825,7 +825,7 @@ const hooksConfigSchema = z
 export type HooksConfig = z.infer<typeof hooksConfigSchema>;
 
 /** Sidebar tab identifiers — scoped tabs filter by active workspace, global tabs show everything. */
-export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins';
+export type SidebarTab = 'chats' | 'tasks' | 'messages' | 'agents' | 'plugins' | 'alerts';
 
 export const sidebarTabSchema = z.enum(['chats', 'tasks', 'messages', 'agents', 'plugins']);
 

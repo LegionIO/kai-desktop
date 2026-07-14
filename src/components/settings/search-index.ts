@@ -314,6 +314,12 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     section: 'automations',
     keywords: ['trigger', 'action', 'when'],
   },
+  {
+    id: 'automations.surfaceAlertsAsModal',
+    label: 'Pop alerts as a front-most window',
+    section: 'automations',
+    keywords: ['alerts', 'modal', 'notification', 'question', 'approval', 'front-most', 'focus'],
+  },
 
   // ─── Application › General ───
   {

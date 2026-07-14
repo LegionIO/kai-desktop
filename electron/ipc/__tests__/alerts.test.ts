@@ -61,6 +61,15 @@ describe('alerts formatters', () => {
     expect(__internal.formatDecision(alert, 'deny')).toContain('Denied');
     expect(__internal.formatDecision(alert, 'deny')).toContain('Do not proceed');
   });
+
+  it('formatDecision appends a free-text note when the user provides one', () => {
+    const alert: Alert = { ...base, kind: 'approval', approvalAction: 'push to prod' };
+    const out = __internal.formatDecision(alert, 'approve', 'but skip the migration step');
+    expect(out).toContain('Approved');
+    expect(out).toContain('Note from the user: but skip the migration step');
+    // Empty/whitespace note is ignored.
+    expect(__internal.formatDecision(alert, 'deny', '   ')).not.toContain('Note from the user');
+  });
 });
 
 describe('alerts IPC validators', () => {

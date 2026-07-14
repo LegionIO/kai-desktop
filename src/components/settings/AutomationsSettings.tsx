@@ -16,12 +16,22 @@ import { generateId } from '@/lib/utils';
 import { NumberField, settingsSelectClass, TextField, Toggle, type SettingsProps } from './shared';
 
 type ConditionOp =
-  'equals' | 'notEquals' | 'contains' | 'startsWith' | 'endsWith' | 'matches' | 'in' | 'exists' | 'expression';
+  | 'equals'
+  | 'notEquals'
+  | 'contains'
+  | 'startsWith'
+  | 'endsWith'
+  | 'matches'
+  | 'in'
+  | 'exists'
+  | 'expression';
 
 type Condition = { path: string; op: ConditionOp; value?: unknown; caseSensitive: boolean };
 
 type ConversationTarget =
-  { type: 'per-invocation' } | { type: 'singleton' } | { type: 'existing'; conversationId: string };
+  | { type: 'per-invocation' }
+  | { type: 'singleton' }
+  | { type: 'existing'; conversationId: string };
 
 type Action =
   | {
@@ -60,6 +70,7 @@ type AutomationsConfig = {
   rules: Rule[];
   log: { maxEntries: number };
   approvalMode?: AutomationApprovalMode;
+  surfaceAlertsAsModal?: boolean;
 };
 
 const APPROVAL_MODES: Array<{ value: AutomationApprovalMode; label: string; hint: string }> = [
@@ -229,6 +240,26 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
         <p className="text-[11px] text-muted-foreground">
           {APPROVAL_MODES.find((m) => m.value === approvalMode)?.hint}
         </p>
+      </div>
+
+      <div
+        data-setting-id="automations.surfaceAlertsAsModal"
+        className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-card/50 p-3"
+      >
+        <div>
+          <div className="text-xs font-medium">Pop alerts as a front-most window</div>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            When an automation raises a question or approval Alert, immediately open a focused modal (and bring the app
+            to the front) so you can act on it right away. When off, you only get an OS notification and the Alerts tab
+            badge.
+          </p>
+        </div>
+        <Toggle
+          id="automations.surfaceAlertsAsModal"
+          label=""
+          checked={!!automations.surfaceAlertsAsModal}
+          onChange={(v) => updateConfig('automations.surfaceAlertsAsModal', v)}
+        />
       </div>
 
       {automations.rules.length === 0 && <p className="text-xs text-muted-foreground">No rules configured.</p>}
