@@ -118,11 +118,13 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     stream = streamWithFallback(conversationId, sanitized, streamConfig, configForStream, pluginTools ?? [], dbPath, {
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
+      isHeadless: true,
     });
   } else {
     stream = streamAgentResponse(conversationId, sanitized, modelConfig, configForStream, pluginTools ?? [], dbPath, {
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
+      isHeadless: true,
     });
   }
 

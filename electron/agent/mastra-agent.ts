@@ -208,7 +208,7 @@ function toMastraTools(
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
-  executionContext?: Pick<ToolExecutionContext, 'cwd'>,
+  executionContext?: Pick<ToolExecutionContext, 'cwd' | 'isHeadless'>,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
   // tool named "__proto__"/"constructor" must create a plain entry, not invoke a
@@ -251,6 +251,7 @@ function toMastraTools(
             toolCallId,
             conversationId,
             cwd: executionContext?.cwd,
+            isHeadless: executionContext?.isHeadless,
             abortSignal: mergedAbortSignal,
             onProgress: (progress: ToolProgressEvent) => {
               hooks?.emitEvent?.({
@@ -985,6 +986,8 @@ export async function* streamAgentResponse(
     reasoningEffort?: ReasoningEffort;
     abortSignal?: AbortSignal;
     cwd?: string;
+    /** No live user watching this run — see ToolExecutionContext.isHeadless. */
+    isHeadless?: boolean;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
@@ -1042,7 +1045,7 @@ export async function* streamAgentResponse(
       onToolExecutionEnd: options?.onToolExecutionEnd,
       augmentToolResult: options?.augmentToolResult,
     },
-    { cwd: effectiveCwd },
+    { cwd: effectiveCwd, isHeadless: options?.isHeadless },
   );
   const providerDefinedTools = buildProviderDefinedTools(modelConfig);
 
@@ -1728,6 +1731,8 @@ export async function* streamWithFallback(
     reasoningEffort?: ReasoningEffort;
     abortSignal?: AbortSignal;
     cwd?: string;
+    /** No live user watching this run — see ToolExecutionContext.isHeadless. */
+    isHeadless?: boolean;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {

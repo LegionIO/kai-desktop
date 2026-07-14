@@ -18,6 +18,10 @@ export type ToolExecutionContext = {
   cwd?: string;
   abortSignal?: AbortSignal;
   onProgress?: (event: ToolProgressEvent) => void;
+  /** True when the run has no live user watching (automation / headless agent
+   *  run). Tools that would normally block on user input (e.g. ask_user) use
+   *  this to fall back to a persistent Alert instead of failing/hanging. */
+  isHeadless?: boolean;
 };
 
 export type ToolDefinition = {

@@ -221,7 +221,7 @@ export async function buildToolRegistry(
     tools.push(createModelSwitchTool(appHome));
     tools.push(createEnterPlanModeTool());
     tools.push(createExitPlanModeTool());
-    tools.push(createAskUserTool());
+    tools.push(createAskUserTool(appHome));
     tools.push(createRequestReviewTool(appHome));
   }
 

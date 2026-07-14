@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
+import { createAlert, type AlertQuestion } from '../ipc/alert-store.js';
+import { notifyAlertCreated } from '../ipc/alert-notify.js';
 
 /**
  * Shared map where agent.ts stores user answers before the tool's execute runs.
@@ -49,7 +51,7 @@ const questionSchema = z.object({
     .describe('Allow multiple selections. Use when choices are not mutually exclusive.'),
 });
 
-export function createAskUserTool(): ToolDefinition {
+export function createAskUserTool(appHome?: string): ToolDefinition {
   return {
     name: 'ask_user',
     description: [
@@ -63,12 +65,33 @@ export function createAskUserTool(): ToolDefinition {
     inputSchema: z.object({
       questions: z.array(questionSchema).min(1).max(4).describe('Questions to ask (1-4)'),
     }),
-    execute: async (_input, context) => {
+    execute: async (input, context) => {
       // By the time execute runs, agent.ts has already stored the user's answers
       const answers = pendingQuestionAnswers.get(context.toolCallId);
       pendingQuestionAnswers.delete(context.toolCallId);
 
       if (!answers) {
+        // Headless / automation run: no live user gated this call, so there are
+        // no answers and blocking would be pointless. Fall back to a persistent
+        // Alert (like request_review) so the user can answer later and the run
+        // resumes. Requires a conversation to resume into + the alert store.
+        if (context.isHeadless && appHome && context.conversationId) {
+          const questions = (input as { questions?: AlertQuestion[] }).questions ?? [];
+          const first = questions[0]?.question ?? 'A question';
+          const alert = createAlert(appHome, {
+            kind: 'question',
+            title: first.length > 80 ? `${first.slice(0, 77)}…` : first,
+            body: questions.map((q) => `• ${q.question}`).join('\n'),
+            conversationId: context.conversationId,
+            questions,
+          });
+          notifyAlertCreated(alert);
+          return {
+            suspended: true,
+            alertId: alert.id,
+            note: 'No live user to answer right now — raised an Alert. End your turn; the user will answer and their response comes back to you as a new message.',
+          };
+        }
         return { error: 'No user response received' };
       }
 

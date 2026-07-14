@@ -5,8 +5,17 @@
  * re-runs orphans the entry — stashQuestionAnswers caps the map so that leak
  * stays bounded (matches loginAttempts/exitCodes bounded-map patterns).
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+// alert-notify pulls in electron via the alerts IPC handler it forwards to; the
+// tool only needs the store write to happen, so stub the notify seam.
+vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
+
 import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool } from '../ask-user.js';
+import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
 beforeEach(() => {
@@ -53,5 +62,53 @@ describe('createAskUserTool execute', () => {
     const tool = createAskUserTool();
     const result = await tool.execute!({ questions: [] }, ctx('tc-missing'));
     expect(result).toEqual({ error: 'No user response received' });
+  });
+});
+
+describe('createAskUserTool headless fallback', () => {
+  let appHome: string;
+  beforeEach(() => {
+    appHome = mkdtempSync(join(tmpdir(), 'kai-askuser-'));
+    mkdirSync(join(appHome, 'data'), { recursive: true });
+  });
+  afterEach(() => rmSync(appHome, { recursive: true, force: true }));
+
+  const q = { question: 'Which environment?', header: 'Env', options: [{ label: 'staging' }, { label: 'prod' }] };
+  const headlessCtx = (toolCallId: string, conversationId?: string): ToolExecutionContext =>
+    ({ toolCallId, conversationId, isHeadless: true }) as ToolExecutionContext;
+
+  it('raises a question alert instead of failing when headless with no answer', async () => {
+    const tool = createAskUserTool(appHome);
+    const result = (await tool.execute!({ questions: [q] }, headlessCtx('tc-h', 'conv-9'))) as Record<string, unknown>;
+    expect(result.suspended).toBe(true);
+    expect(typeof result.alertId).toBe('string');
+    const alerts = listAlerts(appHome);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].kind).toBe('question');
+    const alert = readAlert(appHome, result.alertId as string);
+    expect(alert?.conversationId).toBe('conv-9');
+    expect(alert?.questions?.[0].header).toBe('Env');
+  });
+
+  it('still errors (no alert) when headless but there is no conversation to resume into', async () => {
+    const tool = createAskUserTool(appHome);
+    const result = await tool.execute!({ questions: [q] }, headlessCtx('tc-h2', undefined));
+    expect(result).toEqual({ error: 'No user response received' });
+    expect(listAlerts(appHome)).toHaveLength(0);
+  });
+
+  it('does NOT raise an alert in the interactive path (not headless)', async () => {
+    const tool = createAskUserTool(appHome);
+    const result = await tool.execute!({ questions: [q] }, ctx('tc-i'));
+    expect(result).toEqual({ error: 'No user response received' });
+    expect(listAlerts(appHome)).toHaveLength(0);
+  });
+
+  it('prefers stashed answers even when headless', async () => {
+    const tool = createAskUserTool(appHome);
+    stashQuestionAnswers('tc-h3', { Env: 'prod' });
+    const result = await tool.execute!({ questions: [q] }, headlessCtx('tc-h3', 'conv-9'));
+    expect(result).toEqual({ success: true, answers: { Env: 'prod' } });
+    expect(listAlerts(appHome)).toHaveLength(0);
   });
 });
