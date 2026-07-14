@@ -1809,7 +1809,12 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   // Unwrap /bin/zsh -lc '...' style wrappers for display
   const shellWrapped = rawCommand.match(/^\/bin\/(?:zsh|bash|sh)\s+-\w+\s+'(.+)'$/s);
   const command = shellWrapped ? shellWrapped[1] : rawCommand;
-  const shData = detectShResult(part.result);
+  // Sanitize BEFORE shape detection: observer augmentation wraps a bash result
+  // as { value: <stdout/obj>, observer } and internal keys (__compaction, etc.)
+  // ride along — detectShResult on the RAW result then finds no stdout/stderr
+  // key and renders "No output" despite real output. sanitizeResultForDisplay
+  // unwraps { value } and strips internal keys (matching detectSmartResult).
+  const shData = detectShResult(sanitizeResultForDisplay(part.result));
   // For error results that don't have stdout/stderr shape, extract the error string
   const resultObj = part.result && typeof part.result === 'object' ? (part.result as Record<string, unknown>) : null;
   const errorMessage =
