@@ -13,6 +13,8 @@ interface ContentPanelProps {
   pluginsContent: ReactNode;
   /** Rendered when tab === 'agents' */
   agentsContent: ReactNode;
+  /** Rendered when tab === 'alerts' */
+  alertsContent: ReactNode;
 }
 
 export const ContentPanel: FC<ContentPanelProps> = ({
@@ -21,6 +23,7 @@ export const ContentPanel: FC<ContentPanelProps> = ({
   tasksContent,
   pluginsContent,
   agentsContent,
+  alertsContent,
 }) => {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -28,6 +31,7 @@ export const ContentPanel: FC<ContentPanelProps> = ({
       {activeTab === 'tasks' && tasksContent}
       {activeTab === 'plugins' && pluginsContent}
       {activeTab === 'agents' && agentsContent}
+      {activeTab === 'alerts' && alertsContent}
       {activeTab === 'messages' && (
         <StubPanel
           icon={<InboxIcon size={40} strokeWidth={1.2} />}

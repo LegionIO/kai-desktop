@@ -52,7 +52,7 @@ export const AlertsView: FC = () => {
             </p>
           </div>
         ) : (
-          <div className="mx-auto flex max-w-2xl flex-col gap-3">
+          <div className="mx-auto flex max-w-xl flex-col gap-3">
             {alerts.map((a) => (
               <AlertCard key={a.id} alert={a} />
             ))}

@@ -85,6 +85,7 @@ import { PlanPanel } from '@/components/thread/PlanPanel';
 import { TaskQueue } from '@/components/tasks/TaskQueue';
 import { TaskSidebarList } from '@/components/tasks/TaskSidebarList';
 import { AlertsView } from '@/components/alerts/AlertsView';
+import { AlertsSidebarList } from '@/components/alerts/AlertsSidebarList';
 import { AlertModalHost } from '@/components/alerts/AlertModalHost';
 import { useAlerts } from '@/components/alerts/useAlerts';
 import { TaskCreationView } from '@/components/tasks/TaskCreationView';
@@ -2201,6 +2202,7 @@ function AppShell() {
                           />
                         </div>
                       }
+                      alertsContent={<AlertsSidebarList onSelect={() => setActiveView(ALERTS_VIEW)} />}
                     />
                     <SidebarDock
                       items={dockItems}

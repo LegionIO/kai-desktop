@@ -122,7 +122,7 @@ export const ToolCallDisplay: FC<{
     toolCallId: string;
   }) => Promise<{ id: string; title: string } | null>;
 }> = ({ part, onSendFeedback, onPlanApproved }) => {
-  const [expanded, setExpanded] = useState(part.toolName === 'ask_user');
+  const [expanded, setExpanded] = useState(part.toolName === 'ask_user' || part.toolName === 'request_review');
   const [showOriginal, setShowOriginal] = useState(false);
   const [localApproval, setLocalApproval] = useState<'approved' | 'rejected' | 'dismissed' | null>(null);
   const [feedbackText, setFeedbackText] = useState('');
@@ -155,6 +155,7 @@ export const ToolCallDisplay: FC<{
       ? `Requires approval: ${approvalReason.trim()}`
       : 'Requires approval to execute';
   const isAskUser = part.toolName === 'ask_user';
+  const isRequestReview = part.toolName === 'request_review';
   const isRunning = !hasResult && !isHung && !isPendingApproval;
   const hasLiveOutput = Boolean(part.liveOutput?.stdout || part.liveOutput?.stderr);
   const wasCompacted = Boolean(part.compactionMeta?.wasCompacted);
@@ -471,6 +472,8 @@ export const ToolCallDisplay: FC<{
           <AskUserErrorView result={part.result} />
         ) : isAskUser && hasResult && !isError ? (
           <AskUserAnswersView args={part.args} result={part.result} />
+        ) : isRequestReview ? (
+          <ReviewRequestView args={part.args} result={part.result} />
         ) : (
           <div className="tool-detail-code ml-5 mt-1 mb-2 pl-3">
             {/* Running spinner */}
@@ -598,6 +601,60 @@ const AskUserErrorView: FC<{ result: unknown }> = ({ result }) => {
       <div className="px-3 py-2">
         <pre className="text-destructive whitespace-pre-wrap break-all leading-5">{message}</pre>
       </div>
+    </div>
+  );
+};
+
+/** Renders a request_review call: its kind/title/message + any questions, and
+ *  the resulting alert status (raised / flagged). */
+const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, result }) => {
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  const kind = typeof a.kind === 'string' ? a.kind : 'review';
+  const title = typeof a.title === 'string' ? a.title : '';
+  const message = typeof a.message === 'string' ? a.message : '';
+  const approvalAction = typeof a.approvalAction === 'string' ? a.approvalAction : '';
+  const questions = parseQuestions(args);
+  const r = (result && typeof result === 'object' && !Array.isArray(result) ? result : {}) as Record<string, unknown>;
+  const suspend = r.suspend === true || r.alerted === true;
+  const label = kind === 'fyi' ? 'FYI' : kind === 'approval' ? 'Approval requested' : 'Question raised';
+
+  return (
+    <div className="tool-detail-code ml-5 mt-1 mb-2 space-y-2 pl-3 text-xs">
+      <div className="font-medium text-foreground/80">{label}</div>
+      {title && <div className="text-sm font-medium text-foreground">{title}</div>}
+      {message && <div className="whitespace-pre-wrap text-muted-foreground">{message}</div>}
+      {approvalAction && (
+        <div className="text-muted-foreground">
+          <span className="text-muted-foreground/60">Action: </span>
+          {approvalAction}
+        </div>
+      )}
+      {questions.length > 0 && (
+        <div className="space-y-1.5">
+          {questions.map((q, i) => (
+            <div key={i} className="rounded-lg border border-border/40 p-2">
+              <div className="font-medium text-foreground/80">{q.question}</div>
+              {q.options.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {q.options.map((o) => (
+                    <span key={o.label} className="rounded bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {o.label}
+                    </span>
+                  ))}
+                  {q.multiSelect && (
+                    <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">select many</span>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {suspend && (
+        <div className="text-[11px] text-amber-600 dark:text-amber-400">
+          Raised as an Alert — awaiting the user. The run will resume when they respond.
+        </div>
+      )}
     </div>
   );
 };
@@ -3488,8 +3545,20 @@ function getToolSummary(part: ToolCallPart): string {
   if (part.toolName === 'generate_image' && args.prompt) return String(args.prompt).slice(0, 60);
   if (part.toolName === 'generate_video' && args.prompt) return String(args.prompt).slice(0, 60);
   if (part.toolName === 'ask_user' && Array.isArray(args.questions)) {
-    const count = (args.questions as unknown[]).length;
+    const qs = args.questions as Array<Record<string, unknown>>;
+    const first = qs[0] && typeof qs[0].question === 'string' ? String(qs[0].question) : '';
+    if (first) {
+      const trimmed = first.length > 70 ? `${first.slice(0, 67)}…` : first;
+      return qs.length > 1 ? `${trimmed} (+${qs.length - 1} more)` : trimmed;
+    }
+    const count = qs.length;
     return `${count} question${count !== 1 ? 's' : ''}`;
+  }
+  if (part.toolName === 'request_review') {
+    const kind = typeof args.kind === 'string' ? args.kind : 'review';
+    const title = typeof args.title === 'string' ? args.title : '';
+    const label = kind === 'fyi' ? 'FYI' : kind === 'approval' ? 'Approval' : 'Question';
+    return title ? `${label}: ${title.length > 60 ? `${title.slice(0, 57)}…` : title}` : label;
   }
   if (part.toolName === 'enter_plan_mode')
     return (args as Record<string, unknown>).reason ? String((args as Record<string, unknown>).reason) : '';

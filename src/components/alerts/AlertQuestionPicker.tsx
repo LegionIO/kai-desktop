@@ -29,6 +29,18 @@ export const AlertQuestionPicker: FC<{
 
   const handleSelect = useCallback(
     (qIdx: number, value: string) => {
+      const multi = questions[qIdx]?.multiSelect === true;
+      if (multi) {
+        // Toggle this option in a comma-joined set; never auto-advance (the user
+        // may pick several). Selecting a real option clears any "Other" text.
+        setAnswers((prev) => {
+          const current = prev[qIdx] ? prev[qIdx].split(', ').filter(Boolean) : [];
+          const has = current.includes(value);
+          const next = has ? current.filter((v) => v !== value) : [...current.filter((v) => v !== OTHER), value];
+          return { ...prev, [qIdx]: next.join(', ') };
+        });
+        return;
+      }
       setAnswers((prev) => ({ ...prev, [qIdx]: value }));
       if (value !== OTHER) {
         setOtherTexts((prev) => {
@@ -39,20 +51,42 @@ export const AlertQuestionPicker: FC<{
         if (qIdx < questions.length - 1) setTimeout(() => setActiveTab(qIdx + 1), 160);
       }
     },
-    [questions.length],
+    [questions],
   );
 
-  const handleOtherText = useCallback((qIdx: number, text: string) => {
-    setOtherTexts((prev) => ({ ...prev, [qIdx]: text }));
-    setAnswers((prev) => ({ ...prev, [qIdx]: OTHER }));
-  }, []);
+  const handleOtherText = useCallback(
+    (qIdx: number, text: string) => {
+      setOtherTexts((prev) => ({ ...prev, [qIdx]: text }));
+      const multi = questions[qIdx]?.multiSelect === true;
+      setAnswers((prev) => {
+        if (!multi) return { ...prev, [qIdx]: OTHER };
+        // Multi: keep the picked options, add the OTHER marker so submit merges the text.
+        const current = prev[qIdx] ? prev[qIdx].split(', ').filter(Boolean) : [];
+        const next = current.includes(OTHER) ? current : [...current, OTHER];
+        return { ...prev, [qIdx]: next.join(', ') };
+      });
+    },
+    [questions],
+  );
 
   const handleSubmit = useCallback(() => {
     const result: Record<string, string> = {};
     questions.forEach((q, i) => {
-      const a = answers[i];
-      if (a === OTHER) result[q.question] = otherTexts[i] ?? '';
-      else if (a) result[q.question] = a;
+      const raw = answers[i];
+      if (!raw) return;
+      if (q.multiSelect) {
+        // Replace the OTHER marker with the typed text; join the rest.
+        const parts = raw
+          .split(', ')
+          .filter(Boolean)
+          .map((v) => (v === OTHER ? (otherTexts[i]?.trim() ?? '') : v))
+          .filter(Boolean);
+        if (parts.length) result[q.question] = parts.join(', ');
+      } else if (raw === OTHER) {
+        result[q.question] = otherTexts[i] ?? '';
+      } else {
+        result[q.question] = raw;
+      }
     });
     onSubmit(result);
   }, [questions, answers, otherTexts, onSubmit]);
@@ -60,9 +94,16 @@ export const AlertQuestionPicker: FC<{
   if (questions.length === 0) return null;
 
   const active = questions[activeTab];
-  const hasAllAnswers = questions.every((_, i) => {
-    const a = answers[i];
-    return a && (a !== OTHER || otherTexts[i]?.trim());
+  const isSelected = (qIdx: number, value: string): boolean => {
+    const raw = answers[qIdx];
+    if (!raw) return false;
+    return questions[qIdx]?.multiSelect ? raw.split(', ').includes(value) : raw === value;
+  };
+  const hasAllAnswers = questions.every((q, i) => {
+    const raw = answers[i];
+    if (!raw) return false;
+    if (raw.split(', ').includes(OTHER) || raw === OTHER) return !!otherTexts[i]?.trim();
+    return true;
   });
 
   return (
@@ -71,7 +112,9 @@ export const AlertQuestionPicker: FC<{
         <div className="flex items-center border-b border-border/30">
           <div className="flex flex-1 min-w-0">
             {questions.map((q, i) => {
-              const isAnswered = answers[i] && (answers[i] !== OTHER || otherTexts[i]?.trim());
+              const raw = answers[i];
+              const isAnswered =
+                !!raw && (!raw.split(', ').includes(OTHER) && raw !== OTHER ? true : !!otherTexts[i]?.trim());
               return (
                 <button
                   key={i}
@@ -93,29 +136,41 @@ export const AlertQuestionPicker: FC<{
       )}
 
       <div className="p-3">
-        <div className="mb-2 text-sm font-medium text-foreground">{active.question}</div>
+        <div className="mb-0.5 text-sm font-medium text-foreground">{active.question}</div>
+        {active.multiSelect && <div className="mb-2 text-[11px] text-muted-foreground">Select all that apply</div>}
         <div className="flex flex-col gap-1.5">
           {active.options.map((opt) => {
-            const selected = answers[activeTab] === opt.label;
+            const selected = isSelected(activeTab, opt.label);
             return (
               <button
                 key={opt.label}
                 type="button"
                 onClick={() => handleSelect(activeTab, opt.label)}
-                className={`rounded-lg border px-3 py-2 text-left text-sm transition-colors ${
+                className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-left text-sm transition-colors ${
                   selected
                     ? 'border-primary bg-primary/10 text-foreground'
                     : 'border-border/50 text-foreground/80 hover:border-border hover:bg-muted/50'
                 }`}
               >
-                <div className="font-medium">{opt.label}</div>
-                {opt.description && <div className="text-xs text-muted-foreground">{opt.description}</div>}
+                {active.multiSelect && (
+                  <span
+                    className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                      selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border/60'
+                    }`}
+                  >
+                    {selected && <CheckIcon className="h-3 w-3" />}
+                  </span>
+                )}
+                <span className="min-w-0">
+                  <span className="block font-medium">{opt.label}</span>
+                  {opt.description && <span className="block text-xs text-muted-foreground">{opt.description}</span>}
+                </span>
               </button>
             );
           })}
           <div
             className={`rounded-lg border px-3 py-2 transition-colors ${
-              answers[activeTab] === OTHER ? 'border-primary bg-primary/10' : 'border-border/50'
+              isSelected(activeTab, OTHER) ? 'border-primary bg-primary/10' : 'border-border/50'
             }`}
           >
             <input
