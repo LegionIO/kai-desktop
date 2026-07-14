@@ -388,6 +388,7 @@ export function getBridgeScript(): string {
     },
     conversations: {
       list: function() { return invoke('conversations:list'); },
+      search: function(term) { return invoke('conversations:search', term); },
       get: function(id) { return invoke('conversations:get', id); },
       put: function(c) { return invoke('conversations:put', c); },
       delete: function(id) { return invoke('conversations:delete', id); },

@@ -7,6 +7,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { randomUUID } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
 import { eventBus } from '../automations/event-bus.js';
+import { matchConversation } from './conversation-search.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { resolveStreamConfig } from '../agent/model-catalog.js';
@@ -335,6 +336,32 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       return bAt.localeCompare(aAt);
     });
     return entries;
+  });
+
+  // Content search: match a term against title/fallbackTitle AND message bodies.
+  // conversations:list reads only the lightweight index (no bodies), so search
+  // reads each conversation file. Results keep the index's recency order and
+  // carry a snippet of the match. Bounded: empty term returns []; a hard result
+  // cap protects the caller from a huge store.
+  ipcMain.handle('conversations:search', (_event, term: unknown) => {
+    const q = typeof term === 'string' ? term.trim() : '';
+    if (!q) return [];
+    const MAX_RESULTS = 100;
+    const index = readIndex(appHome);
+    const ordered = Object.values(index.conversations).sort((a, b) => {
+      const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
+      const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
+      return bAt.localeCompare(aAt);
+    });
+    const results: Array<ConversationIndexEntry & { matchedIn: 'title' | 'content'; snippet: string }> = [];
+    for (const entry of ordered) {
+      if (results.length >= MAX_RESULTS) break;
+      const record = readConversation(appHome, entry.id);
+      if (!record) continue;
+      const hit = matchConversation(record, q);
+      if (hit) results.push({ ...entry, matchedIn: hit.matchedIn, snippet: hit.snippet });
+    }
+    return results;
   });
 
   ipcMain.handle('conversations:get', (_event, id: string) => {

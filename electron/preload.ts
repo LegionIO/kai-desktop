@@ -75,6 +75,7 @@ const appAPI = {
 
   conversations: {
     list: () => ipcRenderer.invoke('conversations:list'),
+    search: (term: string) => ipcRenderer.invoke('conversations:search', term),
     get: (id: string) => ipcRenderer.invoke('conversations:get', id),
     put: (conversation: unknown) => ipcRenderer.invoke('conversations:put', conversation),
     delete: (id: string) => ipcRenderer.invoke('conversations:delete', id),
