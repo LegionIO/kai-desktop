@@ -29,7 +29,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import yaml from 'js-yaml';
+import { parse as parseYaml } from 'yaml';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -114,7 +114,7 @@ function main(): void {
   }
   let config: BuilderConfig;
   try {
-    config = (yaml.load(readFileSync(configPath, 'utf8')) as BuilderConfig) ?? {};
+    config = (parseYaml(readFileSync(configPath, 'utf8')) as BuilderConfig) ?? {};
   } catch (err) {
     console.error(`[assert-update-verification] failed to parse electron-builder.yml: ${(err as Error).message}`);
     process.exit(1);
