@@ -1419,32 +1419,50 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (toolName === 'create_artifact' || toolName === 'update_artifact') {
           return { result };
         }
-        // Preserve inline diffs THROUGH compaction: capture the diff metadata,
-        // compact the (possibly large) rest, then re-attach the metadata so a
-        // build/install that both prints a lot and touches a lockfile still
-        // gets its stdout shrunk without losing the inline diff.
+        // Preserve inline diffs AND model-visible media (images/files) THROUGH
+        // compaction: capture them, compact only the text/JSON rest, then
+        // re-attach. Without this, `_modelContent` base64 gets serialized into
+        // the string fed to the token estimator + head/tail truncator (or AI
+        // summarizer), which corrupts the base64 or drops the attachment
+        // entirely — defeating the plugin-attachment feature.
         let preservedDiffTracking: unknown;
+        let preservedModelContent: unknown;
         let resultForCompaction = result;
         if (result && typeof result === 'object' && !Array.isArray(result)) {
           const r = result as Record<string, unknown>;
           const dt = r._diffTracking as { diffs?: unknown[] } | undefined;
           if (dt && Array.isArray(dt.diffs) && dt.diffs.length > 0) {
             preservedDiffTracking = dt;
-            const { _diffTracking, ...rest } = r;
+          }
+          if (Array.isArray(r._modelContent) && r._modelContent.length > 0) {
+            preservedModelContent = r._modelContent;
+          }
+          if (preservedDiffTracking !== undefined || preservedModelContent !== undefined) {
+            const { _diffTracking, _modelContent, ...rest } = r;
             void _diffTracking;
+            void _modelContent;
             resultForCompaction = rest;
           }
         }
         const reattach = (value: unknown): unknown => {
-          if (preservedDiffTracking === undefined) return value;
+          if (preservedDiffTracking === undefined && preservedModelContent === undefined) return value;
           if (value && typeof value === 'object' && !Array.isArray(value)) {
-            return { ...(value as Record<string, unknown>), _diffTracking: preservedDiffTracking };
+            return {
+              ...(value as Record<string, unknown>),
+              ...(preservedDiffTracking !== undefined ? { _diffTracking: preservedDiffTracking } : {}),
+              ...(preservedModelContent !== undefined ? { _modelContent: preservedModelContent } : {}),
+            };
           }
           // Compaction produced a bare string. Only shell/CLI results carry
           // _diffTracking, and the shell renderer recognizes { stdout } — so
           // reattach as a shell-shaped object to keep the output view working
-          // (wrapping as { value } would render as "No output").
-          return { stdout: String(value ?? ''), _diffTracking: preservedDiffTracking };
+          // (wrapping as { value } would render as "No output"). Media rides
+          // alongside as _modelContent so the runtime still emits it natively.
+          return {
+            stdout: String(value ?? ''),
+            ...(preservedDiffTracking !== undefined ? { _diffTracking: preservedDiffTracking } : {}),
+            ...(preservedModelContent !== undefined ? { _modelContent: preservedModelContent } : {}),
+          };
         };
 
         const originalText = stringifyToolResult(resultForCompaction);
