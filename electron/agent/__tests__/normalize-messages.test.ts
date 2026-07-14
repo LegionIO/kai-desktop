@@ -154,3 +154,44 @@ describe('normalizeMessagesForApi — assistant tool-call splitting', () => {
     expect(parts.some((p) => p.type === 'text')).toBe(true);
   });
 });
+
+describe('normalizeMessagesForApi — hardening', () => {
+  it('drops a later duplicate toolCallId (keeps the first pair only)', () => {
+    const out = normalizeMessagesForApi([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'tc1', toolName: 'read', args: {}, result: 'first' },
+          { type: 'tool-call', toolCallId: 'tc1', toolName: 'read', args: {}, result: 'dup' },
+        ],
+      },
+    ]);
+    const asst = out.find((m) => m.role === 'assistant')!;
+    const calls = (asst.content as Array<Record<string, unknown>>).filter((p) => p.type === 'tool-call');
+    expect(calls).toHaveLength(1);
+    const toolMsg = out.find((m) => m.role === 'tool')!;
+    expect((toolMsg.content as unknown[]).length).toBe(1);
+  });
+
+  it('drops empty assistant / tool / system messages', () => {
+    const out = normalizeMessagesForApi([
+      { role: 'assistant', content: '' },
+      { role: 'assistant', content: '   ' },
+      { role: 'assistant', content: null },
+      { role: 'tool', content: [] },
+      { role: 'system', content: '' },
+      { role: 'user', content: 'keep me' },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({ role: 'user', content: 'keep me' });
+  });
+
+  it('keeps a non-empty duplicate id across separate assistant messages deduped', () => {
+    const out = normalizeMessagesForApi([
+      { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'x', toolName: 't', args: {}, result: 'a' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'x', toolName: 't', args: {}, result: 'b' }] },
+    ]);
+    const toolMsgs = out.filter((m) => m.role === 'tool');
+    expect(toolMsgs).toHaveLength(1); // second (dup id) dropped, so only one tool message
+  });
+});

@@ -25,6 +25,16 @@ function inferMimeTypeFromDataUrl(value: unknown): string | undefined {
   return match?.[1];
 }
 
+/** True if a message's content carries nothing the provider can use — an empty
+ *  string, whitespace, null/undefined, or an empty array. Such messages are
+ *  invalid and some providers reject them, so they're dropped. */
+function isEmptyContent(content: unknown): boolean {
+  if (content == null) return true;
+  if (typeof content === 'string') return content.trim().length === 0;
+  if (Array.isArray(content)) return content.length === 0;
+  return false;
+}
+
 function normalizeImagePart(part: RendererContentPart): { type: 'image'; image: unknown; mimeType?: string } {
   const mimeType = typeof part.mimeType === 'string' ? part.mimeType : inferMimeTypeFromDataUrl(part.image);
 
@@ -53,6 +63,10 @@ function normalizeFilePart(part: RendererContentPart): {
 
 export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: string; content: unknown }> {
   const result: Array<{ role: string; content: unknown }> = [];
+  // Track tool-call ids across the whole history: a duplicate id makes call/
+  // result pairing ambiguous and some providers reject it. Keep the first, drop
+  // later duplicate pairs.
+  const seenToolCallIds = new Set<string>();
 
   for (const raw of messages) {
     const msg = raw as { role?: string; content?: unknown };
@@ -60,8 +74,10 @@ export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: stri
 
     const { role } = msg;
 
-    // Pass through system and tool messages unchanged
+    // Pass through system and tool messages unchanged (but drop empty ones —
+    // an empty tool/system message is invalid and some providers reject it).
     if (role === 'system' || role === 'tool') {
+      if (isEmptyContent(msg.content)) continue;
       result.push({ role, content: msg.content });
       continue;
     }
@@ -88,6 +104,7 @@ export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: stri
     // Assistant messages: split tool-call+result into assistant + tool messages
     if (role === 'assistant') {
       if (!Array.isArray(msg.content)) {
+        if (isEmptyContent(msg.content)) continue; // drop empty assistant turns
         result.push({ role, content: msg.content });
         continue;
       }
@@ -119,6 +136,11 @@ export function normalizeMessagesForApi(messages: unknown[]): Array<{ role: stri
           if (!toolCallId || !toolName) {
             continue;
           }
+          // Drop a later duplicate id (ambiguous pairing → provider may reject).
+          if (seenToolCallIds.has(toolCallId)) {
+            continue;
+          }
+          seenToolCallIds.add(toolCallId);
 
           // Emit clean tool-call in the assistant message
           assistantParts.push({
