@@ -28,6 +28,23 @@ function approxBytes(base64: string): number {
   return Math.floor((base64.length * 3) / 4);
 }
 
+/**
+ * The `data` field is contracted to be *bare* base64 (no `data:` URL prefix) —
+ * that is what every runtime's downstream (AI-SDK `image-data`/`file-data`, MCP
+ * `image`/`resource`) expects. A leading `data:<mime>;base64,` prefix would be
+ * treated as part of the payload and silently corrupt the decoded bytes at the
+ * provider. Strip it defensively and, when the caller left `mediaType` generic,
+ * adopt the media type declared in the prefix.
+ */
+const DATA_URL_RE = /^data:([^;,]+)?(?:;[^,]*)?,(.*)$/s;
+function normalizeMediaData(data: string, mediaType: string): { data: string; mediaType: string } {
+  const m = DATA_URL_RE.exec(data);
+  if (!m) return { data, mediaType };
+  const prefixMime = m[1];
+  const useMime = prefixMime && (!mediaType || mediaType === 'application/octet-stream') ? prefixMime : mediaType;
+  return { data: m[2] ?? '', mediaType: useMime };
+}
+
 function isModelContentPart(v: unknown): v is ModelContentPart {
   if (!v || typeof v !== 'object') return false;
   const p = v as Record<string, unknown>;
@@ -67,7 +84,10 @@ export function extractModelContent(result: unknown): {
       parts.push(item);
       continue;
     }
-    const bytes = approxBytes(item.data);
+    // Normalize away any accidental `data:` URL prefix so the payload measured
+    // and forwarded is genuine base64.
+    const { data, mediaType } = normalizeMediaData(item.data, item.mediaType);
+    const bytes = approxBytes(data);
     if (bytes > MAX_PART_BYTES || total + bytes > MAX_TOTAL_BYTES) {
       const label = item.type === 'image' ? 'image' : 'file';
       parts.push({
@@ -77,7 +97,11 @@ export function extractModelContent(result: unknown): {
       continue;
     }
     total += bytes;
-    parts.push(item);
+    parts.push(
+      item.type === 'image'
+        ? { type: 'image', data, mediaType }
+        : { type: 'file', data, mediaType, ...(item.filename ? { filename: item.filename } : {}) },
+    );
   }
 
   return { modelContent: parts.length > 0 ? parts : null, cleaned: rest };

@@ -41,4 +41,29 @@ describe('extractModelContent', () => {
     });
     expect(modelContent).toEqual([{ type: 'text', text: 'ok' }]);
   });
+
+  it('strips an accidental data: URL prefix and keeps bare base64', () => {
+    const { modelContent } = extractModelContent({
+      _modelContent: [{ type: 'image', data: 'data:image/png;base64,AAAA', mediaType: 'image/png' }],
+    });
+    expect(modelContent).toEqual([{ type: 'image', data: 'AAAA', mediaType: 'image/png' }]);
+  });
+
+  it('adopts the mediaType from a data: URL when the caller left it generic', () => {
+    const { modelContent } = extractModelContent({
+      _modelContent: [
+        { type: 'file', data: 'data:application/pdf;base64,JVBERi0=', mediaType: 'application/octet-stream' },
+      ],
+    });
+    expect(modelContent).toEqual([{ type: 'file', data: 'JVBERi0=', mediaType: 'application/pdf' }]);
+  });
+
+  it('measures the decoded payload after stripping the prefix', () => {
+    // Payload is small; only the (large) prefix would push it over — but the
+    // prefix must not count toward the size cap.
+    const { modelContent } = extractModelContent({
+      _modelContent: [{ type: 'image', data: 'data:image/png;base64,AAAA', mediaType: 'image/png' }],
+    });
+    expect(modelContent![0].type).toBe('image');
+  });
 });
