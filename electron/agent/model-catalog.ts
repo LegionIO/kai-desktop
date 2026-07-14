@@ -166,12 +166,19 @@ export function resolveStreamConfig(
   // 3. Resolve fallback chain from profile. Filter against the RESOLVED primary
   // key (primaryModel.key), not the requested key — when the requested key is
   // stale and we fell back to defaultEntry, filtering by the stale key could
-  // leave the resolved primary sitting in its own fallback list.
+  // leave the resolved primary sitting in its own fallback list. Also dedupe by
+  // key (preserving order) so a config with a repeated fallback key doesn't retry
+  // the same model twice.
   const fallbackKeys = profile.fallbackModelKeys;
+  const seenFallback = new Set<string>([primaryModel.key]);
   const fallbackModels = fallbackKeys
     .map((k) => catalog.byKey.get(k))
     .filter((e): e is ModelCatalogEntry => e != null)
-    .filter((e) => e.key !== primaryModel.key);
+    .filter((e) => {
+      if (seenFallback.has(e.key)) return false;
+      seenFallback.add(e.key);
+      return true;
+    });
 
   // 4. Merge parameters: thread overrides → profile overrides → global
   const threadOvr = opts.threadOverrides;

@@ -117,6 +117,20 @@ describe('resolveStreamConfig', () => {
     expect(resolved.profileKey).toBe('p1');
   });
 
+  it('dedupes repeated fallback keys (and drops the primary if listed) preserving order', () => {
+    const config = makeConfig({
+      profiles: [
+        // 'claude' is primary AND listed in fallbacks; 'gpt' appears twice.
+        { key: 'p1', name: 'P1', primaryModelKey: 'claude', fallbackModelKeys: ['gpt', 'claude', 'gpt'] },
+      ] as AppConfig['profiles'],
+      defaultProfileKey: 'p1',
+    });
+    const resolved = resolveStreamConfig(config, { ...baseOpts })!;
+    expect(resolved.primaryModel.key).toBe('claude');
+    // 'gpt' once (deduped), 'claude' removed (it's the primary).
+    expect(resolved.fallbackModels.map((m) => m.key)).toEqual(['gpt']);
+  });
+
   it('the __none__ sentinel skips profiles and uses defaultModelKey', () => {
     const config = makeConfig({
       defaultModelKey: 'gpt',
