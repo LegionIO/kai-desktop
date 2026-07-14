@@ -1,5 +1,6 @@
 import net from 'net';
 import type { Socket } from 'net';
+import { StringDecoder } from 'string_decoder';
 
 type PendingCall = {
   resolve: (value: unknown) => void;
@@ -41,6 +42,12 @@ export function isBackendStale(lastInboundAt: number, now: number, deadMs: numbe
   return now - lastInboundAt > deadMs;
 }
 
+/** Monotonic clock for liveness math — immune to wall-clock jumps (NTP, sleep/
+ *  resume) that could otherwise make a live socket look stale and get torn down. */
+function monoNow(): number {
+  return performance.now();
+}
+
 /**
  * CLI-side client for the leader's local IPC socket. Speaks the same
  * newline-delimited JSON envelope as `local-server.ts`:
@@ -55,6 +62,9 @@ export function isBackendStale(lastInboundAt: number, now: number, deadMs: numbe
 export class LocalBridgeClient {
   private socket: Socket | null = null;
   private buffer = '';
+  /** UTF-8 decoder that holds back a partial multibyte sequence split across TCP
+   *  chunks, so a character spanning two chunks isn't corrupted. Reset per connect. */
+  private decoder = new StringDecoder('utf8');
   private nextId = 0;
   private readonly pending = new Map<string, PendingCall>();
   private readonly listeners = new Map<string, Set<EventHandler>>();
@@ -63,9 +73,11 @@ export class LocalBridgeClient {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   /** Backend version reported in the auth result (empty if unknown / older backend). */
   private _serverVersion = '';
-  /** Wall-clock ms of the last inbound byte from the backend. Liveness is judged
-   *  by elapsed time since this (see HEARTBEAT_DEAD_MS), not a tick counter, so
-   *  coalesced timer callbacks after an event-loop stall can't false-positive. */
+  /** Monotonic ms (performance.now) of the last inbound byte from the backend.
+   *  Liveness is judged by elapsed time since this (see HEARTBEAT_DEAD_MS), not a
+   *  tick counter, so coalesced timer callbacks after an event-loop stall can't
+   *  false-positive; monotonic (not wall-clock) so an NTP/sleep clock jump can't
+   *  make a live socket look stale. */
   private lastInboundAt = 0;
   private intentionalClose = false; // set by close() so disconnect handlers can tell crash from quit
 
@@ -78,6 +90,7 @@ export class LocalBridgeClient {
   connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.buffer = ''; // fresh connection: never carry partial data across sockets
+      this.decoder = new StringDecoder('utf8'); // drop any held partial multibyte seq
       this.intentionalClose = false;
       const socket = net.createConnection(this.socketPath);
       socket.setNoDelay(true);
@@ -179,31 +192,33 @@ export class LocalBridgeClient {
       // by time-since-last-byte prevents a false "dead backend" mid-response
       // (which tore the socket down and overwrote the streaming reply with
       // "reconnected"). Mirrors the server's own alive-on-any-traffic rule.
-      this.lastInboundAt = Date.now();
-      this.buffer += chunk.toString('utf-8');
+      this.lastInboundAt = monoNow();
+      // Decode through StringDecoder so a multibyte UTF-8 char split across two
+      // TCP chunks is reassembled instead of corrupted.
+      this.buffer += this.decoder.write(chunk);
+      // Byte-cap BEFORE draining: if the first pending frame (up to the first
+      // newline, or the whole buffer if none yet) already exceeds the cap, the
+      // peer is hostile/broken — drop the socket rather than parse a giant frame.
+      // (Measured in bytes, not UTF-16 units, to match the server's cap.)
+      const firstNl = this.buffer.indexOf('\n');
+      const frameEnd = firstNl === -1 ? this.buffer.length : firstNl;
+      if (Buffer.byteLength(this.buffer.slice(0, frameEnd), 'utf-8') > MAX_FRAME_BYTES) {
+        this.buffer = '';
+        socket.destroy();
+        return;
+      }
       let idx: number;
       while ((idx = this.buffer.indexOf('\n')) !== -1) {
         const line = this.buffer.slice(0, idx);
         this.buffer = this.buffer.slice(idx + 1);
         if (line.trim()) this.dispatch(line);
       }
-      // Bound the buffer AFTER draining complete frames: what remains is a single
-      // partial (unterminated) frame. Cap THAT — a peer streaming bytes with no
-      // newline would otherwise grow it without limit. Checking before the drain
-      // (against the whole accumulated buffer) would wrongly trip on a legitimate
-      // burst of many small newline-delimited frames arriving in one chunk. On
-      // overrun, drop the socket ('close'/'error' → teardown → recovery).
-      if (this.buffer.length > MAX_FRAME_BYTES) {
-        this.buffer = '';
-        socket.destroy();
-        return;
-      }
     });
 
     // Heartbeat: ping the backend periodically. If NO inbound byte arrives for
     // HEARTBEAT_DEAD_MS the backend is gone (crash, quit, sleep) even if the OS
     // hasn't delivered a socket close yet — tear down so callers learn promptly.
-    this.lastInboundAt = Date.now();
+    this.lastInboundAt = monoNow();
     // Defensive: clear any prior interval before arming a new one, so a wire()
     // that runs without a preceding teardown can't leak a duplicate heartbeat.
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
@@ -212,7 +227,7 @@ export class LocalBridgeClient {
       // Time-based liveness: only declare dead when REAL elapsed silence exceeds
       // the threshold. Immune to coalesced ticks after an event-loop stall (they
       // all observe ~the same `now`, so they can't stack a false positive).
-      if (isBackendStale(this.lastInboundAt, Date.now(), HEARTBEAT_DEAD_MS)) {
+      if (isBackendStale(this.lastInboundAt, monoNow(), HEARTBEAT_DEAD_MS)) {
         this.socket.destroy();
         return;
       }
@@ -276,7 +291,11 @@ export class LocalBridgeClient {
   private dispatch(line: string): void {
     let msg: { id?: string; type?: string; channel?: string; data?: unknown; message?: string };
     try {
-      msg = JSON.parse(line);
+      const parsed = JSON.parse(line);
+      // Guard against valid-but-non-object JSON (e.g. `null`, `42`, `"x"`): reading
+      // `.type` off a null would throw and crash the CLI's data handler.
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      msg = parsed;
     } catch {
       return;
     }

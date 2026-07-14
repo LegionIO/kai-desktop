@@ -214,6 +214,55 @@ describe.skipIf(isWin)('LocalBridgeClient', () => {
     expect(received).toEqual(['hello']); // no new delivery after unsubscribe
   });
 
+  it('ignores valid-but-non-object JSON frames (null/number/string) without crashing', async () => {
+    let pushSocket: Socket | null = null;
+    await startServer((socket, msg) => {
+      if (msg.type === 'invoke' && msg.channel === 'grab') {
+        pushSocket = socket;
+        socket.write(JSON.stringify({ id: msg.id, type: 'result', data: null }) + '\n');
+      }
+    });
+    client = new LocalBridgeClient(socketPath);
+    await client.connect();
+    await client.invoke('grab');
+
+    const received: unknown[] = [];
+    client.on('stream:token', (d) => received.push(d));
+    // A `null` / number / string frame must not throw (reading .type off null
+    // would crash the data handler); a following valid event still dispatches.
+    pushSocket!.write('null\n42\n"hi"\n');
+    pushSocket!.write(JSON.stringify({ type: 'event', channel: 'stream:token', data: 'ok' }) + '\n');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(received).toEqual(['ok']);
+  });
+
+  it('reassembles a multibyte UTF-8 char split across two socket chunks', async () => {
+    let pushSocket: Socket | null = null;
+    await startServer((socket, msg) => {
+      if (msg.type === 'invoke' && msg.channel === 'grab') {
+        pushSocket = socket;
+        socket.write(JSON.stringify({ id: msg.id, type: 'result', data: null }) + '\n');
+      }
+    });
+    client = new LocalBridgeClient(socketPath);
+    await client.connect();
+    await client.invoke('grab');
+
+    const received: unknown[] = [];
+    client.on('stream:token', (d) => received.push(d));
+    // "café🎉" as a full frame, then split its UTF-8 bytes across two writes at a
+    // point that bisects the 4-byte 🎉 (and the é). A per-chunk toString('utf-8')
+    // would corrupt it; the StringDecoder holds the partial sequence.
+    const frame = JSON.stringify({ type: 'event', channel: 'stream:token', data: 'café🎉' }) + '\n';
+    const bytes = Buffer.from(frame, 'utf-8');
+    const cut = bytes.length - 3; // lands inside the trailing multibyte run
+    pushSocket!.write(bytes.subarray(0, cut));
+    await new Promise((r) => setTimeout(r, 15));
+    pushSocket!.write(bytes.subarray(cut));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(received).toEqual(['café🎉']);
+  });
+
   it('rejects all in-flight calls when the connection drops', async () => {
     await startServer((socket, msg) => {
       // Accept the invoke but never respond, then kill the socket.
