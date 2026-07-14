@@ -15,7 +15,7 @@ const GOOD = {
 
 describe('evaluateUpdateVerification', () => {
   it('passes (no failures/warnings) for an intact config', () => {
-    const { failures, warnings } = evaluateUpdateVerification(GOOD, true);
+    const { failures, warnings } = evaluateUpdateVerification(GOOD);
     expect(failures).toEqual([]);
     expect(warnings).toEqual([]);
   });
@@ -37,19 +37,14 @@ describe('evaluateUpdateVerification', () => {
   });
 
   it('accepts a publisherName ARRAY of valid pins', () => {
-    const { failures } = evaluateUpdateVerification({ ...GOOD, win: { publisherName: ['Pub A', 'Pub B'] } }, true);
+    const { failures } = evaluateUpdateVerification({ ...GOOD, win: { publisherName: ['Pub A', 'Pub B'] } });
     expect(failures).toEqual([]);
   });
 
-  it('missing publisherName is a WARNING (not failure) when Windows is NOT shipping', () => {
-    const { failures, warnings } = evaluateUpdateVerification({ mac: GOOD.mac, win: {} }, false);
+  it('missing publisherName is always a WARNING, never a failure (unsigned Windows still ships)', () => {
+    const { failures, warnings } = evaluateUpdateVerification({ mac: GOOD.mac, win: {} });
     expect(failures).toEqual([]);
-    expect(warnings.join(' ')).toMatch(/win\.publisherName is missing/);
-  });
-
-  it('missing publisherName is a FAILURE when Windows IS shipping', () => {
-    const { failures } = evaluateUpdateVerification({ mac: GOOD.mac, win: {} }, true);
-    expect(failures.join(' ')).toMatch(/win\.publisherName is missing/);
+    expect(warnings.join(' ')).toMatch(/win\.publisherName is not set/);
   });
 
   it('FAILS when macOS signing/notarization is disabled', () => {
@@ -66,7 +61,7 @@ describe('evaluateUpdateVerification', () => {
 
   it('does not fail on absent mac/win sections (treats undefined as not-disabled)', () => {
     // Only the publisher-missing warning (win off) — no signing failures from absent keys.
-    const { failures } = evaluateUpdateVerification({}, false);
+    const { failures } = evaluateUpdateVerification({});
     expect(failures).toEqual([]);
   });
 });

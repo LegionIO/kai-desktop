@@ -13,15 +13,6 @@ on:
           - major
           - minor
           - patch
-      include_windows:
-        description: >-
-          Build + publish the Windows artifact. Requires a pinned
-          win.publisherName (signing cert CN) in electron-builder.template.yml —
-          the update-verification guard fails the Windows build without it.
-          Leave OFF until a Windows signing identity is configured.
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
@@ -278,7 +269,7 @@ jobs:
           retention-days: 1
 
   build-windows:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_windows }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: prepare-release
     runs-on: windows-latest
     permissions:
@@ -385,22 +376,7 @@ jobs:
           retention-days: 1
 
   release:
-    # mac + linux are mandatory; Windows is optional (opt-in via include_windows).
-    # A skipped Windows job must not block the release; a Windows job that was
-    # requested but FAILED should (don't ship a release that silently dropped a
-    # requested platform).
-    #
-    # `!cancelled()` is REQUIRED: without a status-check function, a downstream
-    # job whose `needs` includes a SKIPPED job (build-windows, when
-    # include_windows is off) is itself skipped BEFORE this `if:` is evaluated.
-    # !cancelled() forces evaluation so the explicit result checks below apply.
-    if: >-
-      ${{ !cancelled()
-      && github.event_name == 'workflow_dispatch'
-      && needs.prepare-release.result == 'success'
-      && needs.build-mac.result == 'success'
-      && needs.build-linux.result == 'success'
-      && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: [prepare-release, build-mac, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
@@ -419,9 +395,6 @@ jobs:
           path: ./dist/
 
       - name: Download Windows artifacts
-        # Windows is optional (opt-in). When the build-windows job was skipped,
-        # this artifact won't exist — don't fail finalize.
-        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: kai-windows
@@ -447,28 +420,16 @@ jobs:
         env:
           TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
-          # Collect every asset the platform build jobs produced. macOS + Linux
-          # assets are REQUIRED. Windows (*.exe / latest.yml) is OPTIONAL — the
-          # build-windows job is opt-in (include_windows) and skipped by default
-          # until a signing publisher is pinned, so those assets may be absent.
-          # OTA files are optional too (only present for OTA-eligible releases).
+          # Collect every asset the platform build jobs produced. Each is
+          # required except the OTA files (only present for eligible releases).
           assets=()
-          for pat in '*.dmg' '*.zip' 'latest-mac.yml' '*.AppImage' '*.deb' 'latest-linux.yml'; do
+          for pat in '*.dmg' '*.zip' 'latest-mac.yml' '*.exe' 'latest.yml' '*.AppImage' '*.deb' 'latest-linux.yml'; do
             f="$(find dist -maxdepth 1 -type f -name "$pat" | head -n 1)"
             if [ -z "$f" ]; then
               echo "ERROR: expected release asset missing: $pat" >&2
               exit 1
             fi
             assets+=("$f")
-          done
-          # Windows assets — attach if present, don't fail if absent.
-          for pat in '*.exe' 'latest.yml'; do
-            f="$(find dist -maxdepth 1 -type f -name "$pat" | head -n 1)"
-            if [ -n "$f" ]; then
-              assets+=("$f")
-            else
-              echo "NOTE: optional Windows asset not present (include_windows off): $pat"
-            fi
           done
           # Blockmaps (attach ALL). electron-updater needs the .zip.blockmap next
           # to the update zip to do a differential (delta) download on macOS —

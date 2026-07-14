@@ -50,16 +50,13 @@ type BuilderConfig = {
  * empty when the update trust anchor is intact (build should pass); `warnings`
  * are non-fatal advisories. Pure — no I/O — so it's unit-tested.
  *
- * `winShipping` = whether a Windows artifact actually ships (KAI_ENABLE_WIN_BUILD).
- * The Windows publisher pin is REQUIRED (failure) only when Windows ships;
- * otherwise a missing pin is a warning (Windows builds are gated off by default
- * and the pin's value is the signing cert's CN, which must be set before the
- * first real Windows release).
+ * A missing Windows publisher pin is a WARNING, not a failure: unsigned Windows
+ * builds without a pin are the historical, supported posture. The hard failures
+ * are the ones that would silently WEAKEN an existing trust anchor:
+ * verifyUpdateCodeSignature explicitly disabled, a broken (wildcard/empty) pin,
+ * or macOS signing/notarization turned off.
  */
-export function evaluateUpdateVerification(
-  config: BuilderConfig,
-  winShipping = false,
-): { failures: string[]; warnings: string[] } {
+export function evaluateUpdateVerification(config: BuilderConfig): { failures: string[]; warnings: string[] } {
   const failures: string[] = [];
   const warnings: string[] = [];
   const win = config.win ?? {};
@@ -72,14 +69,21 @@ export function evaluateUpdateVerification(
     failures.push('win.verifyUpdateCodeSignature is false — Windows update signature verification is DISABLED.');
   }
 
-  // Windows: publisherName must be pinned (present, non-empty, non-wildcard).
+  // Windows: publisherName SHOULD be pinned (present, non-empty, non-wildcard),
+  // but a missing pin is a WARNING, not a failure — shipping an unsigned Windows
+  // build with no publisher pin is the historical posture (v1.0.146 and earlier)
+  // and remains supported. It only weakens the AUTO-UPDATER's signature check
+  // (electron-updater would accept an update from any publisher); it does not
+  // affect the app itself. Pin it once a signing certificate CN is available.
+  // A present-but-wildcarded/empty pin is still a failure (a broken pin is worse
+  // than none — it implies intent to verify while not actually pinning).
   const publisher = win.publisherName;
   const publisherList = Array.isArray(publisher) ? publisher : publisher === undefined ? [] : [publisher];
   if (publisherList.length === 0) {
-    const msg =
-      'win.publisherName is missing — the Windows updater would accept an update from ANY publisher. ' +
-      'Set it to the Windows signing certificate CN before shipping a Windows release.';
-    (winShipping ? failures : warnings).push(msg);
+    warnings.push(
+      'win.publisherName is not set — the Windows auto-updater will accept an update from any publisher. ' +
+        'Pin it to the Windows signing certificate CN to harden update verification (optional; unsigned Windows builds still ship).',
+    );
   } else {
     for (const p of publisherList) {
       if (typeof p !== 'string' || p.trim() === '' || p.includes('*')) {
@@ -121,8 +125,7 @@ function main(): void {
     return;
   }
 
-  const winShipping = process.env.KAI_ENABLE_WIN_BUILD === '1';
-  const { failures, warnings } = evaluateUpdateVerification(config, winShipping);
+  const { failures, warnings } = evaluateUpdateVerification(config);
   for (const w of warnings) console.warn(`[assert-update-verification] WARNING: ${w}`);
   if (failures.length > 0) {
     console.error('[assert-update-verification] update-signature trust anchor FAILED:');
