@@ -18,6 +18,12 @@ const HEARTBEAT_INTERVAL_MS = 5_000;
  *  brief event-loop stall during a heavy agent stream doesn't trip a false
  *  disconnect (the miss counter is also reset on ANY inbound byte in wire()). */
 const HEARTBEAT_MAX_MISSED = 3;
+/** Max buffered bytes for a single inbound frame before we treat the peer as
+ *  hostile/broken and drop the socket. Mirrors local-server.ts's MAX_FRAME_BYTES
+ *  (8 MiB) so a backend that never sends a newline can't grow this buffer
+ *  without bound (memory-exhaustion guard; defense-in-depth — the backend is
+ *  local + authed, but parity with the server's own cap). */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 /**
  * CLI-side client for the leader's local IPC socket. Speaks the same
@@ -156,6 +162,14 @@ export class LocalBridgeClient {
       // "reconnected"). Mirrors the server's own alive-on-any-traffic rule.
       this.pongMissed = 0;
       this.buffer += chunk.toString('utf-8');
+      // Bound the frame buffer: a peer that streams bytes without ever sending a
+      // newline would otherwise grow this without limit. Drop the socket (a
+      // 'close'/'error' → teardown fires and recovery kicks in).
+      if (this.buffer.length > MAX_FRAME_BYTES) {
+        this.buffer = '';
+        socket.destroy();
+        return;
+      }
       let idx: number;
       while ((idx = this.buffer.indexOf('\n')) !== -1) {
         const line = this.buffer.slice(0, idx);

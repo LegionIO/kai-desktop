@@ -226,6 +226,21 @@ describe.skipIf(isWin)('LocalBridgeClient', () => {
     expect(client.wasIntentionalClose()).toBe(false);
   });
 
+  it('drops the socket when the backend sends an oversized frame with no newline', async () => {
+    await startServer();
+    client = new LocalBridgeClient(socketPath);
+    await client.connect();
+    const dropped = new Promise<void>((resolve) => client!.onDisconnect(() => resolve()));
+    // Backend streams >8 MiB with NO newline — the client must cap the buffer
+    // and destroy the socket rather than growing memory without bound.
+    const huge = 'x'.repeat(9 * 1024 * 1024);
+    serverSockets[0].write(huge);
+    // Wait for the client to detect the overrun + tear down (event-driven, not a
+    // fixed sleep — a 9 MiB transfer can take a moment to fully arrive).
+    await Promise.race([dropped, new Promise((_r, rej) => setTimeout(() => rej(new Error('no drop')), 3000))]);
+    expect(client.isConnected()).toBe(false);
+  });
+
   it('requestShutdown resolves on the server ack', async () => {
     await startServer((socket, msg) => {
       if (msg.type === 'shutdown') {
