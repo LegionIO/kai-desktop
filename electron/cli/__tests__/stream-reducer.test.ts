@@ -1,0 +1,167 @@
+/**
+ * Tests for the pure CLI stream reducer (electron/cli/stream-reducer.ts).
+ *
+ * These reproduce the peer-turn sequences behind the open regressions:
+ *   #217 — a GUI-driven (peer) turn's response should stream + finalize on a
+ *          co-viewing CLI (user prompt shows but response didn't).
+ *   #218 — a peer turn's tool row should not stay "running" forever.
+ * The reducer mirrors app.tsx's inline switch; if the fold were wrong, these
+ * would catch it. (They currently PASS — confirming the transcript fold itself
+ * is correct, which points the live bug at the React/Ink render layer rather
+ * than the state logic. See memory: cli_stream_reducer_untestable.)
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  reduceCliStreamEvent,
+  initialCliStreamState,
+  type CliStreamState,
+  type CliStreamEvent,
+} from '../stream-reducer.js';
+
+function run(events: CliStreamEvent[], start?: CliStreamState): CliStreamState {
+  return events.reduce((s, e) => reduceCliStreamEvent(s, e), start ?? initialCliStreamState());
+}
+
+describe('reduceCliStreamEvent — own-echo dedup', () => {
+  it('skips our own user-message echo (matching nonce) and consumes the nonce', () => {
+    const start: CliStreamState = { ...initialCliStreamState(), ownNonces: new Set(['n1']) };
+    const s = reduceCliStreamEvent(start, { type: 'user-message', text: 'hi', data: { submitNonce: 'n1' } });
+    // No user turn added (we already showed it optimistically), nonce consumed.
+    expect(s.turns).toHaveLength(0);
+    expect(s.ownNonces.has('n1')).toBe(false);
+  });
+
+  it('renders a PEER user-message (no matching nonce) as a user turn + goes running', () => {
+    const s = reduceCliStreamEvent(initialCliStreamState(), { type: 'user-message', text: 'how are you?' });
+    expect(s.turns).toEqual([{ kind: 'user', text: 'how are you?' }]);
+    expect(s.status).toBe('running');
+    expect(s.turnSettled).toBe(false);
+  });
+});
+
+describe('reduceCliStreamEvent — peer-turn response streaming (#217)', () => {
+  it('streams text-deltas into `streaming` and finalizes to an assistant turn on done', () => {
+    const s = run([
+      { type: 'user-message', text: 'hello' },
+      { type: 'text-delta', text: 'Hi ' },
+      { type: 'text-delta', text: 'there!' },
+    ]);
+    // Live streaming text accumulates (this is what the CLI renders live).
+    expect(s.streaming).toBe('Hi there!');
+    expect(s.turns).toEqual([{ kind: 'user', text: 'hello' }]);
+
+    const done = reduceCliStreamEvent(s, { type: 'done' });
+    expect(done.streaming).toBe('');
+    expect(done.turns).toEqual([
+      { kind: 'user', text: 'hello' },
+      { kind: 'assistant', text: 'Hi there!' },
+    ]);
+    expect(done.status).toBe('idle');
+    expect(done.turnSettled).toBe(true);
+  });
+
+  it('a peer turn following a prior turn flushes stale streaming into its own turn first', () => {
+    // Simulate leftover streaming from an interrupted prior turn, then a new peer turn.
+    const dirty: CliStreamState = { ...initialCliStreamState(), streaming: 'leftover' };
+    const s = reduceCliStreamEvent(dirty, { type: 'user-message', text: 'next' });
+    // The leftover is flushed to an assistant turn, then the new user turn is appended.
+    expect(s.turns).toEqual([
+      { kind: 'assistant', text: 'leftover' },
+      { kind: 'user', text: 'next' },
+    ]);
+    expect(s.streaming).toBe('');
+  });
+
+  it('does not emit an empty assistant turn when there was no streaming text', () => {
+    const s = run([{ type: 'user-message', text: 'q' }, { type: 'done' }]);
+    expect(s.turns).toEqual([{ kind: 'user', text: 'q' }]);
+    expect(s.turns.some((t) => t.kind === 'assistant')).toBe(false);
+  });
+});
+
+describe('reduceCliStreamEvent — tool lifecycle + stuck-row backstop (#218)', () => {
+  it('opens a tool row on tool-call and closes it on a matching tool-result', () => {
+    const s = run([
+      { type: 'user-message', text: 'do it' },
+      { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh', args: { cmd: 'ls' } },
+    ]);
+    expect(s.tools).toEqual([{ id: 'tc1', name: 'sh', status: 'running', args: { cmd: 'ls' } }]);
+
+    const done = reduceCliStreamEvent(s, {
+      type: 'tool-result',
+      toolCallId: 'tc1',
+      result: { ok: true },
+      durationMs: 12,
+    });
+    expect(done.tools[0].status).toBe('done');
+    expect(done.tools[0].durationMs).toBe(12);
+  });
+
+  it('marks a tool-result with isError as error', () => {
+    const s = run([
+      { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh' },
+      { type: 'tool-result', toolCallId: 'tc1', result: { isError: true, error: 'boom' } },
+    ]);
+    expect(s.tools[0].status).toBe('error');
+    expect(s.tools[0].error).toBe('boom');
+  });
+
+  it('BACKSTOP: settles a still-running row on done when no matching tool-result arrived (the stuck-row bug)', () => {
+    // Peer turn: tool-call arrives, but the tool-result never matched the row
+    // (the id-space mismatch symptom). done must not leave it spinning.
+    const s = run([
+      { type: 'user-message', text: 'go' },
+      { type: 'tool-call', toolCallId: 'stream-id', toolName: 'sh' },
+      // result arrives under a DIFFERENT id (simulating execute-vs-stream mismatch)
+      { type: 'tool-result', toolCallId: 'execute-id', result: { ok: true } },
+      { type: 'done' },
+    ]);
+    // The row keyed 'stream-id' never got its result, but done settled it.
+    const row = s.tools.find((t) => t.id === 'stream-id');
+    expect(row?.status).toBe('done');
+  });
+
+  it('does NOT force an awaiting row to done on turn end (keeps its picker lifecycle)', () => {
+    const s = run([
+      { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh' },
+      { type: 'tool-approval-required', toolCallId: 'tc1', toolName: 'sh' },
+      { type: 'done' },
+    ]);
+    // awaiting is preserved; only running rows are settled by the backstop.
+    expect(s.tools[0].status).toBe('awaiting');
+  });
+});
+
+describe('reduceCliStreamEvent — terminal + misc', () => {
+  it('error finalizes streaming, appends an error turn, and settles', () => {
+    const s = run([
+      { type: 'user-message', text: 'q' },
+      { type: 'text-delta', text: 'partial' },
+      { type: 'error', error: 'stream failed' },
+    ]);
+    expect(s.turns).toEqual([
+      { kind: 'user', text: 'q' },
+      { kind: 'assistant', text: 'partial' },
+      { kind: 'error', text: 'stream failed' },
+    ]);
+    expect(s.status).toBe('idle');
+    expect(s.turnSettled).toBe(true);
+  });
+
+  it('ignores non-transcript events (model-fallback, unknown) without changing state', () => {
+    const start = run([
+      { type: 'user-message', text: 'q' },
+      { type: 'text-delta', text: 'x' },
+    ]);
+    const after = reduceCliStreamEvent(start, { type: 'model-fallback', data: { toModel: 'gpt-5.6' } });
+    expect(after).toEqual(start);
+  });
+
+  it('is pure — does not mutate the input state', () => {
+    const start = initialCliStreamState();
+    const snapshotTurns = start.turns;
+    reduceCliStreamEvent(start, { type: 'user-message', text: 'q' });
+    expect(start.turns).toBe(snapshotTurns);
+    expect(start.turns).toHaveLength(0);
+  });
+});
