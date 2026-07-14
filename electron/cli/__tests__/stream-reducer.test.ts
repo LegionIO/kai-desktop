@@ -16,6 +16,7 @@ import {
   initialCliStreamState,
   toolTurnOpensAssistantTurn,
   assistantBlockNeedsHeader,
+  formatSubAgentStatusNote,
   type CliStreamState,
   type CliStreamEvent,
   type CliTurn,
@@ -318,5 +319,58 @@ describe('assistantBlockNeedsHeader — one `kai` header per reply (text → too
     ];
     expect(assistantBlockNeedsHeader(turns, 0)).toBe(false);
     expect(assistantBlockNeedsHeader(turns, 1)).toBe(false);
+  });
+});
+
+describe('formatSubAgentStatusNote — surface sub-agent lifecycle to the parent (#226)', () => {
+  const PARENT = 'parent-conv-id';
+
+  it('formats a status note when the event is sub-agent-status for THIS parent', () => {
+    const note = formatSubAgentStatusNote(
+      {
+        type: 'sub-agent-status',
+        parentConversationId: PARENT,
+        subAgentConversationId: 'subabc12345',
+        status: 'running',
+      },
+      PARENT,
+    );
+    expect(note).toBe('↳ sub-agent subabc12 running');
+  });
+
+  it('includes the summary when present', () => {
+    const note = formatSubAgentStatusNote(
+      {
+        type: 'sub-agent-status',
+        parentConversationId: PARENT,
+        subAgentConversationId: 'sub99999999',
+        status: 'completed',
+        summary: 'found 3 files',
+      },
+      PARENT,
+    );
+    expect(note).toBe('↳ sub-agent sub99999 completed — found 3 files');
+  });
+
+  it('returns null for a sub-agent-status of a DIFFERENT parent (not ours)', () => {
+    expect(
+      formatSubAgentStatusNote(
+        { type: 'sub-agent-status', parentConversationId: 'other', subAgentConversationId: 'x', status: 'running' },
+        PARENT,
+      ),
+    ).toBeNull();
+  });
+
+  it('returns null for non-status sub-agent events (so they fall through to the guard, not surfaced)', () => {
+    expect(
+      formatSubAgentStatusNote({ type: 'sub-agent-user-message', parentConversationId: PARENT, text: 'hi' }, PARENT),
+    ).toBeNull();
+    expect(formatSubAgentStatusNote({ type: 'text-delta', text: 'x' }, PARENT)).toBeNull();
+  });
+
+  it('defaults status to running and tolerates a missing sub-agent id', () => {
+    expect(formatSubAgentStatusNote({ type: 'sub-agent-status', parentConversationId: PARENT }, PARENT)).toBe(
+      '↳ sub-agent  running',
+    );
   });
 });

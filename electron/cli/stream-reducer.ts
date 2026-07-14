@@ -71,6 +71,12 @@ export interface CliStreamEvent {
   error?: string;
   durationMs?: number;
   data?: unknown;
+  // Sub-agent lifecycle events carry the parent so a client viewing the parent
+  // can surface them (their own conversationId is the sub-agent's).
+  subAgentConversationId?: string;
+  parentConversationId?: string;
+  status?: string;
+  summary?: string;
 }
 
 export function initialCliStreamState(): CliStreamState {
@@ -245,4 +251,24 @@ export function assistantBlockNeedsHeader(turns: CliTurn[], index: number): bool
   const prev = turns[index - 1];
   if (!prev) return true;
   return prev.kind !== 'assistant' && prev.kind !== 'tool';
+}
+
+/**
+ * Format the dim transcript note for a sub-agent lifecycle event, or null if the
+ * event isn't a sub-agent-status transition for the given parent conversation.
+ *
+ * Sub-agent events are scoped to the SUB-agent's conversationId, so a client
+ * viewing the PARENT must match on parentConversationId (the main-conversation
+ * guard would otherwise drop them). Only `sub-agent-status` is surfaced —
+ * full nested output would be noisy in a flat REPL. Extracted so the "match on
+ * parent + type before the main guard" rule is locked by a test (a refactor
+ * that moved it after the guard would silently stop surfacing sub-agents).
+ */
+export function formatSubAgentStatusNote(event: CliStreamEvent, parentConversationId: string): string | null {
+  if (event.type !== 'sub-agent-status') return null;
+  if (event.parentConversationId !== parentConversationId) return null;
+  const id = (event.subAgentConversationId ?? '').slice(0, 8);
+  const status = event.status ?? 'running';
+  const suffix = event.summary ? ` — ${event.summary}` : '';
+  return `↳ sub-agent ${id} ${status}${suffix}`;
 }

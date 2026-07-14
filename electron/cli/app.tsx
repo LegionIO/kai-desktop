@@ -12,7 +12,7 @@ import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
 import { extractImageMentions } from './images.js';
-import { assistantBlockNeedsHeader } from './stream-reducer.js';
+import { assistantBlockNeedsHeader, formatSubAgentStatusNote } from './stream-reducer.js';
 
 // TEMP debug (issue #217): trace which stream events reach the CLI and whether
 // the conversationId guard passes. Gated on the SAME env var as the backend's
@@ -437,11 +437,9 @@ export function App({
       // state, so a CLI user sees sub-agent activity (the GUI shows a nested
       // view; the CLI at least reflects lifecycle). Only status transitions are
       // surfaced — full nested output would be noisy in a flat REPL.
-      if (e.type === 'sub-agent-status' && e.parentConversationId === convIdRef.current) {
-        const id = (e.subAgentConversationId ?? '').slice(0, 8);
-        const st = e.status ?? 'running';
-        const suffix = e.summary ? ` — ${e.summary}` : '';
-        pushTurn({ kind: 'note', text: `↳ sub-agent ${id} ${st}${suffix}` });
+      const subAgentNote = formatSubAgentStatusNote(e, convIdRef.current);
+      if (subAgentNote) {
+        pushTurn({ kind: 'note', text: subAgentNote });
         return;
       }
       if (e.conversationId !== convIdRef.current) return;
