@@ -678,7 +678,7 @@ export function App({
           pushTurn({
             kind: 'note',
             text:
-              '/new  /resume  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
+              '/new  /resume [search]  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
               '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents\n' +
               '/shot [caption]  /subagents  /subagent-stop [id]  /quit\n' +
               'attach an image inline with @path.png · keys: Esc cancel · Esc Esc rewind · Ctrl-O tools · Ctrl-C quit',
@@ -704,18 +704,28 @@ export function App({
             pushTurn({ kind: 'note', text: 'a turn is in progress — wait for it to finish or /quit' });
             break;
           }
-          const list = (await client.invoke<ConversationRecord[]>('conversations:list')) ?? [];
-          const here = list.filter((c) => c.currentWorkingDirectory === CWD);
-          if (here.length === 0) {
-            pushTurn({ kind: 'note', text: 'no previous chats in this directory' });
+          const term = arg.trim();
+          // With a search term: match title OR message content (server reads
+          // bodies). Without: list ALL chats in the GUI's recency order.
+          type SearchHit = ConversationRecord & { matchedIn?: 'title' | 'content'; snippet?: string };
+          const list = term
+            ? ((await client.invoke<SearchHit[]>('conversations:search', term)) ?? [])
+            : ((await client.invoke<SearchHit[]>('conversations:list')) ?? []);
+          if (list.length === 0) {
+            pushTurn({ kind: 'note', text: term ? `no chats match "${term}"` : 'no previous chats' });
             break;
           }
           setPicker({
-            title: 'Resume which chat?',
-            items: here.slice(0, 20).map((c) => ({
-              label: `${c.title ?? '(untitled)'}  ${c.id.slice(0, 8)}`,
-              value: c.id,
-            })),
+            title: term ? `Resume — matches for "${term}"` : 'Resume which chat?',
+            // All chats, GUI recency order (server already sorts). A ★ flags
+            // chats started in THIS directory; a content match shows its snippet.
+            items: list.slice(0, 30).map((c) => {
+              const here = c.currentWorkingDirectory === CWD ? '★ ' : '  ';
+              const title = c.title ?? '(untitled)';
+              const detail =
+                c.matchedIn === 'content' && c.snippet ? `  — ${stripControl(c.snippet).slice(0, 60)}` : '';
+              return { label: `${here}${title}  ${c.id.slice(0, 8)}${detail}`, value: c.id };
+            }),
             onSelect: (id) => {
               setPicker(null);
               void (async () => {

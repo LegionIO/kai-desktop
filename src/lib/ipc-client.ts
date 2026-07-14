@@ -83,6 +83,7 @@ type AppAPI = {
   };
   conversations: {
     list: () => Promise<unknown[]>;
+    search: (term: string) => Promise<unknown[]>;
     get: (id: string) => Promise<unknown>;
     put: (conversation: unknown) => Promise<unknown>;
     delete: (id: string) => Promise<unknown>;
