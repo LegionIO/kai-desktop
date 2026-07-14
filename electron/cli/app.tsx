@@ -193,6 +193,10 @@ export function App({
   // broadcast `user-message` event; we skip rendering our OWN echo (we already
   // showed the turn optimistically), but render turns submitted elsewhere (GUI).
   const ownSubmitNoncesRef = useRef<Set<string>>(new Set());
+  // Tool-call ids seen this session, so the stream-event handler can decide
+  // new-vs-re-emit synchronously (a setTools updater runs async; the `tools`
+  // state closure is stale). Reset when the transcript resets (createNew/clear).
+  const seenToolIdsRef = useRef<Set<string>>(new Set());
   // Mirror of `status` for reads inside callbacks that must not re-create on
   // every status change (runCommand). Kept in sync below.
   const statusRef = useRef<'idle' | 'running' | 'awaiting-approval'>('idle');
@@ -229,6 +233,7 @@ export function App({
       }
       setTurns([{ kind: 'note', text: note }, ...replay]);
       setTools([]);
+      seenToolIdsRef.current.clear();
     },
     [client],
   );
@@ -322,6 +327,7 @@ export function App({
     unsavedRecordRef.current = rec; // persisted lazily on first submit
     setTurns([]);
     setTools([]);
+    seenToolIdsRef.current.clear();
     // Fresh chat: both selection keys are null, so resolve banner labels from
     // the catalog directly — no conversations:get needed.
     void refreshBanner({ selectedModelKey: null, selectedProfileKey: null });
@@ -455,7 +461,16 @@ export function App({
             const name = e.toolName ?? 'tool';
             const args = e.args;
             cliDebugLog(`[CLI-TOOL-CALL] id=${id} name=${name}`);
-            const isNew = !tools.some((t) => t.id === id);
+            // Track seen tool-call ids in a ref (synchronous, closure-stable) to
+            // decide new-vs-existing. Reading the `tools` STATE here would be
+            // stale — the stream-event effect closes over `tools` from mount
+            // (its deps don't include `tools`) and a setTools updater runs
+            // async, so neither reliably tells us "is this the first time we've
+            // seen this id" at this point in the handler. A stale/false read
+            // would misjudge the PreToolUse re-emit as new → duplicate tool
+            // markers + a spurious streaming flush on each re-emit.
+            const isNew = !seenToolIdsRef.current.has(id);
+            if (isNew) seenToolIdsRef.current.add(id);
             setTools((prev) =>
               prev.some((t) => t.id === id)
                 ? prev.map((t) => (t.id === id ? { ...t, name, status: 'running', args } : t))
@@ -655,6 +670,7 @@ export function App({
         case 'clear':
           setTurns([]);
           setTools([]);
+          seenToolIdsRef.current.clear();
           break;
         case 'resume': {
           if (statusRef.current === 'running' || statusRef.current === 'awaiting-approval') {
