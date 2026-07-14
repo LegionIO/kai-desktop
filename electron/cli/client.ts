@@ -31,6 +31,17 @@ const HEARTBEAT_DEAD_MS = 18_000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 /**
+ * Pure liveness predicate for the heartbeat: is the backend stale (no inbound
+ * byte for longer than `deadMs`)? Time-based on purpose — a burst of coalesced
+ * setInterval callbacks (after an event-loop stall / backgrounding) all observe
+ * ~the same `now`, so they can't stack a false positive the way a per-tick miss
+ * counter did. Exported for testing.
+ */
+export function isBackendStale(lastInboundAt: number, now: number, deadMs: number): boolean {
+  return now - lastInboundAt > deadMs;
+}
+
+/**
  * CLI-side client for the leader's local IPC socket. Speaks the same
  * newline-delimited JSON envelope as `local-server.ts`:
  *   request:  {id,type:'invoke',channel,args}\n
@@ -201,7 +212,7 @@ export class LocalBridgeClient {
       // Time-based liveness: only declare dead when REAL elapsed silence exceeds
       // the threshold. Immune to coalesced ticks after an event-loop stall (they
       // all observe ~the same `now`, so they can't stack a false positive).
-      if (Date.now() - this.lastInboundAt > HEARTBEAT_DEAD_MS) {
+      if (isBackendStale(this.lastInboundAt, Date.now(), HEARTBEAT_DEAD_MS)) {
         this.socket.destroy();
         return;
       }

@@ -15,9 +15,33 @@ import type { Server, Socket } from 'net';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { LocalBridgeClient, tryConnect } from '../client.js';
+import { LocalBridgeClient, tryConnect, isBackendStale } from '../client.js';
 
 const isWin = process.platform === 'win32';
+
+describe('isBackendStale (time-based heartbeat liveness)', () => {
+  const DEAD = 18_000;
+
+  it('is not stale when inbound traffic is recent', () => {
+    expect(isBackendStale(1_000_000, 1_005_000, DEAD)).toBe(false); // 5s ago
+    expect(isBackendStale(1_000_000, 1_017_999, DEAD)).toBe(false); // just under threshold
+  });
+
+  it('is stale only after real elapsed silence exceeds the threshold', () => {
+    expect(isBackendStale(1_000_000, 1_018_001, DEAD)).toBe(true);
+  });
+
+  it('coalesced ticks at the SAME now cannot stack a false positive on a recently-alive backend', () => {
+    // Simulate the bug: after an event-loop stall, several interval callbacks
+    // fire back-to-back — all observe the same `now`. Because a pong arrived 2s
+    // ago, EVERY one of them sees only 2s of silence → none reap the socket.
+    const lastInbound = 1_000_000;
+    const now = 1_002_000; // 2s since last byte; the whole coalesced burst shares this
+    for (let i = 0; i < 5; i++) {
+      expect(isBackendStale(lastInbound, now, DEAD)).toBe(false);
+    }
+  });
+});
 
 let dir: string;
 let socketPath: string;
