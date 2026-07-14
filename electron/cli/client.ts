@@ -12,12 +12,17 @@ type EventHandler = (data: unknown) => void;
 const INVOKE_TIMEOUT_MS = 60_000;
 /** Client → backend ping cadence. Must be < the server's heartbeat timeout (12s). */
 const HEARTBEAT_INTERVAL_MS = 5_000;
-/** Consecutive ticks with NO inbound traffic before the client declares the
- *  backend dead. At 5s/tick this tolerates ~15-20s of silence — comfortably
- *  under the server's 12-24s teardown window, but with enough margin that a
- *  brief event-loop stall during a heavy agent stream doesn't trip a false
- *  disconnect (the miss counter is also reset on ANY inbound byte in wire()). */
-const HEARTBEAT_MAX_MISSED = 3;
+/** Max WALL-CLOCK silence (no inbound bytes at all) before the client declares
+ *  the backend dead. Time-based, NOT tick-counted: if the event loop stalls or
+ *  the process is briefly backgrounded, setInterval callbacks COALESCE and can
+ *  fire several times back-to-back — a tick counter would jump straight past the
+ *  limit and tear down a perfectly-alive connection (the observed random
+ *  "reconnected" flapping). Measuring real elapsed time since the last inbound
+ *  byte is immune to that: a burst of coalesced ticks all see (roughly) the same
+ *  `now`, so a live backend (whose pong just arrived, or arrives on the next
+ *  tick) is never falsely reaped. ~18s tolerates a stall + a slow pong while
+ *  staying under the server's 12-24s teardown window. */
+const HEARTBEAT_DEAD_MS = 18_000;
 /** Max buffered bytes for a single inbound frame before we treat the peer as
  *  hostile/broken and drop the socket. Mirrors local-server.ts's MAX_FRAME_BYTES
  *  (8 MiB) so a backend that never sends a newline can't grow this buffer
@@ -47,7 +52,10 @@ export class LocalBridgeClient {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   /** Backend version reported in the auth result (empty if unknown / older backend). */
   private _serverVersion = '';
-  private pongMissed = 0;
+  /** Wall-clock ms of the last inbound byte from the backend. Liveness is judged
+   *  by elapsed time since this (see HEARTBEAT_DEAD_MS), not a tick counter, so
+   *  coalesced timer callbacks after an event-loop stall can't false-positive. */
+  private lastInboundAt = 0;
   private intentionalClose = false; // set by close() so disconnect handlers can tell crash from quit
 
   constructor(
@@ -154,13 +162,13 @@ export class LocalBridgeClient {
 
   private wire(socket: Socket): void {
     socket.on('data', (chunk: Buffer) => {
-      // ANY inbound byte proves the backend is alive — reset the heartbeat miss
-      // counter here (not only on a 'pong'). During a busy agent stream the
-      // event-loop can delay a pong past a tick even though data is flowing;
-      // resetting on all traffic prevents a false "dead backend" mid-response
+      // ANY inbound byte proves the backend is alive — record the timestamp
+      // (not only on a 'pong'). During a busy agent stream the event-loop can
+      // delay a pong past a tick even though data is flowing; judging liveness
+      // by time-since-last-byte prevents a false "dead backend" mid-response
       // (which tore the socket down and overwrote the streaming reply with
       // "reconnected"). Mirrors the server's own alive-on-any-traffic rule.
-      this.pongMissed = 0;
+      this.lastInboundAt = Date.now();
       this.buffer += chunk.toString('utf-8');
       let idx: number;
       while ((idx = this.buffer.indexOf('\n')) !== -1) {
@@ -181,17 +189,19 @@ export class LocalBridgeClient {
       }
     });
 
-    // Heartbeat: ping the backend periodically. If pongs stop arriving the
-    // backend is gone (crash, quit, sleep) even if the OS hasn't delivered a
-    // socket close yet — tear the connection down so callers learn promptly.
-    this.pongMissed = 0;
+    // Heartbeat: ping the backend periodically. If NO inbound byte arrives for
+    // HEARTBEAT_DEAD_MS the backend is gone (crash, quit, sleep) even if the OS
+    // hasn't delivered a socket close yet — tear down so callers learn promptly.
+    this.lastInboundAt = Date.now();
     // Defensive: clear any prior interval before arming a new one, so a wire()
     // that runs without a preceding teardown can't leak a duplicate heartbeat.
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
       if (!this.connected || !this.socket) return;
-      this.pongMissed += 1;
-      if (this.pongMissed > HEARTBEAT_MAX_MISSED) {
+      // Time-based liveness: only declare dead when REAL elapsed silence exceeds
+      // the threshold. Immune to coalesced ticks after an event-loop stall (they
+      // all observe ~the same `now`, so they can't stack a false positive).
+      if (Date.now() - this.lastInboundAt > HEARTBEAT_DEAD_MS) {
         this.socket.destroy();
         return;
       }
@@ -261,7 +271,8 @@ export class LocalBridgeClient {
     }
 
     if (msg.type === 'pong') {
-      this.pongMissed = 0;
+      // Liveness is already recorded in the 'data' handler (lastInboundAt is set
+      // for ANY inbound byte); a pong is just a no-op keepalive to consume here.
       return;
     }
 
