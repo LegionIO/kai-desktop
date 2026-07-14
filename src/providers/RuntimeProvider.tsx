@@ -2693,12 +2693,17 @@ export function RuntimeProvider({
       // head, so a repro shows whether onNew fires TWICE (double-submit) or once
       // (render-side dup), and what content each turn carries. Remove once fixed.
       if (typeof localStorage !== 'undefined' && localStorage.getItem('kai:dbgPaste') === '1') {
+        // Include a trimmed stack so a repro shows WHICH trigger fired onNew
+        // (ComposerInput.handleSubmit vs Thread.handleSend vs assistant-ui's
+        // built-in composer submit) — codex's review confirms the fix hinges on
+        // whether one gesture fires two submits, not on dedup inside onNew.
+        const src = (new Error().stack ?? '').split('\n').slice(2, 6).join(' | ');
         console.warn(
-          `[DBG-PASTE] onNew conv=${convId} head=${headId ?? 'null'} msgParts=${JSON.stringify(
+          `[DBG-PASTE] onNew conv=${convId} head=${headId ?? 'null'} ts=${Date.now()} msgParts=${JSON.stringify(
             (message.content ?? []).map((p) => (p as { type?: string }).type),
           )} pendingAttachments=${JSON.stringify(
             pendingAttachments.map((a) => ({ isImage: a.isImage, hasText: !!a.text, name: a.name })),
-          )}`,
+          )} src=${src}`,
         );
       }
       const cwd = currentWorkingDirectoryRef.current;
