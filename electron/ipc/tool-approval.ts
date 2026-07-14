@@ -34,6 +34,11 @@ export const pendingToolApprovals = new Map<string, { resolve: (approved: boolea
  * resolves when the user approves, rejects, or dismisses.
  *
  * If an `abortSignal` is provided, aborting it will reject with 'dismiss'.
+ *
+ * ⚠️ The resolved value is `true` (approved), `false` (rejected), or the string
+ * `'dismiss'` (dismissed/aborted). `'dismiss'` is TRUTHY — callers MUST gate on
+ * `decision === true`, never a bare `if (decision)`, or a dismissal/abort would
+ * be treated as approval and execute the tool. (All current callers do this.)
  */
 export function registerPendingApproval(toolCallId: string, abortSignal?: AbortSignal): Promise<boolean | 'dismiss'> {
   // A duplicate toolCallId would overwrite the map entry and orphan the prior
