@@ -1231,8 +1231,21 @@ export function App({
           t.kind === 'tool' ? (
             (() => {
               const tool = toolsById.get(t.id);
-              return tool ? (
+              if (!tool) return null;
+              // Show a `kai` header when this tool row OPENS the assistant's turn
+              // (nothing from kai precedes it — the previous turn is the user's,
+              // or it's the first turn). Without it a tool call that runs before
+              // any assistant text renders bare right under the `you` block and
+              // reads as part of the user's message.
+              const prev = turns[i - 1];
+              const opensAssistantTurn = !prev || prev.kind === 'user';
+              return (
                 <Box key={i} marginTop={1} flexDirection="column">
+                  {opensAssistantTurn ? (
+                    <Text color="magenta" bold>
+                      kai
+                    </Text>
+                  ) : null}
                   <ToolRow
                     name={tool.name}
                     status={tool.status}
@@ -1243,7 +1256,7 @@ export function App({
                     result={tool.result}
                   />
                 </Box>
-              ) : null;
+              );
             })()
           ) : (
             <TurnView key={i} turn={t} />
