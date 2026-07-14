@@ -1814,16 +1814,25 @@ const BashInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
   // ride along — detectShResult on the RAW result then finds no stdout/stderr
   // key and renders "No output" despite real output. sanitizeResultForDisplay
   // unwraps { value } and strips internal keys (matching detectSmartResult).
-  const shData = detectShResult(sanitizeResultForDisplay(part.result));
-  // For error results that don't have stdout/stderr shape, extract the error string
-  const resultObj = part.result && typeof part.result === 'object' ? (part.result as Record<string, unknown>) : null;
-  const errorMessage =
-    isError && !shData && resultObj
-      ? String(resultObj.error ?? resultObj.message ?? JSON.stringify(part.result))
-          .replace(/<tool_use_error>/g, '')
-          .replace(/<\/tool_use_error>/g, '')
-          .trim()
-      : null;
+  const displayResult = sanitizeResultForDisplay(part.result);
+  const resultObj =
+    displayResult && typeof displayResult === 'object' ? (displayResult as Record<string, unknown>) : null;
+  // An EXPLICIT error payload (string error, or { error }/{ message }) suppresses
+  // shell-output rendering. A plain nonzero shell exit still sets isError but has
+  // no error/message field — its stdout/stderr must still render, so we key off
+  // the explicit error fields, NOT the isError flag alone.
+  const hasExplicitError =
+    isError && (typeof displayResult === 'string' || resultObj?.error != null || resultObj?.message != null);
+  const shData = hasExplicitError ? null : detectShResult(displayResult);
+  const errorMessage = hasExplicitError
+    ? String(
+        typeof displayResult === 'string'
+          ? displayResult
+          : (resultObj?.error ?? resultObj?.message ?? JSON.stringify(displayResult)),
+      )
+        .replace(/<\/?tool_use_error>/g, '')
+        .trim()
+    : null;
   const [outputModalOpen, setOutputModalOpen] = useState(false);
   const [commandExpanded, setCommandExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
