@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { Text, useInput } from 'ink';
-import chalk from 'chalk';
 
 /**
  * Local port of `ink-text-input` v6 with ONE behavioral fix: ignore Ctrl/Meta
@@ -10,16 +9,18 @@ import chalk from 'chalk';
  * OTHER ctrl combo (Ctrl-O expand, etc. — which the app handles as shortcuts via
  * its own useInput) ALSO falls through to the character-insert path and leaks
  * that letter into the composer (Ink fans a keypress to every active useInput
- * with no propagation-stop). The fix is a single guard in the input handler; the
- * rest is a faithful copy so cursor/render behavior is unchanged. Only the
- * controlled TextInput is kept (the uncontrolled variant is unused here).
+ * with no propagation-stop). The fix is a single guard in the input handler.
+ *
+ * Unlike upstream (which builds an ANSI string with `chalk`), this renders the
+ * cursor/placeholder with Ink's own <Text inverse/dimColor> — chalk isn't
+ * resolvable in the electron-builder packaging build, and Ink styling is the
+ * idiomatic equivalent. Only the controlled TextInput is kept.
  */
 type Props = {
   value: string;
   placeholder?: string;
   focus?: boolean;
   mask?: string;
-  highlightPastedText?: boolean;
   showCursor?: boolean;
   onChange: (value: string) => void;
   onSubmit?: (value: string) => void;
@@ -30,46 +31,17 @@ export function TextInput({
   placeholder = '',
   focus = true,
   mask,
-  highlightPastedText = false,
   showCursor = true,
   onChange,
   onSubmit,
 }: Props): React.ReactElement {
-  const [state, setState] = useState({
-    cursorOffset: (originalValue || '').length,
-    cursorWidth: 0,
-  });
-  const { cursorOffset, cursorWidth } = state;
+  const [cursorOffset, setCursorOffset] = useState((originalValue || '').length);
 
   useEffect(() => {
-    setState((previousState) => {
-      if (!focus || !showCursor) return previousState;
-      const newValue = originalValue || '';
-      if (previousState.cursorOffset > newValue.length - 1) {
-        return { cursorOffset: newValue.length, cursorWidth: 0 };
-      }
-      return previousState;
-    });
+    if (!focus || !showCursor) return;
+    const newValue = originalValue || '';
+    setCursorOffset((prev) => (prev > newValue.length ? newValue.length : prev));
   }, [originalValue, focus, showCursor]);
-
-  const cursorActualWidth = highlightPastedText ? cursorWidth : 0;
-  const value = mask ? mask.repeat(originalValue.length) : originalValue;
-  let renderedValue = value;
-  let renderedPlaceholder = placeholder ? chalk.grey(placeholder) : undefined;
-
-  if (showCursor && focus) {
-    renderedPlaceholder =
-      placeholder.length > 0 ? chalk.inverse(placeholder[0]) + chalk.grey(placeholder.slice(1)) : chalk.inverse(' ');
-    renderedValue = value.length > 0 ? '' : chalk.inverse(' ');
-    let i = 0;
-    for (const char of value) {
-      renderedValue += i >= cursorOffset - cursorActualWidth && i <= cursorOffset ? chalk.inverse(char) : char;
-      i++;
-    }
-    if (value.length > 0 && cursorOffset === value.length) {
-      renderedValue += chalk.inverse(' ');
-    }
-  }
 
   useInput(
     (input, key) => {
@@ -88,7 +60,6 @@ export function TextInput({
 
       let nextCursorOffset = cursorOffset;
       let nextValue = originalValue;
-      let nextCursorWidth = 0;
 
       if (key.leftArrow) {
         if (showCursor) nextCursorOffset--;
@@ -104,19 +75,48 @@ export function TextInput({
         nextValue =
           originalValue.slice(0, cursorOffset) + input + originalValue.slice(cursorOffset, originalValue.length);
         nextCursorOffset += input.length;
-        if (input.length > 1) nextCursorWidth = input.length;
       }
 
-      if (cursorOffset < 0) nextCursorOffset = 0;
-      if (cursorOffset > originalValue.length) nextCursorOffset = originalValue.length;
+      if (nextCursorOffset < 0) nextCursorOffset = 0;
+      if (nextCursorOffset > nextValue.length) nextCursorOffset = nextValue.length;
 
-      setState({ cursorOffset: nextCursorOffset, cursorWidth: nextCursorWidth });
+      setCursorOffset(nextCursorOffset);
       if (nextValue !== originalValue) onChange(nextValue);
     },
     { isActive: focus },
   );
 
-  return <Text>{placeholder ? (value.length > 0 ? renderedValue : renderedPlaceholder) : renderedValue}</Text>;
+  const value = mask ? mask.repeat(originalValue.length) : originalValue;
+
+  // Placeholder (empty value): show it with the cursor block on its first char.
+  if (value.length === 0 && placeholder) {
+    if (showCursor && focus) {
+      return (
+        <Text>
+          <Text inverse>{placeholder[0]}</Text>
+          <Text dimColor>{placeholder.slice(1)}</Text>
+        </Text>
+      );
+    }
+    return <Text dimColor>{placeholder}</Text>;
+  }
+  if (value.length === 0) {
+    return showCursor && focus ? <Text inverse> </Text> : <Text> </Text>;
+  }
+
+  // Value with a fake block cursor rendered via Ink's inverse styling.
+  if (!showCursor || !focus) return <Text>{value}</Text>;
+
+  const before = value.slice(0, cursorOffset);
+  const atCursor = value[cursorOffset] ?? ' ';
+  const after = value.slice(cursorOffset + 1);
+  return (
+    <Text>
+      {before}
+      <Text inverse>{atCursor}</Text>
+      {after}
+    </Text>
+  );
 }
 
 export default TextInput;
