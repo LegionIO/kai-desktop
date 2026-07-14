@@ -1630,6 +1630,14 @@ function AppShell() {
 
   const { unread: alertUnread } = useAlerts();
 
+  // Clicking the OS notification (or a web push) navigates to the Alerts view.
+  useEffect(() => {
+    return app.alerts.onNavigate(() => {
+      setSidebarSection('alerts');
+      setActiveView(ALERTS_VIEW);
+    });
+  }, []);
+
   const dockItems: DockItem[] = useMemo(() => {
     // Check if a specific plugin panel dock icon is active
     const pluginPanelActive =

@@ -126,6 +126,7 @@ type AppAPI = {
     decide: (id: string, decision: 'approve' | 'deny', note?: string) => Promise<{ ok: boolean; error?: string }>;
     dismiss: (id: string) => Promise<{ ok: boolean; error?: string }>;
     onChanged: (callback: (payload: AlertsChangedPayload) => void) => () => void;
+    onNavigate: (callback: (payload: { alertId?: string }) => void) => () => void;
   };
   workspaces: {
     create: (args: { name: string; directory: string }) => Promise<unknown>;

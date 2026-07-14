@@ -122,6 +122,11 @@ const appAPI = {
       ipcRenderer.on('alerts:changed', handler);
       return () => ipcRenderer.removeListener('alerts:changed', handler);
     },
+    onNavigate: (callback: (payload: { alertId?: string }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: { alertId?: string }) => callback(payload);
+      ipcRenderer.on('alerts:navigate', handler);
+      return () => ipcRenderer.removeListener('alerts:navigate', handler);
+    },
   },
 
   workspaces: {

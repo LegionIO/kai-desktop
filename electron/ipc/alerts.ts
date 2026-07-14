@@ -96,7 +96,16 @@ export function notifyNewAlert(alert: Alert): void {
   const verb = alert.kind === 'fyi' ? 'Flagged for review' : alert.kind === 'approval' ? 'Approval needed' : 'Question';
   try {
     if (Notification.isSupported()) {
-      new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) }).show();
+      const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
+      // Clicking the OS notification should bring the user to the Alerts view.
+      n.on('click', () => {
+        focusMainWindowForModal();
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send('alerts:navigate', { alertId: alert.id });
+        }
+        broadcastToWebClients('alerts:navigate', { alertId: alert.id });
+      });
+      n.show();
     }
   } catch {
     // Notifications can throw on some platforms/permission states — non-fatal.

@@ -406,7 +406,8 @@ export function getBridgeScript(): string {
       answer: function(id, answer) { return invoke('alerts:answer', id, answer); },
       decide: function(id, decision, note) { return invoke('alerts:decide', id, decision, note); },
       dismiss: function(id) { return invoke('alerts:dismiss', id); },
-      onChanged: function(cb) { return on('alerts:changed', cb); }
+      onChanged: function(cb) { return on('alerts:changed', cb); },
+      onNavigate: function(cb) { return on('alerts:navigate', cb); }
     },
     diffs: {
       listForConversation: function(id) { return invoke('diffs:list', id); },
