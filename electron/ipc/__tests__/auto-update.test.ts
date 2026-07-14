@@ -29,7 +29,8 @@ vi.mock('electron-updater', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() }));
 
-const { consumePostUpdateMarker, withTimeout, PRE_UPDATE_HOOK_TIMEOUT_MS } = await import('../auto-update.js');
+const { consumePostUpdateMarker, withTimeout, PRE_UPDATE_HOOK_TIMEOUT_MS, resolveDownloadMode } =
+  await import('../auto-update.js');
 
 const MARKER = join(USERDATA, '.update-completed');
 const writeMarker = (obj: unknown) => writeFileSync(MARKER, JSON.stringify(obj));
@@ -122,5 +123,36 @@ describe('withTimeout (pre-update-hook bound)', () => {
 
   it('PRE_UPDATE_HOOK_TIMEOUT_MS is a sane positive bound (5 min)', () => {
     expect(PRE_UPDATE_HOOK_TIMEOUT_MS).toBe(5 * 60 * 1000);
+  });
+});
+
+describe('resolveDownloadMode — bytes are authoritative over the logger label', () => {
+  const FULL = 559_300_000; // ~559 MB, the reported full size
+
+  it('labels a true delta (total well under full) as differential', () => {
+    // 12 MB of a 559 MB app → clearly a delta.
+    expect(resolveDownloadMode(12_000_000, FULL, 'differential')).toBe('differential');
+  });
+
+  it('CORRECTS a "differential" logger label to full when the bytes are the whole file', () => {
+    // The reported bug: logger said differential but the full file downloaded.
+    expect(resolveDownloadMode(FULL, FULL, 'differential')).toBe('full');
+    // Within 2% of full also counts as full.
+    expect(resolveDownloadMode(Math.floor(FULL * 0.99), FULL, 'differential')).toBe('full');
+  });
+
+  it('labels a full download as full even when the logger never fired', () => {
+    expect(resolveDownloadMode(FULL, FULL, undefined)).toBe('full');
+  });
+
+  it('uses the 98% threshold as the delta/full boundary', () => {
+    expect(resolveDownloadMode(Math.floor(FULL * 0.97), FULL, undefined)).toBe('differential');
+    expect(resolveDownloadMode(Math.floor(FULL * 0.98), FULL, undefined)).toBe('full');
+  });
+
+  it('falls back to the logger label when the full size is unknown', () => {
+    expect(resolveDownloadMode(12_000_000, undefined, 'differential')).toBe('differential');
+    expect(resolveDownloadMode(12_000_000, 0, 'full')).toBe('full');
+    expect(resolveDownloadMode(12_000_000, undefined, undefined)).toBeUndefined();
   });
 });

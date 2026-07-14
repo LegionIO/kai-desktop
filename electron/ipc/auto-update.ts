@@ -121,6 +121,27 @@ function broadcast(status: UpdateStatus): void {
   broadcastToAllWindows('auto-update:status', status);
 }
 
+/**
+ * Decide the download mode shown to the user from the ACTUAL bytes.
+ *
+ * electron-updater's logger sniff can label a download "differential" when it
+ * PLANS a delta, but it may then silently fall back to downloading the full
+ * file (e.g. a blockmap fetch/parse failure) — leaving a "delta" label on what
+ * is really a full download. The bytes are authoritative: if the in-progress
+ * total is within 2% of the known full size, it IS full regardless of the log.
+ * Without a full-size reference, keep whatever the logger sniff derived.
+ */
+export function resolveDownloadMode(
+  progressTotal: number,
+  fullSize: number | undefined,
+  loggerMode: 'full' | 'differential' | undefined,
+): 'full' | 'differential' | undefined {
+  if (fullSize && fullSize > 0) {
+    return progressTotal < fullSize * 0.98 ? 'differential' : 'full';
+  }
+  return loggerMode;
+}
+
 /* ── Plugin Lifecycle Hook Runner ── */
 
 export type UpdateHookRunner = {
@@ -396,12 +417,10 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   });
   autoUpdater.on('download-progress', (progress) => {
     if (!downloaded) {
-      // electron-updater's differential path reports progress.total as the
-      // delta bytes (sum of DOWNLOAD ranges); the full path reports the whole
-      // file. Fall back to that comparison if the logger sniff didn't fire.
-      if (downloadMode === undefined && pendingFullSize) {
-        downloadMode = progress.total < pendingFullSize * 0.98 ? 'differential' : 'full';
-      }
+      // The bytes are authoritative for the mode label (see resolveDownloadMode):
+      // a "differential" plan that silently fell back to a full download must
+      // not keep showing "delta" while the whole file transfers.
+      downloadMode = resolveDownloadMode(progress.total, pendingFullSize, downloadMode);
       broadcast({
         state: 'downloading',
         version: pendingVersion,
