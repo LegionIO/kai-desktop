@@ -19,6 +19,9 @@ export interface ConversationSearchHit {
 const SNIPPET_RADIUS = 40;
 /** Cap how much message text we scan per conversation (perf guard on huge chats). */
 const MAX_SCAN_CHARS = 200_000;
+/** Cap the length of a returned snippet (esp. the title snippet, which would
+ *  otherwise return the whole title) so 100 hits can't inflate the IPC payload. */
+const MAX_SNIPPET_LEN = 200;
 
 /** Flatten a message's `content` (array of {type,text,...} parts, or a raw
  *  string) into searchable plain text. Only text-bearing parts contribute. */
@@ -34,14 +37,20 @@ export function messageTextForSearch(content: unknown): string {
   return out.join(' ');
 }
 
+/** Clamp a snippet to MAX_SNIPPET_LEN (with an ellipsis) so no single hit can
+ *  bloat the search-results IPC payload. */
+function clampSnippet(s: string): string {
+  return s.length > MAX_SNIPPET_LEN ? `${s.slice(0, MAX_SNIPPET_LEN - 1)}…` : s;
+}
+
 /** Build a `…context[term]context…` snippet around the first match in `text`. */
 function makeSnippet(text: string, lowerText: string, lowerTerm: string): string {
   const idx = lowerText.indexOf(lowerTerm);
-  if (idx < 0) return text.slice(0, SNIPPET_RADIUS * 2).trim();
+  if (idx < 0) return clampSnippet(text.slice(0, SNIPPET_RADIUS * 2).trim());
   const start = Math.max(0, idx - SNIPPET_RADIUS);
   const end = Math.min(text.length, idx + lowerTerm.length + SNIPPET_RADIUS);
   const core = text.slice(start, end).replace(/\s+/g, ' ').trim();
-  return `${start > 0 ? '…' : ''}${core}${end < text.length ? '…' : ''}`;
+  return clampSnippet(`${start > 0 ? '…' : ''}${core}${end < text.length ? '…' : ''}`);
 }
 
 /**
@@ -67,7 +76,7 @@ export function matchConversation(
   // not suppress it (some records persist title as '' rather than null).
   const title = conversation.title || conversation.fallbackTitle || '';
   if (title.toLowerCase().includes(lowerTerm)) {
-    return { matchedIn: 'title', snippet: title };
+    return { matchedIn: 'title', snippet: clampSnippet(title) };
   }
 
   const messages = Array.isArray(conversation.messages) ? conversation.messages : [];

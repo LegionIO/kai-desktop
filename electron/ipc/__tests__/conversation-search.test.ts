@@ -94,4 +94,21 @@ describe('matchConversation', () => {
     expect(hit?.snippet.endsWith('…')).toBe(true);
     expect(hit?.snippet.toLowerCase()).toContain('needle');
   });
+
+  it('clamps a very long matching title so the snippet payload stays bounded', () => {
+    const longTitle = 'PREFIX ' + 'z'.repeat(5000);
+    const c = conv({ title: longTitle });
+    const hit = matchConversation(c, 'prefix');
+    expect(hit?.matchedIn).toBe('title');
+    expect(hit!.snippet.length).toBeLessThanOrEqual(200);
+    expect(hit!.snippet.endsWith('…')).toBe(true);
+  });
+
+  it('clamps a content snippet to the max length even without surrounding ellipses', () => {
+    // A single very long word (no spaces) around the match still bounds the snippet.
+    const c = conv({ messages: [{ content: [{ type: 'text', text: 'a'.repeat(5000) + 'needle' }] }] });
+    const hit = matchConversation(c, 'needle');
+    expect(hit?.matchedIn).toBe('content');
+    expect(hit!.snippet.length).toBeLessThanOrEqual(200);
+  });
 });

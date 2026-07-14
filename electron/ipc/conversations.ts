@@ -344,7 +344,11 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   // carry a snippet of the match. Bounded: empty term returns []; a hard result
   // cap protects the caller from a huge store.
   ipcMain.handle('conversations:search', (_event, term: unknown) => {
-    const q = typeof term === 'string' ? term.trim() : '';
+    // Cap the term length: a search term longer than this is never meaningful and
+    // just makes every per-conversation includes() scan more work.
+    const MAX_TERM_LEN = 200;
+    const raw = typeof term === 'string' ? term.trim() : '';
+    const q = raw.length > MAX_TERM_LEN ? raw.slice(0, MAX_TERM_LEN) : raw;
     if (!q) return [];
     const MAX_RESULTS = 100;
     const index = readIndex(appHome);
