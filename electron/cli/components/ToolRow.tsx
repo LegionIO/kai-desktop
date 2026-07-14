@@ -47,6 +47,13 @@ export function ToolRow({
   error = error !== undefined ? stripControl(error) : error;
   const dur = typeof durationMs === 'number' ? ` ${(durationMs / 1000).toFixed(1)}s` : '';
 
+  // A dim hint that this row can be expanded/collapsed with Ctrl-O, shown only
+  // when there IS expandable content (args/result) — so the user discovers the
+  // shortcut where it's useful without cluttering rows that have nothing to dig
+  // into.
+  const hasExpandable = args !== undefined || result !== undefined;
+  const expandHint = hasExpandable ? <Text dimColor> · Ctrl-O {expanded ? 'collapse' : 'expand'}</Text> : null;
+
   const detail =
     expanded && (args !== undefined || result !== undefined) ? (
       <Box flexDirection="column" marginLeft={2}>
@@ -88,6 +95,7 @@ export function ToolRow({
           <Text>
             <Text color="green">✓</Text> <Text>{name}</Text>
             <Text dimColor>{dur}</Text>
+            {expandHint}
           </Text>
         );
       case 'error':
@@ -95,6 +103,7 @@ export function ToolRow({
           <Box flexDirection="column">
             <Text>
               <Text color="red">✗</Text> <Text>{name}</Text>
+              {expandHint}
             </Text>
             {error ? <Text color="red"> {error}</Text> : null}
           </Box>
