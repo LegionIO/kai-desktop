@@ -52,8 +52,15 @@ function validateExistingTargets(actions: unknown, appHome: string): string | nu
     const target = a.conversationTarget;
     if (target?.type !== 'existing') continue;
     const id = target.conversationId;
-    // Empty id is the "target the current chat" sentinel — resolved at runtime.
-    if (typeof id !== 'string' || !id) continue;
+    // This runs AFTER defaultExistingTargetToCurrent, so an empty id here means
+    // it couldn't be pinned to the current chat (e.g. created headlessly with no
+    // active conversation). An unpinned existing-target resolves to null every
+    // run → a brand-new chat each fire (the "one rule, many duplicate chats"
+    // race). Reject it: the author must pass a real id, or use singleton/
+    // per-invocation instead.
+    if (typeof id !== 'string' || !id) {
+      return 'conversationTarget {type:"existing"} has no conversationId and there is no current chat to default to. Pass a real conversation id, or use {type:"singleton"} (one shared chat per rule) / {type:"per-invocation"} (a new chat each run) instead — an unpinned existing-target would create a new chat on every run.';
+    }
 
     const convs = Object.values(getIndex().conversations);
     if (convs.some((c) => c.id === id)) continue; // valid id — keep

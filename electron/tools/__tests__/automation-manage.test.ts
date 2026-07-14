@@ -357,4 +357,26 @@ describe('automations tool: existing-target validation', () => {
     };
     expect(saved.actions[0].conversationTarget.conversationId).toBe('conv-1'); // CTX.conversationId
   });
+
+  it('rejects an existing-target with no id when there is no current chat to pin to', async () => {
+    freshConfig('auto-allow');
+    mockConversations = {};
+    const rule = {
+      name: 'append somewhere',
+      trigger: { source: 'plugin.foo', event: 'thing' },
+      actions: [
+        { type: 'agent', mode: 'conversation', prompt: 'go', tools: false, conversationTarget: { type: 'existing' } },
+      ],
+    };
+    // No conversationId in context → cannot default → must reject (an unpinned
+    // existing-target would spawn a new chat on every run).
+    const tool = createAutomationManageTool('/tmp');
+    const res = (await tool.execute({ action: 'create', rule }, { toolCallId: 'tc-x' } as never)) as Record<
+      string,
+      unknown
+    >;
+    expect(res.success).toBeUndefined();
+    expect(res.error).toMatch(/no conversationId and there is no current chat|singleton|per-invocation/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
 });
