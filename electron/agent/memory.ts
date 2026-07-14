@@ -12,6 +12,34 @@ type MemoryConfig = ConstructorParameters<typeof Memory>[0];
 const RESOURCE_ID = __BRAND_RESOURCE_ID;
 
 let sharedMemory: Memory | null | undefined;
+/** Fingerprint of the config + dbPath the cached `sharedMemory` was built from.
+ *  When it changes (memory settings toggled, embedding provider/key/endpoint
+ *  edited, or a different dbPath), the cache is rebuilt — otherwise a stale
+ *  instance would survive a config change until app restart, and a cached `null`
+ *  from a transient init failure could never recover. */
+let sharedMemoryKey: string | undefined;
+
+/** Build the cache key from only the config that actually affects the Memory
+ *  instance (its memory subtree + the embedding/Azure provider) plus dbPath.
+ *  Exported for testing. */
+export function memoryFingerprint(config: AppConfig, dbPath: string): string {
+  const azure = config.models.providers['azure_primary'];
+  try {
+    return JSON.stringify({
+      dbPath,
+      // The whole memory subtree, incl. semanticRecall.embeddingProvider.
+      memory: config.memory,
+      // Embedding also falls back to the azure_primary provider (see build*Provider).
+      azure: azure
+        ? { endpoint: azure.endpoint, apiKey: azure.apiKey, apiVersion: azure.apiVersion, headers: azure.extraHeaders }
+        : null,
+    });
+  } catch {
+    // Cyclic/unserializable config → fall back to a value that forces a rebuild
+    // each call (correctness over caching).
+    return `nofp-${Date.now()}-${Math.random()}`;
+  }
+}
 
 export function normalizeOpenAIBaseUrl(endpoint?: string): string | undefined {
   const base = endpoint?.trim()?.replace(/\/+$/, '') ?? '';
@@ -186,10 +214,16 @@ export function getResourceId(): string {
 
 export function resetMemory(): void {
   sharedMemory = undefined;
+  sharedMemoryKey = undefined;
 }
 
 export function getSharedMemory(config: AppConfig, dbPath: string): Memory | null {
-  if (sharedMemory !== undefined) return sharedMemory;
+  const key = memoryFingerprint(config, dbPath);
+  // Rebuild when the relevant config or dbPath changed since the cached build —
+  // this auto-invalidates a stale instance AND lets a prior transient failure
+  // (cached null) recover after the user fixes their config.
+  if (sharedMemory !== undefined && sharedMemoryKey === key) return sharedMemory;
+  sharedMemoryKey = key;
 
   if (!config.memory.enabled) {
     sharedMemory = null;

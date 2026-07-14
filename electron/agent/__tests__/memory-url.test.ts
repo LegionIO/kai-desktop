@@ -6,7 +6,8 @@
  * getSharedMemory (Mastra/LibSQL construction) is out of scope.
  */
 import { describe, it, expect } from 'vitest';
-import { normalizeOpenAIBaseUrl, normalizeAzureBaseUrl } from '../memory.js';
+import { normalizeOpenAIBaseUrl, normalizeAzureBaseUrl, memoryFingerprint } from '../memory.js';
+import type { AppConfig } from '../../config/schema.js';
 
 describe('normalizeAzureBaseUrl', () => {
   it('appends /openai to a bare Azure endpoint', () => {
@@ -69,5 +70,46 @@ describe('normalizeOpenAIBaseUrl', () => {
     const out = normalizeOpenAIBaseUrl('https://host.example.com/base');
     expect(out).toBe('https://host.example.com/base/openai');
     expect(new URL(out!).host).toBe('host.example.com');
+  });
+});
+
+describe('memoryFingerprint (cache-invalidation key)', () => {
+  const makeCfg = (over: { enabled?: boolean; apiKey?: string; endpoint?: string } = {}) =>
+    ({
+      memory: {
+        enabled: over.enabled ?? true,
+        lastMessages: 20,
+        workingMemory: { enabled: false, scope: 'thread' },
+        observationalMemory: { enabled: false, scope: 'thread' },
+        semanticRecall: { enabled: false, topK: 3, scope: 'thread' },
+      },
+      models: {
+        providers: {
+          azure_primary: {
+            endpoint: over.endpoint ?? 'https://a.example.com',
+            apiKey: over.apiKey ?? 'k1',
+            apiVersion: '2024',
+          },
+        },
+      },
+    }) as unknown as AppConfig;
+
+  it('is stable for the same config + dbPath', () => {
+    expect(memoryFingerprint(makeCfg(), '/tmp/db')).toBe(memoryFingerprint(makeCfg(), '/tmp/db'));
+  });
+
+  it('changes when dbPath changes', () => {
+    expect(memoryFingerprint(makeCfg(), '/tmp/a')).not.toBe(memoryFingerprint(makeCfg(), '/tmp/b'));
+  });
+
+  it('changes when a memory setting toggles', () => {
+    expect(memoryFingerprint(makeCfg({ enabled: false }), '/tmp/db')).not.toBe(memoryFingerprint(makeCfg(), '/tmp/db'));
+  });
+
+  it('changes when the embedding provider key/endpoint changes', () => {
+    expect(memoryFingerprint(makeCfg({ apiKey: 'k2' }), '/tmp/db')).not.toBe(memoryFingerprint(makeCfg(), '/tmp/db'));
+    expect(memoryFingerprint(makeCfg({ endpoint: 'https://b.example.com' }), '/tmp/db')).not.toBe(
+      memoryFingerprint(makeCfg(), '/tmp/db'),
+    );
   });
 });
