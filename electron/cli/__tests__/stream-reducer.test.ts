@@ -14,8 +14,10 @@ import { describe, it, expect } from 'vitest';
 import {
   reduceCliStreamEvent,
   initialCliStreamState,
+  toolTurnOpensAssistantTurn,
   type CliStreamState,
   type CliStreamEvent,
+  type CliTurn,
 } from '../stream-reducer.js';
 
 function run(events: CliStreamEvent[], start?: CliStreamState): CliStreamState {
@@ -226,5 +228,43 @@ describe('reduceCliStreamEvent — terminal + misc', () => {
     expect(again.tools).toEqual(afterCall.tools);
     expect(again.turns).toEqual(afterCall.turns);
     expect(again.turnSettled).toBe(true);
+  });
+});
+
+describe('toolTurnOpensAssistantTurn — kai header placement (#221)', () => {
+  it('is true when a tool turn is the first turn', () => {
+    const turns: CliTurn[] = [{ kind: 'tool', id: 'tc1' }];
+    expect(toolTurnOpensAssistantTurn(turns, 0)).toBe(true);
+  });
+
+  it('is true when a tool turn immediately follows the user turn (opens the reply)', () => {
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'what time is it?' },
+      { kind: 'tool', id: 'tc1' },
+    ];
+    expect(toolTurnOpensAssistantTurn(turns, 1)).toBe(true);
+  });
+
+  it('is false when a tool turn follows assistant text (continuation, header already shown)', () => {
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'q' },
+      { kind: 'assistant', text: 'let me check' },
+      { kind: 'tool', id: 'tc1' },
+    ];
+    expect(toolTurnOpensAssistantTurn(turns, 2)).toBe(false);
+  });
+
+  it('is false for a second back-to-back tool (same assistant turn)', () => {
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'q' },
+      { kind: 'tool', id: 'tc1' },
+      { kind: 'tool', id: 'tc2' },
+    ];
+    expect(toolTurnOpensAssistantTurn(turns, 2)).toBe(false);
+  });
+
+  it('is false for a non-tool turn at the index', () => {
+    const turns: CliTurn[] = [{ kind: 'assistant', text: 'hi' }];
+    expect(toolTurnOpensAssistantTurn(turns, 0)).toBe(false);
   });
 });

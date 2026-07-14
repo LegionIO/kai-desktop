@@ -213,3 +213,18 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
       return state;
   }
 }
+
+/**
+ * Whether the `tool` turn at `index` OPENS the assistant's turn — i.e. nothing
+ * from the assistant precedes it (the previous turn is the user's, or it's the
+ * first turn). The CLI renders a `kai` header above such a tool row so a tool
+ * call that runs before any assistant text isn't mistaken for part of the
+ * user's message. Continuation tools (previous turn is assistant/tool) get no
+ * header so a multi-step reply isn't littered with repeated headers. Mirrors the
+ * inline decision in app.tsx's transcript render.
+ */
+export function toolTurnOpensAssistantTurn(turns: CliTurn[], index: number): boolean {
+  if (turns[index]?.kind !== 'tool') return false;
+  const prev = turns[index - 1];
+  return !prev || prev.kind === 'user';
+}

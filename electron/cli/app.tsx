@@ -12,6 +12,7 @@ import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
 import { extractImageMentions } from './images.js';
+import { toolTurnOpensAssistantTurn } from './stream-reducer.js';
 
 // TEMP debug (issue #217): trace which stream events reach the CLI and whether
 // the conversationId guard passes. Gated on the SAME env var as the backend's
@@ -1237,8 +1238,7 @@ export function App({
               // or it's the first turn). Without it a tool call that runs before
               // any assistant text renders bare right under the `you` block and
               // reads as part of the user's message.
-              const prev = turns[i - 1];
-              const opensAssistantTurn = !prev || prev.kind === 'user';
+              const opensAssistantTurn = toolTurnOpensAssistantTurn(turns, i);
               return (
                 <Box key={i} marginTop={1} flexDirection="column">
                   {opensAssistantTurn ? (
