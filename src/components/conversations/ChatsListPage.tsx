@@ -88,15 +88,14 @@ function getDisplayTitle(conv: ConversationSummary): string {
   return conv.title?.trim() || conv.fallbackTitle?.trim() || '';
 }
 
-export const ChatsListPage: FC<ChatsListPageProps> = ({
-  onOpenConversation,
-  onNewConversation,
-  workspaceId,
-}) => {
+export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNewConversation, workspaceId }) => {
   const fullWidth = useFullWidthContent();
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // IDs whose message CONTENT matches the search (title matches are instant
+  // below); filled by a debounced conversations:search (reads bodies).
+  const [contentMatchIds, setContentMatchIds] = useState<Set<string>>(new Set());
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [sortMode, setSortMode] = useState<SortMode>('newest');
   const [hoveredId, setHoveredId] = useState<string | null>(null);
@@ -112,11 +111,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try {
-      return new Set(
-        JSON.parse(
-          localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') ?? '[]',
-        ),
-      );
+      return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') ?? '[]'));
     } catch {
       return new Set();
     }
@@ -157,54 +152,63 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      localStorage.setItem(
-        __BRAND_APP_SLUG + ':pinned-conversations',
-        JSON.stringify([...next]),
-      );
+      localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', JSON.stringify([...next]));
       return next;
     });
   }, []);
 
-  const handleArchive = useCallback(async (id: string) => {
-    const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-    if (!conv) return;
-    await app.conversations.put({ ...conv, archived: !conv.archived });
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
-    await loadConversations();
-  }, [loadConversations]);
-
-  const handleDelete = useCallback(async (id: string) => {
-    await app.conversations.delete(id);
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
-    await loadConversations();
-  }, [loadConversations]);
-
-  const handleRename = useCallback(async (id: string, newTitle: string) => {
-    const trimmed = newTitle.trim();
-    if (!trimmed) { setRenameModal(null); return; }
-    const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-    if (!conv) { setRenameModal(null); return; }
-    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
-    setRenameModal(null);
-    await loadConversations();
-  }, [loadConversations]);
-
-  const handleMoreClick = useCallback(
-    (e: React.MouseEvent<HTMLButtonElement>, convId: string) => {
-      e.stopPropagation();
-      const rect = e.currentTarget.getBoundingClientRect();
-      setContextMenu({ x: rect.left, y: rect.bottom + 4, convId });
+  const handleArchive = useCallback(
+    async (id: string) => {
+      const conv = (await app.conversations.get(id)) as ConversationRecord | null;
+      if (!conv) return;
+      await app.conversations.put({ ...conv, archived: !conv.archived });
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      await loadConversations();
     },
-    [],
+    [loadConversations],
   );
+
+  const handleDelete = useCallback(
+    async (id: string) => {
+      await app.conversations.delete(id);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      await loadConversations();
+    },
+    [loadConversations],
+  );
+
+  const handleRename = useCallback(
+    async (id: string, newTitle: string) => {
+      const trimmed = newTitle.trim();
+      if (!trimmed) {
+        setRenameModal(null);
+        return;
+      }
+      const conv = (await app.conversations.get(id)) as ConversationRecord | null;
+      if (!conv) {
+        setRenameModal(null);
+        return;
+      }
+      await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
+      setRenameModal(null);
+      await loadConversations();
+    },
+    [loadConversations],
+  );
+
+  const handleMoreClick = useCallback((e: React.MouseEvent<HTMLButtonElement>, convId: string) => {
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    setContextMenu({ x: rect.left, y: rect.bottom + 4, convId });
+  }, []);
 
   const handleBulkArchive = useCallback(async () => {
     const shouldArchive = filterMode !== 'archived';
@@ -226,13 +230,11 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     await loadConversations();
   }, [selectedIds, loadConversations]);
 
-  const handleRowContextMenu = useCallback(    (e: React.MouseEvent<HTMLDivElement>, convId: string) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setContextMenu({ x: e.clientX, y: e.clientY, convId });
-    },
-    [],
-  );
+  const handleRowContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>, convId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, convId });
+  }, []);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -245,22 +247,42 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     };
   }, [contextMenu]);
 
+  // Debounced content search (title matching is instant below; message-body
+  // matching needs the backend to read conversation files).
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setContentMatchIds((prev) => (prev.size ? new Set() : prev));
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          const hits = (await app.conversations.search(q)) as Array<{ id?: string }>;
+          if (cancelled) return;
+          setContentMatchIds(new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')));
+        } catch {
+          if (!cancelled) setContentMatchIds(new Set());
+        }
+      })();
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [searchQuery]);
+
   const processed = useMemo(() => {
     let result = [...conversations];
 
     // Workspace scoping
     if (workspaceId) {
-      result = result.filter(
-        (c) => c.workspaceId === workspaceId || !c.workspaceId,
-      );
+      result = result.filter((c) => c.workspaceId === workspaceId || !c.workspaceId);
     }
 
     // Hide empty threads
-    result = result.filter(
-      (c) =>
-        c.messageCount > 0 ||
-        Boolean(c.title?.trim() || c.fallbackTitle?.trim()),
-    );
+    result = result.filter((c) => c.messageCount > 0 || Boolean(c.title?.trim() || c.fallbackTitle?.trim()));
 
     // Filter mode
     if (filterMode === 'archived') {
@@ -278,12 +300,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       result = result.filter((c) => !c.archived);
     }
 
-    // Search
+    // Search: title (instant, in-memory) OR message content (contentMatchIds).
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      result = result.filter((c) =>
-        getDisplayTitle(c).toLowerCase().includes(q),
-      );
+      result = result.filter((c) => getDisplayTitle(c).toLowerCase().includes(q) || contentMatchIds.has(c.id));
     }
 
     // Sort
@@ -301,7 +321,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     });
 
     return result;
-  }, [conversations, workspaceId, searchQuery, filterMode, sortMode, pinnedIds]);
+  }, [conversations, workspaceId, searchQuery, contentMatchIds, filterMode, sortMode, pinnedIds]);
 
   const isSelecting = selectedIds.size > 0;
   const allSelected = isSelecting && processed.length > 0 && processed.every((c) => selectedIds.has(c.id));
@@ -334,7 +354,6 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
   return (
     <div className="flex flex-col h-full min-h-0 pt-12 md:pt-14">
-
       {/* Fixed toolbar: search + filter + sort only */}
       <div className="shrink-0 pt-6 pb-2">
         <div className={cn('mx-auto w-full px-4', !fullWidth && 'max-w-3xl')}>
@@ -494,7 +513,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
         {/* Selection bar floats above the list */}
         {isSelecting && (
-          <div className={cn('absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center', !fullWidth && 'max-w-3xl')}>
+          <div
+            className={cn(
+              'absolute inset-x-0 top-0 z-20 mx-auto w-full px-4 h-8 flex items-center',
+              !fullWidth && 'max-w-3xl',
+            )}
+          >
             <button
               type="button"
               onClick={toggleSelectAll}
@@ -513,9 +537,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
                 <div className="h-4 w-4 rounded border-2 border-muted-foreground/40" />
               )}
             </button>
-            <span className="flex-1 ml-2 text-sm font-medium text-foreground">
-              {selectedIds.size} selected
-            </span>
+            <span className="flex-1 ml-2 text-sm font-medium text-foreground">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               <Tooltip content={filterMode === 'archived' ? 'Unarchive selected' : 'Archive selected'} side="bottom">
                 <button
@@ -550,168 +572,165 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
         <div className="h-full overflow-y-auto">
           <div className={cn('mx-auto w-full px-4 pt-10 pb-6', !fullWidth && 'max-w-3xl')}>
-
             {/* Conversation rows */}
             <div className="flex flex-col">
               {hasLoaded && processed.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-24 text-center">
-                <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted/40 text-muted-foreground">
-                  <MessageSquareIcon size={26} strokeWidth={1.3} />
-                </div>
-                <h3 className="mb-1.5 text-sm font-medium text-foreground/80">
-                  {searchQuery
-                    ? 'No chats match your search'
-                    : isFilterActive
-                      ? `No ${FILTER_LABELS[filterMode].toLowerCase()} chats`
-                      : 'No chats yet'}
-                </h3>
-                {!searchQuery && !isFilterActive && (
-                  <p className="mb-5 max-w-xs text-xs text-muted-foreground leading-relaxed">
-                    Start a conversation with Kai. Your chat history will appear here.
-                  </p>
-                )}
-                {!searchQuery && !isFilterActive && (
-                  <button
-                    type="button"
-                    onClick={() => void onNewConversation()}
-                    className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                  >
-                    <PlusIcon size={13} />
-                    Start Your First Chat
-                  </button>
-                )}
-              </div>
-            ) : (
-              processed.map((conv) => {
-                const isHovered = hoveredId === conv.id;
-                const displayTitle = getDisplayTitle(conv) || 'New Chat';
-                const tsStr = formatRowTimestamp(
-                  conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt,
-                );
-                const metaStr = conv.messageCount > 0
-                  ? `${conv.messageCount} msgs · ${tsStr}`
-                  : tsStr;
-                const isPinned = pinnedIds.has(conv.id);
-
-                return (
-                  <div key={conv.id} className="flex w-full items-center">
-                    {/* Checkbox — outside the hover/click zone */}
-                    <div
-                      className="flex w-7 shrink-0 cursor-pointer items-center justify-center py-3"
-                      onMouseEnter={() => setHoveredId(conv.id)}
-                      onMouseLeave={() => setHoveredId(null)}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelectedIds((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(conv.id)) next.delete(conv.id);
-                          else next.add(conv.id);
-                          return next;
-                        });
-                      }}
-                    >
-                      {selectedIds.has(conv.id) ? (
-                        <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-[var(--brand-accent)]">
-                          <CheckIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
-                        </div>
-                      ) : (
-                        <div
-                          className={cn(
-                            'h-4 w-4 shrink-0 rounded border-2 border-muted-foreground/40 transition-opacity',
-                            isHovered || isSelecting ? 'opacity-100' : 'opacity-0',
-                          )}
-                        />
-                      )}
-                    </div>
-
-                    {/* Hoverable / clickable row */}
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      className={cn(
-                        'flex flex-1 min-w-0 items-center gap-3 rounded-xl px-3 py-3 text-left transition-colors cursor-pointer',
-                        selectedIds.has(conv.id)
-                          ? 'bg-[var(--brand-accent)]/10'
-                          : isHovered ? 'bg-muted/60' : '',
-                      )}
-                      onMouseEnter={() => setHoveredId(conv.id)}
-                      onMouseLeave={() => setHoveredId(null)}
-                      onClick={() => onOpenConversation(conv.id)}
-                      onKeyDown={(e) => e.key === 'Enter' && onOpenConversation(conv.id)}
-                      onContextMenu={(e) => handleRowContextMenu(e, conv.id)}
-                    >
-                      <MessageSquareIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-
-                      <div className="flex-1 min-w-0">
-                        <span className="truncate text-sm font-medium text-foreground">
-                          {displayTitle}
-                          {isPinned && (
-                            <PinIcon className="ml-1.5 inline h-3 w-3 text-muted-foreground" />
-                          )}
-                        </span>
-                      </div>
-
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        <span className="text-xs text-muted-foreground whitespace-nowrap">
-                          {metaStr}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={(e) => handleMoreClick(e, conv.id)}
-                          className={cn(
-                            'flex h-6 w-6 items-center justify-center rounded-md transition-all',
-                            'text-muted-foreground hover:bg-muted hover:text-foreground',
-                            isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none',
-                          )}
-                          title="More options"
-                          aria-label="More options"
-                        >
-                          <EllipsisVerticalIcon className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </div>
+                <div className="flex flex-col items-center justify-center py-24 text-center">
+                  <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-muted/40 text-muted-foreground">
+                    <MessageSquareIcon size={26} strokeWidth={1.3} />
                   </div>
-                );
-              })
-            )}
-          </div>{/* end flex flex-col rows */}
-          </div>{/* end max-w-3xl pb-6 */}
-        </div>{/* end overflow-y-auto */}
-      </div>{/* end relative flex-1 */}
+                  <h3 className="mb-1.5 text-sm font-medium text-foreground/80">
+                    {searchQuery
+                      ? 'No chats match your search'
+                      : isFilterActive
+                        ? `No ${FILTER_LABELS[filterMode].toLowerCase()} chats`
+                        : 'No chats yet'}
+                  </h3>
+                  {!searchQuery && !isFilterActive && (
+                    <p className="mb-5 max-w-xs text-xs text-muted-foreground leading-relaxed">
+                      Start a conversation with Kai. Your chat history will appear here.
+                    </p>
+                  )}
+                  {!searchQuery && !isFilterActive && (
+                    <button
+                      type="button"
+                      onClick={() => void onNewConversation()}
+                      className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                    >
+                      <PlusIcon size={13} />
+                      Start Your First Chat
+                    </button>
+                  )}
+                </div>
+              ) : (
+                processed.map((conv) => {
+                  const isHovered = hoveredId === conv.id;
+                  const displayTitle = getDisplayTitle(conv) || 'New Chat';
+                  const tsStr = formatRowTimestamp(conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt);
+                  const metaStr = conv.messageCount > 0 ? `${conv.messageCount} msgs · ${tsStr}` : tsStr;
+                  const isPinned = pinnedIds.has(conv.id);
+
+                  return (
+                    <div key={conv.id} className="flex w-full items-center">
+                      {/* Checkbox — outside the hover/click zone */}
+                      <div
+                        className="flex w-7 shrink-0 cursor-pointer items-center justify-center py-3"
+                        onMouseEnter={() => setHoveredId(conv.id)}
+                        onMouseLeave={() => setHoveredId(null)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedIds((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(conv.id)) next.delete(conv.id);
+                            else next.add(conv.id);
+                            return next;
+                          });
+                        }}
+                      >
+                        {selectedIds.has(conv.id) ? (
+                          <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-[var(--brand-accent)]">
+                            <CheckIcon className="h-2.5 w-2.5 text-[var(--brand-accent-fg)]" strokeWidth={3} />
+                          </div>
+                        ) : (
+                          <div
+                            className={cn(
+                              'h-4 w-4 shrink-0 rounded border-2 border-muted-foreground/40 transition-opacity',
+                              isHovered || isSelecting ? 'opacity-100' : 'opacity-0',
+                            )}
+                          />
+                        )}
+                      </div>
+
+                      {/* Hoverable / clickable row */}
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        className={cn(
+                          'flex flex-1 min-w-0 items-center gap-3 rounded-xl px-3 py-3 text-left transition-colors cursor-pointer',
+                          selectedIds.has(conv.id) ? 'bg-[var(--brand-accent)]/10' : isHovered ? 'bg-muted/60' : '',
+                        )}
+                        onMouseEnter={() => setHoveredId(conv.id)}
+                        onMouseLeave={() => setHoveredId(null)}
+                        onClick={() => onOpenConversation(conv.id)}
+                        onKeyDown={(e) => e.key === 'Enter' && onOpenConversation(conv.id)}
+                        onContextMenu={(e) => handleRowContextMenu(e, conv.id)}
+                      >
+                        <MessageSquareIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+
+                        <div className="flex-1 min-w-0">
+                          <span className="truncate text-sm font-medium text-foreground">
+                            {displayTitle}
+                            {isPinned && <PinIcon className="ml-1.5 inline h-3 w-3 text-muted-foreground" />}
+                          </span>
+                        </div>
+
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <span className="text-xs text-muted-foreground whitespace-nowrap">{metaStr}</span>
+                          <button
+                            type="button"
+                            onClick={(e) => handleMoreClick(e, conv.id)}
+                            className={cn(
+                              'flex h-6 w-6 items-center justify-center rounded-md transition-all',
+                              'text-muted-foreground hover:bg-muted hover:text-foreground',
+                              isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none',
+                            )}
+                            title="More options"
+                            aria-label="More options"
+                          >
+                            <EllipsisVerticalIcon className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+            {/* end flex flex-col rows */}
+          </div>
+          {/* end max-w-3xl pb-6 */}
+        </div>
+        {/* end overflow-y-auto */}
+      </div>
+      {/* end relative flex-1 */}
 
       {/* Bulk delete confirmation modal */}
-      {bulkDeleteOpen && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-sm font-semibold text-foreground">Delete chats</h2>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {`This will permanently delete ${selectedIds.size} chat${selectedIds.size === 1 ? '' : 's'}. This cannot be undone.`}
-            </p>
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBulkDeleteOpen(false)}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { setBulkDeleteOpen(false); void handleBulkDelete(); }}
-                className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-              >
-                <Trash2Icon className="h-3 w-3" />
-                Delete
-              </button>
+      {bulkDeleteOpen &&
+        createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setBulkDeleteOpen(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-sm font-semibold text-foreground">Delete chats</h2>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {`This will permanently delete ${selectedIds.size} chat${selectedIds.size === 1 ? '' : 's'}. This cannot be undone.`}
+              </p>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setBulkDeleteOpen(false)}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBulkDeleteOpen(false);
+                    void handleBulkDelete();
+                  }}
+                  className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  <Trash2Icon className="h-3 w-3" />
+                  Delete
+                </button>
+              </div>
             </div>
-          </div>
-        </div>,
-        document.body,
-      )}
+          </div>,
+          document.body,
+        )}
 
       {/* Context menu */}
       {contextMenu &&
@@ -739,7 +758,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
             <div className="my-1 h-px bg-border/60" />
             <button
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-              onClick={() => { togglePin(contextMenu.convId); setContextMenu(null); }}
+              onClick={() => {
+                togglePin(contextMenu.convId);
+                setContextMenu(null);
+              }}
             >
               <PinIcon className="h-4 w-4 text-muted-foreground" />
               {pinnedIds.has(contextMenu.convId) ? 'Unpin' : 'Pin'}
@@ -757,14 +779,20 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
             </button>
             <button
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-              onClick={() => { void handleArchive(contextMenu.convId); setContextMenu(null); }}
+              onClick={() => {
+                void handleArchive(contextMenu.convId);
+                setContextMenu(null);
+              }}
             >
               <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
               {conversations.find((c) => c.id === contextMenu.convId)?.archived ? 'Unarchive' : 'Archive'}
             </button>
             <button
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-popover-foreground hover:bg-muted/70 transition-colors"
-              onClick={() => { setExportConvId(contextMenu.convId); setContextMenu(null); }}
+              onClick={() => {
+                setExportConvId(contextMenu.convId);
+                setContextMenu(null);
+              }}
             >
               <DownloadIcon className="h-4 w-4 text-muted-foreground" />
               Export
@@ -772,7 +800,10 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
             <div className="my-1 h-px bg-border/60" />
             <button
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-              onClick={() => { void handleDelete(contextMenu.convId); setContextMenu(null); }}
+              onClick={() => {
+                void handleDelete(contextMenu.convId);
+                setContextMenu(null);
+              }}
             >
               <Trash2Icon className="h-4 w-4" />
               Delete
@@ -790,11 +821,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
         />
       )}
 
-      <ExportDialog
-        open={exportConvId !== null}
-        onClose={() => setExportConvId(null)}
-        conversationId={exportConvId}
-      />
+      <ExportDialog open={exportConvId !== null} onClose={() => setExportConvId(null)} conversationId={exportConvId} />
     </div>
   );
 };

@@ -138,6 +138,10 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
   const [exportSubmenuOpen, setExportSubmenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // IDs of conversations whose MESSAGE CONTENT matches the current search
+  // (title matches are handled synchronously below). Populated by a debounced
+  // conversations:search call, since content matching requires reading bodies.
+  const [contentMatchIds, setContentMatchIds] = useState<Set<string>>(new Set());
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<'markdown' | 'json'>('markdown');
@@ -245,6 +249,34 @@ export const ConversationList: FC<ConversationListProps> = ({
     };
   }, [loadConversations]);
 
+  // Debounced content search: title matching is instant (in-memory below), but
+  // matching message BODIES needs the backend to read conversation files. Fetch
+  // the set of content-matching ids ~250ms after typing settles; a stale/empty
+  // query clears it.
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setContentMatchIds((prev) => (prev.size ? new Set() : prev));
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          const hits = (await app.conversations.search(q)) as Array<{ id?: string }>;
+          if (cancelled) return;
+          setContentMatchIds(new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')));
+        } catch {
+          if (!cancelled) setContentMatchIds(new Set());
+        }
+      })();
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [searchQuery]);
+
   const processedConversations = useMemo(() => {
     let result = [...conversations];
 
@@ -261,10 +293,14 @@ export const ConversationList: FC<ConversationListProps> = ({
       (conv) => conv.messageCount > 0 || Boolean(conv.title?.trim() || conv.fallbackTitle?.trim()),
     );
 
-    // Text search
+    // Text search: match the title (instant, in-memory) OR the message content
+    // (via the debounced conversations:search result set — contentMatchIds).
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      result = result.filter((c) => getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q));
+      result = result.filter(
+        (c) =>
+          getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q) || contentMatchIds.has(c.id),
+      );
     }
 
     // Default sort: newest-first by last assistant update
@@ -275,7 +311,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, searchQuery, sessionsByConversation, workspaceId]);
+  }, [conversations, searchQuery, contentMatchIds, sessionsByConversation, workspaceId]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
