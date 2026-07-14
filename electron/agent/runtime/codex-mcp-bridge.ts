@@ -18,6 +18,7 @@ import { createServer, type Server as HttpServer } from 'http';
 import { randomUUID } from 'crypto';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
 import { MAX_TOOL_NAME_LENGTH, makeSafeToolName } from '../../tools/naming.js';
+import { extractModelContent } from '../tool-model-content.js';
 
 // ---------------------------------------------------------------------------
 // Types (dynamic imports — avoid hard compile-time dependency on MCP SDK)
@@ -37,7 +38,7 @@ type McpServerInstance = {
     description: string,
     schema: Record<string, unknown>,
     handler: (args: Record<string, unknown>) => Promise<{
-      content: Array<{ type: string; text: string }>;
+      content: Array<Record<string, unknown> & { type: string }>;
       isError?: boolean;
     }>,
   ): unknown;
@@ -334,11 +335,36 @@ export class CodexMcpBridge {
           }
 
           const result = await boundTool.execute(validatedArgs, context);
-          const text = typeof result === 'string' ? result : JSON.stringify(result);
           // A tool that returns an error-shaped result (isError / error field)
           // must surface as an MCP error, not a successful call — otherwise Codex
           // treats a failed tool as success.
-          return { content: [{ type: 'text' as const, text }], ...(isErrorResult(result) ? { isError: true } : {}) };
+          const isErr = isErrorResult(result);
+          const { modelContent, cleaned } = extractModelContent(result);
+          const content: Array<Record<string, unknown> & { type: string }> = [];
+          const cleanedHasFields =
+            cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
+          if (cleanedHasFields || !modelContent) {
+            content.push({
+              type: 'text',
+              text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned),
+            });
+          }
+          for (const part of modelContent ?? []) {
+            if (part.type === 'text') content.push({ type: 'text', text: part.text });
+            else if (part.type === 'image') {
+              content.push({ type: 'image', data: part.data, mimeType: part.mediaType });
+            } else {
+              content.push({
+                type: 'resource',
+                resource: {
+                  blob: part.data,
+                  mimeType: part.mediaType,
+                  uri: `attachment:///${part.filename ?? 'file'}`,
+                },
+              });
+            }
+          }
+          return { content, ...(isErr ? { isError: true } : {}) };
         } catch (error) {
           return {
             content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }],

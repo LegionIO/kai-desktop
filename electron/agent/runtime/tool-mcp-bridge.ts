@@ -13,6 +13,7 @@
  */
 
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
+import { extractModelContent } from '../tool-model-content.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,7 +26,11 @@ export type McpToolListEntry = {
 };
 
 export type McpToolCallResult = {
-  content: Array<{ type: 'text'; text: string }>;
+  content: Array<
+    | { type: 'text'; text: string }
+    | { type: 'image'; data: string; mimeType: string }
+    | { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } }
+  >;
   isError?: boolean;
 };
 
@@ -146,7 +151,6 @@ export class ToolMcpBridge {
       };
 
       const result = await tool.execute(validatedArgs, context);
-      const text = typeof result === 'string' ? result : JSON.stringify(result);
 
       // Surface an error-shaped tool result as an MCP error, not a success.
       const resultIsError =
@@ -156,8 +160,34 @@ export class ToolMcpBridge {
           (typeof (result as { error?: unknown }).error === 'string' &&
             (result as { error: string }).error.length > 0));
 
+      // Peel off model-visible media into native MCP content blocks.
+      const { modelContent, cleaned } = extractModelContent(result);
+      const content: McpToolCallResult['content'] = [];
+      const cleanedHasFields =
+        cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
+      if (cleanedHasFields || !modelContent) {
+        content.push({
+          type: 'text',
+          text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned),
+        });
+      }
+      for (const part of modelContent ?? []) {
+        if (part.type === 'text') content.push({ type: 'text', text: part.text });
+        else if (part.type === 'image') content.push({ type: 'image', data: part.data, mimeType: part.mediaType });
+        else {
+          content.push({
+            type: 'resource',
+            resource: {
+              blob: part.data,
+              mimeType: part.mediaType,
+              uri: `attachment:///${part.filename ?? 'file'}`,
+            },
+          });
+        }
+      }
+
       return {
-        content: [{ type: 'text', text }],
+        content,
         ...(resultIsError ? { isError: true } : {}),
       };
     } catch (error) {

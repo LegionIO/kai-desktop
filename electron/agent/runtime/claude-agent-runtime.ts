@@ -29,6 +29,7 @@ import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } fr
 import { detectClaudeAgentSdk, resolveClaudeCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
+import { extractModelContent } from '../tool-model-content.js';
 import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
@@ -1095,7 +1096,11 @@ function extractZodShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
 
 /** MCP CallToolResult shape returned by tool handlers. */
 type CallToolResult = {
-  content: Array<{ type: 'text'; text: string }>;
+  content: Array<
+    | { type: 'text'; text: string }
+    | { type: 'image'; data: string; mimeType: string }
+    | { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } }
+  >;
   isError?: boolean;
 };
 
@@ -1146,7 +1151,6 @@ function createToolHandler(
       }
 
       const result = await toolDef.execute(validatedArgs, context);
-      const text = typeof result === 'string' ? result : JSON.stringify(result);
       // Surface an error-shaped tool result as a tool error, not a success.
       const resultIsError =
         !!result &&
@@ -1154,7 +1158,34 @@ function createToolHandler(
         ((result as { isError?: unknown }).isError === true ||
           (typeof (result as { error?: unknown }).error === 'string' &&
             (result as { error: string }).error.length > 0));
-      return { content: [{ type: 'text', text }], ...(resultIsError ? { isError: true } : {}) };
+
+      // Peel off any model-visible media (images / files) into native MCP
+      // content blocks; the rest becomes the usual JSON/text block.
+      const { modelContent, cleaned } = extractModelContent(result);
+      const content: CallToolResult['content'] = [];
+      const cleanedHasFields =
+        cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
+      if (cleanedHasFields || !modelContent) {
+        content.push({
+          type: 'text',
+          text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned),
+        });
+      }
+      for (const part of modelContent ?? []) {
+        if (part.type === 'text') content.push({ type: 'text', text: part.text });
+        else if (part.type === 'image') content.push({ type: 'image', data: part.data, mimeType: part.mediaType });
+        else {
+          content.push({
+            type: 'resource',
+            resource: {
+              blob: part.data,
+              mimeType: part.mediaType,
+              uri: `attachment:///${part.filename ?? 'file'}`,
+            },
+          });
+        }
+      }
+      return { content, ...(resultIsError ? { isError: true } : {}) };
     } catch (err) {
       return {
         content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],

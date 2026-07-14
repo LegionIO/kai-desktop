@@ -19,6 +19,7 @@ import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, Reasoning
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
+import { extractModelContent } from './tool-model-content.js';
 import { isCommandAllowed, scrubShellEnv } from '../tools/shell.js';
 import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
 import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
@@ -275,6 +276,36 @@ function toMastraTools(
         } finally {
           hooks?.onToolExecutionEnd?.({ toolCallId, toolName: tool.name });
         }
+      },
+      // Emit any `_modelContent` (e.g. fetched images) the tool attached as
+      // native model content, so the model sees real images rather than an
+      // opaque base64 string buried in JSON. Falls back to json/text otherwise.
+      toModelOutput: (output: unknown) => {
+        const { modelContent, cleaned } = extractModelContent(output);
+        if (!modelContent) {
+          return typeof cleaned === 'string'
+            ? { type: 'text', value: cleaned }
+            : { type: 'json', value: cleaned ?? null };
+        }
+        const value = modelContent.map((p) => {
+          if (p.type === 'text') return { type: 'text' as const, text: p.text };
+          if (p.type === 'image') {
+            return { type: 'image-data' as const, data: p.data, mediaType: p.mediaType };
+          }
+          return {
+            type: 'file-data' as const,
+            data: p.data,
+            mediaType: p.mediaType,
+            ...(p.filename ? { filename: p.filename } : {}),
+          };
+        });
+        // Prepend a compact JSON summary of the remaining fields as text so the
+        // model still gets the tool's structured result alongside the media.
+        const summary =
+          cleaned && typeof cleaned === 'object' && Object.keys(cleaned as object).length > 0
+            ? [{ type: 'text' as const, text: JSON.stringify(cleaned) }]
+            : [];
+        return { type: 'content', value: [...summary, ...value] };
       },
     });
   }

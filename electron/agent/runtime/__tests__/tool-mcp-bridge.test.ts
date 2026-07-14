@@ -14,6 +14,14 @@ import type { ToolDefinition } from '../../../tools/types.js';
 // Test helpers
 // ---------------------------------------------------------------------------
 
+/** Extract the text of a content part, asserting it is a text block. */
+function textOf(part: { type: string } & Record<string, unknown>): string {
+  if (part.type !== 'text' || typeof part.text !== 'string') {
+    throw new Error(`Expected a text content part, got "${part.type}"`);
+  }
+  return part.text;
+}
+
 function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
     name: overrides.name ?? 'test-tool',
@@ -111,7 +119,7 @@ describe('ToolMcpBridge', () => {
       expect(result.isError).toBeUndefined();
       expect(result.content).toHaveLength(1);
       expect(result.content[0].type).toBe('text');
-      expect(result.content[0].text).toContain('/tmp/file.txt');
+      expect(textOf(result.content[0])).toContain('/tmp/file.txt');
     });
 
     it('returns error for unknown tool', async () => {
@@ -119,8 +127,8 @@ describe('ToolMcpBridge', () => {
       const result = await bridge.callTool('nonexistent', {});
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain('nonexistent');
-      expect(result.content[0].text).toContain('not found');
+      expect(textOf(result.content[0])).toContain('nonexistent');
+      expect(textOf(result.content[0])).toContain('not found');
     });
 
     it('catches execution errors and returns them as MCP error', async () => {
@@ -136,7 +144,7 @@ describe('ToolMcpBridge', () => {
       const result = await bridge.callTool('failing-tool', {});
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain('Intentional test failure');
+      expect(textOf(result.content[0])).toContain('Intentional test failure');
     });
 
     it('validates args before execution', async () => {
@@ -184,7 +192,7 @@ describe('ToolMcpBridge', () => {
       const bridge = createBridge([tool]);
       const result = await bridge.callTool('test-tool', {});
 
-      const parsed = JSON.parse(result.content[0].text);
+      const parsed = JSON.parse(textOf(result.content[0]));
       expect(parsed.files).toEqual(['a.txt', 'b.txt']);
       expect(parsed.count).toBe(2);
     });
