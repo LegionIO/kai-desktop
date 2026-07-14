@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Box, Text } from 'ink';
-import TextInput from 'ink-text-input';
+import TextInput from './TextInput.js';
 import Spinner from 'ink-spinner';
 import { SPINNER_VERBS } from '../../../shared/spinner-verbs.js';
 
