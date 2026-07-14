@@ -7,6 +7,7 @@ import type { AutomationRule, AutomationsConfig } from '../config/schema.js';
 import { automationRuleSchema } from '../config/schema.js';
 import { getRegisteredTools, getWorkspaceToolDefinitions } from '../ipc/agent.js';
 import { readEffectiveConfig, writeDesktopConfig } from '../ipc/config.js';
+import { readIndex } from '../ipc/conversation-store.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { ruleTriggersOnHookEvents } from '../agent/hooks/dispatcher.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../ipc/tool-approval.js';
@@ -25,6 +26,50 @@ function defaultExistingTargetToCurrent(actions: unknown, currentConversationId:
     if (typeof target.conversationId === 'string' && target.conversationId) continue;
     if (currentConversationId) target.conversationId = currentConversationId;
   }
+}
+
+/**
+ * Validate/repair `{type:'existing', conversationId}` targets at authoring time.
+ *
+ * Without this, a model that passes a conversationId that ISN'T a real id — a
+ * chat *title*, a guessed id, or a since-deleted one — silently sails through:
+ * at runtime `readConversation` returns null and the run creates a BRAND-NEW
+ * conversation every single fire (the "one automation, many duplicate chats"
+ * bug). We fail loudly at create/update instead:
+ *   - a conversationId that resolves to a real conversation → keep;
+ *   - one that instead uniquely matches a conversation *title* → repair to that
+ *     id (handles "used the name, not the id");
+ *   - anything else (unknown / ambiguous title) → return an actionable error so
+ *     the create/update is rejected.
+ * Returns an error string, or null if all targets are valid/repaired in place.
+ */
+function validateExistingTargets(actions: unknown, appHome: string): string | null {
+  if (!Array.isArray(actions)) return null;
+  let index: ReturnType<typeof readIndex> | null = null;
+  const getIndex = () => (index ??= readIndex(appHome));
+  for (const a of actions as MutableAgentAction[]) {
+    if (a?.type !== 'agent') continue;
+    const target = a.conversationTarget;
+    if (target?.type !== 'existing') continue;
+    const id = target.conversationId;
+    // Empty id is the "target the current chat" sentinel — resolved at runtime.
+    if (typeof id !== 'string' || !id) continue;
+
+    const convs = Object.values(getIndex().conversations);
+    if (convs.some((c) => c.id === id)) continue; // valid id — keep
+
+    // Not an id — maybe the model passed a title. Repair only on a UNIQUE match.
+    const byTitle = convs.filter((c) => c.title != null && c.title === id);
+    if (byTitle.length === 1) {
+      target.conversationId = byTitle[0].id;
+      continue;
+    }
+    if (byTitle.length > 1) {
+      return `conversationTarget.conversationId "${id}" matches ${byTitle.length} chats by title — pass the exact conversation id, or omit conversationId to target the current chat.`;
+    }
+    return `conversationTarget.conversationId "${id}" is not a known conversation id (and matches no chat title). Omit conversationId to append to the current chat, or pass a valid conversation id — otherwise every run would create a new chat.`;
+  }
+  return null;
 }
 
 function summarizeRule(rule: AutomationRule) {
@@ -208,6 +253,8 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
       '{type:"per-invocation"} (new chat each run, default), {type:"singleton"} (one shared chat',
       'per rule, created on first run then appended), or {type:"existing", conversationId} (append',
       'to a specific chat — omit conversationId to target the chat you are running in right now).',
+      'For {type:"existing"}, conversationId MUST be a real conversation id (not a chat title/name);',
+      'an unknown id is rejected at create/update time because it would make every run spawn a new chat.',
       "includeHistory (default true) passes the target chat's prior messages as context to the agent.",
     ].join('\n'),
     inputSchema: z.object({
@@ -272,6 +319,8 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
           if (!rule) return { error: 'rule is required for create.' };
           const candidate: Record<string, unknown> = { enabled: true, ...rule, id: randomUUID() };
           defaultExistingTargetToCurrent(candidate.actions, context?.conversationId);
+          const targetErr = validateExistingTargets(candidate.actions, appHome);
+          if (targetErr) return { error: targetErr };
           const parsed = automationRuleSchema.safeParse(candidate);
           if (!parsed.success) {
             return { error: 'Rule failed validation.', issues: parsed.error.issues };
@@ -311,6 +360,8 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
             id: prev.id,
           };
           defaultExistingTargetToCurrent(merged.actions, context?.conversationId);
+          const updateTargetErr = validateExistingTargets(merged.actions, appHome);
+          if (updateTargetErr) return { error: updateTargetErr };
           const parsed = automationRuleSchema.safeParse(merged);
           if (!parsed.success) {
             return { error: 'Updated rule failed validation.', issues: parsed.error.issues };

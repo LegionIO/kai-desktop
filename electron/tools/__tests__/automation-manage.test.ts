@@ -34,6 +34,12 @@ vi.mock('../../automations/schema-check.js', () => ({
   validateRulePaths: () => [],
 }));
 
+// Controllable conversation index for existing-target validation.
+let mockConversations: Record<string, { id: string; title: string | null }> = {};
+vi.mock('../../ipc/conversation-store.js', () => ({
+  readIndex: () => ({ conversations: mockConversations }),
+}));
+
 // Controllable approval decision + spy on the broadcast.
 let approvalDecision: boolean | 'dismiss' = true;
 const broadcastSpy = vi.fn();
@@ -99,6 +105,7 @@ async function run(action: string, extra: Record<string, unknown> = {}) {
 beforeEach(() => {
   approvalDecision = true;
   broadcastSpy.mockClear();
+  mockConversations = {};
 });
 
 describe('automations tool approval gate', () => {
@@ -273,5 +280,81 @@ describe('automations tool approval gate', () => {
     expect(broadcastSpy).not.toHaveBeenCalled();
     expect(res.error).toMatch(/no live chat|Settings/i);
     expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+});
+
+describe('automations tool: existing-target validation', () => {
+  const existingRule = (conversationId: string) => ({
+    name: 'append to a chat',
+    trigger: { source: 'plugin.foo', event: 'thing' },
+    actions: [
+      {
+        type: 'agent',
+        mode: 'conversation',
+        prompt: 'go',
+        tools: false,
+        conversationTarget: { type: 'existing', conversationId },
+      },
+    ],
+  });
+
+  it('accepts a conversationTarget whose id is a real conversation', async () => {
+    freshConfig('auto-allow');
+    mockConversations = { 'conv-real': { id: 'conv-real', title: 'My Chat' } };
+    const res = await run('create', { rule: existingRule('conv-real') });
+    expect(res.success).toBe(true);
+    const saved = mockConfig.automations.rules[0] as {
+      actions: Array<{ conversationTarget: { conversationId: string } }>;
+    };
+    expect(saved.actions[0].conversationTarget.conversationId).toBe('conv-real');
+  });
+
+  it('rejects a conversationId that is not a known id and matches no title', async () => {
+    freshConfig('auto-allow');
+    mockConversations = { 'conv-real': { id: 'conv-real', title: 'My Chat' } };
+    const res = await run('create', { rule: existingRule('does-not-exist') });
+    expect(res.success).toBeUndefined();
+    expect(res.error).toMatch(/not a known conversation id/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
+  it('repairs a title passed in place of an id (unique match) to the real id', async () => {
+    freshConfig('auto-allow');
+    mockConversations = { 'conv-abc': { id: 'conv-abc', title: 'Weekly Report' } };
+    const res = await run('create', { rule: existingRule('Weekly Report') });
+    expect(res.success).toBe(true);
+    const saved = mockConfig.automations.rules[0] as {
+      actions: Array<{ conversationTarget: { conversationId: string } }>;
+    };
+    expect(saved.actions[0].conversationTarget.conversationId).toBe('conv-abc');
+  });
+
+  it('rejects an ambiguous title that matches multiple chats', async () => {
+    freshConfig('auto-allow');
+    mockConversations = {
+      a: { id: 'a', title: 'Same' },
+      b: { id: 'b', title: 'Same' },
+    };
+    const res = await run('create', { rule: existingRule('Same') });
+    expect(res.error).toMatch(/matches 2 chats by title/i);
+    expect(mockConfig.automations.rules).toHaveLength(0);
+  });
+
+  it('defaults an omitted conversationId to the current chat (not rejected)', async () => {
+    freshConfig('auto-allow');
+    mockConversations = { 'conv-1': { id: 'conv-1', title: 'Current' } };
+    const rule = {
+      name: 'append here',
+      trigger: { source: 'plugin.foo', event: 'thing' },
+      actions: [
+        { type: 'agent', mode: 'conversation', prompt: 'go', tools: false, conversationTarget: { type: 'existing' } },
+      ],
+    };
+    const res = await run('create', { rule });
+    expect(res.success).toBe(true);
+    const saved = mockConfig.automations.rules[0] as {
+      actions: Array<{ conversationTarget: { conversationId: string } }>;
+    };
+    expect(saved.actions[0].conversationTarget.conversationId).toBe('conv-1'); // CTX.conversationId
   });
 });
