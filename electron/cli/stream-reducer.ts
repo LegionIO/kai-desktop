@@ -174,17 +174,23 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
     case 'error': {
       const flushed = finalizeAssistant(state);
       const turns = [...flushed.turns, { kind: 'error' as const, text: event.error ?? 'unknown error' }];
-      // settleTurn is coalesced by turnSettled; the reducer marks it settled and
-      // settles open tool rows (the queue-drain / setStatus('idle') is a side
-      // effect the caller performs when turnSettled flips true).
-      const settled = flushed.turnSettled ? flushed : { ...flushed, turnSettled: true, status: 'idle' as const };
-      return { ...settled, turns, tools: settleOpenToolRows(settled.tools) };
+      // The error turn is always appended (app.tsx appends unconditionally).
+      // Settling is coalesced by turnSettled: flip it and settle open tool rows
+      // only on the first terminal event. `status` is deliberately NOT set here —
+      // in app.tsx settleTurn() either drains a queued message (staying
+      // effectively running) or goes idle, a queue-dependent SIDE EFFECT the
+      // caller owns (the reducer doesn't model the input queue). The caller
+      // reacts to turnSettled flipping true.
+      if (flushed.turnSettled) return { ...flushed, turns };
+      return { ...flushed, turns, turnSettled: true, tools: settleOpenToolRows(flushed.tools) };
     }
 
     case 'done': {
       const flushed = finalizeAssistant(state);
-      const settled = flushed.turnSettled ? flushed : { ...flushed, turnSettled: true, status: 'idle' as const };
-      return { ...settled, tools: settleOpenToolRows(settled.tools) };
+      // Coalesced settle; `status` left to the caller (queue-drain vs idle). See
+      // the note in the 'error' case above.
+      if (flushed.turnSettled) return flushed;
+      return { ...flushed, turnSettled: true, tools: settleOpenToolRows(flushed.tools) };
     }
 
     default:

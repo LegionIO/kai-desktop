@@ -56,7 +56,8 @@ describe('reduceCliStreamEvent — peer-turn response streaming (#217)', () => {
       { kind: 'user', text: 'hello' },
       { kind: 'assistant', text: 'Hi there!' },
     ]);
-    expect(done.status).toBe('idle');
+    // `status` is left to the caller (queue-drain vs idle); the reducer only
+    // flips turnSettled on the terminal event.
     expect(done.turnSettled).toBe(true);
   });
 
@@ -144,7 +145,7 @@ describe('reduceCliStreamEvent — terminal + misc', () => {
       { kind: 'assistant', text: 'partial' },
       { kind: 'error', text: 'stream failed' },
     ]);
-    expect(s.status).toBe('idle');
+    // Terminal event flips turnSettled; status is the caller's concern.
     expect(s.turnSettled).toBe(true);
   });
 
@@ -163,5 +164,34 @@ describe('reduceCliStreamEvent — terminal + misc', () => {
     reduceCliStreamEvent(start, { type: 'user-message', text: 'q' });
     expect(start.turns).toBe(snapshotTurns);
     expect(start.turns).toHaveLength(0);
+  });
+
+  it("leaves `status` unchanged on done (queue-drain vs idle is the caller's side effect)", () => {
+    // Faithful to app.tsx: settleTurn() drains a queued message (stays running)
+    // OR goes idle — a queue-dependent decision the reducer does not own. The
+    // reducer only flips turnSettled; the caller sets status.
+    const s = run([
+      { type: 'user-message', text: 'q' },
+      { type: 'text-delta', text: 'a' },
+    ]);
+    expect(s.status).toBe('running');
+    const done = reduceCliStreamEvent(s, { type: 'done' });
+    expect(done.status).toBe('running'); // unchanged — caller decides idle/next
+    expect(done.turnSettled).toBe(true);
+  });
+
+  it('coalesces a second terminal event (turnSettled guard) — tool rows settle once', () => {
+    const afterCall = run([
+      { type: 'user-message', text: 'q' },
+      { type: 'tool-call', toolCallId: 'tc1', toolName: 'sh' },
+      { type: 'done' },
+    ]);
+    expect(afterCall.tools[0].status).toBe('done');
+    expect(afterCall.turnSettled).toBe(true);
+    // A stray second done must be a no-op (already settled).
+    const again = reduceCliStreamEvent(afterCall, { type: 'done' });
+    expect(again.tools).toEqual(afterCall.tools);
+    expect(again.turns).toEqual(afterCall.turns);
+    expect(again.turnSettled).toBe(true);
   });
 });
