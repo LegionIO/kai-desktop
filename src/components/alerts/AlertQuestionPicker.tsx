@@ -17,13 +17,21 @@ export const AlertQuestionPicker: FC<{
   submitting?: boolean;
 }> = ({ questions, onSubmit, submitting }) => {
   const [activeTab, setActiveTab] = useState(0);
+  // Single-select: answers[qIdx] holds the chosen option label, or OTHER.
   const [answers, setAnswers] = useState<Record<number, string>>({});
+  // Multi-select: a Set of chosen option labels per question (NEVER contains OTHER;
+  // free text is tracked separately so an option label containing "," or matching
+  // the OTHER sentinel can't corrupt state or collide).
+  const [multiSel, setMultiSel] = useState<Record<number, Set<string>>>({});
+  const [otherOn, setOtherOn] = useState<Record<number, boolean>>({});
   const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
 
   useEffect(() => {
     // Reset when the question set changes (e.g. switching between alerts).
     setActiveTab(0);
     setAnswers({});
+    setMultiSel({});
+    setOtherOn({});
     setOtherTexts({});
   }, [questions]);
 
@@ -31,13 +39,13 @@ export const AlertQuestionPicker: FC<{
     (qIdx: number, value: string) => {
       const multi = questions[qIdx]?.multiSelect === true;
       if (multi) {
-        // Toggle this option in a comma-joined set; never auto-advance (the user
-        // may pick several). Selecting a real option clears any "Other" text.
-        setAnswers((prev) => {
-          const current = prev[qIdx] ? prev[qIdx].split(', ').filter(Boolean) : [];
-          const has = current.includes(value);
-          const next = has ? current.filter((v) => v !== value) : [...current.filter((v) => v !== OTHER), value];
-          return { ...prev, [qIdx]: next.join(', ') };
+        // Toggle this option in the Set; never auto-advance (the user may pick
+        // several). Selecting a real option leaves any Other text intact.
+        setMultiSel((prev) => {
+          const cur = new Set(prev[qIdx] ?? []);
+          if (cur.has(value)) cur.delete(value);
+          else cur.add(value);
+          return { ...prev, [qIdx]: cur };
         });
         return;
       }
@@ -58,13 +66,11 @@ export const AlertQuestionPicker: FC<{
     (qIdx: number, text: string) => {
       setOtherTexts((prev) => ({ ...prev, [qIdx]: text }));
       const multi = questions[qIdx]?.multiSelect === true;
-      setAnswers((prev) => {
-        if (!multi) return { ...prev, [qIdx]: OTHER };
-        // Multi: keep the picked options, add the OTHER marker so submit merges the text.
-        const current = prev[qIdx] ? prev[qIdx].split(', ').filter(Boolean) : [];
-        const next = current.includes(OTHER) ? current : [...current, OTHER];
-        return { ...prev, [qIdx]: next.join(', ') };
-      });
+      if (multi) {
+        setOtherOn((prev) => ({ ...prev, [qIdx]: text.trim().length > 0 }));
+      } else {
+        setAnswers((prev) => ({ ...prev, [qIdx]: OTHER }));
+      }
     },
     [questions],
   );
@@ -72,39 +78,37 @@ export const AlertQuestionPicker: FC<{
   const handleSubmit = useCallback(() => {
     const result: Record<string, string> = {};
     questions.forEach((q, i) => {
-      const raw = answers[i];
-      if (!raw) return;
       if (q.multiSelect) {
-        // Replace the OTHER marker with the typed text; join the rest.
-        const parts = raw
-          .split(', ')
-          .filter(Boolean)
-          .map((v) => (v === OTHER ? (otherTexts[i]?.trim() ?? '') : v))
-          .filter(Boolean);
+        const parts = [...(multiSel[i] ?? [])];
+        if (otherOn[i] && otherTexts[i]?.trim()) parts.push(otherTexts[i].trim());
         if (parts.length) result[q.question] = parts.join(', ');
-      } else if (raw === OTHER) {
-        result[q.question] = otherTexts[i] ?? '';
       } else {
-        result[q.question] = raw;
+        const raw = answers[i];
+        if (raw === OTHER) result[q.question] = otherTexts[i] ?? '';
+        else if (raw) result[q.question] = raw;
       }
     });
     onSubmit(result);
-  }, [questions, answers, otherTexts, onSubmit]);
+  }, [questions, answers, multiSel, otherOn, otherTexts, onSubmit]);
 
   if (questions.length === 0) return null;
 
   const active = questions[activeTab];
   const isSelected = (qIdx: number, value: string): boolean => {
-    const raw = answers[qIdx];
-    if (!raw) return false;
-    return questions[qIdx]?.multiSelect ? raw.split(', ').includes(value) : raw === value;
+    if (questions[qIdx]?.multiSelect) {
+      return value === OTHER ? !!otherOn[qIdx] : !!multiSel[qIdx]?.has(value);
+    }
+    return answers[qIdx] === value;
   };
-  const hasAllAnswers = questions.every((q, i) => {
+  const isQuestionAnswered = (i: number): boolean => {
+    if (questions[i]?.multiSelect) {
+      return (multiSel[i]?.size ?? 0) > 0 || (!!otherOn[i] && !!otherTexts[i]?.trim());
+    }
     const raw = answers[i];
     if (!raw) return false;
-    if (raw.split(', ').includes(OTHER) || raw === OTHER) return !!otherTexts[i]?.trim();
-    return true;
-  });
+    return raw === OTHER ? !!otherTexts[i]?.trim() : true;
+  };
+  const hasAllAnswers = questions.every((_, i) => isQuestionAnswered(i));
 
   return (
     <div className="rounded-xl border border-primary/30 bg-primary/5 overflow-hidden">
@@ -112,9 +116,7 @@ export const AlertQuestionPicker: FC<{
         <div className="flex items-center border-b border-border/30">
           <div className="flex flex-1 min-w-0">
             {questions.map((q, i) => {
-              const raw = answers[i];
-              const isAnswered =
-                !!raw && (!raw.split(', ').includes(OTHER) && raw !== OTHER ? true : !!otherTexts[i]?.trim());
+              const isAnswered = isQuestionAnswered(i);
               return (
                 <button
                   key={i}

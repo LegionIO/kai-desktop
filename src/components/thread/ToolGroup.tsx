@@ -680,6 +680,14 @@ function askUserResultHasAnswers(result: unknown): boolean {
   const pick = (o: unknown): unknown =>
     o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>).answers : undefined;
   let answers = pick(result);
+  // Shape: a plain top-level JSON string (matches AskUserAnswersView shape 3).
+  if (answers === undefined && typeof result === 'string') {
+    try {
+      answers = pick(JSON.parse(result));
+    } catch {
+      /* ignore */
+    }
+  }
   if (answers === undefined && Array.isArray(result)) {
     for (const item of result) {
       if (item && typeof item === 'object' && (item as Record<string, unknown>).type === 'text') {
