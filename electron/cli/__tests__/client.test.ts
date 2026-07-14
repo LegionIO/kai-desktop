@@ -241,6 +241,30 @@ describe.skipIf(isWin)('LocalBridgeClient', () => {
     expect(client.isConnected()).toBe(false);
   });
 
+  it('does NOT drop the socket for many small valid frames whose total exceeds the cap', async () => {
+    // Regression: the cap must bound a single UNTERMINATED frame, not the total
+    // volume of newline-delimited traffic. A burst of small complete frames
+    // (each < cap) totaling > 8 MiB is legitimate and must be delivered, not
+    // treated as an oversized frame.
+    await startServer();
+    client = new LocalBridgeClient(socketPath);
+    await client.connect();
+    let dropped = false;
+    client.onDisconnect(() => (dropped = true));
+    let received = 0;
+    client.on('spam', () => (received += 1));
+    // ~9 MiB total across ~900 complete event frames (each ~10 KiB), each newline
+    // terminated. Written as one big string so they can arrive in few chunks.
+    const frame = JSON.stringify({ type: 'event', channel: 'spam', data: 'y'.repeat(10 * 1024) }) + '\n';
+    const count = 900;
+    serverSockets[0].write(frame.repeat(count));
+    // Give the client time to drain all frames.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(dropped).toBe(false);
+    expect(client.isConnected()).toBe(true);
+    expect(received).toBe(count);
+  });
+
   it('requestShutdown resolves on the server ack', async () => {
     await startServer((socket, msg) => {
       if (msg.type === 'shutdown') {

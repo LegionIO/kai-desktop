@@ -162,19 +162,22 @@ export class LocalBridgeClient {
       // "reconnected"). Mirrors the server's own alive-on-any-traffic rule.
       this.pongMissed = 0;
       this.buffer += chunk.toString('utf-8');
-      // Bound the frame buffer: a peer that streams bytes without ever sending a
-      // newline would otherwise grow this without limit. Drop the socket (a
-      // 'close'/'error' → teardown fires and recovery kicks in).
-      if (this.buffer.length > MAX_FRAME_BYTES) {
-        this.buffer = '';
-        socket.destroy();
-        return;
-      }
       let idx: number;
       while ((idx = this.buffer.indexOf('\n')) !== -1) {
         const line = this.buffer.slice(0, idx);
         this.buffer = this.buffer.slice(idx + 1);
         if (line.trim()) this.dispatch(line);
+      }
+      // Bound the buffer AFTER draining complete frames: what remains is a single
+      // partial (unterminated) frame. Cap THAT — a peer streaming bytes with no
+      // newline would otherwise grow it without limit. Checking before the drain
+      // (against the whole accumulated buffer) would wrongly trip on a legitimate
+      // burst of many small newline-delimited frames arriving in one chunk. On
+      // overrun, drop the socket ('close'/'error' → teardown → recovery).
+      if (this.buffer.length > MAX_FRAME_BYTES) {
+        this.buffer = '';
+        socket.destroy();
+        return;
       }
     });
 
@@ -182,6 +185,9 @@ export class LocalBridgeClient {
     // backend is gone (crash, quit, sleep) even if the OS hasn't delivered a
     // socket close yet — tear the connection down so callers learn promptly.
     this.pongMissed = 0;
+    // Defensive: clear any prior interval before arming a new one, so a wire()
+    // that runs without a preceding teardown can't leak a duplicate heartbeat.
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
       if (!this.connected || !this.socket) return;
       this.pongMissed += 1;
@@ -211,6 +217,10 @@ export class LocalBridgeClient {
   private teardown(fireDisconnect: boolean): void {
     if (!this.connected && !this.socket) return;
     this.connected = false;
+    // Clear the backend version: a reconnect may land on a DIFFERENT backend
+    // (survivor re-election / freshly spawned), so a stale version must not
+    // linger past the drop. It's re-populated by the next auth handshake.
+    this._serverVersion = '';
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
