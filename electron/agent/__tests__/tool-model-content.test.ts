@@ -111,4 +111,41 @@ describe('buildMcpToolContent', () => {
     expect(uris[1]).toBe('attachment:///1-file');
     expect(uris[2]).toBe('attachment:///2-a%20report.txt'); // URI-encoded
   });
+
+  it('never throws or emits undefined text for a cyclic (unserializable) result', () => {
+    const cyclic: Record<string, unknown> = { note: 'hi' };
+    cyclic.self = cyclic;
+    const blocks = buildMcpToolContent(cyclic);
+    const textBlock = blocks.find((b) => b.type === 'text') as { type: 'text'; text: string } | undefined;
+    expect(textBlock).toBeDefined();
+    expect(typeof textBlock!.text).toBe('string'); // never undefined / no throw
+  });
+});
+
+describe('extractModelContent hardening', () => {
+  it('strips a malformed (non-array) _modelContent from the visible result', () => {
+    const { modelContent, cleaned } = extractModelContent({ ok: true, _modelContent: 'oops-not-an-array' });
+    expect(modelContent).toBeNull();
+    expect(cleaned).toEqual({ ok: true }); // reserved field removed even though malformed
+  });
+
+  it('rejects a file part with a non-string filename (would crash encodeURIComponent)', () => {
+    const { modelContent } = extractModelContent({
+      _modelContent: [{ type: 'file', data: 'AAAA', mediaType: 'application/pdf', filename: { evil: 1 } }],
+    });
+    expect(modelContent).toBeNull(); // dropped by validation
+  });
+
+  it('rejects image/file parts with empty data', () => {
+    const { modelContent } = extractModelContent({
+      _modelContent: [{ type: 'image', data: '', mediaType: 'image/png' }],
+    });
+    expect(modelContent).toBeNull();
+  });
+
+  it('caps the number of model-content parts kept', () => {
+    const many = Array.from({ length: 100 }, (_, i) => ({ type: 'text', text: `t${i}` }));
+    const { modelContent } = extractModelContent({ _modelContent: many });
+    expect(modelContent!.length).toBeLessThanOrEqual(64);
+  });
 });

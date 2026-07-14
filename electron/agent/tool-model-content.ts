@@ -50,9 +50,29 @@ function isModelContentPart(v: unknown): v is ModelContentPart {
   const p = v as Record<string, unknown>;
   if (p.type === 'text') return typeof p.text === 'string';
   if (p.type === 'image' || p.type === 'file') {
-    return typeof p.data === 'string' && typeof p.mediaType === 'string';
+    // Require non-empty base64 data + a media type. For files, an optional
+    // filename must be a string (a non-string would crash encodeURIComponent
+    // downstream when building the MCP resource uri).
+    if (typeof p.data !== 'string' || !p.data || typeof p.mediaType !== 'string' || !p.mediaType) return false;
+    if (p.filename !== undefined && typeof p.filename !== 'string') return false;
+    return true;
   }
   return false;
+}
+
+/** Max number of model-content parts kept from one tool result (DoS guard: a
+ *  tool returning thousands of parts shouldn't blow the input/token budget). */
+const MAX_PARTS = 64;
+
+/** JSON.stringify that never throws (cyclic/unsupported) or returns undefined —
+ *  the MCP text block must always be a string. */
+function safeJsonStringify(value: unknown): string {
+  try {
+    const s = JSON.stringify(value);
+    return s ?? '';
+  } catch {
+    return '[unserializable tool result]';
+  }
 }
 
 /**
@@ -70,15 +90,20 @@ export function extractModelContent(result: unknown): {
     return { modelContent: null, cleaned: result };
   }
   const obj = result as Record<string, unknown>;
+  // No reserved field → return the SAME reference (no-op contract callers rely on).
+  if (!Object.hasOwn(obj, '_modelContent')) return { modelContent: null, cleaned: result };
   const raw = obj._modelContent;
-  if (!Array.isArray(raw)) return { modelContent: null, cleaned: result };
-
+  // The reserved field IS present — always strip it from the visible result,
+  // even when it's malformed (non-array), so a bad `_modelContent` can't leak
+  // into the JSON the model sees.
   const { _modelContent, ...rest } = obj;
   void _modelContent;
+  if (!Array.isArray(raw)) return { modelContent: null, cleaned: rest };
 
   const parts: ModelContentPart[] = [];
   let total = 0;
   for (const item of raw) {
+    if (parts.length >= MAX_PARTS) break; // cap part count (DoS guard)
     if (!isModelContentPart(item)) continue;
     if (item.type === 'text') {
       parts.push(item);
@@ -133,7 +158,7 @@ export function buildMcpToolContent(result: unknown): McpContentBlock[] {
   // Emit the JSON/text block when there are structured fields, or when there's
   // no media at all (so an empty result still yields one text block).
   if (cleanedHasFields || !modelContent) {
-    blocks.push({ type: 'text', text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned) });
+    blocks.push({ type: 'text', text: typeof cleaned === 'string' ? cleaned : safeJsonStringify(cleaned) });
   }
   let fileIndex = 0;
   for (const part of modelContent ?? []) {
