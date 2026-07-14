@@ -40,6 +40,12 @@ type StreamEvent = {
   error?: string;
   durationMs?: number;
   data?: unknown;
+  // Sub-agent events are scoped to the SUB-agent's conversationId, but carry the
+  // parent so a client viewing the parent can surface their progress.
+  subAgentConversationId?: string;
+  parentConversationId?: string;
+  status?: string;
+  summary?: string;
 };
 
 // ask_user tool args: questions rendered as sequential pickers in the REPL.
@@ -424,7 +430,21 @@ export function App({
       cliDebugLog(
         `[CLI-EVT] type=${e?.type} evConv=${e?.conversationId} myConv=${convIdRef.current} pass=${!!e && e.conversationId === convIdRef.current} streamLen=${streamingRef.current.length}`,
       );
-      if (!e || e.conversationId !== convIdRef.current) return;
+      if (!e) return;
+      // Sub-agent events are scoped to the SUB-agent's conversationId (so the
+      // main-conversation guard below would drop them), but carry the parent id.
+      // Surface a dim status note when a sub-agent of THIS conversation changes
+      // state, so a CLI user sees sub-agent activity (the GUI shows a nested
+      // view; the CLI at least reflects lifecycle). Only status transitions are
+      // surfaced — full nested output would be noisy in a flat REPL.
+      if (e.type === 'sub-agent-status' && e.parentConversationId === convIdRef.current) {
+        const id = (e.subAgentConversationId ?? '').slice(0, 8);
+        const st = e.status ?? 'running';
+        const suffix = e.summary ? ` — ${e.summary}` : '';
+        pushTurn({ kind: 'note', text: `↳ sub-agent ${id} ${st}${suffix}` });
+        return;
+      }
+      if (e.conversationId !== convIdRef.current) return;
       switch (e.type) {
         case 'user-message': {
           // A user turn submitted into THIS conversation (the guard above already
