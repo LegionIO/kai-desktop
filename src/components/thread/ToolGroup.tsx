@@ -470,8 +470,13 @@ export const ToolCallDisplay: FC<{
           <RuntimeSwitchInlineView part={part} isRunning={isRunning} />
         ) : isAskUser && isError ? (
           <AskUserErrorView result={part.result} />
-        ) : isAskUser && hasResult && !isError ? (
+        ) : isAskUser && hasResult && !isError && askUserResultHasAnswers(part.result) ? (
           <AskUserAnswersView args={part.args} result={part.result} />
+        ) : isAskUser ? (
+          // No consumable answers (e.g. a headless run that raised an Alert, or
+          // a suspended/awaiting turn) — show the questions being asked instead
+          // of an empty body.
+          <ReviewRequestView args={part.args} result={part.result} />
         ) : isRequestReview ? (
           <ReviewRequestView args={part.args} result={part.result} />
         ) : (
@@ -610,13 +615,23 @@ const AskUserErrorView: FC<{ result: unknown }> = ({ result }) => {
 const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, result }) => {
   const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
   const kind = typeof a.kind === 'string' ? a.kind : 'review';
+  // ask_user has no `kind`/`title`/`message` — it only carries `questions`.
+  const isAskUserShape = a.kind === undefined && Array.isArray(a.questions);
   const title = typeof a.title === 'string' ? a.title : '';
   const message = typeof a.message === 'string' ? a.message : '';
   const approvalAction = typeof a.approvalAction === 'string' ? a.approvalAction : '';
   const questions = parseQuestions(args);
   const r = (result && typeof result === 'object' && !Array.isArray(result) ? result : {}) as Record<string, unknown>;
-  const suspend = r.suspend === true || r.alerted === true;
-  const label = kind === 'fyi' ? 'FYI' : kind === 'approval' ? 'Approval requested' : 'Question raised';
+  const suspend = r.suspend === true || r.suspended === true || r.alerted === true;
+  const label = isAskUserShape
+    ? questions.length === 1
+      ? 'Asked the user'
+      : `Asked the user ${questions.length} questions`
+    : kind === 'fyi'
+      ? 'FYI'
+      : kind === 'approval'
+        ? 'Approval requested'
+        : 'Question raised';
 
   return (
     <div className="tool-detail-code ml-5 mt-1 mb-2 space-y-2 pl-3 text-xs">
@@ -658,6 +673,36 @@ const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, resul
     </div>
   );
 };
+
+/** True if an ask_user result actually carries user answers (vs. a headless
+ *  {suspended} result or an empty/awaiting shape). */
+function askUserResultHasAnswers(result: unknown): boolean {
+  const pick = (o: unknown): unknown =>
+    o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>).answers : undefined;
+  let answers = pick(result);
+  if (answers === undefined && Array.isArray(result)) {
+    for (const item of result) {
+      if (item && typeof item === 'object' && (item as Record<string, unknown>).type === 'text') {
+        const text = (item as Record<string, unknown>).text;
+        if (typeof text === 'string') {
+          try {
+            answers = pick(JSON.parse(text));
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+  }
+  if (typeof answers === 'string') {
+    try {
+      answers = JSON.parse(answers);
+    } catch {
+      return false;
+    }
+  }
+  return !!answers && typeof answers === 'object' && Object.keys(answers as object).length > 0;
+}
 
 /** Renders submitted Q&A pairs from a completed ask_user result */
 const AskUserAnswersView: FC<{ args: unknown; result: unknown }> = ({ args, result }) => {
