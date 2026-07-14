@@ -935,6 +935,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           let settled = false;
           let wasShown = showOnCreate;
           let revealTimer: NodeJS.Timeout | null = null;
+          // Guard so a stale-session callback bounce only triggers one reveal-and-reload
+          // (avoids a redirect loop if the IdP keeps bouncing to the tokenless callback).
+          let hiddenRedirectRecovered = false;
 
           const ses = partition ? session.fromPartition(partition) : undefined;
           if (ses) configureSessionCookiePromotion(ses, options.cookiePromotion);
@@ -1035,6 +1038,28 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
                     params[key] = value;
                   }
                 });
+
+                // A hidden-first auth attempt loads the auth URL invisibly, hoping an
+                // existing session silently redirects to the callback WITH the expected
+                // params (e.g. a token). If the IdP instead bounces to the callback with
+                // none of them (stale/expired session, `?error=login_required`, etc.),
+                // this is NOT a completed sign-in — treating it as success resolves a
+                // tokenless result and the window never reveals, so the user never sees
+                // the login form. In that case, let the reveal proceed (show the window
+                // for interactive login) rather than settling a bogus success.
+                const gotExpectedParams = extractParams
+                  ? extractParams.some((k) => params[k] !== undefined && params[k] !== '')
+                  : Object.keys(params).length > 0;
+                if (!wasShown && !gotExpectedParams && !hiddenRedirectRecovered) {
+                  hiddenRedirectRecovered = true;
+                  // Reload the login form (the callback page itself is an error/empty
+                  // bounce or a dead localhost callback) and reveal for interactive login.
+                  authWin.loadURL(url).catch(() => {
+                    /* if reload fails, revealWindow still surfaces whatever loaded */
+                  });
+                  revealWindow();
+                  return;
+                }
 
                 clearRevealTimer();
                 settled = true;
