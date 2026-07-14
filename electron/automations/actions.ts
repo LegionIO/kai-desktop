@@ -49,6 +49,57 @@ export function abortAutomationRun(conversationId: string): boolean {
   return true;
 }
 
+/**
+ * Run one agent turn on an EXISTING conversation with a plain-text prompt, reusing
+ * the automation agent-run machinery (append user turn → stream response → persist
+ * → broadcast live). Used by the Alerts feature to RESUME a suspended run after the
+ * user answers a question / decides an approval: the answer is re-injected as a new
+ * user message and the agent continues from there.
+ *
+ * Thin wrapper over `runAgentAction`: it synthesizes a minimal `agent` action
+ * targeting `conversationId` (mode:'conversation', tools on, history included) plus
+ * a synthetic rule/event/ctx. The prompt is passed as a literal (no `{{ }}`
+ * interpolation) so answer text can't be misread as a template.
+ */
+export async function resumeConversationWithMessage(
+  conversationId: string,
+  promptText: string,
+  deps: ActionDeps,
+  opts?: { modelKey?: string; profileKey?: string; tools?: boolean },
+): Promise<unknown> {
+  const action: Extract<AutomationAction, { type: 'agent' }> = {
+    type: 'agent',
+    mode: 'conversation',
+    prompt: promptText,
+    tools: opts?.tools ?? true,
+    conversationTarget: { type: 'existing', conversationId },
+    includeHistory: true,
+    ...(opts?.modelKey ? { modelKey: opts.modelKey } : {}),
+    ...(opts?.profileKey ? { profileKey: opts.profileKey } : {}),
+  };
+  const rule: AutomationRule = {
+    id: `alert-resume-${conversationId}`,
+    name: 'Alert answer',
+    enabled: true,
+    trigger: { source: 'alerts', event: 'answered' },
+    conditions: [],
+    conditionMode: 'all',
+    actions: [action],
+    debounceMs: 0,
+  };
+  const event: AutomationEvent = {
+    key: `alert-resume:${conversationId}`,
+    source: 'alerts',
+    event: 'answered',
+    payload: null,
+    ts: Date.now(),
+    depth: 0,
+  };
+  // Empty ctx: the prompt is a literal, no template substitution wanted.
+  const ctx: InterpolationCtx = { payload: null, result: [], source: 'alerts', event: 'answered' };
+  return runAgentAction(action, ctx, rule, event, deps);
+}
+
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
 /** Cap the template length: the `{{…}}` regex is quadratic on many unmatched
  *  `{{`, so a pathological user template shouldn't be able to pin the main

@@ -38,6 +38,7 @@ function makeEngine(rules: AutomationRule[], over: Partial<EngineDeps> = {}) {
     rules,
     log: { maxEntries: 50 },
     approvalMode: 'prompt-user',
+    surfaceAlertsAsModal: false,
   };
   const handlePluginAction = vi.fn(async () => 'ok');
   const deps: EngineDeps = {

@@ -108,6 +108,22 @@ const appAPI = {
       ipcRenderer.invoke('conversations:switch-variant', conversationId, variantId),
   },
 
+  alerts: {
+    list: (openOnly?: boolean) => ipcRenderer.invoke('alerts:list', openOnly),
+    get: (id: string) => ipcRenderer.invoke('alerts:get', id),
+    unreadCount: () => ipcRenderer.invoke('alerts:unreadCount') as Promise<number>,
+    answer: (id: string, answer: Record<string, string>) =>
+      ipcRenderer.invoke('alerts:answer', id, answer) as Promise<{ ok: boolean; error?: string }>,
+    decide: (id: string, decision: 'approve' | 'deny') =>
+      ipcRenderer.invoke('alerts:decide', id, decision) as Promise<{ ok: boolean; error?: string }>,
+    dismiss: (id: string) => ipcRenderer.invoke('alerts:dismiss', id) as Promise<{ ok: boolean; error?: string }>,
+    onChanged: (callback: (payload: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);
+      ipcRenderer.on('alerts:changed', handler);
+      return () => ipcRenderer.removeListener('alerts:changed', handler);
+    },
+  },
+
   workspaces: {
     create: (args: { name: string; directory: string }) => ipcRenderer.invoke('workspaces:create', args),
     rename: (args: { id: string; name: string }) => ipcRenderer.invoke('workspaces:rename', args),

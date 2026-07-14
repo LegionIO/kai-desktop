@@ -802,6 +802,12 @@ const automationsConfigSchema = z.object({
    *  - block: always denied for the agent.
    */
   approvalMode: z.enum(['auto-allow', 'prompt-user', 'block']).default('prompt-user'),
+  /**
+   * When on, a new question/approval Alert (raised by a headless automation run
+   * needing the user) pops a front-most, focused modal for immediate action —
+   * instead of only an OS notification + the Alerts tab badge. Default off.
+   */
+  surfaceAlertsAsModal: z.boolean().default(false),
 });
 
 export type AutomationCondition = z.infer<typeof automationConditionSchema>;
@@ -993,6 +999,7 @@ export const appConfigSchema = z.object({
     rules: [],
     log: { maxEntries: 200 },
     approvalMode: 'prompt-user',
+    surfaceAlertsAsModal: false,
   }),
   hooks: hooksConfigSchema,
 });

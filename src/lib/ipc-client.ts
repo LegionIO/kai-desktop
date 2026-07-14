@@ -14,10 +14,15 @@ import type { AdapterCapabilities, PlatformPermissions } from '../../electron/pl
 import type { PlatformCapabilities } from '../../electron/platform/capabilities';
 import type { ConversationChange } from '../../electron/ipc/conversations';
 import type { CliInstallStatus } from '../../electron/ipc/cli-install';
+import type { Alert, AlertIndexEntry } from '../../electron/ipc/alert-store';
 
 export type { ConversationChange } from '../../electron/ipc/conversations';
 export type { ConversationRecord } from '../../electron/ipc/conversation-store';
 export type { CliInstallStatus } from '../../electron/ipc/cli-install';
+export type { Alert, AlertIndexEntry, AlertKind, AlertStatus, AlertQuestion } from '../../electron/ipc/alert-store';
+
+/** Payload pushed on `alerts:changed` — the reason + the affected alert. */
+export type AlertsChangedPayload = { reason: 'created' | 'resolved' | 'dismissed'; alert?: Alert };
 
 export type AutomationSourceCatalogEntry = {
   source: string;
@@ -112,6 +117,15 @@ type AppAPI = {
       conversationId: string,
       variantId: string,
     ) => Promise<{ ok: boolean; conversation?: unknown; error?: string }>;
+  };
+  alerts: {
+    list: (openOnly?: boolean) => Promise<AlertIndexEntry[]>;
+    get: (id: string) => Promise<Alert | null>;
+    unreadCount: () => Promise<number>;
+    answer: (id: string, answer: Record<string, string>) => Promise<{ ok: boolean; error?: string }>;
+    decide: (id: string, decision: 'approve' | 'deny') => Promise<{ ok: boolean; error?: string }>;
+    dismiss: (id: string) => Promise<{ ok: boolean; error?: string }>;
+    onChanged: (callback: (payload: AlertsChangedPayload) => void) => () => void;
   };
   workspaces: {
     create: (args: { name: string; directory: string }) => Promise<unknown>;

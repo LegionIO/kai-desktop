@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
 import { createAlert, type AlertQuestion } from '../ipc/alert-store.js';
+import { notifyAlertCreated } from '../ipc/alert-notify.js';
 
 /**
  * `request_review` — lets an agent (especially a headless AUTOMATION run) raise a
@@ -78,6 +79,9 @@ export function createRequestReviewTool(appHome: string): ToolDefinition {
         ...(kind === 'question' && questions ? { questions } : {}),
         ...(kind === 'approval' && approvalAction ? { approvalAction } : {}),
       });
+      // Fire the OS notification + UI broadcast (no-op in tests / before the
+      // alerts IPC layer has registered its handler).
+      notifyAlertCreated(alert);
 
       // fyi is non-blocking: the run continues. question/approval have no
       // synchronous answer — signal the run to wind down (suspended pending user).

@@ -44,6 +44,8 @@ import { registerAppshotHandlers } from './ipc/appshots.js';
 import { registerDiffHandlers } from './ipc/diffs.js';
 import { registerArtifactBundleHandlers } from './ipc/artifact-bundle.js';
 import { registerAutomationsHandlers } from './ipc/automations.js';
+import { initializeAlerts, registerAlertsHandlers } from './ipc/alerts.js';
+import type { PluginActionPayload } from './plugins/types.js';
 import { eventBus } from './automations/event-bus.js';
 import { registerBuiltinSources } from './automations/builtin-sources.js';
 import { getAutomationEngine, initializeAutomationEngine } from './automations/engine.js';
@@ -1608,16 +1610,26 @@ if (gotSingleInstanceLock) {
         console.warn(`[${__BRAND_PRODUCT_NAME}] Workspace tool init for automations failed (non-fatal):`, err);
       }
     })();
-    const automationEngine = initializeAutomationEngine({
+    const automationDeps = {
       bus: eventBus,
       appHome: APP_HOME,
       getConfig,
       getAutomationsConfig: () => getConfig().automations,
       getRegisteredTools,
       getWorkspaceTools: getWorkspaceToolDefinitions,
-      handlePluginAction: (payload) => pluginManager.handleAction(payload),
-    });
+      handlePluginAction: (payload: PluginActionPayload) => pluginManager.handleAction(payload),
+    };
+    const automationEngine = initializeAutomationEngine(automationDeps);
     registerAutomationsHandlers(ipcMain, automationEngine, eventBus);
+
+    // Alerts: reuse the automation action deps to resume a conversation after
+    // the user answers an alert (request_review / ask_user headless fallback).
+    initializeAlerts({
+      appHome: APP_HOME,
+      getActionDeps: () => automationDeps,
+      surfaceAsModal: () => !!getConfig().automations?.surfaceAlertsAsModal,
+    });
+    registerAlertsHandlers(ipcMain);
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());

@@ -399,6 +399,15 @@ export function getBridgeScript(): string {
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       onChanged: function(cb) { return on('conversations:changed', cb); }
     },
+    alerts: {
+      list: function(openOnly) { return invoke('alerts:list', openOnly); },
+      get: function(id) { return invoke('alerts:get', id); },
+      unreadCount: function() { return invoke('alerts:unreadCount'); },
+      answer: function(id, answer) { return invoke('alerts:answer', id, answer); },
+      decide: function(id, decision) { return invoke('alerts:decide', id, decision); },
+      dismiss: function(id) { return invoke('alerts:dismiss', id); },
+      onChanged: function(cb) { return on('alerts:changed', cb); }
+    },
     diffs: {
       listForConversation: function(id) { return invoke('diffs:list', id); },
       get: function(id, path) { return invoke('diffs:get', id, path); },
