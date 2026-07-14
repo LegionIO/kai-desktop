@@ -1043,21 +1043,30 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
                 // existing session silently redirects to the callback WITH the expected
                 // params (e.g. a token). If the IdP instead bounces to the callback with
                 // none of them (stale/expired session, `?error=login_required`, etc.),
-                // this is NOT a completed sign-in — treating it as success resolves a
-                // tokenless result and the window never reveals, so the user never sees
-                // the login form. In that case, let the reveal proceed (show the window
-                // for interactive login) rather than settling a bogus success.
+                // this is NOT a completed sign-in.
                 const gotExpectedParams = extractParams
                   ? extractParams.some((k) => params[k] !== undefined && params[k] !== '')
                   : Object.keys(params).length > 0;
+
+                // First hidden tokenless bounce: reload the login form + reveal the
+                // window for interactive login (never settle a bogus success while
+                // the user never saw a form).
                 if (!wasShown && !gotExpectedParams && !hiddenRedirectRecovered) {
                   hiddenRedirectRecovered = true;
-                  // Reload the login form (the callback page itself is an error/empty
-                  // bounce or a dead localhost callback) and reveal for interactive login.
                   authWin.loadURL(url).catch(() => {
                     /* if reload fails, revealWindow still surfaces whatever loaded */
                   });
                   revealWindow();
+                  return;
+                }
+
+                // When the caller declared the params it needs (extractParams), a
+                // callback missing ALL of them is a failed/error bounce — settle a
+                // FAILURE, never a tokenless "success". (When no extractParams were
+                // declared, reaching the callback is itself the success signal, so
+                // the legacy behavior is preserved.)
+                if (extractParams && extractParams.length > 0 && !gotExpectedParams) {
+                  settle({ success: false, error: 'Authentication did not complete (no credentials returned)' });
                   return;
                 }
 

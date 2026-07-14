@@ -148,14 +148,21 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
 
   ipcMain.handle('alerts:answer', async (_e, id: string, answer: Record<string, string>) => {
     if (!deps) return { ok: false, error: 'alerts not initialized' };
-    if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
-      return { ok: false, error: 'answer must be an object of { header: choice }' };
+    if (!isValidAlertId(id)) return { ok: false, error: 'invalid alert id' };
+    const clean = sanitizeAnswer(answer);
+    if (!clean) return { ok: false, error: 'answer must be an object of { header: choice } strings' };
+    // Enforce kind: only a `question` alert is answerable this way (an approval
+    // must go through alerts:decide). Prevents cross-kind resolution.
+    const existing = readAlert(deps.appHome, id);
+    if (!existing) return { ok: false, error: 'alert not found' };
+    if (existing.kind !== 'question') {
+      return { ok: false, error: `alert ${id} is a "${existing.kind}", not a question` };
     }
-    const resolved = resolveAlert(deps.appHome, id, answer);
-    if (!resolved) return { ok: false, error: 'alert not found or not open' };
+    const resolved = resolveAlert(deps.appHome, id, clean);
+    if (!resolved) return { ok: false, error: 'alert not open' };
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
     // Resume in the background; don't make the UI wait on a full agent turn.
-    void resume(resolved, formatAnswer(resolved, answer)).catch((err) => {
+    void resume(resolved, formatAnswer(resolved, clean)).catch((err) => {
       console.error('[alerts] resume after answer failed:', err);
     });
     return { ok: true };
@@ -163,11 +170,17 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
 
   ipcMain.handle('alerts:decide', async (_e, id: string, decision: 'approve' | 'deny') => {
     if (!deps) return { ok: false, error: 'alerts not initialized' };
+    if (!isValidAlertId(id)) return { ok: false, error: 'invalid alert id' };
     if (decision !== 'approve' && decision !== 'deny') {
       return { ok: false, error: "decision must be 'approve' or 'deny'" };
     }
+    const existing = readAlert(deps.appHome, id);
+    if (!existing) return { ok: false, error: 'alert not found' };
+    if (existing.kind !== 'approval') {
+      return { ok: false, error: `alert ${id} is a "${existing.kind}", not an approval` };
+    }
     const resolved = resolveAlert(deps.appHome, id, decision);
-    if (!resolved) return { ok: false, error: 'alert not found or not open' };
+    if (!resolved) return { ok: false, error: 'alert not open' };
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
     void resume(resolved, formatDecision(resolved, decision)).catch((err) => {
       console.error('[alerts] resume after decision failed:', err);
@@ -177,6 +190,7 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
 
   ipcMain.handle('alerts:dismiss', (_e, id: string) => {
     if (!deps) return { ok: false, error: 'alerts not initialized' };
+    if (!isValidAlertId(id)) return { ok: false, error: 'invalid alert id' };
     const dismissed = dismissAlert(deps.appHome, id);
     if (!dismissed) return { ok: false, error: 'alert not found' };
     broadcastAlertsChanged({ reason: 'dismissed', alert: dismissed });
@@ -184,5 +198,25 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
   });
 }
 
-/** Pure formatters exposed for unit tests. */
-export const __internal = { formatAnswer, formatDecision };
+/** Alert ids are UUIDs from randomUUID(); reject anything else (bounds + shape). */
+function isValidAlertId(id: unknown): id is string {
+  return typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
+/** Coerce an answer map to bounded `{ header: choice }` strings, or null if invalid.
+ *  Guards against non-string/nested/oversized values reaching the store + resume prompt. */
+function sanitizeAnswer(answer: unknown): Record<string, string> | null {
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return null;
+  const entries = Object.entries(answer as Record<string, unknown>);
+  if (entries.length === 0 || entries.length > 20) return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of entries) {
+    if (typeof k !== 'string' || k.length > 200) return null;
+    if (typeof v !== 'string' || v.length > 2000) return null;
+    out[k] = v;
+  }
+  return out;
+}
+
+/** Pure formatters + validators exposed for unit tests. */
+export const __internal = { formatAnswer, formatDecision, isValidAlertId, sanitizeAnswer };

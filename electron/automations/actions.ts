@@ -97,7 +97,7 @@ export async function resumeConversationWithMessage(
   };
   // Empty ctx: the prompt is a literal, no template substitution wanted.
   const ctx: InterpolationCtx = { payload: null, result: [], source: 'alerts', event: 'answered' };
-  return runAgentAction(action, ctx, rule, event, deps);
+  return runAgentAction(action, ctx, rule, event, deps, { literalPrompt: true, strictExistingTarget: true });
 }
 
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
@@ -219,9 +219,17 @@ async function runAgentAction(
   rule: AutomationRule,
   event: AutomationEvent,
   deps: ActionDeps,
+  opts?: {
+    /** Treat `action.prompt` as literal text — skip `{{ }}` interpolation (used
+     *  by alert resume, where the user's answer must not be read as a template). */
+    literalPrompt?: boolean;
+    /** For `{type:'existing'}`: if the target is missing/busy, THROW instead of
+     *  silently diverting to a new conversation (which would misroute the turn). */
+    strictExistingTarget?: boolean;
+  },
 ): Promise<unknown> {
   const config = deps.getConfig();
-  const prompt = interpolateString(action.prompt, ctx);
+  const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
   const tools = action.tools ? deps.getRegisteredTools() : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
@@ -241,6 +249,14 @@ async function runAgentAction(
   }
 
   const resolved = resolveConversationTarget(action, rule, deps.appHome, title);
+  if (opts?.strictExistingTarget && action.conversationTarget?.type === 'existing' && !resolved) {
+    // The caller demanded a specific existing conversation but it's gone/busy.
+    // Diverting to a new chat would misroute the turn (e.g. an answered alert),
+    // so fail loudly rather than silently spawn a duplicate.
+    const targetId =
+      action.conversationTarget.type === 'existing' ? action.conversationTarget.conversationId : '(unknown)';
+    throw new Error(`Target conversation ${targetId} is missing or busy; not diverting to a new conversation.`);
+  }
   // Ensure a target conversation exists up front so the user prompt (and the
   // live stream) can render immediately instead of after generation.
   let conversationId = resolved?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
