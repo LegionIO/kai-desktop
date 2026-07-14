@@ -95,4 +95,21 @@ describe('analyzeCompletion', () => {
       expect(r.nextStatus).toBe('ai_review');
     });
   });
+
+  describe('unknown / non-numeric exit (killed session, missing code)', () => {
+    it('blocks a NaN exit code instead of treating it as a soft failure', () => {
+      const r = analyzeCompletion(Number.NaN, agent, task, cfg());
+      expect(r.nextStatus).toBe('blocked');
+      expect(r.wasCrash).toBe(true);
+    });
+
+    it('blocks a non-finite (Infinity) exit code', () => {
+      expect(analyzeCompletion(Number.POSITIVE_INFINITY, agent, task, cfg()).nextStatus).toBe('blocked');
+    });
+
+    it('a killed session (NaN) with reviewers still blocks — does not enter ai_review', () => {
+      const r = analyzeCompletion(Number.NaN, agent, task, cfg({ reviewerAgentIds: ['rev-1'] }));
+      expect(r.nextStatus).toBe('blocked');
+    });
+  });
 });

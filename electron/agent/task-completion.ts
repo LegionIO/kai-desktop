@@ -55,6 +55,15 @@ export function analyzeCompletion(
     return { nextStatus: 'blocked', wasTimeout: true, blockedReason: `Timeout after ${retryCount + 1} attempts` };
   }
 
+  // Unknown / non-numeric exit (signal-killed session, missing exit code): do
+  // NOT fall through to the exit-1 soft-failure path (which would send a run
+  // that never cleanly finished to review as a retry candidate). Block it so a
+  // human sees it. Must come BEFORE the numeric comparisons — NaN fails every
+  // comparison and would otherwise slip to the final ai_review return.
+  if (!Number.isFinite(exitCode)) {
+    return { nextStatus: 'blocked', wasCrash: true, blockedReason: 'Process ended with no exit code (killed?)' };
+  }
+
   // Crash: immediately block
   if (exitCode > 1 || exitCode < 0) {
     return { nextStatus: 'blocked', wasCrash: true, blockedReason: `Process crashed (exit code ${exitCode})` };
