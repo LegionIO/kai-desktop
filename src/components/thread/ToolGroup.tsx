@@ -499,6 +499,17 @@ export const ToolCallDisplay: FC<{
               </ToolSection>
             )}
 
+            {/* Input section — the tool's args, tucked inside the expanded card.
+                The specialized tool views (bash/edit/read/…) surface their own
+                inputs; this generic fallback previously showed only the Result,
+                so tools like updateWorkingMemory hid their (meaningful) inputs.
+                Shown only when there are non-empty args. */}
+            {hasDisplayableArgs(part.args) && (
+              <ToolSection title="Input">
+                <CodeBlock code={part.argsText ?? formatResult(part.args)} language="json" />
+              </ToolSection>
+            )}
+
             {/* Result section — with compacted/original toggle when available */}
             {hasResult && (
               <ToolSection
@@ -3590,6 +3601,16 @@ const MiniCodePreview: FC<{ lines: MiniPreviewLine[]; language: string }> = ({ l
     </div>
   );
 };
+
+/**
+ * True only for a tool-call args value that has something worth showing — a
+ * non-empty object. Empty/absent args (many tools take none) get no "Input"
+ * section so the expanded card isn't cluttered with `{}`.
+ */
+function hasDisplayableArgs(args: unknown): boolean {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return Boolean(args);
+  return Object.keys(args as Record<string, unknown>).length > 0;
+}
 
 function formatResult(result: unknown): string {
   const sanitized = sanitizeResultForDisplay(result);
