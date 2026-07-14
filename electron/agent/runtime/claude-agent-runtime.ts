@@ -29,7 +29,7 @@ import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } fr
 import { detectClaudeAgentSdk, resolveClaudeCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
-import { extractModelContent } from '../tool-model-content.js';
+import { buildMcpToolContent } from '../tool-model-content.js';
 import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
@@ -1160,31 +1160,8 @@ function createToolHandler(
             (result as { error: string }).error.length > 0));
 
       // Peel off any model-visible media (images / files) into native MCP
-      // content blocks; the rest becomes the usual JSON/text block.
-      const { modelContent, cleaned } = extractModelContent(result);
-      const content: CallToolResult['content'] = [];
-      const cleanedHasFields =
-        cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
-      if (cleanedHasFields || !modelContent) {
-        content.push({
-          type: 'text',
-          text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned),
-        });
-      }
-      for (const part of modelContent ?? []) {
-        if (part.type === 'text') content.push({ type: 'text', text: part.text });
-        else if (part.type === 'image') content.push({ type: 'image', data: part.data, mimeType: part.mediaType });
-        else {
-          content.push({
-            type: 'resource',
-            resource: {
-              blob: part.data,
-              mimeType: part.mediaType,
-              uri: `attachment:///${part.filename ?? 'file'}`,
-            },
-          });
-        }
-      }
+      // content blocks (shared helper — unique resource URIs, size caps).
+      const content = buildMcpToolContent(result);
       return { content, ...(resultIsError ? { isError: true } : {}) };
     } catch (err) {
       return {

@@ -106,3 +106,47 @@ export function extractModelContent(result: unknown): {
 
   return { modelContent: parts.length > 0 ? parts : null, cleaned: rest };
 }
+
+/** An MCP tool-result content block (text / image / embedded binary resource). */
+export type McpContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
+  | { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } };
+
+/**
+ * Convert a tool result into MCP content blocks: a leading text/JSON block for
+ * the structured (non-media) fields, then native image/resource blocks for any
+ * `_modelContent`. Shared by all three MCP-shaped runtime bridges
+ * (tool-mcp-bridge, codex-mcp-bridge, claude-agent-runtime) so the extraction +
+ * block-shaping logic lives in one place.
+ *
+ * File resources get a UNIQUE `uri` (per-result index + URI-encoded filename) —
+ * multiple unnamed or same-named files must not collide on `attachment:///file`,
+ * since an MCP client may dedupe identical resource identifiers and silently
+ * drop attachments.
+ */
+export function buildMcpToolContent(result: unknown): McpContentBlock[] {
+  const { modelContent, cleaned } = extractModelContent(result);
+  const blocks: McpContentBlock[] = [];
+  const cleanedHasFields =
+    cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
+  // Emit the JSON/text block when there are structured fields, or when there's
+  // no media at all (so an empty result still yields one text block).
+  if (cleanedHasFields || !modelContent) {
+    blocks.push({ type: 'text', text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned) });
+  }
+  let fileIndex = 0;
+  for (const part of modelContent ?? []) {
+    if (part.type === 'text') blocks.push({ type: 'text', text: part.text });
+    else if (part.type === 'image') blocks.push({ type: 'image', data: part.data, mimeType: part.mediaType });
+    else {
+      const name = part.filename ? encodeURIComponent(part.filename) : 'file';
+      blocks.push({
+        type: 'resource',
+        resource: { blob: part.data, mimeType: part.mediaType, uri: `attachment:///${fileIndex}-${name}` },
+      });
+      fileIndex += 1;
+    }
+  }
+  return blocks;
+}

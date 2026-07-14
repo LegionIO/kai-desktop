@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractModelContent } from '../tool-model-content.js';
+import { extractModelContent, buildMcpToolContent } from '../tool-model-content.js';
 
 describe('extractModelContent', () => {
   it('passes through results without _modelContent', () => {
@@ -65,5 +65,50 @@ describe('extractModelContent', () => {
       _modelContent: [{ type: 'image', data: 'data:image/png;base64,AAAA', mediaType: 'image/png' }],
     });
     expect(modelContent![0].type).toBe('image');
+  });
+});
+
+describe('buildMcpToolContent', () => {
+  it('emits a single text block for a plain (no-media) result', () => {
+    const blocks = buildMcpToolContent({ ok: true, note: 'done' });
+    expect(blocks).toEqual([{ type: 'text', text: JSON.stringify({ ok: true, note: 'done' }) }]);
+  });
+
+  it('emits an image block + JSON text block, in order', () => {
+    const blocks = buildMcpToolContent({
+      caption: 'a chart',
+      _modelContent: [{ type: 'image', data: 'AAAA', mediaType: 'image/png' }],
+    });
+    expect(blocks).toEqual([
+      { type: 'text', text: JSON.stringify({ caption: 'a chart' }) },
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+    ]);
+  });
+
+  it('omits the JSON block when _modelContent is the only field', () => {
+    const blocks = buildMcpToolContent({
+      _modelContent: [{ type: 'image', data: 'AAAA', mediaType: 'image/png' }],
+    });
+    expect(blocks).toEqual([{ type: 'image', data: 'AAAA', mimeType: 'image/png' }]);
+  });
+
+  it('gives every file resource a UNIQUE uri (no attachment:///file collision)', () => {
+    const blocks = buildMcpToolContent({
+      _modelContent: [
+        { type: 'file', data: 'AAAA', mediaType: 'application/pdf' }, // unnamed
+        { type: 'file', data: 'BBBB', mediaType: 'application/pdf' }, // unnamed → would collide
+        { type: 'file', data: 'CCCC', mediaType: 'text/plain', filename: 'a report.txt' }, // spaces → must encode
+      ],
+    });
+    const uris = blocks
+      .filter(
+        (b): b is { type: 'resource'; resource: { blob: string; mimeType: string; uri: string } } =>
+          b.type === 'resource',
+      )
+      .map((b) => b.resource.uri);
+    expect(new Set(uris).size).toBe(3); // all distinct
+    expect(uris[0]).toBe('attachment:///0-file');
+    expect(uris[1]).toBe('attachment:///1-file');
+    expect(uris[2]).toBe('attachment:///2-a%20report.txt'); // URI-encoded
   });
 });

@@ -18,7 +18,7 @@ import { createServer, type Server as HttpServer } from 'http';
 import { randomUUID } from 'crypto';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
 import { MAX_TOOL_NAME_LENGTH, makeSafeToolName } from '../../tools/naming.js';
-import { extractModelContent } from '../tool-model-content.js';
+import { buildMcpToolContent } from '../tool-model-content.js';
 
 // ---------------------------------------------------------------------------
 // Types (dynamic imports — avoid hard compile-time dependency on MCP SDK)
@@ -339,31 +339,8 @@ export class CodexMcpBridge {
           // must surface as an MCP error, not a successful call — otherwise Codex
           // treats a failed tool as success.
           const isErr = isErrorResult(result);
-          const { modelContent, cleaned } = extractModelContent(result);
-          const content: Array<Record<string, unknown> & { type: string }> = [];
-          const cleanedHasFields =
-            cleaned && typeof cleaned === 'object' ? Object.keys(cleaned as object).length > 0 : cleaned != null;
-          if (cleanedHasFields || !modelContent) {
-            content.push({
-              type: 'text',
-              text: typeof cleaned === 'string' ? cleaned : JSON.stringify(cleaned),
-            });
-          }
-          for (const part of modelContent ?? []) {
-            if (part.type === 'text') content.push({ type: 'text', text: part.text });
-            else if (part.type === 'image') {
-              content.push({ type: 'image', data: part.data, mimeType: part.mediaType });
-            } else {
-              content.push({
-                type: 'resource',
-                resource: {
-                  blob: part.data,
-                  mimeType: part.mediaType,
-                  uri: `attachment:///${part.filename ?? 'file'}`,
-                },
-              });
-            }
-          }
+          // Native MCP content blocks (shared helper — unique resource URIs).
+          const content = buildMcpToolContent(result);
           return { content, ...(isErr ? { isError: true } : {}) };
         } catch (error) {
           return {
