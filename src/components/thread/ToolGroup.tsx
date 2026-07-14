@@ -3639,11 +3639,18 @@ function formatResult(result: unknown): string {
 function sanitizeResultForDisplay(result: unknown): unknown {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
   const record = result as Record<string, unknown>;
-  const internalKeys = new Set(['observer', 'modelStream', '__compaction', '__executeToolCallId']);
-  const visibleEntries = Object.entries(record).filter(([key]) => !internalKeys.has(key));
+  // Internal / non-model-visible metadata that rides ALONGSIDE the real result:
+  // the explicit set below plus ANY underscore-prefixed key (_diffTracking,
+  // _modelContent, __compaction, __executeToolCallId, …). Stripping these first
+  // is what lets the { value } unwrap below fire — e.g. a workspace-command
+  // result is { value: "<stdout>", _diffTracking }, and without dropping
+  // _diffTracking the two-key object wouldn't unwrap → detectShResult finds no
+  // stdout → "No output" despite real output.
+  const internalKeys = new Set(['observer', 'modelStream']);
+  const visibleEntries = Object.entries(record).filter(([key]) => !internalKeys.has(key) && !key.startsWith('_'));
   const visible = Object.fromEntries(visibleEntries);
 
-  // Observer augmentation may wrap primitive results as { value, observer }.
+  // Observer/wrapper augmentation may wrap the real result as { value, ...meta }.
   if ('value' in visible && Object.keys(visible).length === 1) {
     return visible.value;
   }
@@ -3665,3 +3672,8 @@ function formatLiveOutput(output?: {
   if (output.stopped) chunks.push('[streaming stopped at max output]');
   return chunks.join('\n\n') || '[no output yet]';
 }
+
+/** Exposed for unit tests: the wrapper-unwrap sanitizer + shell-result shape
+ *  detection that together decide whether a bash tool renders stdout or the
+ *  "No output" fallback. */
+export const __internal = { detectShResult, sanitizeResultForDisplay };
