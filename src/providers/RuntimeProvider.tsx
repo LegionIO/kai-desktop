@@ -319,6 +319,24 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 }
 
 /**
+ * True when the last turn in `branch` is already a user message whose text
+ * equals `text`. Used to dedup a broadcast `user-message` (from the `kai` CLI
+ * or a second GUI window) against THIS window's own just-submitted turn — the
+ * originating window already has that turn in its tree, so inserting the echo
+ * would double it. A peer's turn has no such matching last-user turn, so it's
+ * not a duplicate and renders immediately. Exported for testing.
+ */
+export function isDuplicateLastUserMessage(branch: StoredMessage[], text: string): boolean {
+  const last = branch[branch.length - 1];
+  if (!last || last.role !== 'user') return false;
+  const content = Array.isArray(last.content) ? last.content : [];
+  const textPart = content.find((p: unknown) => (p as { type?: string }).type === 'text') as
+    | { text?: string }
+    | undefined;
+  return textPart?.text === text;
+}
+
+/**
  * Walk DOWN from `startId` to the deepest descendant, always taking the last
  * (most recent) child, and return that leaf's id. Cycle-guarded the same way as
  * getActiveBranch so a corrupt parentId cycle can't hang the caller.
@@ -1970,13 +1988,7 @@ export function RuntimeProvider({
         const msgText = e.text ?? '';
         if (msgText) {
           const branch = getActiveBranch(acc.messages, acc.headId);
-          const last = branch[branch.length - 1];
-          const lastIsUser = last?.role === 'user';
-          const lastContent = lastIsUser && Array.isArray(last.content) ? last.content : [];
-          const lastText = lastContent.find((p: unknown) => (p as { type?: string }).type === 'text') as
-            | { text?: string }
-            | undefined;
-          const isDuplicate = lastIsUser && lastText?.text === msgText;
+          const isDuplicate = isDuplicateLastUserMessage(branch, msgText);
           if (!isDuplicate) {
             const userMsg: StoredMessage = {
               id: msgId(),

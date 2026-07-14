@@ -14,7 +14,7 @@ vi.mock('@/lib/ipc-client', () => ({
   app: new Proxy({}, { get: () => () => undefined }),
 }));
 
-import { getActiveBranch, ensureTree, deepestLatestDescendant } from '../RuntimeProvider';
+import { getActiveBranch, ensureTree, deepestLatestDescendant, isDuplicateLastUserMessage } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
 
@@ -131,5 +131,34 @@ describe('deepestLatestDescendant', () => {
 
   it('does NOT infinite-loop on a self-referential node', () => {
     expect(deepestLatestDescendant(asTreeD([n('a', 'a')]), 'a')).toBe('a');
+  });
+});
+
+describe('isDuplicateLastUserMessage — peer user-message dedup (#222)', () => {
+  type Msg = { role: string; content: unknown };
+  const asBranch = (msgs: Msg[]) => msgs as unknown as Parameters<typeof isDuplicateLastUserMessage>[0];
+  const userMsg = (text: string): Msg => ({ role: 'user', content: [{ type: 'text', text }] });
+  const assistantMsg = (text: string): Msg => ({ role: 'assistant', content: [{ type: 'text', text }] });
+
+  it('is a duplicate when the last turn is a user message with matching text (our own echo)', () => {
+    expect(isDuplicateLastUserMessage(asBranch([userMsg('hello')]), 'hello')).toBe(true);
+    expect(isDuplicateLastUserMessage(asBranch([assistantMsg('hi'), userMsg('again')]), 'again')).toBe(true);
+  });
+
+  it('is NOT a duplicate when the text differs (a peer submitted a different prompt)', () => {
+    expect(isDuplicateLastUserMessage(asBranch([userMsg('hello')]), 'world')).toBe(false);
+  });
+
+  it('is NOT a duplicate when the last turn is an assistant message (peer turn on a settled convo)', () => {
+    expect(isDuplicateLastUserMessage(asBranch([userMsg('q'), assistantMsg('a')]), 'q')).toBe(false);
+  });
+
+  it('is NOT a duplicate on an empty branch (first turn from a peer)', () => {
+    expect(isDuplicateLastUserMessage(asBranch([]), 'hello')).toBe(false);
+  });
+
+  it('handles a user message with no text part (non-text content) as non-duplicate', () => {
+    const imgOnly: Msg = { role: 'user', content: [{ type: 'image', image: 'x' }] };
+    expect(isDuplicateLastUserMessage(asBranch([imgOnly]), 'hello')).toBe(false);
   });
 });
