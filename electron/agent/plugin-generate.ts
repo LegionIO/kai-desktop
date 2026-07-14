@@ -5,6 +5,7 @@ import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
+import { randomUUID } from 'crypto';
 import { join } from 'path';
 
 export type PluginGenerateOptions = {
@@ -43,6 +44,14 @@ export type PluginGenerateStreamEvent = Omit<StreamEvent, 'type'> & {
   type: Exclude<StreamEvent['type'], 'user-message'>;
   modelKey?: string;
 };
+
+/** Synthetic conversation id for a headless run with no real target. Uses a
+ *  UUID under a reserved `plugin-` namespace: collision-safe and disjoint from
+ *  real conversation ids (which are never `plugin-<uuid>`), so a synthetic id
+ *  can't accidentally point at a persisted conversation and misroute a write. */
+function syntheticConversationId(): string {
+  return `plugin-${randomUUID()}`;
+}
 
 function configForPluginStream(
   config: AppConfig,
@@ -91,7 +100,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     const dbPath = join(appHome, 'data', 'memory.db');
     const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
     const configForStream = configForPluginStream(config, null, systemPrompt);
-    const conversationId = options.conversationId ?? `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const conversationId = options.conversationId ?? syntheticConversationId();
 
     const stream = streamAgentResponse(
       conversationId,
@@ -100,7 +109,14 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       configForStream,
       pluginTools ?? [],
       dbPath,
-      { abortSignal: options.abortSignal },
+      // isHeadless MUST match the other stream paths: this is still a headless /
+      // automation run, so ask_user must fall back to an Alert (not block). Also
+      // forward reasoningEffort so the default-model path honors it.
+      {
+        abortSignal: options.abortSignal,
+        reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
+        isHeadless: true,
+      },
     );
     return { stream, modelKey: fallbackEntry.key };
   }
@@ -110,7 +126,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   const sanitized = sanitizePluginMessages(messages as Array<{ role: string; content: unknown }>);
   const configForStream = configForPluginStream(config, streamConfig, systemPrompt);
 
-  const conversationId = options.conversationId ?? `plugin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const conversationId = options.conversationId ?? syntheticConversationId();
 
   let stream: AsyncGenerator<StreamEvent>;
 
