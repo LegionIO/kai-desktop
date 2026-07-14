@@ -2176,7 +2176,6 @@ function AppShell() {
                         </div>
                       }
                     />
-                    <UpdateCard />
                     <SidebarDock
                       items={dockItems}
                       bubbleExpanded={pluginBubbleExpanded}
