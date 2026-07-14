@@ -12,12 +12,7 @@ export type SanitizedPluginMessage = {
 function cleanToolResult(
   part: Record<string, unknown>,
 ): Extract<SanitizedPluginContentPart, { type: 'tool-result' }> | null {
-  if (
-    typeof part.toolCallId !== 'string'
-    || !part.toolCallId
-    || typeof part.toolName !== 'string'
-    || !part.toolName
-  ) {
+  if (typeof part.toolCallId !== 'string' || !part.toolCallId || typeof part.toolName !== 'string' || !part.toolName) {
     return null;
   }
   return {
@@ -34,12 +29,13 @@ function cleanToolResult(
  * Combined renderer-style tool-call parts that include a result are split into
  * the same assistant/tool sequence accepted by the regular conversation path.
  */
-export function sanitizePluginMessages(
-  messages: Array<{ role: string; content: unknown }>,
-): SanitizedPluginMessage[] {
+export function sanitizePluginMessages(messages: Array<{ role: string; content: unknown }>): SanitizedPluginMessage[] {
   const clean: SanitizedPluginMessage[] = [];
 
   for (const msg of messages) {
+    // Defensive: a buggy (but trusted) plugin could pass a null/non-object entry;
+    // reading `.role` off it would throw and abort the whole run. Skip it instead.
+    if (!msg || typeof msg !== 'object') continue;
     const role = msg.role;
     if (role !== 'user' && role !== 'assistant' && role !== 'system' && role !== 'tool') continue;
 
@@ -49,9 +45,7 @@ export function sanitizePluginMessages(
         const toolResults = parts
           .filter((part) => part?.type === 'tool-result')
           .map(cleanToolResult)
-          .filter((
-            part,
-          ): part is Extract<SanitizedPluginContentPart, { type: 'tool-result' }> => part !== null);
+          .filter((part): part is Extract<SanitizedPluginContentPart, { type: 'tool-result' }> => part !== null);
         if (toolResults.length > 0) clean.push({ role, content: toolResults });
         continue;
       }
@@ -87,12 +81,12 @@ export function sanitizePluginMessages(
           continue;
         }
         if (
-          role === 'assistant'
-          && part?.type === 'tool-call'
-          && typeof part.toolCallId === 'string'
-          && part.toolCallId
-          && typeof part.toolName === 'string'
-          && part.toolName
+          role === 'assistant' &&
+          part?.type === 'tool-call' &&
+          typeof part.toolCallId === 'string' &&
+          part.toolCallId &&
+          typeof part.toolName === 'string' &&
+          part.toolName
         ) {
           messageParts.push({
             type: 'tool-call',

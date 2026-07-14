@@ -106,4 +106,14 @@ describe('sanitizePluginMessages', () => {
       },
     ]);
   });
+
+  it('skips null / non-object message entries without crashing (buggy-plugin robustness)', () => {
+    const result = sanitizePluginMessages([
+      null as unknown as { role: string; content: unknown },
+      42 as unknown as { role: string; content: unknown },
+      'nope' as unknown as { role: string; content: unknown },
+      { role: 'user', content: 'hello' },
+    ]);
+    expect(result).toEqual([{ role: 'user', content: 'hello' }]);
+  });
 });
