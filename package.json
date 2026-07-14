@@ -1,7 +1,7 @@
 {
   "name": "kai",
   "productName": "Kai",
-  "version": "1.0.140",
+  "version": "1.0.141",
   "description": "Kai - Local AI Assistant",
   "main": "./out/main/index.js",
   "bin": {
