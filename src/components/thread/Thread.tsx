@@ -65,6 +65,7 @@ import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
+import { MessageContentErrorBoundary } from './MessageContentErrorBoundary';
 import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
 import { PipelineInsights } from './PipelineInsights';
 import type { PipelineEnrichments } from './PipelineInsights';
@@ -1265,7 +1266,8 @@ const AssistantMessage: FC = () => {
 
   // Extract pipeline enrichments stored as a content part
   const enrichmentsPart = content.find((p: { type: string }) => p.type === 'enrichments') as
-    { type: 'enrichments'; enrichments: PipelineEnrichments } | undefined;
+    | { type: 'enrichments'; enrichments: PipelineEnrichments }
+    | undefined;
   const pipelineEnrichments = enrichmentsPart?.enrichments ?? null;
 
   // Extract max-turns-reached content parts for interactive continue card
@@ -1341,7 +1343,9 @@ const AssistantMessage: FC = () => {
             </>
           ) : (
             <>
-              <MessagePrimitive.Content components={assistantContentComponents} />
+              <MessageContentErrorBoundary resetKey={content.length}>
+                <MessagePrimitive.Content components={assistantContentComponents} />
+              </MessageContentErrorBoundary>
               {/* Thinking spinner: visible inside assistant bubble, hidden by CSS once content parts render */}
               <div className="aui-typing-dots">
                 <ThinkingSpinner />
