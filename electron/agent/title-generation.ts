@@ -59,6 +59,9 @@ export function resolveTitleModel(config: AppConfig, threadModelKey: string | nu
  */
 export function normalizeGeneratedTitle(rawTitle: string | null, maxWords = 4, maxChars = 80): string | null {
   if (!rawTitle) return null;
+  // Guard against non-positive / non-finite limits (would yield an empty title).
+  const words = Number.isFinite(maxWords) && maxWords > 0 ? Math.floor(maxWords) : 4;
+  const chars = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 80;
 
   const cleaned = stripDisplayUnsafeChars(rawTitle.trim())
     .replace(/^["']|["']$/g, '')
@@ -68,7 +71,12 @@ export function normalizeGeneratedTitle(rawTitle: string | null, maxWords = 4, m
 
   if (!cleaned) return null;
 
-  return cleaned.split(/\s+/).slice(0, maxWords).join(' ').slice(0, maxChars);
+  const clipped = cleaned.split(/\s+/).slice(0, words).join(' ');
+  // Truncate by CODE POINT, not UTF-16 unit, so an emoji/surrogate pair at the
+  // boundary isn't split into a lone surrogate (which renders as �).
+  const cp = Array.from(clipped);
+  const truncated = (cp.length > chars ? cp.slice(0, chars).join('') : clipped).trim();
+  return truncated || null;
 }
 
 /**
