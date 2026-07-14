@@ -2,8 +2,9 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useApp, useStdout, useInput } from 'ink';
 import Spinner from 'ink-spinner';
 import { randomUUID } from 'crypto';
-import { appendFileSync } from 'fs';
+import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { getAppHome } from '../local-bridge/paths.js';
 import type { LocalBridgeClient } from './client.js';
 import { renderMarkdown, stripControl } from './render/markdown.js';
 import { InputBox } from './components/InputBox.js';
@@ -16,13 +17,20 @@ import { assistantBlockNeedsHeader, formatSubAgentStatusNote } from './stream-re
 
 // TEMP debug (issue #217): trace which stream events reach the CLI and whether
 // the conversationId guard passes. Gated on the SAME env var as the backend's
-// stream-pipeline log (KAI_DEBUG_STREAM) and written alongside it, so one flag
-// lights up both ends of the GUI->CLI pipeline. Remove once #217 is resolved.
+// stream-pipeline log (KAI_DEBUG_STREAM) so one flag lights up both ends of the
+// GUI->CLI pipeline. Writes under ~/.kai/debug-logs/ (NOT process.cwd(), which
+// is unpredictable for the installed `kai`) so a trace is capturable from the
+// packaged app. Remove once #217 is resolved.
 const CLI_DEBUG_ENABLED = !!process.env.KAI_DEBUG_STREAM;
-const CLI_DEBUG_LOG = join(process.cwd(), 'debug-logs', 'stream-pipeline.log');
+const CLI_DEBUG_LOG = join(getAppHome(), 'debug-logs', 'stream-pipeline.log');
+let cliDebugDirReady = false;
 function cliDebugLog(msg: string): void {
   if (!CLI_DEBUG_ENABLED) return;
   try {
+    if (!cliDebugDirReady) {
+      mkdirSync(join(getAppHome(), 'debug-logs'), { recursive: true });
+      cliDebugDirReady = true;
+    }
     appendFileSync(CLI_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
   } catch {
     /* best-effort */

@@ -27,12 +27,16 @@ import {
 } from '../agent/compaction.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { getAppHome } from '../local-bridge/paths.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging for stream pipeline diagnostics
 // ---------------------------------------------------------------------------
 const IPC_DEBUG_ENABLED = !!process.env.KAI_DEBUG_STREAM;
-const IPC_DEBUG_DIR = join(process.cwd(), 'debug-logs');
+// Under ~/.kai/debug-logs/ (NOT process.cwd(), which for the installed app's
+// main process is typically '/') so the [BROADCAST] trace is capturable from
+// the packaged app — matches the CLI's cliDebugLog target.
+const IPC_DEBUG_DIR = join(getAppHome(), 'debug-logs');
 const IPC_DEBUG_LOG = join(IPC_DEBUG_DIR, 'stream-pipeline.log');
 function ipcDebugLog(msg: string): void {
   if (!IPC_DEBUG_ENABLED) return;
