@@ -15,6 +15,7 @@ import {
   reduceCliStreamEvent,
   initialCliStreamState,
   toolTurnOpensAssistantTurn,
+  assistantBlockNeedsHeader,
   type CliStreamState,
   type CliStreamEvent,
   type CliTurn,
@@ -266,5 +267,56 @@ describe('toolTurnOpensAssistantTurn — kai header placement (#221)', () => {
   it('is false for a non-tool turn at the index', () => {
     const turns: CliTurn[] = [{ kind: 'assistant', text: 'hi' }];
     expect(toolTurnOpensAssistantTurn(turns, 0)).toBe(false);
+  });
+});
+
+describe('assistantBlockNeedsHeader — one `kai` header per reply (text → tool → text)', () => {
+  it('shows the header on the first assistant/tool turn of a reply', () => {
+    // user, [assistant] → the assistant block opens here.
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'q' },
+      { kind: 'assistant', text: 'joke' },
+    ];
+    expect(assistantBlockNeedsHeader(turns, 1)).toBe(true);
+  });
+
+  it('SUPPRESSES the header on assistant text that CONTINUES after a tool (the reported dup)', () => {
+    // user, assistant(joke), tool, assistant(count) — one reply, header only on index 1.
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'q' },
+      { kind: 'assistant', text: 'joke' },
+      { kind: 'tool', id: 'tc1' },
+      { kind: 'assistant', text: 'here you go' },
+    ];
+    expect(assistantBlockNeedsHeader(turns, 1)).toBe(true); // opens the reply
+    expect(assistantBlockNeedsHeader(turns, 2)).toBe(false); // tool continues
+    expect(assistantBlockNeedsHeader(turns, 3)).toBe(false); // post-tool text continues
+  });
+
+  it('shows the header on a tool that opens the reply (no text first)', () => {
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'count files' },
+      { kind: 'tool', id: 'tc1' },
+    ];
+    expect(assistantBlockNeedsHeader(turns, 1)).toBe(true);
+  });
+
+  it('re-shows the header for a NEW reply after a user turn interleaves', () => {
+    const turns: CliTurn[] = [
+      { kind: 'assistant', text: 'first reply' },
+      { kind: 'user', text: 'follow-up' },
+      { kind: 'assistant', text: 'second reply' },
+    ];
+    expect(assistantBlockNeedsHeader(turns, 0)).toBe(true); // first (index 0, no prev)
+    expect(assistantBlockNeedsHeader(turns, 2)).toBe(true); // new reply after the user turn
+  });
+
+  it('is false for non-assistant-side turns (user/error/note)', () => {
+    const turns: CliTurn[] = [
+      { kind: 'user', text: 'q' },
+      { kind: 'error', text: 'boom' },
+    ];
+    expect(assistantBlockNeedsHeader(turns, 0)).toBe(false);
+    expect(assistantBlockNeedsHeader(turns, 1)).toBe(false);
   });
 });

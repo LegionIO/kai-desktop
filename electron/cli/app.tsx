@@ -12,7 +12,7 @@ import { Picker, type PickerItem } from './components/Picker.js';
 import { Banner } from './components/Banner.js';
 import { expandFileMentions } from './mentions.js';
 import { extractImageMentions } from './images.js';
-import { toolTurnOpensAssistantTurn } from './stream-reducer.js';
+import { assistantBlockNeedsHeader } from './stream-reducer.js';
 
 // TEMP debug (issue #217): trace which stream events reach the CLI and whether
 // the conversationId guard passes. Gated on the SAME env var as the backend's
@@ -1233,15 +1233,13 @@ export function App({
             (() => {
               const tool = toolsById.get(t.id);
               if (!tool) return null;
-              // Show a `kai` header when this tool row OPENS the assistant's turn
-              // (nothing from kai precedes it — the previous turn is the user's,
-              // or it's the first turn). Without it a tool call that runs before
-              // any assistant text renders bare right under the `you` block and
-              // reads as part of the user's message.
-              const opensAssistantTurn = toolTurnOpensAssistantTurn(turns, i);
+              // A `kai` header shows only when this row BEGINS an assistant block
+              // (see assistantBlockNeedsHeader). Continuation tools/text within
+              // the same reply (text → tool → text) suppress it, so one turn has
+              // one header — matching the GUI.
               return (
                 <Box key={i} marginTop={1} flexDirection="column">
-                  {opensAssistantTurn ? (
+                  {assistantBlockNeedsHeader(turns, i) ? (
                     <Text color="magenta" bold>
                       kai
                     </Text>
@@ -1258,15 +1256,36 @@ export function App({
                 </Box>
               );
             })()
+          ) : t.kind === 'assistant' ? (
+            // Render assistant text inline (not via TurnView) so its `kai` header
+            // can be suppressed when it CONTINUES an assistant block (e.g. text
+            // after a mid-reply tool call) — one reply, one header.
+            <Box key={i} marginTop={1} flexDirection="column">
+              {assistantBlockNeedsHeader(turns, i) ? (
+                <Text color="magenta" bold>
+                  kai
+                </Text>
+              ) : null}
+              <Text>{renderMarkdown(t.text)}</Text>
+            </Box>
           ) : (
             <TurnView key={i} turn={t} />
           ),
         )}
         {streamingRef.current.trim() ? (
           <Box marginTop={1} flexDirection="column">
-            <Text color="magenta" bold>
-              kai
-            </Text>
+            {/* Live streaming text is the tail of the current assistant turn.
+                Show `kai` only if it BEGINS the block — i.e. the last committed
+                turn isn't itself assistant-side (else it's continuation after a
+                mid-reply tool call and the header already showed above). */}
+            {(() => {
+              const prev = turns[turns.length - 1];
+              return !prev || (prev.kind !== 'assistant' && prev.kind !== 'tool');
+            })() ? (
+              <Text color="magenta" bold>
+                kai
+              </Text>
+            ) : null}
             <Text>{renderMarkdown(streamingRef.current)}</Text>
           </Box>
         ) : null}

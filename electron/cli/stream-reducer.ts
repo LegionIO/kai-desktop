@@ -228,3 +228,21 @@ export function toolTurnOpensAssistantTurn(turns: CliTurn[], index: number): boo
   const prev = turns[index - 1];
   return !prev || prev.kind === 'user';
 }
+
+/**
+ * Whether an assistant-side turn (an `assistant` text block OR a `tool` row) at
+ * `index` should render the `kai` header. A single assistant reply can span
+ * text → tool → text; those are ONE turn and should show `kai` only ONCE, at
+ * the start. So a header is needed only when this turn BEGINS an assistant block
+ * — i.e. the previous turn is NOT itself an assistant-side turn (it's a user
+ * turn, an error/note, or there is none). Continuation blocks (previous turn is
+ * `assistant` or `tool`) suppress the header. Mirrors the GUI, which groups a
+ * whole reply under one `kai` label. Used by app.tsx's transcript render.
+ */
+export function assistantBlockNeedsHeader(turns: CliTurn[], index: number): boolean {
+  const cur = turns[index];
+  if (cur?.kind !== 'assistant' && cur?.kind !== 'tool') return false;
+  const prev = turns[index - 1];
+  if (!prev) return true;
+  return prev.kind !== 'assistant' && prev.kind !== 'tool';
+}
