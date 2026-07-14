@@ -21,6 +21,7 @@ import {
   shouldCompact,
   compactConversationPrefix,
   compactToolResult,
+  splitPreservedFields,
   estimateToolTokens,
   isStrictPrefix,
 } from '../agent/compaction.js';
@@ -1420,50 +1421,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           return { result };
         }
         // Preserve inline diffs AND model-visible media (images/files) THROUGH
-        // compaction: capture them, compact only the text/JSON rest, then
+        // compaction: split them off, compact only the text/JSON rest, then
         // re-attach. Without this, `_modelContent` base64 gets serialized into
         // the string fed to the token estimator + head/tail truncator (or AI
         // summarizer), which corrupts the base64 or drops the attachment
         // entirely — defeating the plugin-attachment feature.
-        let preservedDiffTracking: unknown;
-        let preservedModelContent: unknown;
-        let resultForCompaction = result;
-        if (result && typeof result === 'object' && !Array.isArray(result)) {
-          const r = result as Record<string, unknown>;
-          const dt = r._diffTracking as { diffs?: unknown[] } | undefined;
-          if (dt && Array.isArray(dt.diffs) && dt.diffs.length > 0) {
-            preservedDiffTracking = dt;
-          }
-          if (Array.isArray(r._modelContent) && r._modelContent.length > 0) {
-            preservedModelContent = r._modelContent;
-          }
-          if (preservedDiffTracking !== undefined || preservedModelContent !== undefined) {
-            const { _diffTracking, _modelContent, ...rest } = r;
-            void _diffTracking;
-            void _modelContent;
-            resultForCompaction = rest;
-          }
-        }
-        const reattach = (value: unknown): unknown => {
-          if (preservedDiffTracking === undefined && preservedModelContent === undefined) return value;
-          if (value && typeof value === 'object' && !Array.isArray(value)) {
-            return {
-              ...(value as Record<string, unknown>),
-              ...(preservedDiffTracking !== undefined ? { _diffTracking: preservedDiffTracking } : {}),
-              ...(preservedModelContent !== undefined ? { _modelContent: preservedModelContent } : {}),
-            };
-          }
-          // Compaction produced a bare string. Only shell/CLI results carry
-          // _diffTracking, and the shell renderer recognizes { stdout } — so
-          // reattach as a shell-shaped object to keep the output view working
-          // (wrapping as { value } would render as "No output"). Media rides
-          // alongside as _modelContent so the runtime still emits it natively.
-          return {
-            stdout: String(value ?? ''),
-            ...(preservedDiffTracking !== undefined ? { _diffTracking: preservedDiffTracking } : {}),
-            ...(preservedModelContent !== undefined ? { _modelContent: preservedModelContent } : {}),
-          };
-        };
+        const { resultForCompaction, reattach } = splitPreservedFields(result);
 
         const originalText = stringifyToolResult(resultForCompaction);
         const userQuery = extractLatestUserQuery(messages);

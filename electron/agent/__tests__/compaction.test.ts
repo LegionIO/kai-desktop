@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isStrictPrefix, selectProtectedTail, type ChatMessage } from '../compaction';
+import { isStrictPrefix, selectProtectedTail, splitPreservedFields, type ChatMessage } from '../compaction';
 
 describe('isStrictPrefix (compaction reuse / divergence detector)', () => {
   it('is true when ids are an ordered prefix of the branch', () => {
@@ -100,5 +100,53 @@ describe('selectProtectedTail (compaction boundary + tool-call/result pair integ
   it('returns boundary = length (compact nothing) when no protection window', () => {
     const msgs = [u('0'), a('1')];
     expect(selectProtectedTail(msgs, 0, 0).boundaryIndex).toBe(2);
+  });
+});
+
+describe('splitPreservedFields (compaction-exempt tool-result fields)', () => {
+  const img = { type: 'image', data: 'AAAA', mediaType: 'image/png' };
+
+  it('leaves a plain result untouched (no reattach change)', () => {
+    const r = { ok: true, note: 'done' };
+    const { resultForCompaction, reattach } = splitPreservedFields(r);
+    expect(resultForCompaction).toEqual(r);
+    expect(reattach('summarized')).toBe('summarized'); // no-op passthrough
+  });
+
+  it('strips _modelContent before compaction and re-attaches it onto an object result', () => {
+    const r = { caption: 'chart', _modelContent: [img] };
+    const { resultForCompaction, reattach } = splitPreservedFields(r);
+    // The media must NOT be in the body handed to the truncator.
+    expect(resultForCompaction).toEqual({ caption: 'chart' });
+    expect((resultForCompaction as Record<string, unknown>)._modelContent).toBeUndefined();
+    // …and it comes back intact after compaction.
+    expect(reattach({ caption: 'chart (shrunk)' })).toEqual({
+      caption: 'chart (shrunk)',
+      _modelContent: [img],
+    });
+  });
+
+  it('re-attaches _modelContent onto a bare-string compaction result as shell-shaped output', () => {
+    const { resultForCompaction, reattach } = splitPreservedFields({ _modelContent: [img] });
+    expect(resultForCompaction).toEqual({});
+    expect(reattach('...[truncated]...')).toEqual({ stdout: '...[truncated]...', _modelContent: [img] });
+  });
+
+  it('preserves _diffTracking and _modelContent together', () => {
+    const dt = { diffs: [{ path: 'a.txt' }] };
+    const { resultForCompaction, reattach } = splitPreservedFields({
+      stdout: 'huge output',
+      _diffTracking: dt,
+      _modelContent: [img],
+    });
+    expect(resultForCompaction).toEqual({ stdout: 'huge output' });
+    expect(reattach({ stdout: 'shrunk' })).toEqual({ stdout: 'shrunk', _diffTracking: dt, _modelContent: [img] });
+  });
+
+  it('ignores an empty _modelContent array (nothing to preserve)', () => {
+    const r = { ok: true, _modelContent: [] };
+    const { resultForCompaction, reattach } = splitPreservedFields(r);
+    expect(resultForCompaction).toBe(r); // untouched
+    expect(reattach('x')).toBe('x');
   });
 });

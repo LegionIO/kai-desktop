@@ -437,6 +437,61 @@ async function aiExtractRelevantInfo(
 }
 
 /**
+ * Split a tool result's compaction-exempt fields off the compactable body.
+ *
+ * Two reserved fields must NOT be fed to the text token-estimator / truncator /
+ * AI summarizer:
+ *  - `_diffTracking`: inline diff metadata (a build that prints a lot AND touches
+ *    a lockfile still needs its stdout shrunk without losing the diff).
+ *  - `_modelContent`: native model-visible media (base64 images/files). Slicing
+ *    or summarizing this string corrupts the base64 / drops the attachment.
+ *
+ * Returns the body to compact (`resultForCompaction`, with those keys removed)
+ * plus a `reattach(value)` that restores them onto the compacted output —
+ * handling both the object-result and bare-string-result (shell-shaped) cases.
+ * Pure, so the preservation contract is unit-tested.
+ */
+export function splitPreservedFields(result: unknown): {
+  resultForCompaction: unknown;
+  reattach: (value: unknown) => unknown;
+} {
+  let preservedDiffTracking: unknown;
+  let preservedModelContent: unknown;
+  let resultForCompaction = result;
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const r = result as Record<string, unknown>;
+    const dt = r._diffTracking as { diffs?: unknown[] } | undefined;
+    if (dt && Array.isArray(dt.diffs) && dt.diffs.length > 0) {
+      preservedDiffTracking = dt;
+    }
+    if (Array.isArray(r._modelContent) && r._modelContent.length > 0) {
+      preservedModelContent = r._modelContent;
+    }
+    if (preservedDiffTracking !== undefined || preservedModelContent !== undefined) {
+      const { _diffTracking, _modelContent, ...rest } = r;
+      void _diffTracking;
+      void _modelContent;
+      resultForCompaction = rest;
+    }
+  }
+  const reattach = (value: unknown): unknown => {
+    if (preservedDiffTracking === undefined && preservedModelContent === undefined) return value;
+    const extra = {
+      ...(preservedDiffTracking !== undefined ? { _diffTracking: preservedDiffTracking } : {}),
+      ...(preservedModelContent !== undefined ? { _modelContent: preservedModelContent } : {}),
+    };
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return { ...(value as Record<string, unknown>), ...extra };
+    }
+    // Compaction produced a bare string. The shell renderer recognizes
+    // { stdout } — reattach as a shell-shaped object to keep the output view
+    // working (wrapping as { value } would render as "No output").
+    return { stdout: String(value ?? ''), ...extra };
+  };
+  return { resultForCompaction, reattach };
+}
+
+/**
  * Compact a tool result if it exceeds the configured token threshold.
  *
  * Strategy (matching maelstrom):
